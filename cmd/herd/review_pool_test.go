@@ -216,3 +216,36 @@ func TestResolvePoolCandidateRejectsDetachedSurfaceAtWrongSHA(t *testing.T) {
 		t.Fatal("a surface at the wrong commit must not resolve; the SHA is verified, not assumed")
 	}
 }
+
+// FAC-653: a sha too short to verify is a bad ARGUMENT, not a missing worktree.
+// The >=12 guard is correct -- an abbreviation could ambiguously match the wrong
+// commit -- but the refusal read "no worktree holds candidate at exact sha",
+// which sent an operator hunting for a surface that existed with exactly the
+// right HEAD. Reproduced live against .herd/worktrees/origin-repair-cha-2797-p2,
+// whose HEAD was the requested commit.
+func TestResolvePoolCandidateNamesAShortSHAAsTheProblem(t *testing.T) {
+	root := t.TempDir()
+	_, err := resolvePoolReviewCandidateAt(root, "feat/x", "326da989")
+	if err == nil {
+		t.Fatal("a short sha must be refused, never guessed")
+	}
+	if !strings.Contains(err.Error(), "too short to verify") {
+		t.Errorf("the refusal must blame the argument, not an absent worktree: %v", err)
+	}
+	if strings.Contains(err.Error(), "no worktree holds") {
+		t.Errorf("a short sha must not be reported as a missing worktree: %v", err)
+	}
+}
+
+// A full-length sha with genuinely no surface still reports the worktree miss,
+// so the new branch cannot swallow the real case.
+func TestResolvePoolCandidateStillReportsAGenuineWorktreeMiss(t *testing.T) {
+	root := t.TempDir()
+	_, err := resolvePoolReviewCandidateAt(root, "feat/x", strings.Repeat("a", 40))
+	if err == nil {
+		t.Fatal("a full sha with no surface must still fail")
+	}
+	if !strings.Contains(err.Error(), "no worktree holds") {
+		t.Errorf("expected the worktree-miss message: %v", err)
+	}
+}

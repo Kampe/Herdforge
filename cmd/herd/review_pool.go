@@ -150,6 +150,33 @@ func runPoolReview(ref string) error {
 		reviewer = resolved
 	}
 
+	// FAC-653: refuse a DUPLICATE launch before touching the pool.
+	//
+	// The agent name is derived deterministically from ref+sha, so relaunching
+	// the same candidate collides with the reviewer already working on it. That
+	// collision was only detected at `herdr agent start` -- the LAST step, after
+	// this command had already leased a slot, EVICTED whatever was living in it,
+	// and closed that pane. So a duplicate launch destroyed a healthy reviewer in
+	// a DIFFERENT slot and then failed anyway, and every retry destroyed one more.
+	//
+	// Observed live: a relaunch of origin/repair/cha-2797-p2 evicted an occupant
+	// from pool-05 and closed tab w4:t1H, then failed with agent_name_taken
+	// because review-origin-repair-ch-66fa9d85 was already Working in pool-04.
+	// Repeated attempts left four idle review agents and zero working reviewers
+	// on a host that had been fully occupied -- read from outside as a pool,
+	// reaper, or admission fault, when it was a retry loop eating its own fleet.
+	//
+	// Checking first makes a duplicate launch IDEMPOTENT and non-destructive: the
+	// candidate is already being reviewed, which is success, not a conflict. An
+	// unreadable agent list is NOT proof of absence, so it falls through to the
+	// old behaviour rather than refusing a legitimate launch.
+	if live, name, ok := liveReviewerFor(ref, sha); ok && live {
+		fmt.Printf("review --pool: candidate %s is ALREADY being reviewed by %s; not launching a second reviewer "+
+			"(the deterministic agent name is derived from ref+sha, so this would collide, and reaching the collision "+
+			"would first evict whatever is living in the newly leased slot)\n", shortSHA(sha), name)
+		return nil
+	}
+
 	p := worktree.NewPool(root, *poolRoot, 2)
 	// FAC-591: teach the pool which lease holders are still alive so it can
 	// reclaim the rest itself. Every launch that died after leasing used to
@@ -431,6 +458,17 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 	if sha != "" {
 		if dir := detachedSurfaceAtSHA(root, sha); dir != "" {
 			return dir, nil
+		}
+		// FAC-653: a SHA too short to verify is a bad ARGUMENT, not a missing
+		// worktree. headMatchesSHA and detachedSurfaceAtSHA both require >=12
+		// hex so an abbreviation cannot ambiguously match the wrong commit --
+		// correct -- but the refusal then read "no worktree holds candidate at
+		// exact sha", which sent an operator hunting for a surface that was
+		// sitting right there with exactly the right HEAD. Say which it is.
+		if len(strings.TrimSpace(sha)) < 12 {
+			return "", fmt.Errorf("candidate sha %q is too short to verify (need at least 12 hex characters); "+
+				"an abbreviation could match more than one commit, so it is refused rather than guessed. "+
+				"Pass the full 40-character sha", sha)
 		}
 		return "", fmt.Errorf("no worktree holds candidate %q at exact sha %s: neither a checked-out branch nor a detached surface with that HEAD (looked in %v)",
 			ref, shortSHA(sha), candidateSurfaceDirs(root, ref))
@@ -973,6 +1011,26 @@ func builderFamilyFromReceipts(root, sha string) string {
 // agentNameFor is the name this dispatch will give its reviewer, so eviction can
 // spare a pane that is already the legitimate holder (an idempotent re-dispatch).
 func agentNameFor(ref, sha string) string { return reviewAgentName(ref, sha) }
+
+// liveReviewerFor reports whether a reviewer for this exact candidate is already
+// running. The third return is false when the agent list could not be read at
+// all, which must never be mistaken for "no reviewer exists" (FAC-653).
+func liveReviewerFor(ref, sha string) (live bool, name string, known bool) {
+	want := agentNameFor(ref, sha)
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return false, "", false
+	}
+	for _, a := range agents {
+		if strings.TrimSpace(a.Name) != want {
+			continue
+		}
+		// Any registered agent under this exact name blocks the start, whatever
+		// its status: herdr refuses the name itself, not just working agents.
+		return true, want, true
+	}
+	return false, want, true
+}
 
 // evictPoolSlotOccupants closes every pane whose foreground process is living
 // inside slotPath, except one already named keepAgent.
