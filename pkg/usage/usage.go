@@ -40,7 +40,12 @@ type grokAuthEntry struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-var openUsageBinary = findOpenUsageBinary()
+// FAC-684: this was `var openUsageBinary = findOpenUsageBinary()`, resolved once
+// at package init. HERD_OPENUSAGE_BIN therefore had to be set before the process
+// started; setting it later -- which is the only thing an in-process test can do
+// -- silently had no effect, so every test that "stubbed" quota was in fact
+// reading the machine's live numbers and passing or failing by time of day.
+// Resolve on use instead. The lookup is a couple of stat calls.
 
 func findOpenUsageBinary() string {
 	if override := strings.TrimSpace(os.Getenv("HERD_OPENUSAGE_BIN")); override != "" {
@@ -76,9 +81,9 @@ func FetchProvider(provider string) (*UsageSnapshot, error) {
 func fetchViaBinary(provider string) (*UsageSnapshot, error) {
 	var cmd *exec.Cmd
 	if provider == "" {
-		cmd = exec.Command(openUsageBinary)
+		cmd = exec.Command(findOpenUsageBinary())
 	} else {
-		cmd = exec.Command(openUsageBinary, provider)
+		cmd = exec.Command(findOpenUsageBinary(), provider)
 	}
 	out, err := cmd.Output()
 	if err != nil {

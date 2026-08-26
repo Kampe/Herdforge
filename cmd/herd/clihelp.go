@@ -229,6 +229,11 @@ Commands:
   full rebuild; if parity still fails the run exits non-zero (BLOCKED) and the
   emitted plan broadens to the full profile instead of narrowing.`,
 	"harvest": "Usage: herd harvest [--quiet] [--json]\n  Fleet-wide worktree harvest sweep.",
+	"capacity": "Usage: herd capacity [--json] [--review-limit N] [--reviewer-mib N] [--floor-mib N]\n" +
+		"  Reports whether THIS host can accept another review launch, from its live\n" +
+		"  census (herdr server, agent list, memory) rather than configured slots.\n" +
+		"  Exits 3 on a refusal so a shell caller cannot ignore it by not parsing output.\n" +
+		"  Memory it cannot measure is reported unknown, never as a refusal.",
 	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main]\n" +
 		"  Retire worktrees whose work has LANDED: no unique commits against base, so\n" +
 		"  removal is provably lossless. Never touches unmerged, dirty, locked or\n" +
