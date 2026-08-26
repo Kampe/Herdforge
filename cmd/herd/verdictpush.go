@@ -1,15 +1,43 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
 )
+
+var (
+	transportedReviewerAgents = herdr.AgentList
+	transportedReviewerClose  = herdr.CloseSettledReviewTab
+	transportedReviewerHead   = func(cwd string) (string, error) {
+		out, err := exec.Command("git", "-C", cwd, "rev-parse", "HEAD").CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("candidate HEAD: %s", strings.TrimSpace(string(out)))
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+)
+
+type reviewReapReceipt struct {
+	ObservedAt  string `json:"observed_at"`
+	Layer       string `json:"layer"`
+	Disposition string `json:"disposition"`
+	Reason      string `json:"reason,omitempty"`
+	Artifact    string `json:"artifact"`
+	SHA         string `json:"sha,omitempty"`
+	Reviewer    string `json:"reviewer,omitempty"`
+	TabID       string `json:"tab_id,omitempty"`
+	PaneID      string `json:"pane_id,omitempty"`
+}
 
 // runVerdictPush transports one verdict artifact to the ledger host over git.
 //
@@ -198,7 +226,10 @@ func sweepVerdictPush(remote, workspace string, dryRun bool) error {
 		}
 	}
 
-	pushed, skipped, failed := 0, 0, 0
+	pushed, skipped, failed, reaped, reapFailed := 0, 0, 0, 0, 0
+	var residentAgents []herdr.AgentEntry
+	var residentCensusErr error
+	residentCensusLoaded := false
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".md") {
@@ -208,27 +239,153 @@ func sweepVerdictPush(remote, workspace string, dryRun bool) error {
 		if len(ref) > 220 {
 			ref = ref[:220]
 		}
-		if existing[ref] {
+		transported := existing[ref]
+		if transported {
 			skipped++
-			continue
-		}
-		if dryRun {
+		} else if dryRun {
 			fmt.Printf("WOULD_PUSH %s -> %s\n", name, ref)
 			pushed++
-			continue
+		} else {
+			os.Args = []string{"herd", "verdict-push", "--artifact", filepath.Join(inbox, name), "--workspace", ws, "--remote", remote}
+			if err := runVerdictPush(); err != nil {
+				fmt.Fprintf(os.Stderr, "verdict-push sweep: %s: %v\n", name, err)
+				failed++
+				continue
+			}
+			pushed++
+			transported = true // runVerdictPush performed its own ls-remote readback.
 		}
-		os.Args = []string{"herd", "verdict-push", "--artifact", filepath.Join(inbox, name), "--workspace", ws, "--remote", remote}
-		if err := runVerdictPush(); err != nil {
-			fmt.Fprintf(os.Stderr, "verdict-push sweep: %s: %v\n", name, err)
-			failed++
-			continue
+
+		if transported || dryRun {
+			if !residentCensusLoaded {
+				residentAgents, residentCensusErr = transportedReviewerAgents()
+				residentCensusLoaded = true
+			}
+			receipt, reapErr := reapTransportedReviewerFromCensus(root, filepath.Join(inbox, name), dryRun, residentAgents, residentCensusErr)
+			if !dryRun {
+				if err := appendReviewReapReceipt(root, receipt); err != nil && reapErr == nil {
+					reapErr = fmt.Errorf("persist cleanup receipt: %w", err)
+					receipt.Disposition, receipt.Reason = "blocked", reapErr.Error()
+				}
+			}
+			if receipt.Disposition == "reaped" {
+				reaped++
+				residentAgents = removeResidentAgent(residentAgents, receipt.Reviewer)
+			}
+			if reapErr != nil {
+				reapFailed++
+				fmt.Fprintf(os.Stderr, "REAP_BLOCKED layer=%s artifact=%s reason=%q\n", receipt.Layer, name, receipt.Reason)
+			} else if receipt.Disposition == "would_reap" {
+				fmt.Printf("WOULD_REAP reviewer=%s sha=%s tab=%s\n", receipt.Reviewer, shortSHA(receipt.SHA), receipt.TabID)
+			}
 		}
-		pushed++
 	}
-	fmt.Printf("verdict-push sweep: pushed=%d already_present=%d failed=%d workspace=%s\n",
-		pushed, skipped, failed, ws)
-	if failed > 0 {
-		return fmt.Errorf("%d verdict(s) could not be transported", failed)
+	fmt.Printf("verdict-push sweep: pushed=%d already_present=%d failed=%d reaped=%d reap_failed=%d workspace=%s\n",
+		pushed, skipped, failed, reaped, reapFailed, ws)
+	if failed > 0 || reapFailed > 0 {
+		return fmt.Errorf("transport_failed=%d resident_cleanup_failed=%d", failed, reapFailed)
 	}
 	return nil
+}
+
+func removeResidentAgent(agents []herdr.AgentEntry, name string) []herdr.AgentEntry {
+	out := agents[:0]
+	for _, agent := range agents {
+		if agent.Name != name {
+			out = append(out, agent)
+		}
+	}
+	return out
+}
+
+func reapTransportedReviewer(root, artifactPath string, dryRun bool) (reviewReapReceipt, error) {
+	agents, censusErr := transportedReviewerAgents()
+	return reapTransportedReviewerFromCensus(root, artifactPath, dryRun, agents, censusErr)
+}
+
+func reapTransportedReviewerFromCensus(root, artifactPath string, dryRun bool, agents []herdr.AgentEntry, censusErr error) (reviewReapReceipt, error) {
+	r := reviewReapReceipt{
+		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), Layer: "resident_cleanup",
+		Disposition: "retained", Artifact: filepath.Base(artifactPath),
+	}
+	body, err := os.ReadFile(artifactPath)
+	if err != nil {
+		r.Disposition, r.Reason = "blocked", "read verdict artifact: "+err.Error()
+		return r, err
+	}
+	a := reviewingest.Parse(string(body))
+	r.SHA, r.Reviewer = strings.TrimSpace(a.SHA), strings.TrimSpace(a.Reviewer)
+	if len(r.SHA) != 40 || r.Reviewer == "" {
+		r.Reason = "artifact lacks exact sha/reviewer identity; no resident mutation attempted"
+		return r, nil
+	}
+	if censusErr != nil {
+		r.Disposition, r.Reason = "blocked", "agent census unavailable: "+censusErr.Error()
+		return r, censusErr
+	}
+	var matches []herdr.AgentEntry
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Name) == r.Reviewer {
+			matches = append(matches, agent)
+		}
+	}
+	if len(matches) == 0 {
+		r.Disposition, r.Reason = "already_absent", "no live reviewer with exact artifact identity"
+		return r, nil
+	}
+	if len(matches) != 1 {
+		r.Disposition, r.Reason = "blocked", fmt.Sprintf("exact reviewer identity is ambiguous (%d matches)", len(matches))
+		return r, errors.New(r.Reason)
+	}
+	agent := matches[0]
+	r.TabID, r.PaneID = agent.TabID, agent.PaneID
+	if agent.Status != "idle" && agent.Status != "done" {
+		r.Reason = fmt.Sprintf("reviewer status %q is not settled", agent.Status)
+		return r, nil
+	}
+	if agent.Focused == nil || *agent.Focused {
+		r.Reason = "reviewer focus is not explicitly false"
+		return r, nil
+	}
+	if strings.TrimSpace(agent.Cwd) == "" || strings.TrimSpace(agent.TabID) == "" ||
+		strings.TrimSpace(agent.PaneID) == "" || strings.TrimSpace(agent.Workspace) == "" ||
+		strings.TrimSpace(agent.TerminalID) == "" || strings.TrimSpace(agent.Session.Value) == "" {
+		r.Disposition, r.Reason = "blocked", "reviewer live identity is incomplete"
+		return r, errors.New(r.Reason)
+	}
+	head, err := transportedReviewerHead(agent.Cwd)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(head), r.SHA) {
+		r.Disposition, r.Reason = "blocked", fmt.Sprintf("candidate HEAD mismatch: got=%q want=%q error=%v", strings.TrimSpace(head), r.SHA, err)
+		return r, errors.New(r.Reason)
+	}
+	if dryRun {
+		r.Disposition, r.Reason = "would_reap", "remote verdict ref present and all resident identity gates passed"
+		return r, nil
+	}
+	if err := transportedReviewerClose(agent); err != nil {
+		r.Disposition, r.Reason = "blocked", "exact tab/process-tree cleanup: "+err.Error()
+		return r, err
+	}
+	r.Disposition, r.Reason = "reaped", "remote verdict ref present; exact settled reviewer and captured process tree retired"
+	return r, nil
+}
+
+func appendReviewReapReceipt(root string, receipt reviewReapReceipt) error {
+	path := filepath.Join(root, ".herd", "review", "reap.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	b, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
 }

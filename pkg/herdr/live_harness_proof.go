@@ -135,6 +135,57 @@ func CloseReviewTab(tabID, name string) error {
 	return hardCloseTab(tabID, name)
 }
 
+// CloseSettledReviewTab retires a reviewer only from a fully observed live
+// identity. It snapshots the pane's exact PID/start-token tree before the
+// fenced close, then reaps any survivors after close (including reparented MCP
+// children) without ever matching by process name.
+func CloseSettledReviewTab(agent AgentEntry) error {
+	if strings.TrimSpace(agent.Name) == "" || strings.TrimSpace(agent.TabID) == "" ||
+		strings.TrimSpace(agent.PaneID) == "" || strings.TrimSpace(agent.Workspace) == "" ||
+		strings.TrimSpace(agent.TerminalID) == "" || strings.TrimSpace(agent.Session.Value) == "" {
+		return fmt.Errorf("settled review close: incomplete agent/tab/pane incarnation")
+	}
+	if agent.Focused == nil || *agent.Focused {
+		return fmt.Errorf("settled review close: tab focus is not explicitly false")
+	}
+	if agent.Status != "idle" && agent.Status != "done" {
+		return fmt.Errorf("settled review close: status %q is not idle or done", agent.Status)
+	}
+
+	live, err := AgentList()
+	if err != nil {
+		return fmt.Errorf("settled review close readback: %w", err)
+	}
+	var exact *AgentEntry
+	for i := range live {
+		a := &live[i]
+		if a.Name == agent.Name && a.TabID == agent.TabID && a.PaneID == agent.PaneID &&
+			a.Workspace == agent.Workspace && a.TerminalID == agent.TerminalID &&
+			a.Session.Value == agent.Session.Value && a.Revision == agent.Revision &&
+			a.StateChangeSeq == agent.StateChangeSeq {
+			exact = a
+			break
+		}
+	}
+	if exact == nil {
+		return fmt.Errorf("settled review close: live agent identity changed")
+	}
+	if exact.Focused == nil || *exact.Focused || (exact.Status != "idle" && exact.Status != "done") {
+		return fmt.Errorf("settled review close: live status/focus changed")
+	}
+	snapshot, err := GetHostedPaneIdentity(exact.PaneID)
+	if err != nil {
+		return fmt.Errorf("settled review close process snapshot: %w", err)
+	}
+	if _, err := CloseExactTab(exactIdentityFor(*exact)); err != nil {
+		return fmt.Errorf("settled review close exact tab: %w", err)
+	}
+	if err := ReapHostedPaneSnapshot(snapshot); err != nil {
+		return fmt.Errorf("settled review close process tree: %w", err)
+	}
+	return hardCloseTab(exact.TabID, exact.Name)
+}
+
 func randomNonce(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

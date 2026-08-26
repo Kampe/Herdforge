@@ -1552,19 +1552,23 @@ type AgentSession struct {
 // FAC-158 observation fields are filled by authority adapters / fixtures,
 // never invented from the raw agent list.
 type AgentEntry struct {
-	Name             string       `json:"name,omitempty"`
-	Kind             string       `json:"agent,omitempty"`
-	Status           string       `json:"agent_status,omitempty"`
-	AssignmentStatus string       `json:"assignment_status,omitempty"`
-	LoopMode         string       `json:"loop_mode,omitempty"`
-	PaneID           string       `json:"pane_id,omitempty"`
-	TabID            string       `json:"tab_id,omitempty"`
-	Workspace        string       `json:"workspace_id,omitempty"`
-	TerminalID       string       `json:"terminal_id,omitempty"`
-	Cwd              string       `json:"cwd,omitempty"`
-	TerminalTitle    string       `json:"terminal_title,omitempty"` // UI title (login/auth detection)
-	ForegroundCwd    string       `json:"foreground_cwd,omitempty"`
-	Session          AgentSession `json:"agent_session,omitempty"`
+	Name             string `json:"name,omitempty"`
+	Kind             string `json:"agent,omitempty"`
+	Status           string `json:"agent_status,omitempty"`
+	AssignmentStatus string `json:"assignment_status,omitempty"`
+	LoopMode         string `json:"loop_mode,omitempty"`
+	PaneID           string `json:"pane_id,omitempty"`
+	TabID            string `json:"tab_id,omitempty"`
+	Workspace        string `json:"workspace_id,omitempty"`
+	TerminalID       string `json:"terminal_id,omitempty"`
+	Cwd              string `json:"cwd,omitempty"`
+	TerminalTitle    string `json:"terminal_title,omitempty"` // UI title (login/auth detection)
+	ForegroundCwd    string `json:"foreground_cwd,omitempty"`
+	// Focused is a pointer because an older Herdr omitting the field is not
+	// evidence that a tab is unfocused. Autonomous retirement requires an
+	// explicit false value.
+	Focused *bool        `json:"focused,omitempty"`
+	Session AgentSession `json:"agent_session,omitempty"`
 	// InteractiveReady is herdr's own statement that the harness TUI will accept
 	// input. A POINTER because absent and false are different facts: an older
 	// herdr omits the field entirely, and treating that as "not ready" would

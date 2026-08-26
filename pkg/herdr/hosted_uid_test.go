@@ -632,6 +632,70 @@ func TestTerminateHostedPaneTree_NeverSignalsSelf(t *testing.T) {
 	}
 }
 
+func TestReapHostedPaneSnapshotTerminatesCapturedOrphanMCPChild(t *testing.T) {
+	defer func(old func(int, syscall.Signal) error) { signalExact = old }(signalExact)
+	defer func(old func()) { sleepBrief = old }(sleepBrief)
+	defer func(old func() int) { osGetpid = old }(osGetpid)
+	defer func(old func(int) (string, error)) { readStartTok = old }(readStartTok)
+	defer func(old func(int) bool) { processExists = old }(processExists)
+
+	osGetpid = func() int { return 999 }
+	sleepBrief = func() {}
+	processExists = func(int) bool { return true }
+	readStartTok = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
+	var signals []struct {
+		pid int
+		sig syscall.Signal
+	}
+	signalExact = func(pid int, sig syscall.Signal) error {
+		signals = append(signals, struct {
+			pid int
+			sig syscall.Signal
+		}{pid, sig})
+		return nil
+	}
+	snapshot := &HostedPaneIdentity{PaneID: "w4:p1", Tree: []HostedProcessIdentity{
+		{PID: 501, StartToken: "tok-501", Role: "agent"},
+		{PID: 777, ParentPID: 501, StartToken: "tok-777", Role: "descendant"}, // affine-mcp
+	}}
+	if err := ReapHostedPaneSnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []int{501, 777} {
+		term, kill := false, false
+		for _, got := range signals {
+			if got.pid == pid && got.sig == syscall.SIGTERM {
+				term = true
+			}
+			if got.pid == pid && got.sig == syscall.SIGKILL {
+				kill = true
+			}
+		}
+		if !term || !kill {
+			t.Fatalf("pid %d missing TERM/KILL in %v", pid, signals)
+		}
+	}
+}
+
+func TestReapHostedPaneSnapshotRefusesReusedPID(t *testing.T) {
+	defer func(old func(int, syscall.Signal) error) { signalExact = old }(signalExact)
+	defer func(old func()) { sleepBrief = old }(sleepBrief)
+	defer func(old func() int) { osGetpid = old }(osGetpid)
+	defer func(old func(int) (string, error)) { readStartTok = old }(readStartTok)
+	defer func(old func(int) bool) { processExists = old }(processExists)
+
+	osGetpid = func() int { return 999 }
+	sleepBrief = func() {}
+	processExists = func(int) bool { return true }
+	readStartTok = func(int) (string, error) { return "reused-token", nil }
+	signals := 0
+	signalExact = func(int, syscall.Signal) error { signals++; return nil }
+	err := ReapHostedPaneSnapshot(&HostedPaneIdentity{PaneID: "w4:p1", Tree: []HostedProcessIdentity{{PID: 777, StartToken: "captured-token"}}})
+	if err == nil || !errors.Is(err, ErrHostedUIDPIDReuse) || signals != 0 {
+		t.Fatalf("err=%v signals=%d", err, signals)
+	}
+}
+
 func TestFailHostedIsolationProofWithLifecycle_TombsOnRollbackFailure(t *testing.T) {
 	// Residual of HIGH #2: rollback failure must still Invalidate (tombstone)
 	// before dropToolChild — never sticky provisional without tombstone.
