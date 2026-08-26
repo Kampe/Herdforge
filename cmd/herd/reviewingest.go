@@ -918,7 +918,7 @@ func runHarvestMerge() {
 		}
 		*candidate = rangeSpec.SHA
 	}
-	report, err := resolveHarvestCandidateWithReconstructionAt(repoRoot, *branch, *candidate, *reconstructedFrom, *contentProof)
+	report, err := resolveHarvestCandidateWithReconstructionAt(repoRoot, *branch, *candidate, *reconstructedFrom, *contentProof, *allowUnrecorded)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
 		os.Exit(1)
@@ -1157,7 +1157,23 @@ func resolveHarvestCandidateWithReconstruction(branch, requested, reconstructedS
 	return resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, reconstructedSHA, contentProof)
 }
 
-func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, reconstructedSHA, contentProof string) (harvestCandidateReport, error) {
+// resolveHarvestCandidateWithReconstructionAt resolves the exact candidate and
+// decides its eligibility.
+//
+// FAC-671: this decides eligibility BEFORE harvestMergeVerdict runs, and rejects
+// on report.Eligible, so FAC-670's acceptance -- threaded only into the later
+// gate -- was unreachable for the class it was written for. Reported by the
+// orchestrator on the same SHA FAC-670 was verified against: the run exited at
+// "exact reviewed candidate is not eligible" without ever reaching the flag.
+//
+// I fixed one of TWO Eligible call sites and verified the one I had changed.
+// That is the second time in this sequence I confirmed a fix on the path I was
+// looking at rather than the path that runs.
+//
+// allowUnrecorded is variadic so every existing caller keeps the strict default
+// and only the explicit operator path opts in.
+func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, reconstructedSHA, contentProof string, allowUnrecorded ...bool) (harvestCandidateReport, error) {
+	accept := len(allowUnrecorded) > 0 && allowUnrecorded[0]
 	var err error
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
@@ -1194,7 +1210,13 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		report.Retired = true
 		return report, nil
 	}
-	queued, err := ledger.Queued()
+	// FAC-671: the queue lookup runs BEFORE the eligibility gates, so the
+	// acceptance has to reach it or the candidate is never even a candidate.
+	queueOf := ledger.Queued
+	if accept {
+		queueOf = ledger.QueuedAllowingUnrecordedProvenance
+	}
+	queued, err := queueOf()
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("read harvest queue: %w", err)
 	}
@@ -1269,7 +1291,11 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 	if !found {
 		return report, nil
 	}
-	eligible, err := ledger.Eligible(sha, "")
+	gate := ledger.Eligible
+	if accept {
+		gate = ledger.EligibleAllowingUnrecordedProvenance
+	}
+	eligible, err := gate(sha, "")
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("review ledger refuses %s: %w", shortSHA12(sha), err)
 	}
