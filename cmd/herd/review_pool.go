@@ -1092,7 +1092,7 @@ func builderFamilyFromReceipts(root, sha string) string {
 		}
 		// Reachability, not equality: the commit need not be the branch tip, it
 		// only has to have been produced on that branch.
-		if err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", sha, branch).Run(); err == nil {
+		if commitIsAncestor(root, sha, branch) {
 			return family
 		}
 	}

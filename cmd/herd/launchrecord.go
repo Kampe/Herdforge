@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -82,14 +81,22 @@ func runLaunchRecord() error {
 	return nil
 }
 
+// gitBranchOf is the detached-aware form of the canonical currentBranch().
+//
+// FAC-669: this re-implemented `rev-parse --abbrev-ref HEAD`, which FAC-556 had
+// already extracted precisely so "the branch here" could not mean two different
+// things. The duplicate-rule gate caught it. It now delegates, and keeps only
+// the one behaviour it genuinely adds: a detached HEAD answers the literal
+// string "HEAD", which is not a branch, and recording that as one is the shape
+// that produced review artifacts naming a branch that did not contain their own
+// SHA.
 func gitBranchOf(dir string) string {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	b, err := currentBranch(dir)
 	if err != nil {
 		return ""
 	}
-	b := strings.TrimSpace(string(out))
+	b = strings.TrimSpace(b)
 	if b == "HEAD" {
-		// Detached: no branch to join commits through.
 		return ""
 	}
 	return b

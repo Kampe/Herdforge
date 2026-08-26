@@ -25,7 +25,7 @@ func DefaultPath(root string) string {
 	// FAC-641: an explicit override wins, so a lane running from its OWN worktree
 	// can still read the authoritative ledger without changing directory.
 	//
-	// The coordinator lives in /Users/kampe/Personal/chainseer-orchestrator, whose
+	// The coordinator lives in its own orchestrator worktree, whose
 	// .herd/review-ledger.jsonl is a 0-byte file, while the shared checkout holds
 	// 1968 rows. Resolving purely from cwd made every readiness query answer from
 	// the wrong file and report 71 reviewed heads as unreviewed. Coordinator
