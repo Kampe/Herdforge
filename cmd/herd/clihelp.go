@@ -229,6 +229,11 @@ Commands:
   full rebuild; if parity still fails the run exits non-zero (BLOCKED) and the
   emitted plan broadens to the full profile instead of narrowing.`,
 	"harvest": "Usage: herd harvest [--quiet] [--json]\n  Fleet-wide worktree harvest sweep.",
+	"review-host": "Usage: herd review-host [--host <h>] [--fence <reason>] [--recover --evidence <what>] [--json]\n" +
+		"  Circuit breaker for a remote review host. One control-plane timeout fences it;\n" +
+		"  only an explicit --recover with evidence clears it. Exits 3 while fenced.\n" +
+		"  The fence never expires on a timer: a host that fell over under fleet pressure\n" +
+		"  looks healthy the moment the pressure stops.",
 	"capacity": "Usage: herd capacity [--json] [--review-limit N] [--reviewer-mib N] [--floor-mib N]\n" +
 		"  Reports whether THIS host can accept another review launch, from its live\n" +
 		"  census (herdr server, agent list, memory) rather than configured slots.\n" +
