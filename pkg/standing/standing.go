@@ -520,8 +520,18 @@ func indexAgents(agents []Agent, workspace, repoRoot string) map[string][]Agent 
 // LiveAgentName resolves a lane to the agent name that ACTUALLY EXISTS in the
 // fleet: the repository-qualified name when an agent holds it, otherwise the
 // legacy unqualified name when a pre-qualification agent is still running.
-// Falls back to the qualified name when neither is live, so callers minting a
-// new identity keep current naming.
+// Returns live=false when neither is live: the name is still the qualified form
+// so a caller MINTING a new identity keeps current naming, but a caller that
+// TARGETS an agent must not send to it.
+//
+// FAC-597: the bool did not exist, and every caller of this function targets
+// rather than mints. With an empty census both haveQualified and haveLegacy are
+// false, the !haveLegacy branch fires, and the result is a synthesized
+// forge-<lane>-<digest> name that nothing answers to -- the exact "qualified
+// name no agent holds" this function was written to prevent. It does not fail
+// loudly: pulse addresses its review handoff to the phantom, and drain embeds
+// it in the review packet as the address the reviewer must return its verdict
+// to, so a scarce review slot is spent on a reviewer told to report to nobody.
 //
 // FAC-547: every caller that TARGETS a live agent must resolve this way.
 // Targeting AgentNameForRepository directly broke pulse's review handoff: with
@@ -530,7 +540,7 @@ func indexAgents(agents []Agent, workspace, repoRoot string) map[string][]Agent 
 // supervisor predated qualification — so five open_review actions in a row
 // failed against a nonexistent name and dispatch stayed review-saturated.
 // Only sites that MINT a new identity should use the raw qualified name.
-func LiveAgentName(agents []Agent, laneName, repository string) string {
+func LiveAgentName(agents []Agent, laneName, repository string) (string, bool) {
 	qualified := AgentNameForRepository(laneName, repository)
 	legacy := AgentName(laneName)
 	haveQualified, haveLegacy := false, false
@@ -542,10 +552,13 @@ func LiveAgentName(agents []Agent, laneName, repository string) string {
 			haveLegacy = true
 		}
 	}
-	if haveQualified || !haveLegacy {
-		return qualified
+	if haveQualified {
+		return qualified, true
 	}
-	return legacy
+	if haveLegacy {
+		return legacy, true
+	}
+	return qualified, false
 }
 
 // standingAgent resolves a lane to its live agent. Within one workspace two
