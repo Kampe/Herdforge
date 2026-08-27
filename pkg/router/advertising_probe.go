@@ -60,7 +60,7 @@ func advertisingProviderProbe(provider, model string) (bool, string) {
 // timeout <= 0 falls back to the launch-path budget (45s).
 func runProviderProbe(provider, model string, timeout time.Duration) (bool, string) {
 	if timeout <= 0 {
-		timeout = 45 * time.Second
+		timeout = providerProbeBudget
 	}
 	command, args, stdin, err := providerProbeCommand(provider, model)
 	if err != nil {
@@ -68,11 +68,22 @@ func runProviderProbe(provider, model string, timeout time.Duration) (bool, stri
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	started := time.Now()
 	stdout, stderr, runErr, timedOut := execProviderProbe(ctx, command, args, stdin)
+	elapsed := time.Since(started)
 	combined := stdout + "\n" + stderr
 	ok, reason := classifyProviderProbeOutput(stdout, combined, runErr, timedOut)
-	if timedOut && reason == "provider probe timeout" && timeout <= AdvertisingProbeTimeout {
-		return false, "provider_probe_deadline"
+	if timedOut && reason == probeTimeoutMarker {
+		// CHA-2451's read paths keep their terse machine marker; they already
+		// skip the live probe and only need a deadline token.
+		if timeout <= AdvertisingProbeTimeout {
+			return false, "provider_probe_deadline"
+		}
+		// FAC-596: the admission path surfaces this string to an operator as
+		// the routing reason, so it must say WHAT it waited on, HOW LONG, and
+		// that the answer is unknown rather than a refusal.
+		return false, fmt.Sprintf("provider probe %s: %s/%s did not answer within %s (waited %s)",
+			ProbeUnknownPrefix, provider, model, timeout.Round(time.Second), elapsed.Round(time.Second))
 	}
 	return ok, reason
 }
