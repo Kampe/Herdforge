@@ -4350,7 +4350,7 @@ func runSend() {
 		fmt.Fprintf(os.Stderr, "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n")
 		os.Exit(2)
 	}
-	target := resolveSendTarget(pos[0])
+	target := pos[0]
 
 	var text string
 	switch {
@@ -4373,13 +4373,9 @@ func runSend() {
 		os.Exit(1)
 	}
 
-	var status string
-	var err error
-	if strings.TrimSpace(*workspace) != "" {
-		status, err = herdr.SendInWorkspace(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second, strings.TrimSpace(*workspace))
-	} else {
-		status, err = herdr.Send(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
-	}
+	// FAC-617: resolve standing roles then Send through one seam so tests can
+	// drive the operator path without os.Exit.
+	resolved, status, err := sendWithResolvedTarget(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second, strings.TrimSpace(*workspace))
 	if err != nil {
 		if status == "queued" || status == "deferred" {
 			fmt.Fprintf(os.Stderr, "herd send: -> %s: %v\n", status, err)
@@ -4389,15 +4385,15 @@ func runSend() {
 		os.Exit(1)
 	}
 	if lane := strings.TrimSpace(os.Getenv("HERD_LANE")); lane != "" {
-		if err := feedback.RecordReply(context.Background(), feedback.DefaultMailDir("."), lane, target, text); err != nil {
+		if err := feedback.RecordReply(context.Background(), feedback.DefaultMailDir("."), lane, resolved, text); err != nil {
 			fmt.Fprintf(os.Stderr, "herd send: record feedback reply: %v\n", err)
 			os.Exit(1)
 		}
 	}
 	if strings.TrimSpace(*workspace) != "" {
-		fmt.Println(herdr.FormatSendResultInWorkspace(target, *workspace, status))
+		fmt.Println(herdr.FormatSendResultInWorkspace(resolved, *workspace, status))
 	} else {
-		fmt.Println(herdr.FormatSendResult(target, status))
+		fmt.Println(herdr.FormatSendResult(resolved, status))
 	}
 }
 

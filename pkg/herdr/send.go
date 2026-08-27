@@ -128,36 +128,24 @@ func requireAgentInWorkspace(target, expected string) (AgentEntry, error) {
 		return AgentEntry{}, err
 	}
 
-	// A bare lane label has two plausible live names: the label itself and
-	// Herdforge's canonical forge-<label> standing name. Resolve both before
-	// applying workspace filtering. Otherwise an exact registration in one
-	// repository can hide a forge-derived registration in another repository,
-	// making a successful prompt look like proof of correct delivery.
+	// Exact name or pane id first.
 	exactMatches := make([]AgentEntry, 0, 1)
-	derivedMatches := make([]AgentEntry, 0, 1)
 	for _, agent := range agents {
 		if agent.Name == target || agent.PaneID == target {
 			exactMatches = append(exactMatches, agent)
 		}
 	}
-	if !strings.Contains(target, ":") && !strings.HasPrefix(target, "forge-") {
-		derived := "forge-" + target
-		for _, agent := range agents {
-			if agent.Name == derived {
-				derivedMatches = append(derivedMatches, agent)
-			}
-		}
-	}
-	if len(exactMatches) == 1 && len(derivedMatches) > 0 {
-		return AgentEntry{}, fmt.Errorf("agent '%s' is ambiguous: exact live agent %q and forge-derived live agent %q; specify the registered name explicitly", target, exactMatches[0].Name, derivedMatches[0].Name)
-	}
-	if len(exactMatches) == 0 && len(derivedMatches) > 1 {
-		return AgentEntry{}, fmt.Errorf("agent '%s' is ambiguous: forge-derived name matches %d live agents; specify the registered name explicitly", target, len(derivedMatches))
-	}
-
 	matches := exactMatches
 	if len(matches) == 0 {
-		matches = derivedMatches
+		// FAC-617: standing lane roles resolve through standing.LiveAgentName /
+		// AgentNameForRepository — never the naive "forge-"+label concatenation,
+		// which misses truncated digest names (review-harvest-supervisor →
+		// forge-review-harvest-su-<digest>) and duplicates a rule that drifts.
+		derived, derr := ResolveStandingLaneMatches(target, agents, "")
+		if derr != nil {
+			return AgentEntry{}, derr
+		}
+		matches = derived
 	}
 	if len(matches) == 0 {
 		return AgentEntry{}, noAgentFoundError(target, agents, expected)

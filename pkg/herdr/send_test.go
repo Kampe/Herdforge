@@ -236,16 +236,17 @@ func TestSendRejectsCrossWorkspaceDuplicateName(t *testing.T) {
 	}
 }
 
-func TestSendRejectsAmbiguousBareLabelAcrossForgeDerivation(t *testing.T) {
+func TestSendRejectsAmbiguousStandingDigestForms(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	prev := runHerdr
 	t.Cleanup(func() { runHerdr = prev })
 	prompted := false
+	// Two truncated digest forms for the same long standing lane — refuse.
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 			return `{"result":{"agents":[
-				{"name":"scout-planner","pane_id":"pane-chainseer","workspace_id":"wC","agent_status":"idle"},
-				{"name":"forge-scout-planner","pane_id":"pane-herdforge","workspace_id":"wK","agent_status":"idle"}
+				{"name":"forge-review-harvest-su-aaaaaaaa","pane_id":"pane-a","workspace_id":"wK","agent_status":"idle"},
+				{"name":"forge-review-harvest-su-bbbbbbbb","pane_id":"pane-b","workspace_id":"wK","agent_status":"idle"}
 			]}}`, nil
 		}
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
@@ -254,10 +255,12 @@ func TestSendRejectsAmbiguousBareLabelAcrossForgeDerivation(t *testing.T) {
 		return "{}", nil
 	}
 
-	if _, err := Send("scout-planner", "do not misdeliver", false, time.Second); err == nil {
-		t.Fatal("bare label with exact and forge-derived live agents must be rejected")
-	} else if !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "forge-scout-planner") {
-		t.Fatalf("error = %v; want an explicit ambiguous forge-derived candidate error", err)
+	if _, err := Send("review-harvest-supervisor", "do not guess", false, time.Second); err == nil {
+		t.Fatal("ambiguous standing digest forms must be rejected")
+	} else if !strings.Contains(err.Error(), "ambiguous") ||
+		!strings.Contains(err.Error(), "forge-review-harvest-su-aaaaaaaa") ||
+		!strings.Contains(err.Error(), "forge-review-harvest-su-bbbbbbbb") {
+		t.Fatalf("error = %v; want ambiguous refusal naming both candidates", err)
 	}
 	if prompted {
 		t.Fatal("ambiguous target must be rejected before prompt")
