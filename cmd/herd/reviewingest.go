@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/committime"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/mail"
@@ -37,6 +38,20 @@ func runReviewIngest() {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve repository root: %v\n", err)
 		os.Exit(1)
 	}
+	// FAC-625: the receipt log must be read from the worktree-INVARIANT project
+	// root, never from the process cwd. Ingest run from a lane worktree has its
+	// own (empty) .herd/launch-receipts.jsonl, so a cwd-relative read found no
+	// receipt reaching the candidate and recorded provenance_unrecorded on a
+	// candidate whose provenance existed all along -- at the project root, one
+	// hop away. HERD_ROOT names the lane, not the project, so it must not be
+	// trusted here; gitroot.ProjectRoot is the one function in the tree that
+	// answers this without depending on which worktree asked.
+	projectRoot, _, err := gitroot.ProjectRoot(context.Background(), repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve project root: %v\n", err)
+		os.Exit(1)
+	}
+	receiptPath := launch.ReceiptPathFor(projectRoot)
 	parsed, err := parseReviewIngestArgs(os.Args[2:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
@@ -151,8 +166,9 @@ func runReviewIngest() {
 		// text alone is not evidence: branches are reused, relaunched and
 		// rebased, and a confidently wrong family is worse than none because
 		// independence is computed against it.
-		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA,
-			commitCreationTime(a.SHA), branchReachesSHA); err != nil {
+		proven, err := reviewingest.ReconcileBuilderFamilyForSHA(&a, receiptPath, a.SHA,
+			commitCreationTime(a.SHA), branchReachesSHA)
+		if err != nil {
 			emit.refused(f, err)
 			refused++
 			continue
@@ -171,11 +187,20 @@ func runReviewIngest() {
 		// commit and no ledger record proving it is DOWNGRADED to unrecorded, so
 		// it cannot be used to compute reviewer/builder independence. Before the
 		// gate assignment below, which is what routes it to provenance-unrecorded.
-		if err := reviewingest.RequireCorroboratedFamily(&a, a.SHA, reviewledger.FamilyUnrecorded,
-			ledger.ProvenBuilderFamily, artifactIsCandidAboutFamily); err != nil {
-			emit.refused(f, err)
-			refused++
-			continue
+		//
+		// FAC-625: skipped when the reconciliation above already PROVED the
+		// family from a receipt reaching this exact SHA. The ledger record this
+		// gate would check for is created BY INGESTING A VERDICT FOR THIS SHA, so
+		// running it unconditionally downgraded every first review of every
+		// candidate -- including ones this card had already proven -- to
+		// unrecorded.
+		if !proven {
+			if err := reviewingest.RequireCorroboratedFamily(&a, a.SHA, reviewledger.FamilyUnrecorded,
+				ledger.ProvenBuilderFamily, artifactIsCandidAboutFamily); err != nil {
+				emit.refused(f, err)
+				refused++
+				continue
+			}
 		}
 		artifactName := reviewingest.RetainedArtifactName(a.SHA, a.Reviewer, body)
 		gate := "independent"

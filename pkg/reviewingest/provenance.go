@@ -72,27 +72,35 @@ type reaches func(branch, sha string) bool
 // are the pre-FAC-620 state and stay admissible; the ingest gate routes them to
 // provenance-unrecorded. Only an UNHEDGED assertion with nothing behind it is
 // refused, because that is the one shape that looks like proof and is not.
-func ReconcileBuilderFamilyForSHA(a *Artifact, receiptPath, sha string, commitTime time.Time, reachable reaches) error {
+// The returned bool reports whether the family is now PROVENANCE-BACKED by a
+// receipt reaching this exact SHA. FAC-625: RequireCorroboratedFamily used to
+// run unconditionally after this join, re-checking against the ledger a family
+// that was already proven from a launch receipt. The ledger record that would
+// corroborate a SHA is created BY INGESTING A VERDICT FOR THAT SHA, so every
+// first review of every candidate was downgraded to unrecorded regardless of
+// how solid its receipt-based proof was. Callers must skip the corroboration
+// gate when this returns true.
+func ReconcileBuilderFamilyForSHA(a *Artifact, receiptPath, sha string, commitTime time.Time, reachable reaches) (bool, error) {
 	if a == nil || strings.TrimSpace(sha) == "" || reachable == nil {
-		return nil
+		return false, nil
 	}
 	recorded, ok := launch.BuilderFamilyReachingSHA(receiptPath, sha, commitTime, func(branch string) bool {
 		return reachable(branch, sha)
 	})
 	if !ok {
-		return nil
+		return false, nil
 	}
 	stated := strings.TrimSpace(a.BuilderFamily)
 	if stated == "" {
 		a.BuilderFamily = recorded
-		return nil
+		return true, nil
 	}
 	if !strings.EqualFold(stated, recorded) {
-		return fmt.Errorf("builder-family %q contradicts launch provenance %q recorded for a branch reaching %s; "+
+		return false, fmt.Errorf("builder-family %q contradicts launch provenance %q recorded for a branch reaching %s; "+
 			"one of them is wrong about who wrote this code and admitting either would launder the disagreement",
 			stated, recorded, shortSHA(sha))
 	}
-	return nil
+	return true, nil
 }
 
 // RequireCorroboratedFamily stops an unproven builder-family being TRUSTED.
