@@ -46,7 +46,10 @@ func TestDrainJSONBoundsHangingScan(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "drain", "--json")
+	// FAC-603: default drain is index-bounded and would finish instantly with
+	// an empty ready set. The hanging-scan contract is on the explicit repair
+	// full scan that still walks worktrees via git.
+	cmd := exec.CommandContext(ctx, binary, "drain", "--repair", "--json")
 	cmd.Dir = repo
 	out, err := cmd.CombinedOutput()
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -87,7 +90,8 @@ func TestDrainCLI_ExitContracts(t *testing.T) {
 	if len(packet) == 0 || packet["kaneo_ok"] == nil {
 		t.Fatalf("missing fixed packet keys: %s", stdout.String())
 	}
-	for _, phase := range []string{"phase=harvest-scan", "phase=review-scan"} {
+	// FAC-603: default drain uses exact-ready index, not full harvest-scan.
+	for _, phase := range []string{"phase=exact-ready-index", "phase=review-scan"} {
 		if !strings.Contains(stderr.String(), phase) {
 			t.Fatalf("stderr missing %q: %s", phase, stderr.String())
 		}
@@ -197,7 +201,7 @@ func TestDrainCLI_ProgressUsesStderrAndQuietSuppressesIt(t *testing.T) {
 			if strings.Contains(stdout, "phase=") {
 				t.Fatalf("phase progress leaked to stdout: %s", stdout)
 			}
-			for _, phase := range []string{"phase=harvest-scan", "phase=review-scan"} {
+			for _, phase := range []string{"phase=exact-ready-index", "phase=review-scan"} {
 				if !strings.Contains(stderr, phase) {
 					t.Fatalf("stderr missing %q: %s", phase, stderr)
 				}

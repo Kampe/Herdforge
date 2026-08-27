@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/drainreceipt"
 )
@@ -72,7 +74,6 @@ func TestDrainCommandWritesDurableReceipt(t *testing.T) {
 func TestDrainCommandResumesFromPriorTimeoutCursor(t *testing.T) {
 	root := initDrainRepo(t)
 	if err := drainreceipt.MarkTimeout(root, "review-scan", "abc123deadbeef", 12, 100); err != nil {
-		// MarkTimeout without Begin still writes a timeout receipt.
 		t.Fatal(err)
 	}
 	oldWD, err := os.Getwd()
@@ -98,5 +99,50 @@ func TestDrainCommandResumesFromPriorTimeoutCursor(t *testing.T) {
 	}
 	if r.Status == drainreceipt.StatusRunning {
 		t.Fatal("second drain must terminate the receipt")
+	}
+}
+
+// FAC-605 residual: an abandoned running receipt (process died mid-loop) with a
+// hot-loop cursor must resume — the incident shape, not a graceful timeout.
+func TestDrainCommandResumesFromAbandonedRunningCursor(t *testing.T) {
+	root := initDrainRepo(t)
+	if _, err := drainreceipt.Begin(root, "30s", "harvest-scan"); err != nil {
+		t.Fatal(err)
+	}
+	if err := drainreceipt.Progress(root, "review-scan", "killed-mid-loop-sha", 40, 1742, 0); err != nil {
+		t.Fatal(err)
+	}
+	r, err := drainreceipt.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != drainreceipt.StatusRunning || r.ResumeCursor != "killed-mid-loop-sha" {
+		t.Fatalf("precondition: running with cursor, got status=%q cursor=%q", r.Status, r.ResumeCursor)
+	}
+	r.UpdatedAt = time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	body, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(drainreceipt.Path(root), append(body, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+
+	t.Setenv("HERD_DRAIN_TIMEOUT", "1ns")
+	t.Setenv("HERD_DRAIN_REVIEW_TIMEOUT", "1ns")
+
+	var out, errOut bytes.Buffer
+	_ = runDrainCommand([]string{"--json", "--quiet"}, &out, &errOut)
+	if !bytes.Contains(errOut.Bytes(), []byte("resume_cursor=killed-mid-loop-sha")) {
+		t.Fatalf("abandoned running must resume; stderr=%s", errOut.String())
 	}
 }

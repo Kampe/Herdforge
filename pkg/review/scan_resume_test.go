@@ -22,7 +22,7 @@ func TestScanResumesAfterCursor(t *testing.T) {
 		RepoRoot:    t.TempDir(),
 		LedgerPath:  t.TempDir() + "/ledger.jsonl",
 		ResumeAfter: "sha-b",
-		Progress: func(done, total int, branch string) {
+		Progress: func(done, total int, branch, sha string) {
 			seen = append(seen, branch)
 		},
 	}

@@ -91,22 +91,62 @@ func Load(repoRoot string) (*Receipt, error) {
 	return &r, nil
 }
 
-// PriorResumeCursor returns the resume cursor from a prior timeout receipt.
-// ok is false when there is no receipt, the prior run completed, or the cursor
-// is empty. Call BEFORE Begin: Begin overwrites the prior receipt.
+// DefaultAbandonedAge is how old a still-running receipt must be before it is
+// treated as an abandoned process (FAC-605). Presence is not liveness: a
+// receipt frozen at status=running after SIGKILL/OOM must not be read as a
+// live drain, and must not collapse into "never ran".
+const DefaultAbandonedAge = 3 * time.Minute
+
+// PriorResumeCursor returns a usable resume cursor from a prior drain.
+// Accepts an explicit timeout receipt, or a running receipt whose UpdatedAt is
+// older than the bound (or DefaultAbandonedAge) — that is an abandoned run,
+// not a live one. ok is false when there is no receipt, the prior run
+// completed, the cursor is empty, or a running receipt is still fresh.
+// Call BEFORE Begin: Begin overwrites the prior receipt.
 func PriorResumeCursor(repoRoot string) (cursor string, ok bool) {
 	r, err := Load(repoRoot)
 	if err != nil || r == nil {
-		return "", false
-	}
-	if r.Status != StatusTimeout {
 		return "", false
 	}
 	c := strings.TrimSpace(r.ResumeCursor)
 	if c == "" {
 		return "", false
 	}
-	return c, true
+	switch r.Status {
+	case StatusTimeout:
+		return c, true
+	case StatusRunning:
+		if Abandoned(r, time.Now().UTC()) {
+			return c, true
+		}
+		return "", false
+	default:
+		return "", false
+	}
+}
+
+// Abandoned reports whether a running receipt is too old to be a live drain.
+// An unfinished record and a missing record are different facts.
+func Abandoned(r *Receipt, now time.Time) bool {
+	if r == nil || r.Status != StatusRunning {
+		return false
+	}
+	updated, err := time.Parse(time.RFC3339Nano, r.UpdatedAt)
+	if err != nil {
+		updated, err = time.Parse(time.RFC3339, r.UpdatedAt)
+		if err != nil {
+			return true // unparseable mtime: fail closed as abandoned
+		}
+	}
+	limit := DefaultAbandonedAge
+	if b := strings.TrimSpace(r.Bound); b != "" {
+		if d, err := time.ParseDuration(b); err == nil && d > 0 {
+			// Bound plus a small grace: a live drain should refresh UpdatedAt
+			// inside the hot loop well before the wall bound expires.
+			limit = d + time.Minute
+		}
+	}
+	return now.Sub(updated) > limit
 }
 
 // MarkTimeout records an explicit timeout with resume cursor. Never leave

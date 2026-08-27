@@ -43,8 +43,9 @@ type PinFreshness struct {
 // review remains usable in offline fixtures and cannot silently guess a board.
 type Drain struct {
 	// Progress, when set, is called before each tip is probed so a caller can
-	// measure real per-item cost instead of guessing a budget.
-	Progress func(done, total int, branch string)
+	// measure real per-item cost and (FAC-605) persist a resume cursor while
+	// the scan is still live. sha is the tip about to be probed.
+	Progress func(done, total int, branch, sha string)
 
 	// ResumeAfter, when set, is the last tip SHA fully processed by a prior
 	// bounded drain (FAC-605). Scan continues AFTER this SHA rather than
@@ -301,7 +302,7 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 			if label == "" {
 				label = "sha:" + shortSHA(sha)
 			}
-			d.Progress(i, len(tips), label)
+			d.Progress(i, len(tips), label, sha)
 		}
 		// FAC-562: bound the WHOLE per-tip iteration, not just the content-merge
 		// probe. The reported 1m49s items were spent in freshness (behind count
