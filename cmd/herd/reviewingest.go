@@ -178,14 +178,35 @@ func runReviewIngest() {
 		// ledger with standing/* and wt/* names board-done can never close. Both
 		// rows still share one identity; that identity is now card-ref or empty,
 		// and empty is refused below by name rather than recorded as a branch.
-		taskIdentity := ingestTaskIdentityFor(a.TaskRef, a.Branch)
+		// Validate the RAW value, before collapse.
+		//
+		// Review finding on 827601fadb70: ingestTaskIdentityFor collapses an
+		// invalid standing/* or wt/* ref to "" via CloseableCardRef, so
+		// RequireCloseableCardRef received an already-empty string and always
+		// took its "task is empty" branch. The message that NAMES the offending
+		// value was unreachable from the shipped path -- which is the entire
+		// operator diagnostic this change exists to provide.
+		//
+		// The existing bad-value tests call RequireCloseableCardRef directly
+		// with the raw ref, so they passed while the shipped path could not
+		// produce that message. They were vacuous for the behaviour under test:
+		// a test that exercises the validator instead of the path is testing
+		// that the validator works, which was never in doubt.
 		if a.Verdict != "RETIRED" {
-			if err := reviewledger.RequireCloseableCardRef(taskIdentity, "artifact "+filepath.Base(f)+" task"); err != nil {
+			// Validate the RAW header, not the normalized one. TaskRef is ""
+			// for any non-card value, so passing it here reports "empty" and
+			// loses the offending ref -- the defect this gate exists to avoid.
+			rawTask := a.RawTaskRef
+			if rawTask == "" {
+				rawTask = a.TaskRef
+			}
+			if err := reviewledger.RequireCloseableCardRef(rawTask, "artifact "+filepath.Base(f)+" task"); err != nil {
 				emit.refused(f, err)
 				refused++
 				continue
 			}
 		}
+		taskIdentity := ingestTaskIdentityFor(a.TaskRef, a.Branch)
 		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,

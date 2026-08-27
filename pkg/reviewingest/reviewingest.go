@@ -33,7 +33,11 @@ type Artifact struct {
 	// TaskRef is the board card this verdict belongs to. Without it a ledger
 	// row carries only sha+verdict, so no verdict can be tied back to a card
 	// and a corrupted board cannot be rebuilt from review history (FAC-578).
-	TaskRef        string
+	TaskRef string
+	// RawTaskRef is the task header exactly as written, before normalization.
+	// TaskRef is "" for any non-card value, so without this the offending value
+	// cannot be named in a refusal.
+	RawTaskRef     string
 	Reviewer       string
 	Authority      string
 	ReviewerFamily string
@@ -138,6 +142,13 @@ func Parse(text string) Artifact {
 			case "branch":
 				a.Branch = value
 			case "task", "task-id", "card", "ticket":
+				// Keep the RAW value. NormalizeTaskRef returns "" for anything
+				// that is not card-shaped, so a standing/* or wt/* task is
+				// destroyed here -- one layer above the ingest gate that is
+				// supposed to report it. The refusal then says "task is empty"
+				// and the operator never learns WHICH ref was wrong, which is
+				// the whole diagnostic FAC-578 exists to provide.
+				a.RawTaskRef = strings.TrimSpace(value)
 				a.TaskRef = NormalizeTaskRef(value)
 			case "reviewer":
 				a.Reviewer = value
