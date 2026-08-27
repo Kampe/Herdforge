@@ -45,13 +45,22 @@ func newStandingTestRouter(t *testing.T, q quotaMode, l liveMode) *SurfaceRouter
 	} else {
 		computed["codex"] = usage.BurnState{Available: true, Reason: "ok"}
 	}
-	r := testRouter(computed, "codex")
+	// FAC-615: a HEALTHY ALTERNATE must exist, or a fallthrough test cannot
+	// distinguish "did not fall through" from "fell through and found nothing".
+	// The live incident had exactly this shape: codex unable to take work while
+	// grok 4.6 was healthy and direct herdr launch used it successfully.
+	computed["grok"] = usage.BurnState{Available: true, Reason: "ok"}
+	r := testRouter(computed, "codex", "grok")
 
 	prev := r.Probes
 	r.Probes = &Probes{
 		CLIPresent: prev.CLIPresent,
 		Now:        prev.Now,
 		LiveCount: func(provider, model, pool string) (int, error) {
+			// Only the PREFERRED provider is constrained; the alternate is free.
+			if !strings.EqualFold(provider, "codex") {
+				return 0, nil
+			}
 			switch l {
 			case liveUnknown:
 				return 0, errors.New("herdr census unreadable")
