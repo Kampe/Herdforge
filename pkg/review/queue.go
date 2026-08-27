@@ -1,6 +1,7 @@
 package review
 
 import (
+	"github.com/Kampe/Herdforge/pkg/refname"
 	"sort"
 	"strings"
 )
@@ -47,11 +48,11 @@ func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) [
 
 func normalizeQueueLane(branch string) string {
 	branch = strings.TrimSpace(branch)
-	if i := strings.Index(branch, "#standing/"); i >= 0 {
-		return branch[i+len("#standing/"):]
+	if marker := "#" + refname.StandingBranchPrefix; strings.Contains(branch, marker) {
+		return branch[strings.Index(branch, marker)+len(marker):]
 	}
-	if strings.HasPrefix(branch, "standing/") {
-		return strings.TrimPrefix(branch, "standing/")
+	if strings.HasPrefix(branch, refname.StandingBranchPrefix) {
+		return strings.TrimPrefix(branch, refname.StandingBranchPrefix)
 	}
 	return branch
 }

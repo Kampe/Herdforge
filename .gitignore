@@ -129,3 +129,15 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl
 .herd/review-ledger.jsonl.*
 .herd/harvest-queue.jsonl.*
+
+# FAC-711: review packets are RUNTIME artifacts. A packet records the exact
+# worktree a reviewer was pinned to, so its contents legitimately contain an
+# absolute path on this host -- and left untracked-and-unignored they failed the
+# preflight boundary check inside `herd selftest`, exactly as the scout-planner
+# guard receipts did in chainseer (CHA-3176).
+#
+# Ignoring PRESERVES them: they stay on disk as evidence and stay out of the
+# repository. Same reasoning as .herd/coverage/ and .herd/bootstrap/ above.
+.herd/review-packets/
+.herd/review/
+.herd/pool/

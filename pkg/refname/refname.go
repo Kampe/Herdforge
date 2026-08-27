@@ -18,6 +18,21 @@ import (
 )
 
 // unsafeChars are everything git-unfriendly for a single ref segment.
+// StandingBranchPrefix is the branch namespace a standing lane's HOME lives in.
+//
+// FAC-711: this literal was written in cmd/herd/worktreereap.go and
+// pkg/review/queue.go, and one of those uses is protective -- isResidentHome
+// refuses to reap a standing lane's home, and a reaper that stops recognising
+// this prefix classifies that home as a removable task worktree. FAC-672 caught
+// exactly that in a dry run, with the coordinator's own home listed for removal.
+// A convention rename landing on only one copy is how that becomes a live loss.
+//
+// NOT to be confused with kick.StandingNamePrefix ("standing-"), which is an
+// AGENT NAME prefix. Similar spelling, different namespace: one names a git
+// branch, the other names a live pane. Conflating them would make a reaper
+// protect the wrong thing.
+const StandingBranchPrefix = "standing/"
+
 var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
 // mainToken matches the trunk name in any case. A publication guard that greps

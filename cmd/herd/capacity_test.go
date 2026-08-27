@@ -194,9 +194,19 @@ func TestBlockedReviewersAreNamedWhenTheyHoldTheCap(t *testing.T) {
 // every host that has not adopted the wrapper, trading a bounded risk for a
 // certain outage -- while the memory, swap and derived-slot gates already bound
 // the aggregate. Visible, not fatal.
+// FAC-711: this file used a literal user-home path, which made the test file
+// itself an absolute-path leak and failed the preflight boundary check inside
+// `herd selftest`. The path is only an IDENTIFIER for the harness -- any
+// absolute path exercises the logic -- so it now uses a root carrying no leak
+// marker.
+//
+// Worth recording twice over: the first rewrite of this comment still said the
+// marker out loud and tripped the same gate again. A test that violates the
+// invariant it helps enforce is worse than no test, because it makes the gate
+// look broken rather than the code.
 func TestUncappedHarnessWarnsWithoutRefusing(t *testing.T) {
 	o := healthy()
-	o.HarnessPath, o.HarnessCapped = "/home/kampe/.local/bin/claude", false
+	o.HarnessPath, o.HarnessCapped = "/opt/harness/bin/claude", false
 	c := decideCapacity(o, 5, 4096, 6144)
 	if !c.Admit {
 		t.Fatalf("an uncapped harness fenced the host: %s", c.Reason)
@@ -208,7 +218,7 @@ func TestUncappedHarnessWarnsWithoutRefusing(t *testing.T) {
 
 func TestCappedHarnessAddsNoWarning(t *testing.T) {
 	o := healthy()
-	o.HarnessPath, o.HarnessCapped = "/home/kampe/.local/bin/claude", true
+	o.HarnessPath, o.HarnessCapped = "/opt/harness/bin/claude", true
 	if c := decideCapacity(o, 5, 4096, 6144); strings.Contains(c.Reason, "NOT memory-capped") {
 		t.Fatalf("a capped harness still warned: %s", c.Reason)
 	}
