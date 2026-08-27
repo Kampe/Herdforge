@@ -1,10 +1,7 @@
 package router
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -18,23 +15,13 @@ var providerProbeFailures = []string{
 	"usage limit",
 }
 
-// defaultProviderProbe performs one bounded request. A successful process is
-// not enough: the exact sentinel must be returned and known auth/quota errors
-// are unavailable even when a CLI exits zero after printing the error.
+// defaultProviderProbe performs one bounded request for launch/admission.
+// Read paths (resolve-lane, herd route) use advertisingProviderProbe instead
+// (CHA-2451). A successful process is not enough: the exact sentinel must be
+// returned and known auth/quota errors are unavailable even when a CLI exits
+// zero after printing the error.
 func defaultProviderProbe(provider, model string) (bool, string) {
-	command, args, stdin, err := providerProbeCommand(provider, model)
-	if err != nil {
-		return false, err.Error()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.Stdin = strings.NewReader(stdin)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, runErr := cmd.Output()
-	combined := string(out) + "\n" + stderr.String()
-	return classifyProviderProbeOutput(string(out), combined, runErr, ctx.Err() == context.DeadlineExceeded)
+	return runProviderProbe(provider, model, 45*time.Second)
 }
 
 func classifyProviderProbeOutput(output, combined string, runErr error, timedOut bool) (bool, string) {

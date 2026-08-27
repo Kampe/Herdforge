@@ -7332,6 +7332,11 @@ func runProcess() {
 
 // liveScorer backs lane resolution with the real herd-route port over live
 // openusage quota — the same decision core the zsh fleet uses.
+//
+// CHA-2451: install read-path probes that skip live generation (CLI + quota
+// only). A stuck defaultProviderProbe (45s, e.g. codex spark) previously made
+// resolve-lane emit zero stdout until an outer audit timeout. Quota honesty is
+// unchanged; spend is never invented. Launch/admission keeps the 45s probe.
 func liveScorer() resolve.RouteScorer {
 	e := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
@@ -7341,6 +7346,7 @@ func liveScorer() resolve.RouteScorer {
 		fmt.Fprintf(os.Stderr, "resolve-lane: WARN live quota unavailable (%v); routing on availability only\n", err)
 	}
 	sr := router.NewRouter(e, computed)
+	router.InstallReadPathProbes(sr)
 	return &resolve.DefaultAdapter{
 		ScoreFn: func(shape string, preferProvider string) *resolve.RouteScore {
 			rt, err := sr.Pick(shape, preferProvider, "")
@@ -7418,6 +7424,9 @@ func runRoute() {
 		computed = e.ComputeAll(snap)
 	}
 	sr := router.NewRouter(e, computed)
+	// CHA-2451: same advertising probe budget as resolve-lane. Launch Decide
+	// keeps defaultProbes via its own NewRouter path.
+	router.InstallReadPathProbes(sr)
 	sr.Probes.LiveCount = liveRouteCount
 
 	rt, err := sr.Pick(shape, *provider, *excludeFamily)
