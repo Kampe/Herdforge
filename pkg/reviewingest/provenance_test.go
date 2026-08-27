@@ -1,6 +1,7 @@
 package reviewingest
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,13 @@ func receiptFile(t *testing.T, lines ...string) string {
 // The reviewed commit was written at 20:00. Every receipt below is placed
 // relative to it deliberately.
 var commitAt = time.Date(2026, 8, 27, 20, 0, 0, 0, time.UTC)
+
+// noLedger: the ledger can prove nothing. notCandid: the artifact made a bare
+// claim. Together they are the strictest setting, so any test using them that
+// does NOT expect a refusal is asserting the receipt join carried the decision.
+func noLedger(string) (string, error) { return "", nil }
+func notCandid(string) bool          { return false }
+func isCandid(string) bool           { return true }
 
 const claudeRow = `{"created_at":"2026-08-27T19:00:00Z","task_ref":"defi-crusader","lane":"defi-crusader","provider":"claude","model":"claude-sonnet-5","builder_family":"anthropic","branch":"wt/defi-crusader","accepted":true}`
 
@@ -71,17 +79,18 @@ func TestAMatchingFamilyIsAccepted(t *testing.T) {
 	}
 }
 
-// No recorded provenance must NOT refuse. Absence of a receipt is the
-// pre-FAC-620 state, not evidence of a different builder -- refusing on it
-// would reject every historical artifact.
-func TestNoRecordedProvenanceLeavesTheArtifactAlone(t *testing.T) {
+// No recorded provenance must NOT be treated as a CONTRADICTION. Absence of a
+// receipt is the pre-FAC-620 state, not evidence of a different builder.
+// A candid artifact passes through untouched.
+func TestNoRecordedProvenanceLeavesACandidArtifactAlone(t *testing.T) {
 	path := receiptFile(t, `{"branch":"wt/other","provider":"grok","builder_family":"xai","accepted":true}`)
-	a := &Artifact{BuilderFamily: "openai"}
+	a := &Artifact{BuilderFamily: "unknown"}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatalf("absence of a receipt was treated as a conflict: %v", err)
 	}
-	if a.BuilderFamily != "openai" {
+	if a.BuilderFamily != "unknown" {
 		t.Fatalf("artifact was mutated with no provenance to justify it: %q", a.BuilderFamily)
 	}
 }
@@ -109,7 +118,9 @@ func TestAReceiptWhoseBranchDoesNotReachTheSHAIsIgnored(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "openai"}
 
-	// The branch exists in the receipt but does NOT contain this commit.
+	// The branch exists in the receipt but does NOT contain this commit. The
+	// ledger independently proves openai, so the only question under test is
+	// whether the unreachable receipt overwrites it.
 	err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(branch, sha string) bool { return false })
 
@@ -200,5 +211,77 @@ func TestAnUndatedReceiptIsNotProvenance(t *testing.T) {
 	}
 	if a.BuilderFamily != "" {
 		t.Fatalf("family %q resolved from an undated receipt", a.BuilderFamily)
+	}
+}
+
+// THE fourth-review regression. Every rejection path in the join lands on "no
+// qualifying receipt", and that used to leave the artifact ALONE -- so each
+// time the join got stricter, MORE reviewer-asserted families went unchecked.
+// Tightening the guard widened the hole it existed to close.
+//
+// A bare assertion with no receipt and no ledger record must be refused.
+func TestABareAssertedFamilyWithNoCorroborationIsDowngraded(t *testing.T) {
+	a := &Artifact{BuilderFamily: "openai"} // asserted, nothing behind it
+
+	if err := RequireCorroboratedFamily(a, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "unrecorded", noLedger, notCandid); err != nil {
+		t.Fatalf("an uncorroborated family was REFUSED rather than downgraded: %v.\n"+
+			"Refusing halts every first review: the ledger record that could corroborate a SHA "+
+			"is created by ingesting a verdict for that SHA.", err)
+	}
+	if a.BuilderFamily != "unrecorded" {
+		t.Fatalf("builder_family = %q, want unrecorded. An unproven assertion stayed TRUSTED, so "+
+			"independence would be computed against a family nothing proves -- the hole FAC-620 exists to close.",
+			a.BuilderFamily)
+	}
+}
+
+// The escape hatch must stay open: a reviewer who candidly says "unknown" is
+// being honest, and the ingest gate routes that to provenance-unrecorded.
+// Refusing it would punish honesty and reward assertion -- the FAC-608 defect.
+func TestACandidUnrecordedFamilyIsStillAdmitted(t *testing.T) {
+	a := &Artifact{BuilderFamily: "unknown"}
+
+	if err := RequireCorroboratedFamily(a, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "unrecorded", noLedger, isCandid); err != nil {
+		t.Fatalf("a candid unrecorded family was refused: %v", err)
+	}
+	if a.BuilderFamily != "unknown" {
+		t.Fatalf("a candid family was rewritten to %q; the honest case must pass through untouched", a.BuilderFamily)
+	}
+}
+
+// A ledger record for the EXACT SHA is corroboration, and admits the claim.
+func TestALedgerProvenFamilyCorroboratesTheAssertion(t *testing.T) {
+	a := &Artifact{BuilderFamily: "openai"}
+
+	if err := RequireCorroboratedFamily(a, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "unrecorded",
+		func(string) (string, error) { return "openai", nil }, notCandid); err != nil {
+		t.Fatalf("a ledger-proven family was refused: %v", err)
+	}
+	if a.BuilderFamily != "openai" {
+		t.Fatalf("a ledger-PROVEN family was downgraded to %q; corroboration must preserve it", a.BuilderFamily)
+	}
+}
+
+// And a claim the ledger CONTRADICTS is refused, not quietly overwritten.
+func TestALedgerContradictingTheAssertionRefuses(t *testing.T) {
+	a := &Artifact{BuilderFamily: "openai"}
+
+	err := RequireCorroboratedFamily(a, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "unrecorded",
+		func(string) (string, error) { return "anthropic", nil }, notCandid)
+	if err == nil || !strings.Contains(err.Error(), "contradicts ledger-recorded") {
+		t.Fatalf("a family contradicting the ledger was not refused: %v", err)
+	}
+}
+
+// An unreadable ledger is not proof of absence. It must refuse rather than
+// admit -- reporting "nothing proves this" when the check itself failed is the
+// absence-as-definitive-negative defect this whole card is made of.
+func TestAnUnreadableLedgerRefusesRatherThanAdmitting(t *testing.T) {
+	a := &Artifact{BuilderFamily: "openai"}
+
+	err := RequireCorroboratedFamily(a, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "unrecorded",
+		func(string) (string, error) { return "", errors.New("ledger unreadable") }, notCandid)
+	if err == nil || !strings.Contains(err.Error(), "could not be checked") {
+		t.Fatalf("an unreadable ledger was treated as proof of absence: %v", err)
 	}
 }
