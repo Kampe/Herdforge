@@ -85,7 +85,7 @@ func runCapacity(args []string) error {
 	perReviewer := fs.Int64("reviewer-mib", envInt64("HERD_REVIEWER_RSS_MIB", 4096), "expected TOTAL cost of one reviewer including the toolchain it spawns, in MiB")
 	floor := fs.Int64("floor-mib", envInt64("HERD_MEM_FLOOR_MIB", 6144), "memory that must remain free AFTER the new reviewer, for sshd/herdr and the host OS")
 	claim := fs.Bool("claim", false, "hold an admission lease across the caller's launch, so concurrent callers cannot all pass the same check")
-	holdFor := fs.Duration("claim-ttl", 180*time.Second, "how long a claimed admission stays held before it expires")
+	holdFor := fs.Duration("claim-ttl", defaultAdmissionLeaseTTL, "how long a claimed admission stays held before it expires")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -186,8 +186,8 @@ type CapacityObservation struct {
 // remote launcher can gate on without scraping prose. available_slots is the
 // live remainder after the census, not the configured pool size.
 type Capacity struct {
-	SchemaVersion  int    `json:"schema_version"`
-	ObservedAt     string `json:"observed_at"`
+	SchemaVersion int    `json:"schema_version"`
+	ObservedAt    string `json:"observed_at"`
 	CapacityObservation
 	ReviewLimit    int    `json:"review_limit"`
 	LimitDerived   bool   `json:"review_limit_derived"`
@@ -574,7 +574,7 @@ var poolCapacityObserve = observeCapacity
 func acquirePoolCapacityOrRefuse() (release func(), err error) {
 	perReviewer := envInt64("HERD_REVIEWER_RSS_MIB", 4096)
 	floor := envInt64("HERD_MEM_FLOOR_MIB", 6144)
-	ttl := 180 * time.Second
+	ttl := defaultAdmissionLeaseTTL
 	if v := strings.TrimSpace(os.Getenv("HERD_ADMISSION_LEASE_TTL")); v != "" {
 		if d, parseErr := time.ParseDuration(v); parseErr == nil && d > 0 {
 			ttl = d
@@ -623,32 +623,66 @@ func admissionLeasePath() string {
 // killed mid-flight would otherwise fence the host permanently, which converts
 // a crash into an outage -- the same trade this codebase keeps getting wrong in
 // the other direction.
+// defaultAdmissionLeaseTTL must exceed the work it guards, or the guard
+// expires mid-launch and a second launcher is admitted while the first is still
+// preparing.
+//
+// FAC-713: this was 180s. Route resolution alone was MEASURED at 29-272s before
+// FAC-679 cached the quota read, so the lease could expire during the very
+// operation it exists to serialize -- and it did, which is how the reviewer
+// reproduced a third concurrent launcher. A TTL shorter than its critical
+// section is not a short lease, it is no lease.
+//
+// 600s is deliberately generous. The cost of a too-long TTL is a delayed
+// retry after a crash; the cost of a too-short one is concurrent launches on a
+// host that just fell over from concurrent launches.
+const defaultAdmissionLeaseTTL = 600 * time.Second
+
 func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error) {
 	path := admissionLeasePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, false, err
 	}
-	try := func() (bool, error) {
+
+	// FAC-713: an OWNERSHIP TOKEN, not just a file.
+	//
+	// Review finding on 1d99c2ef6c4f, reproduced: release() removed the lease
+	// file unconditionally. If holder A's lease expired and B reclaimed it, A's
+	// deferred release deleted B's lease and a third launcher C could take it --
+	// three concurrent launchers from a gate whose entire purpose is to admit
+	// one. That is worse than no lease, because the gate reports success while
+	// serializing nothing.
+	//
+	// The token is what makes release safe: a holder may only delete the lease
+	// it still owns.
+	token := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+
+	write := func() (bool, error) {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			fmt.Fprintf(f, "pid=%d taken=%s ttl=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339), ttl)
-			return true, f.Close()
+			_, werr := fmt.Fprintf(f, "token=%s pid=%d taken=%s ttl=%s\n",
+				token, os.Getpid(), time.Now().UTC().Format(time.RFC3339), ttl)
+			if cerr := f.Close(); werr == nil {
+				werr = cerr
+			}
+			return werr == nil, werr
 		}
 		if !os.IsExist(err) {
 			return false, err
 		}
 		return false, nil
 	}
-	ok, err := try()
+
+	ok, err := write()
 	if err != nil {
 		return nil, false, err
 	}
 	if !ok {
-		// Expired lease: reclaim it. Age is read from the file, not remembered,
-		// so a lease survives the process that took it.
+		// Expired lease: reclaim. Age is read from the file, not remembered, so
+		// a lease outlives the process that took it.
 		if fi, statErr := os.Stat(path); statErr == nil && time.Since(fi.ModTime()) > ttl {
 			_ = os.Remove(path)
-			if ok, err = try(); err != nil {
+			if ok, err = write(); err != nil {
 				return nil, false, err
 			}
 		}
@@ -656,7 +690,26 @@ func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error
 	if !ok {
 		return nil, false, nil
 	}
-	return func() { _ = os.Remove(path) }, true, nil
+
+	return func() { releaseAdmissionLease(path, token) }, true, nil
+}
+
+// releaseAdmissionLease removes the lease ONLY if this holder still owns it.
+//
+// A holder whose lease already expired and was reclaimed by someone else must
+// not delete the new owner's lease on its way out. Silence is correct here:
+// losing the lease is a normal outcome of running past TTL, and the launch it
+// guarded has already happened either way.
+func releaseAdmissionLease(path, token string) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if !strings.Contains(string(raw), "token="+token+" ") {
+		// Someone else owns it now. Deleting it would admit a third launcher.
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // hostProcessLoad counts processes and threads, and reads the fd ceiling.
