@@ -45,3 +45,19 @@ mv -f "$tmp" "$root/bin/herd"
 rm -f "$link"
 ln -s "bin/herd" "$link"
 mv -f "$link" "$root/herd"
+
+# FAC-717: bin/herdforge is a SYMLINK, never a second executable.
+#
+# docs/operations/second-host-wsl.md tells operators to run `./bin/herdforge
+# preflight`, and nothing in this build ever produced that file. A copy left
+# over from an earlier build sat there for SIX DAYS reporting a stale revision,
+# and a lane pulsing it read working=1 capacity=14 against a live fleet of
+# working=9 capacity=6. Every census in that lane's reports came from code six
+# days behind the tree, and the provenance line said UNKNOWN rather than saying
+# the readings could not be trusted.
+#
+# A second executable can drift. A symlink cannot: it resolves to whatever
+# bin/herd currently is, so the documented entrypoint and the built one are the
+# same file by construction rather than by remembering to rebuild both.
+rm -f "$root/bin/herdforge"
+ln -s "herd" "$root/bin/herdforge"
