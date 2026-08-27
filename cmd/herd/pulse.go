@@ -370,9 +370,18 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		}
 		explain, explainErr := herdr.ExplainAgent(explainTarget)
 		agent := pulse.AgentObservation{
-			Name:              a.Name,
-			Raw:               a.Status,
-			Status:            pulse.ClassifyStatus(a.Status, false),
+			Name: a.Name,
+			Raw:  a.Status,
+			// FAC-614: pane-AWARE classification. readPulseHerdr already pays
+			// for the pane read above; classifying without it is what made a
+			// paused goal indistinguishable from work in progress. An
+			// independent review FAILed the first version of this change for
+			// exactly this -- the policy existed and the beat never used it.
+			Status: pulse.ClassifyStatusWithPane(a.Status, false, paneBody),
+			// FAC-614: the harness's own transition counter. Resume escalation
+			// measures PROGRESS against this, not elapsed time -- a lane can be
+			// legitimately slow without being stuck.
+			StateSeq:          int64(a.StateChangeSeq),
 			PaneID:            a.PaneID,
 			PaneState:         a.Status,
 			ForegroundProcess: processName,

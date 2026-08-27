@@ -86,6 +86,11 @@ var actionKindOrder = map[ActionKind]int{
 
 // Options configure one beat.
 type Options struct {
+	// StateDir is where beat-durable bookkeeping lives. FAC-614: resume
+	// throttling has to survive between beats, or every beat is the first beat
+	// and the cadence bound never binds. Empty falls back to the repo-relative
+	// default, and HERD_RESUME_STATE overrides both.
+	StateDir string
 	// Act enables bounded mutations (lease renew, callback consume, reconcile).
 	Act bool
 	// Spawn enables dispatch planning when Act is also true. Spawn alone is invalid.
@@ -157,6 +162,11 @@ type AgentObservation struct {
 	ContextWarning    string      `json:"context_warning,omitempty"`
 	// Stale is set when the source marks the lane past its progress bound.
 	Stale bool `json:"stale,omitempty"`
+	// StateSeq is the harness's own monotonic state-change counter for this
+	// lane. FAC-614: resume escalation measures PROGRESS against this rather
+	// than elapsed time -- a lane can be legitimately slow without being stuck,
+	// and only the harness knows whether anything actually changed.
+	StateSeq int64 `json:"state_seq,omitempty"`
 	// FAC-221: reap evidence. Filled by the caller from worktree, board,
 	// review, and safe-ref sources. Plan uses these to decide reap vs keep.
 	// TabID identifies the lane for the reap close target.
@@ -734,6 +744,71 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	// beat plans open_review for finished lanes so the coordinator cannot miss
 	// them. A lane that is already out for review (SafeRef set) or whose ticket
 	// is done (work landed) is reaped instead — see the reap block below.
+	// FAC-614: wake a lane whose goal loop stopped, BEFORE the reap pass. A
+	// paused lane is not idle and must never be reaped for being stuck -- it is
+	// resident, has work, and needs a verb rather than a close.
+	//
+	// The first version of this change built the classifier, the policy and the
+	// actor and wired NONE of them into the beat. An independent review FAILed
+	// it: "the policy helpers are real; the shipped beat does not use them."
+	// This is that wiring.
+	resumeState := LoadResumeState(ResumeStatePath(opts.StateDir))
+	resumeDirty := false
+	for _, a := range agents {
+		if a.Name == "" || a.Status != StatusPaused {
+			continue
+		}
+		d := DecideResume(resumeState.Lanes[a.Name], a.Name, a.StateSeq, now)
+		switch {
+		case d.Escalate:
+			actions = append(actions, Action{
+				Kind:     ActionWouldRun,
+				Target:   a.Name,
+				WouldRun: "escalate_paused " + a.Name,
+				Reason:   "paused lane NOT resumed: " + d.Reason,
+				Safe:     false,
+			})
+		case d.Resume:
+			act := Action{
+				Kind:   ActionResumeGoal,
+				Target: a.Name,
+				Reason: d.Reason,
+				Safe:   true,
+			}
+			if !opts.Act {
+				act.Kind = ActionWouldRun
+				act.WouldRun = "resume_goal " + a.Name
+				act.Reason = "would resume paused goal (--act): " + d.Reason
+				act.Safe = false
+			} else {
+				resumeState = RecordResume(resumeState, a.Name, a.StateSeq, now)
+				resumeDirty = true
+			}
+			actions = append(actions, act)
+		default:
+			actions = append(actions, Action{
+				Kind:     ActionWouldRun,
+				Target:   a.Name,
+				WouldRun: "resume_goal " + a.Name,
+				Reason:   "paused lane throttled: " + d.Reason,
+				Safe:     false,
+			})
+		}
+	}
+	// A lane that is no longer paused forgets its history, so a lane pausing
+	// once a day is never treated as stuck.
+	for _, a := range agents {
+		if a.Name != "" && a.Status != StatusPaused {
+			if _, tracked := resumeState.Lanes[a.Name]; tracked {
+				resumeState = ClearResume(resumeState, a.Name)
+				resumeDirty = true
+			}
+		}
+	}
+	if resumeDirty {
+		_ = SaveResumeState(ResumeStatePath(opts.StateDir), resumeState)
+	}
+
 	for _, a := range agents {
 		if a.Name == "" {
 			continue
@@ -1162,6 +1237,17 @@ func Apply(ctx context.Context, snap Snapshot, actor Actor) (Snapshot, error) {
 				err = fmt.Errorf("%w: %s", ErrDispatchBlocked, out.DispatchBlockReason)
 			} else {
 				err = actor.Dispatch(ctx, a.Target, a.Reason)
+			}
+		case ActionResumeGoal:
+			// FAC-614: the third half. Classifying a lane paused and planning a
+			// resume changes nothing if Apply never executes it -- an
+			// independent review FAILed the first version precisely because
+			// "Apply never calls ResumeGoal".
+			lane, ok := laneByTarget[a.Target]
+			if !ok {
+				err = fmt.Errorf("resume target %q not in observation", a.Target)
+			} else {
+				err = actor.ResumeGoal(ctx, lane)
 			}
 		case ActionReapLane:
 			lane, ok := laneByTarget[a.Target]
