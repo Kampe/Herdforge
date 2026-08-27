@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/reviewack"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
 )
 
 const reapTestSHA = "0123456789abcdef0123456789abcdef01234567"
@@ -27,6 +29,22 @@ func reapAgent(status string, focused bool) herdr.AgentEntry {
 		Name: "review-fac-585-01234567", Status: status, Focused: &focused,
 		TabID: "w4:t1", PaneID: "w4:p1", Workspace: "w4", TerminalID: "term-1",
 		Cwd: "/candidate", Session: herdr.AgentSession{Value: "session-1"}, Revision: 7, StateChangeSeq: 9,
+	}
+}
+
+
+func emitReapAck(t *testing.T, root, artifactPath string) {
+	t.Helper()
+	body, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := reviewingest.Parse(string(body))
+	if err := reviewack.Emit(root, reviewack.Ack{
+		SHA: a.SHA, Reviewer: a.Reviewer, ArtifactDigest: reviewack.ArtifactDigest(body),
+		LaunchIdentity: a.Reviewer,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -80,7 +98,9 @@ func TestReapTransportedReviewerKeepsFocusedAndWorkingTabs(t *testing.T) {
 }
 
 func TestReapTransportedReviewerIsIdempotentAfterExactClose(t *testing.T) {
-	artifact := reapArtifact(t, t.TempDir())
+	root := t.TempDir()
+	artifact := reapArtifact(t, root)
+	emitReapAck(t, root, artifact)
 	live := true
 	closed := 0
 	installReapSeams(t, func() ([]herdr.AgentEntry, error) {
@@ -94,26 +114,42 @@ func TestReapTransportedReviewerIsIdempotentAfterExactClose(t *testing.T) {
 		return nil
 	}, reapTestSHA)
 
-	first, err := reapTransportedReviewer(t.TempDir(), artifact, false)
+	first, err := reapTransportedReviewer(root, artifact, false)
 	if err != nil || first.Disposition != "reaped" {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
-	second, err := reapTransportedReviewer(t.TempDir(), artifact, false)
+	second, err := reapTransportedReviewer(root, artifact, false)
 	if err != nil || second.Disposition != "already_absent" || closed != 1 {
 		t.Fatalf("second=%+v err=%v closes=%d", second, err, closed)
 	}
 }
 
 func TestReapTransportedReviewerDryRunReportsWithoutClosing(t *testing.T) {
-	artifact := reapArtifact(t, t.TempDir())
+	root := t.TempDir()
+	artifact := reapArtifact(t, root)
+	emitReapAck(t, root, artifact)
 	closed := false
 	installReapSeams(t, func() ([]herdr.AgentEntry, error) { return []herdr.AgentEntry{reapAgent("idle", false)}, nil }, func(herdr.AgentEntry) error {
 		closed = true
 		return nil
 	}, reapTestSHA)
 
-	r, err := reapTransportedReviewer(t.TempDir(), artifact, true)
+	r, err := reapTransportedReviewer(root, artifact, true)
 	if err != nil || r.Disposition != "would_reap" || closed {
+		t.Fatalf("receipt=%+v err=%v closed=%v", r, err, closed)
+	}
+}
+
+func TestReapTransportedReviewerRetainsWithoutIngestAck(t *testing.T) {
+	root := t.TempDir()
+	artifact := reapArtifact(t, root)
+	closed := false
+	installReapSeams(t, func() ([]herdr.AgentEntry, error) { return []herdr.AgentEntry{reapAgent("idle", false)}, nil }, func(herdr.AgentEntry) error {
+		closed = true
+		return nil
+	}, reapTestSHA)
+	r, err := reapTransportedReviewer(root, artifact, false)
+	if err != nil || r.Disposition != "retained" || !strings.Contains(r.Reason, "ingest_ack") || closed {
 		t.Fatalf("receipt=%+v err=%v closed=%v", r, err, closed)
 	}
 }

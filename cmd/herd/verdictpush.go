@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 )
 
@@ -358,15 +359,22 @@ func reapTransportedReviewerFromCensus(root, artifactPath string, dryRun bool, a
 		r.Disposition, r.Reason = "blocked", fmt.Sprintf("candidate HEAD mismatch: got=%q want=%q error=%v", strings.TrimSpace(head), r.SHA, err)
 		return r, errors.New(r.Reason)
 	}
+	// FAC-586: require durable canonical-ingest acknowledgment before retiring
+	// the resident. Transport (remote verdict ref) alone is not admission.
+	ack := reviewack.Consume(root, r.SHA, r.Reviewer, reviewack.ArtifactDigest(body), r.Reviewer)
+	if !ack.OK {
+		r.Disposition, r.Reason = "retained", ack.Layer+": "+ack.Reason
+		return r, nil
+	}
 	if dryRun {
-		r.Disposition, r.Reason = "would_reap", "remote verdict ref present and all resident identity gates passed"
+		r.Disposition, r.Reason = "would_reap", "ingest ack verified and all resident identity gates passed"
 		return r, nil
 	}
 	if err := transportedReviewerClose(agent); err != nil {
 		r.Disposition, r.Reason = "blocked", "exact tab/process-tree cleanup: "+err.Error()
 		return r, err
 	}
-	r.Disposition, r.Reason = "reaped", "remote verdict ref present; exact settled reviewer and captured process tree retired"
+	r.Disposition, r.Reason = "reaped", "ingest ack verified; exact settled reviewer and captured process tree retired"
 	return r, nil
 }
 

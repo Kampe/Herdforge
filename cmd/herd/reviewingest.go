@@ -15,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
+	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/reviewroot"
@@ -312,6 +313,15 @@ func runReviewIngest() {
 			o.Disposition, o.Enqueued = dispositionAdmitted, boolPtr(enqueued)
 			emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
 				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
+			// FAC-586: durable ack that canonical ingest admitted this artifact.
+			// Remote-ref transport and ledger admission are distinct; review hosts
+			// must not retire residents on transport alone.
+			if ackErr := reviewack.Emit(reviewRoot.RepoRoot, reviewack.Ack{
+				SHA: a.SHA, Reviewer: a.Reviewer, ArtifactDigest: reviewack.ArtifactDigest(body),
+				LaunchIdentity: a.Reviewer,
+			}); ackErr != nil {
+				fmt.Fprintf(os.Stderr, "review-ingest: ADMITTED %s but ingest ack emit failed: %v\n", a.SHA[:12], ackErr)
+			}
 			postReviewCompleteCallback(a.SHA, a.Branch, a.Reviewer, a.Verdict)
 			reclaimReviewPoolSlotFor(a.SHA)
 		}
