@@ -515,12 +515,36 @@ func applyDegradedAuthority(r Result, degraded map[string]string) Result {
 	if r.Counts == nil {
 		r.Counts = map[AttentionLevel]int{}
 	}
+	// FAC-701: matching the degraded ROSTER name against item names by exact
+	// equality duplicated every degraded lane. The report holds the LIVE name
+	// (forge-api-crusader-2918de97b5); degraded is keyed by the roster name
+	// (forge-api-crusader). So each lane appeared twice -- once critical and
+	// "unknown", once with its real status -- and a 14-agent fleet reported 21
+	// lanes.
+	//
+	// This is the FAC-660 family in code I wrote one commit earlier, which is
+	// the whole reason it is worth a comment: the roster and the fleet do not
+	// spell a lane the same way, and any NEW map keyed on one and looked up by
+	// the other reintroduces it. Resolve through the lane matcher, as every
+	// other lookup in this package now does.
 	seen := map[string]int{}
 	for i, it := range r.Items {
 		seen[it.Name] = i
 	}
+	locate := func(rosterName string) (int, bool) {
+		if i, ok := seen[rosterName]; ok {
+			return i, true
+		}
+		lanes := []string{rosterName}
+		for i, it := range r.Items {
+			if kick.LaneForAgent(it.Name, lanes) != "" {
+				return i, true
+			}
+		}
+		return 0, false
+	}
 	for name, reason := range degraded {
-		if i, ok := seen[name]; ok {
+		if i, ok := locate(name); ok {
 			if r.Items[i].Level != LevelCritical {
 				r.Counts[r.Items[i].Level]--
 				r.Counts[LevelCritical]++

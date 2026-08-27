@@ -527,3 +527,40 @@ func TestNoDegradedLanesLeavesTheResultUntouched(t *testing.T) {
 		t.Fatalf("a clean scan was modified: %+v", got)
 	}
 }
+
+// FAC-701: `degraded` is keyed by the ROSTER name while the report holds the
+// LIVE name, so exact-equality matching duplicated every degraded lane -- once
+// critical and "unknown", once with its real status. A 14-agent fleet reported
+// 21 lanes. This is the FAC-660 family reappearing in code written one commit
+// earlier, which is exactly why it needs a test rather than care.
+func TestDegradedLaneAnnotatesTheLiveRowRatherThanDuplicatingIt(t *testing.T) {
+	base := Result{
+		Items:   []Item{{Name: "forge-api-crusader-2918de97b5", Status: "done", Level: LevelHigh}},
+		Counts:  map[AttentionLevel]int{LevelHigh: 1},
+		Total:   1,
+		Needing: 1,
+	}
+	got := applyDegradedAuthority(base, map[string]string{
+		"forge-api-crusader": "hold authority unavailable: ambiguous binding",
+	})
+
+	if got.Total != 1 || len(got.Items) != 1 {
+		t.Fatalf("degraded roster entry duplicated its live lane: total=%d items=%d", got.Total, len(got.Items))
+	}
+	if got.Items[0].Name != "forge-api-crusader-2918de97b5" {
+		t.Fatalf("live identity was replaced by the roster name: %+v", got.Items[0])
+	}
+	if got.Items[0].Level != LevelCritical {
+		t.Fatalf("live row was not raised to critical: %+v", got.Items[0])
+	}
+}
+
+func TestDegradedLaneWithNoLiveRowIsStillAdded(t *testing.T) {
+	// The dedup must not swallow a lane that genuinely has no live row, or a
+	// broken binding on an absent lane disappears entirely.
+	base := Result{Items: []Item{{Name: "forge-other-2918de97b5", Level: LevelNone}}, Counts: map[AttentionLevel]int{LevelNone: 1}, Total: 1}
+	got := applyDegradedAuthority(base, map[string]string{"forge-recovery-sentinel": "hold authority unavailable: boom"})
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("a degraded lane with no live row was dropped: total=%d items=%d", got.Total, len(got.Items))
+	}
+}
