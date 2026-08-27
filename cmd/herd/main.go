@@ -395,6 +395,9 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "utilization":
+		runUtilizationCommand(os.Args[2:])
+
 	case "capacity":
 		if err := runCapacity(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "herd capacity: %v\n", err)
@@ -11364,5 +11367,45 @@ func releaseScopeClaimQuietly(ref string) {
 		}
 		fmt.Printf("herd board-done: released %s scope claim in %s\n", ref, repository)
 		return
+	}
+}
+
+// runUtilizationCommand builds attention's triage once and projects the
+// utilization beat from it, so lane status and hold state have exactly one
+// source (FAC-706).
+func runUtilizationCommand(args []string) {
+	authority, err := newProductionHoldAuthority()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", err)
+		os.Exit(1)
+	}
+	repository, err := holdRepository()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", err)
+		os.Exit(1)
+	}
+	resolver, err := loadProductionActiveTaskResolver(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: active task authority: %v\n", err)
+		os.Exit(1)
+	}
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", err)
+		os.Exit(1)
+	}
+	registry, err := canonicalLaneRegistry(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", err)
+		os.Exit(1)
+	}
+	result, runErr := attention.RunWithHoldReaderAndTasks(authority, repository, resolver, registry)
+	if result == nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: triage unavailable: %v\n", runErr)
+		os.Exit(1)
+	}
+	if err := runUtilization(args, result); err != nil {
+		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", err)
+		os.Exit(1)
 	}
 }
