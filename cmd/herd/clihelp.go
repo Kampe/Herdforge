@@ -234,6 +234,11 @@ Commands:
 		"  only an explicit --recover with evidence clears it. Exits 3 while fenced.\n" +
 		"  The fence never expires on a timer: a host that fell over under fleet pressure\n" +
 		"  looks healthy the moment the pressure stops.",
+	"utilization": "Usage: herd utilization [--json]\n" +
+		"  Publish the per-lane utilization beat: lane, status, blocker, next wake.\n" +
+		"  Names the one condition that matters -- idle, unheld, with work available --\n" +
+		"  as a FAILED BEAT rather than folding it into a healthy-looking total.\n" +
+		"  Fleet health is never read from resident tab counts; presence is not activity.",
 	"capacity": "Usage: herd capacity [--json] [--review-limit N] [--reviewer-mib N] [--floor-mib N]\n" +
 		"  Reports whether THIS host can accept another review launch, from its live\n" +
 		"  census (herdr server, agent list, memory) rather than configured slots.\n" +
