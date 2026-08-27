@@ -149,6 +149,16 @@ func ValidateLaunch(
 			Reason: "full graph snapshot returned nil",
 		}
 	}
+	// Non-vacuity on the snapshot THIS gate actually used (scoped when available).
+	// Callers must not pay for a second whole-project SnapshotGraph just to run
+	// RejectEmptyProviderGraph; an unreachable provider must not read as an
+	// unblocked zero-edge card (FAC-464 / deps residual).
+	if err := RejectEmptyProviderGraph(snap); err != nil {
+		return nil, &BlockedError{
+			Ref: taskRef, Code: "stale",
+			Reason: err.Error() + "; relation snapshot contained no provider data",
+		}
+	}
 	// Post-selection TOCTOU: re-validate entire prerequisite closure under budget.
 	if selectionRevision != "" {
 		if ps, ok := store.(*ProviderStore); ok {

@@ -81,8 +81,9 @@ func TestProviderStore_ConcurrentSnapshotAndNewTask(t *testing.T) {
 
 // FAC-464: a provider snapshot containing no relations and the SHA-256
 // revision of an empty stream is not evidence that the dependency graph was
-// successfully read. The launch gate must fail closed instead of approving
-// every task against a vacuous graph.
+// successfully read. ValidateLaunch applies RejectEmptyProviderGraph to the
+// snapshot it used and must fail closed instead of approving every task
+// against a vacuous graph.
 func TestRejectEmptyProviderGraph(t *testing.T) {
 	if err := RejectEmptyProviderGraph(&GraphSnapshot{
 		ProviderRevision: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

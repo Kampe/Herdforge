@@ -124,29 +124,9 @@ func runDepsCheck() {
 		fmt.Fprintf(os.Stderr, "provenance extract: %v\n", xerr)
 		os.Exit(1)
 	}
-	// Exact-card vacuity check must NOT pay for a whole-project SnapshotGraph.
-	// RequireTaskLaunch already scopes via SnapshotGraphForTask; the pre-check
-	// here used to fan out ListProjectRelations and time out before launch.
-	// Keep RejectEmptyProviderGraph, but feed it the task-scoped snapshot.
-	var desiredEdges []deps.DependencyEdge
-	if desired != nil && desired.Present {
-		var derr error
-		desiredEdges, derr = desired.DesiredBlocks()
-		if derr != nil {
-			fmt.Fprintf(os.Stderr, "provenance: %v\n", derr)
-			os.Exit(1)
-		}
-	}
-	snap, serr := deps.ExactCardGraphSnapshot(context.Background(), store, deps.Ref(ref), deps.TaskID(task.ID), desiredEdges)
-	if serr != nil {
-		fmt.Fprintf(os.Stderr, "snapshot graph: %v\n", serr)
-		os.Exit(1)
-	}
-	if serr := deps.RejectEmptyProviderGraph(snap); serr != nil {
-		fmt.Fprintf(os.Stderr, "BLOCKED %s: %v; relation snapshot contained no provider data\n", ref, serr)
-		os.Exit(1)
-	}
-
+	// Vacuity lives inside ValidateLaunch on the scoped snapshot. Do not
+	// SnapshotGraph here: that was the whole-project read that timed out
+	// exact-card admission before RequireTaskLaunch could use SnapshotGraphForTask.
 	ep := deps.LaunchEntrypoint(*entry)
 	gr, err := deps.RequireTaskLaunch(context.Background(), store, ep, deps.Ref(ref), desired, "")
 	if err != nil {
@@ -200,6 +180,9 @@ func runDepsReconcile() {
 			os.Exit(1)
 		}
 	}
+	// Operator reconcile asks for project-wide cycle proof (RequireFullClosure
+	// + FullClosure). That is not the launch eligibility path: ValidateLaunch
+	// already scopes via SnapshotGraphForTask. Keep the bulk read here.
 	snap, lerr := store.SnapshotGraph(context.Background())
 	if lerr != nil {
 		fmt.Fprintf(os.Stderr, "snapshot graph: %v\n", lerr)
