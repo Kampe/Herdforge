@@ -311,3 +311,65 @@ func TestUnknownSwapTotalCannotTripTheBackstop(t *testing.T) {
 		t.Fatalf("unreadable swap total produced a refusal: %s", c.Reason)
 	}
 }
+
+// FAC-713, from the FAC-584 review finding on 1d99c2ef6c4f. Reproduced there in
+// a disposable clone; pinned here.
+//
+// release() removed the lease file unconditionally. If holder A's lease expired
+// and B reclaimed it, A's deferred release deleted B's lease and a third
+// launcher could take it -- THREE concurrent launchers from a gate whose whole
+// purpose is to admit one. Worse than no lease, because it reports success
+// while serializing nothing.
+func TestExpiredHolderReleaseDoesNotEvictTheNewOwner(t *testing.T) {
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", filepath.Join(t.TempDir(), "admission.lease"))
+
+	// A takes the lease with a TTL that expires immediately.
+	releaseA, heldA, err := holdAdmissionLease(time.Nanosecond)
+	if err != nil || !heldA {
+		t.Fatalf("A failed to take the lease: held=%v err=%v", heldA, err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	// B reclaims the expired lease. A is still live.
+	releaseB, heldB, err := holdAdmissionLease(time.Nanosecond)
+	if err != nil || !heldB {
+		t.Fatalf("B failed to reclaim an expired lease: held=%v err=%v", heldB, err)
+	}
+
+	// A finishes and releases. It must NOT remove B's lease.
+	releaseA()
+
+	// If A evicted B, a third launcher can now take the lease while B is live.
+	_, heldC, err := holdAdmissionLease(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if heldC {
+		t.Fatal("a third launcher was admitted: an expired holder's release evicted the live owner")
+	}
+	releaseB()
+}
+
+func TestReleaseByTheRealOwnerStillFreesTheLease(t *testing.T) {
+	// The ownership check must not make release a no-op, or the lease leaks and
+	// the gate becomes an outage for a full TTL.
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", filepath.Join(t.TempDir(), "admission.lease"))
+
+	release, held, err := holdAdmissionLease(time.Hour)
+	if err != nil || !held {
+		t.Fatalf("first claim failed: held=%v err=%v", held, err)
+	}
+	release()
+	if _, held2, err := holdAdmissionLease(time.Hour); err != nil || !held2 {
+		t.Fatalf("lease was not freed by its real owner: held=%v err=%v", held2, err)
+	}
+}
+
+func TestDefaultLeaseTTLExceedsMeasuredRouteResolution(t *testing.T) {
+	// Route resolution was measured at 29-272s. A TTL shorter than its critical
+	// section is not a short lease, it is no lease.
+	if defaultAdmissionLeaseTTL <= 272*time.Second {
+		t.Fatalf("default TTL %s does not exceed measured route resolution (272s); the lease can expire mid-launch",
+			defaultAdmissionLeaseTTL)
+	}
+}
