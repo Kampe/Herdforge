@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -135,6 +136,24 @@ func runReviewIngest() {
 			continue
 		}
 		a := reviewingest.Parse(string(body))
+		// FAC-620: reconcile the CLAIMED builder family against recorded launch
+		// provenance BEFORE Validate and before anything reaches the ledger.
+		//
+		// A previous attempt added this reconciliation and never called it from
+		// here -- it existed only in its own package and test, so builder family
+		// still arrived as whatever a reviewer typed. That is the helper-only
+		// defect this card has now been FAILed for twice; the call belongs on
+		// the shipped path or it does nothing.
+		//
+		// Only a receipt whose branch git-REACHES this exact SHA counts. Branch
+		// text alone is not evidence: branches are reused, relaunched and
+		// rebased, and a confidently wrong family is worse than none because
+		// independence is computed against it.
+		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA, branchReachesSHA); err != nil {
+			emit.refused(f, err)
+			refused++
+			continue
+		}
 		if err := a.Validate(coordinators, commitExists); err != nil {
 			emit.refused(f, err)
 			refused++
@@ -1799,4 +1818,19 @@ func reachableFromBranch(repoRoot, sha, branch string) bool {
 		return false
 	}
 	return commitIsAncestor(repoRoot, sha, branch)
+}
+
+// branchReachesSHA reports whether branch contains sha, using real git
+// ancestry. FAC-620: this is what makes a launch receipt evidence about a
+// COMMIT rather than about a name.
+func branchReachesSHA(branch, sha string) bool {
+	branch = strings.TrimSpace(branch)
+	sha = strings.TrimSpace(sha)
+	if branch == "" || sha == "" {
+		return false
+	}
+	// --is-ancestor exits 0 when sha is reachable from branch. Any error, a
+	// missing branch or an unknown sha, is NOT reachability: unknown must never
+	// read as proven.
+	return exec.Command("git", "merge-base", "--is-ancestor", sha, branch).Run() == nil
 }

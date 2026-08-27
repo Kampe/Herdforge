@@ -112,3 +112,41 @@ func BuilderFamilyForBranch(path, branch string) (string, bool) {
 	}
 	return family, family != ""
 }
+
+// BuilderFamilyReachingSHA resolves builder provenance from a receipt whose
+// branch PROVABLY contains the reviewed commit.
+//
+// FAC-620: matching branch text alone is not evidence. Branches are reused,
+// relaunched and rebased, so a receipt naming a branch says nothing about
+// whether that branch still reaches the SHA under review. Attributing a family
+// on the name alone yields confident WRONG provenance -- worse than none,
+// because independence is computed against it and it looks authoritative.
+//
+// reaches is injected so the caller supplies real git ancestry and tests need
+// no repository. A receipt whose branch does not reach the SHA is skipped, not
+// guessed at.
+func BuilderFamilyReachingSHA(path, sha string, reaches func(branch string) bool) (string, bool) {
+	if strings.TrimSpace(sha) == "" || reaches == nil {
+		return "", false
+	}
+	receipts, err := ReadReceipts(path)
+	if err != nil {
+		return "", false
+	}
+	family := ""
+	for _, r := range receipts {
+		if !r.Accepted {
+			continue
+		}
+		branch := strings.TrimSpace(r.Branch)
+		fam := strings.TrimSpace(r.BuilderFamily)
+		if branch == "" || fam == "" {
+			continue
+		}
+		if !reaches(branch) {
+			continue
+		}
+		family = fam
+	}
+	return family, family != ""
+}
