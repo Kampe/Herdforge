@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
@@ -66,22 +68,41 @@ func runLaunchRecord() error {
 	if branch == "" {
 		return fmt.Errorf("cannot resolve a branch in %s; a receipt with no branch cannot be joined to a commit", *cwd)
 	}
+	// FAC-625: --lane CHA-#### with no --task-ref is the standing dispatch
+	// shape, and it used to write an empty task ref -- unjoinable to the card
+	// the lane was launched for. The lane name is the task identity for this
+	// call shape (matching recordResolvedLaunchReceipt below); an explicit
+	// --task-ref still wins because it can name something the lane cannot.
+	resolvedTaskRef := strings.TrimSpace(*taskRef)
+	if resolvedTaskRef == "" {
+		resolvedTaskRef = strings.TrimSpace(*lane)
+	}
 
-	sink := launch.DefaultSink()
+	// FAC-625: the receipt must land where review-ingest reads it -- the
+	// worktree-invariant project root -- not wherever DefaultSink's cwd-relative
+	// path happens to resolve from *cwd (a lane worktree). A receipt written
+	// into the lane's own .herd is invisible to ingest, which reads the project
+	// root's log.
+	root, _, err := gitroot.ProjectRoot(context.Background(), *cwd)
+	if err != nil {
+		return fmt.Errorf("resolve project root from %s: %w", *cwd, err)
+	}
+	sink := &launch.JSONLSink{Path: launch.ReceiptPathFor(root)}
 	if err := sink.Write(launch.Receipt{
-		CreatedAt:    time.Now().UTC(),
-		TaskRef:      strings.TrimSpace(*taskRef),
-		Lane:         strings.TrimSpace(*lane),
-		Name:         strings.TrimSpace(*lane),
-		Role:         strings.TrimSpace(*role),
-		TaskShape:    strings.TrimSpace(*shape),
-		Provider:     strings.TrimSpace(*provider),
-		Model:        strings.TrimSpace(*model),
-		CWD:          strings.TrimSpace(*cwd),
-		Branch:       branch,
-		PullRequest:  strings.TrimSpace(*pr),
-		CandidateSHA: strings.TrimSpace(*candidate),
-		Accepted:     true,
+		CreatedAt:     time.Now().UTC(),
+		TaskRef:       resolvedTaskRef,
+		Lane:          strings.TrimSpace(*lane),
+		Name:          strings.TrimSpace(*lane),
+		Role:          strings.TrimSpace(*role),
+		TaskShape:     strings.TrimSpace(*shape),
+		Provider:      strings.TrimSpace(*provider),
+		Model:         strings.TrimSpace(*model),
+		BuilderFamily: family,
+		CWD:           strings.TrimSpace(*cwd),
+		Branch:        branch,
+		PullRequest:   strings.TrimSpace(*pr),
+		CandidateSHA:  strings.TrimSpace(*candidate),
+		Accepted:      true,
 	}); err != nil {
 		return fmt.Errorf("write launch receipt: %w", err)
 	}
