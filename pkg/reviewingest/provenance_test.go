@@ -45,8 +45,15 @@ func TestAnUnstatedFamilyIsFilledFromRecordedProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The bool is the caller's licence to SKIP the corroboration gate. A false
+	// here sends a genuinely proven family to that gate, which downgrades it to
+	// unrecorded on every FIRST review -- the live CHA-3211 failure.
+	if !backed {
+		t.Fatal("a family backed by a receipt reaching this commit reported itself unproven")
 	}
 	if a.BuilderFamily != "anthropic" {
 		t.Fatalf("builder_family = %q, want anthropic resolved from the launch receipt", a.BuilderFamily)
@@ -59,7 +66,11 @@ func TestAStatedFamilyContradictingProvenanceIsRefused(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "openai"} // reviewer believed the configured pin
 
-	_, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if backed {
+		t.Fatal("a REFUSED artifact reported provenance-backed; a caller reading that bool " +
+			"would skip the corroboration gate for a family nothing agrees on")
+	}
 	if err == nil {
 		t.Fatal("a builder-family contradicting recorded provenance was admitted; " +
 			"independence would be computed against a family that never wrote the code")
@@ -74,8 +85,15 @@ func TestAMatchingFamilyIsAccepted(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "anthropic"}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatalf("a family agreeing with provenance was refused: %v", err)
+	}
+	// The bool is the caller's licence to SKIP the corroboration gate. A false
+	// here sends a genuinely proven family to that gate, which downgrades it to
+	// unrecorded on every FIRST review -- the live CHA-3211 failure.
+	if !backed {
+		t.Fatal("a family backed by a receipt reaching this commit reported itself unproven")
 	}
 }
 
@@ -86,9 +104,16 @@ func TestNoRecordedProvenanceLeavesACandidArtifactAlone(t *testing.T) {
 	path := receiptFile(t, `{"branch":"wt/other","provider":"grok","builder_family":"xai","accepted":true}`)
 	a := &Artifact{BuilderFamily: "unknown"}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
-		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+		func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatalf("absence of a receipt was treated as a conflict: %v", err)
+	}
+	// Nothing reaches this commit, so nothing is proven: the caller must still
+	// run the corroboration gate rather than skip it.
+	if backed {
+		t.Fatal("reported provenance-backed with no reaching receipt; the corroboration " +
+			"gate would be skipped for a family nothing proves")
 	}
 	if a.BuilderFamily != "unknown" {
 		t.Fatalf("artifact was mutated with no provenance to justify it: %q", a.BuilderFamily)
@@ -103,8 +128,15 @@ func TestTheMostRecentLaunchForABranchWins(t *testing.T) {
 	)
 	a := &Artifact{}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The bool is the caller's licence to SKIP the corroboration gate. A false
+	// here sends a genuinely proven family to that gate, which downgrades it to
+	// unrecorded on every FIRST review -- the live CHA-3211 failure.
+	if !backed {
+		t.Fatal("a family backed by a receipt reaching this commit reported itself unproven")
 	}
 	if a.BuilderFamily != "anthropic" {
 		t.Fatalf("builder_family = %q; an earlier launch outranked the one that produced the tip", a.BuilderFamily)
@@ -121,11 +153,17 @@ func TestAReceiptWhoseBranchDoesNotReachTheSHAIsIgnored(t *testing.T) {
 	// The branch exists in the receipt but does NOT contain this commit. The
 	// ledger independently proves openai, so the only question under test is
 	// whether the unreachable receipt overwrites it.
-	_, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(branch, sha string) bool { return false })
 
 	if err != nil {
 		t.Fatalf("an unreachable branch was treated as contradicting provenance: %v", err)
+	}
+	// Nothing reaches this commit, so nothing is proven: the caller must still
+	// run the corroboration gate rather than skip it.
+	if backed {
+		t.Fatal("reported provenance-backed with no reaching receipt; the corroboration " +
+			"gate would be skipped for a family nothing proves")
 	}
 	if a.BuilderFamily != "openai" {
 		t.Fatalf("family was overwritten from a receipt that does not reach the commit: %q", a.BuilderFamily)
@@ -137,8 +175,15 @@ func TestUnknownReachabilityIsNotProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, nil); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Nothing reaches this commit, so nothing is proven: the caller must still
+	// run the corroboration gate rather than skip it.
+	if backed {
+		t.Fatal("reported provenance-backed with no reaching receipt; the corroboration " +
+			"gate would be skipped for a family nothing proves")
 	}
 	if a.BuilderFamily != "" {
 		t.Fatalf("family %q was resolved with no way to prove reachability", a.BuilderFamily)
@@ -160,9 +205,16 @@ func TestALaunchAfterTheCommitDoesNotStealAttribution(t *testing.T) {
 	)
 	a := &Artifact{}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
-		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+		func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The bool is the caller's licence to SKIP the corroboration gate. A false
+	// here sends a genuinely proven family to that gate, which downgrades it to
+	// unrecorded on every FIRST review -- the live CHA-3211 failure.
+	if !backed {
+		t.Fatal("a family backed by a receipt reaching this commit reported itself unproven")
 	}
 	if a.BuilderFamily != "anthropic" {
 		t.Fatalf("builder_family = %q, want anthropic. A relaunch at 21:00 was credited with a commit "+
@@ -179,9 +231,16 @@ func TestACorrectStatedFamilyIsNotRefusedByALaterRelaunch(t *testing.T) {
 	)
 	a := &Artifact{BuilderFamily: "anthropic"} // correct, and provable
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
-		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+		func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatalf("a truthful builder-family was refused because a LATER launch reused the branch: %v", err)
+	}
+	// The bool is the caller's licence to SKIP the corroboration gate. A false
+	// here sends a genuinely proven family to that gate, which downgrades it to
+	// unrecorded on every FIRST review -- the live CHA-3211 failure.
+	if !backed {
+		t.Fatal("a family backed by a receipt reaching this commit reported itself unproven")
 	}
 }
 
@@ -191,9 +250,16 @@ func TestAnUnknownCommitTimeYieldsNoProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", time.Time{},
-		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", time.Time{},
+		func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Nothing reaches this commit, so nothing is proven: the caller must still
+	// run the corroboration gate rather than skip it.
+	if backed {
+		t.Fatal("reported provenance-backed with no reaching receipt; the corroboration " +
+			"gate would be skipped for a family nothing proves")
 	}
 	if a.BuilderFamily != "" {
 		t.Fatalf("family %q resolved with no commit time to order the receipts against", a.BuilderFamily)
@@ -205,9 +271,16 @@ func TestAnUndatedReceiptIsNotProvenance(t *testing.T) {
 	path := receiptFile(t, `{"branch":"wt/defi-crusader","provider":"grok","builder_family":"xai","accepted":true}`)
 	a := &Artifact{}
 
-	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
-		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	backed, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+		func(b, sha string) bool { return b == "wt/defi-crusader" })
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Nothing reaches this commit, so nothing is proven: the caller must still
+	// run the corroboration gate rather than skip it.
+	if backed {
+		t.Fatal("reported provenance-backed with no reaching receipt; the corroboration " +
+			"gate would be skipped for a family nothing proves")
 	}
 	if a.BuilderFamily != "" {
 		t.Fatalf("family %q resolved from an undated receipt", a.BuilderFamily)
