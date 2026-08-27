@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/readyindex"
 )
 
 // RecordOpts carries optional fields for Record.
@@ -469,6 +471,17 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	if err := l.appendRow(l.QueuePath, qRow); err != nil {
 		return false, err
 	}
+	// FAC-603: keep the exact-ready projection in sync with queue mutations.
+	// Projection write failure must not roll back a durable ledger admit; repair
+	// rebuilds from Queued(). Best-effort is intentional.
+	indexPath := readyindex.PathFor(l.Path)
+	if opts.Verdict == VerdictPASS {
+		_ = readyindex.Upsert(indexPath, readyindex.Entry{
+			SHA: opts.SHA, Branch: opts.Branch, Lane: opts.Lane, Reviewer: opts.Reviewer,
+		})
+	} else if opts.Verdict == VerdictFAIL || opts.Verdict == VerdictBLOCKED {
+		_ = readyindex.Remove(indexPath, opts.SHA)
+	}
 	return opts.Verdict == VerdictPASS, nil
 }
 
@@ -580,7 +593,11 @@ func (l *Ledger) Consumed(sha, mergeSHA string) error {
 		MergeSHA: mergeSHA,
 		Status:   "consumed",
 	}
-	return l.appendRow(l.QueuePath, qRow)
+	if err := l.appendRow(l.QueuePath, qRow); err != nil {
+		return err
+	}
+	_ = readyindex.Remove(readyindex.PathFor(l.Path), sha)
+	return nil
 }
 
 // EnqueueOpts carries fields for manual enqueue.

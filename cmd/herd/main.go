@@ -8106,10 +8106,13 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	maxHarvest := fs.Int("max-harvest", 1, "Maximum harvest actions")
 	maxRelaunch := fs.Int("max-relaunch", drainIntEnv("HERD_DRAIN_MAX_RELAUNCH", 8), "Maximum ledger-backed relaunches")
 	autoTiers := fs.String("auto-harvest-tiers", "", "Comma-separated recorded tiers allowed for harvest")
+	repair := fs.Bool("repair", false, "Full worktree tip scan and rebuild the exact-ready index (explicit reconcile)")
+	fullScan := fs.Bool("full-scan", false, "Alias for --repair")
 	selftest := fs.Bool("selftest", false, "Verify drain integration seams")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	doRepair := *repair || *fullScan
 	if *selftest {
 		return runDrainSelftest()
 	}
@@ -8155,119 +8158,145 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		return 2
 	}
 	scanTimeout := drainScanTimeout()
-	// FAC-605: read the prior timeout cursor BEFORE Begin overwrites the receipt.
+	// FAC-605: read the prior cursor BEFORE Begin overwrites the receipt.
+	// Resume still applies under FAC-603: exact-ready discovery shrinks the tip
+	// set, but review-scan over that set can still time out or die mid-loop;
+	// ResumeAfter continues within whatever tip set this run builds.
 	resumeAfter, resumeOK := drainreceipt.PriorResumeCursor(root)
-	if _, err := drainreceipt.Begin(root, scanTimeout.String(), "harvest-scan"); err != nil {
+	// Begin on EVERY path (default exact-ready and --repair). A receipt that
+	// only exists on --repair would leave the common path unrecorded.
+	beginPhase := "exact-ready-index"
+	if doRepair {
+		beginPhase = "harvest-scan"
+	}
+	if _, err := drainreceipt.Begin(root, scanTimeout.String(), beginPhase); err != nil {
 		fmt.Fprintf(errOut, "herd-drain: durable receipt begin: %v\n", err)
 		return 1
 	}
 	if resumeOK {
-		fmt.Fprintf(errOut, "herd-drain: resuming after resume_cursor=%s (prior timeout)\n", resumeAfter)
+		fmt.Fprintf(errOut, "herd-drain: resuming after resume_cursor=%s (prior timeout or abandoned run)\n", resumeAfter)
 	}
-	if !*quiet {
-		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
-	}
-	h := harvest.NewHarvester(root)
-	scanCtx, cancelScan := context.WithTimeout(context.Background(), scanTimeout)
-	defer cancelScan()
-	harvestStart := time.Now()
-	harvestResult, err := h.HarvestReadOnly(scanCtx)
-	harvestElapsed := time.Since(harvestStart).Round(time.Second)
-	if err != nil {
-		if scanCtx.Err() != nil {
-			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s during phase=harvest-scan after %s: %v\n",
-				scanTimeout, harvestElapsed, scanCtx.Err())
-			fmt.Fprintln(errOut, "herd-drain: partial=none — harvest-scan produced no result; raise the bound with HERD_DRAIN_TIMEOUT (e.g. HERD_DRAIN_TIMEOUT=6m) to see counts")
-			if rerr := drainreceipt.MarkTimeout(root, "harvest-scan", "", 0, 0); rerr != nil {
-				fmt.Fprintf(errOut, "herd-drain: durable receipt timeout: %v\n", rerr)
-			}
-		} else {
-			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
-		}
-		return 1
-	}
-	if !*quiet {
-		fmt.Fprintf(errOut, "herd-drain: phase=harvest-scan done in %s: unmerged_worktrees=%d input_errors=%d\n",
-			harvestElapsed, len(harvestResult.UnmergedWorktrees), len(harvestResult.Errors))
-	}
-	if !*quiet {
-		for _, skip := range harvestResult.Skipped {
-			fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s (%s)\n", skip.Path, skip.Reason)
-		}
-	}
-	_ = drainreceipt.Progress(root, "review-scan", "", 0, 0, len(harvestResult.UnmergedWorktrees))
-	harvestErrors := false
-	for _, harvestErr := range harvestResult.Errors {
-		// FAC-604: never label a named non-worktree exclusion as UNKNOWN.
-		if strings.Contains(harvestErr, "not a git worktree") {
-			fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s\n", harvestErr)
-			continue
-		}
-		harvestErrors = true
-		fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
-	}
+	// FAC-603: default discovery is the exact-ready index (O(ready set)).
+	// Full worktree tip scan is --repair/--full-scan only: cost otherwise grows
+	// with fleet history and is the incident that made drain vanish mid-board.
+	var harvestResult *harvest.HarvestResult
+	var harvestElapsed time.Duration
+	var harvestErrors bool
+	var scanTargets []harvest.UnmergedWork
 	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp, ResumeAfter: resumeAfter}
+	if doRepair {
+		if !*quiet {
+			fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan (repair/full-scan)")
+		}
+		h := harvest.NewHarvester(root)
+		scanCtx, cancelScan := context.WithTimeout(context.Background(), scanTimeout)
+		defer cancelScan()
+		harvestStart := time.Now()
+		var err error
+		harvestResult, err = h.HarvestReadOnly(scanCtx)
+		harvestElapsed = time.Since(harvestStart).Round(time.Second)
+		if err != nil {
+			if scanCtx.Err() != nil {
+				fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s during phase=harvest-scan after %s: %v\n",
+					scanTimeout, harvestElapsed, scanCtx.Err())
+				fmt.Fprintln(errOut, "herd-drain: partial=none — harvest-scan produced no result; raise the bound with HERD_DRAIN_TIMEOUT (e.g. HERD_DRAIN_TIMEOUT=6m) to see counts")
+				if rerr := drainreceipt.MarkTimeout(root, "harvest-scan", "", 0, 0); rerr != nil {
+					fmt.Fprintf(errOut, "herd-drain: durable receipt timeout: %v\n", rerr)
+				}
+			} else {
+				fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+			}
+			return 1
+		}
+		if !*quiet {
+			fmt.Fprintf(errOut, "herd-drain: phase=harvest-scan done in %s: unmerged_worktrees=%d input_errors=%d\n",
+				harvestElapsed, len(harvestResult.UnmergedWorktrees), len(harvestResult.Errors))
+		}
+		if !*quiet {
+			for _, skip := range harvestResult.Skipped {
+				fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s (%s)\n", skip.Path, skip.Reason)
+			}
+		}
+		_ = drainreceipt.Progress(root, "review-scan", "", 0, 0, len(harvestResult.UnmergedWorktrees))
+		// FAC-604: named non-worktree exclusions are not UNKNOWN errors.
+		harvestErrors = false
+		for _, harvestErr := range harvestResult.Errors {
+			if strings.Contains(harvestErr, "not a git worktree") {
+				fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s\n", harvestErr)
+				continue
+			}
+			harvestErrors = true
+			fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
+		}
+		var skippedCandidates []review.SkippedCandidate
+		scanTargets, skippedCandidates = review.ScopeDrainCandidates(
+			harvestResult.UnmergedWorktrees, drainReceiptOracle(root))
+		if !*quiet && len(skippedCandidates) > 0 {
+			for reason, n := range review.SummarizeSkips(skippedCandidates) {
+				fmt.Fprintf(errOut, "herd-drain: scoped out %d worktree(s): %s\n", n, reason)
+			}
+		}
+	} else {
+		tips, _, err := loadExactReadyTips(root, ledgerPath, errOut, *quiet)
+		if err != nil {
+			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+			return 1
+		}
+		scanTargets = tips
+		harvestResult = &harvest.HarvestResult{}
+		harvestElapsed = 0
+		_ = drainreceipt.Progress(root, "review-scan", "", 0, 0, len(tips))
+	}
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
 	}
-	// FAC-555 follow-up: review-scan's cost is O(unmerged worktrees), but it
-	// inherited whatever was left of a FIXED 2m budget already spent by
-	// harvest-scan. Measured on a real board: harvest took 41s for 64
-	// worktrees, leaving review-scan 79s for those same 64 -- not enough, so it
-	// timed out every pass regardless of how good the partial was.
-	//
-	// The item count is known exactly at this point, so review-scan gets its
-	// own budget scaled to it. Still bounded, and the derived budget is printed
-	// so an operator can see why it is what it is.
-	// FAC-559: scope the set BEFORE budgeting it. Consumer-declared semantics:
-	// audit/*-reachability, archive/* and unreceipted worktree-agent-* scratch
-	// are never product review candidates, while standing/* and herd/* carry
-	// real candidates and are therefore receipt-gated rather than excluded.
-	scanTargets, skippedCandidates := review.ScopeDrainCandidates(
-		harvestResult.UnmergedWorktrees, drainReceiptOracle(root))
-	if !*quiet && len(skippedCandidates) > 0 {
-		// Never drop input silently: a scan that quietly shrinks its own set
-		// reads as "nothing to drain".
-		for reason, n := range review.SummarizeSkips(skippedCandidates) {
-			fmt.Fprintf(errOut, "herd-drain: scoped out %d worktree(s): %s\n", n, reason)
-		}
-	}
-	// Budget on TIPS, not worktrees. review-scan iterates one tip per unmerged
-	// SHA, so a worktree-count budget was off by the average commits per
-	// worktree: 54 in-scope worktrees expanded to 400 tips, giving the scan
-	// roughly an eighth of the time it needed.
-	// Ask the drain itself how many tips it will iterate. The tip set is
-	// worktree SHAs PLUS queued ledger pins, so counting only the worktree half
-	// reported 170 while the scan traversed 402 -- the entire queue was missing
-	// from the budget.
+	// FAC-555 follow-up: review-scan's cost is O(tips in the scan set). The
+	// item count is known exactly at this point, so review-scan gets its own
+	// budget scaled to it.
+	// FAC-559 (repair path): scope before budgeting. Exact-ready path is
+	// already scoped to admitted queue entries.
 	tipCount, tipErr := d.PlanTipCount(scanTargets)
 	if tipErr != nil {
 		fmt.Fprintf(errOut, "herd-drain: cannot plan tip count: %v\n", tipErr)
 		return 1
 	}
+	// Exact-ready tips are already one-SHA rows. Prefer the concrete set size
+	// so a parallel queue read cannot under-budget the scan we are about to run.
+	if !doRepair && len(scanTargets) > tipCount {
+		tipCount = len(scanTargets)
+	}
 	reviewTimeout := drainReviewTimeout(tipCount)
 	reviewCtx, cancelReview := context.WithTimeout(context.Background(), reviewTimeout)
 	defer cancelReview()
 	if !*quiet {
-		fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d tip(s) across %d in-scope worktree(s) of %d scanned\n",
-			reviewTimeout, tipCount, len(scanTargets), len(harvestResult.UnmergedWorktrees))
+		if doRepair {
+			fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d tip(s) across %d in-scope worktree(s) of %d scanned\n",
+				reviewTimeout, tipCount, len(scanTargets), len(harvestResult.UnmergedWorktrees))
+		} else {
+			fmt.Fprintf(errOut, "herd-drain: review-scan budget=%s for %d exact-ready tip(s)\n",
+				reviewTimeout, tipCount)
+		}
 	}
 	// Emit per-item progress with elapsed time so the REAL per-item cost is
 	// measurable from one run. Guessing budgets from the outside is what made
 	// 3s/worktree wrong on the reported board.
+	//
+	// FAC-605 residual: also persist the resume cursor FROM INSIDE the hot loop.
+	// A receipt written only at phase boundaries freezes at status=running with
+	// an empty cursor when the process is SIGKILL/OOM'd mid-scan.
 	reviewStart := time.Now()
-	if !*quiet {
-		lastTick := reviewStart
-		d.Progress = func(done, total int, branch string) {
-			// Report every item for the first few, then every fifth, so the
-			// early per-item cost is visible without flooding a large board.
-			if done < 3 || done%5 == 0 {
-				now := time.Now()
-				fmt.Fprintf(errOut, "herd-drain: review-scan %d/%d elapsed=%s last_item=%s branch=%s\n",
-					done, total, now.Sub(reviewStart).Round(time.Second),
-					now.Sub(lastTick).Round(time.Millisecond), branch)
-				lastTick = now
-			}
+	lastTick := reviewStart
+	d.Progress = func(done, total int, branch, sha string) {
+		_ = drainreceipt.Progress(root, "review-scan", sha, done, total, 0)
+		if *quiet {
+			return
+		}
+		if done < 3 || done%5 == 0 {
+			now := time.Now()
+			fmt.Fprintf(errOut, "herd-drain: review-scan %d/%d elapsed=%s last_item=%s branch=%s\n",
+				done, total, now.Sub(reviewStart).Round(time.Second),
+				now.Sub(lastTick).Round(time.Millisecond), branch)
+			lastTick = now
 		}
 	}
 	report, err := d.Scan(reviewCtx, scanTargets)
@@ -8338,6 +8367,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	}
 	if cerr := drainreceipt.MarkCompleted(root, scannedDone, totalDone); cerr != nil {
 		fmt.Fprintf(errOut, "herd-drain: durable receipt complete: %v\n", cerr)
+	}
+	if doRepair {
+		rebuildExactReadyFromQueued(root, ledgerPath, errOut)
 	}
 	if *asJSON {
 		if err := json.NewEncoder(out).Encode(report); err != nil {

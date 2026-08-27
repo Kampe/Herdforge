@@ -54,7 +54,7 @@ func TestScanProgressIsReported(t *testing.T) {
 	d := &Drain{
 		RepoRoot:   t.TempDir(),
 		LedgerPath: t.TempDir() + "/ledger.jsonl",
-		Progress:   func(done, total int, branch string) { calls++ },
+		Progress:   func(done, total int, branch, sha string) { calls++ },
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
