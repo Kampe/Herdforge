@@ -44,6 +44,15 @@ type Artifact struct {
 	// worktree reports the pin without effort, and a wandering one has to
 	// state a mismatch or lie outright.
 	ReadHead string
+	// ReadBase is the base the reviewer diffed FROM. Without it the artifact
+	// records an endpoint and not a RANGE, so a reviewer that read one commit
+	// and a reviewer that read fifty produce identical provenance.
+	//
+	// FAC-704: PR 3468 carried an exact-SHA PASS that had reviewed only the
+	// immediate-parent repair commit. The head matched, every gate passed, and
+	// the rest of the range was never examined. An endpoint cannot detect that;
+	// only a base can.
+	ReadBase string
 	RetryOf  string
 	Body     string
 	// UnknownHeaders are front-matter keys we did not recognise. Validate
@@ -140,6 +149,8 @@ func Parse(text string) Artifact {
 				a.BuilderFamily = value
 			case "verdict":
 				a.Verdict = strings.ToUpper(value)
+			case "reviewed-base":
+				a.ReadBase = value
 			case "reviewed-head":
 				// The reference key, written by every reviewer via
 				// `reviewed-head: $(git rev-parse HEAD)`. Spelling this
@@ -207,7 +218,7 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	// unwritten contract would make every reviewer's first artifact a guess.
 	if len(a.UnknownHeaders) > 0 {
 		return fmt.Errorf("unrecognised front-matter key(s): %s; accepted keys are "+
-			"sha, branch, task, task-id, card, ticket, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-head, retry-of "+
+			"sha, branch, task, task-id, card, ticket, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-base, reviewed-head, retry-of "+
 			"(see .herd/prompts/review-verdict.template.md); a misspelled gate key silently "+
 			"disables its gate, so this is refused rather than ignored",
 			strings.Join(a.UnknownHeaders, ", "))
