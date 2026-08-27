@@ -4350,7 +4350,7 @@ func runSend() {
 		fmt.Fprintf(os.Stderr, "Usage: herd send <pane|name> \"<text>\" [--file path] [--no-verify] [--timeout s]\n")
 		os.Exit(2)
 	}
-	target := pos[0]
+	target := resolveSendTarget(pos[0])
 
 	var text string
 	switch {
