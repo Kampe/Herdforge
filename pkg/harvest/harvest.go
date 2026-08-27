@@ -139,9 +139,13 @@ func (h *Harvester) harvest(ctx context.Context, fetch bool) (*HarvestResult, er
 		return nil, fmt.Errorf("list worktrees: %w", err)
 	}
 
+	// FAC-604: validate each harvest input is a real linked worktree BEFORE any
+	// per-path scan (rev-parse / cherry / merge-tree). Soft scratch exclusion is
+	// not enough: a stale path with .git removed must not pay scan cost and then
+	// be relabelled. ClassifyHarvestInputStrict is the production gate.
 	eligible := make([]string, 0, len(worktrees))
 	for _, wtPath := range worktrees {
-		ok, reason := ClassifyHarvestInput(h.repoRoot, wtPath)
+		ok, reason := ClassifyHarvestInputStrict(h.repoRoot, wtPath)
 		if !ok {
 			result.Skipped = append(result.Skipped, HarvestSkip{Path: wtPath, Reason: reason})
 			continue
