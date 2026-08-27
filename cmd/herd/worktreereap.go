@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/refname"
+
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
 )
@@ -302,7 +304,7 @@ func retireLandedOne(root string, l reapRow, run reapGitRunner) error {
 // than a task worktree. Both look "landed" because a home tracks the base.
 func isResidentHome(branch, path string) bool {
 	b := strings.ToLower(strings.TrimSpace(branch))
-	if strings.HasPrefix(b, "standing/") || b == "main" || b == "master" {
+	if refname.IsStandingBranch(b) || b == "main" || b == "master" {
 		return true
 	}
 	// A checkout that sits directly beside the repository rather than inside a
