@@ -8911,9 +8911,33 @@ func readBrokerHealth(root string, cfg *config.Config) brokerHealth {
 		return brokerHealth{Detail: err.Error()}
 	}
 	if err := brokerPing(root, sock); err != nil {
-		return brokerHealth{Socket: sock, Detail: err.Error()}
+		return brokerHealth{Socket: sock, Detail: brokerFailureDetail(sock, err)}
 	}
 	return brokerHealth{Socket: sock, Serving: true}
+}
+
+// brokerFailureDetail turns a raw dial error into something an operator can act
+// on.
+//
+// FAC-592: dispatch already said this properly -- requireServingBroker names
+// `herd broker ensure` in its refusal. `herd status` did not: it printed the
+// bare dial error, "connect: connection refused", and stopped. The same
+// condition was actionable on one surface and a dead end on the other, and
+// status is the surface an operator reads FIRST.
+//
+// It also separates two faults that the dial error alone conflates. A socket
+// file that EXISTS with nothing behind it is a coordinator that died and left
+// its socket -- the file's presence is not evidence of a listener, and reading
+// it as one is what made this take a diagnosis instead of a glance. No socket
+// file at all is a broker that was never started here. Same remedy, different
+// story, and the difference is what tells an operator whether something crashed.
+func brokerFailureDetail(sock string, err error) string {
+	const remedy = "run `herd broker ensure` (or start the coordinator with `herd forge --loop`)"
+	if info, statErr := os.Stat(sock); statErr == nil {
+		return fmt.Sprintf("%v; socket file exists (last modified %s) but nothing is listening on it, so a coordinator left it behind: %s",
+			err, info.ModTime().UTC().Format(time.RFC3339), remedy)
+	}
+	return fmt.Sprintf("%v; no socket file at that path, so no broker has been started for this repository: %s", err, remedy)
 }
 
 // requireServingBroker is admission-only: it probes the coordinator-owned
