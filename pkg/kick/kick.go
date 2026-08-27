@@ -757,12 +757,18 @@ func paneShowsPausedGoal(paneID string) bool {
 	if err != nil {
 		return false
 	}
-	return containsPausedGoalMarker(string(out))
+	return ContainsPausedGoalMarker(string(out))
 }
 
-// containsPausedGoalMarker is the pure predicate, split out so the detection
+// ContainsPausedGoalMarker is the pure predicate, split out so the detection
 // is testable without a live pane.
-func containsPausedGoalMarker(text string) bool {
+//
+// FAC-614: exported so pulse can classify a paused lane without writing a
+// second copy of this rule. kick already owns the marker vocabulary and the
+// resume verb; a parallel implementation in pulse would be the duplicate-rule
+// defect pkg/invariant fails the build on, and the two would drift the first
+// time a harness renamed a marker.
+func ContainsPausedGoalMarker(text string) bool {
 	for _, marker := range []string{"Goal paused", "Goal stalled", "Goal achieved", "Goal blocked", goalResumeVerb} {
 		if strings.Contains(text, marker) {
 			return true

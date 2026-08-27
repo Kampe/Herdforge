@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/kick"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,21 @@ const (
 	StatusDone        AgentStatus = "done"
 	StatusStale       AgentStatus = "stale"
 	StatusUnknown     AgentStatus = "unknown"
+
+	// StatusPaused is a goal-driven lane sitting at a terminal goal state.
+	//
+	// FAC-614: herdr reports agent_status=working for such a lane, because the
+	// process IS alive -- it is the GOAL loop that has stopped. So a paused
+	// lane was indistinguishable from a productive one in every status surface,
+	// and stayed that way until a human read the pane. An orchestrator sat
+	// paused long enough for the operator to conclude it had "failed to do
+	// shit", while every census called it healthy.
+	//
+	// Same defect family as a synthesised agent name no agent holds (FAC-597)
+	// and a socket file with no listener behind it: presence mistaken for
+	// liveness. Naming the state is the half that makes the other half -- the
+	// automatic resume -- safe to act on.
+	StatusPaused AgentStatus = "paused"
 )
 
 // ActionKind names a bounded action the beat may plan or apply.
@@ -457,6 +473,31 @@ var ErrUnknownCritical = errors.New("pulse: unknown critical state")
 
 // ErrDispatchBlocked is returned when Apply is asked to dispatch while blocked.
 var ErrDispatchBlocked = errors.New("pulse: dispatch blocked")
+
+// ClassifyStatusWithPane maps a raw status into the taxonomy, consulting pane
+// content so a paused goal is not reported as work in progress.
+//
+// FAC-614: paneText is what the lane's terminal actually shows. Empty paneText
+// means the pane could not be read, and an unreadable pane is UNKNOWN, not
+// paused -- guessing "paused" would send a resume verb into a healthy working
+// lane, which is the safety property pkg/kick already established and this must
+// not weaken.
+//
+// Only a lane the raw status calls BUSY can be reclassified paused. An idle,
+// done, or blocked lane means something else and is left alone.
+func ClassifyStatusWithPane(raw string, stale bool, paneText string) AgentStatus {
+	base := ClassifyStatus(raw, stale)
+	if base != StatusBusy {
+		return base
+	}
+	if strings.TrimSpace(paneText) == "" {
+		return base
+	}
+	if kick.ContainsPausedGoalMarker(paneText) {
+		return StatusPaused
+	}
+	return base
+}
 
 // ClassifyStatus maps a raw agent status string into the coordinator taxonomy.
 func ClassifyStatus(raw string, stale bool) AgentStatus {

@@ -766,7 +766,7 @@ func TestPausedGoalIsDetectedFromPaneText(t *testing.T) {
 		"Goal achieved",
 		"Goal blocked",
 	} {
-		if !containsPausedGoalMarker(marker) {
+		if !ContainsPausedGoalMarker(marker) {
 			t.Fatalf("terminal goal state not detected in %q; kick would send a prompt the lane cannot consume", marker)
 		}
 	}
@@ -779,7 +779,7 @@ func TestHealthyPaneIsNotTreatedAsPaused(t *testing.T) {
 		"› Ask Codex to do anything",
 		"",
 	} {
-		if containsPausedGoalMarker(text) {
+		if ContainsPausedGoalMarker(text) {
 			t.Fatalf("healthy pane text was read as a paused goal: %q", text)
 		}
 	}
