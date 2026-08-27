@@ -365,10 +365,28 @@ func RunWithHoldReader(reader lifecycle.HoldReader, repository string) (*Result,
 }
 
 func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
+	return runWithFleet(kick.FetchAgentList, reader, repository, resolver, registry)
+}
+
+// runWithFleet is the whole body of the scan, with the fleet census injected.
+//
+// FAC-593 (review repair): the first attempt to pin the degraded-reason
+// behaviour tested the helper directly, so it stayed GREEN when the shipped
+// call site was reverted -- it pinned a function, not the behaviour an operator
+// triggers. A test can only be non-vacuous here if it drives this body.
+//
+// The census is injected rather than stubbed through a package global because
+// pkg/kick ALREADY injects exactly this dependency as Options.FetchAgents; a
+// second convention for one rule is the duplicate-rule defect pkg/invariant
+// fails the build on.
+func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
 	if reader == nil || strings.TrimSpace(repository) == "" {
 		return nil, fmt.Errorf("herd-attention: durable hold authority and repository identity are required")
 	}
-	agents, err := kick.FetchAgentList()
+	if fetchAgents == nil {
+		return nil, fmt.Errorf("herd-attention: a fleet census source is required")
+	}
+	agents, err := fetchAgents()
 	if err != nil {
 		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
