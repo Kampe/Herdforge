@@ -8313,30 +8313,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	// measurable from one run. Guessing budgets from the outside is what made
 	// 3s/worktree wrong on the reported board.
 	//
-	// FAC-605 residual: persist the resume cursor FROM INSIDE the hot loop, but
-	// bound the cadence. Always-writing once per tip is an O(N) fsync defect on
-	// the path that already vanished mid-board (1,742 tips). Time-based (2s)
-	// rather than tip-count: tip costs are not uniform. A kill loses at most
-	// ~2s of progress; the first tip always writes so the cursor is never empty.
+	// FAC-605 residual: cadenced in-loop receipt writes (see attachDrainReceiptProgress).
 	reviewStart := time.Now()
-	lastTick := reviewStart
-	receiptCadence := drainreceipt.NewProgressCadence(drainreceipt.DefaultProgressInterval)
-	d.Progress = func(done, total int, branch, sha string) {
-		now := time.Now()
-		if receiptCadence.ShouldWrite(now, done) {
-			_ = drainreceipt.Progress(root, "review-scan", sha, done, total, 0)
-			receiptCadence.MarkWritten(now)
-		}
-		if *quiet {
-			return
-		}
-		if done < 3 || done%5 == 0 {
-			fmt.Fprintf(errOut, "herd-drain: review-scan %d/%d elapsed=%s last_item=%s branch=%s\n",
-				done, total, now.Sub(reviewStart).Round(time.Second),
-				now.Sub(lastTick).Round(time.Millisecond), branch)
-			lastTick = now
-		}
-	}
+	attachDrainReceiptProgress(&d, root, *quiet, errOut, reviewStart, 0)
 	report, err := d.Scan(reviewCtx, scanTargets)
 	reviewElapsed := time.Since(reviewStart).Round(time.Second)
 	if err != nil {
