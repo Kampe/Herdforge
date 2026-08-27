@@ -250,18 +250,22 @@ func PeerEffort(effort string) string {
 }
 
 // FamilyFor mirrors family_for.
-// KnownFamilies is every model family FamilyFor can return. Kept immediately
-// next to FamilyFor so the two cannot drift, exactly as AllShapes is kept next
-// to Waterfall; TestKnownFamiliesCoversEveryFamilyFamilyForCanReturn fails the
-// build if a new provider introduces a family this list omits.
+// KnownFamilies is every model family FamilyFor can return, including fallbacks
+// like lazer's "proxy". Kept immediately next to FamilyFor so the two cannot
+// drift, exactly as AllShapes is kept next to Waterfall.
 //
 // FAC-595: this exists so an unrecognized family can be REFUSED. Without it the
 // exclusion filter compares against a name no provider carries, matches
 // nothing, and silently routes onto the family the caller excluded.
+//
+// KnownFamilies must stay a superset of pkg/review.LedgerFamilyAllowlist and
+// pkg/reviewledger.FamilyAllowlist (the documented 11-token builder set). A
+// ModelFor walk alone is not enough: FamilyFor("lazer", unmatched) returns
+// "proxy" without any catalog model mapping to it.
 func KnownFamilies() []string {
 	return []string{
 		"alibaba", "anthropic", "antigravity", "deepseek", "google",
-		"moonshot", "open-weight", "openai", "xai", "zhipu",
+		"moonshot", "open-weight", "openai", "proxy", "xai", "zhipu",
 	}
 }
 
@@ -1024,7 +1028,9 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		return nil, fmt.Errorf("herd-route: unknown task shape: %s", shape)
 	}
 	// FAC-595: refuse before routing, not after. An unknown family here used to
-	// fall through to a comparison that never matched.
+	// fall through to a comparison that never matched. Trim before validate and
+	// compare so whitespace cannot re-open the silent-ignore hole.
+	excludedFamily = strings.TrimSpace(excludedFamily)
 	if err := ValidateFamily(excludedFamily); err != nil {
 		return nil, err
 	}

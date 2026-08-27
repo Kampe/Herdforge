@@ -786,21 +786,27 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	//
 	// Without this the failure surfaced as "no healthy launch candidate", which
 	// blames capacity for what is actually a bad argument.
-	if err := ValidateFamily(strings.TrimSpace(req.ExcludedFamily)); err != nil {
+	// Trim once, then validate and compare the trimmed values. Validating a
+	// trimmed copy while comparing the raw field re-opens the silent-ignore
+	// hole for padded names (e.g. "xai "): ValidateFamily passes, equality
+	// never matches, independence looks enforced and is not.
+	excludedFamily := strings.TrimSpace(req.ExcludedFamily)
+	authorFamily := strings.TrimSpace(req.AuthorFamily)
+	if err := ValidateFamily(excludedFamily); err != nil {
 		return nil, err
 	}
-	if err := ValidateFamily(strings.TrimSpace(req.AuthorFamily)); err != nil {
+	if err := ValidateFamily(authorFamily); err != nil {
 		return nil, err
 	}
-	excluded := req.ExcludedFamily
+	excluded := excludedFamily
 	isReviewer := req.Role == RoleReviewer || req.Role == RoleAssayer
 	if isReviewer {
-		if strings.TrimSpace(req.AuthorFamily) == "" {
+		if authorFamily == "" {
 			return nil, fmt.Errorf("herd-route: reviewer decision requires author_family")
 		}
 		// Author family is always excluded for reviewer independence.
 		if excluded == "" {
-			excluded = req.AuthorFamily
+			excluded = authorFamily
 		}
 	}
 
@@ -969,7 +975,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if excluded != "" && family == excluded {
 			continue
 		}
-		if isReviewer && family == req.AuthorFamily {
+		if isReviewer && family == authorFamily {
 			continue
 		}
 
@@ -1126,8 +1132,8 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	// Final coherence re-check (mutation-safe).
 	if isReviewer {
-		if best.family == "" || best.family == req.AuthorFamily {
-			return nil, fmt.Errorf("herd-route: reviewer family %q not independent of author family %q", best.family, req.AuthorFamily)
+		if best.family == "" || best.family == authorFamily {
+			return nil, fmt.Errorf("herd-route: reviewer family %q not independent of author family %q", best.family, authorFamily)
 		}
 		if FlashFrontierHighForbidden(authCap, best.cap, effort) {
 			return nil, fmt.Errorf("herd-route: flash author + frontier-high reviewer forbidden")
@@ -1145,7 +1151,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		req.Role, shape, req.Risk, effort, best.provider, model, best.family, best.cap, best.pool, best.pressure, best.rank,
 	)
 	if isReviewer {
-		rationale += fmt.Sprintf(" author_family=%s", req.AuthorFamily)
+		rationale += fmt.Sprintf(" author_family=%s", authorFamily)
 	}
 	if best.probeReq {
 		rationale += " probe=required+pass"
