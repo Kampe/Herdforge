@@ -117,7 +117,12 @@ func dirBytes(root string) uint64 {
 			return filepath.SkipAll
 		}
 		if info, statErr := d.Info(); statErr == nil {
-			total += uint64(info.Size())
+			// G115: FileInfo.Size is int64 and can be negative on some
+			// filesystems for special files. A negative size is not reclaimable
+			// bytes; casting it would wrap to a huge uint64 and invent capacity.
+			if size := info.Size(); size > 0 {
+				total += uint64(size)
+			}
 		}
 		return nil
 	})
