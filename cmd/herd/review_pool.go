@@ -1383,6 +1383,19 @@ ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
 Your cwd is an isolated review surface. Every command you run must stay inside it.
 NEVER run git, or any command that writes, against the canonical shared checkout.
 
+The Surface path below is a SYMLINK into your exclusive leased warm-pool slot
+(.herd/pool/pool-NN). That alias is intentional: herd review --pool leases one
+clean slot, pins the candidate there, and points the surface at that same tree.
+Seeing the symlink resolve to your own pool cwd is NOT a broken isolation
+contract and is NOT shared main. Isolation means exclusive lease + pool
+worktree, not "surface path string differs from cwd".
+
+git rev-parse --show-toplevel resolves THROUGH the symlink to the pool
+worktree path. That is correct. Fail closed only if toplevel is the canonical
+shared checkout (the repo root that is not under .herd/pool/). Comparing
+toplevel to the literal Surface symlink string and calling a match
+"non-isolated" is a false positive.
+
 This is not hypothetical. Proving a test non-vacuous by swapping a file for its
 parent-commit blob is GOOD practice and 132 verdicts in this corpus do it. Done in
 the wrong directory it silently rewrites shared main: on 2026-08-26 the canonical
@@ -1392,12 +1405,14 @@ and a coordinator had to restore it by hand.
 
 If you swap a file to prove non-vacuity:
   1. confirm where you are first: git rev-parse --show-toplevel
-     it MUST be your surface. If it names the shared checkout, STOP.
-  2. do the swap, run the test, then restore: git checkout -- <path>
+     it MUST resolve under .herd/pool/ (your leased slot). If it names the
+     shared checkout root, STOP.
+  2. prefer /tmp or an untracked scratch file; if you must swap a tracked file
+     inside the pool, do the swap, run the test, then restore: git checkout -- <path>
   3. confirm clean before writing your verdict: git status --porcelain
-Never pass -C, --git-dir or --work-tree pointing outside your surface, and never
-cd out of it to run a build or test. If something seems to require the shared
-checkout, that is a finding to report, not a step to take.
+Never pass -C, --git-dir or --work-tree pointing outside your surface/pool, and
+never cd out of it to run a build or test. If something seems to require the
+shared checkout, that is a finding to report, not a step to take.
 
 Candidate: %s
 Surface: %s
