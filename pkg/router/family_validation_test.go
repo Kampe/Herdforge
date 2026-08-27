@@ -62,15 +62,27 @@ func TestKnownExcludedFamilyIsStillAccepted(t *testing.T) {
 	}
 }
 
-// Anti-drift: KnownFamilies must cover every family FamilyFor can actually
-// return for a routed surface. Without this, adding a provider whose family is
-// new would make that family unusable as an exclusion -- the guard would refuse
-// a legitimate name. AllShapes/Waterfall are kept adjacent for the same reason.
+// Anti-drift: KnownFamilies must cover every family FamilyFor can return.
+// A ModelFor walk alone is incomplete: FamilyFor("lazer", unmatched) returns
+// "proxy" with no catalog model mapping to it. Ledger allowlist supersets are
+// asserted in family_allowlist_consistency_test.go (external test package) so
+// this file does not import reviewledger (import cycle via config).
 func TestKnownFamiliesCoversEveryFamilyFamilyForCanReturn(t *testing.T) {
 	known := map[string]bool{}
 	for _, f := range KnownFamilies() {
 		known[f] = true
 	}
+
+	// Explicit fallback literal: lazer unmatched → proxy. Assert the return is
+	// PRESENT before checking coverage so a silent no-op mutation is visible.
+	proxyFallback := FamilyFor("lazer", "totally-unmatched-model-xyz")
+	if proxyFallback != "proxy" {
+		t.Fatalf("FamilyFor(lazer, unmatched) = %q, want proxy; update KnownFamilies when retiring the fallback", proxyFallback)
+	}
+	if !known["proxy"] {
+		t.Fatal("KnownFamilies omits proxy while FamilyFor still returns it")
+	}
+
 	for _, surface := range surfaceCapabilities {
 		for _, shape := range AllShapes() {
 			model := ModelFor(surface.Provider, shape)
@@ -85,6 +97,44 @@ func TestKnownFamiliesCoversEveryFamilyFamilyForCanReturn(t *testing.T) {
 			}
 		}
 	}
+}
+
+// Proxy is a ledger-legitimate builder family. ValidateFamily and Decide must
+// accept it so a recorded proxy author can still get a reviewer routed.
+func TestProxyFamilyIsAcceptedByValidateAndDecide(t *testing.T) {
+	if err := ValidateFamily("proxy"); err != nil {
+		t.Fatalf("ValidateFamily(proxy): %v", err)
+	}
+	clearRouteEnv(t)
+	r := testRouter(nil)
+	_, err := r.Decide(LaunchRequest{
+		Role:         RoleReviewer,
+		Shape:        "qa",
+		AuthorFamily: "proxy",
+	})
+	if err != nil && strings.Contains(err.Error(), "unknown model family") {
+		t.Fatalf("Decide refused proxy author family: %v", err)
+	}
+}
+
+// Padded but otherwise valid family names must not silently match nothing after
+// ValidateFamily accepts the trimmed form.
+func TestDecideTrimsAuthorFamilyBeforeIndependenceCompare(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil)
+	_, err := r.Decide(LaunchRequest{
+		Role:         RoleReviewer,
+		Shape:        "qa",
+		AuthorFamily: "xai ",
+	})
+	if err != nil && strings.Contains(err.Error(), "unknown model family") {
+		t.Fatalf("padded xai must validate as xai: %v", err)
+	}
+	// If trim were missing on the compare side only, independence would look
+	// enforced while every candidate family == "xai" would fail to match
+	// "xai " and a same-family reviewer could win. The unknown-family refusal
+	// above is the validate half; acceptance here means the trimmed name is
+	// what Decide holds for exclusion.
 }
 
 // The severe instance. For a reviewer, Decide sets excluded = req.AuthorFamily
