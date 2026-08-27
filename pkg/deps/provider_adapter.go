@@ -331,6 +331,23 @@ func (s *ProviderStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, erro
 		s.BulkRelCalls.Add(1)
 		rels, err = bp.ListProjectRelations(ctx, s.ProjectID)
 		if err != nil {
+			// FAC-707: this is a WHOLE-PROJECT fetch, so its failure is not a
+			// property of whichever card the caller asked about. Reported live,
+			// `herd deps reconcile` timed out identically for CHA-2776,
+			// CHA-3192 and CHA-3176 and was read as three blocked cards. It was
+			// one degraded provider reported three times:
+			//
+			//	ListProjectRelations: BLOCKED(provider_timeout): kaneo:
+			//	list deadline exceeded after 2m0s
+			//
+			// A lane that reads that as "this card is blocked" advances to the
+			// next card and fails again, and again, burning its whole beat on a
+			// condition no card can escape. Saying the scope out loud is the
+			// difference between a lane advancing usefully and a lane grinding.
+			if provider.ClassifyOpError(err) == provider.OpTimeout {
+				return nil, fmt.Errorf("deps: PROVIDER DEGRADED, not a card blocker: the project-wide relation fetch timed out, "+
+					"so EVERY card reconciles identically until the board responds; preserve the blocker and do not retry other cards for this reason: %w", err)
+			}
 			return nil, fmt.Errorf("deps: bulk project relations: %w", err)
 		}
 	} else {
