@@ -8255,19 +8255,25 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	// Emit per-item progress with elapsed time so the REAL per-item cost is
 	// measurable from one run. Guessing budgets from the outside is what made
 	// 3s/worktree wrong on the reported board.
+	//
+	// FAC-605: also persist the resume cursor FROM INSIDE the hot loop. A
+	// receipt written only at phase boundaries freezes at status=running with
+	// an empty cursor when the process is SIGKILL/OOM'd mid-scan — the exact
+	// "no process survived" incident. stderr cadence stays sparse; the durable
+	// receipt advances every tip.
 	reviewStart := time.Now()
-	if !*quiet {
-		lastTick := reviewStart
-		d.Progress = func(done, total int, branch string) {
-			// Report every item for the first few, then every fifth, so the
-			// early per-item cost is visible without flooding a large board.
-			if done < 3 || done%5 == 0 {
-				now := time.Now()
-				fmt.Fprintf(errOut, "herd-drain: review-scan %d/%d elapsed=%s last_item=%s branch=%s\n",
-					done, total, now.Sub(reviewStart).Round(time.Second),
-					now.Sub(lastTick).Round(time.Millisecond), branch)
-				lastTick = now
-			}
+	lastTick := reviewStart
+	d.Progress = func(done, total int, branch, sha string) {
+		_ = drainreceipt.Progress(root, "review-scan", sha, done, total, 0)
+		if *quiet {
+			return
+		}
+		if done < 3 || done%5 == 0 {
+			now := time.Now()
+			fmt.Fprintf(errOut, "herd-drain: review-scan %d/%d elapsed=%s last_item=%s branch=%s\n",
+				done, total, now.Sub(reviewStart).Round(time.Second),
+				now.Sub(lastTick).Round(time.Millisecond), branch)
+			lastTick = now
 		}
 	}
 	report, err := d.Scan(reviewCtx, scanTargets)
