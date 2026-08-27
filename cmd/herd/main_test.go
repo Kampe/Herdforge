@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/laneenv"
+
 	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/coordinator"
@@ -70,7 +72,11 @@ func TestMain(m *testing.M) {
 	// creates coordinator-signed fixtures in-process and launches child CLIs;
 	// keep that pane marker out of both test contexts while leaving the
 	// production signer-boundary check unchanged.
-	_ = os.Unsetenv("HERD_ROLE")
+	// FAC-610: HERD_ROLE was the first of these to bite, but it is one member
+	// of a class. A lane also inherits HERD_ROOT, HERD_PROJECT_ROOT,
+	// HERD_WORKSPACE and HERDR_* pane vars, which made five cmd/herd tests fail
+	// in a lane's shell and pass in the coordinator's on the same commit.
+	laneenv.Strip()
 
 	root, rootGitState, guardErr := snapshotRootGitState()
 	if guardErr != nil {
