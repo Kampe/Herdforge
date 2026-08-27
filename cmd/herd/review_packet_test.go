@@ -305,3 +305,33 @@ func TestPacketUnrecordedSentinelMatchesTheLedgerConstant(t *testing.T) {
 		t.Error("the stale 'unproven' spelling must not reappear in the packet")
 	}
 }
+
+// Seq 5423 / review-cha-3214-b7606267567a: a reviewer saw the surface symlink
+// resolve to its own leased pool cwd and called that "non-isolated". The pool
+// lease is exclusive; the symlink aliasing that cwd is the designed surface.
+// The packet must say so, and must tell reviewers that show-toplevel resolving
+// under .herd/pool/ is correct while the shared checkout root is the fail-closed
+// case. Prefer /tmp or untracked scratch for non-vacuity swaps.
+func TestReviewPacketExplainsSurfaceAliasAndPoolToplevel(t *testing.T) {
+	body := reviewPacketBody("CHA-3214", "b7606267567ab149a427d7b7c142790a23141141",
+		".herd/review-surfaces/review-cha-3214-b7606267567a",
+		"/repo/.herd/review/inbox/b7606267567a-review-cha-3214-b7606267567a.md",
+		"forge-review-harvest-su", "openai", "wB")
+
+	for _, want := range []string{
+		"SYMLINK into your exclusive leased warm-pool slot",
+		"NOT a broken isolation",
+		".herd/pool/",
+		"false positive",
+		"/tmp or an untracked scratch",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("packet must explain surface-alias contract; missing %q", want)
+		}
+	}
+	// The old "MUST be your surface" string compared poorly to resolved toplevel
+	// and produced the false non-isolated report. Keep the shared-checkout stop.
+	if !strings.Contains(body, "shared checkout root") {
+		t.Error("packet must still fail closed when toplevel is the shared checkout")
+	}
+}
