@@ -140,10 +140,42 @@ func CheckLaneAndTaskHold(ctx context.Context, reader HoldReader, resolver Activ
 		return nil
 	}
 	task := tasks[0]
-	if task.Repository != repository || task.Owner != owner || task.Lane != lane || task.Scope != "task" || strings.TrimSpace(task.Task) == "" {
-		return fmt.Errorf("%w: lane=%s", ErrActiveTaskUnknown, lane)
+	// FAC-593: this named the lane and nothing else, so a lane that resolved ONE
+	// card and rejected it on a field check was indistinguishable from a lane
+	// that matched nothing -- and the rejected card's ref, which is the only
+	// dispatchable part of the finding, was thrown away. Name the candidate and
+	// the discriminator that failed; "1 candidate" also separates this from the
+	// no-candidate pass above.
+	if mismatch := taskBindingMismatch(task, repository, owner, lane); mismatch != "" {
+		ref := strings.TrimSpace(task.Task)
+		if ref == "" {
+			ref = "(no ref)"
+		}
+		return fmt.Errorf("%w: lane=%s considered 1 candidate and rejected it: %s (%s)",
+			ErrActiveTaskUnknown, lane, ref, mismatch)
 	}
 	return check(task)
+}
+
+// taskBindingMismatch names the first field on which a resolved candidate fails
+// to bind to the lane being checked, or "" when it binds. The caller needs the
+// discriminator, not a boolean: "lane=other-lane, want api-crusader" tells an
+// operator which card to re-home, and "scope" tells them the resolver is
+// emitting a lane identity where a task identity belongs.
+func taskBindingMismatch(task HoldIdentity, repository, owner, lane string) string {
+	switch {
+	case task.Repository != repository:
+		return fmt.Sprintf("repository=%s, want %s", task.Repository, repository)
+	case task.Owner != owner:
+		return fmt.Sprintf("owner=%s, want %s", task.Owner, owner)
+	case task.Lane != lane:
+		return fmt.Sprintf("lane=%s, want %s", task.Lane, lane)
+	case task.Scope != "task":
+		return fmt.Sprintf("scope=%s, want task", task.Scope)
+	case strings.TrimSpace(task.Task) == "":
+		return "task ref is empty"
+	}
+	return ""
 }
 
 // HoldAuthority persists holds and explicit release events in the canonical

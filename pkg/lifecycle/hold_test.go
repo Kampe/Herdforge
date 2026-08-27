@@ -516,3 +516,41 @@ func (stubReader) Check(context.Context, HoldIdentity, int64) (HoldDecision, err
 }
 
 func stubGeneration(context.Context, HoldIdentity) (int64, error) { return 1, nil }
+
+// FAC-593: the single-candidate mismatch branch named the lane and nothing
+// else. Live it read "active task binding is unknown or ambiguous: lane=api"
+// with a card sitting right there in the resolver result -- so the operator
+// could not tell whether the lane matched nothing, matched two, or matched one
+// card that failed a field check, nor which field. A refusal that hides the
+// candidate it rejected cannot be acted on.
+func TestSingleCandidateMismatchNamesTheCardAndTheDiscriminator(t *testing.T) {
+	resolver := func(context.Context, string) ([]HoldIdentity, error) {
+		return []HoldIdentity{
+			{Repository: "repo", Owner: "owner", Lane: "other-lane", Task: "CHA-1784", Scope: "task"},
+		}, nil
+	}
+	err := CheckLaneAndTaskHold(context.Background(), stubReader{}, resolver, "repo", "owner", "api-crusader", stubGeneration)
+	if err == nil {
+		t.Fatal("a mismatched candidate was admitted")
+	}
+	for _, want := range []string{"lane=api-crusader", "CHA-1784", "lane", "other-lane", "rejected"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+// A candidate with no ref at all must still be distinguishable from a lane that
+// matched nothing: the remedy differs (fix the card identity vs. bind a card).
+func TestSingleCandidateWithNoRefIsNotReportedAsNoCandidate(t *testing.T) {
+	resolver := func(context.Context, string) ([]HoldIdentity, error) {
+		return []HoldIdentity{{Repository: "repo", Owner: "owner", Lane: "api-crusader", Scope: "task"}}, nil
+	}
+	err := CheckLaneAndTaskHold(context.Background(), stubReader{}, resolver, "repo", "owner", "api-crusader", stubGeneration)
+	if err == nil {
+		t.Fatal("a candidate with no ref was admitted")
+	}
+	if !strings.Contains(err.Error(), "1 candidate") {
+		t.Fatalf("a rejected candidate reads as no candidate: %v", err)
+	}
+}
