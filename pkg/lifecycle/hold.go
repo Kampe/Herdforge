@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -101,9 +102,39 @@ func CheckLaneAndTaskHold(ctx context.Context, reader HoldReader, resolver Activ
 	if err := check(HoldIdentity{Repository: repository, Owner: owner, Lane: lane, Scope: "lane"}); err != nil {
 		return err
 	}
+	// FAC-702: these were one message, and they are three different problems
+	// with three different owners. Measured on the live fleet, seven lanes
+	// reported "active task binding is unknown or ambiguous" and the operator
+	// could not tell which failure any of them was:
+	//
+	//	docs-custodian    23 in-progress cards  -> genuinely ambiguous, board hygiene
+	//	chain-indexer     14                    -> same
+	//	qa-sentinel        0                    -> NOT ambiguous at all; the
+	//	                                          resolver itself failed, and
+	//	                                          zero tasks is a clean pass
+	//
+	// A refusal that cannot be told apart from a different refusal cannot be
+	// acted on. Name the cause, and name the tasks: the remedy for ambiguity is
+	// to move cards out of in-progress, and you cannot do that without knowing
+	// which ones.
 	tasks, err := resolver(ctx, lane)
-	if err != nil || len(tasks) > 1 {
-		return fmt.Errorf("%w: lane=%s", ErrActiveTaskUnknown, lane)
+	if err != nil {
+		return fmt.Errorf("%w: lane=%s: the resolver failed, so no binding was read at all (this is NOT an ambiguous lane): %v", ErrActiveTaskUnknown, lane, err)
+	}
+	if len(tasks) > 1 {
+		refs := make([]string, 0, len(tasks))
+		for _, t := range tasks {
+			refs = append(refs, t.Task)
+		}
+		sort.Strings(refs)
+		shown := refs
+		truncated := ""
+		if len(shown) > 8 {
+			truncated = fmt.Sprintf(" (+%d more)", len(shown)-8)
+			shown = shown[:8]
+		}
+		return fmt.Errorf("%w: lane=%s has %d active tasks and a lane works one at a time; move all but one out of in-progress: %s%s",
+			ErrActiveTaskUnknown, lane, len(tasks), strings.Join(shown, ", "), truncated)
 	}
 	if len(tasks) == 0 {
 		return nil
