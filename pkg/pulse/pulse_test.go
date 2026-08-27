@@ -248,12 +248,16 @@ func TestJSONAndHumanCountsIdentical(t *testing.T) {
 		t.Fatalf("JSON counts %+v != snap counts %+v", decoded.Counts, snap.Counts)
 	}
 	// Human must embed the same numeric tallies.
-	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d",
-		snap.Counts.Agents, snap.Counts.HealthyIdle, snap.Counts.Busy, snap.Counts.Blocked,
+	// FAC-614 adds paused and resume_goal to BOTH surfaces. The expectation is
+	// extended rather than loosened: this test exists to prove human output and
+	// JSON report the same tallies, so a new count must appear in both or the
+	// parity it guards is gone.
+	want := fmt.Sprintf("agents=%d healthy_idle=%d busy=%d paused=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d resume_goal=%d would_run=%d reconcile=%d applied=%d",
+		snap.Counts.Agents, snap.Counts.HealthyIdle, snap.Counts.Busy, snap.Counts.Paused, snap.Counts.Blocked,
 		snap.Counts.Done, snap.Counts.Stale, snap.Counts.Unknown, snap.Counts.Actions,
 		snap.Counts.RenewLeases, snap.Counts.ConsumeCallback, snap.Counts.Dispatch,
 		snap.Counts.OpenReview, snap.Counts.ReviewsInFlight, snap.Counts.ReapLanes,
-		snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
+		snap.Counts.ResumeGoal, snap.Counts.WouldRun, snap.Counts.Reconcile, snap.Counts.Applied)
 	if !strings.Contains(human, want) {
 		t.Fatalf("human missing counts line %q\n---\n%s", want, human)
 	}
