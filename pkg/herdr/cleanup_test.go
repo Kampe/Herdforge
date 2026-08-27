@@ -284,6 +284,28 @@ func TestProjectLiveFleetStatusClassifiesLiveAgentsWithoutReconciliationAuthorit
 	}
 }
 
+// seq 3130 / FAC-660 residual: a hashed standing agent that is working must
+// count as working capacity. Standing names used to win the switch before live
+// status, so herd status reported working=1 standing=13 while herdr showed a
+// full busy forge-* fleet.
+func TestProjectLiveFleetStatusCountsWorkingStandingAsWorking(t *testing.T) {
+	got := ProjectLiveFleetStatus([]AgentEntry{
+		{Name: "forge-docs-custodian-2918de97b5", Status: "working", Workspace: "wB"},
+		{Name: "forge-platform-ops-2918de97b5", Status: "idle", Workspace: "wB"},
+		{Name: "forge-api-crusader-2918de97b5", Status: "working", Workspace: "wB"},
+	}, map[string]bool{
+		"forge-docs-custodian-2918de97b5": true,
+		"forge-platform-ops-2918de97b5":   true,
+		"forge-api-crusader-2918de97b5":   true,
+	}, "wB", 14)
+	if got.Working != 2 {
+		t.Fatalf("working=%d, want 2 busy standing-named agents counted as working: %+v", got.Working, got)
+	}
+	if got.Standing != 1 {
+		t.Fatalf("standing=%d, want 1 idle standing agent: %+v", got.Standing, got)
+	}
+}
+
 func TestProjectLiveFleetStatusSeparatesQueuedAssignmentFromWorkingGoal(t *testing.T) {
 	got := ProjectLiveFleetStatus([]AgentEntry{
 		{Name: "forge-worker", Status: "working", AssignmentStatus: "queued", Workspace: "wF"},
