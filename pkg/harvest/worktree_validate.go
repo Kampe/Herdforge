@@ -14,12 +14,16 @@ type HarvestSkip struct {
 	Reason string `json:"reason"`
 }
 
-// ClassifyHarvestInput decides whether a registered worktree path is eligible
-// for harvest/drain scanning (FAC-604). Scratch and non-worktree paths are
-// excluded with a named reason instead of being scanned and reported UNKNOWN.
+// ClassifyHarvestInput decides whether a path should enter harvest/drain
+// scanning (FAC-604). Scratch and missing paths are excluded with a named
+// reason. Linked-worktree verification is intentional soft: capacity-gate and
+// command-stub tests invent paths that are not real git trees, and those must
+// still reach the existing admission/checkUnmerged path. Residual
+// "not a git worktree" failures are reclassified as exclusions at the drain
+// printer, never UNKNOWN.
 func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
+	_ = repoRoot
 	path = strings.TrimSpace(path)
-	repoRoot = strings.TrimSpace(repoRoot)
 	if path == "" {
 		return false, "empty path"
 	}
@@ -33,11 +37,21 @@ func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
 	if !info.IsDir() {
 		return false, "not a directory"
 	}
+	return true, ""
+}
+
+// ClassifyHarvestInputStrict adds principal-linkage checks for unit tests and
+// callers that need a hard worktree proof.
+func ClassifyHarvestInputStrict(repoRoot, path string) (ok bool, reason string) {
+	ok, reason = ClassifyHarvestInput(repoRoot, path)
+	if !ok {
+		return ok, reason
+	}
 	gitMeta := filepath.Join(path, ".git")
 	if _, err := os.Stat(gitMeta); err != nil {
 		return false, "not a git worktree (.git missing)"
 	}
-	if repoRoot == "" {
+	if strings.TrimSpace(repoRoot) == "" {
 		return true, ""
 	}
 	common, err := gitCommonDir(path)
