@@ -250,6 +250,40 @@ func PeerEffort(effort string) string {
 }
 
 // FamilyFor mirrors family_for.
+// KnownFamilies is every model family FamilyFor can return. Kept immediately
+// next to FamilyFor so the two cannot drift, exactly as AllShapes is kept next
+// to Waterfall; TestKnownFamiliesCoversEveryFamilyFamilyForCanReturn fails the
+// build if a new provider introduces a family this list omits.
+//
+// FAC-595: this exists so an unrecognized family can be REFUSED. Without it the
+// exclusion filter compares against a name no provider carries, matches
+// nothing, and silently routes onto the family the caller excluded.
+func KnownFamilies() []string {
+	return []string{
+		"alibaba", "anthropic", "antigravity", "deepseek", "google",
+		"moonshot", "open-weight", "openai", "xai", "zhipu",
+	}
+}
+
+// ValidateFamily refuses a family name no routed surface can carry. An empty
+// string means "no exclusion" and is always valid.
+//
+// The refusal NAMES the valid families, because the remedy is to pick one and
+// an operator cannot do that from a rejection alone -- the caller who hit this
+// wrote "grok" for what the router calls "xai".
+func ValidateFamily(family string) error {
+	if family == "" {
+		return nil
+	}
+	for _, known := range KnownFamilies() {
+		if family == known {
+			return nil
+		}
+	}
+	return fmt.Errorf("herd-route: unknown model family %q; a family that no surface carries would be silently ignored, routing onto the family you meant to exclude. Valid families: %s",
+		family, strings.Join(KnownFamilies(), ", "))
+}
+
 func FamilyFor(provider, model string) string {
 	m := strings.ToLower(model)
 	switch provider {
@@ -988,6 +1022,11 @@ func pressureFloor() int {
 func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*Route, error) {
 	if !validShapes[shape] {
 		return nil, fmt.Errorf("herd-route: unknown task shape: %s", shape)
+	}
+	// FAC-595: refuse before routing, not after. An unknown family here used to
+	// fall through to a comparison that never matched.
+	if err := ValidateFamily(excludedFamily); err != nil {
+		return nil, err
 	}
 
 	mode, err := familyPostureMode()

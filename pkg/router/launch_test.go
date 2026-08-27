@@ -468,7 +468,7 @@ func TestDecideQuotaHeadroomPick(t *testing.T) {
 		Role:         RoleReviewer,
 		Shape:        "implementation",
 		Risk:         classify.TierR2,
-		AuthorFamily: "unrelated",
+		AuthorFamily: "zhipu",
 	})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
@@ -493,7 +493,7 @@ func TestDecideWeeklyCapSkip(t *testing.T) {
 		Role:         RoleReviewer,
 		Shape:        "implementation",
 		Risk:         classify.TierR1,
-		AuthorFamily: "unrelated",
+		AuthorFamily: "zhipu",
 	})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
@@ -546,7 +546,7 @@ func TestDecideWeeklyCapSoleCandidateFailsClosed(t *testing.T) {
 		Role:              RoleReviewer,
 		Shape:             "implementation",
 		Risk:              classify.TierR1,
-		AuthorFamily:      "unrelated",
+		AuthorFamily:      "zhipu",
 		RequestedProvider: "claude",
 	})
 	if err == nil {
@@ -589,7 +589,7 @@ func TestDecideLunaRequiresProbePass(t *testing.T) {
 		Role:              RoleReviewer,
 		Shape:             "implementation",
 		Risk:              classify.TierR2,
-		AuthorFamily:      "unrelated",
+		AuthorFamily:      "zhipu",
 		RequestedProvider: "",
 	})
 	if err != nil {
@@ -705,7 +705,7 @@ func TestDecideWeeklyCapIsLoadBearing(t *testing.T) {
 	}
 	r := testRouter(computed, "claude", "grok", "codex", "opencode", "agy", "kimi")
 	// Preferential shape: implementation lists claude first.
-	d, err := r.Decide(LaunchRequest{Role: RoleReviewer, Shape: "implementation", AuthorFamily: "unrelated"})
+	d, err := r.Decide(LaunchRequest{Role: RoleReviewer, Shape: "implementation", AuthorFamily: "zhipu"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +718,7 @@ func TestDecideWeeklyCapIsLoadBearing(t *testing.T) {
 		"grok":   {Available: true, Pressure: 80},
 	}
 	r2 := testRouter(healthy, "claude", "grok", "codex", "opencode", "agy", "kimi")
-	d2, err := r2.Decide(LaunchRequest{Role: RoleReviewer, Shape: "implementation", AuthorFamily: "unrelated"})
+	d2, err := r2.Decide(LaunchRequest{Role: RoleReviewer, Shape: "implementation", AuthorFamily: "zhipu"})
 	if err != nil {
 		t.Fatal(err)
 	}
