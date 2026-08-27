@@ -1,11 +1,12 @@
 package harvest
 
 import (
-	"fmt"
+	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // HarvestSkip names a path that must not be scanned as a harvest candidate.
@@ -16,11 +17,8 @@ type HarvestSkip struct {
 
 // ClassifyHarvestInput decides whether a path should enter harvest/drain
 // scanning (FAC-604). Scratch and missing paths are excluded with a named
-// reason. Linked-worktree verification is intentional soft: capacity-gate and
-// command-stub tests invent paths that are not real git trees, and those must
-// still reach the existing admission/checkUnmerged path. Residual
-// "not a git worktree" failures are reclassified as exclusions at the drain
-// printer, never UNKNOWN.
+// reason. Residual "not a git worktree" failures are reclassified as
+// exclusions at the drain printer, never UNKNOWN.
 func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
 	_ = repoRoot
 	path = strings.TrimSpace(path)
@@ -41,7 +39,8 @@ func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
 }
 
 // ClassifyHarvestInputStrict adds principal-linkage checks for unit tests and
-// callers that need a hard worktree proof.
+// callers that need a hard worktree proof. Uses pkg/gitroot.CommonDir so the
+// FAC-575 duplicate-literal gate does not grow a second --git-common-dir site.
 func ClassifyHarvestInputStrict(repoRoot, path string) (ok bool, reason string) {
 	ok, reason = ClassifyHarvestInput(repoRoot, path)
 	if !ok {
@@ -54,11 +53,11 @@ func ClassifyHarvestInputStrict(repoRoot, path string) (ok bool, reason string) 
 	if strings.TrimSpace(repoRoot) == "" {
 		return true, ""
 	}
-	common, err := gitCommonDir(path)
+	common, err := gitroot.CommonDir(context.Background(), path)
 	if err != nil {
 		return false, "not a git worktree: " + err.Error()
 	}
-	principalCommon, err := gitCommonDir(repoRoot)
+	principalCommon, err := gitroot.CommonDir(context.Background(), repoRoot)
 	if err != nil {
 		return true, ""
 	}
@@ -90,20 +89,4 @@ func scratchPathReason(path string) string {
 	default:
 		return ""
 	}
-}
-
-func gitCommonDir(path string) (string, error) {
-	cmd := exec.Command("git", "-C", path, "rev-parse", "--git-common-dir")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	common := strings.TrimSpace(string(out))
-	if common == "" {
-		return "", fmt.Errorf("empty common dir")
-	}
-	if !filepath.IsAbs(common) {
-		common = filepath.Join(path, common)
-	}
-	return filepath.Clean(common), nil
 }
