@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
@@ -112,10 +113,29 @@ func runDepsCheck() {
 	}
 	store := deps.StoreFor(tp, cfg.TaskProvider.ProjectID)
 
+	// FAC-607: these reads used context.Background() with no deadline. When the
+	// provider stopped answering, the command hung until the operator's own
+	// `timeout` killed it -- rc=124 with ZERO stdout, reported repeatedly for
+	// `herd deps check`, `board-sync`, `board-audit` and `herd lost` while
+	// Kaneo canonical reads succeeded and Herdr panes were healthy.
+	//
+	// A silent rc=124 is indistinguishable from a clean pass. Bounding the read
+	// from INSIDE means the deadline that fires first is ours, so the process
+	// gets to explain itself instead of being killed mid-sentence.
+	budget := providerReadBudget()
+
 	// Load desired from task description fence if present (never free-text).
 	// Extract errors are hard failures (never ignored).
-	task, gerr := tp.GetTask(context.Background(), ref)
+	task, diag, gerr := provider.BoundedRead(context.Background(), providerLabel(cfg), budget, "",
+		func(ctx context.Context, ph *provider.Phases) (*provider.Task, error) {
+			ph.Enter("GetTask " + ref)
+			return tp.GetTask(ctx, ref)
+		})
 	if gerr != nil || task == nil {
+		if diag.Unknown() {
+			fmt.Fprintf(os.Stderr, "UNKNOWN %s: %s\n", ref, diag.String())
+			os.Exit(3)
+		}
 		fmt.Fprintf(os.Stderr, "task %s: %v\n", ref, gerr)
 		os.Exit(1)
 	}
@@ -128,7 +148,19 @@ func runDepsCheck() {
 	// SnapshotGraph here: that was the whole-project read that timed out
 	// exact-card admission before RequireTaskLaunch could use SnapshotGraphForTask.
 	ep := deps.LaunchEntrypoint(*entry)
-	gr, err := deps.RequireTaskLaunch(context.Background(), store, ep, deps.Ref(ref), desired, "")
+	gr, launchDiag, err := provider.BoundedRead(context.Background(), providerLabel(cfg), budget, "",
+		func(ctx context.Context, ph *provider.Phases) (*deps.GateResult, error) {
+			ph.Enter("RequireTaskLaunch " + ref)
+			return deps.RequireTaskLaunch(ctx, store, ep, deps.Ref(ref), desired, "")
+		})
+	if launchDiag.Unknown() {
+		// A launch gate that could not read its graph is UNKNOWN. Reporting it
+		// as BLOCKED would assert a dependency verdict nobody established, and
+		// reporting nothing would read as clean -- both are wrong for the same
+		// reason.
+		fmt.Fprintf(os.Stderr, "UNKNOWN %s: %s\n", ref, launchDiag.String())
+		os.Exit(3)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "BLOCKED %s: %v\n", ref, err)
 		if gr != nil && gr.Report != nil {
@@ -301,4 +333,30 @@ workers write/test this command; they never apply live (no sidecar authority)`)
 	if !plan.OK {
 		os.Exit(1)
 	}
+}
+
+// providerReadBudget is the INTERNAL deadline for a provider-bound read.
+//
+// FAC-607: it must be shorter than the operator's external `timeout` wrapper.
+// If theirs fires first the process is killed with zero stdout and explains
+// nothing, which is the rc=124 silence this exists to prevent. Overridable so a
+// slow host can raise it without editing code.
+func providerReadBudget() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("HERD_PROVIDER_READ_BUDGET")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 20 * time.Second
+}
+
+// providerLabel names the provider in diagnostics. An operator reading a
+// timeout needs to know WHICH backend went quiet.
+func providerLabel(cfg *config.Config) string {
+	if cfg != nil {
+		if n := strings.TrimSpace(cfg.TaskProvider.Type); n != "" {
+			return n
+		}
+	}
+	return "task-provider"
 }
