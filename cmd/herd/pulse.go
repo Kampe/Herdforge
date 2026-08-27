@@ -10,6 +10,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -381,7 +382,7 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 			// FAC-614: the harness's own transition counter. Resume escalation
 			// measures PROGRESS against this, not elapsed time -- a lane can be
 			// legitimately slow without being stuck.
-			StateSeq:          int64(a.StateChangeSeq),
+			StateSeq:          safeStateSeq(a.StateChangeSeq),
 			PaneID:            a.PaneID,
 			PaneState:         a.Status,
 			ForegroundProcess: processName,
@@ -1175,4 +1176,25 @@ func (a *livePulseActor) ResumeGoal(ctx context.Context, lane pulse.AgentObserva
 		return fmt.Errorf("pulse: resume submit lane %q pane %s: %w", lane.Name, paneID, err)
 	}
 	return nil
+}
+
+// safeStateSeq narrows herdr's unsigned transition counter without an
+// overflowing conversion.
+//
+// FAC-614 wrote int64(a.StateChangeSeq) directly and the security gate refused
+// it as an unreviewed HIGH G115 finding -- correctly: a uint64 above MaxInt64
+// wraps to a NEGATIVE sequence, and resume escalation compares sequences to
+// decide whether a lane made progress. A negative seq would read as "went
+// backwards", which is neither progress nor stasis and would make the
+// escalation counter behave unpredictably on exactly the lane it is meant to
+// protect.
+//
+// Saturating is the right narrowing here rather than erroring: the counter is
+// monotonic evidence of progress, so clamping at the maximum preserves the only
+// property the comparison depends on.
+func safeStateSeq(seq uint64) int64 {
+	if seq > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(seq)
 }
