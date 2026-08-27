@@ -1994,14 +1994,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			return standing.Tab{ID: tab.ID, Label: tab.Label, PaneID: tab.Pane.ID, Cwd: tab.Cwd}, nil
 		},
 		StartAgent: func(tab standing.Tab, agentName string, route standing.Route, lane *config.LaneDef, repository string) error {
-			decision, ok := route.Decision.(*router.LaunchDecision)
-			if !ok || decision == nil {
-				return errors.New("standing start requires a routed LaunchDecision")
-			}
-			return herdr.StartPreparedAgent(tab.ID, agentName, decision.Harness, tab.PaneID, launch.Request{
-				Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane,
-				Repository: repository, Lane: lane.Name, Name: agentName, TabID: tab.ID, PaneID: tab.PaneID,
-			})
+			return startStandingAgent(tab, agentName, route, lane, repository, herdr.StartPreparedAgent)
 		},
 		PromptAgent: func(agentName, promptText string) error {
 			_, err := herdr.Send(agentName, promptText, true, 30*time.Second)
@@ -11628,4 +11621,47 @@ func runUtilizationCommand(args []string) {
 		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// startStandingAgent starts a standing lane and records its provenance.
+//
+// FAC-620: extracted from the StartAgent closure so the receipt write is on a
+// path a test can drive. While it lived inline, a test could only call the
+// writer directly -- which proves the writer works and says nothing about
+// whether the launcher calls it. That is the exact vacuous shape that produced
+// four independent FAILs in this repository today, and the operator required
+// the regression to fail when the production write is deleted.
+//
+// startAgent is injected so the test never touches a live pane.
+func startStandingAgent(
+	tab standing.Tab,
+	agentName string,
+	route standing.Route,
+	lane *config.LaneDef,
+	repository string,
+	startAgent func(tabID, name, harness, paneID string, req launch.Request) error,
+) error {
+	decision, ok := route.Decision.(*router.LaunchDecision)
+	if !ok || decision == nil {
+		return errors.New("standing start requires a routed LaunchDecision")
+	}
+	if err := startAgent(tab.ID, agentName, decision.Harness, tab.PaneID, launch.Request{
+		Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane,
+		Repository: repository, Lane: lane.Name, Name: agentName, TabID: tab.ID, PaneID: tab.PaneID,
+	}); err != nil {
+		return err
+	}
+	// Record provenance from the RESOLVED route, after the agent is live and
+	// BEFORE PromptAgent/SetGoal deliver kickoff. This is the only point that
+	// knows what actually resolved: lane config still says codex while the
+	// decision may say claude.
+	//
+	// A launch whose provenance cannot be written is not a usable launch -- its
+	// commits could never prove cross-family independence, which is precisely
+	// the state Chainseer reported. So this fails the launch rather than
+	// proceeding silently.
+	if err := recordResolvedLaunchReceipt(decision, lane, agentName, tab.Cwd, repository, tab.ID, tab.PaneID); err != nil {
+		return fmt.Errorf("lane %q launched but provenance could not be recorded: %w", lane.Name, err)
+	}
+	return nil
 }

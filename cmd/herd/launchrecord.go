@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"os"
 	"strings"
 	"time"
@@ -108,4 +109,61 @@ func gitBranchOf(dir string) string {
 		return ""
 	}
 	return b
+}
+
+// recordResolvedLaunchReceipt persists provenance for a standing lane from the
+// route that ACTUALLY resolved, before any kickoff text is delivered.
+//
+// FAC-620: FAC-615 restored provider fallthrough, so a lane configured for
+// codex now routinely runs claude. Nothing wrote that down. Chainseer produced
+// real work whose builder family could not be proven -- CHA-2582 9d76009de5,
+// CHA-3455 ac1ffa7321, CHA-3454 6f6c250d5 and CHA-3456 2ca09828d all have a
+// Claude/Anthropic builder and NO launch row -- and the only lane that did have
+// a row got it because a worker appended one by hand after the fact, which
+// proves nothing about what the launcher resolved.
+//
+// Every field comes from the DECISION, never from lane config. A receipt built
+// from config would name the configured pin after a reroute, and a wrong family
+// is worse than a missing one: independence would be computed against a family
+// that never wrote the code, and the record would look authoritative while
+// being false.
+//
+// An unmappable family REFUSES rather than recording "unknown", matching the
+// manual recorder's existing rule: unprovable authorship must not be written
+// down as if it were provenance.
+func recordResolvedLaunchReceipt(decision *router.LaunchDecision, lane *config.LaneDef, agentName, cwd, repository string, tabID, paneID string) error {
+	if decision == nil {
+		return fmt.Errorf("launch receipt requires a resolved decision")
+	}
+	if lane == nil {
+		return fmt.Errorf("launch receipt requires a lane")
+	}
+	provider := strings.TrimSpace(decision.Provider)
+	model := strings.TrimSpace(decision.Model)
+	family := router.FamilyFor(provider, model)
+	if strings.TrimSpace(family) == "" {
+		return fmt.Errorf("resolved route %s/%s maps to no vendor family; refusing to record unprovable authorship for lane %q",
+			provider, model, lane.Name)
+	}
+	branch := gitBranchOf(cwd)
+	if branch == "" {
+		return fmt.Errorf("cannot resolve a branch in %s; a receipt with no branch cannot be joined to a commit", cwd)
+	}
+	return launch.DefaultSink().Write(launch.Receipt{
+		CreatedAt:     time.Now().UTC(),
+		Lane:          lane.Name,
+		Name:          strings.TrimSpace(agentName),
+		Role:          strings.TrimSpace(lane.Role),
+		TaskShape:     strings.TrimSpace(decision.Shape),
+		Provider:      provider,
+		Model:         model,
+		Effort:        strings.TrimSpace(decision.Effort),
+		BuilderFamily: family,
+		CWD:           cwd,
+		Branch:        branch,
+		Repository:    strings.TrimSpace(repository),
+		TabID:         strings.TrimSpace(tabID),
+		PaneID:        strings.TrimSpace(paneID),
+		Accepted:      true,
+	})
 }
