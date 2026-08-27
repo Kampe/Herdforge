@@ -32,7 +32,7 @@ func TestAnUnstatedFamilyIsFilledFromRecordedProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamily(a, path, "wt/defi-crusader"); err != nil {
+	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}
 	if a.BuilderFamily != "anthropic" {
@@ -46,12 +46,12 @@ func TestAStatedFamilyContradictingProvenanceIsRefused(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "openai"} // reviewer believed the configured pin
 
-	err := ReconcileBuilderFamily(a, path, "wt/defi-crusader")
+	err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", func(b, sha string) bool { return b == "wt/defi-crusader" })
 	if err == nil {
 		t.Fatal("a builder-family contradicting recorded provenance was admitted; " +
 			"independence would be computed against a family that never wrote the code")
 	}
-	if !strings.Contains(err.Error(), "contradicts recorded launch provenance") {
+	if !strings.Contains(err.Error(), "contradicts launch provenance") {
 		t.Fatalf("refusal does not name the conflict: %v", err)
 	}
 }
@@ -61,7 +61,7 @@ func TestAMatchingFamilyIsAccepted(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "anthropic"}
 
-	if err := ReconcileBuilderFamily(a, path, "wt/defi-crusader"); err != nil {
+	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatalf("a family agreeing with provenance was refused: %v", err)
 	}
 }
@@ -73,7 +73,7 @@ func TestNoRecordedProvenanceLeavesTheArtifactAlone(t *testing.T) {
 	path := receiptFile(t, `{"branch":"wt/other","provider":"grok","builder_family":"xai","accepted":true}`)
 	a := &Artifact{BuilderFamily: "openai"}
 
-	if err := ReconcileBuilderFamily(a, path, "wt/defi-crusader"); err != nil {
+	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatalf("absence of a receipt was treated as a conflict: %v", err)
 	}
 	if a.BuilderFamily != "openai" {
@@ -89,10 +89,42 @@ func TestTheMostRecentLaunchForABranchWins(t *testing.T) {
 	)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamily(a, path, "wt/defi-crusader"); err != nil {
+	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}
 	if a.BuilderFamily != "anthropic" {
 		t.Fatalf("builder_family = %q; an earlier launch outranked the one that produced the tip", a.BuilderFamily)
+	}
+}
+
+// FAC-620: branch TEXT is not evidence. A receipt whose branch no longer
+// reaches the reviewed commit must be ignored, not used -- branches are reused,
+// relaunched and rebased, and a confidently wrong family is worse than none.
+func TestAReceiptWhoseBranchDoesNotReachTheSHAIsIgnored(t *testing.T) {
+	path := receiptFile(t, claudeRow)
+	a := &Artifact{BuilderFamily: "openai"}
+
+	// The branch exists in the receipt but does NOT contain this commit.
+	err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		func(branch, sha string) bool { return false })
+
+	if err != nil {
+		t.Fatalf("an unreachable branch was treated as contradicting provenance: %v", err)
+	}
+	if a.BuilderFamily != "openai" {
+		t.Fatalf("family was overwritten from a receipt that does not reach the commit: %q", a.BuilderFamily)
+	}
+}
+
+// Unknown reachability must never read as proven. A git failure is not evidence.
+func TestUnknownReachabilityIsNotProvenance(t *testing.T) {
+	path := receiptFile(t, claudeRow)
+	a := &Artifact{}
+
+	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", nil); err != nil {
+		t.Fatal(err)
+	}
+	if a.BuilderFamily != "" {
+		t.Fatalf("family %q was resolved with no way to prove reachability", a.BuilderFamily)
 	}
 }
