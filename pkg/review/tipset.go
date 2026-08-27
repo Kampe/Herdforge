@@ -1,6 +1,26 @@
 package review
 
-import "github.com/Kampe/Herdforge/pkg/harvest"
+import (
+	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/harvest"
+)
+
+// tipIndexAfter returns the index of the first tip to probe AFTER afterSHA
+// (FAC-605 resume cursor). Empty afterSHA or a cursor no longer present in
+// the tip set means start at 0 (full restart).
+func tipIndexAfter(tips []harvest.UnmergedWork, afterSHA string) int {
+	afterSHA = strings.TrimSpace(afterSHA)
+	if afterSHA == "" {
+		return 0
+	}
+	for i, u := range tips {
+		if len(u.Unmerged) > 0 && u.Unmerged[0] == afterSHA {
+			return i + 1
+		}
+	}
+	return 0
+}
 
 // buildTipSet is the SINGLE source of truth for what review-scan iterates.
 //

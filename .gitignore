@@ -38,6 +38,7 @@ TASK-CONTEXT.json
 .herd/claim/
 .herd/receipts/
 .herd/verification-receipts/
+.herd/drain/
 .herd/approve-intents.jsonl
 .herd/approve-intents.lock
 
