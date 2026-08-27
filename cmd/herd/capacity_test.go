@@ -196,7 +196,7 @@ func TestBlockedReviewersAreNamedWhenTheyHoldTheCap(t *testing.T) {
 // the aggregate. Visible, not fatal.
 func TestUncappedHarnessWarnsWithoutRefusing(t *testing.T) {
 	o := healthy()
-	o.HarnessPath, o.HarnessCapped = "/home/kampe/.local/bin/claude", false
+	o.HarnessPath, o.HarnessCapped = "/opt/testharness/bin/claude", false
 	c := decideCapacity(o, 5, 4096, 6144)
 	if !c.Admit {
 		t.Fatalf("an uncapped harness fenced the host: %s", c.Reason)
@@ -208,7 +208,7 @@ func TestUncappedHarnessWarnsWithoutRefusing(t *testing.T) {
 
 func TestCappedHarnessAddsNoWarning(t *testing.T) {
 	o := healthy()
-	o.HarnessPath, o.HarnessCapped = "/home/kampe/.local/bin/claude", true
+	o.HarnessPath, o.HarnessCapped = "/opt/testharness/bin/claude", true
 	if c := decideCapacity(o, 5, 4096, 6144); strings.Contains(c.Reason, "NOT memory-capped") {
 		t.Fatalf("a capped harness still warned: %s", c.Reason)
 	}
