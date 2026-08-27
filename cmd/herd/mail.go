@@ -119,9 +119,17 @@ func warnUnknownMailParticipants(sender, recipient string) {
 	for _, agent := range agents {
 		if name := strings.TrimSpace(agent.Name); name != "" {
 			known[name] = struct{}{}
-			if name == recipient {
+			if name == recipient || name == resolveSendTarget(recipient) {
 				candidate := agent
 				recipientAgent = &candidate
+			}
+		}
+	}
+	// Also treat standing roles that resolve to a known live name as known
+	for _, role := range []string{sender, recipient} {
+		if live := resolveSendTarget(role); live != role {
+			if _, ok := known[live]; ok {
+				known[role] = struct{}{}
 			}
 		}
 	}
