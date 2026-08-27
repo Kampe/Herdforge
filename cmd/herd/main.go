@@ -1288,6 +1288,7 @@ func runStatus() {
 			standingNames[standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))] = true
 		}
 		fleet = herdr.ProjectLiveFleetStatus(observer.LiveAgents(), standingNames, cfg.Fleet.HerdrWorkspace, len(cfg.Lanes))
+		fleet.Reclaimable = herdr.CountReclaimable(observer.LiveAgents())
 	}
 	if err != nil {
 		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
@@ -1295,6 +1296,15 @@ func runStatus() {
 	} else {
 		fmt.Printf("Reconciliation: observed\nFleet: working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
 			fleet.Working, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+	}
+	// FAC-714: a saturated fleet with reclaimable lanes and a saturated fleet
+	// with none read identically as capacity=0. Say which one this is, and name
+	// the action, because a number with no remedy ends the investigation
+	// exactly where it should start.
+	if fleet.Capacity == 0 && fleet.Reclaimable > 0 {
+		fmt.Printf("  capacity=0 but %d settled lane(s) are holding slots — reclaim before dispatching (herd cleanup)\n", fleet.Reclaimable)
+	} else if fleet.Capacity == 0 {
+		fmt.Println("  capacity=0 and NO lane is reclaimable — this fleet is genuinely full, not merely untidy")
 	}
 	reportWorkspacePlacement()
 }
