@@ -6485,6 +6485,24 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		// Review and assayer lanes may be rerouted by quota. Bind the harness
 		// selected by the router so the launch tuple remains coherent.
 		bindHarness = decision.Provider
+	} else if lane.Standing && !strings.EqualFold(strings.TrimSpace(lane.Harness), strings.TrimSpace(decision.Provider)) {
+		// FAC-615: a STANDING worker may now be rerouted too, for the same
+		// reason review lanes already were -- its configured provider is
+		// config, not an operator pin.
+		//
+		// Binding the CONFIGURED harness after the router chose a different
+		// provider defeats the fallthrough at the last step:
+		//
+		//	lane "chain-indexer" bind vendor harness: configured vendor harness
+		//	"codex" must match routed provider "claude"
+		//
+		// observed live once provider and model fallthrough were working. The
+		// bind check itself is correct -- it enforces a coherent launch tuple.
+		// The caller was handing it a stale harness.
+		//
+		// A NON-standing pinned builder still must match: that is a genuine
+		// operator override and a mismatch there is a real error worth refusing.
+		bindHarness = decision.Provider
 	}
 	decision, err = router.BindVendorHarness(decision, bindHarness)
 	if err != nil {
@@ -6493,10 +6511,24 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	if decision.Shape != lane.TaskShape {
 		return nil, fmt.Errorf("lane %q routed shape drift: configured %s, got %s", lane.Name, lane.TaskShape, decision.Shape)
 	}
-	if pinnedBuilder && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
+	// FAC-615: a pin is HARD only when it is not a standing lane's config.
+	//
+	// These post-routing equality checks exist to catch the router silently
+	// ignoring an operator pin -- a real and worth-refusing condition. But they
+	// key on pinnedBuilder, which is a ROLE test (worker/forge-smith/recovery),
+	// not an intent test. For a standing lane the provider comes from
+	// .herd/herd.yaml and reroute is legitimate, so these fired on every
+	// successful fallthrough and undid it at the last step:
+	//
+	//	lane "chain-indexer" routed harness drift: got claude, want codex
+	//
+	// observed live after provider, model and bind fallthrough were all working.
+	// A non-standing pinned builder keeps every one of these checks.
+	hardPin := pinnedBuilder && !lane.Standing
+	if hardPin && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
 		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}
-	if pinnedBuilder {
+	if hardPin {
 		if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
 			return nil, fmt.Errorf("lane %q fixed builder route drift: configured %s/%s/%s, got %s/%s/%s", lane.Name, lane.Provider, lane.Model, lane.Effort, decision.Provider, decision.Model, decision.Effort)
 		}

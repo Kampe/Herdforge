@@ -840,11 +840,37 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	//
 	// A NON-standing pinned builder keeps its pin: that is a real override and
 	// the router still refuses an unroutable provider on its own.
+	// FAC-615: clearing the provider is not enough -- the MODEL pin has to go
+	// with it.
+	//
+	// The scoring loop applies req.RequestedModel to EVERY candidate provider:
+	//
+	//	model := ModelFor(provider, shape)
+	//	if req.RequestedModel != "" { model = req.RequestedModel }
+	//
+	// A standing worker requests codex's gpt-5.6-luna. Once the provider
+	// fallthrough opened the waterfall, every alternate was evaluated as
+	// claude/gpt-5.6-luna, grok/gpt-5.6-luna and so on -- combinations whose
+	// family and capability do not resolve, so they were dropped before any
+	// gate that records a reason. That is exactly why the diagnostic listed
+	// only codex and agy while the waterfall was
+	// [claude grok codex ollama agy lazer]: the other four never survived model
+	// resolution.
+	//
+	// Falling through to a different provider means taking THAT provider's
+	// model for the shape. Keeping the old provider's model is not a
+	// fallthrough, it is a guaranteed miss.
+	clearRequestedModel := false
 	if req.Standing && strings.TrimSpace(req.PreferredProvider) == "" &&
 		strings.TrimSpace(requestedProvider) != "" {
 		if r.standingProviderSpent(requestedProvider, req.RequestedModel) {
 			requestedProvider = ""
+			clearRequestedModel = true
 		}
+	}
+	effectiveRequestedModel := req.RequestedModel
+	if clearRequestedModel {
+		effectiveRequestedModel = ""
 	}
 
 	if req.Standing && strings.TrimSpace(req.PreferredProvider) != "" {
@@ -936,8 +962,8 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 
 	for pref, provider := range candidates {
 		model := ModelFor(provider, shape)
-		if req.RequestedModel != "" {
-			model = req.RequestedModel
+		if effectiveRequestedModel != "" {
+			model = effectiveRequestedModel
 		} else if req.PreferredModel != "" && strings.EqualFold(provider, req.PreferredProvider) &&
 			(req.Standing || KnownRoutableModel(req.PreferredModel)) {
 			// A soft preference has to be EXPRESSIBLE, not merely rankable. A
@@ -1061,6 +1087,16 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 			}
 			if !known || !pass {
 				// Unknown or failed probe → fail closed for this candidate.
+				// FAC-615: record it. This was the LAST silent rejection path,
+				// and its silence is why a fixture with a full catalog still
+				// reported "no candidate surfaces were evaluated at all" -- the
+				// only surface was dropped here without a word.
+				state := "failed"
+				if !known {
+					state = "no probe result recorded"
+				}
+				surfaceRejections = append(surfaceRejections,
+					fmt.Sprintf("%s/%s: model requires a live probe and it %s", provider, model, state))
 				continue
 			}
 		}
