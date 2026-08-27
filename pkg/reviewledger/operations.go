@@ -300,6 +300,18 @@ func (l *Ledger) Validate(opts IngestOpts) error {
 	if opts.Verdict.ReviewerFamily != "" && !FamilyAllowlist[opts.Verdict.ReviewerFamily] {
 		return fmt.Errorf("unknown reviewer family %q (refusing unprovable review provenance)", opts.Verdict.ReviewerFamily)
 	}
+	// FAC-578: a review recorded against a branch name can never close a card.
+	// Require the same closeable card ref on both rows so Admit's equality
+	// check (FAC-657) and board-done stay aligned on something closable.
+	if err := RequireCloseableCardRef(opts.Record.Task, "record.task"); err != nil {
+		return err
+	}
+	if err := RequireCloseableCardRef(opts.Verdict.Task, "verdict.task"); err != nil {
+		return err
+	}
+	if CloseableCardRef(opts.Record.Task) != CloseableCardRef(opts.Verdict.Task) {
+		return fmt.Errorf("FAC-578: record.task %q and verdict.task %q disagree after canonicalisation", opts.Record.Task, opts.Verdict.Task)
+	}
 	return nil
 }
 
