@@ -268,3 +268,69 @@ func TestRequireWorkspaceRefusesRegisteredWorkspaceMissingFromLiveList(t *testin
 		t.Fatal("w4 is present and must be found")
 	}
 }
+
+// FAC-712: the drift finding reported agent.Name, which is EMPTY for an
+// unnamed pane -- a plain terminal rather than a named agent. The herd-smith
+// lane reported this line on every beat for hours:
+//
+//	DRIFT agent= workspace=w20 expected=wB foreground_cwd=.../chainseer
+//
+// The drift was real and the finding was unactionable. That is why it survived:
+// it named a problem and no identity, so nobody could close it.
+func TestDriftIdentityNamesAnUnnamedPane(t *testing.T) {
+	got := driftIdentity(AgentEntry{PaneID: "w20:p7"})
+	if !strings.Contains(got, "w20:p7") {
+		t.Fatalf("identity does not locate the pane, so the finding stays unactionable: %q", got)
+	}
+	if !strings.Contains(got, "unnamed") {
+		t.Fatalf("identity does not say it is unnamed; an operator will hunt for a named agent: %q", got)
+	}
+}
+
+func TestDriftIdentityPrefersTheRealName(t *testing.T) {
+	// The fallback is a fallback. A named agent must never lose its name to a
+	// pane id, or the report becomes harder to act on rather than easier.
+	if got := driftIdentity(AgentEntry{Name: "forge-docs-custodian-2918de97b5", PaneID: "wB:p1"}); got != "forge-docs-custodian-2918de97b5" {
+		t.Fatalf("a named agent lost its name to the fallback: %q", got)
+	}
+}
+
+func TestDriftIdentityFallsBackToTabWhenPaneIsAbsent(t *testing.T) {
+	if got := driftIdentity(AgentEntry{TabID: "w20:t3"}); !strings.Contains(got, "w20:t3") {
+		t.Fatalf("tab id was not used when no pane id exists: %q", got)
+	}
+}
+
+func TestDriftIdentityNeverReturnsEmpty(t *testing.T) {
+	// Even with nothing to go on, say so: a blank field reads as a rendering
+	// bug and sends the reader looking in the wrong place.
+	if got := driftIdentity(AgentEntry{}); strings.TrimSpace(got) == "" {
+		t.Fatal("a fully unidentified pane still produced an empty identity")
+	}
+}
+
+// The test that actually matters: through AuditWorkspaceDrift, not the helper.
+//
+// My first three tests here called driftIdentity directly, which proves the
+// helper works -- something never in doubt. The FAC-578 review caught exactly
+// that pattern in adjacent code: a test that exercises the validator instead of
+// the shipped path passes while the shipped path stays broken. This one fails
+// if the wiring is reverted.
+func TestAuditWorkspaceDriftReportsAnIdentityForAnUnnamedPane(t *testing.T) {
+	// A pane with NO name, drifted: sitting in w20 while its cwd names a
+	// workspace labelled wB. This is the live shape the herd-smith lane
+	// reported every beat.
+	agents := []AgentEntry{{Workspace: "w20", ForegroundCwd: "/somewhere/chainseer", PaneID: "w20:p7"}}
+	workspaces := []WorkspaceEntry{{WorkspaceID: "wB", Label: "chainseer"}}
+
+	findings := AuditWorkspaceDrift(agents, workspaces)
+	if len(findings) != 1 {
+		t.Fatalf("expected one drift finding, got %d: %+v", len(findings), findings)
+	}
+	if strings.TrimSpace(findings[0].Agent) == "" {
+		t.Fatal("drift finding carries an EMPTY agent: this is the unactionable line that survived every beat")
+	}
+	if !strings.Contains(findings[0].Agent, "w20:p7") {
+		t.Fatalf("drift finding does not locate the pane: %+v", findings[0])
+	}
+}
