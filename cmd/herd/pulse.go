@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/harvest"
+	"github.com/Kampe/Herdforge/pkg/kick"
 	"io"
 	"os"
 	"os/exec"
@@ -1124,4 +1125,45 @@ func pulseReviewPacket(lane pulse.AgentObservation, commits []harvest.UnlandedCo
 		"Drain the inbox before acting on pane text. An unread entry always means unfinished " +
 		"work, so never mark one done to clear the list.\n")
 	return b.String()
+}
+
+// ResumeGoal sends the harness resume verb to a lane whose goal loop stopped.
+//
+// FAC-614: an orchestrator sat at "Goal paused (/goal resume)" while herdr
+// reported agent_status=working -- the process was alive, the goal loop was
+// not. Every census called it healthy until an operator read the pane.
+//
+// The verb, not a prompt. A paused lane cannot consume plain text: kick already
+// established this (FAC-696) and reported "FAIL unconsumed prompt" correctly
+// and uselessly before it learned to send the verb instead.
+//
+// Re-checks the pane immediately before sending rather than trusting the
+// classification that planned this action. A beat can be seconds old, the lane
+// may have resumed on its own, and sending a resume verb into a lane that is
+// working is the one harm this path can do.
+func (a *livePulseActor) ResumeGoal(ctx context.Context, lane pulse.AgentObservation) error {
+	paneID := strings.TrimSpace(lane.PaneID)
+	if paneID == "" {
+		return fmt.Errorf("pulse: resume requires pane_id; lane %q has none", lane.Name)
+	}
+
+	out, err := exec.CommandContext(ctx, "herdr", "pane", "read", paneID, "--source", "recent-unwrapped").Output()
+	if err != nil {
+		// Unknown is not paused. Refusing here costs one beat; guessing sends
+		// the verb into a healthy lane.
+		return fmt.Errorf("pulse: resume refused for lane %q pane %s: pane unreadable, and an unreadable pane is UNKNOWN not paused: %w",
+			lane.Name, paneID, err)
+	}
+	if !kick.ContainsPausedGoalMarker(string(out)) {
+		return fmt.Errorf("pulse: resume refused for lane %q pane %s: pane no longer shows a paused goal; it resumed on its own between the beat and now",
+			lane.Name, paneID)
+	}
+
+	if err := exec.CommandContext(ctx, "herdr", "pane", "send-text", paneID, kick.GoalResumeVerb()).Run(); err != nil {
+		return fmt.Errorf("pulse: resume send-text lane %q pane %s: %w", lane.Name, paneID, err)
+	}
+	if err := exec.CommandContext(ctx, "herdr", "pane", "send-keys", paneID, "enter").Run(); err != nil {
+		return fmt.Errorf("pulse: resume submit lane %q pane %s: %w", lane.Name, paneID, err)
+	}
+	return nil
 }

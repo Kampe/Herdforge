@@ -743,6 +743,14 @@ func LoadBroadcastMarkers(path string) (map[string][]broadcast.ExclusionKind, er
 // goalResumeVerb is what a paused goal-driven lane actually accepts.
 const goalResumeVerb = "/goal resume"
 
+// GoalResumeVerb is what a paused goal-driven lane accepts.
+//
+// FAC-614: exported so pulse sends the same verb kick does. Two copies of this
+// string would drift the first time a harness changed it, and the failure would
+// be silent -- the lane would simply ignore the wrong verb, exactly as it
+// ignores a plain prompt.
+func GoalResumeVerb() string { return goalResumeVerb }
+
 // paneShowsPausedGoal reports whether a pane is sitting at a terminal goal
 // state, which the harness renders with its own resume hint.
 //

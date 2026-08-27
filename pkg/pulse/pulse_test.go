@@ -270,6 +270,10 @@ type recordingActor struct {
 	failRenewGeneration int64
 	// failReapLane forces ReapLane to fail for any lane when true.
 	failReapLane bool
+	// resumed records lanes handed to ResumeGoal (FAC-614).
+	resumed []string
+	// resumeErr forces ResumeGoal to fail when set.
+	resumeErr error
 	// failOpenReview forces OpenReview to fail for any lane when true.
 	failOpenReview bool
 	// consumeOnce tracks envelope IDs already acked (idempotent).
@@ -302,6 +306,14 @@ func (a *recordingActor) Dispatch(context.Context, string, string) error {
 	a.dispatch++
 	return nil
 }
+
+// FAC-614: records resume attempts so a test can assert a paused lane was
+// woken with the verb rather than left reported as busy.
+func (a *recordingActor) ResumeGoal(_ context.Context, lane AgentObservation) error {
+	a.resumed = append(a.resumed, lane.Name)
+	return a.resumeErr
+}
+
 func (a *recordingActor) ReapLane(_ context.Context, lane AgentObservation) error {
 	if a.failReapLane {
 		return errors.New("reap failed: fencing evidence incomplete")
