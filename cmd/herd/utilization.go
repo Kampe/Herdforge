@@ -36,6 +36,14 @@ func runUtilization(args []string, result *attention.Result) error {
 		return fmt.Errorf("attention triage unavailable, so utilization is UNKNOWN rather than empty")
 	}
 
+	// A wake queue nobody reads is the same dead handoff it exists to prevent,
+	// so the utilization beat is its consumer. Problems are REPORTED rather
+	// than fatal: an unreadable wake must not hide the lane states underneath.
+	wakes, wakeProblems := beat.PendingWakes(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	for _, p := range wakeProblems {
+		fmt.Fprintf(os.Stderr, "herd-utilization: %v\n", p)
+	}
+
 	states := make([]beat.LaneState, 0, len(result.Items))
 	for _, it := range result.Items {
 		st := beat.LaneState{
@@ -54,7 +62,16 @@ func runUtilization(args []string, result *attention.Result) error {
 		// number meaningless.
 		st.WorkAvailable = attention.NeedsEyes(it.Level) && !st.Held
 
-		if it.Status == "missing" {
+		// FAC-707: a wake RECORDED at the event that produced it beats a wake
+		// guessed here. `herd kick` is a generic nudge; the enqueued action is
+		// the exact next thing this lane was told to do when its last handoff
+		// completed. Prefer the recorded one, and say what caused it.
+		if w, ok := wakes[it.Name]; ok {
+			st.NextWake = w.Action
+			if w.Cause != "" {
+				st.NextWake += "   (from " + string(w.Event) + ": " + w.Cause + ")"
+			}
+		} else if it.Status == "missing" {
 			st.NextWake = "herd standing --only " + it.Name
 		} else {
 			st.NextWake = "herd kick"
