@@ -762,6 +762,10 @@ func TestStandingLaneWithSpentPreferenceReroutesInsteadOfLaunchingIntoZero(t *te
 			t.Fatal(err)
 		}
 	}
+	// CI runners do not have grok/claude on PATH. The fixtures above are the
+	// harnesses; put them first so harness_binary_missing cannot fire before
+	// the quota reroute under test.
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	pinQuota(t, dir, map[string]float64{"grok": 100, "claude": 10})
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	t.Setenv("HERD_MODE", "local")
