@@ -776,6 +776,22 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		return nil, fmt.Errorf("herd-route: invalid effort %q", effort)
 	}
 
+	// FAC-595: validate BOTH family inputs before they are used as filters.
+	// Each is compared by equality against a candidate's family, so a name the
+	// router does not recognise matches nothing and the filter silently does
+	// nothing. For a reviewer that is severe: excluded is set FROM AuthorFamily
+	// below, and the independence check further down compares against it too,
+	// so one unrecognised string disables reviewer independence twice and the
+	// resulting verdict looks valid while being inadmissible.
+	//
+	// Without this the failure surfaced as "no healthy launch candidate", which
+	// blames capacity for what is actually a bad argument.
+	if err := ValidateFamily(strings.TrimSpace(req.ExcludedFamily)); err != nil {
+		return nil, err
+	}
+	if err := ValidateFamily(strings.TrimSpace(req.AuthorFamily)); err != nil {
+		return nil, err
+	}
 	excluded := req.ExcludedFamily
 	isReviewer := req.Role == RoleReviewer || req.Role == RoleAssayer
 	if isReviewer {
