@@ -55,7 +55,12 @@ func AuditWorkspaceDrift(agents []AgentEntry, workspaces []WorkspaceEntry) []Wor
 		if !known || workspace == expected {
 			continue
 		}
-		findings = append(findings, WorkspaceDrift{Agent: agent.Name, Workspace: workspace, ExpectedWorkspace: expected, ForegroundCwd: cwd})
+		findings = append(findings, WorkspaceDrift{
+			Agent:             driftIdentity(agent),
+			Workspace:         workspace,
+			ExpectedWorkspace: expected,
+			ForegroundCwd:     cwd,
+		})
 	}
 	sort.SliceStable(findings, func(i, j int) bool {
 		if findings[i].Agent != findings[j].Agent {
@@ -370,4 +375,35 @@ func PickWorkspaceStrict(entries []WorkspaceEntry, repoName string) (string, boo
 		return first, true
 	}
 	return "", false
+}
+
+// driftIdentity returns something an operator can act on.
+//
+// FAC-712: this reported agent.Name, which is EMPTY for an unnamed pane -- a
+// plain terminal rather than a named agent. The herd-smith lane reported this
+// line on every beat for hours:
+//
+//	DRIFT agent= workspace=w20 expected=wB foreground_cwd=.../chainseer
+//
+// The drift was real and the finding was unactionable, which is exactly why it
+// survived beat after beat: nothing in that line locates the pane, and an
+// operator hunting for an agent by empty name is hunting for something that
+// does not exist. A report that names a problem and no identity cannot be
+// closed by anyone.
+//
+// An unnamed pane is still locatable by pane or tab id, and saying "unnamed"
+// out loud stops the search for a named agent before it starts.
+func driftIdentity(agent AgentEntry) string {
+	if n := strings.TrimSpace(agent.Name); n != "" {
+		return n
+	}
+	if p := strings.TrimSpace(agent.PaneID); p != "" {
+		return "unnamed pane " + p
+	}
+	if t := strings.TrimSpace(agent.TabID); t != "" {
+		return "unnamed tab " + t
+	}
+	// Never empty: a blank field reads as a rendering bug and sends the reader
+	// looking in the wrong place.
+	return "unidentified pane (no name, pane id or tab id)"
 }
