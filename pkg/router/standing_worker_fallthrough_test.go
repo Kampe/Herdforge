@@ -3,6 +3,8 @@ package router
 import (
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
 // FAC-615, second attempt. The first version fixed standingProviderSpent and
@@ -100,5 +102,50 @@ func TestANonStandingPinnedBuilderKeepsItsPin(t *testing.T) {
 	d, err := r.Decide(req)
 	if err == nil && !strings.EqualFold(d.Provider, "codex") {
 		t.Fatalf("a non-standing pinned builder was rerouted to %s; that pin is an operator override and must be honoured or refused, never silently moved", d.Provider)
+	}
+}
+
+// FAC-615: the operator requires a standing worker to land on a healthy Grok
+// 4.6 when one has capacity. That cannot be proven on the live fleet while grok
+// is at concurrency cap (observed: grok SKIP "at concurrency cap live=10 cap=2"
+// while claude was READY live=1 cap=2, which is why the live dry-run correctly
+// routes to claude).
+//
+// So it is proven deterministically instead: with claude unable to take work
+// and grok healthy, the fallthrough must select grok -- not refuse, and not
+// reach past grok to a lower-ranked surface.
+func TestStandingWorkerLandsOnGrokWhenGrokIsTheHealthySurface(t *testing.T) {
+	clearRouteEnv(t)
+
+	computed := map[string]usage.BurnState{
+		"codex":  {Available: false, Reason: "weekly-exhausted"},
+		"claude": {Available: false, Reason: "weekly-exhausted"},
+		"grok":   {Available: true, Reason: "ok"},
+	}
+	r := testRouter(computed, "codex", "claude", "grok")
+	prev := r.Probes
+	r.Probes = &Probes{
+		CLIPresent: prev.CLIPresent,
+		Now:        prev.Now,
+		LiveCount: func(provider, model, pool string) (int, error) {
+			if strings.EqualFold(provider, "grok") {
+				return 0, nil // grok has room
+			}
+			return 99, nil // everyone else is full
+		},
+	}
+
+	req := standingWorkerRequest("codex", "gpt-5.6-luna")
+	d, err := r.Decide(req)
+	if err != nil {
+		t.Fatalf("standing worker refused while grok was healthy and had capacity: %v", err)
+	}
+	if !strings.EqualFold(d.Provider, "grok") {
+		t.Fatalf("routed to %s/%s; want grok when grok is the only surface able to take work",
+			d.Provider, d.Model)
+	}
+	// Never Grok 4.5 -- explicit operator constraint.
+	if strings.Contains(strings.ToLower(d.Model), "4.5") {
+		t.Fatalf("routed to %s: Grok 4.5 is forbidden", d.Model)
 	}
 }
