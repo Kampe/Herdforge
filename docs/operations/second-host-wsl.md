@@ -120,6 +120,24 @@ source ~/.herd/env.sh
 `preflight` is the gate on whether this checkout may dispatch at all. Do not skip
 it because the primary passes; it checks *this* host.
 
+## Capacity before remote worktree preparation (FAC-584)
+
+`herd review --pool` refuses on the review host before candidate resolution or
+worktree preparation when Herdr is down, the agent census is unreadable, live
+reviewer slots are full, or memory headroom cannot admit another reviewer. The
+same check is the contract for any remote launcher (including
+`herd-review-remote`):
+
+```text
+ssh <review-host> 'cd <repo> && herd capacity --json --claim'
+```
+
+A non-zero exit or `"admit": false` means do not create a remote worktree and do
+not launch a reviewer. `--claim` holds a host-local admission lease so concurrent
+callers cannot all pass the same census. The JSON document carries
+`schema_version`, `observed_at`, Herdr state, memory, process census, limits,
+`available_slots`, `admit`, and a durable `reason`.
+
 ## Why review-only, and not builders
 
 A builder needs the live stack for blackbox work, and the stack is tied to one

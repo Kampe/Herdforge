@@ -55,6 +55,17 @@ func runPoolReview(ref string) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
+	// FAC-584: capacity BEFORE candidate resolution. resolvePoolReviewCandidateAt
+	// can prepare a detached worktree when none holds the SHA; that is already
+	// repository mutation. The W4 incident prepared a worktree and then died
+	// because herdr was down -- this gate makes that order impossible.
+	releaseCapacity, err := acquirePoolCapacityOrRefuse()
+	if err != nil {
+		return err
+	}
+	if releaseCapacity != nil {
+		defer releaseCapacity()
+	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.

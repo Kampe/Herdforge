@@ -181,14 +181,26 @@ type CapacityObservation struct {
 }
 
 // Capacity is the observation plus one decision with a named reason.
+//
+// FAC-584: schema_version and observed_at make this one stable JSON document a
+// remote launcher can gate on without scraping prose. available_slots is the
+// live remainder after the census, not the configured pool size.
 type Capacity struct {
+	SchemaVersion  int    `json:"schema_version"`
+	ObservedAt     string `json:"observed_at"`
 	CapacityObservation
-	ReviewLimit  int    `json:"review_limit"`
-	LimitDerived bool   `json:"review_limit_derived"`
-	NeedMiB      int64  `json:"need_mib"`
-	Admit        bool   `json:"admit"`
-	Reason       string `json:"reason"`
+	ReviewLimit    int    `json:"review_limit"`
+	LimitDerived   bool   `json:"review_limit_derived"`
+	AvailableSlots int    `json:"available_slots"`
+	NeedMiB        int64  `json:"need_mib"`
+	Admit          bool   `json:"admit"`
+	Reason         string `json:"reason"`
 }
+
+// capacitySchemaVersion is the JSON contract for `herd capacity --json` and the
+// review --pool preflight gate. Bump when a consumer field is renamed or
+// removed; additive fields do not require a bump.
+const capacitySchemaVersion = 1
 
 func (c Capacity) String() string {
 	verdict := "ADMIT"
@@ -241,7 +253,16 @@ const memoryPressurePct = 20
 const swapExhaustedPct = 75
 
 func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB int64) Capacity {
-	c := Capacity{CapacityObservation: o, ReviewLimit: limit, NeedMiB: perReviewerMiB + floorMiB}
+	c := Capacity{
+		SchemaVersion:       capacitySchemaVersion,
+		ObservedAt:          time.Now().UTC().Format(time.RFC3339Nano),
+		CapacityObservation: o,
+		ReviewLimit:         limit,
+		NeedMiB:             perReviewerMiB + floorMiB,
+	}
+	if limit > o.Reviewers {
+		c.AvailableSlots = limit - o.Reviewers
+	}
 
 	switch {
 	case !o.HerdrRunning:
@@ -445,6 +466,12 @@ func envInt64(key string, def int64) int64 {
 }
 
 func emitCapacity(c Capacity, asJSON bool) {
+	if c.SchemaVersion == 0 {
+		c.SchemaVersion = capacitySchemaVersion
+	}
+	if c.ObservedAt == "" {
+		c.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -452,6 +479,52 @@ func emitCapacity(c Capacity, asJSON bool) {
 		return
 	}
 	fmt.Println(c.String())
+}
+
+// poolCapacityObserve is the live census behind the review --pool gate.
+// Tests replace it so admission policy can be proven without a live host.
+var poolCapacityObserve = observeCapacity
+
+// acquirePoolCapacityOrRefuse is the FAC-584 launch gate: refuse BEFORE any
+// candidate resolution or worktree preparation when this host cannot safely
+// admit another reviewer. It holds the host-local admission lease across the
+// caller's preparation+launch window so concurrent pool launches cannot each
+// pass the same census (FAC-686).
+//
+// Remote launchers (herd-review-remote and siblings) must run the same check on
+// the review host before creating a remote worktree:
+//
+//	ssh <review-host> herd capacity --json --claim
+//
+// A non-zero exit or admit=false means do not prepare the candidate.
+func acquirePoolCapacityOrRefuse() (release func(), err error) {
+	perReviewer := envInt64("HERD_REVIEWER_RSS_MIB", 4096)
+	floor := envInt64("HERD_MEM_FLOOR_MIB", 6144)
+	ttl := 180 * time.Second
+	if v := strings.TrimSpace(os.Getenv("HERD_ADMISSION_LEASE_TTL")); v != "" {
+		if d, parseErr := time.ParseDuration(v); parseErr == nil && d > 0 {
+			ttl = d
+		}
+	}
+
+	rel, held, leaseErr := holdAdmissionLease(ttl)
+	if leaseErr != nil {
+		return nil, fmt.Errorf("review --pool capacity gate: admission lease: %w", leaseErr)
+	}
+	if !held {
+		return nil, fmt.Errorf("review --pool REFUSING before candidate preparation: another launch holds the admission lease on this host; serialize rather than racing it")
+	}
+
+	obs := poolCapacityObserve()
+	limit := derivedReviewLimit(obs.MemTotalMiB, perReviewer)
+	c := decideCapacity(obs, limit, perReviewer, floor)
+	c.LimitDerived = true
+	if !c.Admit {
+		rel()
+		return nil, fmt.Errorf("review --pool REFUSING before candidate preparation: %s", c.Reason)
+	}
+	fmt.Printf("review --pool capacity: %s\n", c.String())
+	return rel, nil
 }
 
 // admissionLeasePath is host-local on purpose: the census this lease protects is
