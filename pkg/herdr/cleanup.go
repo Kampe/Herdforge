@@ -202,6 +202,21 @@ type FleetStatus struct {
 	// "we could not read this" and "this build has no compare-and-close"
 	// (FAC-571).
 	Unfenceable int
+	// Reclaimable counts SETTLED lanes -- live agents reporting done/complete
+	// -- that are holding a slot while producing nothing.
+	//
+	// FAC-714: after FAC-660's residual fix (#618) working standing agents
+	// correctly consume capacity, and the fleet went to capacity=0 with
+	// working=11. That number is now TRUE and it names no remedy, which is the
+	// same defect this repository keeps finding: a count is reportable, only an
+	// identity or an action is usable. Two of those lanes were `done` and
+	// reclaimable at the moment capacity read zero.
+	//
+	// Reported rather than subtracted from Capacity. A settled lane genuinely
+	// occupies its slot until something reaps it, so counting it as free would
+	// invite dispatch into a seat that is still taken -- trading an honest zero
+	// for an optimistic lie.
+	Reclaimable int
 	Classes     map[TabClass]int
 }
 
@@ -303,6 +318,23 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 		p.Capacity = 0
 	}
 	return p
+}
+
+// CountReclaimable reports how many live agents are SETTLED -- done or complete
+// -- and therefore holding a slot while producing nothing.
+//
+// FAC-714: this exists so `capacity=0` can carry its own remedy. A saturated
+// fleet with reclaimable lanes and a saturated fleet with none are completely
+// different situations that read identically as a zero.
+func CountReclaimable(agents []AgentEntry) int {
+	n := 0
+	for _, a := range agents {
+		switch NormalizeTaskStatus(a.Status) {
+		case "done", "complete", "completed":
+			n++
+		}
+	}
+	return n
 }
 
 func authorityReady[T any](a Authority[T]) bool {

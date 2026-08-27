@@ -418,3 +418,43 @@ func TestEmptyRosterDoesNotProtectEverything(t *testing.T) {
 		t.Fatal("an empty roster must protect nothing, or reaping silently stops")
 	}
 }
+
+// FAC-714: after #618 made working standing agents consume capacity, the live
+// fleet went to capacity=0 with working=11. That zero is TRUE and it names no
+// remedy -- and two of those lanes were `done`, holding slots while producing
+// nothing.
+//
+// A saturated fleet with reclaimable lanes and a saturated fleet with none are
+// completely different situations that read identically as a zero.
+func TestCountReclaimableFindsSettledLanes(t *testing.T) {
+	got := CountReclaimable([]AgentEntry{
+		{Name: "forge-orchestrator", Status: "done"},
+		{Name: "forge-ux-comber-2918de97b5", Status: "done"},
+		{Name: "forge-api-crusader-2918de97b5", Status: "working"},
+		{Name: "forge-docs-custodian-2918de97b5", Status: "idle"},
+	})
+	if got != 2 {
+		t.Fatalf("reclaimable=%d, want 2 settled lanes", got)
+	}
+}
+
+func TestIdleIsNotReclaimable(t *testing.T) {
+	// An idle lane is waiting for work, not finished with it. Reaping it would
+	// destroy a warm lane that is about to be useful, so only SETTLED counts.
+	if got := CountReclaimable([]AgentEntry{{Name: "forge-perf-cost-guard", Status: "idle"}}); got != 0 {
+		t.Fatalf("an idle lane was reported reclaimable: %d", got)
+	}
+}
+
+func TestReclaimableDoesNotInflateCapacity(t *testing.T) {
+	// A settled lane genuinely occupies its slot until something reaps it.
+	// Counting it as free invites dispatch into a seat that is still taken --
+	// trading an honest zero for an optimistic lie.
+	got := ProjectLiveFleetStatus([]AgentEntry{
+		{Name: "forge-a", Status: "working", Workspace: "wB"},
+		{Name: "forge-b", Status: "done", Workspace: "wB"},
+	}, map[string]bool{"forge-a": true, "forge-b": true}, "wB", 1)
+	if got.Capacity != 0 {
+		t.Fatalf("capacity=%d, want 0: a settled lane must not be counted as a free slot", got.Capacity)
+	}
+}
