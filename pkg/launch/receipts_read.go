@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // DefaultReceiptPath is the launch-receipt log DefaultSink writes.
@@ -125,8 +126,23 @@ func BuilderFamilyForBranch(path, branch string) (string, bool) {
 // reaches is injected so the caller supplies real git ancestry and tests need
 // no repository. A receipt whose branch does not reach the SHA is skipped, not
 // guessed at.
-func BuilderFamilyReachingSHA(path, sha string, reaches func(branch string) bool) (string, bool) {
-	if strings.TrimSpace(sha) == "" || reaches == nil {
+//
+// Reachability alone is necessary but NOT sufficient, and the third review of
+// this card is what found the hole: standing lanes are relaunched on the SAME
+// branch as normal fleet operation, so
+//
+//	T0 launch A (anthropic) -> T1 A commits abc123 -> T2 relaunch B (xai)
+//
+// leaves BOTH receipts reaching abc123, and last-in-file-order handed the
+// commit to B -- a launch that had not started when abc123 was written. So the
+// receipt must also PREDATE the commit, and among those the latest wins: that
+// is the launch that was running when the commit landed.
+//
+// commitTime is the reviewed commit's author time. A zero commitTime, or a
+// receipt with no timestamp, cannot be ordered and so is not provenance --
+// unknown must never read as proven.
+func BuilderFamilyReachingSHA(path, sha string, commitTime time.Time, reaches func(branch string) bool) (string, bool) {
+	if strings.TrimSpace(sha) == "" || reaches == nil || commitTime.IsZero() {
 		return "", false
 	}
 	receipts, err := ReadReceipts(path)
@@ -134,19 +150,26 @@ func BuilderFamilyReachingSHA(path, sha string, reaches func(branch string) bool
 		return "", false
 	}
 	family := ""
+	var best time.Time
 	for _, r := range receipts {
 		if !r.Accepted {
 			continue
 		}
 		branch := strings.TrimSpace(r.Branch)
 		fam := strings.TrimSpace(r.BuilderFamily)
-		if branch == "" || fam == "" {
+		if branch == "" || fam == "" || r.CreatedAt.IsZero() {
+			continue
+		}
+		if r.CreatedAt.After(commitTime) {
+			continue
+		}
+		if !best.IsZero() && r.CreatedAt.Before(best) {
 			continue
 		}
 		if !reaches(branch) {
 			continue
 		}
-		family = fam
+		family, best = fam, r.CreatedAt
 	}
 	return family, family != ""
 }
