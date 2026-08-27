@@ -72,3 +72,43 @@ func ReadReceipts(path string) ([]Receipt, error) {
 	}
 	return out, nil
 }
+
+// BuilderFamilyForBranch resolves recorded builder provenance for a branch.
+//
+// FAC-620: review intake previously took builder family from a HEADER a
+// reviewer typed. That is an assertion, not provenance -- and after FAC-615's
+// provider fallthrough it is an assertion about a route the reviewer did not
+// observe. A lane configured for codex that ran claude would be attested as
+// whatever the reviewer believed.
+//
+// A launch receipt saying "lane X ran claude on branch Y", plus a commit on
+// branch Y, is traceable. This is the read side of that join.
+//
+// The LAST accepted receipt for the branch wins: a branch may be relaunched,
+// and the most recent launch is the one that produced the current tip.
+// Receipts without a family are skipped rather than treated as empty evidence,
+// because a receipt that could not derive a family was refused at write time
+// and any such row predates that rule.
+func BuilderFamilyForBranch(path, branch string) (string, bool) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return "", false
+	}
+	receipts, err := ReadReceipts(path)
+	if err != nil {
+		return "", false
+	}
+	family := ""
+	for _, r := range receipts {
+		if !r.Accepted {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(r.Branch), branch) {
+			continue
+		}
+		if f := strings.TrimSpace(r.BuilderFamily); f != "" {
+			family = f
+		}
+	}
+	return family, family != ""
+}
