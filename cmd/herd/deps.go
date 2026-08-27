@@ -124,7 +124,20 @@ func runDepsCheck() {
 		fmt.Fprintf(os.Stderr, "provenance extract: %v\n", xerr)
 		os.Exit(1)
 	}
-	snap, serr := store.SnapshotGraph(context.Background())
+	// Exact-card vacuity check must NOT pay for a whole-project SnapshotGraph.
+	// RequireTaskLaunch already scopes via SnapshotGraphForTask; the pre-check
+	// here used to fan out ListProjectRelations and time out before launch.
+	// Keep RejectEmptyProviderGraph, but feed it the task-scoped snapshot.
+	var desiredEdges []deps.DependencyEdge
+	if desired != nil && desired.Present {
+		var derr error
+		desiredEdges, derr = desired.DesiredBlocks()
+		if derr != nil {
+			fmt.Fprintf(os.Stderr, "provenance: %v\n", derr)
+			os.Exit(1)
+		}
+	}
+	snap, serr := deps.ExactCardGraphSnapshot(context.Background(), store, deps.Ref(ref), deps.TaskID(task.ID), desiredEdges)
 	if serr != nil {
 		fmt.Fprintf(os.Stderr, "snapshot graph: %v\n", serr)
 		os.Exit(1)
