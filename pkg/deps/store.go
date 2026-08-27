@@ -40,15 +40,17 @@ var ErrClaimFence = errors.New("deps: claim fence revision required")
 // ErrPostClaimDrift means the graph changed after the claim mutation.
 var ErrPostClaimDrift = errors.New("deps: post-claim graph drift (compensation required)")
 
-// ErrEmptyProviderGraph means the provider returned the digest of an empty
-// relation stream. That digest is not evidence of a successfully observed
-// dependency graph and must never make every task launchable.
+// ErrEmptyProviderGraph means the snapshot carries the digest of an empty
+// relation stream without proving a successful observation. That digest is
+// not evidence of a read graph and must never make every task launchable.
+// ProviderStore.snapshotFromRelations domain-separates observed-empty so a
+// real zero-edge card does not collide with this sentinel.
 var ErrEmptyProviderGraph = errors.New("deps: empty provider graph")
 
 const emptyProviderGraphRevision = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-// RejectEmptyProviderGraph rejects the provider snapshot shape that is
-// indistinguishable from a relation read that returned no data at all.
+// RejectEmptyProviderGraph rejects the vacuous empty-stream digest. An
+// observed empty graph from ProviderStore uses a different revision.
 func RejectEmptyProviderGraph(snap *GraphSnapshot) error {
 	if snap != nil && len(snap.Edges) == 0 && snap.ProviderRevision == emptyProviderGraphRevision {
 		return ErrEmptyProviderGraph
