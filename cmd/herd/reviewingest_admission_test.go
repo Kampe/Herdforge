@@ -176,3 +176,7 @@ func TestReviewIngestCollisionIsRefusedBeforeLedgerMutation(t *testing.T) {
 		t.Fatalf("collision consumed source: %v", err)
 	}
 }
+
+// FAC-620: the fake satisfies the corroboration lookup an asserted
+// builder-family needs when no launch receipt reaches the commit.
+func (f *fakeReviewIngestLedger) ProvenBuilderFamily(string) (string, error) { return "", nil }

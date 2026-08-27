@@ -55,6 +55,23 @@ type reaches func(branch, sha string) bool
 // attribution from the launch that actually produced it. commitTime closes
 // that: only receipts predating the commit qualify, latest one wins. An
 // unknown commit time yields no provenance rather than a guess.
+//
+// The fourth review found the hole that pairs with all of the above: every
+// rejection path here lands on "no qualifying receipt", and that outcome LEFT
+// THE ARTIFACT ALONE -- so a reviewer-asserted family sailed through unchecked.
+// Tightening the join therefore widened the hole it was closing. So when no
+// receipt qualifies, a BARE asserted family must be corroborated by an
+// exact-SHA ledger record or refused.
+//
+// corroborate reports the family the ledger can prove for this exact SHA. It
+// returns an error for an unreadable ledger, which is not proof of anything and
+// must not be reported as absence.
+//
+// candid reports that the artifact declined to claim a family at all -- an
+// honest "unknown", or a hedged claim the reviewer flagged as inferred. Those
+// are the pre-FAC-620 state and stay admissible; the ingest gate routes them to
+// provenance-unrecorded. Only an UNHEDGED assertion with nothing behind it is
+// refused, because that is the one shape that looks like proof and is not.
 func ReconcileBuilderFamilyForSHA(a *Artifact, receiptPath, sha string, commitTime time.Time, reachable reaches) error {
 	if a == nil || strings.TrimSpace(sha) == "" || reachable == nil {
 		return nil
@@ -74,6 +91,73 @@ func ReconcileBuilderFamilyForSHA(a *Artifact, receiptPath, sha string, commitTi
 		return fmt.Errorf("builder-family %q contradicts launch provenance %q recorded for a branch reaching %s; "+
 			"one of them is wrong about who wrote this code and admitting either would launder the disagreement",
 			stated, recorded, shortSHA(sha))
+	}
+	return nil
+}
+
+// RequireCorroboratedFamily stops an unproven builder-family being TRUSTED.
+//
+// It downgrades rather than refuses, and that distinction was measured, not
+// assumed. Refusing was the obvious reading, and it is wrong: the ledger record
+// that could corroborate a SHA is created BY ingesting a verdict for that SHA,
+// so no first review of any commit can ever be corroborated. A dry-run of the
+// refusing version against the live inbox refused the only artifact in it -- a
+// legitimate independent FAIL. A gate whose "absence" branch is the normal case
+// does not harden a pipeline, it halts one.
+//
+// So an uncorroborated assertion is rewritten to the unrecorded sentinel. The
+// review survives, and the field can no longer launder a guess into an
+// independence computation -- which was the whole harm. It lands in exactly the
+// bucket FAC-627/FAC-628 built for honestly-unprovable provenance.
+//
+// Refusal is kept for the two cases where something is actually WRONG rather
+// than merely unproven: the ledger contradicts the claim, or the ledger cannot
+// be read (unreadable is not proof of absence).
+//
+// unrecorded is the sentinel the caller's gate recognises. Passing "" disables
+// the downgrade and leaves the artifact untouched.
+func RequireCorroboratedFamily(a *Artifact, sha, unrecorded string, corroborate func(string) (string, error), candid func(string) bool) error {
+	if a == nil || strings.TrimSpace(sha) == "" {
+		return nil
+	}
+	return requireCorroboration(a, sha, unrecorded, corroborate, candid)
+}
+
+// requireCorroboration handles the no-qualifying-receipt case.
+//
+// Untouched: no claim at all, or a candid/hedged one. Untouched: a claim the
+// ledger independently proves for this exact SHA. Downgraded: a bare assertion
+// with neither -- it is indistinguishable from a guess. Refused: a claim the
+// ledger contradicts, or one that could not be checked at all.
+func requireCorroboration(a *Artifact, sha, unrecorded string, corroborate func(string) (string, error), candid func(string) bool) error {
+	stated := strings.TrimSpace(a.BuilderFamily)
+	if stated == "" {
+		return nil
+	}
+	if candid != nil && candid(stated) {
+		return nil
+	}
+	if corroborate == nil {
+		// No way to check is not the same as checked-and-absent. Refusing here
+		// would punish a caller that simply has no ledger wired; admitting is
+		// the pre-FAC-620 behaviour and the caller keeps its own gate.
+		return nil
+	}
+	proven, err := corroborate(sha)
+	if err != nil {
+		return fmt.Errorf("builder-family %q could not be checked for %s: %w; an unreadable ledger is not proof of provenance",
+			stated, shortSHA(sha), err)
+	}
+	if proven == "" {
+		// Not refused: downgraded. The review is real work and survives; the
+		// unproven family simply stops being usable as provenance.
+		if unrecorded != "" {
+			a.BuilderFamily = unrecorded
+		}
+		return nil
+	}
+	if !strings.EqualFold(stated, proven) {
+		return fmt.Errorf("builder-family %q contradicts ledger-recorded %q for %s", stated, proven, shortSHA(sha))
 	}
 	return nil
 }

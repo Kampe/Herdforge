@@ -150,7 +150,8 @@ func runReviewIngest() {
 		// text alone is not evidence: branches are reused, relaunched and
 		// rebased, and a confidently wrong family is worse than none because
 		// independence is computed against it.
-		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA, commitAuthorTime(a.SHA), branchReachesSHA); err != nil {
+		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA,
+			commitCreationTime(a.SHA), branchReachesSHA); err != nil {
 			emit.refused(f, err)
 			refused++
 			continue
@@ -161,6 +162,16 @@ func runReviewIngest() {
 			continue
 		}
 		if err := a.ValidatePassDiff(diffEmpty); err != nil {
+			emit.refused(f, err)
+			refused++
+			continue
+		}
+		// FAC-620: an asserted builder-family with no launch receipt reaching the
+		// commit and no ledger record proving it is DOWNGRADED to unrecorded, so
+		// it cannot be used to compute reviewer/builder independence. Before the
+		// gate assignment below, which is what routes it to provenance-unrecorded.
+		if err := reviewingest.RequireCorroboratedFamily(&a, a.SHA, reviewledger.FamilyUnrecorded,
+			ledger.ProvenBuilderFamily, artifactIsCandidAboutFamily); err != nil {
 			emit.refused(f, err)
 			refused++
 			continue
@@ -652,6 +663,9 @@ type reviewIngestLedger interface {
 	Validate(reviewledger.IngestOpts) error
 	VerdictFor(string) (reviewledger.LedgerRow, bool, error)
 	VerdictForReviewer(string, string) (reviewledger.LedgerRow, bool, error)
+	// FAC-620: the corroboration an asserted builder-family needs when no
+	// launch receipt reaches the commit.
+	ProvenBuilderFamily(string) (string, error)
 }
 
 type reviewIngestDecision string
@@ -681,6 +695,15 @@ const (
 // typos "anthropc" is asserting authorship it did not verify, and FAC-590 exists
 // to refuse exactly that. Only an explicit unknown -- optionally followed by the
 // reviewer's explanation, which several write at length -- is honest.
+// artifactIsCandidAboutFamily reports that the artifact declined to claim a
+// family it could not prove -- an honest "unknown", or a hedged claim. Those
+// stay admissible and route to provenance-unrecorded; only a bare unhedged
+// assertion needs corroborating.
+func artifactIsCandidAboutFamily(raw string) bool {
+	_, candid := honestlyUnrecordedFamily(raw)
+	return candid
+}
+
 func honestlyUnrecordedFamily(raw string) (string, bool) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	if v == "" {
@@ -1836,16 +1859,36 @@ func branchReachesSHA(branch, sha string) bool {
 	return exec.Command("git", "merge-base", "--is-ancestor", sha, branch).Run() == nil
 }
 
-// commitAuthorTime is when the reviewed commit was written. A launch that
-// started AFTER it cannot have produced it, however reachable its branch is.
-// An unreadable time returns zero, which the join treats as no provenance --
-// never as permission to attribute on reachability alone.
-func commitAuthorTime(sha string) time.Time {
+// commitCreationTime is when the reviewed commit OBJECT was created. A launch
+// that started after it cannot have produced it, however reachable its branch.
+//
+// Committer time (%cI), not author time (%aI). The fourth review of FAC-620
+// caught that distinction being wrong: `git commit --amend` and `git
+// cherry-pick` both PRESERVE the original author timestamp and stamp a new
+// committer timestamp. So a lane launched at 21:00 that amends a commit
+// carrying a 20:00 author time would have its own receipt rejected as
+// "recorded after the commit" -- and because a rejected receipt lands on
+// no-provenance, the reviewer's asserted family was then never checked at all.
+// The tightening reopened the hole it existed to close, for two of the most
+// ordinary git workflows there are.
+//
+// Ambiguity policy, stated explicitly rather than left implicit:
+//
+//   - The comparison is strict: CreatedAt <= creation time, no skew grace. A
+//     grace window would re-admit the steal this guard exists to stop, by
+//     exactly its own width.
+//   - A rebase, amend or cherry-pick moves creation time FORWARD, so receipts
+//     from the original authoring launch may stop qualifying. That is accepted:
+//     it yields no provenance, and an asserted family then has to be
+//     corroborated by the ledger or be refused. Failing closed is the point.
+//   - An unreadable or unparseable time returns zero, which the join treats as
+//     no provenance -- never as permission to attribute on reachability alone.
+func commitCreationTime(sha string) time.Time {
 	sha = strings.TrimSpace(sha)
 	if sha == "" {
 		return time.Time{}
 	}
-	out, err := exec.Command("git", "show", "-s", "--format=%aI", sha).Output()
+	out, err := exec.Command("git", "show", "-s", "--format=%cI", sha).Output()
 	if err != nil {
 		return time.Time{}
 	}
