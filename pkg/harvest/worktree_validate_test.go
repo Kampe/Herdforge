@@ -15,18 +15,23 @@ func TestClassifyHarvestInputExcludesScratchpad(t *testing.T) {
 	}
 }
 
-func TestClassifyHarvestInputExcludesMissingGit(t *testing.T) {
+func TestClassifyHarvestInputStrictExcludesMissingGit(t *testing.T) {
 	dir := t.TempDir()
-	ok, reason := ClassifyHarvestInput(dir, dir)
+	ok, reason := ClassifyHarvestInputStrict(dir, dir)
 	if ok || !strings.Contains(reason, "not a git worktree") {
 		t.Fatalf("ok=%v reason=%q", ok, reason)
 	}
 }
 
+func TestClassifyHarvestInputAllowsOrdinaryDir(t *testing.T) {
+	dir := t.TempDir()
+	ok, reason := ClassifyHarvestInput("/repo", dir)
+	if !ok || reason != "" {
+		t.Fatalf("ok=%v reason=%q", ok, reason)
+	}
+}
+
 func TestHarvestSkipsScratchWithoutUNKNOWNError(t *testing.T) {
-	// Build a fake listWorktrees by using a real repo with an added scratch-like path
-	// that is NOT linked: we inject via Classify only through harvest filter unit.
-	// Direct unit: skipped slice construction.
 	root := t.TempDir()
 	scratch := filepath.Join(root, "scratchpad", "mcp-nonvacuity-check")
 	if err := os.MkdirAll(scratch, 0o755); err != nil {
