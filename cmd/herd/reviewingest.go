@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/committime"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/mail"
@@ -1848,53 +1849,19 @@ func reachableFromBranch(repoRoot, sha, branch string) bool {
 // ancestry. FAC-620: this is what makes a launch receipt evidence about a
 // COMMIT rather than about a name.
 func branchReachesSHA(branch, sha string) bool {
-	branch = strings.TrimSpace(branch)
-	sha = strings.TrimSpace(sha)
-	if branch == "" || sha == "" {
-		return false
-	}
-	// --is-ancestor exits 0 when sha is reachable from branch. Any error, a
-	// missing branch or an unknown sha, is NOT reachability: unknown must never
-	// read as proven.
-	return exec.Command("git", "merge-base", "--is-ancestor", sha, branch).Run() == nil
+	// commitIsAncestor is the tree's one definition of "does ref contain sha".
+	// FAC-561 was caused by two copies of that check disagreeing about what "on
+	// this branch" meant; a second copy here would be the third.
+	return commitIsAncestor("", sha, branch)
 }
 
-// commitCreationTime is when the reviewed commit OBJECT was created. A launch
-// that started after it cannot have produced it, however reachable its branch.
+// commitCreationTime is when the reviewed commit OBJECT was created.
 //
-// Committer time (%cI), not author time (%aI). The fourth review of FAC-620
-// caught that distinction being wrong: `git commit --amend` and `git
-// cherry-pick` both PRESERVE the original author timestamp and stamp a new
-// committer timestamp. So a lane launched at 21:00 that amends a commit
-// carrying a 20:00 author time would have its own receipt rejected as
-// "recorded after the commit" -- and because a rejected receipt lands on
-// no-provenance, the reviewer's asserted family was then never checked at all.
-// The tightening reopened the hole it existed to close, for two of the most
-// ordinary git workflows there are.
-//
-// Ambiguity policy, stated explicitly rather than left implicit:
-//
-//   - The comparison is strict: CreatedAt <= creation time, no skew grace. A
-//     grace window would re-admit the steal this guard exists to stop, by
-//     exactly its own width.
-//   - A rebase, amend or cherry-pick moves creation time FORWARD, so receipts
-//     from the original authoring launch may stop qualifying. That is accepted:
-//     it yields no provenance, and an asserted family then has to be
-//     corroborated by the ledger or be refused. Failing closed is the point.
-//   - An unreadable or unparseable time returns zero, which the join treats as
-//     no provenance -- never as permission to attribute on reachability alone.
+// The rule itself -- committer time, never author time, and zero when
+// unanswerable -- lives in pkg/committime, because pkg/candidateindex asks the
+// same question and CI's duplicate-rule gate caught the two copies. That gate
+// is right: the author/committer distinction had already been got wrong here
+// once, and two copies means a fix lands on only one of them.
 func commitCreationTime(sha string) time.Time {
-	sha = strings.TrimSpace(sha)
-	if sha == "" {
-		return time.Time{}
-	}
-	out, err := exec.Command("git", "show", "-s", "--format=%cI", sha).Output()
-	if err != nil {
-		return time.Time{}
-	}
-	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
-	if err != nil {
-		return time.Time{}
-	}
-	return t
+	return committime.Of("", sha)
 }

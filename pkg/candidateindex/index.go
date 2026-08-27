@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/committime"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/mail"
@@ -446,10 +447,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 					if sha40Re.MatchString(head) {
 						worktreeCandidate := getOrCreate(ref, head, provider.PriorityMedium)
 						addSource(candidateKey{ref: ref, sha: head}, SourceWorktree)
-						observedAt := time.Time{}
-						if out, showErr := exec.Command("git", "-C", wt, "show", "-s", "--format=%cI", head).Output(); showErr == nil {
-							observedAt, _ = time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
-						}
+						observedAt := committime.Of(wt, head)
 						observe(ref, head, SourceWorktree, observedAt, 0)
 						list = append(list, worktreeCandidate)
 					}
