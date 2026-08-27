@@ -502,6 +502,14 @@ func (s *ProviderStore) snapshotFromRelations(ctx context.Context, rels []provid
 		return out[i].CanonicalKey() < out[j].CanonicalKey()
 	})
 	h := sha256.New()
+	// Domain-separate a successful empty observation from SHA256("").
+	// RejectEmptyProviderGraph treats the empty-stream digest as vacuous
+	// (FAC-464). ValidateLaunch now applies that guard to every snapshot,
+	// including scoped zero-edge cards, so an observed empty graph must not
+	// collide with the sentinel or every no-deps launch fails closed.
+	if len(out) == 0 {
+		_, _ = h.Write([]byte("deps:observed-empty-graph\n"))
+	}
 	for _, e := range out {
 		_, _ = h.Write([]byte(e.RelationID + "|" + e.CanonicalKey()))
 		_, _ = h.Write([]byte{0})
