@@ -28,6 +28,7 @@ type UnmergedWork struct {
 
 type HarvestResult struct {
 	UnmergedWorktrees []UnmergedWork `json:"unmerged_worktrees"`
+	Skipped           []HarvestSkip  `json:"skipped,omitempty"`
 	Errors            []string       `json:"errors,omitempty"`
 }
 
@@ -138,7 +139,15 @@ func (h *Harvester) harvest(ctx context.Context, fetch bool) (*HarvestResult, er
 		return nil, fmt.Errorf("list worktrees: %w", err)
 	}
 
-	eligible := worktrees
+	eligible := make([]string, 0, len(worktrees))
+	for _, wtPath := range worktrees {
+		ok, reason := ClassifyHarvestInput(h.repoRoot, wtPath)
+		if !ok {
+			result.Skipped = append(result.Skipped, HarvestSkip{Path: wtPath, Reason: reason})
+			continue
+		}
+		eligible = append(eligible, wtPath)
+	}
 	// Capacity is checked before goroutine fan-out so a failed probe cannot
 	// start concurrent fetches or leave a partially-mutating harvest.
 	mode := noFetch
