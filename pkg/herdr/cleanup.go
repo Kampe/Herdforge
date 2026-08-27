@@ -268,12 +268,17 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 			class = TabUserShell
 		case NormalizeAssignmentStatus(agent.AssignmentStatus) == "queued":
 			class = TabQueued
-		case isStandingAgent(agent.Name, standing):
-			class = TabStanding
+		// FAC-660 residual / seq 3130: a standing-named agent that is WORKING
+		// is productive capacity, not idle standing inventory. Classifying
+		// standing names before live status made herd status report
+		// working=1 standing=13 while herdr/pulse showed ~14 busy forge-*
+		// agents. Match on activity first; standing is the idle remainder.
 		case NormalizeTaskStatus(agent.Status) == "in-progress":
 			class = TabActive
 		case NormalizeTaskStatus(agent.Status) == "recovering":
 			class = TabRecovering
+		case isStandingAgent(agent.Name, standing):
+			class = TabStanding
 		default:
 			class = TabBlocked
 		}
