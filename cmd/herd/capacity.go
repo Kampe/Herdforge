@@ -84,6 +84,7 @@ func runCapacity(args []string) error {
 	limit := fs.Int("review-limit", 0, "max concurrent live reviewers; 0 derives it from this host's memory budget")
 	perReviewer := fs.Int64("reviewer-mib", envInt64("HERD_REVIEWER_RSS_MIB", 4096), "expected TOTAL cost of one reviewer including the toolchain it spawns, in MiB")
 	floor := fs.Int64("floor-mib", envInt64("HERD_MEM_FLOOR_MIB", 6144), "memory that must remain free AFTER the new reviewer, for sshd/herdr and the host OS")
+	refreshLaunch := fs.Bool("refresh-launchable", false, "probe the router for live provider concurrency and cache it; slow (20-90s) and never run inline")
 	claim := fs.Bool("claim", false, "hold an admission lease across the caller's launch, so concurrent callers cannot all pass the same check")
 	holdFor := fs.Duration("claim-ttl", defaultAdmissionLeaseTTL, "how long a claimed admission stays held before it expires")
 	if err := fs.Parse(args); err != nil {
@@ -131,8 +132,24 @@ func runCapacity(args []string) error {
 		effectiveLimit = derivedReviewLimit(obs.MemTotalMiB, *perReviewer)
 	}
 
+	if *refreshLaunch {
+		// Explicit, operator-invoked, and slow ON PURPOSE. The router doctor
+		// takes 20-90s because it queries live quota per provider; that cost is
+		// acceptable when someone asked for it and unacceptable inline.
+		l, err := refreshLaunchable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd capacity: refresh-launchable: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("provider concurrency refreshed: %s\n", l.Detail)
+		return nil
+	}
+
 	c := decideCapacity(obs, effectiveLimit, *perReviewer, *floor)
 	c.LimitDerived = *limit <= 0
+	// FAC-609: bind the memory-derived ceiling to what a provider can actually
+	// accept. An unreadable router stays UNKNOWN and never reduces the limit.
+	applyLaunchable(&c, launchableReviewSlots())
 
 	emitCapacity(c, *asJSON)
 	if !c.Admit {
@@ -189,12 +206,20 @@ type Capacity struct {
 	SchemaVersion int    `json:"schema_version"`
 	ObservedAt    string `json:"observed_at"`
 	CapacityObservation
-	ReviewLimit    int    `json:"review_limit"`
-	LimitDerived   bool   `json:"review_limit_derived"`
-	AvailableSlots int    `json:"available_slots"`
-	NeedMiB        int64  `json:"need_mib"`
-	Admit          bool   `json:"admit"`
-	Reason         string `json:"reason"`
+	ReviewLimit    int  `json:"review_limit"`
+	LimitDerived   bool `json:"review_limit_derived"`
+	AvailableSlots int  `json:"available_slots"`
+
+	// FAC-609: provider concurrency is a second, independent ceiling. Reporting
+	// memory headroom a provider cannot accept sends a coordinator into a retry
+	// loop against a wall.
+	LaunchableSlots   int    `json:"launchable_slots,omitempty"`
+	LaunchableKnown   bool   `json:"launchable_known"`
+	LaunchableBinding bool   `json:"launchable_is_binding_constraint,omitempty"`
+	LaunchableDetail  string `json:"launchable_detail,omitempty"`
+	NeedMiB           int64  `json:"need_mib"`
+	Admit             bool   `json:"admit"`
+	Reason            string `json:"reason"`
 }
 
 // capacitySchemaVersion is the JSON contract for `herd capacity --json` and the
