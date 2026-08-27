@@ -6320,8 +6320,9 @@ func prepareStandingWorktreeWith(lane *config.LaneDef, add func(path, branch str
 		if err := add(lane.Worktree, branch); err != nil {
 			return fmt.Errorf("create standing worktree %s: %w", lane.Name, err)
 		}
+		return nil
 	}
-	return nil
+	return readmitStandingWorktree(lane.Name, wtPath)
 }
 
 func routedLaneDecision(ctx context.Context, task *provider.Task) func(*config.LaneDef) (*router.LaunchDecision, error) {

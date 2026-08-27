@@ -149,6 +149,10 @@ type Receipt struct {
 	BuilderFamily string `json:"builder_family,omitempty"`
 	Branch        string `json:"branch,omitempty"`
 	Worktree      string `json:"worktree,omitempty"`
+	// AdmittedBase is the commit at HEAD when a standing worktree passed its
+	// origin/main admission gate. It lets a later candidate be tied to the
+	// world its lane could actually see when work began.
+	AdmittedBase string `json:"admitted_base,omitempty"`
 	// PullRequest is the PR this launch's work is proposed through, and
 	// CandidateSHA the exact commit it produced.
 	//

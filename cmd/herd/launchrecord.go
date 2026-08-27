@@ -149,6 +149,10 @@ func recordResolvedLaunchReceipt(decision *router.LaunchDecision, lane *config.L
 	if branch == "" {
 		return fmt.Errorf("cannot resolve a branch in %s; a receipt with no branch cannot be joined to a commit", cwd)
 	}
+	admittedBase, err := worktreeHeadSHA(cwd)
+	if err != nil {
+		return fmt.Errorf("resolve admitted base for %s: %w", cwd, err)
+	}
 	// FAC-620 P2: TaskRef is the JOIN KEY every consumer uses -- review intake
 	// matches on it, and the signed-context path refuses when it does not equal
 	// the ref under review. The first version of this writer set Lane and Name
@@ -173,6 +177,7 @@ func recordResolvedLaunchReceipt(decision *router.LaunchDecision, lane *config.L
 		BuilderFamily: family,
 		CWD:           cwd,
 		Branch:        branch,
+		AdmittedBase:  admittedBase,
 		Repository:    strings.TrimSpace(repository),
 		TabID:         strings.TrimSpace(tabID),
 		PaneID:        strings.TrimSpace(paneID),
