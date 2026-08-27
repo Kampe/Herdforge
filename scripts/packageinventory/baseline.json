@@ -6,7 +6,7 @@
     "internal": 1,
     "production": 102,
     "secondary": 1,
-    "unwired": 24
+    "unwired": 25
   },
   "packages": [
     {
@@ -301,6 +301,12 @@
       "path": "github.com/Kampe/Herdforge/pkg/herdr",
       "class": "production",
       "test_importers": 5,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/integration",
+      "class": "unwired",
+      "test_importers": 0,
       "has_own_tests": true
     },
     {
