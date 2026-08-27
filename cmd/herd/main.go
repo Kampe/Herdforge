@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Kampe/Herdforge/pkg/beat"
 	"github.com/Kampe/Herdforge/pkg/lock"
 
 	"github.com/Kampe/Herdforge/pkg/activate"
@@ -8058,6 +8059,15 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	// that returns nothing actionable is indistinguishable from a broken one.
 	// Each phase is now timed and reports what it produced, and a timeout emits
 	// the partial that was already in hand.
+	// FAC-705: refuse a repository-wide scan inside a declared exact-action
+	// beat. A supervisor whose beat was "launch this one queued review" ran
+	// drain instead, burned minutes, and had to be killed from the coordinator
+	// pane -- the review was never launched. drain was not broken; it was the
+	// wrong tool for a beat whose action was already known.
+	if err := beat.RefuseBroadScan("herd drain", "herd review <ref> --pool --sha <sha>"); err != nil {
+		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
+		return 2
+	}
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
 	}
