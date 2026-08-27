@@ -15,10 +15,9 @@ type HarvestSkip struct {
 	Reason string `json:"reason"`
 }
 
-// ClassifyHarvestInput decides whether a path should enter harvest/drain
-// scanning (FAC-604). Scratch and missing paths are excluded with a named
-// reason. Residual "not a git worktree" failures are reclassified as
-// exclusions at the drain printer, never UNKNOWN.
+// ClassifyHarvestInput is the soft pre-filter (scratch / missing / not-a-dir).
+// Production harvest uses ClassifyHarvestInputStrict; keep this helper for
+// callers that only need the scratch class without a principal-linkage probe.
 func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
 	_ = repoRoot
 	path = strings.TrimSpace(path)
@@ -38,9 +37,10 @@ func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
 	return true, ""
 }
 
-// ClassifyHarvestInputStrict adds principal-linkage checks for unit tests and
-// callers that need a hard worktree proof. Uses pkg/gitroot.CommonDir so the
-// FAC-575 duplicate-literal gate does not grow a second --git-common-dir site.
+// ClassifyHarvestInputStrict is the FAC-604 production gate: soft pre-filter
+// plus .git presence and principal common-dir linkage via pkg/gitroot.CommonDir
+// (FAC-575: no second --git-common-dir literal). Called from Harvester.harvest
+// before any per-path scan work.
 func ClassifyHarvestInputStrict(repoRoot, path string) (ok bool, reason string) {
 	ok, reason = ClassifyHarvestInput(repoRoot, path)
 	if !ok {

@@ -221,15 +221,43 @@ func (b *identityDriftBackend) StatFS(string) (resources.Capacity, error) {
 	return resources.Capacity{FilesystemID: id, TotalBytes: 1 << 40, FreeBytes: 1 << 40, TotalInodes: 1 << 30, FreeInodes: 1 << 30}, nil
 }
 
+// capacityGit runs real git for fixture setup only. Harvest's runtime git is
+// still mocked via execCommandContext; FAC-604 Strict needs a real .git +
+// common-dir linkage so stub paths reach admission instead of being skipped.
+func capacityGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=capacity", "GIT_AUTHOR_EMAIL=capacity@test",
+		"GIT_COMMITTER_NAME=capacity", "GIT_COMMITTER_EMAIL=capacity@test",
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v (%s)", args, err, out)
+	}
+}
+
+func initCapacityRepo(t *testing.T, root string) {
+	t.Helper()
+	capacityGit(t, root, "init", "-q", "-b", "main")
+	capacityGit(t, root, "config", "user.email", "capacity@test")
+	capacityGit(t, root, "config", "user.name", "capacity")
+	capacityGit(t, root, "commit", "--allow-empty", "-q", "-m", "base")
+}
+
+// DISCLOSURE (FAC-604 repair): fixtures previously MkdirAll'd non-git stub
+// paths so Strict was walked back to keep capacity-gate tests green. That made
+// production scan-then-filter. Fixtures now create real linked worktrees so
+// Strict can stay on the Harvest() path; the gate under test is still admission
+// ordering, not worktree inventedness.
 func newCapacityBehaviorFixture(t *testing.T, worktreeCount int) (*Harvester, *capacityBehaviorCommands) {
 	t.Helper()
 	root := t.TempDir()
+	initCapacityRepo(t, root)
 	commands := &capacityBehaviorCommands{root: root, order: &capacityBehaviorTimeline{}, branchOutputs: []string{"main"}}
 	for i := 0; i < worktreeCount; i++ {
 		wt := filepath.Join(root, "wt-"+string(rune('a'+i)))
-		if err := os.MkdirAll(wt, 0o755); err != nil {
-			t.Fatal(err)
-		}
+		capacityGit(t, root, "worktree", "add", "-q", "-b", "feat-"+string(rune('a'+i)), wt)
 		commands.wts = append(commands.wts, wt)
 	}
 	h := NewHarvester(root)
@@ -319,13 +347,13 @@ func TestSameRootFeatureDirectFetchUsesExactAdmissionToken(t *testing.T) {
 
 func TestDirectRetargetUsesAdmittedCanonicalDirectoryForAllGitCommands(t *testing.T) {
 	root := t.TempDir()
+	initCapacityRepo(t, root)
 	realWorktree := filepath.Join(root, "real-worktree")
 	alias := filepath.Join(root, "alias-worktree")
 	newTarget := filepath.Join(root, "retargeted-worktree")
-	for _, path := range []string{realWorktree, newTarget} {
-		if err := os.MkdirAll(path, 0o755); err != nil {
-			t.Fatal(err)
-		}
+	capacityGit(t, root, "worktree", "add", "-q", "-b", "real-feature", realWorktree)
+	if err := os.MkdirAll(newTarget, 0o755); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Symlink(realWorktree, alias); err != nil {
 		t.Fatal(err)
@@ -398,11 +426,10 @@ func TestSuccessfulBatchAdmissionOrderAndExactlyOnceScopes(t *testing.T) {
 
 func TestCanonicalSymlinkMappingCannotTriggerSecondAdmission(t *testing.T) {
 	root := t.TempDir()
+	initCapacityRepo(t, root)
 	realWorktree := filepath.Join(root, "real-worktree")
 	alias := filepath.Join(root, "alias-worktree")
-	if err := os.MkdirAll(realWorktree, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	capacityGit(t, root, "worktree", "add", "-q", "-b", "real-feature", realWorktree)
 	if err := os.Symlink(realWorktree, alias); err != nil {
 		t.Fatal(err)
 	}
