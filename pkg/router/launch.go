@@ -818,6 +818,35 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		return nil, fmt.Errorf("herd-route: family posture: %w", modeErr)
 	}
 	requestedProvider := req.RequestedProvider
+
+	// FAC-615: a STANDING worker lane's configured provider is CONFIG, not an
+	// operator pin, and it must fall through when that provider cannot take
+	// work.
+	//
+	// launchStandingLane sets RequestedProvider (not Preferred) for
+	// pinnedBuilder roles -- worker, forge-smith, recovery. Every lane in the
+	// live incident is a worker: defi-crusader, platform-ops, api-crusader,
+	// chain-indexer, nft-data-engineer. So PreferredProvider was empty, the
+	// standing block below never ran, and standingProviderSpent was never
+	// called. The first version of this fix was therefore UNREACHABLE for
+	// exactly the lanes it was written for -- caught by independent review, not
+	// by its own tests, which drove standingProviderSpent directly.
+	//
+	// pinnedBuilder conflates two different things: "this role is a builder"
+	// and "an operator pinned this provider". Only the second should be hard.
+	// A standing lane's provider comes from .herd/herd.yaml; treating it as an
+	// override is what killed five lanes beside a healthy Grok 4.6 that direct
+	// herdr launch used successfully at the same moment.
+	//
+	// A NON-standing pinned builder keeps its pin: that is a real override and
+	// the router still refuses an unroutable provider on its own.
+	if req.Standing && strings.TrimSpace(req.PreferredProvider) == "" &&
+		strings.TrimSpace(requestedProvider) != "" {
+		if r.standingProviderSpent(requestedProvider, req.RequestedModel) {
+			requestedProvider = ""
+		}
+	}
+
 	if req.Standing && strings.TrimSpace(req.PreferredProvider) != "" {
 		// A standing lane's preference is normally a hard provider-family
 		// boundary: it may fall back within its provider, never into the global
@@ -850,11 +879,28 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if err != nil {
 		return nil, err
 	}
+	// FAC-615: refuse only when the REQUESTED provider itself cannot host a
+	// lane -- not when some other candidate in the waterfall cannot.
+	//
+	// The loop below already filters unlaunchable candidates. This guard ran
+	// first and refused outright whenever ANY candidate was unlaunchable and a
+	// RequestedProvider was set. Standing worker lanes always set
+	// RequestedProvider, so once the provider fallthrough started reaching the
+	// global waterfall, the mere PRESENCE of opencode/ollama in the candidate
+	// list killed the launch:
+	//
+	//	herd-route: provider "ollama" is not launchable as a Herdr lane
+	//
+	// observed live on chain-indexer after the fallthrough was wired. A
+	// candidate that cannot host a lane is not an error, it is simply not a
+	// candidate -- structurally unlaunchable surfaces are excluded, and only a
+	// pin on such a surface is a genuine operator error worth refusing.
 	for _, provider := range candidates {
-		if !IsLaneLaunchable(provider) {
-			if req.RequestedProvider != "" {
-				return nil, fmt.Errorf("herd-route: provider %q is not launchable as a Herdr lane; choose a supported harness (codex, claude, grok, agy, or opencode)", provider)
-			}
+		if IsLaneLaunchable(provider) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(req.RequestedProvider), strings.TrimSpace(provider)) {
+			return nil, fmt.Errorf("herd-route: provider %q is not launchable as a Herdr lane; choose a supported harness (codex, claude, grok, agy, or opencode)", provider)
 		}
 	}
 	launchable := candidates[:0]
@@ -885,6 +931,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	var picks []scored
 	modelOverride := map[string]string{}
+	var surfaceRejections []string
 	var launchabilityFailure string
 
 	for pref, provider := range candidates {
@@ -906,7 +953,8 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		}
 		// Spark / AGY fallbacks reuse Pick's available() + overrides.
 		family := FamilyFor(provider, model)
-		if ok, _ := posture.Allow(mode, provider, model, family); !ok {
+		if ok, why := posture.Allow(mode, provider, model, family); !ok {
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: posture: %s", provider, model, why))
 			continue
 		}
 		pool := QuotaPoolFor(provider, model)
@@ -950,6 +998,13 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 			if strings.HasPrefix(detail, "provider unavailable:") {
 				launchabilityFailure = fmt.Sprintf("%s/%s: %s", provider, model, strings.TrimPrefix(detail, "provider unavailable: "))
 			}
+			// FAC-615: record WHY. A bare "no healthy launch candidate" blames
+			// capacity in the abstract and cannot be acted on -- it took a fleet
+			// incident and a direct herdr launch to discover that the real state
+			// was "every surface at concurrency cap". Naming each rejected
+			// surface turns the refusal into something an operator can answer.
+			surfaceRejections = append(surfaceRejections,
+				fmt.Sprintf("%s/%s: %s", provider, model, detail))
 			continue
 		}
 		if r.Probes != nil && r.Probes.Launchable != nil {
@@ -970,12 +1025,15 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 
 		// Family gates.
 		if family == "" {
-			continue // unknown family fails closed
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: unknown model family (fails closed)", provider, model))
+			continue
 		}
 		if excluded != "" && family == excluded {
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: family %s excluded by request", provider, model, family))
 			continue
 		}
 		if isReviewer && family == authorFamily {
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: reviewer independence: same family as author (%s)", provider, model, family))
 			continue
 		}
 
@@ -985,9 +1043,11 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		}
 		cap := CapabilityOfSurface(provider, model)
 		if cap == CapUnknown {
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: unknown surface capability", provider, model))
 			continue
 		}
 		if model == "" && !modelDefaultSurface(provider) {
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s: no model resolved and surface has no default", provider))
 			continue
 		}
 
@@ -1091,7 +1151,11 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if launchabilityFailure != "" {
 			return nil, fmt.Errorf("herd-route: no launchable candidate for role=%s shape=%s: %s", req.Role, shape, launchabilityFailure)
 		}
-		return nil, fmt.Errorf("herd-route: no healthy launch candidate for role=%s shape=%s", req.Role, shape)
+		if len(surfaceRejections) > 0 {
+			return nil, fmt.Errorf("herd-route: no healthy launch candidate for role=%s shape=%s; every candidate surface was rejected: %s",
+				req.Role, shape, strings.Join(surfaceRejections, "; "))
+		}
+		return nil, fmt.Errorf("herd-route: no healthy launch candidate for role=%s shape=%s (no candidate surfaces were evaluated at all)", req.Role, shape)
 	}
 
 	// Deterministic: lowest rank wins; equal rank → provider name ASC.
