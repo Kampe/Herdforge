@@ -57,6 +57,9 @@ const (
 	ActionReapLane        ActionKind = "reap_lane"
 	ActionDispatch        ActionKind = "dispatch"
 	ActionWouldRun        ActionKind = "would_run"
+
+	// ActionResumeGoal wakes a lane whose goal loop stopped. FAC-614.
+	ActionResumeGoal ActionKind = "resume_goal"
 )
 
 // Mode is the beat posture. Observe never mutates; Act applies safe renewals
@@ -392,6 +395,8 @@ type Counts struct {
 	Agents          int `json:"agents"`
 	HealthyIdle     int `json:"healthy_idle"`
 	Busy            int `json:"busy"`
+	Paused          int `json:"paused"`
+	ResumeGoal      int `json:"resume_goal"`
 	Blocked         int `json:"blocked"`
 	Done            int `json:"done"`
 	Stale           int `json:"stale"`
@@ -463,6 +468,13 @@ type Actor interface {
 	// lane in the observation; the implementation must use generation-fenced
 	// close (TabCloseCAS) and fail closed when fencing evidence is incomplete.
 	ReapLane(ctx context.Context, lane AgentObservation) error
+	// ResumeGoal sends the harness resume verb to a lane sitting at a terminal
+	// goal state. FAC-614: a paused lane cannot consume a plain prompt, so a
+	// normal nudge is silently ignored -- the verb is the only thing that wakes
+	// it. Implementations must NOT invent a resume for a lane whose pane could
+	// not be read; unknown is not paused.
+	ResumeGoal(ctx context.Context, lane AgentObservation) error
+
 	// Dispatch is optional; nil or error means no launch happened.
 	Dispatch(ctx context.Context, target, reason string) error
 }
@@ -1034,6 +1046,10 @@ func CountActions(agents []AgentObservation, actions []Action) Counts {
 			c.Blocked++
 		case StatusDone:
 			c.Done++
+		case StatusPaused:
+			// FAC-614: counted separately and NOT folded into Busy. Folding it
+			// back is how the stall became invisible in the first place.
+			c.Paused++
 		case StatusStale:
 			c.Stale++
 		default:
@@ -1056,6 +1072,8 @@ func CountActions(agents []AgentObservation, actions []Action) Counts {
 			c.WouldRun++
 		case ActionReconcile:
 			c.Reconcile++
+		case ActionResumeGoal:
+			c.ResumeGoal++
 		}
 		if a.Applied {
 			c.Applied++
