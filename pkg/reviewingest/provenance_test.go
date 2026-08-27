@@ -45,7 +45,7 @@ func TestAnUnstatedFamilyIsFilledFromRecordedProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}
 	if a.BuilderFamily != "anthropic" {
@@ -59,7 +59,7 @@ func TestAStatedFamilyContradictingProvenanceIsRefused(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "openai"} // reviewer believed the configured pin
 
-	err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
+	_, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" })
 	if err == nil {
 		t.Fatal("a builder-family contradicting recorded provenance was admitted; " +
 			"independence would be computed against a family that never wrote the code")
@@ -74,7 +74,7 @@ func TestAMatchingFamilyIsAccepted(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{BuilderFamily: "anthropic"}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatalf("a family agreeing with provenance was refused: %v", err)
 	}
 }
@@ -86,7 +86,7 @@ func TestNoRecordedProvenanceLeavesACandidArtifactAlone(t *testing.T) {
 	path := receiptFile(t, `{"branch":"wt/other","provider":"grok","builder_family":"xai","accepted":true}`)
 	a := &Artifact{BuilderFamily: "unknown"}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatalf("absence of a receipt was treated as a conflict: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestTheMostRecentLaunchForABranchWins(t *testing.T) {
 	)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}
 	if a.BuilderFamily != "anthropic" {
@@ -121,7 +121,7 @@ func TestAReceiptWhoseBranchDoesNotReachTheSHAIsIgnored(t *testing.T) {
 	// The branch exists in the receipt but does NOT contain this commit. The
 	// ledger independently proves openai, so the only question under test is
 	// whether the unreachable receipt overwrites it.
-	err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+	_, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(branch, sha string) bool { return false })
 
 	if err != nil {
@@ -137,7 +137,7 @@ func TestUnknownReachabilityIsNotProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, nil); err != nil {
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt, nil); err != nil {
 		t.Fatal(err)
 	}
 	if a.BuilderFamily != "" {
@@ -160,7 +160,7 @@ func TestALaunchAfterTheCommitDoesNotStealAttribution(t *testing.T) {
 	)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestACorrectStatedFamilyIsNotRefusedByALaterRelaunch(t *testing.T) {
 	)
 	a := &Artifact{BuilderFamily: "anthropic"} // correct, and provable
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatalf("a truthful builder-family was refused because a LATER launch reused the branch: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestAnUnknownCommitTimeYieldsNoProvenance(t *testing.T) {
 	path := receiptFile(t, claudeRow)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", time.Time{},
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", time.Time{},
 		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestAnUndatedReceiptIsNotProvenance(t *testing.T) {
 	path := receiptFile(t, `{"branch":"wt/defi-crusader","provider":"grok","builder_family":"xai","accepted":true}`)
 	a := &Artifact{}
 
-	if err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
+	if _, err := ReconcileBuilderFamilyForSHA(a, path, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", commitAt,
 		func(b, sha string) bool { return b == "wt/defi-crusader" }); err != nil {
 		t.Fatal(err)
 	}

@@ -177,9 +177,10 @@ func runReviewIngest() {
 		// text alone is not evidence: branches are reused, relaunched and
 		// rebased, and a confidently wrong family is worse than none because
 		// independence is computed against it.
-		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, receiptPath, a.SHA,
-			commitCreationTime(a.SHA), branchReachesSHA); err != nil {
-			emit.refused(f, err)
+		provenanceBacked, provErr := reviewingest.ReconcileBuilderFamilyForSHA(&a, receiptPath, a.SHA,
+			commitCreationTime(a.SHA), branchReachesSHA)
+		if provErr != nil {
+			emit.refused(f, provErr)
 			refused++
 			continue
 		}
@@ -197,8 +198,12 @@ func runReviewIngest() {
 		// commit and no ledger record proving it is DOWNGRADED to unrecorded, so
 		// it cannot be used to compute reviewer/builder independence. Before the
 		// gate assignment below, which is what routes it to provenance-unrecorded.
-		if err := reviewingest.RequireCorroboratedFamily(&a, a.SHA, reviewledger.FamilyUnrecorded,
-			ledger.ProvenBuilderFamily, artifactIsCandidAboutFamily); err != nil {
+		// Skip when a launch receipt reaching this exact commit already proved
+		// the family: corroborating an already-proven family against the ledger
+		// downgrades it to unrecorded on every FIRST review, since the ledger
+		// record that would corroborate a SHA is created BY this ingest. That
+		// made the live CHA-3211 candidate unmergeable despite a valid receipt.
+		if err := requireCorroborationUnlessProven(&a, provenanceBacked, ledger.ProvenBuilderFamily); err != nil {
 			emit.refused(f, err)
 			refused++
 			continue
@@ -726,6 +731,15 @@ const (
 // family it could not prove -- an honest "unknown", or a hedged claim. Those
 // stay admissible and route to provenance-unrecorded; only a bare unhedged
 // assertion needs corroborating.
+// requireCorroborationUnlessProven applies the corroboration gate only to a
+// family nothing has proven yet.
+func requireCorroborationUnlessProven(a *reviewingest.Artifact, provenanceBacked bool, proven func(string) (string, error)) error {
+	if provenanceBacked {
+		return nil
+	}
+	return reviewingest.RequireCorroboratedFamily(a, a.SHA, reviewledger.FamilyUnrecorded, proven, artifactIsCandidAboutFamily)
+}
+
 func artifactIsCandidAboutFamily(raw string) bool {
 	_, candid := honestlyUnrecordedFamily(raw)
 	return candid
