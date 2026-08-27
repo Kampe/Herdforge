@@ -131,6 +131,9 @@ func TestStandingFallthroughRecordsTheResolvedRouteNotTheConfiguredPin(t *testin
 	if strings.TrimSpace(r.Branch) == "" {
 		t.Fatal("receipt has no branch; it cannot be joined to any commit")
 	}
+	if got, want := r.AdmittedBase, strings.TrimSpace(gitCandidateOutputAt(t, root, "rev-parse", "HEAD")); got != want {
+		t.Fatalf("admitted_base = %q, want current admitted worktree base %q", got, want)
+	}
 	if strings.TrimSpace(r.Lane) == "" || strings.TrimSpace(r.Name) == "" {
 		t.Fatalf("receipt does not identify the lane/agent: lane=%q name=%q", r.Lane, r.Name)
 	}
