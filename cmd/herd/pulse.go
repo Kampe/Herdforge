@@ -994,8 +994,18 @@ func (a *livePulseActor) OpenReview(ctx context.Context, lane pulse.AgentObserva
 	// name, and targeting the qualified form sent every review handoff to a
 	// name no agent held.
 	target := standing.AgentNameForRepository(supervisor.Name, repositoryIdentityForLaunch(cfg))
+	// FAC-597: a census that CANNOT be read and a census that does not hold this
+	// lane are different facts. A list error is unknown, so keep the qualified
+	// name and let delivery report its own failure. A successful list that lacks
+	// the supervisor is MISSING: addressing it anyway spends a review slot on a
+	// reviewer told to report to an agent nobody can name.
 	if live, listErr := herdrStandingAgents(); listErr == nil {
-		target = standing.LiveAgentName(live, supervisor.Name, repositoryIdentityForLaunch(cfg))
+		name, isLive := standing.LiveAgentName(live, supervisor.Name, repositoryIdentityForLaunch(cfg))
+		if !isLive {
+			return fmt.Errorf("pulse: review supervisor lane %q has no live agent (looked for %q across %d live standing agent(s)); raise or rebind it before opening a review",
+				supervisor.Name, name, len(live))
+		}
+		target = name
 	}
 	// Resolve exact identity here, from git, rather than asking the receiver to
 	// re-derive it from a tab id.

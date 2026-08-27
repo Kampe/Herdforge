@@ -84,13 +84,19 @@ type drainAdapters struct {
 	run func(ctx context.Context, sha string, adm harvest.AdmissionContext, dry bool) (*harvest.IntegrationResult, error)
 }
 
-// drainLiveAgentName resolves a lane to the live agent name, falling back to
-// the qualified form when the fleet cannot be listed.
-func drainLiveAgentName(laneName, repository string) string {
+// drainLiveAgentName resolves a lane to the live agent name.
+//
+// The returned bool is liveness, NOT success: a fleet that cannot be listed is
+// unknown, so it reports true with the qualified name and lets delivery fail
+// with its own message. Only a successful census that does not hold the lane
+// reports false (FAC-597). The name is embedded in the review packet as the
+// address a reviewer returns its verdict to, so a phantom there is not a
+// cosmetic defect.
+func drainLiveAgentName(laneName, repository string) (string, bool) {
 	if live, err := herdrStandingAgents(); err == nil {
 		return standing.LiveAgentName(live, laneName, repository)
 	}
-	return standing.AgentNameForRepository(laneName, repository)
+	return standing.AgentNameForRepository(laneName, repository), true
 }
 
 func (a *drainAdapters) hooks() drainActionHooks {
@@ -645,6 +651,11 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 		project = review.ResolveKaneoProject(root)
 	}
 	repository := repositoryIdentityForLaunch(cfg)
+	supervisorAgent, supervisorLive := drainLiveAgentName(supervisorLane.Name, repository)
+	if !supervisorLive {
+		return nil, fmt.Errorf("review supervisor lane %q is configured but has no live agent (looked for %q); raise or rebind it before dispatching reviewers, or they will be told to deliver verdicts to an agent nobody can name",
+			supervisorLane.Name, supervisorAgent)
+	}
 	a := &drainAdapters{
 		root:       root,
 		project:    project,
@@ -653,7 +664,7 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 		lane:       lane,
 		// FAC-547: adopt a legacy-named live supervisor rather than targeting
 		// a qualified name no agent holds.
-		supervisor:  drainLiveAgentName(supervisorLane.Name, repository),
+		supervisor:  supervisorAgent,
 		tasks:       tp,
 		ledger:      ledger,
 		launcher:    liveDrainLauncher{lane: lane.Name, repository: repository},

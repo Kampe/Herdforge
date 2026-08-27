@@ -3,6 +3,7 @@ package herdr
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -31,9 +32,53 @@ func liveStatus(target string) (string, error) {
 	}
 	st := StatusFromList(agents, target)
 	if st == "" {
-		return "", fmt.Errorf("no agent '%s' found", target)
+		return "", noAgentFoundError(target, agents, "")
 	}
 	return st, nil
+}
+
+// noAgentFoundError is the ONE definition of "that target is not live".
+//
+// FAC-597: this was two copies of the bare string "no agent 'X' found", and it
+// was the only refusal in this file that named nothing but the failed target.
+// Its immediate neighbours already name their candidates ("exact live agent %q
+// and forge-derived live agent %q"), so an operator hitting an AMBIGUOUS target
+// learned strictly more than one hitting an ABSENT target.
+//
+// Measured: the review supervisor lane was reaped mid-session, and both
+// `herd send review-supervisor` and `herd send forge-review-supervisor-4922de28`
+// answered only "no agent found". Nothing in that output said the fleet was
+// reachable, that three other agents were live, or what to target instead, so
+// the refusal was indistinguishable from herdr being down and a handoff stalled
+// behind it.
+//
+// An empty fleet and a fleet that merely lacks this target are different faults
+// with different remedies: raise anything, versus raise this one.
+func noAgentFoundError(target string, agents []AgentEntry, workspace string) error {
+	names := make([]string, 0, len(agents))
+	for _, a := range agents {
+		if workspace != "" && a.Workspace != "" && a.Workspace != workspace {
+			continue
+		}
+		if name := strings.TrimSpace(a.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	scope := "the live fleet"
+	if workspace != "" {
+		scope = fmt.Sprintf("workspace %q", workspace)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("no agent '%s' found: %s has no live agents at all, so this is an unraised fleet rather than a stale target", target, scope)
+	}
+	shown, truncated := names, ""
+	if len(shown) > 8 {
+		truncated = fmt.Sprintf(" (+%d more)", len(shown)-8)
+		shown = shown[:8]
+	}
+	return fmt.Errorf("no agent '%s' found: %s is reachable and holds %d live agent(s), none named that; live now: %s%s",
+		target, scope, len(names), strings.Join(shown, ", "), truncated)
 }
 
 func liveStatusScoped(target string) (string, error) {
@@ -115,7 +160,7 @@ func requireAgentInWorkspace(target, expected string) (AgentEntry, error) {
 		matches = derivedMatches
 	}
 	if len(matches) == 0 {
-		return AgentEntry{}, fmt.Errorf("no agent '%s' found", target)
+		return AgentEntry{}, noAgentFoundError(target, agents, expected)
 	}
 	for _, agent := range matches {
 		// Older Herdr fixtures and live versions may omit workspace_id. There is
