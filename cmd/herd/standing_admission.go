@@ -3,8 +3,9 @@ package main
 import (
 	"fmt"
 	"os/exec"
-	"strconv"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/preflight"
 )
 
 // readmitStandingWorktree refreshes an existing lane only when doing so cannot
@@ -43,21 +44,5 @@ func readmitStandingWorktree(lane, path string) error {
 }
 
 func standingWorktreeDistance(path string) (ahead, behind int, err error) {
-	out, err := exec.Command("git", "-C", path, "rev-list", "--left-right", "--count", "HEAD...origin/main").Output()
-	if err != nil {
-		return 0, 0, err
-	}
-	fields := strings.Fields(string(out))
-	if len(fields) != 2 {
-		return 0, 0, fmt.Errorf("unexpected git distance output %q", strings.TrimSpace(string(out)))
-	}
-	ahead, err = strconv.Atoi(fields[0])
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse ahead %q: %w", fields[0], err)
-	}
-	behind, err = strconv.Atoi(fields[1])
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse behind %q: %w", fields[1], err)
-	}
-	return ahead, behind, nil
+	return preflight.RefDistance(path, "HEAD", "origin/main")
 }

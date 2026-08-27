@@ -34,25 +34,35 @@ func CheckMainOriginDivergence(root string) (MainOriginDivergence, error) {
 	if _, err := runCmd(root, "git", "rev-parse", "--verify", "--quiet", "refs/heads/main"); err != nil {
 		return MainOriginDivergence{}, nil
 	}
-	out, err := runCmd(root, "git", "rev-list", "--left-right", "--count", "main...origin/main")
+	localAhead, remoteAhead, err := RefDistance(root, "main", "origin/main")
 	if err != nil {
 		return MainOriginDivergence{}, fmt.Errorf("check main/origin/main divergence: %w", err)
-	}
-	parts := strings.Fields(out)
-	if len(parts) != 2 {
-		return MainOriginDivergence{}, fmt.Errorf("check main/origin/main divergence: expected two counts, got %q", out)
-	}
-	localAhead, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return MainOriginDivergence{}, fmt.Errorf("check main/origin/main divergence: parse local count %q: %w", parts[0], err)
-	}
-	remoteAhead, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return MainOriginDivergence{}, fmt.Errorf("check main/origin/main divergence: parse origin count %q: %w", parts[1], err)
 	}
 	report := MainOriginDivergence{LocalAhead: localAhead, RemoteAhead: remoteAhead}
 	if report.LocalAhead != 0 || report.RemoteAhead != 0 {
 		return report, fmt.Errorf("main/origin/main diverged: main is %d commit(s) ahead and origin/main is %d commit(s) ahead", report.LocalAhead, report.RemoteAhead)
 	}
 	return report, nil
+}
+
+// RefDistance reports commits unique to left and right, respectively. An
+// unreadable comparison is an error, never a plausible zero distance.
+func RefDistance(root, left, right string) (leftAhead, rightAhead int, err error) {
+	out, err := runCmd(root, "git", "rev-list", "--left-right", "--count", left+"..."+right)
+	if err != nil {
+		return 0, 0, err
+	}
+	parts := strings.Fields(out)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("expected two counts, got %q", out)
+	}
+	leftAhead, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse left count %q: %w", parts[0], err)
+	}
+	rightAhead, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse right count %q: %w", parts[1], err)
+	}
+	return leftAhead, rightAhead, nil
 }
