@@ -4,7 +4,7 @@
   "generated_by": "scripts/packageinventory/inventory.go",
   "class_counts": {
     "internal": 1,
-    "production": 101,
+    "production": 102,
     "secondary": 1,
     "unwired": 24
   },
@@ -48,6 +48,12 @@
     {
       "path": "github.com/Kampe/Herdforge/pkg/backfill",
       "class": "unwired",
+      "test_importers": 0,
+      "has_own_tests": true
+    },
+    {
+      "path": "github.com/Kampe/Herdforge/pkg/beat",
+      "class": "production",
       "test_importers": 0,
       "has_own_tests": true
     },
