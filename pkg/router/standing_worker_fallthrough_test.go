@@ -35,25 +35,20 @@ func standingWorkerRequest(provider, model string) LaunchRequest {
 		RequestedEffort:   "medium",
 		TaskRef:           "chain-indexer",
 		Scope:             ScopeLane,
+		// Probe-gated models fail closed without a recorded result. Supply
+		// passes for the surfaces under test so the fixture exercises the
+		// ROUTING decision rather than the probe gate.
+		ProbeResults: map[string]bool{
+			ProbeKey("codex", "gpt-5.6-luna"):                        true,
+			ProbeKey("grok", ModelFor("grok", "implementation")):     true,
+			ProbeKey("claude", ModelFor("claude", "implementation")): true,
+		},
 	}
 }
 
 // THE regression. A standing worker whose requested provider cannot take work
 // must reach a healthy alternate instead of refusing.
 func TestStandingWorkerFallsThroughAnUnavailableRequestedProvider(t *testing.T) {
-	// BLOCKED, not passing, and deliberately not deleted.
-	//
-	// testRouter does not populate a model catalog, so the scoring loop never
-	// evaluates a single surface -- the refusal is "no candidate surfaces were
-	// evaluated at all", which happens even for a HEALTHY requested provider.
-	// That is a fixture limitation, not the shipped behaviour: the same request
-	// routes fine against the live catalog.
-	//
-	// Skipped rather than removed because the live dry-run for chain-indexer is
-	// still failing and this is the test that must eventually prove it fixed.
-	// Deleting it would erase the obligation.
-	t.Skip("needs a model-catalog fixture; see live dry-run blocker in the PR body")
-
 	r := newStandingTestRouter(t, quotaHealthy, liveAtCap) // codex at concurrency cap
 
 	d, err := r.Decide(standingWorkerRequest("codex", "gpt-5.6-luna"))
@@ -69,19 +64,6 @@ func TestStandingWorkerFallsThroughAnUnavailableRequestedProvider(t *testing.T) 
 // A standing worker whose provider IS healthy must still get it. The
 // fallthrough must not become a wander.
 func TestStandingWorkerKeepsAHealthyRequestedProvider(t *testing.T) {
-	// BLOCKED, not passing, and deliberately not deleted.
-	//
-	// testRouter does not populate a model catalog, so the scoring loop never
-	// evaluates a single surface -- the refusal is "no candidate surfaces were
-	// evaluated at all", which happens even for a HEALTHY requested provider.
-	// That is a fixture limitation, not the shipped behaviour: the same request
-	// routes fine against the live catalog.
-	//
-	// Skipped rather than removed because the live dry-run for chain-indexer is
-	// still failing and this is the test that must eventually prove it fixed.
-	// Deleting it would erase the obligation.
-	t.Skip("needs a model-catalog fixture; see live dry-run blocker in the PR body")
-
 	r := newStandingTestRouter(t, quotaHealthy, liveBelowCap)
 
 	d, err := r.Decide(standingWorkerRequest("codex", "gpt-5.6-luna"))
