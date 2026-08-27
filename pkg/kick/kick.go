@@ -777,7 +777,22 @@ func paneShowsPausedGoal(paneID string) bool {
 // defect pkg/invariant fails the build on, and the two would drift the first
 // time a harness renamed a marker.
 func ContainsPausedGoalMarker(text string) bool {
-	for _, marker := range []string{"Goal paused", "Goal stalled", "Goal achieved", "Goal blocked", goalResumeVerb} {
+	// FAC-619: goalResumeVerb was in this list and MUST NOT be.
+	//
+	// "/goal resume" is an INPUT we send, not a state the harness reports.
+	// Sending it types the string into the pane, where it stays in scrollback
+	// forever -- so the next pane read matches it, classifies the lane paused
+	// again, and resumes a lane that is actively working. The fix manufactured
+	// the evidence that re-triggered it.
+	//
+	// Observed live on forge-orchestrator: reported paused with raw_status
+	// working while the pane showed "Working (1m 28s)", with the resume plan at
+	// "attempt 2 of 3". The seed was a MANUAL /goal resume typed by the
+	// coordinator hours earlier; every automated resume then re-armed it.
+	//
+	// Only harness-reported STATE may be evidence. An echo of our own action
+	// never is.
+	for _, marker := range []string{"Goal paused", "Goal stalled", "Goal achieved", "Goal blocked"} {
 		if strings.Contains(text, marker) {
 			return true
 		}

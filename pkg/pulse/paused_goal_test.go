@@ -22,11 +22,19 @@ func TestAPausedGoalIsNotReportedAsBusy(t *testing.T) {
 func TestOtherTerminalGoalStatesAlsoCountAsPaused(t *testing.T) {
 	// kick owns this vocabulary; pulse must agree with it rather than keep a
 	// second list that drifts the first time a harness renames a marker.
+	// FAC-619: "/goal resume" was in this list and its removal is the fix, not
+	// a weakening. The verb is an INPUT we send; treating it as a paused state
+	// made every resume re-arm the next one, so a working lane was resumed
+	// forever. Observed live on forge-orchestrator at "attempt 2 of 3" while
+	// its pane read "Working (1m 28s)".
+	//
+	// The harness's real status line is "Goal paused (/goal resume)" and still
+	// matches -- on "Goal paused", pinned by
+	// TestTheRealStatusLineStillMatchesOnItsStateWord.
 	for _, pane := range []string{
 		"Goal achieved",
 		"Goal blocked",
 		"Goal stalled",
-		"/goal resume",
 	} {
 		if got := ClassifyStatusWithPane("working", false, pane); got != StatusPaused {
 			t.Fatalf("pane %q classified %q, want paused", pane, got)
