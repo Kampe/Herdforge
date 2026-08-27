@@ -411,7 +411,7 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 				heldFacts[name] = err.Error()
 				continue
 			}
-			degraded[name] = "hold authority unavailable: " + err.Error()
+			degraded[name] = degradedReason(err)
 			continue
 		}
 	}
@@ -422,6 +422,21 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 	// real finding, not a healthy idle lane.
 	r = applyDegradedAuthority(r, degraded)
 	return &r, nil
+}
+
+// degradedReason labels a lane's triage finding by its actual cause.
+//
+// FAC-593: every non-denial was stamped "hold authority unavailable", so an
+// ambiguous active-card binding -- which already names the candidate refs and
+// the remedy (move cards out of in-progress) -- reached the operator as an
+// infrastructure failure. Eight lanes read that way in one incident. The
+// binding error is self-describing; passing it through verbatim is the whole
+// fix, and re-labelling it is what destroyed the information.
+func degradedReason(err error) string {
+	if errors.Is(err, lifecycle.ErrActiveTaskUnknown) {
+		return err.Error()
+	}
+	return "hold authority unavailable: " + err.Error()
 }
 
 func authorityFailure(name string, err error) (*Result, error) {
