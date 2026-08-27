@@ -234,6 +234,12 @@ Commands:
 		"  only an explicit --recover with evidence clears it. Exits 3 while fenced.\n" +
 		"  The fence never expires on a timer: a host that fell over under fleet pressure\n" +
 		"  looks healthy the moment the pressure stops.",
+	"integrate": "Usage: herd integrate --candidate <sha> [--step <s> --evidence <text>] [--status] [--json]\n" +
+		"  Drive one candidate's integration lifecycle against a durable record:\n" +
+		"  exact-pass, harvest-current-main, integration-pr, merge, runtime-bind,\n" +
+		"  patch-identity-proof, cleanup. ONE step per invocation, on purpose.\n" +
+		"  Refuses cleanup without patch-identity proof: cleanup destroys the source\n" +
+		"  worktree and branch, and proof is what makes that safe rather than lossy.",
 	"utilization": "Usage: herd utilization [--json]\n" +
 		"  Publish the per-lane utilization beat: lane, status, blocker, next wake.\n" +
 		"  Names the one condition that matters -- idle, unheld, with work available --\n" +

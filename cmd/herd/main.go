@@ -395,6 +395,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "integrate":
+		if err := runIntegrate(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd integrate: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "utilization":
 		runUtilizationCommand(os.Args[2:])
 
