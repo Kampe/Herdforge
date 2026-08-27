@@ -54,6 +54,28 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 		if filepath.IsAbs(path) || path == ".." || strings.HasPrefix(filepath.ToSlash(path), "../") || (ext != ".go" && ext != ".yaml" && ext != ".yml" && ext != ".md" && ext != ".json") || filepath.Base(path) == ".mcp.json" {
 			return nil
 		}
+		// FAC-606: the review-evidence exemption has to live HERE, not in the
+		// walk below.
+		//
+		// This function has two callers: the changed-paths loop and the full
+		// WalkDir. The directory skips only exist in the walk. `herd preflight`
+		// calls CheckWorktreeBoundaryChanged, which takes the changed-paths
+		// loop -- so an exemption placed in the walk never runs on the path the
+		// CLI actually uses.
+		//
+		// FAC-602 put it in the walk and its tests passed, because a bare
+		// t.TempDir() with no git history falls through to the walk. The tests
+		// exercised the branch the fix was in rather than the branch the
+		// operator triggers, so both agreed with each other and neither agreed
+		// with reality. That is the same vacuous shape FAC-578 and the FAC-593
+		// review both turned on.
+		//
+		// One guard in the shared function covers both callers; a guard per
+		// caller is how the first attempt missed one.
+		if slashed := filepath.ToSlash(path); strings.HasPrefix(slashed, ".herd/review/") ||
+			strings.HasPrefix(slashed, ".herd/review-packets/") {
+			return nil
+		}
 		data, err := root.ReadFile(path)
 		if err != nil {
 			return nil
