@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harness"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
@@ -69,6 +71,7 @@ type Request struct {
 	HookWarning        func(string)
 	HookDiscovery      harness.HookDiscovery
 	HookPolicyRevision string
+	HookPolicyPath     string
 }
 
 // LaunchEffects are the write-capable operations that must remain behind the
@@ -185,6 +188,7 @@ type Receipt struct {
 	FleetSurface      string `json:"fleet_allowed_surface,omitempty"`
 	// Hook preflight evidence (FAC-177).
 	PolicyRevision    string `json:"policy_revision,omitempty"`
+	PolicyPath        string `json:"policy_path,omitempty"`
 	Kind              string `json:"kind,omitempty"`
 	HookCode          string `json:"hook_code,omitempty"`
 	HookName          string `json:"hook_name,omitempty"`
@@ -448,11 +452,11 @@ func (s *MemorySink) HasDegraded(req Request) (bool, error) {
 }
 
 func DefaultSink() Sink {
-	p := os.Getenv("HERD_LAUNCH_RECEIPTS")
-	if p == "" {
-		p = ".herd/launch-receipts.jsonl"
+	root, _, err := gitroot.ProjectRoot(context.Background(), ".")
+	if err != nil {
+		return &JSONLSink{Path: DefaultReceiptPath()}
 	}
-	return &JSONLSink{Path: p}
+	return &JSONLSink{Path: ReceiptPathFor(root)}
 }
 
 func normalized(v string) string {
@@ -860,6 +864,7 @@ func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
 		return report, recordHookFailure(req, sink, harness.HookCodeDiscoveryFailed, "", harness.EndpointInvalid, "")
 	}
 	req.HookPolicyRevision = result.PolicyRevision
+	req.HookPolicyPath = result.PolicyPath
 	if result.PolicyRequired {
 		bound, code, digest := harness.ApplyHookPolicies(result.Hooks, result.Policies, result.PolicyRevision)
 		if code != harness.HookCodeHealthy {
@@ -906,18 +911,23 @@ func hookReceiptKey(req Request, code harness.HookCode, name string) string {
 func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {
 	role, shape, provider, model, effort, digest, argv := fields(req)
 	fd, fa, ff, fs := fleetReceiptFields(req)
-	receipt := receiptFrom(req, role, shape, provider, model, effort, digest, argv, false, fmt.Sprintf("launch hook preflight failed: %s", code), fd, fa, ff, fs)
+	reason := fmt.Sprintf("launch hook preflight failed: %s", code)
+	if code == harness.HookCodePolicySetMissing {
+		reason = fmt.Sprintf("%s: no hook policy set loaded from %s", reason, req.HookPolicyPath)
+	}
+	receipt := receiptFrom(req, role, shape, provider, model, effort, digest, argv, false, reason, fd, fa, ff, fs)
 	receipt.Kind = "launch_rejected"
 	receipt.PolicyRevision = req.HookPolicyRevision
+	receipt.PolicyPath = req.HookPolicyPath
 	receipt.HookCode = string(code)
 	receipt.HookName = name
 	receipt.EndpointClass = string(endpoint)
 	receipt.RedactedAuthority = authority
 	receipt.ReceiptKey = hookReceiptKey(req, code, name)
 	if _, err := writeOnce(sink, receipt); err != nil {
-		return fmt.Errorf("launch hook preflight failed: %s", code)
+		return errors.New(reason)
 	}
-	return fmt.Errorf("launch hook preflight failed: %s", code)
+	return errors.New(reason)
 }
 
 func recordHookDegraded(req Request, sink Sink, report harness.HookReport) (bool, error) {

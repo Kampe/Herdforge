@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 func TestGetHarnessConfig_GenericFallback(t *testing.T) {
@@ -372,7 +375,7 @@ func TestHookPoliciesBindExactRevisionAndHealthAuthority(t *testing.T) {
 		revision string
 		code     HookCode
 	}{
-		{"missing", HookPolicy{}, "", HookCodePolicyMissing},
+		{"missing", HookPolicy{}, "", HookCodePolicySetMissing},
 		{"stale", valid, "sha256:stale", HookCodePolicyStale},
 		{"mismatch", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequirement("unknown"), HealthURL: valid.HealthURL}, "", HookCodePolicyMismatch},
 		{"external", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "https://example.com/health"}, "", HookCodeAuthority},
@@ -466,6 +469,54 @@ func TestDefaultDiscoveryAugmentsClaudeInsteadOfReplacingIt(t *testing.T) {
 	result, err := (DefaultDiscovery{OverridePath: overridePath}).Discover("claude")
 	if err != nil || result.State != DiscoveryHooks || len(result.Hooks) != 1 || result.Hooks[0].URL != "http://127.0.0.1:8790/live" || len(result.Policies) != 1 || !result.PolicyRequired {
 		t.Fatalf("override replaced canonical discovery = %+v, err=%v", result, err)
+	}
+}
+
+func TestDefaultDiscoveryFindsRepositoryPolicyFromNonRootCWD(t *testing.T) {
+	repo := t.TempDir()
+	if err := exec.Command("git", "-C", repo, "init", "-q").Run(); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(repo, "settings.json")
+	settings := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"http","name":"canonical","url":"http://127.0.0.1:8790/live"}]}]}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CLAUDE_SETTINGS_FILE", settingsPath)
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "")
+	t.Setenv(gitroot.EnvProjectRoot, "")
+	discovered, err := (ClaudeDiscovery{}).Discover("claude")
+	if err != nil || len(discovered.Hooks) != 1 {
+		t.Fatalf("discovery fixture = %+v, err=%v", discovered, err)
+	}
+	canonicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(canonicalRepo, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(policyPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	policy := `{"providers":{"claude":{"policies":[{"handler_digest":` + fmt.Sprintf("%q", discovered.Hooks[0].Name) + `,"requirement":"required","health_url":"http://127.0.0.1:8790/health"}]}}}`
+	if err := os.WriteFile(policyPath, []byte(policy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(repo, "lane", "nested")
+	if err := os.MkdirAll(elsewhere, 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCWD) })
+
+	result, err := (DefaultDiscovery{}).Discover("claude")
+	if err != nil || result.State != DiscoveryHooks || len(result.Policies) != 1 || result.PolicyPath != policyPath {
+		t.Fatalf("non-root shipped discovery = %+v, err=%v", result, err)
 	}
 }
 

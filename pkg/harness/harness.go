@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
 
@@ -180,6 +181,8 @@ func (h *Hook) UnmarshalJSON(data []byte) error {
 
 type DiscoveryState string
 
+const defaultHookPolicyPath = ".herd/harness-hooks.json"
+
 const (
 	DiscoveryNotDiscovered DiscoveryState = "not-discovered"
 	DiscoveryNoHooks       DiscoveryState = "discovered-no-hooks"
@@ -195,6 +198,7 @@ type HookDiscoveryResult struct {
 	PolicyRequired         bool
 	PolicyRevision         string
 	ExpectedPolicyRevision string
+	PolicyPath             string
 }
 
 type HookDiscovery interface {
@@ -223,7 +227,7 @@ func (d FileDiscovery) Discover(provider string) (HookDiscoveryResult, error) {
 		path = strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE"))
 	}
 	if path == "" {
-		path = ".herd/harness-hooks.json"
+		path = defaultHookPolicyPath
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -271,7 +275,14 @@ func (d DefaultDiscovery) Discover(provider string) (HookDiscoveryResult, error)
 		overridePath = strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE"))
 	}
 	if overridePath == "" {
-		overridePath = ".herd/harness-hooks.json"
+		root, _, err := gitroot.ProjectRoot(context.Background(), ".")
+		if err != nil {
+			if isNoHookProvider(provider) {
+				return HookDiscoveryResult{State: DiscoveryNoHooks}, nil
+			}
+			return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
+		}
+		overridePath = filepath.Join(root, defaultHookPolicyPath)
 	}
 	var override HookDiscoveryResult
 	hasOverride := false
@@ -287,6 +298,7 @@ func (d DefaultDiscovery) Discover(provider string) (HookDiscoveryResult, error)
 	}
 	if strings.EqualFold(strings.TrimSpace(provider), "claude") {
 		result, err := d.Claude.Discover(provider)
+		result.PolicyPath = overridePath
 		if err != nil || result.State != DiscoveryHooks || !hasOverride {
 			return result, err
 		}
@@ -296,13 +308,21 @@ func (d DefaultDiscovery) Discover(provider string) (HookDiscoveryResult, error)
 		return result, nil
 	}
 	if hasOverride {
+		override.PolicyPath = overridePath
 		return override, nil
 	}
+	if isNoHookProvider(provider) {
+		return HookDiscoveryResult{State: DiscoveryNoHooks}, nil
+	}
+	return HookDiscoveryResult{State: DiscoveryNotDiscovered}, nil
+}
+
+func isNoHookProvider(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "codex", "grok", "kimi", "agy", "antigravity", "pi", "opencode":
-		return HookDiscoveryResult{State: DiscoveryNoHooks}, nil
+		return true
 	default:
-		return HookDiscoveryResult{State: DiscoveryNotDiscovered}, nil
+		return false
 	}
 }
 
@@ -614,6 +634,7 @@ const (
 	HookCodeDegraded           HookCode = "hook.degraded"
 	HookCodeHealthMalformed    HookCode = "hook.health_malformed"
 	HookCodePolicyMissing      HookCode = "hook.policy_missing"
+	HookCodePolicySetMissing   HookCode = "hook.policy_set_missing"
 	HookCodePolicyStale        HookCode = "hook.policy_stale"
 	HookCodePolicyDuplicate    HookCode = "hook.policy_duplicate"
 	HookCodePolicyMismatch     HookCode = "hook.policy_mismatch"
@@ -746,7 +767,7 @@ func (d DefaultDiscovery) PolicyInventory(provider string) (HookPolicyInventory,
 // policy-required should call this function.
 func ApplyHookPolicies(hooks []Hook, policies []HookPolicy, revision string) ([]Hook, HookCode, string) {
 	if len(policies) == 0 {
-		return nil, HookCodePolicyMissing, firstHookDigest(hooks)
+		return nil, HookCodePolicySetMissing, ""
 	}
 	if strings.TrimSpace(revision) == "" || revision != policyRevision(policies) {
 		return nil, HookCodePolicyStale, firstHookDigest(hooks)

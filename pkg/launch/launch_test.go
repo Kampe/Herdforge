@@ -525,6 +525,31 @@ func TestHookReceiptRedactsAuthorityAndIsStable(t *testing.T) {
 	}
 }
 
+func TestEmptyPolicySetRefusalNamesPathAndPersistsReceipt(t *testing.T) {
+	req := good(t)
+	req.HookDiscovery = harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) {
+		return harness.HookDiscoveryResult{
+			State:          harness.DiscoveryHooks,
+			Hooks:          []harness.Hook{{Name: "innocent-hook", Requirement: harness.HookRequired}},
+			PolicyRequired: true,
+			PolicyRevision: harness.HookPolicyRevision(nil),
+			PolicyPath:     ".herd/harness-hooks.json",
+		}, nil
+	})
+	sink := &MemorySink{}
+	err := Validate(req, sink)
+	if err == nil || !strings.Contains(err.Error(), "no hook policy set loaded from .herd/harness-hooks.json") {
+		t.Fatalf("empty policy refusal = %v", err)
+	}
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("empty policy receipts = %+v", sink.Receipts)
+	}
+	receipt := sink.Receipts[0]
+	if receipt.HookCode != string(harness.HookCodePolicySetMissing) || receipt.HookName != "" || receipt.PolicyPath != ".herd/harness-hooks.json" {
+		t.Fatalf("empty policy receipt = %+v", receipt)
+	}
+}
+
 func TestOptionalDegradedReceiptIsDurablyDeduplicated(t *testing.T) {
 	req := good(t)
 	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}})
