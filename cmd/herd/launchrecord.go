@@ -149,8 +149,20 @@ func recordResolvedLaunchReceipt(decision *router.LaunchDecision, lane *config.L
 	if branch == "" {
 		return fmt.Errorf("cannot resolve a branch in %s; a receipt with no branch cannot be joined to a commit", cwd)
 	}
+	// FAC-620 P2: TaskRef is the JOIN KEY every consumer uses -- review intake
+	// matches on it, and the signed-context path refuses when it does not equal
+	// the ref under review. The first version of this writer set Lane and Name
+	// and omitted TaskRef entirely, so the receipt was unresolvable by ref and
+	// the propagation it was written for could never happen. Caught by
+	// independent review.
+	//
+	// For a standing lane the task identity IS the lane: launch.Request on this
+	// path already carries TaskRef: lane.Name, so the receipt agrees with the
+	// request that produced it rather than inventing a second convention.
+	taskRef := strings.TrimSpace(lane.Name)
 	return launch.DefaultSink().Write(launch.Receipt{
 		CreatedAt:     time.Now().UTC(),
+		TaskRef:       taskRef,
 		Lane:          lane.Name,
 		Name:          strings.TrimSpace(agentName),
 		Role:          strings.TrimSpace(lane.Role),
