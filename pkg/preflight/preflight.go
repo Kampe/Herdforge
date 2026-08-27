@@ -93,6 +93,31 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 				if path == filepath.Join(".herd", "bootstrap") {
 					return fs.SkipDir
 				}
+				// FAC-602: review evidence is the same category, and it jammed
+				// the whole repository.
+				//
+				// A reviewer records WHERE it verified something -- "diffed in
+				// /Users/.../worktrees/fac-578-closeable-card-ref", "reproduced
+				// on origin/main at 7fb62eb". That is a receipt doing its job,
+				// exactly as FAC-700's scout-planner guard artifacts were. These
+				// files are untracked but NOT gitignored, so the ignored[] check
+				// below never reaches them and every walk scanned them.
+				//
+				// Observed live: twelve verdict and packet artifacts failed
+				// `make preflight` for EVERY lane in the shared checkout at once.
+				// Preflight fails closed, so each lane read a repository-wide
+				// block as its own and chased a phantom. One reviewer writing one
+				// honest path was enough to do it, and each new verdict made it
+				// worse.
+				//
+				// These artifacts cannot leak a host path into the repository:
+				// they are never committed, and review-ingest consumes them into
+				// the ledger rather than the tree. The TRACKED boundary stays
+				// covered.
+				if path == filepath.Join(".herd", "review") ||
+					path == filepath.Join(".herd", "review-packets") {
+					return fs.SkipDir
+				}
 				fullPath := filepath.Join(rootDir, path)
 				if gitdir.IsNestedGitDir(fullPath, rootDir) {
 					return fs.SkipDir
