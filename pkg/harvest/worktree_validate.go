@@ -48,7 +48,15 @@ func ClassifyHarvestInput(repoRoot, path string) (ok bool, reason string) {
 	if err != nil {
 		return true, ""
 	}
-	if filepath.Clean(common) != filepath.Clean(principalCommon) {
+	commonResolved, err1 := filepath.EvalSymlinks(common)
+	principalResolved, err2 := filepath.EvalSymlinks(principalCommon)
+	if err1 != nil {
+		commonResolved = filepath.Clean(common)
+	}
+	if err2 != nil {
+		principalResolved = filepath.Clean(principalCommon)
+	}
+	if commonResolved != principalResolved {
 		return false, "worktree not linked to principal repository"
 	}
 	return true, ""
