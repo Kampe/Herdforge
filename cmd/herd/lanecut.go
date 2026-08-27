@@ -130,6 +130,26 @@ func runLaneCut(args []string) error {
 			*base, err, strings.TrimSpace(string(out)), *branch)
 	}
 
+	// FAC-703: a three-dot diff can be non-empty while the patch applies to
+	// NOTHING, because --3way resolves content that already reached the base by
+	// another route as already-applied. That is a meaningful answer -- the work
+	// is not stranded, it landed -- and it was being reported as:
+	//
+	//	herd lane-cut: commit candidate: exit status 1: nothing to commit
+	//
+	// which reads as a tooling failure. Measured live cutting docs/history from
+	// standing/docs-custodian: 5 files and 577 insertions in the diff, zero
+	// bytes after apply, because origin/main already carried them.
+	//
+	// Checking BEFORE committing means the caller is told the useful thing
+	// instead of a git exit status, and the deferred cleanup still removes the
+	// half-built candidate.
+	if out, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output(); err == nil && len(strings.TrimSpace(string(out))) == 0 {
+		return fmt.Errorf("scope %v shows a non-empty diff against %s but applies to NOTHING: this work has already reached %s by another route, "+
+			"so there is nothing to extract. The lane branch %q is untouched and is behind rather than stranded; rebase or retire it instead of cutting",
+			[]string(scope), *base, *base, *branch)
+	}
+
 	msg := fmt.Sprintf("cut: bounded candidate from %s", *branch)
 	if strings.TrimSpace(*task) != "" {
 		msg = fmt.Sprintf("%s: bounded candidate cut from %s", strings.TrimSpace(*task), *branch)
