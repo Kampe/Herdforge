@@ -3,6 +3,7 @@ package pulse
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,5 +155,24 @@ func TestResumeStatePathHonoursTheStateDir(t *testing.T) {
 	dir := t.TempDir()
 	if got := ResumeStatePath(dir); got != filepath.Join(dir, ".herd", "run", "resume-state.json") {
 		t.Fatalf("path = %s, want it under the supplied state dir", got)
+	}
+}
+
+// WIRING 4: the human output must show paused and resume_goal. The original
+// independent FAIL listed this explicitly -- "human output omits
+// paused/resume_goal" -- and a count that exists only in JSON is invisible to
+// the operator reading a beat, which is how the stall went unnoticed.
+func TestHumanOutputShowsPausedAndResumeGoal(t *testing.T) {
+	snap, err := Plan(pausedObs("forge-orchestrator", 10), planOpts(t, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := FormatHuman(snap)
+
+	if !strings.Contains(out, "paused=1") {
+		t.Fatalf("human output omits paused=1; the operator cannot see a paused lane:\n%s", out)
+	}
+	if !strings.Contains(out, "resume_goal=1") {
+		t.Fatalf("human output omits resume_goal=1; the planned wake is invisible:\n%s", out)
 	}
 }

@@ -1299,9 +1299,9 @@ func FormatHuman(snap Snapshot) string {
 	}
 	fmt.Fprintf(&b, "beat_sequence: %d observed_at: %s\n", snap.BeatSequence, snap.ObservedAt.UTC().Format(time.RFC3339Nano))
 	c := snap.Counts
-	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d would_run=%d reconcile=%d applied=%d\n",
-		c.Agents, c.HealthyIdle, c.Busy, c.Blocked, c.Done, c.Stale, c.Unknown,
-		c.Actions, c.RenewLeases, c.ConsumeCallback, c.Dispatch, c.OpenReview, c.ReviewsInFlight, c.ReapLanes, c.WouldRun, c.Reconcile, c.Applied)
+	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d paused=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d resume_goal=%d would_run=%d reconcile=%d applied=%d\n",
+		c.Agents, c.HealthyIdle, c.Busy, c.Paused, c.Blocked, c.Done, c.Stale, c.Unknown,
+		c.Actions, c.RenewLeases, c.ConsumeCallback, c.Dispatch, c.OpenReview, c.ReviewsInFlight, c.ReapLanes, c.ResumeGoal, c.WouldRun, c.Reconcile, c.Applied)
 	if snap.UnknownCritical {
 		fmt.Fprintf(&b, "unknown_critical: true\n")
 		for _, r := range snap.UnknownReasons {
