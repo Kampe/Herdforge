@@ -167,11 +167,17 @@ herd review FAC-123 --pool
 herd board-done FAC-123
 ```
 
-`herd review <ref> --pool` is the signer-independent reviewer path. It pins
-the candidate into a clean warm-pool slot, creates a relative symlink under
-`.herd/review-surfaces/`, starts persistent OpenCode in a Herdr tab, and
-delivers the review packet. The lease remains held until verdict ingest and
-release; use `--no-launch` to prepare the surface without starting Herdr.
+`herd review <ref> --pool` is the signer-independent reviewer path. It leases
+one exclusive clean warm-pool slot, pins the candidate into that slot, creates
+a relative symlink under `.herd/review-surfaces/` that aliases the leased pool
+cwd (intentional — not a second copy and not shared main), starts persistent
+OpenCode in a Herdr tab whose cwd is that surface, and delivers the review
+packet. Isolation is the exclusive lease plus the pool worktree; a reviewer
+that sees the surface symlink resolve to its own pool cwd is on the correct
+tree. Non-vacuity parent-blob swaps must stay inside that pool (or `/tmp`) and
+be restored before the verdict — never against the canonical shared checkout.
+The lease remains held until verdict ingest and release; use `--no-launch` to
+prepare the surface without starting Herdr.
 
 The exact command surface is evolving quickly while the Chainseer workflow is ported. `herd --help` is authoritative for the binary at the checked-out revision.
 
