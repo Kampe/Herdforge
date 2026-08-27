@@ -154,7 +154,14 @@ func runLaneCut(args []string) error {
 	if strings.TrimSpace(*task) != "" {
 		msg = fmt.Sprintf("%s: bounded candidate cut from %s", strings.TrimSpace(*task), *branch)
 	}
-	if out, err := exec.Command("git", "-C", dir, "commit", "-q", "-m", msg).CombinedOutput(); err != nil {
+	// Pin author/committer on the command itself. CI runners often have no
+	// global user.identity, and "Author identity unknown" is not a useful
+	// failure for an extraction that otherwise applied cleanly.
+	commit := exec.Command("git", "-C", dir,
+		"-c", "user.name=herdforge-lane-cut",
+		"-c", "user.email=herdforge-lane-cut@invalid",
+		"commit", "-q", "-m", msg)
+	if out, err := commit.CombinedOutput(); err != nil {
 		return fmt.Errorf("commit candidate: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	sha, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
