@@ -7778,6 +7778,7 @@ func runLocked(child []string, lockdir string) int {
 //	herd review-ledger list|queued|pending   — read the ledger as JSON
 //	herd review-ledger tier <sha>            — resolved risk tier for a sha
 //	herd review-ledger drift                — report standing builder-family drift
+//	herd review-ledger evidence-gap         — FAC-578 non-closable tasks + in-review holes
 func runReviewLedger() {
 	ledgerPath := reviewLedgerPath()
 	l, err := reviewledger.NewReviewLedger(".", ledgerPath)
@@ -7790,6 +7791,36 @@ func runReviewLedger() {
 		mode = os.Args[2]
 	}
 	switch mode {
+	case "evidence-gap":
+		// FAC-578: make the accounting leak visible. Ledger Task values that are
+		// not closeable card refs, plus optional in-review cards with no ledger
+		// evidence when --with-board is set.
+		rows, err := l.AllRows()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger evidence-gap: %v\n", err)
+			os.Exit(1)
+		}
+		withBoard := false
+		for _, a := range os.Args[3:] {
+			if a == "--with-board" {
+				withBoard = true
+			}
+		}
+		var inReview []string
+		if withBoard {
+			refs, boardErr := listInReviewCardRefs()
+			if boardErr != nil {
+				fmt.Fprintf(os.Stderr, "review-ledger evidence-gap: board listing failed (%v); reporting ledger-only gap\n", boardErr)
+				inReview = nil
+			} else {
+				inReview = refs
+			}
+		}
+		report := reviewledger.BuildEvidenceGapReport(rows, inReview)
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger evidence-gap: encode: %v\n", err)
+			os.Exit(1)
+		}
 	case "list":
 		rows, err := l.AllRows()
 		if err != nil {
@@ -7967,6 +7998,32 @@ func reviewLedgerPath() string {
 		return filepath.Join(root, ".herd", "review-ledger.jsonl")
 	}
 	return filepath.Join(".herd", "review-ledger.jsonl")
+}
+
+// listInReviewCardRefs is the board half of FAC-578 evidence-gap: in-review
+// cards with no ledger row are the accounting leak made visible from the board
+// side. Ledger-only mode stays usable when the board is unreachable.
+func listInReviewCardRefs() ([]string, error) {
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		return nil, err
+	}
+	tp, err := loadTaskProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := tp.ListTasks(context.Background(), cfg.TaskProvider.ProjectID, "in-review")
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		refs = append(refs, task.Ref)
+	}
+	return refs, nil
 }
 
 // reportStandingBuilderFamilyDrift resolves live Herdr provider evidence and

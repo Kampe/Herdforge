@@ -173,12 +173,19 @@ func runReviewIngest() {
 		// comparison could therefore never succeed, which is one of the four
 		// reasons harvest admission had never admitted a candidate.
 		//
-		// The card ref is the real task identity and is what FAC-578 put on the
-		// verdict row so a verdict can be tied back to a card. The branch is a
-		// location, not a task. So both rows now take the card ref, and BOTH fall
-		// back to the branch together when the artifact declares no card --
-		// falling back on only one side is how they diverged in the first place.
+		// FAC-578: the card ref is the only closable task identity. Falling back
+		// to the branch made both rows agree (FAC-657) while filling the live
+		// ledger with standing/* and wt/* names board-done can never close. Both
+		// rows still share one identity; that identity is now card-ref or empty,
+		// and empty is refused below by name rather than recorded as a branch.
 		taskIdentity := ingestTaskIdentityFor(a.TaskRef, a.Branch)
+		if a.Verdict != "RETIRED" {
+			if err := reviewledger.RequireCloseableCardRef(taskIdentity, "artifact "+filepath.Base(f)+" task"); err != nil {
+				emit.refused(f, err)
+				refused++
+				continue
+			}
+		}
 		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
@@ -770,11 +777,14 @@ func minInt(a, b int) int {
 
 // ingestTaskIdentityFor is the single source both ledger rows take their task
 // from, so they cannot disagree by construction (FAC-657).
+//
+// FAC-578 multi-ref decision: one verdict carries exactly one closeable card
+// ref. A lane branch covering N cards needs N reviews. The branch argument is
+// retained so call sites stay explicit about the location they considered and
+// discarded; it is never returned as a task identity.
 func ingestTaskIdentityFor(taskRef, branch string) string {
-	if t := strings.TrimSpace(taskRef); t != "" {
-		return t
-	}
-	return strings.TrimSpace(branch)
+	_ = branch
+	return reviewledger.CloseableCardRef(taskRef)
 }
 
 func ingestDisposition(enqueued bool, verdict string) string {

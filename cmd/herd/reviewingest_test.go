@@ -163,19 +163,36 @@ func TestReviewCompletionCallbackRefusesAnEmptySHA(t *testing.T) {
 // sources -- record.Task from the BRANCH, verdict.Task from the CARD REF -- so
 // on the live ledger 0 of 1027 SHAs had them equal and 726 verdict rows carried
 // none at all. The comparison could never succeed.
+//
+// FAC-578: agreeing on a branch is still an unclosable identity. Both rows
+// share one function; that function returns only a closeable card ref.
 func TestIngestTaskIdentityIsSharedByBothRows(t *testing.T) {
-	// With a card ref, both rows take the card ref.
 	got := ingestTaskIdentityFor("CHA-2796", "feat/some-branch")
 	if got != "CHA-2796" {
 		t.Errorf("the card ref is the task identity, got %q", got)
 	}
-	// Without one, BOTH fall back to the branch together. Falling back on only
-	// one side is exactly how they diverged.
-	if got := ingestTaskIdentityFor("", "feat/some-branch"); got != "feat/some-branch" {
-		t.Errorf("both rows must fall back together, got %q", got)
+	if got := ingestTaskIdentityFor("", "feat/some-branch"); got != "" {
+		t.Errorf("a branch must never become the task identity, got %q", got)
 	}
-	if got := ingestTaskIdentityFor("  ", "  feat/x  "); got != "feat/x" {
-		t.Errorf("whitespace-only must not count as a card ref, got %q", got)
+	if got := ingestTaskIdentityFor("standing/api-crusader", "standing/api-crusader"); got != "" {
+		t.Errorf("a standing lane name is not closable, got %q", got)
+	}
+	if got := ingestTaskIdentityFor("fix/cha-2120-telegram", "fix/cha-2120-telegram"); got != "" {
+		t.Errorf("a card-shaped token inside a branch must not count, got %q", got)
+	}
+}
+
+func TestIngestRefusesBranchAsTaskByArtifactName(t *testing.T) {
+	err := reviewledger.RequireCloseableCardRef("", "artifact only-branch.md task")
+	if err == nil {
+		t.Fatal("empty task must refuse")
+	}
+	if !strings.Contains(err.Error(), "artifact only-branch.md task") || !strings.Contains(err.Error(), "FAC-578") {
+		t.Fatalf("refusal must name the artifact, got %v", err)
+	}
+	err = reviewledger.RequireCloseableCardRef("wt/chain-indexer", "artifact only-branch.md task")
+	if err == nil || !strings.Contains(err.Error(), `artifact only-branch.md task "wt/chain-indexer"`) {
+		t.Fatalf("refusal must name the bad value, got %v", err)
 	}
 }
 

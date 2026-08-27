@@ -183,11 +183,13 @@ func TestIngestEnsuresExactAdmissionBeforePassAndIsIdempotent(t *testing.T) {
 			SHA: sha, Branch: "herd/fac-372", BuilderFamily: "anthropic",
 			ReviewerFamily: "openai", Reviewer: "reviewer-foreign",
 			Artifact: ".herd/review/inbox/verdict.md", Gate: "independent",
+			Task: "FAC-372",
 		},
 		Verdict: VerdictOpts{
 			SHA: sha, Reviewer: "reviewer-foreign", Verdict: VerdictPASS,
 			ReviewerFamily: "openai", BuilderFamily: "anthropic",
 			Artifact: ".herd/review/inbox/verdict.md", Branch: "herd/fac-372",
+			Task: "FAC-372",
 		},
 	}
 	for attempt := 0; attempt < 2; attempt++ {
@@ -233,13 +235,15 @@ func TestIngestRefusesPassWithoutAuthenticatedExactProvenance(t *testing.T) {
 		{"missing branch", func(o *IngestOpts) { o.Record.Branch = "" }},
 		{"missing artifact", func(o *IngestOpts) { o.Record.Artifact = "" }},
 		{"artifact mismatch", func(o *IngestOpts) { o.Verdict.Artifact = ".herd/review/inbox/other.md" }},
+		{"missing task", func(o *IngestOpts) { o.Record.Task = ""; o.Verdict.Task = "" }},
+		{"branch as task", func(o *IngestOpts) { o.Record.Task = "standing/api-crusader"; o.Verdict.Task = "standing/api-crusader" }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newTestLedger(t)
 			opts := IngestOpts{
-				Record:  RecordOpts{SHA: "0123456789012345678901234567890123456789", Branch: "herd/fac-372", BuilderFamily: "anthropic", ReviewerFamily: "openai", Reviewer: "reviewer-foreign", Artifact: ".herd/review/inbox/verdict.md", Gate: "independent"},
-				Verdict: VerdictOpts{SHA: "0123456789012345678901234567890123456789", Reviewer: "reviewer-foreign", Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "anthropic", Artifact: ".herd/review/inbox/verdict.md"},
+				Record:  RecordOpts{SHA: "0123456789012345678901234567890123456789", Branch: "herd/fac-372", BuilderFamily: "anthropic", ReviewerFamily: "openai", Reviewer: "reviewer-foreign", Artifact: ".herd/review/inbox/verdict.md", Gate: "independent", Task: "FAC-372"},
+				Verdict: VerdictOpts{SHA: "0123456789012345678901234567890123456789", Reviewer: "reviewer-foreign", Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "anthropic", Artifact: ".herd/review/inbox/verdict.md", Task: "FAC-372"},
 			}
 			tc.mutate(&opts)
 			if _, err := l.Ingest(opts); err == nil {
