@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/Kampe/Herdforge/pkg/launch"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/reviewack"
@@ -149,7 +150,7 @@ func runReviewIngest() {
 		// text alone is not evidence: branches are reused, relaunched and
 		// rebased, and a confidently wrong family is worse than none because
 		// independence is computed against it.
-		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA, branchReachesSHA); err != nil {
+		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA, commitAuthorTime(a.SHA), branchReachesSHA); err != nil {
 			emit.refused(f, err)
 			refused++
 			continue
@@ -1833,4 +1834,24 @@ func branchReachesSHA(branch, sha string) bool {
 	// missing branch or an unknown sha, is NOT reachability: unknown must never
 	// read as proven.
 	return exec.Command("git", "merge-base", "--is-ancestor", sha, branch).Run() == nil
+}
+
+// commitAuthorTime is when the reviewed commit was written. A launch that
+// started AFTER it cannot have produced it, however reachable its branch is.
+// An unreadable time returns zero, which the join treats as no provenance --
+// never as permission to attribute on reachability alone.
+func commitAuthorTime(sha string) time.Time {
+	sha = strings.TrimSpace(sha)
+	if sha == "" {
+		return time.Time{}
+	}
+	out, err := exec.Command("git", "show", "-s", "--format=%aI", sha).Output()
+	if err != nil {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }

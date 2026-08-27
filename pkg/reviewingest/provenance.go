@@ -3,6 +3,7 @@ package reviewingest
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/launch"
 )
@@ -48,11 +49,17 @@ type reaches func(branch, sha string) bool
 //
 // So a receipt qualifies only when its branch git-reaches the exact SHA. A
 // receipt whose branch has moved on is ignored, not guessed at.
-func ReconcileBuilderFamilyForSHA(a *Artifact, receiptPath, sha string, reachable reaches) error {
+//
+// And reachability is not enough on its own: a standing lane relaunched on the
+// same branch AFTER the commit was written also reaches it, and would steal the
+// attribution from the launch that actually produced it. commitTime closes
+// that: only receipts predating the commit qualify, latest one wins. An
+// unknown commit time yields no provenance rather than a guess.
+func ReconcileBuilderFamilyForSHA(a *Artifact, receiptPath, sha string, commitTime time.Time, reachable reaches) error {
 	if a == nil || strings.TrimSpace(sha) == "" || reachable == nil {
 		return nil
 	}
-	recorded, ok := launch.BuilderFamilyReachingSHA(receiptPath, sha, func(branch string) bool {
+	recorded, ok := launch.BuilderFamilyReachingSHA(receiptPath, sha, commitTime, func(branch string) bool {
 		return reachable(branch, sha)
 	})
 	if !ok {
