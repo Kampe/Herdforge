@@ -1254,6 +1254,26 @@ func (r *SurfaceRouter) standingProviderSpent(provider, model string) bool {
 	if provider == "" {
 		return false
 	}
+	// FAC-615: "spent" means the provider CANNOT TAKE WORK, not merely that its
+	// quota is exhausted.
+	//
+	// Reported live: platform-ops, api-crusader, chain-indexer and
+	// nft-data-engineer all refused with "no healthy launch candidate", while
+	// `route implementation` and `resolve-lane` for the same lanes selected
+	// healthy surfaces (claude-sonnet-5, grok-4.6). Codex weekly quota was
+	// AVAILABLE; its CONCURRENCY SLOT was occupied. So this predicate said "not
+	// spent", the standing family boundary stayed hard, and four lanes died
+	// beside a healthy alternate.
+	//
+	// FAC-684 already established that the boundary holds only while the
+	// preferred provider can actually take work. Quota was simply the wrong
+	// measure of that. Concurrency exhaustion is a second, independent way to
+	// have no capacity -- the same disagreement FAC-609 found between the
+	// memory-derived review ceiling and provider concurrency.
+	//
+	// r.available() already owns the full rule (CLI present, provider probe,
+	// quota, concurrency). Consulting it here rather than re-deriving keeps one
+	// definition; a second copy would drift the first time either input changed.
 	spent := func(pool string) (bad, known bool) {
 		st, ok := r.quotaState(provider, pool)
 		if !ok {
@@ -1262,7 +1282,37 @@ func (r *SurfaceRouter) standingProviderSpent(provider, model string) bool {
 		if weeklyAtOrOverCap(st) {
 			return true, true
 		}
-		return !st.Available && st.Reason != "no-quota-data", true
+		if !st.Available && st.Reason != "no-quota-data" {
+			return true, true
+		}
+		// Quota is fine. The provider may still be unable to take work.
+		//
+		// A router with no Probes cannot measure concurrency at all, and
+		// r.available dereferences them. That is not hypothetical: several
+		// existing tests construct &SurfaceRouter{Computed: ...} directly, and
+		// the first version of this change panicked on them. No probes means
+		// concurrency is UNKNOWN, and unknown is not exhaustion -- the same rule
+		// this function already applies to unknown quota.
+		if r.Probes == nil {
+			// Quota is healthy and KNOWN so. Returning unknown here would be
+			// wrong in a way that bites the sibling-pool check: a known-healthy
+			// sibling would stop holding the boundary and the lane would cross
+			// providers while its own could still take it. Without probes,
+			// fall back to exactly the pre-FAC-615 quota semantics.
+			return false, true
+		}
+		ok2, reason := r.available(provider, model, pool)
+		if ok2 {
+			return false, true
+		}
+		// UNKNOWN is not evidence of exhaustion. A probe that could not read
+		// live concurrency must NOT widen a family boundary -- that is the
+		// same rule this function already applies to unknown quota, and
+		// relaxing it would let a standing lane wander families on ignorance.
+		if strings.Contains(reason, "unknown") {
+			return false, false
+		}
+		return true, true
 	}
 
 	bad, known := spent(QuotaPoolFor(provider, model))
