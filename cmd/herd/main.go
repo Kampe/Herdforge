@@ -8177,8 +8177,19 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: phase=harvest-scan done in %s: unmerged_worktrees=%d input_errors=%d\n",
 			harvestElapsed, len(harvestResult.UnmergedWorktrees), len(harvestResult.Errors))
 	}
-	harvestErrors := len(harvestResult.Errors) > 0
+	if !*quiet {
+		for _, skip := range harvestResult.Skipped {
+			fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s (%s)\n", skip.Path, skip.Reason)
+		}
+	}
+	harvestErrors := false
 	for _, harvestErr := range harvestResult.Errors {
+		// FAC-604: never label a named non-worktree exclusion as UNKNOWN.
+		if strings.Contains(harvestErr, "not a git worktree") {
+			fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s\n", harvestErr)
+			continue
+		}
+		harvestErrors = true
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
 	}
 	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp}
