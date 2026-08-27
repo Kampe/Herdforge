@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/committime"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/mail"
@@ -37,6 +38,31 @@ func runReviewIngest() {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve repository root: %v\n", err)
 		os.Exit(1)
 	}
+	// FAC-625: the receipt log is resolved from the PROJECT root, never the
+	// process cwd.
+	//
+	// FAC-620 wired provenance reconciliation into ingest using
+	// launch.DefaultReceiptPath(), which is cwd-relative -- the exact defect
+	// FAC-646 had already fixed one caller away, in builderFamilyFromReceipts.
+	// Ingest run from a lane worktree therefore read that worktree's receipt log
+	// instead of the project's, found no receipt reaching the candidate, and
+	// recorded provenance_unrecorded on a candidate whose provenance existed.
+	//
+	// gitroot.ProjectRoot is worktree-INVARIANT: every worktree of a repository
+	// resolves the same value. repoRoot above is cwd and stays cwd, because the
+	// git commands below are meant to run against the checkout the operator
+	// invoked; only the shared control-plane log is project-scoped.
+	projectRoot, laneOverride, err := gitroot.ProjectRoot(context.Background(), ".")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve project root: %v\n", err)
+		os.Exit(1)
+	}
+	if laneOverride != "" {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: note: HERD_ROOT=%s names a lane, not this project; the receipt log is read from %s\n",
+			laneOverride, projectRoot)
+	}
+	receiptPath := launch.ReceiptPathFor(projectRoot)
+
 	parsed, err := parseReviewIngestArgs(os.Args[2:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
@@ -151,7 +177,7 @@ func runReviewIngest() {
 		// text alone is not evidence: branches are reused, relaunched and
 		// rebased, and a confidently wrong family is worse than none because
 		// independence is computed against it.
-		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, launch.DefaultReceiptPath(), a.SHA,
+		if err := reviewingest.ReconcileBuilderFamilyForSHA(&a, receiptPath, a.SHA,
 			commitCreationTime(a.SHA), branchReachesSHA); err != nil {
 			emit.refused(f, err)
 			refused++

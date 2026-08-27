@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 )
@@ -67,11 +69,39 @@ func runLaunchRecord() error {
 		return fmt.Errorf("cannot resolve a branch in %s; a receipt with no branch cannot be joined to a commit", *cwd)
 	}
 
-	sink := launch.DefaultSink()
+	// FAC-625: the receipt log is the PROJECT's, not the process cwd's.
+	// launch.DefaultSink is cwd-relative, so recording from a lane worktree wrote
+	// the receipt into that worktree's log where ingest never looks. Two of the
+	// three defects on this card are the same cwd-relative class as FAC-643/646.
+	projectRoot, _, rootErr := gitroot.ProjectRoot(context.Background(), ".")
+	if rootErr != nil {
+		return fmt.Errorf("resolve project root for the receipt log: %w", rootErr)
+	}
+	sink := &launch.JSONLSink{Path: launch.ReceiptPathFor(projectRoot)}
+
+	// FAC-625: TaskRef defaults to the lane.
+	//
+	// The standing workflow directs `--lane CHA-####` without `--task-ref`, so
+	// TaskRef was written empty and the receipt could not be joined to a card.
+	// The lane IS the task identity on that path; requiring the operator to
+	// repeat it is a second place to get one fact right.
+	recordedTaskRef := strings.TrimSpace(*taskRef)
+	if recordedTaskRef == "" {
+		recordedTaskRef = strings.TrimSpace(*lane)
+	}
+
 	if err := sink.Write(launch.Receipt{
-		CreatedAt:    time.Now().UTC(),
-		TaskRef:      strings.TrimSpace(*taskRef),
-		Lane:         strings.TrimSpace(*lane),
+		CreatedAt: time.Now().UTC(),
+		TaskRef:   recordedTaskRef,
+		// FAC-625: THE defect. family was computed, guarded and PRINTED, but
+		// never written. Every manually recorded receipt went out with an empty
+		// builder_family, which BuilderFamilyReachingSHA skips -- so the command
+		// whose whole purpose is recording provenance recorded everything except
+		// provenance, and its success line printed `family=anthropic` while the
+		// row on disk proved nothing. Live rows: CHA-3211 21:24:34,
+		// CHA-3455 21:16:50, CHA-3466 21:20:25.
+		BuilderFamily: family,
+		Lane:          strings.TrimSpace(*lane),
 		Name:         strings.TrimSpace(*lane),
 		Role:         strings.TrimSpace(*role),
 		TaskShape:    strings.TrimSpace(*shape),
