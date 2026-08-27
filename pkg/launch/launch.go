@@ -137,8 +137,18 @@ type Receipt struct {
 	// is on branch Y, is traceable provenance. It is not the domain inference a
 	// reviewer correctly refused ("apps/api is nominally api-crusader's") -- it is
 	// the launch record for the branch the commit actually sits on.
-	Branch   string `json:"branch,omitempty"`
-	Worktree string `json:"worktree,omitempty"`
+	// BuilderFamily is the vendor family derived from the RESOLVED
+	// provider/model, never from lane configuration.
+	//
+	// FAC-620: FAC-615 gave standing lanes provider fallthrough, so a lane
+	// configured for codex now routinely runs claude. A receipt built from lane
+	// config would name codex while claude wrote the commit -- and a WRONG
+	// family is worse than an absent one, because cross-family review
+	// independence would be computed against a family that never built the
+	// code, and it would look authoritative.
+	BuilderFamily string `json:"builder_family,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+	Worktree      string `json:"worktree,omitempty"`
 	// PullRequest is the PR this launch's work is proposed through, and
 	// CandidateSHA the exact commit it produced.
 	//
