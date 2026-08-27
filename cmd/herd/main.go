@@ -39,6 +39,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/drainreceipt"
 	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/feedback"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
@@ -8153,11 +8154,20 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		return 2
 	}
+	scanTimeout := drainScanTimeout()
+	// FAC-605: read the prior timeout cursor BEFORE Begin overwrites the receipt.
+	resumeAfter, resumeOK := drainreceipt.PriorResumeCursor(root)
+	if _, err := drainreceipt.Begin(root, scanTimeout.String(), "harvest-scan"); err != nil {
+		fmt.Fprintf(errOut, "herd-drain: durable receipt begin: %v\n", err)
+		return 1
+	}
+	if resumeOK {
+		fmt.Fprintf(errOut, "herd-drain: resuming after resume_cursor=%s (prior timeout)\n", resumeAfter)
+	}
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=harvest-scan")
 	}
 	h := harvest.NewHarvester(root)
-	scanTimeout := drainScanTimeout()
 	scanCtx, cancelScan := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancelScan()
 	harvestStart := time.Now()
@@ -8168,6 +8178,9 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(errOut, "herd-drain: bounded scan exceeded %s during phase=harvest-scan after %s: %v\n",
 				scanTimeout, harvestElapsed, scanCtx.Err())
 			fmt.Fprintln(errOut, "herd-drain: partial=none — harvest-scan produced no result; raise the bound with HERD_DRAIN_TIMEOUT (e.g. HERD_DRAIN_TIMEOUT=6m) to see counts")
+			if rerr := drainreceipt.MarkTimeout(root, "harvest-scan", "", 0, 0); rerr != nil {
+				fmt.Fprintf(errOut, "herd-drain: durable receipt timeout: %v\n", rerr)
+			}
 		} else {
 			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		}
@@ -8182,6 +8195,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(errOut, "herd-drain: excluded harvest input: %s (%s)\n", skip.Path, skip.Reason)
 		}
 	}
+	_ = drainreceipt.Progress(root, "review-scan", "", 0, 0, len(harvestResult.UnmergedWorktrees))
 	harvestErrors := false
 	for _, harvestErr := range harvestResult.Errors {
 		// FAC-604: never label a named non-worktree exclusion as UNKNOWN.
@@ -8192,7 +8206,7 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 		harvestErrors = true
 		fmt.Fprintf(errOut, "herd-drain: UNKNOWN harvest input: %s\n", harvestErr)
 	}
-	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp}
+	d := review.Drain{RepoRoot: root, StateDir: os.Getenv("HERD_STATE_DIR"), LedgerPath: ledgerPath, Cap: cap, StaleBehind: stale, Provider: tp, ResumeAfter: resumeAfter}
 	if !*quiet {
 		fmt.Fprintln(errOut, "herd-drain: phase=review-scan")
 	}
@@ -8280,6 +8294,18 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 			}
 			// Emit the partial already in hand instead of only the deadline.
 			emitDrainPartial(out, errOut, harvestResult, *asJSON)
+			// Cursor is the last tip this run actually probed (Pins are this-run
+			// only). Index math against ScannedTips breaks under ResumeAfter.
+			cursor, scanned, total := "", 0, tipCount
+			if report != nil {
+				scanned, total = report.ScannedTips, report.TotalTips
+				if len(report.Pins) > 0 {
+					cursor = report.Pins[len(report.Pins)-1].SHA
+				}
+			}
+			if rerr := drainreceipt.MarkTimeout(root, "review-scan", cursor, scanned, total); rerr != nil {
+				fmt.Fprintf(errOut, "herd-drain: durable receipt timeout: %v\n", rerr)
+			}
 		} else {
 			fmt.Fprintf(errOut, "herd-drain: %v\n", err)
 		}
@@ -8299,6 +8325,19 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 	}
 	if harvestErrors {
 		report.Errors = append(report.Errors, "harvest input errors; action projection is fail-closed")
+	}
+	scannedDone, totalDone := 0, tipCount
+	if report != nil {
+		if report.TotalTips > 0 {
+			totalDone = report.TotalTips
+		}
+		scannedDone = report.ScannedTips
+		if scannedDone == 0 {
+			scannedDone = totalDone
+		}
+	}
+	if cerr := drainreceipt.MarkCompleted(root, scannedDone, totalDone); cerr != nil {
+		fmt.Fprintf(errOut, "herd-drain: durable receipt complete: %v\n", cerr)
 	}
 	if *asJSON {
 		if err := json.NewEncoder(out).Encode(report); err != nil {

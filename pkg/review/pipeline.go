@@ -1,10 +1,10 @@
 package review
 
 import (
-	"errors"
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -45,6 +45,12 @@ type Drain struct {
 	// Progress, when set, is called before each tip is probed so a caller can
 	// measure real per-item cost instead of guessing a budget.
 	Progress func(done, total int, branch string)
+
+	// ResumeAfter, when set, is the last tip SHA fully processed by a prior
+	// bounded drain (FAC-605). Scan continues AFTER this SHA rather than
+	// restarting the tip set. Empty means start from the beginning. If the
+	// SHA is no longer in the tip set (board changed), Scan restarts at 0.
+	ResumeAfter string
 
 	// ProbeBudget bounds ONE content-merge probe. Zero uses the default.
 	ProbeBudget time.Duration
@@ -267,7 +273,10 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	}
 	sort.Strings(r.Shas.ReviewPass)
 	r.ReviewPass = len(r.Shas.ReviewPass)
-	for i, u := range tips {
+	start := tipIndexAfter(tips, d.ResumeAfter)
+	r.TotalTips = len(tips)
+	for i := start; i < len(tips); i++ {
+		u := tips[i]
 		// FAC-560: the per-tip work is a git merge-tree probe, so this loop is
 		// the O(N) cost. Report progress and stop cleanly on deadline: the scan
 		// previously consumed its whole budget and returned nothing, so neither
@@ -384,6 +393,8 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 	for _, p := range [][]string{r.Shas.Harvestable, r.Shas.NeedReview, r.Shas.ContentMerged, r.Shas.HarvestReady, r.Shas.RebaseNeeded} {
 		sort.Strings(p)
 	}
+	r.ScannedTips = len(tips)
+	r.TotalTips = len(tips)
 	r.Harvestable = len(r.Shas.Harvestable)
 	r.NeedReview = len(r.Shas.NeedReview)
 	r.ContentMerged = len(r.Shas.ContentMerged)
