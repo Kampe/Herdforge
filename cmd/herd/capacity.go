@@ -2,12 +2,12 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -395,11 +395,15 @@ func herdrServerRunning() (bool, string) {
 	return false, "herdr status server printed no status line"
 }
 
-// hostMemoryMiB reads /proc/meminfo. Returns (-1, -1) where that does not
-// exist, which the decision treats as unmeasured rather than as zero.
+// hostMemoryMiB reads /proc/meminfo, falling back to the Darwin interfaces.
+// Returns (-1, -1) where neither exists, which the decision treats as
+// unmeasured rather than as zero.
 func hostMemoryMiB() (total, avail, swapUsed int64) {
 	raw, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
+		if runtime.GOOS == "darwin" {
+			return darwinMemoryMiB()
+		}
 		return -1, -1, -1
 	}
 	kb := map[string]int64{}
@@ -427,6 +431,76 @@ func hostMemoryMiB() (total, avail, swapUsed int64) {
 	}
 	if total, ok := kb["SwapTotal"]; ok {
 		swapUsed = (total - kb["SwapFree"]) / 1024
+	}
+	return total, avail, swapUsed
+}
+
+// darwinMemoryMiB measures total and available memory on macOS.
+//
+// FAC-718: a Mac reports no /proc/meminfo, so hostMemoryMiB returned -1 and
+// derivedReviewLimit collapsed the ceiling to ONE reviewer for the whole host.
+// That is not the documented "unknown is not a refusal" behaviour -- it refuses
+// every reviewer after the first, which is how a single settled reviewer of
+// mine blocked another project's admission entirely. The host has 48GiB; the
+// cap was 1 because nobody had taught it to look.
+//
+// Swap is deliberately returned UNMEASURED rather than read from
+// vm.swapusage. macOS pages into a dynamically grown, compressed swap file as
+// normal operation, so its swap LEVEL is not the same phenomenon as the Linux
+// exhaustion this host's 75% backstop was calibrated against -- this machine
+// sits at 87% while completely healthy. Reporting it would fire that gate and
+// refuse every review, turning a too-small cap into a total outage. Declining
+// to map a differently-defined metric onto a threshold calibrated for another
+// one is the honest reading, not a gap being hidden: MemAvailable still gates,
+// so a genuinely exhausted Mac is still refused on the measurement that means
+// the same thing on both platforms.
+func darwinMemoryMiB() (total, avail, swapUsed int64) {
+	total, avail, swapUsed = -1, -1, -1
+
+	if out, err := exec.Command("sysctl", "-n", "hw.memsize").Output(); err == nil {
+		if b, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil && b > 0 {
+			total = b / 1024 / 1024
+		}
+	}
+
+	out, err := exec.Command("vm_stat").Output()
+	if err != nil {
+		return total, avail, swapUsed
+	}
+	lines := strings.Split(string(out), "\n")
+	if len(lines) == 0 {
+		return total, avail, swapUsed
+	}
+	// "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+	_, sizePart, ok := strings.Cut(lines[0], "page size of ")
+	if !ok {
+		return total, avail, swapUsed
+	}
+	pageBytes, err := strconv.ParseInt(strings.Fields(sizePart)[0], 10, 64)
+	if err != nil || pageBytes <= 0 {
+		return total, avail, swapUsed
+	}
+
+	// Free plus the pages the kernel can reclaim without paging anything out.
+	// This is the closest analogue to Linux MemAvailable; counting only "Pages
+	// free" would understate reclaimable memory by an order of magnitude on a
+	// warm machine and refuse reviewers a healthy host can seat.
+	var pages int64
+	for _, key := range []string{"Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"} {
+		for _, line := range lines {
+			k, v, ok := strings.Cut(line, ":")
+			if !ok || strings.TrimSpace(k) != key {
+				continue
+			}
+			n, err := strconv.ParseInt(strings.Trim(strings.TrimSpace(v), "."), 10, 64)
+			if err == nil {
+				pages += n
+			}
+			break
+		}
+	}
+	if pages > 0 {
+		avail = pages * pageBytes / 1024 / 1024
 	}
 	return total, avail, swapUsed
 }
@@ -671,13 +745,22 @@ type hostMemory struct {
 func readHostMemory() freshness.Reading[hostMemory] {
 	total, avail, swapUsed := hostMemoryMiB()
 	now := time.Now()
+	// FAC-718: name the interface the number actually came from. Reporting a
+	// Darwin sysctl reading as "/proc/meminfo: fresh" is the same class of
+	// defect as every other mislabelled source this control plane has been
+	// bitten by -- an operator checking why a cap moved would go read a file
+	// that does not exist on the host that produced the number.
+	source := "/proc/meminfo"
+	if runtime.GOOS == "darwin" {
+		source = "sysctl hw.memsize + vm_stat"
+	}
 	if total < 0 && avail < 0 {
 		return freshness.Degrade[hostMemory](
-			freshness.Reading[hostMemory]{}, "/proc/meminfo",
-			errors.New("no /proc/meminfo on this host"),
+			freshness.Reading[hostMemory]{}, source,
+			fmt.Errorf("no %s on this host", source),
 			"run the capacity check on the review host itself; memory gating is skipped where it cannot be measured")
 	}
-	return freshness.Fresh(now.Format(time.RFC3339)+" /proc/meminfo", now,
+	return freshness.Fresh(now.Format(time.RFC3339)+" "+source, now,
 		hostMemory{TotalMiB: total, AvailMiB: avail, SwapUsedMiB: swapUsed})
 }
 
