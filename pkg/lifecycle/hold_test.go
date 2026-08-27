@@ -458,3 +458,61 @@ type heldTaskReader struct{}
 func (heldTaskReader) Check(_ context.Context, id HoldIdentity, _ int64) (HoldDecision, error) {
 	return HoldDecision{Held: id.Scope == "task"}, nil
 }
+
+// FAC-702: one message covered three different problems with three different
+// owners. Measured live, seven lanes reported "unknown or ambiguous" and the
+// operator could not tell which failure any of them was -- docs-custodian had
+// 23 in-progress cards (board hygiene), while qa-sentinel had ZERO and was
+// failing for an entirely different reason.
+func TestResolverFailureIsNotReportedAsAmbiguity(t *testing.T) {
+	resolver := func(context.Context, string) ([]HoldIdentity, error) {
+		return nil, errors.New("board unreachable")
+	}
+	err := CheckLaneAndTaskHold(context.Background(), stubReader{}, resolver, "repo", "owner", "qa-sentinel", stubGeneration)
+	if err == nil {
+		t.Fatal("a failed resolver was admitted")
+	}
+	if !strings.Contains(err.Error(), "NOT an ambiguous lane") {
+		t.Fatalf("resolver failure still reads as ambiguity: %v", err)
+	}
+	if !strings.Contains(err.Error(), "board unreachable") {
+		t.Fatalf("the underlying cause was swallowed: %v", err)
+	}
+}
+
+func TestAmbiguousLaneNamesTheTasksToMove(t *testing.T) {
+	// The remedy is to move cards out of in-progress, which is impossible
+	// without knowing which ones.
+	resolver := func(context.Context, string) ([]HoldIdentity, error) {
+		return []HoldIdentity{
+			{Repository: "repo", Owner: "owner", Lane: "docs-custodian", Task: "CHA-2", Scope: "task"},
+			{Repository: "repo", Owner: "owner", Lane: "docs-custodian", Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+	err := CheckLaneAndTaskHold(context.Background(), stubReader{}, resolver, "repo", "owner", "docs-custodian", stubGeneration)
+	if err == nil {
+		t.Fatal("an ambiguous lane was admitted")
+	}
+	for _, want := range []string{"has 2 active tasks", "CHA-1", "CHA-2", "move all but one"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+func TestZeroActiveTasksIsACleanPass(t *testing.T) {
+	// Zero is not ambiguous. A lane with no active task binding is simply
+	// unbound, and treating that as a failure would fence every idle lane.
+	resolver := func(context.Context, string) ([]HoldIdentity, error) { return nil, nil }
+	if err := CheckLaneAndTaskHold(context.Background(), stubReader{}, resolver, "repo", "owner", "qa-sentinel", stubGeneration); err != nil {
+		t.Fatalf("a lane with no active task was refused: %v", err)
+	}
+}
+
+type stubReader struct{}
+
+func (stubReader) Check(context.Context, HoldIdentity, int64) (HoldDecision, error) {
+	return HoldDecision{}, nil
+}
+
+func stubGeneration(context.Context, HoldIdentity) (int64, error) { return 1, nil }
