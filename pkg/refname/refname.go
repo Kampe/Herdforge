@@ -1,4 +1,9 @@
-// Package refname builds git ref names that are safe to publish.
+// Package refname builds git ref names that are safe to publish and names the
+// standing-lane branch prefix in exactly one place.
+//
+// The "standing/" literal used to appear in worktreereap, review candidacy, and
+// review queue. TestNoNewDuplicatedRules caught the third copy (FAC-575). All
+// callers go through StandingBranchPrefix / IsStandingBranch.
 //
 // FAC-574: this exists because the same rule was implemented twice and I fixed
 // the wrong copy. A generated harvest branch inherited "current-main" from its
@@ -16,6 +21,18 @@ import (
 	"regexp"
 	"strings"
 )
+
+// StandingBranchPrefix is the branch-name prefix for standing lane homes.
+// Control-lane branches and resident worktree homes share this spelling.
+const StandingBranchPrefix = "standing/"
+
+// HerdBranchPrefix is the ephemeral herd-task branch prefix.
+const HerdBranchPrefix = "herd/"
+
+// IsStandingBranch reports whether branch is a standing-lane home name.
+func IsStandingBranch(branch string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(branch)), StandingBranchPrefix)
+}
 
 // unsafeChars are everything git-unfriendly for a single ref segment.
 var unsafeChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)

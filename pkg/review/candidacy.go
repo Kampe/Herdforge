@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/refname"
+
 	"github.com/Kampe/Herdforge/pkg/harvest"
 )
 
@@ -100,7 +102,7 @@ func scopeReason(branch string, w harvest.UnmergedWork, hasReceipt HasCandidateR
 	}
 	// Control-lane branches: real candidates live here, so gate on a receipt
 	// rather than excluding the prefix.
-	if strings.HasPrefix(lower, "standing/") || strings.HasPrefix(lower, "herd/") {
+	if refname.IsStandingBranch(lower) || strings.HasPrefix(lower, refname.HerdBranchPrefix) {
 		if hasReceipt(w) {
 			return "", false
 		}

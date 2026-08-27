@@ -3,6 +3,8 @@ package review
 import (
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/refname"
 )
 
 // queuePin is ledger-owned queue recovery evidence. The enqueue row may omit
@@ -47,11 +49,12 @@ func queuePins(s LedgerSnapshot, pass map[string]string, veto map[string]bool) [
 
 func normalizeQueueLane(branch string) string {
 	branch = strings.TrimSpace(branch)
-	if i := strings.Index(branch, "#standing/"); i >= 0 {
-		return branch[i+len("#standing/"):]
+	if i := strings.Index(strings.ToLower(branch), "#"+refname.StandingBranchPrefix); i >= 0 {
+		return branch[i+len("#"+refname.StandingBranchPrefix):]
 	}
-	if strings.HasPrefix(branch, "standing/") {
-		return strings.TrimPrefix(branch, "standing/")
+	if refname.IsStandingBranch(branch) {
+		// Trim using the canonical prefix length; IsStandingBranch is case-insensitive.
+		return strings.TrimSpace(branch)[len(refname.StandingBranchPrefix):]
 	}
 	return branch
 }
