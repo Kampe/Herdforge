@@ -18,7 +18,17 @@ func DefaultReceiptPath() string {
 	if p := strings.TrimSpace(os.Getenv("HERD_LAUNCH_RECEIPTS")); p != "" {
 		return p
 	}
-	return filepath.Join(".herd", "launch-receipts.jsonl")
+	return PathFor("")
+}
+
+// PathFor returns the receipt path rooted at root without applying an
+// environment override. Callers that have already established the canonical
+// project root use this to compare an override against that project.
+func PathFor(root string) string {
+	if strings.TrimSpace(root) == "" {
+		return filepath.Join(".herd", "launch-receipts.jsonl")
+	}
+	return filepath.Join(root, ".herd", "launch-receipts.jsonl")
 }
 
 // ReceiptPathFor anchors the receipt log on an explicit repository root.
@@ -33,10 +43,7 @@ func ReceiptPathFor(root string) string {
 	if p := strings.TrimSpace(os.Getenv("HERD_LAUNCH_RECEIPTS")); p != "" {
 		return p
 	}
-	if strings.TrimSpace(root) == "" {
-		return DefaultReceiptPath()
-	}
-	return filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	return PathFor(root)
 }
 
 // ReadReceipts returns every parseable receipt, oldest first. A missing log is

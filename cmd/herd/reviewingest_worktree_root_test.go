@@ -28,6 +28,9 @@ import (
 // opens -- exactly the "helper is correct, production caller reads the wrong
 // path" shape this card exists to close.
 func TestReviewIngestResolvesReceiptsFromProjectRootInAWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
 	binary := buildHerd(t)
 	root := t.TempDir()
 	git := func(dir string, args ...string) {
@@ -87,12 +90,14 @@ func TestReviewIngestResolvesReceiptsFromProjectRootInAWorktree(t *testing.T) {
 
 	cmd := exec.Command(binary, "review-ingest", "verdict.md")
 	cmd.Dir = lane // the shipped call shape: ingest runs FROM the lane worktree
+	cmd.Env = append(os.Environ(), "HERD_PROJECT_ROOT="+root, "HERD_ROOT="+lane,
+		"HERD_LAUNCH_RECEIPTS=", "HERD_REVIEW_LEDGER=")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("review-ingest: %v: %s", err, out)
 	}
 
-	ledger, err := reviewledger.NewReadOnlyReviewLedger(lane, reviewledger.DefaultPath(lane))
+	ledger, err := reviewledger.NewReadOnlyReviewLedger(root, reviewledger.PathFor(root))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
@@ -117,6 +122,89 @@ func TestReviewIngestResolvesReceiptsFromProjectRootInAWorktree(t *testing.T) {
 	if record.Gate == reviewledger.GateProvenanceUnrecorded {
 		t.Fatalf("gate = %s; a receipt reaching the exact commit proved the family and must not be "+
 			"downgraded to unrecorded", record.Gate)
+	}
+	if _, err := os.Stat(reviewledger.PathFor(lane)); !os.IsNotExist(err) {
+		t.Fatalf("lane worktree ledger must remain untouched, stat err=%v", err)
+	}
+}
+
+// A receipt can prove builder provenance only for the project that owns it.
+// This invokes the shipped mutating command with exactly that project as its
+// provenance root but another project's ledger override. It must refuse before
+// creating the ledger, retaining an inbox artifact, or emitting an ack.
+func TestReviewIngestRefusesMixedProjectLedgerBeforeMutation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	binary := buildHerd(t)
+	provenanceRoot := t.TempDir()
+	ledgerRoot := t.TempDir()
+	git := func(dir string, args ...string) {
+		t.Helper()
+		if out, err := testgit.Command(dir, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	for _, root := range []string{provenanceRoot, ledgerRoot} {
+		git(root, "init", "-q", "-b", "main")
+		git(root, "config", "user.email", "fac644@test.invalid")
+		git(root, "config", "user.name", "fac644")
+		git(root, "commit", "-q", "--allow-empty", "-m", "base")
+	}
+	git(provenanceRoot, "branch", "origin/main")
+	if err := os.WriteFile(filepath.Join(provenanceRoot, "candidate.txt"), []byte("fac-644\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(provenanceRoot, "add", "candidate.txt")
+	git(provenanceRoot, "commit", "-q", "-m", "candidate")
+	sha := strings.TrimSpace(runOutput(t, provenanceRoot, "rev-parse", "HEAD"))
+	commitISO := strings.TrimSpace(runOutput(t, provenanceRoot, "show", "-s", "--format=%cI", sha))
+	commitTime, err := time.Parse(time.RFC3339, commitISO)
+	if err != nil {
+		t.Fatalf("parse commit time %q: %v", commitISO, err)
+	}
+
+	receipt := fmt.Sprintf(
+		`{"created_at":%q,"task_ref":"FAC-644","lane":"fac-644","provider":"claude","model":"claude-sonnet-5","builder_family":"anthropic","branch":"main","accepted":true}`,
+		commitTime.Add(-time.Minute).UTC().Format(time.RFC3339))
+	if err := os.MkdirAll(filepath.Join(provenanceRoot, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(provenanceRoot, ".herd", "launch-receipts.jsonl"), []byte(receipt+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	artifact := "sha: " + sha + "\n" +
+		"branch: main\n" +
+		"task: FAC-644\n" +
+		"reviewer: independent-reviewer\n" +
+		"reviewer-family: openai\n" +
+		"builder-family: anthropic\n" +
+		"verdict: PASS\n" +
+		"reviewed-head: " + sha + "\n---\n" +
+		strings.Repeat("Independently verified the candidate against the project receipt and commit. ", 6) + "\n"
+	artifactPath := filepath.Join(provenanceRoot, "verdict.md")
+	if err := os.WriteFile(artifactPath, []byte(artifact), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ledgerPath := reviewledger.PathFor(ledgerRoot)
+	cmd := exec.Command(binary, "review-ingest", "verdict.md")
+	cmd.Dir = provenanceRoot
+	cmd.Env = append(os.Environ(), "HERD_PROJECT_ROOT="+provenanceRoot,
+		"HERD_REVIEW_LEDGER="+ledgerPath, "HERD_LAUNCH_RECEIPTS=", "HERD_ROOT="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("mixed-project ingest unexpectedly succeeded: %s", out)
+	}
+	text := string(out)
+	if !strings.Contains(text, provenanceRoot) || !strings.Contains(text, ledgerRoot) {
+		t.Fatalf("mixed-project refusal must name both roots %q and %q:\n%s", provenanceRoot, ledgerRoot, text)
+	}
+	if _, err := os.Stat(ledgerPath); !os.IsNotExist(err) {
+		t.Fatalf("foreign ledger was mutated before refusal, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(provenanceRoot, ".herd", "review")); !os.IsNotExist(err) {
+		t.Fatalf("provenance project retained or acknowledged an artifact before refusal, stat err=%v", err)
 	}
 }
 
