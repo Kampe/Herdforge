@@ -154,3 +154,53 @@ func TestKaneoCLI_AttachTaskLabelKeepsDonorAndTarget(t *testing.T) {
 		t.Fatalf("attach must read back target and donor, target=%v donor=%v", sawTarget, sawDonor)
 	}
 }
+
+func TestKaneoCLI_CreateTaskLabelRejectsAttachedRow(t *testing.T) {
+	old := kaneoRunCLI
+	t.Cleanup(func() { kaneoRunCLI = old })
+	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
+		command := strings.Join(args, " ")
+		if strings.HasPrefix(command, "label list") {
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
+		}
+		if strings.HasPrefix(command, "label create") {
+			return &CLIResult{Stdout: []byte(`{"id":"old-row","name":"herd-smith","taskId":"other"}`)}, nil
+		}
+		return &CLIResult{Stdout: []byte(`[]`)}, nil
+	}
+	k := NewKaneoProvider("", "project-1", true)
+	row, err := k.CreateTaskLabel(context.Background(), "target", "herd-smith")
+	if err == nil {
+		t.Fatalf("create must refuse an attached row, got %+v", row)
+	}
+}
+
+type attachedCreateProvider struct {
+	*MemoryProvider
+	attaches int
+	taskID   string
+}
+
+func (a *attachedCreateProvider) CreateTaskLabel(_ context.Context, _, name string) (TaskLabel, error) {
+	return TaskLabel{ID: "live-row", Name: name, TaskID: a.taskID}, nil
+}
+
+func (a *attachedCreateProvider) AttachTaskLabel(ctx context.Context, taskID, labelID string) error {
+	a.attaches++
+	return a.MemoryProvider.AttachTaskLabel(ctx, taskID, labelID)
+}
+
+func TestEnsureTaskRoleLabel_CreatedAttachedRowIsNotAttached(t *testing.T) {
+	base := NewMemoryProvider()
+	base.AddTask(&Task{ID: "target", ProjectID: "project"})
+	for _, donor := range []string{"other", "target"} {
+		p := &attachedCreateProvider{MemoryProvider: base, taskID: donor}
+		err := EnsureTaskRoleLabel(context.Background(), p, "target", "forge-smith")
+		if err == nil {
+			t.Fatalf("create result attached to %s must fail closed", donor)
+		}
+		if p.attaches != 0 {
+			t.Fatalf("attach issued for create result attached to %s", donor)
+		}
+	}
+}

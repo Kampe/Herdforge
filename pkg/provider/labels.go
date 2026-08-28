@@ -420,8 +420,8 @@ func repairTaskRoleLabel(ctx context.Context, p TaskLabelProvider, sourceID, tar
 		if err != nil {
 			return fmt.Errorf("label repair: create target label: %w", err)
 		}
-		if created.ID == "" || (created.TaskID != "" && created.TaskID != targetID) {
-			return compensateLabel(ctx, p, sourceID, targetID, source, target, beforeSource, beforeTarget, TaskLabel{}, nil, fmt.Errorf("created label has unknown or wrong ownership"))
+		if err := requireUnattachedCreatedLabel(created); err != nil {
+			return compensateLabel(ctx, p, sourceID, targetID, source, target, beforeSource, beforeTarget, TaskLabel{}, nil, err)
 		}
 		if opts.Evidence != nil {
 			if err := opts.Evidence.RecordLabelRepairEvidence(LabelRepairEvidence{Repository: opts.Repository, Provider: opts.Provider, Project: opts.Project, TargetTaskID: targetID, PreTargetLabels: encodeLabelIDs(target), CanonicalRole: role, TransactionID: opts.TransactionID, Generation: opts.Generation, Outcome: "CREATED", Phase: "created", Revision: opts.Revision, Operation: opts.Operation, CreatedLabelID: created.ID}); err != nil {
@@ -673,8 +673,8 @@ func ensureTaskRoleLabel(ctx context.Context, p TaskLabelProvider, targetID, rol
 		if err != nil {
 			return err
 		}
-		if created.ID == "" || (created.TaskID != "" && created.TaskID != targetID) {
-			return &LabelTransactionError{Cause: ErrLabelOwnershipUnknown, Compensation: ErrLabelTransactionBlocked}
+		if err := requireUnattachedCreatedLabel(created); err != nil {
+			return &LabelTransactionError{Cause: err, Compensation: ErrLabelTransactionBlocked}
 		}
 		if opts.Evidence != nil {
 			if err := opts.Evidence.RecordLabelRepairEvidence(LabelRepairEvidence{Repository: opts.Repository, Provider: opts.Provider, Project: opts.Project, TargetTaskID: targetID, PreTargetLabels: encodeLabelIDs(before), CanonicalRole: role, TransactionID: opts.TransactionID, Generation: opts.Generation, Outcome: "CREATED", Phase: "created", Revision: opts.Revision, Operation: opts.Operation, CreatedLabelID: created.ID}); err != nil {
@@ -917,6 +917,16 @@ func countRole(labels []TaskLabel, role string) int {
 	}
 	return n
 }
+func requireUnattachedCreatedLabel(created TaskLabel) error {
+	if created.ID == "" {
+		return fmt.Errorf("created label has unknown identity")
+	}
+	if created.TaskID != "" {
+		return fmt.Errorf("created label %s is already attached to %s", created.ID, created.TaskID)
+	}
+	return nil
+}
+
 func ownsLabel(labels []TaskLabel, id, taskID string) bool {
 	for _, l := range labels {
 		if l.ID == id && l.TaskID == taskID {

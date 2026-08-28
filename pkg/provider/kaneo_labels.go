@@ -158,6 +158,9 @@ func (k *KaneoProvider) CreateTaskLabel(ctx context.Context, taskID, name string
 		if rows[0].ID == "" || rows[0].Name != name {
 			return TaskLabel{}, fmt.Errorf("label create identity mismatch")
 		}
+		if rows[0].TaskID != "" {
+			return TaskLabel{}, fmt.Errorf("kaneo label create returned attached row %s on %s", rows[0].ID, rows[0].TaskID)
+		}
 		k.proofMu.Lock()
 		if k.pendingCreates == nil {
 			k.pendingCreates = make(map[string]map[string]TaskLabel)
