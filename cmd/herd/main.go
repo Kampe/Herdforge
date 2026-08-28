@@ -3230,6 +3230,15 @@ func runApprove() {
 	finish(0)
 }
 
+// errNoDispatchAuthorization marks boundBoardProvider's ONE recoverable
+// failure: no dispatch task-context exists anywhere (worktree or canonical
+// store). approveOne treats this — and only this — as grounds to fall back
+// to completion-receipt evidence (FAC-629). Every other boundBoardProvider
+// failure (unreadable, unsigned, tampered, mis-bound, expired, stale or
+// released lease, corrupt fence store) means a dispatch context EXISTS and
+// failed a real check, and must stay a hard failure.
+var errNoDispatchAuthorization = errors.New("no dispatch task-context authorization")
+
 // boundBoardProvider binds board mutations for ref to its launch receipt:
 // the receipt must EXIST in the managed worktree and authenticate against
 // the published coordinator key; the coordinator context is then re-ISSUED
@@ -3249,18 +3258,33 @@ func boundBoardProvider(cfg *config.Config, tp provider.TaskProvider, root, ref 
 		// Worktree reaped: recover from the coordinator's DURABLE canonical
 		// receipt store — issued, signed authority, not a config fallback.
 		tc, err = dispatch.LoadCanonicalReceipt(root, hsync.NormalizeRef(ref))
-	}
-	if err != nil {
-		// FAC-629: this is a DISPATCH TASK-CONTEXT — proof an agent was
-		// AUTHORIZED to work the card, bounded and expiring by design — not a
-		// launch receipt and not completion evidence. The prior message named
-		// the wrong artifact ("no usable launch receipt"), which sent an
-		// operator looking in .herd/launch-receipts.jsonl, where a valid
-		// task-bound row sat the whole time. Name the artifact class actually
-		// missing and exactly where both lookups searched.
-		return nil, tc, fmt.Errorf(
-			"no dispatch task-context authorization for %s (checked worktree %s and canonical store %s; FAC-145 fail-closed, no config fallback): %w",
-			ref, filepath.Join(wt, dispatch.TaskContextFile), filepath.Join(root, dispatch.CanonicalReceiptDir), err)
+		if err != nil {
+			// FAC-629: NEITHER copy exists at all. This is a DISPATCH
+			// TASK-CONTEXT — proof an agent was AUTHORIZED to work the card,
+			// bounded and expiring by design — not a launch receipt and not
+			// completion evidence. The prior message named the wrong artifact
+			// ("no usable launch receipt"), which sent an operator looking in
+			// .herd/launch-receipts.jsonl, where a valid task-bound row sat
+			// the whole time.
+			//
+			// errNoDispatchAuthorization is a distinct sentinel from every
+			// other failure below on purpose: approveOne falls back to
+			// completion-receipt evidence ONLY on "nothing exists to check",
+			// never on "something exists and failed its check" (tampered
+			// signature, stale/released lease, corrupt fence store). Those
+			// must stay hard failures — a real security refusal must never be
+			// silently swapped for a different, unrelated evidence chain.
+			return nil, tc, fmt.Errorf(
+				"%w for %s (checked worktree %s and canonical store %s; FAC-145 fail-closed, no config fallback): %v",
+				errNoDispatchAuthorization, ref, filepath.Join(wt, dispatch.TaskContextFile), filepath.Join(root, dispatch.CanonicalReceiptDir), err)
+		}
+	} else if err != nil {
+		// The worktree copy EXISTS but could not be read (malformed, permission
+		// denied, etc.) — a present-but-broken context is not "missing", and
+		// must not silently fall through to the canonical store or to
+		// completion-receipt evidence.
+		return nil, tc, fmt.Errorf("dispatch task-context at %s is unreadable (FAC-145 fail-closed): %w",
+			filepath.Join(wt, dispatch.TaskContextFile), err)
 	}
 	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
 	if err != nil {
@@ -3849,7 +3873,14 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		// merge SHA, verdict, verification digest — is what actually evidences
 		// completion. Resume is crash recovery for an already-journaled
 		// coordinator-bound intent and must not silently change authority.
-		if resume != nil {
+		//
+		// The fallback triggers ONLY on errNoDispatchAuthorization — no
+		// dispatch context exists anywhere. Every other boundBoardProvider
+		// failure (tampered signature, stale or released lease, corrupt fence
+		// store) means a context EXISTS and failed a real security check;
+		// swapping those for completion-receipt evidence would silently
+		// launder a refusal into a close through an unrelated evidence chain.
+		if resume != nil || !errors.Is(err, errNoDispatchAuthorization) {
 			return nil, err
 		}
 		return approveByCompletionReceipt(ctx, cfg, tp, stack, root, ref, receiptPath, acceptanceEvidence, err)
