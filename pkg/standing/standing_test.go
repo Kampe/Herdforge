@@ -11,6 +11,13 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 )
 
+func TestCompareModelReportsBothValues(t *testing.T) {
+	err := CompareModel("grok-4.6", "Grok 4.5 (high)")
+	if err == nil || !strings.Contains(err.Error(), "grok-4.6") || !strings.Contains(err.Error(), "Grok 4.5 (high)") {
+		t.Fatalf("drift not reported loudly: %v", err)
+	}
+}
+
 func writePrompt(t *testing.T, dir, rel, body string) string {
 	t.Helper()
 	p := filepath.Join(dir, rel)

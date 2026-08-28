@@ -5,6 +5,15 @@ import (
 	"time"
 )
 
+func TestEmptyContinuationLoopIsNonProductive(t *testing.T) {
+	if !EmptyContinuationLoop(308, "\n") {
+		t.Fatal("empty continuation loop must be detected")
+	}
+	if EmptyContinuationLoop(308, "completed work") {
+		t.Fatal("productive output must not be empty")
+	}
+}
+
 // Without noise-stripping a "thinking" pane redraws forever and STALL can
 // never fire. This is the load-bearing behaviour of the whole detector.
 func TestFrozenPaneFingerprintsIdenticallyDespiteLiveNoise(t *testing.T) {
