@@ -1916,6 +1916,14 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 				return nil, err
 			}
 			out := make([]standing.Agent, 0, len(raw))
+			receiptModels := map[string]string{}
+			if receipts, readErr := launch.ReadReceipts(launch.DefaultReceiptPath()); readErr == nil {
+				for _, receipt := range receipts {
+					if receipt.Accepted && strings.TrimSpace(receipt.Name) != "" && strings.TrimSpace(receipt.Model) != "" {
+						receiptModels[receipt.Name] = receipt.Model
+					}
+				}
+			}
 			for _, a := range raw {
 				out = append(out, standing.Agent{
 					Name: a.Name, Status: a.Status, PaneID: a.PaneID,
@@ -1927,6 +1935,9 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 					Kind:  a.Kind,
 					Model: a.Model, LaunchModel: a.LaunchModel,
 				})
+				if out[len(out)-1].LaunchModel == "" {
+					out[len(out)-1].LaunchModel = receiptModels[a.Name]
+				}
 			}
 			return out, nil
 		},

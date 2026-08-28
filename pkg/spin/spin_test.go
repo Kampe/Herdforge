@@ -14,6 +14,16 @@ func TestEmptyContinuationLoopIsNonProductive(t *testing.T) {
 	}
 }
 
+func TestSlowFirstTokenIsNotNonProductive(t *testing.T) {
+	th := Thresholds{StallSamples: 2, SpinSamples: 2}
+	_, findings := Classify(nil, Sample{AgentStatus: "working", Continuation: 1}, th, 0)
+	for _, finding := range findings {
+		if finding == NonProductive {
+			t.Fatal("a first silent continuation must remain productive")
+		}
+	}
+}
+
 // Without noise-stripping a "thinking" pane redraws forever and STALL can
 // never fire. This is the load-bearing behaviour of the whole detector.
 func TestFrozenPaneFingerprintsIdenticallyDespiteLiveNoise(t *testing.T) {
