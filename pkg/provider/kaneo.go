@@ -160,27 +160,50 @@ type kaneoOriginCred struct {
 	TrustedOrigin string
 }
 
-// userConfigDirFn is os.UserConfigDir; tests inject a hermetic root.
-// Must return an absolute path or empty/error — never a worktree-relative dir.
+// userHomeDirFn and userConfigDirFn are the os directory helpers; tests inject
+// hermetic roots.
+var userHomeDirFn = os.UserHomeDir
+
 var userConfigDirFn = os.UserConfigDir
 
-// kaneoCLIConfigPath returns the canonical kaneo config.json path under
-// os.UserConfigDir (macOS: ~/Library/Application Support/kaneo/config.json,
-// Linux: ~/.config/kaneo/config.json). Refuses non-absolute roots so empty
-// HOME/XDG cannot collapse into repo-relative credential files.
+// kaneoConfigPathFromRoot returns the canonical kaneo config.json path under
+// an absolute config root. Refuses non-absolute roots so empty HOME/XDG
+// cannot collapse into repo-relative credential files.
+func kaneoConfigPathFromRoot(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", fmt.Errorf("kaneo config root empty")
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("kaneo config root is not absolute (refusing worktree-relative credential path)")
+	}
+	return filepath.Join(root, "kaneo", "config.json"), nil
+}
+
+// kaneoCLIConfigPath prefers ~/.config/kaneo/config.json because it is not
+// TCC-protected on macOS. The current kaneo CLI uses os.UserConfigDir (which
+// is ~/Library/Application Support on macOS), so retain that location as a
+// fallback for existing CLI-managed profiles. A profile moved to ~/.config
+// is intentionally read by Herdforge while the CLI remains on its platform
+// config path until it supports the same override.
 func kaneoCLIConfigPath() (string, error) {
+	if home, err := userHomeDirFn(); err == nil {
+		home = strings.TrimSpace(home)
+		if filepath.IsAbs(home) {
+			preferred := filepath.Join(home, ".config", "kaneo", "config.json")
+			if _, err := os.Stat(preferred); err == nil {
+				return preferred, nil
+			} else if !os.IsNotExist(err) {
+				return "", err
+			}
+		}
+	}
+
 	dir, err := userConfigDirFn()
 	if err != nil {
 		return "", err
 	}
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
-		return "", fmt.Errorf("user config dir empty")
-	}
-	if !filepath.IsAbs(dir) {
-		return "", fmt.Errorf("user config dir is not absolute (refusing worktree-relative credential path)")
-	}
-	return filepath.Join(dir, "kaneo", "config.json"), nil
+	return kaneoConfigPathFromRoot(dir)
 }
 
 // canonicalizeHTTPOrigin returns scheme://host:port for comparison.
