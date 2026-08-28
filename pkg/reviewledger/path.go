@@ -34,6 +34,13 @@ func DefaultPath(root string) string {
 	if p := strings.TrimSpace(os.Getenv("HERD_REVIEW_LEDGER")); p != "" {
 		return p
 	}
+	return PathFor(root)
+}
+
+// PathFor returns the ledger path rooted at root without applying an
+// environment override. A mutating caller can use it to verify that an
+// override still belongs to the canonical project it already resolved.
+func PathFor(root string) string {
 	if strings.TrimSpace(root) == "" {
 		return filepath.Join(".herd", Leaf)
 	}

@@ -1,18 +1,20 @@
 package main
 
 import (
-	"path/filepath"
 	"testing"
 
-	"github.com/Kampe/Herdforge/pkg/reviewroot"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 func TestParseReviewIngestArgs(t *testing.T) {
-	// FAC-572: the default review root is no longer cwd-relative. It comes from
-	// the one canonical resolver, so this command cannot audit a different
-	// corpus than the queue refers to depending on where it was run.
-	defaultRoot := reviewroot.Resolve(".").Root
-	defaultLedger := filepath.Join(".herd", "review-ledger.jsonl")
+	projectRoot := t.TempDir()
+	roots := reviewIngestRoots{
+		ProjectRoot: projectRoot,
+		Review:      resolvedReviewRoot(projectRoot, ""),
+		LedgerPath:  reviewledger.PathFor(projectRoot),
+	}
+	defaultRoot := roots.Review.Paths.Root
+	defaultLedger := roots.LedgerPath
 	tests := []struct {
 		name      string
 		args      []string
@@ -32,7 +34,7 @@ func TestParseReviewIngestArgs(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseReviewIngestArgs(tc.args)
+			got, err := parseReviewIngestArgs(tc.args, roots)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected parse error for %v, got %+v", tc.args, got)
