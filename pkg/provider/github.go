@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -137,13 +138,18 @@ func (g *GitHubProvider) getTaskOnce(ctx context.Context, id string) (*Task, err
 }
 
 func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status string) ([]*Task, error) {
+	stateQuery, err := githubStateQuery(status)
+	if err != nil {
+		return nil, err
+	}
+
 	dls := g.deadlines()
 	ctx, cancel := WithOpDeadline(ctx, dls, OpList)
 	defer cancel()
 
 	var tasks []*Task
-	err := RetryRead(ctx, g.readRetry(), func(rctx context.Context) error {
-		t, e := g.listTasksOnce(rctx, projectID, status)
+	err = RetryRead(ctx, g.readRetry(), func(rctx context.Context) error {
+		t, e := g.listTasksOnce(rctx, projectID, stateQuery)
 		if e != nil {
 			return AsTimeout("github", "ListTasks", OpList, dls.For(OpList), e)
 		}
@@ -153,12 +159,19 @@ func (g *GitHubProvider) ListTasks(ctx context.Context, projectID string, status
 	return tasks, err
 }
 
-func (g *GitHubProvider) listTasksOnce(ctx context.Context, projectID string, status string) ([]*Task, error) {
-	stateQuery := "open"
-	ns := NormalizeStatus(status)
-	if ns == StatusDone || ns == StatusArchived || status == "closed" {
-		stateQuery = "closed"
+func githubStateQuery(status string) (string, error) {
+	normalized := NormalizeStatus(status)
+	switch {
+	case strings.TrimSpace(status) == "", normalized == StatusToDo:
+		return "open", nil
+	case normalized == StatusDone || normalized == StatusArchived:
+		return "closed", nil
+	default:
+		return "", fmt.Errorf("github: cannot list status %q; GitHub issues expose only open/closed: %w", status, ErrUnsupportedStatus)
 	}
+}
+
+func (g *GitHubProvider) listTasksOnce(ctx context.Context, projectID string, stateQuery string) ([]*Task, error) {
 
 	// Paginate until empty page (short page continues). Duplicate page or
 	// page-cap without empty termination is a hard error.
