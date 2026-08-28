@@ -3223,7 +3223,12 @@ func runApprove() {
 		}
 	}
 
-	fmt.Printf("\nherd approve: approved=%d refused=%d suppressed=%d failed=%d\n", approved, refused, suppressed, failed)
+	open := len(tasks) - approved
+	fmt.Printf("\nherd approve: approved=%d refused=%d suppressed=%d failed=%d open=%d\n", approved, refused, suppressed, failed, open)
+	if approved == 0 && failed > 0 {
+		fmt.Fprintf(os.Stderr, "CONTROL-PLANE STALL: approved=0 failed=%d (in-review one-way valve)\n", failed)
+		finish(1)
+	}
 	if failed > 0 {
 		finish(1)
 	}

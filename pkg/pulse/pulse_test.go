@@ -1086,3 +1086,28 @@ func TestOpenReviewSafeRefFlipIsNonVacuous(t *testing.T) {
 		t.Fatal("adding SafeRef must produce a reap — SafeRef distinction is non-vacuous")
 	}
 }
+
+func TestPlanInReviewStall(t *testing.T) {
+	obs := healthyObs()
+	obs.Provider.InReview = 50
+	snap, err := Plan(obs, Options{Act: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.UnknownCritical {
+		t.Fatal("expected UnknownCritical when in-review threshold exceeded")
+	}
+	if snap.ExitCode == 0 {
+		t.Fatal("expected non-zero exit code for in-review stall")
+	}
+	found := false
+	for _, r := range snap.UnknownReasons {
+		if strings.Contains(r, "in-review stall threshold exceeded") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected alarm in unknown reasons, got %v", snap.UnknownReasons)
+	}
+}

@@ -135,6 +135,7 @@ type ProviderObservation struct {
 	QueueDepth  int64  `json:"queue_depth"`
 	Claimable   int64  `json:"claimable"`
 	InProgress  int64  `json:"in_progress"`
+	InReview    int64  `json:"in_review"`
 	NextTaskRef string `json:"next_task_ref,omitempty"`
 	// NextTaskID is the provider identity captured with NextTaskRef. Dispatch
 	// uses it for an O(1) re-read instead of hydrating the whole board again.
@@ -592,6 +593,8 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	var unknownReasons []string
 	if !obs.Provider.Known || strings.TrimSpace(obs.Provider.Error) != "" {
 		unknownReasons = append(unknownReasons, "provider: "+unknownDetail(obs.Provider.Known, obs.Provider.Error))
+	} else if obs.Provider.InReview >= 50 {
+		unknownReasons = append(unknownReasons, fmt.Sprintf("provider: in-review stall threshold exceeded (%d waiting)", obs.Provider.InReview))
 	}
 	if !obs.Herdr.Known || strings.TrimSpace(obs.Herdr.Error) != "" {
 		unknownReasons = append(unknownReasons, "herdr: "+unknownDetail(obs.Herdr.Known, obs.Herdr.Error))
@@ -1317,6 +1320,9 @@ func FormatHuman(snap Snapshot) string {
 		} else {
 			fmt.Fprintf(&b, "broker: UNAVAILABLE (%s)\n", snap.Observation.Broker.Error)
 		}
+	}
+	if snap.Observation.Provider.Known {
+		fmt.Fprintf(&b, "provider: claimable=%d in_progress=%d in_review=%d\n", snap.Observation.Provider.Claimable, snap.Observation.Provider.InProgress, snap.Observation.Provider.InReview)
 	}
 	fmt.Fprintf(&b, "agents:\n")
 	if len(snap.Agents) == 0 {
