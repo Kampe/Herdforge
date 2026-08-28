@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"io"
 	"math"
 	"os"
@@ -43,6 +44,13 @@ func runPulse() {
 }
 
 func runPulseCommand(args []string, out, errOut *os.File) int {
+	return runPulseCommandContext(context.Background(), args, out, errOut)
+}
+
+// runPulseCommandContext is the canonical heartbeat path for both the pulse
+// CLI and the independent daemon. Keeping them on this one command path means
+// the daemon cannot quietly omit a recovery action the operator's pulse sees.
+func runPulseCommandContext(ctx context.Context, args []string, out, errOut *os.File) int {
 	fs := flag.NewFlagSet("pulse", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	act := fs.Bool("act", false, "Apply bounded mutations (renew leases, consume callbacks, reconcile)")
@@ -70,7 +78,6 @@ func runPulseCommand(args []string, out, errOut *os.File) int {
 	// FAC-93 / stop-cli AC: pulse is the canonical fleet-admission gate.
 	// Missing, corrupt, or active wind-down must fail closed before any beat
 	// work (observe or --act), matching every other claiming command.
-	ctx := context.Background()
 	if err := requireFleetAdmission(ctx); err != nil {
 		fmt.Fprintf(errOut, "pulse: %v\n", err)
 		return 1
@@ -364,6 +371,7 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		}
 		agents = scoped
 	}
+	coordinatorNames := pulseCoordinatorNames()
 	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
@@ -387,6 +395,9 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		agent := pulse.AgentObservation{
 			Name: a.Name,
 			Raw:  a.Status,
+			// Configuration owns coordinator role assignment; pulse only projects
+			// that already-declared identity onto this live observation.
+			Coordinator: coordinatorNames[a.Name],
 			// FAC-614: pane-AWARE classification. readPulseHerdr already pays
 			// for the pane read above; classifying without it is what made a
 			// paused goal indistinguishable from work in progress. An
@@ -438,6 +449,26 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		out = append(out, agent)
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
+}
+
+// pulseCoordinatorNames resolves both current repository-qualified and
+// legacy standing names for the configured orchestrator. A coordinator's
+// identity belongs to the roster and standing naming owners, never to a
+// pulse-local literal.
+func pulseCoordinatorNames() map[string]bool {
+	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	if err != nil {
+		return nil
+	}
+	lane := findLaneForRole(cfg, launch.OrchestratorRole)
+	if lane == nil || strings.TrimSpace(lane.Name) == "" {
+		return nil
+	}
+	names := map[string]bool{standing.AgentName(lane.Name): true}
+	if repository := repositoryIdentityForLaunch(cfg); repository != "" {
+		names[standing.AgentNameForRepository(lane.Name, repository)] = true
+	}
+	return names
 }
 
 func packetPendingFromExplain(explain herdr.AgentExplain) bool {

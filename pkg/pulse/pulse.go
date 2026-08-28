@@ -152,15 +152,19 @@ type HerdrObservation struct {
 
 // AgentObservation is one standing or one-off lane.
 type AgentObservation struct {
-	Name              string      `json:"name"`
-	Status            AgentStatus `json:"status"`
-	Raw               string      `json:"raw_status,omitempty"`
-	PaneID            string      `json:"pane_id,omitempty"`
-	PaneState         string      `json:"pane_state,omitempty"`
-	ForegroundProcess string      `json:"foreground_process,omitempty"`
-	ExitReason        string      `json:"exit_reason,omitempty"`
-	LastError         string      `json:"last_error,omitempty"`
-	ContextWarning    string      `json:"context_warning,omitempty"`
+	Name   string      `json:"name"`
+	Status AgentStatus `json:"status"`
+	// Coordinator identifies the configured orchestrator lane. A paused
+	// coordinator blocks every downstream control-plane action, so it has a
+	// distinct alarm and observe-mode exit posture from an ordinary paused lane.
+	Coordinator       bool   `json:"coordinator,omitempty"`
+	Raw               string `json:"raw_status,omitempty"`
+	PaneID            string `json:"pane_id,omitempty"`
+	PaneState         string `json:"pane_state,omitempty"`
+	ForegroundProcess string `json:"foreground_process,omitempty"`
+	ExitReason        string `json:"exit_reason,omitempty"`
+	LastError         string `json:"last_error,omitempty"`
+	ContextWarning    string `json:"context_warning,omitempty"`
 	// Stale is set when the source marks the lane past its progress bound.
 	Stale bool `json:"stale,omitempty"`
 	// StateSeq is the harness's own monotonic state-change counter for this
@@ -456,8 +460,13 @@ type Snapshot struct {
 	// review queue is not a fact about whether it may work. Keeping one global
 	// flag is what let a review cap stop builders.
 	BuilderDispatchBlocked bool `json:"builder_dispatch_blocked"`
+	// PausedCoordinators names configured coordinator lanes whose goal loop is
+	// paused. Keeping identities (rather than only a count) makes the alarm
+	// actionable for both humans and external daemon supervisors.
+	PausedCoordinators []string `json:"paused_coordinators,omitempty"`
 	// ExitCode is 0 when the beat is healthy; non-zero when unknown critical
-	// state is present or an applied action failed hard.
+	// state is present, an applied action failed hard, or observe mode finds a
+	// paused coordinator that needs the external daemon's --act recovery.
 	ExitCode int `json:"exit_code"`
 }
 
@@ -588,6 +597,11 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		return agents[i].Name < agents[j].Name
 	})
 	snap.Agents = agents
+	for _, a := range agents {
+		if a.Coordinator && a.Status == StatusPaused {
+			snap.PausedCoordinators = append(snap.PausedCoordinators, a.Name)
+		}
+	}
 
 	// Critical unknown: never treat errors as zero work or free capacity.
 	var unknownReasons []string
@@ -1009,7 +1023,12 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	snap.Counts = CountActions(agents, actions)
 
 	// Exit posture: unknown critical → non-zero; no dispatch when critical.
-	if snap.UnknownCritical {
+	//
+	// FAC-633: observe mode is intentionally advisory for ordinary would-run
+	// work, but a paused coordinator is different: it cannot consume the beat
+	// that would resume it. Make that condition a hard, separately detectable
+	// failure so the independent daemon is both prompted and monitored.
+	if snap.UnknownCritical || (!opts.Act && len(snap.PausedCoordinators) > 0) {
 		snap.ExitCode = 1
 	}
 	return snap, nil
@@ -1301,6 +1320,14 @@ func FormatHuman(snap Snapshot) string {
 		fmt.Fprintf(&b, "reason: %s\n", snap.Reason)
 	}
 	fmt.Fprintf(&b, "beat_sequence: %d observed_at: %s\n", snap.BeatSequence, snap.ObservedAt.UTC().Format(time.RFC3339Nano))
+	if len(snap.PausedCoordinators) > 0 {
+		fmt.Fprintf(&b, "CONTROL-PLANE STALL: paused coordinator(s): %s\n", strings.Join(snap.PausedCoordinators, ", "))
+		if snap.Mode == ModeObserve {
+			fmt.Fprintln(&b, "  external daemon recovery required: pulse --act resumes paused goals outside the coordinator")
+		} else {
+			fmt.Fprintln(&b, "  external daemon recovery is applying the guarded paused-goal resume")
+		}
+	}
 	c := snap.Counts
 	fmt.Fprintf(&b, "counts: agents=%d healthy_idle=%d busy=%d paused=%d blocked=%d done=%d stale=%d unknown=%d actions=%d renew_leases=%d consume_callbacks=%d dispatch=%d open_review=%d reviews_in_flight=%d reap_lanes=%d resume_goal=%d would_run=%d reconcile=%d applied=%d\n",
 		c.Agents, c.HealthyIdle, c.Busy, c.Paused, c.Blocked, c.Done, c.Stale, c.Unknown,

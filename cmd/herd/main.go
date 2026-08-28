@@ -1650,6 +1650,7 @@ func runDaemon() {
 	daemonFlags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	role := daemonFlags.String("role", "worker", "Target role for pulse sweeps")
 	interval := daemonFlags.Int("interval", 60, "Pulse interval in seconds")
+	once := daemonFlags.Bool("once", false, "Run one external recovery and orchestration cycle, then exit")
 	daemonFlags.Parse(os.Args[2:])
 
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
@@ -1670,7 +1671,11 @@ func runDaemon() {
 	pulseInterval := time.Duration(*interval) * time.Second
 
 	fmt.Printf("Daemon started (role=%s interval=%ds)\n", *role, *interval)
-	fmt.Println("Press Ctrl+C to stop.")
+	if *once {
+		fmt.Println("One-cycle mode: external paused-goal recovery enabled.")
+	} else {
+		fmt.Println("External paused-goal recovery enabled. Press Ctrl+C to stop.")
+	}
 
 	cycle := func(ctx context.Context) error {
 		// FAC-196: claim-to-dispatch is one transaction. Non-compensable
@@ -1748,7 +1753,14 @@ func runDaemon() {
 		}
 		return nil
 	}
-	if err := daemon.RunPulseScheduler(ctx, daemon.PulseSchedulerOptions{Interval: pulseInterval}, func(ctx context.Context) error {
+	if err := daemon.RunPulseScheduler(ctx, daemon.PulseSchedulerOptions{Interval: pulseInterval, MaxTicks: boolToInt(*once)}, func(ctx context.Context) error {
+		// FAC-633: this daemon is a process outside any coordinator goal loop.
+		// Run the exact pulse --act command path before route/admission work, so
+		// a paused, killed, or quota-blocked coordinator cannot deadlock its own
+		// recovery behind the work it has stopped consuming.
+		if code := runPulseCommandContext(ctx, []string{"--act", "--reason", "daemon external recovery"}, os.Stdout, os.Stderr); code != 0 {
+			fmt.Fprintf(os.Stderr, "daemon: external recovery beat exited %d\n", code)
+		}
 		if err := runDaemonCycle(ctx, requireFleetAdmission, cycle); err != nil {
 			fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
 		}
@@ -1758,6 +1770,13 @@ func runDaemon() {
 		os.Exit(1)
 	}
 	fmt.Println("\nDaemon shutting down.")
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // runDaemonCycle is the production per-cycle admission seam. The cycle
