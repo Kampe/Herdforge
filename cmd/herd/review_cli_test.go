@@ -1920,6 +1920,33 @@ func TestApproveCLI_MissingReceiptRefusedNoFallback(t *testing.T) {
 	}
 }
 
+func TestApproveCLI_StallAlarmFires(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+
+	// In approveFixture, one task (FAC-1) is left in-review.
+	// If we remove its receipt, it will fail to approve.
+	// When it fails, approved=0 and failed=1, triggering the alarm.
+	if err := os.Remove(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, ".herd", "receipts")); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err == nil {
+		t.Fatalf("stall must exit non-zero, output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "CONTROL-PLANE STALL:") {
+		t.Fatalf("expected control-plane alarm, got:\n%s", out)
+	}
+	if !strings.Contains(string(out), "in-review one-way valve") {
+		t.Fatalf("expected alarm to name the common failure class, got:\n%s", out)
+	}
+}
+
 // shortSocketPath returns a unix socket path short enough for the macOS
 // 104-byte sun_path limit, cleaned up with the test.
 // socketSeq guarantees per-process uniqueness; nanos alone collide when

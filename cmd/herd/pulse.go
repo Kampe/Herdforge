@@ -256,11 +256,19 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 			}
 		}
 	}
+	
+	inReviewTasks, err := tp.ListTasks(ctx, project, "in-review")
+	var inReview int64
+	if err == nil {
+		inReview = int64(len(inReviewTasks))
+	}
+
 	obs := pulse.ProviderObservation{
 		Known:      true,
 		QueueDepth: int64(len(tasks)),
 		Claimable:  claimable,
 		InProgress: inProgress,
+		InReview:   inReview,
 	}
 	if next := selectPulseDispatchTask(claimableTasks); next != nil {
 		obs.NextTaskRef = strings.TrimSpace(next.Ref)
