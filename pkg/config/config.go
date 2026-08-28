@@ -232,6 +232,36 @@ type StandingRolePolicy struct {
 	NativeRole string `yaml:"native_role"`
 }
 
+// NativeLaunchRole resolves the canonical Herdforge authority role for a
+// configured lane. Repository-local standing role names remain lane identity;
+// only their explicit native role is admitted at launch and receipt boundaries.
+func NativeLaunchRole(lane *LaneDef) (router.Role, error) {
+	if lane == nil {
+		return "", fmt.Errorf("launch route requires a configured lane")
+	}
+	role := strings.TrimSpace(lane.Role)
+	if role == "" {
+		return "", fmt.Errorf("lane %q has no role", lane.Name)
+	}
+	if lane.StandingRolePolicy == nil {
+		if lane.Standing && !router.KnownRole(router.Role(role)) {
+			return "", fmt.Errorf("lane %q custom standing role %q requires standing_role_policy.native_role", lane.Name, role)
+		}
+		return router.Role(role), nil
+	}
+	if !lane.Standing {
+		return "", fmt.Errorf("lane %q declares standing_role_policy but is not standing", lane.Name)
+	}
+	native := strings.TrimSpace(lane.StandingRolePolicy.NativeRole)
+	if !router.KnownRole(router.Role(native)) {
+		return "", fmt.Errorf("lane %q standing role %q maps to unknown native role %q", lane.Name, role, native)
+	}
+	if router.KnownRole(router.Role(role)) {
+		return "", fmt.Errorf("lane %q canonical role %q cannot declare standing_role_policy", lane.Name, role)
+	}
+	return router.Role(native), nil
+}
+
 type TaskProvider struct {
 	Type        string `yaml:"type"`
 	ProjectID   string `yaml:"project_id"`

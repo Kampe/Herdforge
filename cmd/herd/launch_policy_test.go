@@ -116,7 +116,7 @@ func TestCustomStandingRoleUsesExplicitNativeWorkerPolicy(t *testing.T) {
 	if err := validateLaneLaunchConfig(lane); err != nil {
 		t.Fatalf("custom standing role should validate through its explicit native policy: %v", err)
 	}
-	role, err := nativeLaunchRole(lane)
+	role, err := config.NativeLaunchRole(lane)
 	if err != nil || role != router.RoleWorker {
 		t.Fatalf("native role = %q, err = %v; want worker", role, err)
 	}

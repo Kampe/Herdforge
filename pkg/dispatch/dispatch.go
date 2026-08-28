@@ -196,6 +196,7 @@ func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*h
 	}
 	return herdr.DeliverAndProve(target, text, timeout)
 }
+
 // TabClose compensates a tab dispatch itself created. It uses the fenced
 // close path (FAC-550); the bare herdr.TabClose stub always refuses, which
 // leaked one tab per failed dispatch.
@@ -1094,7 +1095,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// 7b. Inject the task-provider context receipt (FAC-145): every isolated
 	// agent gets provider + project + task binding at spawn — NoLaunch
 	// worktrees included, so a later manual/review launch inherits it too.
-	baseReceipt := d.taskContext(task, wtInfo, branch, lane, opts)
+	baseReceipt, err := d.taskContext(task, wtInfo, branch, lane, opts)
+	if err != nil {
+		return nil, failOwned("task_context_write_failed",
+			fmt.Errorf("failed to resolve task context role: %w", err))
+	}
 	tc0, err := d.signReceipt(baseReceipt)
 	if err != nil {
 		return nil, failOwned("task_context_write_failed",
@@ -2069,13 +2074,12 @@ func (d *Dispatcher) signReceipt(tc TaskContext) (TaskContext, error) {
 // HerdrWorkspace is stamped later by launch() once RequireWorkspace resolves.
 // Agent receipts never carry the mutate op: board transitions stay
 // coordinator-owned.
-func (d *Dispatcher) taskContext(task *provider.Task, wtInfo *worktree.WorktreeInfo, branch string, lane *config.LaneDef, opts DispatchOptions) TaskContext {
-	// No silent role defaulting: the lane must state a known role, and the
-	// op set follows the role policy strictly.
-	role := ""
-	if lane != nil {
-		role = strings.TrimSpace(lane.Role)
+func (d *Dispatcher) taskContext(task *provider.Task, wtInfo *worktree.WorktreeInfo, branch string, lane *config.LaneDef, opts DispatchOptions) (TaskContext, error) {
+	nativeRole, err := config.NativeLaunchRole(lane)
+	if err != nil {
+		return TaskContext{}, err
 	}
+	role := string(nativeRole)
 	// Every isolated agent role gets its sanctioned op set; an unknown role
 	// yields nil and the receipt fails Validate before any launch.
 	ops := OpsForRole(role)
@@ -2097,7 +2101,7 @@ func (d *Dispatcher) taskContext(task *provider.Task, wtInfo *worktree.WorktreeI
 		SessionID:         NewSessionID(role, task.Ref, wtInfo.BaseSHA, opts.LeaseID),
 		AllowedOps:        ops,
 		ExpiresAt:         time.Now().Add(DefaultReceiptTTL),
-	}
+	}, nil
 }
 
 func slugForTask(ref, title string) string {

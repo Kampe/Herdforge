@@ -6349,9 +6349,9 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 			return nil, fmt.Errorf("%w: lane %q harness %q binary not found in $PATH — install %s or provision the harness before raising lanes", ErrHarnessBinaryMissing, lane.Name, harness, harness)
 		}
 	}
-	role, err := nativeLaunchRole(lane)
+	role, err := config.NativeLaunchRole(lane)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrWorkerConfigPolicy, err)
 	}
 	shape := strings.TrimSpace(lane.TaskShape)
 	if shape == "" {
@@ -6539,37 +6539,6 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	return decision, nil
 }
 
-func nativeLaunchRole(lane *config.LaneDef) (router.Role, error) {
-	if lane == nil {
-		return "", fmt.Errorf("launch route requires a configured lane")
-	}
-	role := strings.TrimSpace(lane.Role)
-	if role == "" {
-		return "", fmt.Errorf("lane %q has no role", lane.Name)
-	}
-	if lane.StandingRolePolicy == nil {
-		if lane.Standing && !knownLaunchRole(role) {
-			return "", fmt.Errorf("%w: lane %q custom standing role %q requires standing_role_policy.native_role", ErrWorkerConfigPolicy, lane.Name, role)
-		}
-		return router.Role(role), nil
-	}
-	if !lane.Standing {
-		return "", fmt.Errorf("%w: lane %q declares standing_role_policy but is not standing", ErrWorkerConfigPolicy, lane.Name)
-	}
-	native := strings.TrimSpace(lane.StandingRolePolicy.NativeRole)
-	if !knownLaunchRole(native) {
-		return "", fmt.Errorf("%w: lane %q standing role %q maps to unknown native role %q", ErrWorkerConfigPolicy, lane.Name, role, native)
-	}
-	if knownLaunchRole(role) {
-		return "", fmt.Errorf("%w: lane %q canonical role %q cannot declare standing_role_policy", ErrWorkerConfigPolicy, lane.Name, role)
-	}
-	return router.Role(native), nil
-}
-
-func knownLaunchRole(role string) bool {
-	return router.KnownRole(router.Role(strings.TrimSpace(role)))
-}
-
 func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	if lane == nil {
 		return fmt.Errorf("lane launch config is required")
@@ -6578,9 +6547,9 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 	if role == "" || strings.TrimSpace(lane.AgentKind) == "" || strings.TrimSpace(lane.Provider) == "" || strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Harness) == "" || strings.TrimSpace(lane.Effort) == "" || strings.TrimSpace(lane.TaskShape) == "" {
 		return fmt.Errorf("lane %q has incomplete launch authority", lane.Name)
 	}
-	nativeRole, roleErr := nativeLaunchRole(lane)
+	nativeRole, roleErr := config.NativeLaunchRole(lane)
 	if roleErr != nil {
-		return roleErr
+		return fmt.Errorf("%w: %v", ErrWorkerConfigPolicy, roleErr)
 	}
 	expectedShapes := map[string]string{launch.WorkerRole: "implementation", launch.ForgeSmithRole: "implementation", launch.RecoveryRole: "implementation", launch.ReviewerRole: "qa", launch.AssayerRole: "qa", launch.OrchestratorRole: "coordinator", launch.ScoutPlannerRole: "architecture", launch.VerificationGateRole: "bounded", launch.ReviewSupervisorRole: "coordinator", launch.HarvestRole: "bounded", launch.RecoverySentinelRole: "bounded"}
 	if expected, ok := expectedShapes[string(nativeRole)]; ok && lane.TaskShape != expected {

@@ -415,6 +415,98 @@ func TestDispatch_NoLaunch_UsesActualGitBranchAndImmutableBase(t *testing.T) {
 	}
 }
 
+func dispatchNoLaunchWithLane(t *testing.T, ref string, lane config.LaneDef) (string, *DispatchResult, error) {
+	t.Helper()
+	repo, wm := initDispatchRepo(t)
+	cfg := testCfg()
+	cfg.Lanes = []config.LaneDef{lane}
+	tp := &statusTrackingProvider{
+		mockTaskProvider: mockTaskProvider{tasks: []*provider.Task{baseTask(ref)}},
+	}
+	d := NewDispatcher(cfg, tp, wm)
+	d.Compensator = &recordingCompensator{}
+	d.Herdr = &fakeHerdr{available: false}
+	res, err := d.Dispatch(context.Background(), DispatchOptions{
+		TicketRef: ref, NoLaunch: true, LaneName: lane.Name,
+		LeaseID: "claim:1", LeaseGeneration: 1,
+	})
+	if res != nil && res.Worktree != "" {
+		t.Cleanup(func() { os.RemoveAll(res.Worktree) })
+	}
+	return repo, res, err
+}
+
+func TestDispatch_NoLaunch_CustomStandingRoleSignsNativeWorkerTaskContext(t *testing.T) {
+	lane := config.LaneDef{
+		Name: "nft-data-engineer", Role: "nft-data-engineer", Standing: true,
+		StandingRolePolicy: &config.StandingRolePolicy{NativeRole: launch.WorkerRole},
+		Model:              testWorkerModel, AgentKind: "codex", Prompt: ".herd/prompts/worker.md",
+	}
+	repo, res, err := dispatchNoLaunchWithLane(t, "FAC-640", lane)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if res.Lane != lane.Name {
+		t.Fatalf("result lane = %q, want raw lane identity %q", res.Lane, lane.Name)
+	}
+	tc, err := ReadTaskContext(res.Worktree)
+	if err != nil {
+		t.Fatalf("ReadTaskContext: %v", err)
+	}
+	if tc.Role != launch.WorkerRole {
+		t.Fatalf("task context role = %q, want canonical native role %q", tc.Role, launch.WorkerRole)
+	}
+	if want := OpsForRole(launch.WorkerRole); !reflect.DeepEqual(tc.AllowedOps, want) {
+		t.Fatalf("task context ops = %v, want worker ops %v", tc.AllowedOps, want)
+	}
+	if want := NewSessionID(launch.WorkerRole, "FAC-640", res.BaseSHA, "claim:1"); tc.SessionID != want {
+		t.Fatalf("task context session = %q, want native-role session %q", tc.SessionID, want)
+	}
+	verifier, err := LoadVerifier(repo)
+	if err != nil {
+		t.Fatalf("LoadVerifier: %v", err)
+	}
+	if err := verifier.Verify(tc); err != nil {
+		t.Fatalf("signed task context verification: %v", err)
+	}
+}
+
+func TestDispatch_NoLaunch_CustomStandingRoleWithoutNativePolicyFailsClosed(t *testing.T) {
+	lane := config.LaneDef{
+		Name: "nft-data-engineer", Role: "nft-data-engineer", Standing: true,
+		Model: testWorkerModel, AgentKind: "codex", Prompt: ".herd/prompts/worker.md",
+	}
+	_, _, err := dispatchNoLaunchWithLane(t, "FAC-640", lane)
+	if err == nil {
+		t.Fatal("custom standing role without native policy must be rejected")
+	}
+	if !strings.Contains(err.Error(), "failed to resolve task context role") ||
+		!strings.Contains(err.Error(), "requires standing_role_policy.native_role") {
+		t.Fatalf("dispatch rejected at wrong boundary: %v", err)
+	}
+}
+
+func TestDispatch_NoLaunch_OrdinaryWorkerRoleRemainsWorker(t *testing.T) {
+	lane := config.LaneDef{
+		Name: "worker", Role: launch.WorkerRole,
+		Model: testWorkerModel, AgentKind: "codex", Prompt: ".herd/prompts/worker.md",
+	}
+	_, res, err := dispatchNoLaunchWithLane(t, "FAC-640", lane)
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	tc, err := ReadTaskContext(res.Worktree)
+	if err != nil {
+		t.Fatalf("ReadTaskContext: %v", err)
+	}
+	if tc.Role != launch.WorkerRole {
+		t.Fatalf("ordinary worker task context role = %q, want %q", tc.Role, launch.WorkerRole)
+	}
+	if want := NewSessionID(launch.WorkerRole, "FAC-640", res.BaseSHA, "claim:1"); tc.SessionID != want {
+		t.Fatalf("ordinary worker session = %q, want %q", tc.SessionID, want)
+	}
+}
+
 func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	repo, wm := initDispatchRepo(t)
 	tp := &statusTrackingProvider{
