@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -153,6 +154,16 @@ func runDepsCheck() {
 			ph.Enter("RequireTaskLaunch " + ref)
 			return deps.RequireTaskLaunch(ctx, store, ep, deps.Ref(ref), desired, "")
 		})
+	var semanticBlocker *deps.BlockedError
+	if gr != nil && errors.As(err, &semanticBlocker) && semanticBlocker.Code == "open_blocker" {
+		// RequireTaskLaunch completed its provider reads and produced an
+		// authoritative semantic verdict. Keep UNKNOWN reserved for transport,
+		// timeout, and unreadable-provider paths that have no populated gate.
+		fmt.Fprintf(os.Stderr, "BLOCKED %s: %v\n", ref, semanticBlocker)
+		out, _ := json.MarshalIndent(gr, "", "  ")
+		fmt.Println(string(out))
+		os.Exit(1)
+	}
 	if launchDiag.Unknown() {
 		// A launch gate that could not read its graph is UNKNOWN. Reporting it
 		// as BLOCKED would assert a dependency verdict nobody established, and
