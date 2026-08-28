@@ -73,7 +73,27 @@ type Agent struct {
 	// Kind is the harness behind the pane. FAC-578: recycling a settled lane
 	// depends on trusting its reported status, and idle is not equally
 	// trustworthy across harnesses.
-	Kind string
+	Kind         string
+	Model        string
+	LaunchModel  string
+	Continuation int
+	Output       string
+}
+
+type ModelDrift struct{ Expected, Live string }
+
+func (d ModelDrift) Error() string {
+	return fmt.Sprintf("MODEL DRIFT: launch receipt pinned %q, live pane reports %q", d.Expected, d.Live)
+}
+func CompareModel(expected, live string) error {
+	expected, live = strings.TrimSpace(expected), strings.TrimSpace(live)
+	if expected == "" || live == "" || strings.EqualFold(expected, live) {
+		return nil
+	}
+	return ModelDrift{Expected: expected, Live: live}
+}
+func ForbiddenModel(provider, model string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "grok") && strings.EqualFold(strings.TrimSpace(model), "grok-4.5")
 }
 
 // Tab is a created herdr tab.
@@ -959,6 +979,14 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 		}
 		rr.Provider = route.Provider
 		rr.Model = route.Model
+		if ForbiddenModel(route.Provider, route.Model) {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = fmt.Sprintf("forbidden model at launch construction: %s/%s", route.Provider, route.Model)
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %s", lane.Name, rr.Reason))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
 
 		// Inventory is only needed after policy admits (idempotent skip-if-live).
 		if err := loadLive(); err != nil {
@@ -970,6 +998,14 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			continue
 		}
 		if actualName, a, ok := standingAgent(live, lane.Name, repository, rr.CWD); ok && NameHeld(a.Status) {
+			if err := CompareModel(a.LaunchModel, a.Model); err != nil {
+				rr.Outcome = OutcomeFailed
+				rr.Reason = err.Error()
+				result.Failed++
+				failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+				result.Roles = append(result.Roles, rr)
+				continue
+			}
 			rr.AgentName = actualName
 			// FAC-578: recycle any SETTLED standing lane, not only "done". A
 			// paused goal reports idle, and skipping it left the lane alive and

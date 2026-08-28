@@ -26,9 +26,10 @@ import (
 type Finding string
 
 const (
-	Stall Finding = "STALL"
-	Spin  Finding = "SPIN"
-	Long  Finding = "LONG"
+	Stall         Finding = "STALL"
+	Spin          Finding = "SPIN"
+	Long          Finding = "LONG"
+	NonProductive Finding = "NON_PRODUCTIVE"
 )
 
 // Defaults mirror the shell's tunables.
@@ -158,6 +159,14 @@ type Sample struct {
 	// LastActionTaken is the last act actually performed, so a second stall
 	// escalates from nudge to recovery instead of nudging forever.
 	LastActionTaken Action `json:"last_action_taken,omitempty"`
+	Continuation    int    `json:"continuation,omitempty"`
+	Output          string `json:"output,omitempty"`
+}
+
+// EmptyContinuationLoop identifies a stop-hook loop that advances without
+// producing work. Such a pane must not consume a working slot.
+func EmptyContinuationLoop(continuation int, output string) bool {
+	return continuation > 0 && strings.TrimSpace(output) == ""
 }
 
 // Thresholds tune detection.
@@ -199,6 +208,9 @@ func Classify(prev *Sample, now Sample, th Thresholds, workingFor time.Duration)
 	if !strings.EqualFold(now.AgentStatus, "working") {
 		out.StallHits, out.SpinHits = 0, 0
 		return out, nil
+	}
+	if EmptyContinuationLoop(now.Continuation, now.Output) {
+		return out, []Finding{NonProductive}
 	}
 
 	var findings []Finding
