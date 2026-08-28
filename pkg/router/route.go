@@ -898,7 +898,22 @@ func (r *SurfaceRouter) quotaState(provider, pool string) (usage.BurnState, bool
 	if !ok {
 		return usage.BurnState{}, false
 	}
-	if pool != "" && pool != "default" {
+	// FAC-627: "default" is a pool like any other, and excluding it here made a
+	// healthy surface unroutable.
+	//
+	// Codex meters its default pool and its Spark pool separately. With default
+	// at 13% used and Spark exhausted, this returned the PROVIDER AGGREGATE for
+	// pool="default" -- and the aggregate is exhausted solely because Spark is.
+	// So every codex/default candidate was rejected as "quota exhausted" while
+	// 87% of the pool it would actually bill remained. Shell herdr-route selects
+	// codex/default correctly, which is why the doctor and the launcher
+	// disagreed: two authorities reading the same usage data, one per-pool and
+	// one aggregated, and only the aggregated one gated launches.
+	//
+	// A recorded pool is now honoured whatever it is named. The aggregate stays
+	// the fallback for a pool the provider does not meter separately, which is
+	// the only case it can honestly answer for.
+	if pool != "" {
 		if ps, ok := st.Pools[pool]; ok {
 			return ps, true
 		}
