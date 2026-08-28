@@ -33,8 +33,21 @@ func writeKaneoConfig(t *testing.T, root string, cfg kaneoCLIAuthConfig) string 
 	return path
 }
 
+func withUserHomeDir(t *testing.T, dir string) {
+	t.Helper()
+	prev := userHomeDirFn
+	userHomeDirFn = func() (string, error) {
+		if dir == "" {
+			return "", errors.New("unset home dir")
+		}
+		return dir, nil
+	}
+	t.Cleanup(func() { userHomeDirFn = prev })
+}
+
 func withUserConfigDir(t *testing.T, dir string) {
 	t.Helper()
+	withUserHomeDir(t, t.TempDir())
 	prev := userConfigDirFn
 	userConfigDirFn = func() (string, error) {
 		if dir == "" {
@@ -43,6 +56,89 @@ func withUserConfigDir(t *testing.T, dir string) {
 		return dir, nil
 	}
 	t.Cleanup(func() { userConfigDirFn = prev })
+}
+
+// TestResolveKaneoProfileCred_PrefersHomeConfig drives the shipped resolver
+// through the non-TCC path before the legacy platform config path.
+func TestResolveKaneoProfileCred_PrefersHomeConfig(t *testing.T) {
+	t.Setenv("KANEO_API_KEY", "")
+	home := t.TempDir()
+	legacyRoot := filepath.Join(t.TempDir(), "Library", "Application Support")
+	withUserConfigDir(t, legacyRoot)
+	withUserHomeDir(t, home)
+
+	const preferredKey = "preferred-home-key-cccccccc"
+	writeKaneoConfig(t, filepath.Join(home, ".config"), kaneoCLIAuthConfig{
+		DefaultProfile: "default",
+		Profiles: map[string]kaneoCLIProfile{
+			"default": {APIKey: preferredKey, APIURL: "https://preferred.example"},
+		},
+	})
+	writeKaneoConfig(t, legacyRoot, kaneoCLIAuthConfig{
+		DefaultProfile: "default",
+		Profiles: map[string]kaneoCLIProfile{
+			"default": {APIKey: "must-not-use-legacy", APIURL: "https://legacy.example"},
+		},
+	})
+
+	cred := ResolveKaneoProfileCred()
+	if cred.Key != preferredKey {
+		t.Fatalf("ResolveKaneoProfileCred must prefer ~/.config profile, got key len=%d match=%v", len(cred.Key), cred.Key == preferredKey)
+	}
+	if !strings.Contains(cred.TrustedOrigin, "preferred.example") {
+		t.Fatalf("preferred profile origin must be selected, got %q", cred.TrustedOrigin)
+	}
+}
+
+// TestResolveKaneoProfileCred_FallsBackToUserConfigDir drives the shipped
+// resolver through the existing platform config path when ~/.config is absent.
+func TestResolveKaneoProfileCred_FallsBackToUserConfigDir(t *testing.T) {
+	t.Setenv("KANEO_API_KEY", "")
+	home := t.TempDir()
+	legacyRoot := filepath.Join(t.TempDir(), "Library", "Application Support")
+	withUserConfigDir(t, legacyRoot)
+	withUserHomeDir(t, home)
+
+	const legacyKey = "legacy-platform-key-dddddddd"
+	writeKaneoConfig(t, legacyRoot, kaneoCLIAuthConfig{
+		DefaultProfile: "default",
+		Profiles: map[string]kaneoCLIProfile{
+			"default": {APIKey: legacyKey, APIURL: "https://legacy.example"},
+		},
+	})
+
+	cred := ResolveKaneoProfileCred()
+	if cred.Key != legacyKey {
+		t.Fatalf("ResolveKaneoProfileCred must fall back to platform profile, got key len=%d match=%v", len(cred.Key), cred.Key == legacyKey)
+	}
+}
+
+// TestResolveKaneoProfileCred_EmptyHomeRefusesRelativePath proves the shipped
+// resolver cannot read a credential from a worktree-relative .config path.
+func TestResolveKaneoProfileCred_EmptyHomeRefusesRelativePath(t *testing.T) {
+	t.Setenv("KANEO_API_KEY", "")
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	withUserHomeDir(t, "")
+	prev := userConfigDirFn
+	userConfigDirFn = func() (string, error) { return ".config", nil }
+	t.Cleanup(func() { userConfigDirFn = prev })
+
+	worktree := t.TempDir()
+	t.Chdir(worktree)
+	writeKaneoConfig(t, filepath.Join(worktree, ".config"), kaneoCLIAuthConfig{
+		DefaultProfile: "default",
+		Profiles: map[string]kaneoCLIProfile{
+			"default": {APIKey: "must-not-read-relative", APIURL: "https://relative.example"},
+		},
+	})
+
+	if cred := ResolveKaneoProfileCred(); cred.Key != "" || cred.TrustedOrigin != "" {
+		t.Fatalf("empty HOME/XDG must not produce a repo-relative credential path, got key len=%d origin=%q", len(cred.Key), cred.TrustedOrigin)
+	}
+	if path, err := kaneoCLIConfigPath(); err == nil || path != "" {
+		t.Fatalf("empty HOME/XDG must refuse config path, got path=%q err=%v", path, err)
+	}
 }
 
 // TestResolveKaneoAPIKey_UserConfigDir_macOSStyle uses an absolute Application
@@ -220,8 +316,12 @@ func TestResolveKaneoAPIKey_NoCredential_ListProjectRelationsFailClosed(t *testi
 // TestKaneoCLIConfigPath_IsAbsolute under real UserConfigDir.
 func TestKaneoCLIConfigPath_IsAbsolute(t *testing.T) {
 	// Restore real UserConfigDir for this test.
+	userHomeDirFn = os.UserHomeDir
 	userConfigDirFn = os.UserConfigDir
-	t.Cleanup(func() { userConfigDirFn = os.UserConfigDir })
+	t.Cleanup(func() {
+		userHomeDirFn = os.UserHomeDir
+		userConfigDirFn = os.UserConfigDir
+	})
 	path, err := kaneoCLIConfigPath()
 	if err != nil {
 		// Some CI images may lack UserConfigDir; skip only then.
