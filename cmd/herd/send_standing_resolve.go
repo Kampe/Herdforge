@@ -28,7 +28,7 @@ func resolveSendTarget(target string) string {
 		}
 	}
 	repo := ""
-	if cfg, cfgErr := config.LoadConfig(".herd/herd.yaml"); cfgErr == nil {
+	if cfg, cfgErr := config.LoadConfig(config.DefaultConfigPath); cfgErr == nil {
 		repo = repositoryIdentityForLaunch(cfg)
 	}
 	matches, merr := herdr.ResolveStandingLaneMatches(target, agents, repo)
