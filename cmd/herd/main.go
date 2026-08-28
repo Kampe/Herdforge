@@ -3225,11 +3225,21 @@ func runApprove() {
 
 	open := len(tasks) - approved
 	fmt.Printf("\nherd approve: approved=%d refused=%d suppressed=%d failed=%d open=%d\n", approved, refused, suppressed, failed, open)
-	if approved == 0 && failed > 0 {
-		fmt.Fprintf(os.Stderr, "CONTROL-PLANE STALL: approved=0 failed=%d (in-review one-way valve)\n", failed)
-		finish(1)
+	zeroClose := approved == 0 && refused+suppressed+failed > 0
+	if zeroClose {
+		classes := make([]string, 0, 3)
+		if refused > 0 {
+			classes = append(classes, fmt.Sprintf("refused=%d", refused))
+		}
+		if suppressed > 0 {
+			classes = append(classes, fmt.Sprintf("suppressed=%d", suppressed))
+		}
+		if failed > 0 {
+			classes = append(classes, fmt.Sprintf("failed=%d", failed))
+		}
+		fmt.Fprintf(os.Stderr, "CONTROL-PLANE STALL: approved=0 %s (in-review one-way valve)\n", strings.Join(classes, " "))
 	}
-	if failed > 0 {
+	if zeroClose || failed > 0 {
 		finish(1)
 	}
 	finish(0)

@@ -339,6 +339,7 @@ func herdCmdWithFake(binary, dir, keyDir, fakeBin, fakeLog string, args ...strin
 type fakeKaneo struct {
 	mu            sync.Mutex
 	status        string
+	noTasks       bool
 	labels        []string
 	lieOnPatch    bool // ack the PATCH but never change state (readback drift)
 	lastComment   string
@@ -385,11 +386,24 @@ func (fk *fakeKaneo) setLabels(labels ...string) {
 	fk.labels = append([]string(nil), labels...)
 }
 
+func (fk *fakeKaneo) setNoTasks(noTasks bool) {
+	fk.mu.Lock()
+	defer fk.mu.Unlock()
+	fk.noTasks = noTasks
+}
+
 func newFakeKaneo() (*fakeKaneo, *httptest.Server) {
 	fk := &fakeKaneo{status: "in-progress"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/task", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		fk.mu.Lock()
+		noTasks := fk.noTasks
+		fk.mu.Unlock()
+		if noTasks {
+			fmt.Fprint(w, "[]")
+			return
+		}
 		fmt.Fprintf(w, "[%s]", fk.taskJSON())
 	})
 	mux.HandleFunc("/api/task/t1/comment", func(w http.ResponseWriter, r *http.Request) {
@@ -1944,6 +1958,82 @@ func TestApproveCLI_StallAlarmFires(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "in-review one-way valve") {
 		t.Fatalf("expected alarm to name the common failure class, got:\n%s", out)
+	}
+	if !strings.Contains(string(out), "failed=1") {
+		t.Fatalf("expected alarm to classify the failed sweep, got:\n%s", out)
+	}
+}
+
+func TestApproveCLI_ZeroCloseStallAlarmClassifiesRefusedAndSuppressed(t *testing.T) {
+	binary := buildHerd(t)
+
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, dir string)
+		class   string
+	}{
+		{
+			name: "refused",
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.Remove(hsync.ReceiptPath(dir, "FAC-1")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			class: "refused=1",
+		},
+		{
+			name: "suppressed",
+			prepare: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.Remove(hsync.ReceiptPath(dir, "FAC-1")); err != nil {
+					t.Fatal(err)
+				}
+				if err := appendLegacyReceiptTombstone(filepath.Join(dir, legacyReceiptLog), legacyReceiptTombstone{
+					TaskRef: "FAC-1",
+					TaskID:  "t1",
+					Reason:  "pre-completion-receipt task",
+					Actor:   "test",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			class: "suppressed=1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, keyDir, _ := approveFixture(t)
+			provisionFence(t, binary, dir, keyDir)
+			tc.prepare(t, dir)
+
+			out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+			if err == nil {
+				t.Fatalf("%s zero-close sweep must exit non-zero, output:\n%s", tc.name, out)
+			}
+			if !strings.Contains(string(out), "CONTROL-PLANE STALL: approved=0") {
+				t.Fatalf("expected control-plane alarm, got:\n%s", out)
+			}
+			if !strings.Contains(string(out), tc.class) {
+				t.Fatalf("expected alarm to classify %s, got:\n%s", tc.class, out)
+			}
+		})
+	}
+}
+
+func TestApproveCLI_EmptySweepDoesNotAlarm(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+	fk.setNoTasks(true)
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err != nil {
+		t.Fatalf("empty sweep must exit zero: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "CONTROL-PLANE STALL:") {
+		t.Fatalf("empty sweep must not alarm, got:\n%s", out)
 	}
 }
 

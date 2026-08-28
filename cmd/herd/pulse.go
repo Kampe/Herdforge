@@ -232,6 +232,13 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
 	}
 	project := strings.TrimSpace(cfg.TaskProvider.ProjectID)
+	return collectPulseProviderObservation(ctx, tp, project)
+}
+
+// collectPulseProviderObservation turns both scoped board reads into one
+// all-or-unknown provider observation. A failed in-review read is not zero
+// review work and cannot leave a dispatch candidate behind.
+func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvider, project string) (pulse.ProviderObservation, map[string]bool) {
 	tasks, err := tp.ListTasks(ctx, project, provider.StatusToDo)
 	if err != nil {
 		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
@@ -256,11 +263,10 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 			}
 		}
 	}
-	
+
 	inReviewTasks, err := tp.ListTasks(ctx, project, "in-review")
-	var inReview int64
-	if err == nil {
-		inReview = int64(len(inReviewTasks))
+	if err != nil {
+		return pulse.ProviderObservation{Known: false, Error: fmt.Sprintf("list in-review tasks: %v", err)}, nil
 	}
 
 	obs := pulse.ProviderObservation{
@@ -268,7 +274,7 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 		QueueDepth: int64(len(tasks)),
 		Claimable:  claimable,
 		InProgress: inProgress,
-		InReview:   inReview,
+		InReview:   int64(len(inReviewTasks)),
 	}
 	if next := selectPulseDispatchTask(claimableTasks); next != nil {
 		obs.NextTaskRef = strings.TrimSpace(next.Ref)
