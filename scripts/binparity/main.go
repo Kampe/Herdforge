@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,9 +14,19 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 const defaultManifest = "docs/architecture/chainseer-bin-parity.json"
+
+const (
+	exitSourceUnavailable = 2
+	exitParityMismatch    = 3
+	exitManifestInvalid   = 4
+)
+
+var errParityMismatch = errors.New("parity mismatch")
 
 var allowedDisposition = map[string]bool{
 	"herdforge_command_replacement": true,
@@ -47,21 +58,60 @@ func main() {
 	manifestPath := fs.String("manifest", defaultManifest, "repo-relative parity manifest")
 	sourcePath := fs.String("source", os.Getenv("CHAINSEER_BIN"), "Chainseer bin directory")
 	fs.Parse(os.Args[1:])
-	if *sourcePath == "" {
-		*sourcePath = "../chainseer/bin"
+	if strings.TrimSpace(*sourcePath) == "" {
+		resolved, err := defaultSourcePath(context.Background(), ".")
+		if err != nil {
+			reportSourceUnavailable(err)
+		}
+		*sourcePath = resolved
+	}
+	if err := sourceDirectoryAvailable(*sourcePath); err != nil {
+		reportSourceUnavailable(err)
 	}
 	m, err := readManifest(*manifestPath)
 	if err == nil {
 		err = validateManifest(m)
 	}
-	if err == nil {
-		err = auditSource(*sourcePath, m)
-	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "binparity: FAIL: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "binparity: MANIFEST_INVALID: %v\n", err)
+		os.Exit(exitManifestInvalid)
+	}
+	if err := auditSource(*sourcePath, m); err != nil {
+		if errors.Is(err, errParityMismatch) {
+			fmt.Fprintf(os.Stderr, "binparity: PARITY_MISMATCH: %v\n", err)
+			os.Exit(exitParityMismatch)
+		}
+		reportSourceUnavailable(err)
 	}
 	fmt.Printf("binparity: PASS: %d executable dispositions\n", len(m.Entries))
+}
+
+func defaultSourcePath(ctx context.Context, startDir string) (string, error) {
+	projectRoot, _, err := gitroot.ProjectRoot(ctx, startDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve Herdforge git root: %w", err)
+	}
+	return filepath.Join(filepath.Dir(projectRoot), "chainseer", "bin"), nil
+}
+
+func sourceDirectoryAvailable(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("Chainseer source at %q: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("Chainseer source at %q is not a directory", path)
+	}
+	return nil
+}
+
+func reportSourceUnavailable(err error) {
+	if os.Getenv("CHAINSEER_PARITY_OPTIONAL") == "1" {
+		fmt.Printf("binparity: SKIP_SOURCE_UNAVAILABLE: %v\n", err)
+		os.Exit(0)
+	}
+	fmt.Fprintf(os.Stderr, "binparity: SOURCE_UNAVAILABLE: %v (set CHAINSEER_BIN for an authorized source)\n", err)
+	os.Exit(exitSourceUnavailable)
 }
 
 func readManifest(path string) (Manifest, error) {
@@ -150,11 +200,11 @@ func auditSource(root string, m Manifest) error {
 	}
 	sort.Strings(manifest)
 	if len(files) != len(manifest) {
-		return fmt.Errorf("source has %d executables but manifest has %d", len(files), len(manifest))
+		return fmt.Errorf("%w: source has %d executables but manifest has %d", errParityMismatch, len(files), len(manifest))
 	}
 	for i := range files {
 		if files[i] != manifest[i] {
-			return fmt.Errorf("executable parity mismatch at %q vs %q", files[i], manifest[i])
+			return fmt.Errorf("%w at %q vs %q", errParityMismatch, files[i], manifest[i])
 		}
 	}
 	return nil
