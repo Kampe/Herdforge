@@ -1973,6 +1973,9 @@ func TestApproveCLI_StallAlarmFiresOnSuppressed(t *testing.T) {
 	if !strings.Contains(string(out), "CONTROL-PLANE STALL:") {
 		t.Fatalf("expected control-plane alarm, got:\n%s", out)
 	}
+	if !strings.Contains(string(out), "suppressed=1") || !strings.Contains(string(out), "refused=0") {
+		t.Fatalf("expected suppressed-only sweep, but counts were wrong:\n%s", out)
+	}
 }
 
 // shortSocketPath returns a unix socket path short enough for the macOS
