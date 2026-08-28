@@ -109,13 +109,16 @@ func buildDoneRequest(repoDir, projectID, ref, receiptPath, acceptanceEvidence s
 	if receipt == nil {
 		return req, closer, nil
 	}
-	authority, closer, err := openLifecycleAuthority(repoDir)
-	if err != nil {
-		return req, func() {}, err
-	}
 	req.Receipt = receipt
 	if strings.TrimSpace(req.AcceptanceEvidence) == "" {
 		req.AcceptanceEvidence = receipt.AcceptanceEvidence
+	}
+	if receipt.ProvenanceMode == hsync.ProvenanceReduced {
+		return req, closer, nil
+	}
+	authority, closer, err := openLifecycleAuthority(repoDir)
+	if err != nil {
+		return req, func() {}, err
 	}
 	req.Lifecycle = authority
 	return req, closer, nil

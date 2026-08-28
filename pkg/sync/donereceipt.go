@@ -232,6 +232,16 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 		return fmt.Errorf("merge sha %s carries patch %s, not the accepted candidate's patch %s",
 			r.MergeSHA, landed, r.PatchID)
 	}
+	// Reduced receipts are deliberately minted only by post-merge PR
+	// reconciliation after the exact review-ledger verdict and patch-equivalent
+	// landing have been proven. They omit dispatch-derived lifecycle, task-id,
+	// and acceptance fields rather than fabricating them after the work landed.
+	// Their positive PR, sealed digest, verification evidence, cross-family
+	// PASS, repository binding, and Git/patch proof above are the completion
+	// authority; an absent or expired dispatch authorization is not.
+	if reduced {
+		return nil
+	}
 
 	// Lifecycle binding: the task must be durably past integration, at the
 	// exact lease generation and candidate the receipt was minted under.
@@ -286,6 +296,18 @@ func PatchID(repoDir, sha string) (string, error) {
 // ReceiptPath is where BoardDone looks for a card's receipt by default.
 func ReceiptPath(repoDir, ref string) string {
 	return filepath.Join(repoDir, ".herd", "receipts", NormalizeRef(ref)+".json")
+}
+
+// MissingCompletionReceiptError names the absent artifact class and the exact
+// path searched. Keep this diagnostic shared by every automatic close entry
+// point: a launch receipt or task context is authorization to work, not proof
+// that the work landed.
+func MissingCompletionReceiptError(repoDir, ref string) error {
+	ref = NormalizeRef(ref)
+	return fmt.Errorf("%w for %s: no landing completion receipt at %s (completion-evidence store searched). "+
+		"A commit naming the ref is a discovery hint, not proof. Supply the receipt the integration produced, "+
+		"or close it manually with --override-policy/--override-actor/--override-reason/--override-evidence",
+		ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
 }
 
 // WriteReceipt seals and durably writes a receipt for ref. Producers use this;
