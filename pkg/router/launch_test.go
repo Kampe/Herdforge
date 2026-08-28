@@ -54,6 +54,34 @@ func TestForbiddenDeepSeek(t *testing.T) {
 	}
 }
 
+// FAC-628: a standing lane's live pane was observed running Grok 4.5 against
+// the operator's standing rule that grok must be 4.6 and never 4.5, while
+// routing policy names only grok-4.6 and every dry-run resolved grok-4.6.
+// This is the hard-stop gate enforced where a route is CONSTRUCTED.
+func TestForbiddenGrokVersion(t *testing.T) {
+	if ForbiddenGrokVersion("grok-4.6") {
+		t.Fatal("grok-4.6 must be allowed")
+	}
+	if ForbiddenGrokVersion("litellm/lazer/grok-4.6") {
+		t.Fatal("a prefixed grok-4.6 route must be allowed")
+	}
+	if !ForbiddenGrokVersion("grok-4.5") {
+		t.Fatal("grok-4.5 must be forbidden")
+	}
+	if !ForbiddenGrokVersion("Grok 4.5 (high)") {
+		t.Fatal("a TUI-shaped 'Grok 4.5' mention must be forbidden -- this is the live incident's exact string")
+	}
+	if !ForbiddenGrokVersion("grok/4.5-fast") {
+		t.Fatal("a slash-separated grok-4.5 route must be forbidden")
+	}
+	if ForbiddenGrokVersion("claude-sonnet-5") {
+		t.Fatal("non-grok models must not trip the gate")
+	}
+	if ForbiddenGrokVersion("grok-4.6-fast") {
+		t.Fatal("a suffixed 4.6 variant must still read as version 4.6, not forbidden")
+	}
+}
+
 func TestModelRequiresProbeLunaAndDeepseek(t *testing.T) {
 	if !ModelRequiresProbe("gpt-5.6-luna") {
 		t.Fatal("luna must require tool-probe")
@@ -647,6 +675,25 @@ func TestDecideNoCandidateFailsClosed(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("exhausted sole candidate must fail closed")
+	}
+}
+
+// FAC-628: the forbidden-grok-version gate must be enforced where the launch
+// is CONSTRUCTED (Decide itself), not left to kickoff prose that a relaunch
+// would not carry.
+func TestDecideRefusesForbiddenGrokVersion(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(nil, "grok")
+	_, err := r.Decide(LaunchRequest{
+		Role:              RoleWorker,
+		Shape:             "implementation",
+		RequestedProvider: "grok", RequestedModel: "grok-4.5",
+	})
+	if err == nil {
+		t.Fatal("a request explicitly naming grok-4.5 must be refused at construction")
+	}
+	if !strings.Contains(err.Error(), "grok") {
+		t.Fatalf("refusal must name the forbidden grok version, got: %v", err)
 	}
 }
 

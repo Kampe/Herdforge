@@ -9,15 +9,70 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
 )
+
+var liveModelMention = regexp.MustCompile(`(?i)\b(grok[\s/_-]*\d+\.\d+(?:[^\n)]*)?|(?:claude|gpt|codex|gemini|deepseek)[\s/_-]*[a-z0-9.-]+)`)
+
+func liveModelFromPane(tail string) string {
+	m := liveModelMention.FindStringSubmatch(tail)
+	if len(m) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+func recordedModelForAgent(root string, agent herdr.AgentEntry) string {
+	receipts, err := launch.ReadReceipts(launch.ReceiptPathFor(root))
+	if err != nil {
+		return ""
+	}
+	for i := len(receipts) - 1; i >= 0; i-- {
+		r := receipts[i]
+		if !r.Accepted || strings.TrimSpace(r.Model) == "" {
+			continue
+		}
+		if (agent.PaneID != "" && r.PaneID == agent.PaneID) || (agent.Name != "" && r.Name == agent.Name) {
+			return strings.TrimSpace(r.Model)
+		}
+	}
+	return ""
+}
+
+// continuationsForWorktree reads the durable stop-hook continuation counter
+// for the lane checked out at cwd (FAC-628). goalguard's own state path is
+// cwd-relative by design (each lane's Stop hook runs with its own worktree
+// as cwd, per goalguard.DefaultPath's doc comment), so this joins the SAME
+// relative path directly against the pane's observed cwd rather than reusing
+// DefaultPath, which would read spin's OWN process cwd instead of the pane's.
+//
+// Missing or unreadable state is not evidence of an empty loop -- it is the
+// normal state for a lane not running under a goal-guarded Stop hook at all
+// -- so it returns 0, never an error.
+func continuationsForWorktree(cwd string) int64 {
+	if strings.TrimSpace(cwd) == "" {
+		return 0
+	}
+	store, err := goalguard.Open(goalguard.PathForCWD(cwd))
+	if err != nil {
+		return 0
+	}
+	goal, err := store.Load()
+	if err != nil {
+		return 0
+	}
+	return int64(goal.Continuations)
+}
 
 // runSpin samples the live fleet and reports which agents are consuming
 // resources without durable progress (FAC-90).
@@ -97,14 +152,16 @@ func runSpin() {
 		pid, cwd, alive := paneProcessState(a.PaneID)
 
 		obs := spin.Observation{
-			PaneID:      a.PaneID,
-			Name:        a.Name,
-			AgentStatus: a.Status,
-			PID:         pid,
-			ProcAlive:   alive,
-			UniqueWork:  spin.TriUnknown,
-			Diagnostic:  string(process.ClassifyTarget(a.PaneID, a.Name, a.Status, tail).Class),
-			Progress:    spin.Progress{StateChangeSeq: a.StateChangeSeq},
+			PaneID:        a.PaneID,
+			Name:          a.Name,
+			AgentStatus:   a.Status,
+			PID:           pid,
+			ProcAlive:     alive,
+			UniqueWork:    spin.TriUnknown,
+			Diagnostic:    string(process.ClassifyTarget(a.PaneID, a.Name, a.Status, tail).Class),
+			Progress:      spin.Progress{StateChangeSeq: a.StateChangeSeq, Continuations: continuationsForWorktree(cwd)},
+			RecordedModel: recordedModelForAgent(repoRoot, a),
+			LiveModel:     liveModelFromPane(tail),
 		}
 
 		writer := spin.IsWriter(a.Name, cwd)

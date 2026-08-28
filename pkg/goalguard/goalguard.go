@@ -124,6 +124,13 @@ func DefaultPath() string {
 	return filepath.Join(posture.StateDir(), "goal-guard.json")
 }
 
+// PathForCWD returns the goal-guard state path for an explicitly observed
+// lane worktree. Callers inspecting another lane must not use DefaultPath,
+// which resolves against the inspecting process's cwd.
+func PathForCWD(cwd string) string {
+	return filepath.Join(cwd, ".herd", "goal-guard.json")
+}
+
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("goalguard: state path is required")

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -546,6 +547,40 @@ func IsDeepSeekV4(model string) bool {
 	return strings.Contains(m, "deepseek-v4") || strings.Contains(m, "deepseek/v4")
 }
 
+// grokVersionRe extracts a grok major.minor version token, e.g. "4.5" out of
+// "grok-4.5", "grok/4.5-fast", "Grok 4.5 (high)". Deliberately loose about
+// what surrounds the number so it catches the model however a provider or
+// harness spells it, and strict about the number itself so "4.5x" is not
+// mistaken for "4.5".
+var grokVersionRe = regexp.MustCompile(`(?i)grok[\s/_-]*(\d+\.\d+)`)
+
+// IsAllowedGrokVersion reports whether a grok model is the sanctioned 4.6
+// line. FAC-628: a standing lane's live pane was observed running Grok 4.5
+// while routing policy names only grok-4.6 and every dry-run resolved
+// grok-4.6 — the operator's standing rule is 4.6 and never 4.5. A model
+// string naming no grok version at all is not evidence either way and is
+// treated as allowed by this gate, matching IsDeepSeekV4's non-deepseek
+// convention immediately below.
+func IsAllowedGrokVersion(model string) bool {
+	m := grokVersionRe.FindStringSubmatch(model)
+	if m == nil {
+		return true // not a versioned grok mention → N/A, allowed by this gate
+	}
+	return m[1] == "4.6"
+}
+
+// ForbiddenGrokVersion rejects any grok model that names a version other than
+// 4.6. Enforced where a route is CONSTRUCTED (Pick and Decide below), not in
+// kickoff prose: a constraint stated only in prompt text is not enforcement,
+// because a relaunch will not carry it.
+func ForbiddenGrokVersion(model string) bool {
+	m := grokVersionRe.FindStringSubmatch(model)
+	if m == nil {
+		return false
+	}
+	return m[1] != "4.6"
+}
+
 // ForbiddenDeepSeek rejects non-v4 deepseek models.
 func ForbiddenDeepSeek(model string) bool {
 	m := strings.ToLower(model)
@@ -1067,6 +1102,10 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if ForbiddenDeepSeek(model) {
 			continue
 		}
+		if ForbiddenGrokVersion(model) {
+			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: forbidden grok version (must be 4.6)", provider, model))
+			continue
+		}
 		cap := CapabilityOfSurface(provider, model)
 		if cap == CapUnknown {
 			surfaceRejections = append(surfaceRejections, fmt.Sprintf("%s/%s: unknown surface capability", provider, model))
@@ -1244,6 +1283,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	}
 	if ForbiddenDeepSeek(model) {
 		return nil, fmt.Errorf("herd-route: non-v4 deepseek forbidden: %s", model)
+	}
+	if ForbiddenGrokVersion(model) {
+		return nil, fmt.Errorf("herd-route: forbidden grok version (must be 4.6): %s", model)
 	}
 
 	rationale := fmt.Sprintf(

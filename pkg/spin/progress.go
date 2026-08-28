@@ -44,6 +44,15 @@ type Progress struct {
 	// Head and Dirty are the worktree git snapshot.
 	Head  string `json:"head,omitempty"`
 	Dirty int    `json:"dirty,omitempty"`
+	// Continuations is the durable stop-hook continuation counter
+	// (goalguard.Goal.Continuations) for this lane. FAC-628: a lane in an
+	// EMPTY continuation loop increments this every cycle while producing no
+	// output change, no lifecycle movement, and no git delta -- it reports
+	// agent_status=working in every census while doing nothing, consuming a
+	// concurrency slot and quota. It is deliberately NOT one of the "moved"
+	// signals below: an advancing continuation count with nothing else
+	// moving is the ABSENCE of progress, not evidence of it.
+	Continuations int64 `json:"continuations,omitempty"`
 }
 
 // Known reports whether at least one progress signal is actually observable.
@@ -106,6 +115,10 @@ type Observation struct {
 	// Findings are the fingerprint detector's STALL/SPIN/LONG output,
 	// carried for the operator. They never drive Cause or NextAction.
 	Findings []Finding `json:"findings,omitempty"`
+	// RecordedModel is the launch receipt pin; LiveModel is parsed from the
+	// pane's own model identification. A mismatch is a hard stop.
+	RecordedModel string `json:"recorded_model,omitempty"`
+	LiveModel     string `json:"live_model,omitempty"`
 }
 
 // Cause is why an agent looks the way it does. These are mutually exclusive
@@ -121,6 +134,14 @@ const (
 	CauseCrashLoop     Cause = "CRASH_LOOP"
 	CauseNoProgress    Cause = "NO_PROGRESS"
 	CauseUnknownState  Cause = "UNKNOWN_STATE"
+	// CauseEmptyLoop is a lane whose stop-hook continuation counter is
+	// advancing while no other durable signal moves (FAC-628). Distinct from
+	// CauseNoProgress: silence alone is ambiguous (a slow tool call looks
+	// identical for a few cycles), but a climbing continuation count with
+	// nothing else moving is direct, immediate proof the hook keeps firing
+	// on nothing -- it does not wait for Policy.NoProgressCycles.
+	CauseEmptyLoop  Cause = "EMPTY_LOOP"
+	CauseModelDrift Cause = "MODEL_DRIFT"
 )
 
 // Action is the bounded next step.
@@ -248,6 +269,13 @@ func Assess(prev *Sample, obs Observation, pol Policy, now time.Time, act bool) 
 	// These run before any classification, because a verdict built on
 	// evidence we do not actually have is worse than admitting the gap.
 	switch {
+	case obs.RecordedModel != "" && obs.LiveModel != "" && !strings.EqualFold(obs.RecordedModel, obs.LiveModel):
+		a.Cause = CauseModelDrift
+		a.NextAction = ActionOperator
+		a.Withheld = "model drift is a hard stop; do not nudge or relaunch this lane"
+		a.Evidence = append(a.Evidence, fmt.Sprintf("live model drift: launch receipt=%q live pane=%q", obs.RecordedModel, obs.LiveModel))
+		out.LastActionTaken = ""
+		return out, a
 	case obs.ProcAlive == TriUnknown || obs.ProcAlive == "":
 		a.Cause = CauseUnknownState
 		a.NextAction = ActionObserve
@@ -287,6 +315,19 @@ func Assess(prev *Sample, obs Observation, pol Policy, now time.Time, act bool) 
 		a.Cause = CauseProgressing
 	case out.RestartCycles >= pol.RestartCycles:
 		a.Cause = CauseCrashLoop
+		a.NextAction = ActionRecover
+	case prev != nil && obs.Progress.Continuations > prev.Progress.Continuations:
+		// FAC-628: the stop-hook fired and consumed a continuation, and
+		// NOTHING else durable moved this cycle (out.NoProgressCycles > 0 is
+		// guaranteed here, since CauseProgressing already claimed the
+		// zero case above). This is stronger evidence than silence: it
+		// proves the loop is actively re-triggering on an unchanged state,
+		// not merely slow. Fires immediately rather than waiting for
+		// Policy.NoProgressCycles quiet samples.
+		a.Cause = CauseEmptyLoop
+		a.Evidence = append(a.Evidence, fmt.Sprintf(
+			"stop-hook continuation advanced %d->%d with no other durable signal moving",
+			prev.Progress.Continuations, obs.Progress.Continuations))
 		a.NextAction = ActionRecover
 	case obs.Diagnostic == "QUOTA":
 		// Provider exhaustion burns a turn per nudge and fixes nothing;

@@ -180,6 +180,81 @@ func TestCrashLoopEscalatesStraightToRecovery(t *testing.T) {
 	}
 }
 
+// FAC-628: a lane spinning in an empty stop-hook loop reports
+// agent_status=working in every census while producing nothing — no
+// lifecycle movement, no candidate change, no herdr state-change advance, no
+// git delta — and the ONLY thing moving is the continuation counter itself.
+// That must be caught immediately, not after Policy.NoProgressCycles quiet
+// samples: a climbing continuation count with nothing else moving is direct
+// proof of the loop, not mere ambiguous silence.
+func TestEmptyContinuationLoopIsCaughtImmediatelyNotAsGenericSilence(t *testing.T) {
+	pol := DefaultPolicy()
+	c := newClock()
+	p := working(7, "abc", 42)
+	p.Continuations = 305
+
+	first, a1 := Assess(nil, obs("working", p), pol, c.now(), false)
+	if a1.Cause != CauseProgressing {
+		t.Fatalf("first observation must not be judged yet, got %s", a1.Cause)
+	}
+	c.advance(DefaultInterval)
+
+	// Second sample: EVERY durable signal unchanged except the continuation
+	// counter, which advanced. A generic no-progress verdict would need
+	// pol.NoProgressCycles (3) quiet samples to fire; empty-loop must not
+	// wait for that.
+	p2 := p
+	p2.Continuations = 306
+	_, a2 := Assess(&first, obs("working", p2), pol, c.now(), false)
+
+	if a2.Cause != CauseEmptyLoop {
+		t.Fatalf("continuation advancing with nothing else moving must read EMPTY_LOOP, got %s (%v)", a2.Cause, a2.Evidence)
+	}
+	if a2.NextAction != ActionRecover {
+		t.Fatalf("empty-loop next action = %s, want recover", a2.NextAction)
+	}
+	found := false
+	for _, e := range a2.Evidence {
+		if strings.Contains(e, "305->306") || strings.Contains(e, "continuation") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("evidence must name the continuation advance, got %v", a2.Evidence)
+	}
+}
+
+// A durable signal genuinely advancing alongside the continuation counter is
+// real work, not an empty loop — CauseEmptyLoop must not fire on it.
+func TestContinuationAdvancingWithRealProgressIsNotAnEmptyLoop(t *testing.T) {
+	pol := DefaultPolicy()
+	c := newClock()
+	p := working(7, "abc", 42)
+	p.Continuations = 10
+	first, _ := Assess(nil, obs("working", p), pol, c.now(), false)
+	c.advance(DefaultInterval)
+
+	p2 := working(8, "abc", 42) // lifecycle_seq advanced: real movement
+	p2.Continuations = 11
+	_, a2 := Assess(&first, obs("working", p2), pol, c.now(), false)
+	if a2.Cause != CauseProgressing {
+		t.Fatalf("real durable progress alongside a continuation bump must not be EMPTY_LOOP, got %s", a2.Cause)
+	}
+}
+
+func TestLiveModelDriftIsAHardStopAndNamesBothModels(t *testing.T) {
+	p := working(7, "abc", 42)
+	_, a := Assess(nil, Observation{PaneID: "p1", Name: "smith", AgentStatus: "working", Progress: p,
+		RecordedModel: "grok-4.6", LiveModel: "Grok 4.5 (high)"}, DefaultPolicy(), time.Now(), false)
+	if a.Cause != CauseModelDrift || a.NextAction != ActionOperator {
+		t.Fatalf("model drift = %s/%s, want hard stop/operator", a.Cause, a.NextAction)
+	}
+	evidence := strings.Join(a.Evidence, " ")
+	if !strings.Contains(evidence, "grok-4.6") || !strings.Contains(evidence, "Grok 4.5") {
+		t.Fatalf("model drift evidence must name both values, got %v", a.Evidence)
+	}
+}
+
 // "Never kill a session or release a lease while unique work or unknown
 // state exists" — the two gates, each proven against a passing control.
 func TestUniqueWorkAndUnknownProcessStateFailClosed(t *testing.T) {
