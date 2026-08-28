@@ -735,9 +735,6 @@ func compensateTargetLabel(ctx context.Context, p TaskLabelProvider, targetID st
 		if err := p.DetachTaskLabel(ctx, created.ID); err != nil {
 			comp = err
 		}
-		if err := p.DeleteTaskLabel(ctx, created.ID); err != nil && comp == nil {
-			comp = err
-		}
 	}
 	// Restore any pre-existing, provider-owned rows detached by a family
 	// reconciliation. Never use the untrusted create response for this step.
@@ -947,9 +944,6 @@ func compensateLabel(ctx context.Context, p TaskLabelProvider, sourceID, targetI
 	var comp error
 	if created.ID != "" {
 		if err := p.DetachTaskLabel(ctx, created.ID); err != nil {
-			comp = err
-		}
-		if err := p.DeleteTaskLabel(ctx, created.ID); err != nil && comp == nil {
 			comp = err
 		}
 	}

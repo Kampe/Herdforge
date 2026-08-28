@@ -13,6 +13,11 @@ import (
 
 var ErrRedundantLabelAttach = fmt.Errorf("redundant label attach returned null success")
 
+// ErrWorkspaceLabelDeleteRefused is the fail-closed result of DeleteTaskLabel.
+// `kaneo label delete` resolves by name workspace-wide, so no Herdforge path
+// may issue that argv.
+var ErrWorkspaceLabelDeleteRefused = fmt.Errorf("kaneo workspace label delete is refused")
+
 func (k *KaneoProvider) LabelMutationAuthority() (string, error) {
 	if k == nil || strings.TrimSpace(k.ProjectID) == "" {
 		return "", fmt.Errorf("kaneo label authority: immutable project identity required")
@@ -223,6 +228,14 @@ func (k *KaneoProvider) ProveLabelCreation(ctx context.Context, created TaskLabe
 
 func (k *KaneoProvider) AttachTaskLabel(ctx context.Context, taskID, labelID string) error {
 	if k.UseCLI {
+		before, err := k.listWorkspaceLabels(ctx)
+		if err != nil {
+			return fmt.Errorf("kaneo task label attach: donor snapshot: %w", err)
+		}
+		donorID := ""
+		if row, ok := before[labelID]; ok {
+			donorID = row.TaskID
+		}
 		args := []string{"task", "label", "add", taskID, labelID}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
@@ -241,6 +254,22 @@ func (k *KaneoProvider) AttachTaskLabel(ctx context.Context, taskID, labelID str
 		}
 		if len(rows) != 1 || rows[0].ID != labelID || rows[0].TaskID != taskID {
 			return fmt.Errorf("kaneo label attach identity mismatch")
+		}
+		targetRows, err := k.ListTaskLabels(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("kaneo task label attach: target readback: %w", err)
+		}
+		if !ownsLabel(targetRows, labelID, taskID) {
+			return fmt.Errorf("kaneo task label attach: target readback mismatch")
+		}
+		if donorID != "" && donorID != taskID {
+			donorRows, err := k.ListTaskLabels(ctx, donorID)
+			if err != nil {
+				return fmt.Errorf("kaneo task label attach: donor readback: %w", err)
+			}
+			if !ownsLabel(donorRows, labelID, donorID) {
+				return fmt.Errorf("kaneo task label attach: donor lost label %s", labelID)
+			}
 		}
 		return nil
 	}
@@ -285,25 +314,10 @@ func (k *KaneoProvider) DetachTaskLabel(ctx context.Context, labelID string) err
 }
 
 func (k *KaneoProvider) DeleteTaskLabel(ctx context.Context, labelID string) error {
-	if k.UseCLI {
-		args := []string{"label", "delete", labelID}
-		if k.ProjectID != "" {
-			args = append(args, "--project", k.ProjectID)
-		}
-		res, err := kaneoRunCLI(ctx, "kaneo", args...)
-		if err != nil {
-			return fmt.Errorf("kaneo task label delete: %w", err)
-		}
-		rows, err := decodeKaneoLabels(http.StatusOK, res.Stdout)
-		if err != nil {
-			return err
-		}
-		if len(rows) != 1 || rows[0].ID != labelID {
-			return fmt.Errorf("kaneo label delete identity mismatch")
-		}
-		return nil
+	if strings.TrimSpace(labelID) == "" {
+		return fmt.Errorf("kaneo workspace label delete: label identity required: %w", ErrWorkspaceLabelDeleteRefused)
 	}
-	return fmt.Errorf("kaneo workspace label delete over HTTP is unsupported without a proven contract")
+	return fmt.Errorf("kaneo workspace label delete is refused for %s: %w", labelID, ErrWorkspaceLabelDeleteRefused)
 }
 
 func (k *KaneoProvider) kaneoLabelHTTP(ctx context.Context, method, endpoint string, payload []byte) ([]TaskLabel, error) {

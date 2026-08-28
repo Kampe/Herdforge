@@ -251,8 +251,10 @@ func TestKaneoCLI_LabelArgvContract(t *testing.T) {
 	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
 		calls = append(calls, strings.Join(args, " "))
 		switch {
-		case strings.HasPrefix(strings.Join(args, " "), "task label list"):
+		case strings.HasPrefix(strings.Join(args, " "), "task label list t1"):
 			return &CLIResult{Stdout: []byte(`[{"id":"l1","name":"forge-smith","taskId":"t1"}]`)}, nil
+		case strings.HasPrefix(strings.Join(args, " "), "task label list t2"):
+			return &CLIResult{Stdout: []byte(`[{"id":"l2","name":"forge-smith","taskId":"t2"}]`)}, nil
 		case strings.HasPrefix(strings.Join(args, " "), "label list"):
 			workspaceLists++
 			if workspaceLists == 1 {
@@ -279,10 +281,18 @@ func TestKaneoCLI_LabelArgvContract(t *testing.T) {
 	if err := k.DetachTaskLabel(context.Background(), "l2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.DeleteTaskLabel(context.Background(), "l2"); err != nil {
-		t.Fatal(err)
+	if err := k.DeleteTaskLabel(context.Background(), "l2"); !errors.Is(err, ErrWorkspaceLabelDeleteRefused) {
+		t.Fatalf("workspace label delete must fail closed: %v", err)
 	}
-	want := []string{"task label list t1 --json --project project-1", "label list --json --project project-1", "label create --color #808080 forge-smith --json --project project-1", "task label add t2 l2 --project project-1", "task label delete l2 --project project-1", "label delete l2 --project project-1"}
+	want := []string{
+		"task label list t1 --json --project project-1",
+		"label list --json --project project-1",
+		"label create --color #808080 forge-smith --json --project project-1",
+		"label list --json --project project-1",
+		"task label add t2 l2 --project project-1",
+		"task label list t2 --json --project project-1",
+		"task label delete l2 --project project-1",
+	}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("CLI argv mismatch:\n got %v\nwant %v", calls, want)
 	}
@@ -291,7 +301,11 @@ func TestKaneoCLI_LabelArgvContract(t *testing.T) {
 func TestKaneoCLI_RedundantAttachNullIsTypedFailure(t *testing.T) {
 	old := kaneoRunCLI
 	t.Cleanup(func() { kaneoRunCLI = old })
-	kaneoRunCLI = func(context.Context, string, ...string) (*CLIResult, error) {
+	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
+		command := strings.Join(args, " ")
+		if strings.HasPrefix(command, "label list") || strings.HasPrefix(command, "task label list") {
+			return &CLIResult{Stdout: []byte(`[]`)}, nil
+		}
 		return &CLIResult{Stdout: []byte("null")}, nil
 	}
 	k := NewKaneoProvider("", "project-1", true)
