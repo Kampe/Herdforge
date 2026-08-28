@@ -3,6 +3,7 @@ package spin
 import (
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // Without noise-stripping a "thinking" pane redraws forever and STALL can
@@ -25,6 +26,23 @@ func TestNormalizeStripsAnsiAndCollapsesWhitespace(t *testing.T) {
 	got := NormalizeTail("\x1b[32mhello\x1b[0m    world\n\n  again  ")
 	if got != "hello world again" {
 		t.Fatalf("normalize = %q", got)
+	}
+}
+
+func TestStripTerminalControlSequences(t *testing.T) {
+	got := StripTerminalControlSequences("\x1b]0;Herdforge: ready\a\x1b[32mPROBE_OK\x1b[0m\x1b]0;Herdforge: done\x1b\\")
+	if got != "PROBE_OK" {
+		t.Fatalf("stripped output = %q", got)
+	}
+}
+
+func TestStripTerminalControlSequencesPreservesUTF8(t *testing.T) {
+	got := StripTerminalControlSequences("⠋ PROBE_OK")
+	if got != "⠋ PROBE_OK" {
+		t.Fatalf("stripped output = %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("stripped output is not valid UTF-8: %q", got)
 	}
 }
 

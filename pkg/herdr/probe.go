@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/router"
+	"github.com/Kampe/Herdforge/pkg/spin"
 )
 
 const (
@@ -101,7 +102,8 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, runErr := cmd.Output()
-	combined := string(out) + "\n" + stderr.String()
+	sanitizedOut := spin.StripTerminalControlSequences(string(out))
+	combined := sanitizedOut + "\n" + spin.StripTerminalControlSequences(stderr.String())
 	lower := strings.ToLower(combined)
 
 	for _, sig := range exhaustionSignals {
@@ -115,11 +117,11 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 	if runErr != nil {
 		detail := firstLine(combined)
 		if detail == "" {
-			detail = runErr.Error()
+			detail = spin.StripTerminalControlSequences(runErr.Error())
 		}
 		return ProbeResult{Model: model, Reason: "probe failed: " + detail}
 	}
-	if strings.TrimSpace(string(out)) != probeToken {
+	if strings.TrimSpace(sanitizedOut) != probeToken {
 		return ProbeResult{Model: model, Reason: "no exact probe output"}
 	}
 	return ProbeResult{Model: model, Available: true}

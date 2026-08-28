@@ -170,6 +170,42 @@ echo PROBE_OK`)
 	}
 }
 
+func TestProbeProviderModel_OSCWrappedTokenPasses(t *testing.T) {
+	dir := t.TempDir()
+	writeProbeCLI(t, dir, "pi", `printf '\033]0;Herdforge: ready\007PROBE_OK\033]0;Herdforge: done\033\\'`)
+	t.Setenv("PATH", dir)
+
+	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
+	if !result.Available {
+		t.Fatalf("OSC-wrapped exact token must pass: %+v", result)
+	}
+}
+
+func TestProbeProviderModel_OSCWithoutTokenFails(t *testing.T) {
+	dir := t.TempDir()
+	writeProbeCLI(t, dir, "pi", `printf '\033]0;Herdforge: ready\007\033]0;Herdforge: done\033\\'`)
+	t.Setenv("PATH", dir)
+
+	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
+	if result.Available || result.Reason != "no exact probe output" {
+		t.Fatalf("OSC output without the token must fail closed: %+v", result)
+	}
+}
+
+func TestProbeProviderModel_SanitizesFailureDetail(t *testing.T) {
+	dir := t.TempDir()
+	writeProbeCLI(t, dir, "pi", `printf '\033]0;Herdforge: ready\007command failed\033]0;Herdforge: done\033\\'; exit 2`)
+	t.Setenv("PATH", dir)
+
+	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
+	if result.Available || result.Reason != "probe failed: command failed" {
+		t.Fatalf("failure detail = %+v", result)
+	}
+	if strings.ContainsAny(result.Reason, "\x1b\a") {
+		t.Fatalf("failure detail contains a raw control byte: %q", result.Reason)
+	}
+}
+
 func TestProbeProviderModel_FailsClosed(t *testing.T) {
 	t.Run("unsupported provider", func(t *testing.T) {
 		// FAC-578: this case used to assert that native CLAUDE was unsupported,

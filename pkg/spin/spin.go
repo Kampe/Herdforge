@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Finding is one detected condition.
@@ -42,7 +43,6 @@ const (
 )
 
 var (
-	ansiRe    = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 	spinnerRe = regexp.MustCompile(`^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⠂⠄⠆⠃⠁⠈⠐⠠⢀⡀]*$`)
 	tokensRe  = regexp.MustCompile(`(?i)[0-9]+\s*tokens?|tokens?\s*[:=0-9]`)
 	contextRe = regexp.MustCompile(`(?i)context\s*[0-9]+%`)
@@ -51,6 +51,91 @@ var (
 	wsRe      = regexp.MustCompile(`\s+`)
 )
 
+// StripTerminalControlSequences removes terminal control sequences while
+// preserving printable output. It recognizes OSC title sequences terminated by
+// BEL or ST and CSI/ANSI sequences, and drops any remaining non-newline control
+// bytes so callers can safely include the result in diagnostics.
+func StripTerminalControlSequences(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case 0x1b:
+			if i+1 < len(s) {
+				switch s[i+1] {
+				case ']':
+					i = skipOSC(s, i+2)
+					continue
+				case '[':
+					i = skipCSI(s, i+2)
+					continue
+				}
+			}
+			i++
+			continue
+		case 0x9d:
+			i = skipOSC(s, i+1)
+			continue
+		case 0x9b:
+			i = skipCSI(s, i+1)
+			continue
+		case '\n':
+			out.WriteByte(s[i])
+		default:
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				// Invalid bytes must not reach a diagnostic.
+				i++
+				continue
+			}
+			switch r {
+			case 0x009d:
+				i = skipOSC(s, i+size)
+				continue
+			case 0x009b:
+				i = skipCSI(s, i+size)
+				continue
+			case '\n':
+				out.WriteString(s[i : i+size])
+			default:
+				if r >= 0x20 && (r < 0x7f || r > 0x9f) {
+					out.WriteString(s[i : i+size])
+				}
+			}
+			i += size
+			continue
+		}
+		i++
+	}
+	return out.String()
+}
+
+func skipOSC(s string, i int) int {
+	for i < len(s) {
+		if s[i] == '\a' || s[i] == 0x9c {
+			return i + 1
+		}
+		if r, size := utf8.DecodeRuneInString(s[i:]); r == 0x009c {
+			return i + size
+		}
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+			return i + 2
+		}
+		i++
+	}
+	return len(s)
+}
+
+func skipCSI(s string, i int) int {
+	for i < len(s) {
+		if s[i] >= 0x40 && s[i] <= 0x7e {
+			return i + 1
+		}
+		i++
+	}
+	return len(s)
+}
+
 // NormalizeTail strips the noise that changes every frame even when an agent
 // is doing nothing: spinners, token counters, context percentages, ticking
 // timers, and ANSI escapes. Without this, a frozen pane never fingerprints as
@@ -58,7 +143,7 @@ var (
 func NormalizeTail(tail string) string {
 	var kept []string
 	for _, line := range strings.Split(tail, "\n") {
-		line = ansiRe.ReplaceAllString(line, "")
+		line = StripTerminalControlSequences(line)
 		switch {
 		case spinnerRe.MatchString(line),
 			tokensRe.MatchString(line),
