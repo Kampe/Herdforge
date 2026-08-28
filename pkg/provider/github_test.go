@@ -105,6 +105,10 @@ func TestGitHubProvider_ListTasks_InReviewUnsupported(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		if page := r.URL.Query().Get("page"); page != "" && page != "1" {
+			w.Write([]byte(`[]`))
+			return
+		}
 		w.Write([]byte(`[
 			{"number":7,"title":"Open to-do issue","body":"","state":"open","created_at":"2026-08-01T20:00:00Z","labels":[]}
 		]`))
