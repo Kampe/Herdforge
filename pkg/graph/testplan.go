@@ -12,7 +12,7 @@ import (
 
 // PlannerVersion is the plan-builder identity. Bump when plan semantics change
 // so consumers can invalidate cached plans.
-const PlannerVersion = "1.0.0"
+const PlannerVersion = "1.1.0"
 
 // Language identifies a repository profile language family.
 type Language string
@@ -79,6 +79,15 @@ type PlanCommand struct {
 	Source string   `json:"source"` // owner | graph-tests_for | graph-consumer | profile | escalation
 }
 
+// NonGoOwner is a repo-relative command that covers one non-Go changed path.
+// Callers discover candidates from revision-bound metadata; Plan alone decides
+// whether their coverage is sufficient to suppress the Go-wide fallback.
+type NonGoOwner struct {
+	Path   string   `json:"path"`
+	Argv   []string `json:"argv"`
+	Reason string   `json:"reason"`
+}
+
 // VerificationProfile holds repository-defined command arrays. Every command
 // is an exact argv (no shell tokenization). Empty slices mean "not configured".
 type VerificationProfile struct {
@@ -120,6 +129,10 @@ type PlanInput struct {
 	BaseSHA      string   `json:"base_sha"`
 	CandidateSHA string   `json:"candidate_sha"`
 	ChangedPaths []string `json:"changed_paths"`
+	// NonGoOwners are exact commands for paths that cannot map to a Go
+	// package. They are candidates, not a caller-side merge: Plan validates,
+	// deduplicates, and combines them with package and profile commands.
+	NonGoOwners []NonGoOwner `json:"non_go_owners,omitempty"`
 	// ChangedSymbols are public/exported identifiers introduced or modified.
 	ChangedSymbols []string            `json:"changed_symbols,omitempty"`
 	Graph          GraphEvidence       `json:"graph"`
@@ -200,6 +213,11 @@ func Plan(in PlanInput) (*TestPlan, error) {
 	paths := uniqueSortedPaths(in.ChangedPaths)
 	symbols := uniqueSortedStrings(in.ChangedSymbols)
 	packages := packagesForPaths(paths, prof.Language)
+	nonGoOwners, nonGoCovered := nonGoOwnersForPaths(in.NonGoOwners, paths)
+	// A non-Go owner can replace the Go-wide profile only for a wholly covered
+	// non-Go diff. Any unknown path, empty change set, or Go package keeps the
+	// broad fallback so absence never reads as "no tests needed".
+	suppressGoProfile := len(paths) > 0 && len(packages) == 0 && len(nonGoCovered) == len(paths)
 
 	anchor := strings.TrimSpace(in.GraphAnchorSHA)
 	if anchor == "" {
@@ -265,9 +283,18 @@ func Plan(in PlanInput) (*TestPlan, error) {
 		reasons = append(reasons, fmt.Sprintf("%s:%s:%s", stage, source, reason))
 	}
 
-	// Profile-level lint (once, always first when configured).
-	for _, argv := range prof.Lint {
-		add(StageLint, argv, "profile lint", "profile")
+	// Shell and other non-Go owners are merged here, before deciding whether a
+	// no-package Go profile remains relevant.
+	for _, owner := range nonGoOwners {
+		add(StageTest, owner.Argv, owner.Reason, "owner")
+	}
+
+	// Profile-level lint is relevant unless every changed path has a non-Go
+	// owner and no Go owner package exists.
+	if !suppressGoProfile {
+		for _, argv := range prof.Lint {
+			add(StageLint, argv, "profile lint", "profile")
+		}
 	}
 
 	// Owner package builds (sorted packages).
@@ -278,7 +305,7 @@ func Plan(in PlanInput) (*TestPlan, error) {
 		}
 	}
 	// If no package builds were produced, fall back to profile Build once.
-	if len(packages) == 0 || len(prof.PackageBuild) == 0 {
+	if (len(packages) == 0 || len(prof.PackageBuild) == 0) && !suppressGoProfile {
 		for _, argv := range prof.Build {
 			add(StageBuild, argv, "profile build", "profile")
 		}
@@ -292,7 +319,7 @@ func Plan(in PlanInput) (*TestPlan, error) {
 		}
 	}
 	// No packages (docs-only / unknown paths): use profile Test if any.
-	if len(packages) == 0 {
+	if len(packages) == 0 && !suppressGoProfile {
 		for _, argv := range prof.Test {
 			add(StageTest, argv, "profile test (no owner package)", "profile")
 		}
@@ -483,6 +510,56 @@ func uniqueSortedStrings(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// nonGoOwnersForPaths keeps only complete, repo-relative owner candidates for
+// changed paths. It returns deterministically sorted commands and the paths
+// they cover; coverage is intentionally path-based rather than inferred from
+// the absence of a Go package.
+func nonGoOwnersForPaths(owners []NonGoOwner, changed []string) ([]NonGoOwner, map[string]struct{}) {
+	changedSet := make(map[string]struct{}, len(changed))
+	for _, p := range changed {
+		changedSet[p] = struct{}{}
+	}
+
+	covered := make(map[string]struct{}, len(changed))
+	seen := make(map[string]struct{}, len(owners))
+	valid := make([]NonGoOwner, 0, len(owners))
+	for _, owner := range owners {
+		p := normalizeRepoPath(owner.Path)
+		if p == "" {
+			continue
+		}
+		if _, changed := changedSet[p]; !changed {
+			continue
+		}
+		if len(owner.Argv) == 0 || strings.TrimSpace(owner.Argv[0]) == "" {
+			continue
+		}
+		argv := append([]string(nil), owner.Argv...)
+		key := p + "\x00" + strings.Join(argv, "\x00")
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		owner.Path = p
+		owner.Argv = argv
+		owner.Reason = strings.TrimSpace(owner.Reason)
+		valid = append(valid, owner)
+		covered[p] = struct{}{}
+	}
+
+	sort.Slice(valid, func(i, j int) bool {
+		if valid[i].Path != valid[j].Path {
+			return valid[i].Path < valid[j].Path
+		}
+		ai, aj := strings.Join(valid[i].Argv, "\x00"), strings.Join(valid[j].Argv, "\x00")
+		if ai != aj {
+			return ai < aj
+		}
+		return valid[i].Reason < valid[j].Reason
+	})
+	return valid, covered
 }
 
 func normalizeRepoPath(p string) string {

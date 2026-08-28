@@ -112,6 +112,74 @@ func TestPlan_OwnerPackagesTargeted(t *testing.T) {
 	}
 }
 
+func TestPlan_NonGoOwnersSuppressGoProfileOnlyWithCompleteCoverage(t *testing.T) {
+	in := baseInput("bin/ship", "tests/ship.zsh")
+	in.NonGoOwners = []NonGoOwner{
+		{Path: "bin/ship", Argv: []string{"zsh", "-n", "bin/ship"}, Reason: "syntax"},
+		{Path: "bin/ship", Argv: []string{"zsh", "tests/ship.zsh"}, Reason: "sibling"},
+		{Path: "tests/ship.zsh", Argv: []string{"zsh", "tests/ship.zsh"}, Reason: "changed test"},
+	}
+	plan, err := Plan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shellSyntax, shellTest bool
+	for _, c := range plan.Commands {
+		if c.Argv[0] == "go" {
+			t.Fatalf("fully owned shell diff must suppress Go profile: %+v", plan.Commands)
+		}
+		if reflect.DeepEqual(c.Argv, []string{"zsh", "-n", "bin/ship"}) {
+			shellSyntax = true
+		}
+		if reflect.DeepEqual(c.Argv, []string{"zsh", "tests/ship.zsh"}) {
+			shellTest = true
+		}
+	}
+	if !shellSyntax || !shellTest {
+		t.Fatalf("missing shell owners: %+v", plan.Commands)
+	}
+
+	// One uncovered non-Go path must retain the broad fallback rather than
+	// treating the known shell owner as coverage for the whole diff.
+	in.ChangedPaths = append(in.ChangedPaths, "scripts/unknown.data")
+	plan, err = Plan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileTest := false
+	for _, c := range plan.Commands {
+		if reflect.DeepEqual(c.Argv, []string{"go", "test", "-count=1", "./..."}) {
+			profileTest = true
+		}
+	}
+	if !profileTest {
+		t.Fatalf("uncovered non-Go path must retain broad fallback: %+v", plan.Commands)
+	}
+}
+
+func TestPlan_MergesGoAndNonGoOwners(t *testing.T) {
+	in := baseInput("pkg/graph/graph.go", "bin/ship")
+	in.NonGoOwners = []NonGoOwner{
+		{Path: "bin/ship", Argv: []string{"zsh", "-n", "bin/ship"}, Reason: "syntax"},
+	}
+	plan, err := Plan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goOwner, shellOwner bool
+	for _, c := range plan.Commands {
+		if reflect.DeepEqual(c.Argv, []string{"go", "test", "-count=1", "./pkg/graph"}) {
+			goOwner = true
+		}
+		if reflect.DeepEqual(c.Argv, []string{"zsh", "-n", "bin/ship"}) {
+			shellOwner = true
+		}
+	}
+	if !goOwner || !shellOwner {
+		t.Fatalf("mixed diff must retain both Go and shell owners: %+v", plan.Commands)
+	}
+}
+
 func TestPlan_QuotedArgvPreserved(t *testing.T) {
 	// Paths with spaces must remain single argv elements.
 	in := baseInput("pkg/graph/graph.go")

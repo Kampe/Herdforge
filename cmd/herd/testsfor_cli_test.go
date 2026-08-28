@@ -40,8 +40,9 @@ type testsForOutput struct {
 		Escalated         bool     `json:"escalated"`
 		EscalationReasons []string `json:"escalation_reasons"`
 		Commands          []struct {
-			Stage string   `json:"stage"`
-			Argv  []string `json:"argv"`
+			Stage  string   `json:"stage"`
+			Argv   []string `json:"argv"`
+			Source string   `json:"source"`
 		} `json:"commands"`
 	} `json:"plan"`
 }
@@ -78,6 +79,43 @@ func fixtureRepo(t *testing.T) (dir, base, candidate string) {
 
 	write(filepath.Join("pkg", "with space", "thing.go"),
 		"package thing\n\nfunc helper() int { return 1 }\n\n// Exported is new in the candidate.\nfunc Exported() int { return helper() }\n")
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "-q", "-m", "candidate")
+	candidate = gitIn(t, dir, "rev-parse", "HEAD")
+	return dir, base, candidate
+}
+
+// shellFixtureRepo keeps one unchanged Go source in every fixture. The graph
+// integrity proof is therefore real while the candidate diff exercises only
+// shell ownership (plus optional Go or unrecognised-path controls).
+func shellFixtureRepo(t *testing.T, changeGo, unknownPath bool) (dir, base, candidate string) {
+	t.Helper()
+	dir = t.TempDir()
+	gitIn(t, dir, "init", "-q", "-b", "main")
+	write := func(rel, body string, mode os.FileMode) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module fixture\n\ngo 1.22\n", 0o644)
+	write("pkg/fixture/fixture.go", "package fixture\n\nfunc stable() int { return 1 }\n", 0o644)
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "-q", "-m", "base")
+	base = gitIn(t, dir, "rev-parse", "HEAD")
+
+	if changeGo {
+		write("pkg/fixture/fixture.go", "package fixture\n\nfunc stable() int { return 2 }\n", 0o644)
+	}
+	write("bin/check-unbound-vars", "#!/usr/bin/env zsh\nset -u\n[[ -n \"${1:-}\" ]]\n", 0o755)
+	write("bin/ship", "#!/usr/bin/env zsh\ncase \"${1:-}\" in\n  --selftest) exit 0 ;;\nesac\nexit 0\n", 0o755)
+	write("tests/ship.zsh", "#!/usr/bin/env zsh\nexit 0\n", 0o644)
+	if unknownPath {
+		write("scripts/unknown.data", "unknown\n", 0o644)
+	}
 	gitIn(t, dir, "add", "-A")
 	gitIn(t, dir, "commit", "-q", "-m", "candidate")
 	candidate = gitIn(t, dir, "rev-parse", "HEAD")
@@ -179,6 +217,34 @@ func runTestsForCLI(t *testing.T, repo string, args ...string) (testsForOutput, 
 	return out, stderr, code
 }
 
+func hasPlanCommand(out testsForOutput, want []string) bool {
+	for _, command := range out.Plan.Commands {
+		if len(command.Argv) != len(want) {
+			continue
+		}
+		match := true
+		for i := range want {
+			if command.Argv[i] != want[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func hasGoCommand(out testsForOutput) bool {
+	for _, command := range out.Plan.Commands {
+		if len(command.Argv) > 0 && command.Argv[0] == "go" {
+			return true
+		}
+	}
+	return false
+}
+
 // TestTestsFor_CompleteIndexProducesTargetedPlan proves pkg/graph.Plan has a
 // real compiled production caller: the planner_version can only appear in this
 // output if the herd binary reached graph.Plan.
@@ -249,6 +315,88 @@ func TestTestsFor_CompleteIndexProducesTargetedPlan(t *testing.T) {
 		t.Fatal(err)
 	} else if !strings.Contains(string(data), "status") {
 		t.Fatalf("graph tool was not invoked: %q", data)
+	}
+}
+
+func TestTestsFor_ShellOwnersSuppressGoProfile(t *testing.T) {
+	repo, base, cand := shellFixtureRepo(t, false, false)
+	tool, _ := stubGraphTool(t, 1, false)
+
+	out, stderr, code := runTestsForCLI(t, repo, "--graph-tool", tool, base+".."+cand)
+	if code != 0 {
+		t.Fatalf("exit %d, want 0\nstderr: %s", code, stderr)
+	}
+	if out.Blocked || !out.Integrity.Trusted {
+		t.Fatalf("shell-only fixture must retain trusted graph evidence: %+v", out.Integrity)
+	}
+	for _, command := range out.Plan.Commands {
+		if len(command.Argv) > 0 && command.Argv[0] == "go" {
+			t.Fatalf("fully owned shell diff must not emit Go profile: %+v", out.Plan.Commands)
+		}
+	}
+	for _, want := range [][]string{
+		{"zsh", "-n", "bin/ship"},
+		{"zsh", "bin/check-unbound-vars", "bin/ship"},
+		{"zsh", "tests/ship.zsh"},
+		{"zsh", "bin/ship", "--selftest"},
+	} {
+		if !hasPlanCommand(out, want) {
+			t.Fatalf("missing exact shell owner %q in %+v", want, out.Plan.Commands)
+		}
+	}
+}
+
+func TestTestsFor_MixedGoAndShellOwnersRemainTargeted(t *testing.T) {
+	repo, base, cand := shellFixtureRepo(t, true, false)
+	tool, _ := stubGraphTool(t, 1, false)
+
+	out, stderr, code := runTestsForCLI(t, repo, "--graph-tool", tool, base+".."+cand)
+	if code != 0 {
+		t.Fatalf("exit %d, want 0\nstderr: %s", code, stderr)
+	}
+	for _, want := range [][]string{
+		{"go", "build", "./pkg/fixture"},
+		{"go", "test", "-count=1", "./pkg/fixture"},
+		{"zsh", "tests/ship.zsh"},
+	} {
+		if !hasPlanCommand(out, want) {
+			t.Fatalf("mixed diff missing %q in %+v", want, out.Plan.Commands)
+		}
+	}
+}
+
+func TestTestsFor_UnknownNonGoPathKeepsBroadFallback(t *testing.T) {
+	repo, base, cand := shellFixtureRepo(t, false, true)
+	tool, _ := stubGraphTool(t, 1, false)
+
+	out, stderr, code := runTestsForCLI(t, repo, "--graph-tool", tool, base+".."+cand)
+	if code != 0 {
+		t.Fatalf("exit %d, want 0\nstderr: %s", code, stderr)
+	}
+	for _, want := range [][]string{
+		{"go", "vet", "./..."},
+		{"go", "build", "./..."},
+		{"go", "test", "-count=1", "./..."},
+	} {
+		if !hasPlanCommand(out, want) {
+			t.Fatalf("unknown non-Go path must keep fallback %q in %+v", want, out.Plan.Commands)
+		}
+	}
+}
+
+func TestTestsFor_IncompleteGraphStillBlocksShellOwners(t *testing.T) {
+	repo, base, cand := shellFixtureRepo(t, false, false)
+	tool, _ := stubGraphTool(t, 0, false)
+
+	out, stderr, code := runTestsForCLI(t, repo, "--graph-tool", tool, base+".."+cand)
+	if code == 0 || !out.Blocked || out.Integrity.Trusted {
+		t.Fatalf("incomplete graph must keep blocking shell plan: code=%d %+v", code, out.Integrity)
+	}
+	if !strings.Contains(stderr, "BLOCKED") {
+		t.Fatalf("blocked shell plan must say BLOCKED, stderr=%q", stderr)
+	}
+	if !hasPlanCommand(out, []string{"zsh", "tests/ship.zsh"}) {
+		t.Fatalf("blocked plan must retain shell owners while broadening: %+v", out.Plan.Commands)
 	}
 }
 

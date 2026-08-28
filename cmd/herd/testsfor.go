@@ -99,6 +99,11 @@ func runTestsFor() {
 	// would escape the worktree. Record it and refuse to narrow.
 	changed, rejected := splitEscapingPaths(rawChanged)
 	manifest := graph.BuildManifest(rawTracked, graph.DefaultSourceExts)
+	shellOwners, err := candidateShellOwners(ctx, root, candSHA, changed)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd tests-for: shell owners: %v\n", err)
+		os.Exit(1)
+	}
 
 	diffText, err := gitText(ctx, root, "diff", "-U0", baseSHA, candSHA, "--")
 	if err != nil {
@@ -138,6 +143,7 @@ func runTestsFor() {
 		CandidateSHA:   candSHA,
 		ChangedPaths:   changed,
 		ChangedSymbols: symbols,
+		NonGoOwners:    shellOwners,
 		Graph:          ev,
 		Profile:        graph.DefaultGoProfile(),
 		// The index must be built on the candidate tree: edges about symbols the
@@ -271,6 +277,144 @@ func gitZList(ctx context.Context, dir string, args ...string) ([]string, error)
 		}
 	}
 	return list, nil
+}
+
+type gitTreeEntry struct {
+	Mode string
+	Type string
+}
+
+// gitTreeEntries reads candidate-tree metadata rather than the worktree so
+// owner selection stays bound to the revision pair that tests-for reports.
+func gitTreeEntries(ctx context.Context, root, commit string) (map[string]gitTreeEntry, error) {
+	out, err := gitText(ctx, root, "ls-tree", "-r", "-z", commit, "--")
+	if err != nil {
+		return nil, err
+	}
+	entries := make(map[string]gitTreeEntry)
+	for _, raw := range strings.Split(out, "\x00") {
+		if raw == "" {
+			continue
+		}
+		parts := strings.SplitN(raw, "\t", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("malformed git ls-tree record")
+		}
+		fields := strings.Fields(parts[0])
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("malformed git ls-tree metadata")
+		}
+		paths, rejected := splitEscapingPaths([]string{parts[1]})
+		if len(rejected) != 0 || len(paths) != 1 {
+			continue
+		}
+		entries[paths[0]] = gitTreeEntry{Mode: fields[0], Type: fields[1]}
+	}
+	return entries, nil
+}
+
+// candidateShellOwners provides revision-bound shell owner candidates. It does
+// not merge commands or decide fallback behavior; graph.Plan owns both.
+func candidateShellOwners(ctx context.Context, root, candidate string, changed []string) ([]graph.NonGoOwner, error) {
+	entries, err := gitTreeEntries(ctx, root, candidate)
+	if err != nil {
+		return nil, err
+	}
+
+	contents := make(map[string]string)
+	read := func(repoPath string) (string, error) {
+		if body, ok := contents[repoPath]; ok {
+			return body, nil
+		}
+		body, err := gitText(ctx, root, "show", candidate+":"+repoPath)
+		if err != nil {
+			return "", err
+		}
+		contents[repoPath] = body
+		return body, nil
+	}
+
+	const unboundVarsGate = "bin/check-unbound-vars"
+	gateAvailable := false
+	if entry, ok := entries[unboundVarsGate]; ok {
+		body, err := read(unboundVarsGate)
+		if err != nil {
+			return nil, err
+		}
+		gateAvailable = executableZsh(entry, body)
+	}
+
+	var owners []graph.NonGoOwner
+	for _, repoPath := range changed {
+		if path.Dir(repoPath) == "tests" && strings.HasSuffix(repoPath, ".zsh") {
+			if entry, ok := entries[repoPath]; ok && entry.Type == "blob" {
+				owners = append(owners, graph.NonGoOwner{
+					Path:   repoPath,
+					Argv:   []string{"zsh", repoPath},
+					Reason: "shell test owner for " + repoPath,
+				})
+			}
+		}
+
+		if path.Dir(repoPath) != "bin" {
+			continue
+		}
+		entry, ok := entries[repoPath]
+		if !ok || entry.Type != "blob" {
+			continue
+		}
+		body, err := read(repoPath)
+		if err != nil {
+			return nil, err
+		}
+		if !executableZsh(entry, body) {
+			continue
+		}
+
+		owners = append(owners, graph.NonGoOwner{
+			Path:   repoPath,
+			Argv:   []string{"zsh", "-n", repoPath},
+			Reason: "executable zsh syntax owner for " + repoPath,
+		})
+		if gateAvailable && repoPath != unboundVarsGate {
+			owners = append(owners, graph.NonGoOwner{
+				Path:   repoPath,
+				Argv:   []string{"zsh", unboundVarsGate, repoPath},
+				Reason: "unbound-variable gate for " + repoPath,
+			})
+		}
+
+		sibling := path.Join("tests", path.Base(repoPath)+".zsh")
+		if entry, ok := entries[sibling]; ok && entry.Type == "blob" {
+			owners = append(owners, graph.NonGoOwner{
+				Path:   repoPath,
+				Argv:   []string{"zsh", sibling},
+				Reason: "direct sibling shell test for " + repoPath,
+			})
+		}
+		if declaresSelftest(body) {
+			owners = append(owners, graph.NonGoOwner{
+				Path:   repoPath,
+				Argv:   []string{"zsh", repoPath, "--selftest"},
+				Reason: "declared selftest for " + repoPath,
+			})
+		}
+	}
+	return owners, nil
+}
+
+func executableZsh(entry gitTreeEntry, body string) bool {
+	if entry.Mode != "100755" || entry.Type != "blob" {
+		return false
+	}
+	firstLine, _, _ := strings.Cut(body, "\n")
+	return strings.HasPrefix(firstLine, "#!") && strings.Contains(firstLine, "zsh")
+}
+
+// declaresSelftest recognizes only the explicit capability literal. It never
+// tokenizes or interprets shell source to fabricate a semantic test edge.
+func declaresSelftest(body string) bool {
+	return strings.Contains(body, "--selftest")
 }
 
 // splitEscapingPaths returns repo-relative paths and the raw entries that did
