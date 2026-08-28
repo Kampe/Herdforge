@@ -3,6 +3,7 @@ package reviewledger
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // AdmissionOpts binds the exact-current-candidate context a merge caller
@@ -76,24 +77,69 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			latest[r.SHA+":"+r.Reviewer] = r
 		}
 	}
+	// FAC-630: every `continue` below used to land on one generic refusal, so an
+	// operator holding a valid PASS and a real digest could not tell WHICH of
+	// eight conditions failed. On the live fleet that read as "the digest is
+	// missing" when the digest was present and the launch family was the
+	// problem, and again as the same string when the risk tier was the problem.
+	// Absence of a reason is not a reason: record why each candidate verdict was
+	// skipped and report the most specific one.
+	var skipped []string
+	note := func(reviewer, why string) {
+		skipped = append(skipped, fmt.Sprintf("reviewer=%s: %s", reviewer, why))
+	}
 	for key, verdict := range latest {
 		if (verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED)) && !l.isCoordinator(verdict.Reviewer) {
 			if launchRow, ok := launch[key]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
 				return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", verdict.Verdict, verdict.Reviewer))
 			}
 		}
-		if verdict.Verdict != string(VerdictPASS) || l.isCoordinator(verdict.Reviewer) {
+		if verdict.Verdict != string(VerdictPASS) {
+			note(verdict.Reviewer, "verdict is "+verdict.Verdict+", not PASS")
+			continue
+		}
+		if l.isCoordinator(verdict.Reviewer) {
+			note(verdict.Reviewer, "reviewer is a coordinator; a self-review is not independent")
 			continue
 		}
 		launchRow, ok := launch[key]
-		if !ok || launchRow.BuilderFamily == "" || !FamilyAllowlist[launchRow.BuilderFamily] {
+		if !ok {
+			note(verdict.Reviewer, "no launch record row for this reviewer on this candidate")
+			continue
+		}
+		if launchRow.BuilderFamily == "" {
+			note(verdict.Reviewer, "launch record has no builder family")
+			continue
+		}
+		if !FamilyAllowlist[launchRow.BuilderFamily] {
+			note(verdict.Reviewer, fmt.Sprintf("launch record builder family %q is not an allowlisted vendor family "+
+				"(a candidate whose provenance was recorded as %q cannot establish cross-family independence)",
+				launchRow.BuilderFamily, launchRow.BuilderFamily))
 			continue
 		}
 		families := resolveFamily(launchRow.BuilderFamily, launchRow.ReviewerFamily, verdict.BuilderFamily, verdict.ReviewerFamily)
-		if families.State != familySet || families.Value == launchRow.BuilderFamily || !FamilyAllowlist[families.Value] {
+		if families.State != familySet {
+			note(verdict.Reviewer, "reviewer family could not be resolved from the launch and verdict rows")
 			continue
 		}
-		if verdict.Reviewer == "" || (launchRow.BuilderIdentity != "" && verdict.Reviewer == launchRow.BuilderIdentity) || verdict.VerificationDigest == "" {
+		if families.Value == launchRow.BuilderFamily {
+			note(verdict.Reviewer, fmt.Sprintf("reviewer family %q equals the builder family; not independent", families.Value))
+			continue
+		}
+		if !FamilyAllowlist[families.Value] {
+			note(verdict.Reviewer, fmt.Sprintf("reviewer family %q is not an allowlisted vendor family", families.Value))
+			continue
+		}
+		if verdict.Reviewer == "" {
+			note("(unnamed)", "verdict has no reviewer identity")
+			continue
+		}
+		if launchRow.BuilderIdentity != "" && verdict.Reviewer == launchRow.BuilderIdentity {
+			note(verdict.Reviewer, "reviewer identity equals the builder identity; a self-review is not independent")
+			continue
+		}
+		if verdict.VerificationDigest == "" {
+			note(verdict.Reviewer, "verdict carries no verification digest")
 			continue
 		}
 		tier, err := l.Tier(sha)
@@ -101,11 +147,18 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			return nil, err
 		}
 		if tier == "" {
+			note(verdict.Reviewer, "no risk tier is recorded for this candidate on any launch record row")
 			continue
 		}
 		return &AdmissionResult{Admitted: true, Reason: "validated independent verdict for exact candidate (reduced provenance)", SHA: sha, Reviewer: verdict.Reviewer, ReviewerFamily: families.Value, Tier: tier, VerificationDigest: verdict.VerificationDigest, AuthorFamily: launchRow.BuilderFamily}, nil
 	}
-	return reject(sha, "no independent PASS verdict with durable verification evidence")
+	if len(skipped) > 0 {
+		sort.Strings(skipped)
+		return reject(sha, "no independent PASS verdict with durable verification evidence; "+
+			strings.Join(skipped, "; "))
+	}
+	return reject(sha, "no independent PASS verdict with durable verification evidence: "+
+		"no verdict rows exist for this candidate")
 }
 
 // admissionRejected is the sentinel error Admit returns alongside a non-nil,
