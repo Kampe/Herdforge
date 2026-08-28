@@ -594,6 +594,9 @@ func ArgvFor(provider, model, effort string) []string {
 // reports whether the caller should ALSO pipe the prompt on stdin (surfaces
 // that read stdin rather than a file).
 func HeadlessArgvFor(provider, model, effort, promptPath string) (argv []string, delivery PromptDelivery) {
+	if ForbiddenModel(provider, model) {
+		return nil, DeliverByStdin
+	}
 	pe := PeerEffort(effort)
 	switch provider {
 	case "grok":

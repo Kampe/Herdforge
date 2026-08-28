@@ -36,6 +36,23 @@ func TestRunRaiseRefusesForbiddenModelThroughShippedPath(t *testing.T) {
 	}
 }
 
+func TestRunRaiseReportsLiveReceiptModelDrift(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.ListAgents = func() ([]Agent, error) {
+		return []Agent{{Name: testAgentName("orch"), Status: "working", Workspace: "wTEST", Cwd: filepath.Join(repo, ".worktrees", "orch"), LaunchModel: "grok-4.6", Model: "Grok 4.5 (high)"}}, nil
+	}
+	opts.AdmitRoute = func(*config.LaneDef) (Route, error) { return Route{Provider: "claude", Model: "claude-opus-5"}, nil }
+	opts.CreateTab = func(ws, label, cwd string) (Tab, error) { return Tab{ID: "t", PaneID: "p", Cwd: cwd}, nil }
+	opts.StartAgent = func(Tab, string, Route, *config.LaneDef, string) error { return nil }
+	r, err := Run(cfg, opts)
+	if err == nil || r.Failed == 0 || !strings.Contains(r.Roles[0].Reason, "MODEL DRIFT") {
+		t.Fatalf("raise must report live/receipt drift: result=%+v err=%v", r, err)
+	}
+}
+
 func writePrompt(t *testing.T, dir, rel, body string) string {
 	t.Helper()
 	p := filepath.Join(dir, rel)
