@@ -21,6 +21,17 @@ import (
 	"github.com/Kampe/Herdforge/pkg/winddown"
 )
 
+type inReviewReadFailingProvider struct {
+	*provider.MemoryProvider
+}
+
+func (p inReviewReadFailingProvider) ListTasks(ctx context.Context, project, status string) ([]*provider.Task, error) {
+	if status == provider.StatusInReview {
+		return nil, errors.New("in-review read timed out")
+	}
+	return p.MemoryProvider.ListTasks(ctx, project, status)
+}
+
 func TestPulseReviewPacketRoutesToSupervisor(t *testing.T) {
 	packet := pulseReviewPacket(pulse.AgentObservation{Name: "api-crusader", TabID: "wB:t2WF", Workspace: "wB"}, nil, nil)
 	if !strings.Contains(packet, "PULSE REVIEW HANDOFF") || !strings.Contains(packet, "wB:t2WF") {
@@ -43,6 +54,48 @@ func TestSelectPulseDispatchTaskSortsByPriorityThenRef(t *testing.T) {
 	}
 	if got = selectPulseDispatchTask([]*provider.Task{{Status: provider.StatusInProgress, Ref: "FAC-1"}}); got != nil {
 		t.Fatalf("in-progress-only board selected %+v", got)
+	}
+}
+
+func TestCollectPulseProviderObservationFailsClosedOnInReviewReadError(t *testing.T) {
+	tp := inReviewReadFailingProvider{MemoryProvider: provider.NewMemoryProvider()}
+	if _, err := tp.CreateTask(context.Background(), &provider.Task{
+		ID: "task-641", Ref: "FAC-641", Title: "pulse error fixture", ProjectID: "proj-641", Status: provider.StatusToDo,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	providerObs, doneRefs := collectPulseProviderObservation(context.Background(), tp, "proj-641")
+	if providerObs.Known {
+		t.Fatalf("in-review read error reported known provider observation: %+v", providerObs)
+	}
+	if !strings.Contains(providerObs.Error, "in-review read timed out") {
+		t.Fatalf("in-review error missing from provider observation: %+v", providerObs)
+	}
+	if providerObs.NextTaskRef != "" || providerObs.NextTaskID != "" || doneRefs != nil {
+		t.Fatalf("unknown provider read left dispatch or completion evidence behind: observation=%+v doneRefs=%v", providerObs, doneRefs)
+	}
+
+	snap, err := pulse.Plan(pulse.Observation{
+		Provider: providerObs,
+		Herdr:    pulse.HerdrObservation{Known: true},
+		Review:   pulse.ReviewObservation{Known: true},
+		Quota:    pulse.QuotaObservation{Known: true},
+		WindDown: pulse.WindDownObservation{Known: true},
+	}, pulse.Options{Act: true, Spawn: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.UnknownCritical || !snap.DispatchBlocked || snap.ExitCode == 0 {
+		t.Fatalf("in-review read error must block dispatch with a non-zero pulse: %+v", snap)
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == pulse.ActionDispatch {
+			t.Fatalf("dispatch remained eligible after an in-review read error: %+v", action)
+		}
+	}
+	if strings.Contains(pulse.FormatHuman(snap), "in_review=0") {
+		t.Fatalf("unknown in-review count was reported as zero: %s", pulse.FormatHuman(snap))
 	}
 }
 
