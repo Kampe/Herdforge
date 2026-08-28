@@ -804,8 +804,8 @@ func approveFixture(t *testing.T) (dir, keyDir string, fk *fakeKaneo) {
 	return dir, keyDir, fk
 }
 
-// FAC-145: approve mutates through the receipt-bound provider and raises
-// the coordinator PASS callback with the receipt's binding.
+// FAC-629: approve mutates through the completion-receipt gate and raises the
+// coordinator PASS callback with the landing evidence's binding.
 func TestApproveCLI_BoundMutationAndPassCallback(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
@@ -866,28 +866,56 @@ func fixtureEvidenceSHA(t *testing.T, dir string) string {
 func writeIntentRecord(t *testing.T, dir, keyDir, ref, sha, state string) string {
 	t.Helper()
 	signer := fixtureSigner(t, keyDir, dir)
-	// The journal record carries the EXACT live receipt identity (an
+	// The journal record carries the EXACT landing receipt identity (an
 	// interrupted approveOne would have journaled these very fields).
-	rc, err := dispatch.LoadCanonicalReceipt(dir, ref)
+	rc, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, ref))
 	if err != nil {
 		t.Fatal(err)
 	}
-	dedupeID := fmt.Sprintf("approve:%s:%s:%s:gen%d", rc.Repository, ref, sha, rc.LeaseGeneration)
+	repository := dispatch.RepositoryIdentityOrName(dir, "herdforge-test")
+	dedupeID := fmt.Sprintf("approve:%s:%s:%s:receipt:%s", repository, ref, sha, rc.Digest)
 	if err := appendApproveIntent(dir, signer, approveIntent{
-		Repository:      rc.Repository,
-		ProviderType:    rc.ProviderType,
-		ProjectID:       rc.ProjectID,
-		Ref:             ref,
-		TaskID:          rc.TaskID,
-		SHA:             sha,
-		LeaseID:         rc.LeaseID,
-		LeaseGeneration: rc.LeaseGeneration,
-		DedupeID:        dedupeID,
-		State:           state,
+		Repository:       repository,
+		ProviderType:     "kaneo",
+		ProjectID:        "proj-x",
+		Ref:              ref,
+		TaskID:           rc.TaskID,
+		SHA:              sha,
+		CompletionDigest: rc.Digest,
+		LeaseGeneration:  rc.LeaseGeneration,
+		DedupeID:         dedupeID,
+		State:            state,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	return dedupeID
+}
+
+func TestApproveIntentRejectsDifferentLandingMerge(t *testing.T) {
+	dir, _, _ := approveFixture(t)
+	cfg, err := config.LoadConfig(filepath.Join(dir, ".herd", "herd.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, "FAC-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := approveIntent{
+		Repository:       dispatch.RepositoryIdentityOrName(dir, cfg.Project.Name),
+		ProviderType:     cfg.TaskProvider.Type,
+		ProjectID:        cfg.TaskProvider.ProjectID,
+		Ref:              receipt.TaskRef,
+		TaskID:           receipt.TaskID,
+		SHA:              strings.Repeat("f", 40),
+		CompletionDigest: receipt.Digest,
+		LeaseGeneration:  receipt.LeaseGeneration,
+		DedupeID:         "approve-test-different-merge",
+		State:            "intent",
+	}
+	if err := rec.matchesCompletion(cfg, dir, receipt.TaskID, receipt); err == nil || !strings.Contains(err.Error(), "does not match the landing receipt") {
+		t.Fatalf("journaled merge drift must refuse reconciliation, got %v", err)
+	}
 }
 
 // FAC-145 crash safety: a journaled approval intent with no done record
@@ -903,7 +931,7 @@ func TestApproveCLI_ReconcilesInterruptedTransition(t *testing.T) {
 
 	// Simulate the crashed run's already-delivered callback: the reconcile
 	// replay must dedupe against it, not append a duplicate.
-	rcGen, err := dispatch.LoadCanonicalReceipt(dir, "FAC-1")
+	rcGen, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, "FAC-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1079,15 +1107,17 @@ func TestApproveCLI_TornAnchorHealsAndCompletes(t *testing.T) {
 	}
 }
 
-// FAC-145 recovery proof: after the ephemeral worktree is reaped, the
-// approval still binds through the coordinator's DURABLE canonical receipt
-// and completes exactly once.
-func TestApproveCLI_RecoversAfterWorktreeLoss(t *testing.T) {
+// FAC-629 recovery proof: after both the ephemeral worktree and canonical
+// task context are gone, the landing receipt still closes exactly once.
+func TestApproveCLI_RecoversFromLandingReceiptAfterWorktreeLoss(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
-	// The whole worktree is gone (GC/reap) — only the canonical copy remains.
+	// Neither form of dispatch authorization remains.
 	if err := os.RemoveAll(filepath.Join(dir, ".herd", "worktrees", "fac-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, dispatch.CanonicalTaskContextDir)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1096,7 +1126,7 @@ func TestApproveCLI_RecoversAfterWorktreeLoss(t *testing.T) {
 		t.Fatalf("recovery approve failed: %v\n%s", err, out)
 	}
 	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
-		t.Fatalf("expected approval via canonical receipt, got:\n%s", out)
+		t.Fatalf("expected approval via landing receipt, got:\n%s", out)
 	}
 	if got := atomic.LoadInt32(&fk.patches); got != 1 {
 		t.Fatalf("expected exactly 1 board write, saw %d", got)
@@ -1144,10 +1174,9 @@ func TestApproveCLI_ReadbackDriftFailsApproval(t *testing.T) {
 	}
 }
 
-// FAC-145: a RELEASED newer generation still fences out older receipts —
-// the fence is the durable per-key high-water across all lease states,
-// never just active claims.
-func TestApproveCLI_ReleasedNewerGenerationStillFences(t *testing.T) {
+// FAC-629: a released worker authorization does not invalidate durable
+// completion evidence. Approval acquires its own fenced review mutation.
+func TestApproveCLI_ReleasedWorkerGenerationDoesNotBlockLandingReceipt(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
@@ -1164,14 +1193,14 @@ func TestApproveCLI_ReleasedNewerGenerationStillFences(t *testing.T) {
 	st.Close()
 
 	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
-	if err == nil {
-		t.Fatalf("receipt behind released newer generation must be fenced:\n%s", out)
+	if err != nil {
+		t.Fatalf("released worker authorization blocked landing evidence: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "no ACTIVE lease") {
-		t.Fatalf("expected no-active-lease refusal, got:\n%s", out)
+	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
+		t.Fatalf("expected landing-receipt approval, got:\n%s", out)
 	}
-	if got := atomic.LoadInt32(&fk.patches); got != 0 {
-		t.Fatalf("fenced receipt still performed %d board write(s)", got)
+	if got := atomic.LoadInt32(&fk.patches); got != 1 {
+		t.Fatalf("expected one fenced board write, got %d", got)
 	}
 }
 
@@ -1652,19 +1681,8 @@ func TestApproveCLI_RejectedVerdictVetoesApproval(t *testing.T) {
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
 	candidate := fixtureEvidenceSHA(t, dir)
-	rc, err := dispatch.LoadCanonicalReceipt(dir, "FAC-1")
+	rc, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, "FAC-1"))
 	if err != nil {
-		t.Fatal(err)
-	}
-	// Stamp the candidate onto the canonical receipt so approval consults
-	// the verdict record for this exact commit.
-	rc.CandidateSHA = candidate
-	signer := fixtureSigner(t, keyDir, dir)
-	signed, err := signer.Issue(rc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json"), mustJSON(t, signed), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1673,7 +1691,7 @@ func TestApproveCLI_RejectedVerdictVetoesApproval(t *testing.T) {
 		Ref: "FAC-1", Kind: mail.CallbackBlocked, SHA: candidate, Repo: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
 		LeaseGeneration: rc.LeaseGeneration, SenderRole: "reviewer",
 		Detail:   "REVIEW VERDICT FAC-1: REJECTED",
-		DedupeID: mail.VerdictEffectID(fmt.Sprintf("herdforge-test:FAC-1:%s:gen%d:%s:REJECTED", candidate, rc.LeaseGeneration, rc.LeaseID)),
+		DedupeID: mail.VerdictEffectID(fmt.Sprintf("herdforge-test:FAC-1:%s:gen%d:%s:REJECTED", candidate, rc.LeaseGeneration, rc.Digest)),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1732,9 +1750,9 @@ func TestDispatchCLI_FailedDispatchReleasesLease(t *testing.T) {
 	}
 }
 
-// FAC-145: a corrupt or unreadable fence store REFUSES authority — stale
-// authority never fails open to generation zero.
-func TestApproveCLI_CorruptFenceStoreRefused(t *testing.T) {
+// FAC-629: a corrupt shared lifecycle/fence store refuses completion before
+// any provider mutation; unreadable state never degrades into weaker proof.
+func TestApproveCLI_CorruptStateStoreRefused(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
@@ -1746,8 +1764,8 @@ func TestApproveCLI_CorruptFenceStoreRefused(t *testing.T) {
 	if err == nil {
 		t.Fatalf("corrupt fence store must refuse approval:\n%s", out)
 	}
-	if !strings.Contains(string(out), "fence") {
-		t.Fatalf("expected fence refusal, got:\n%s", out)
+	if !strings.Contains(string(out), "not a database") {
+		t.Fatalf("expected corrupt-state refusal, got:\n%s", out)
 	}
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
 		t.Fatalf("corrupt fence still performed %d board write(s)", got)
@@ -1858,10 +1876,9 @@ func TestApproveCLI_ConcurrentApprovesSerializeAndDedupe(t *testing.T) {
 	}
 }
 
-// Malicious-worker proof at the CLI: a worker that edits its own receipt
-// (widening role to coordinator) breaks the coordinator signature and the
-// approval refuses with zero provider writes.
-func TestApproveCLI_TamperedReceiptRejected(t *testing.T) {
+// FAC-629: a tampered task context cannot become closing authority, nor can it
+// veto independently validated landing evidence.
+func TestApproveCLI_TamperedTaskContextDoesNotReplaceLandingEvidence(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
@@ -1880,43 +1897,135 @@ func TestApproveCLI_TamperedReceiptRejected(t *testing.T) {
 	}
 
 	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
-	if err == nil {
-		t.Fatalf("tampered receipt must refuse approval:\n%s", out)
+	if err != nil {
+		t.Fatalf("task-context tampering blocked landing evidence: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "signature") {
-		t.Fatalf("expected signature rejection, got:\n%s", out)
+	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
+		t.Fatalf("expected landing-receipt approval, got:\n%s", out)
 	}
-	if got := atomic.LoadInt32(&fk.patches); got != 0 {
-		t.Fatalf("tampered receipt still performed %d status write(s)", got)
+	if got := atomic.LoadInt32(&fk.patches); got != 1 {
+		t.Fatalf("expected one receipt-gated status write, got %d", got)
 	}
 }
 
-// FAC-145: a missing receipt on a managed worktree refuses the approval —
-// there is NO config-derived fallback.
-func TestApproveCLI_MissingReceiptRefusedNoFallback(t *testing.T) {
+// FAC-629: a missing dispatch task context is irrelevant to automatic close;
+// the landing receipt is the completion authority.
+func TestApproveCLI_LandingReceiptClosesWithoutTaskContext(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
 
-	// Simulate a receipt that never existed anywhere: neither the worktree
-	// copy nor the durable canonical copy remains.
+	// Remove both forms of the dispatch-time authorization.
 	if err := os.Remove(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")); err != nil {
 		t.Fatal(err)
 	}
-	// Canonical copies are session-keyed; remove the whole store.
-	if err := os.RemoveAll(filepath.Join(dir, ".herd", "receipts")); err != nil {
+	if err := os.RemoveAll(filepath.Join(dir, dispatch.CanonicalTaskContextDir)); err != nil {
 		t.Fatal(err)
 	}
 
 	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
-	if err == nil {
-		t.Fatalf("missing receipt must refuse approval:\n%s", out)
+	if err != nil {
+		t.Fatalf("landing receipt should approve without task context: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "no usable launch receipt") {
-		t.Fatalf("expected fail-closed missing-receipt refusal, got:\n%s", out)
+	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
+		t.Fatalf("expected landing-receipt approval, got:\n%s", out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 1 {
+		t.Fatalf("expected one status write, got %d", got)
+	}
+}
+
+// FAC-629: the shipped approve path consumes the exact reduced schema minted
+// by post-merge PR reconciliation (the FAC-625 production shape), with no
+// task context, lifecycle row, task id, lease, or post-hoc acceptance block.
+func TestApproveCLI_ReducedLandingReceiptClosesWithoutDispatchProvenance(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+
+	path := hsync.ReceiptPath(dir, "FAC-1")
+	r, err := hsync.LoadReceipt(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.TaskID = ""
+	r.ProviderRevision = ""
+	r.LeaseGeneration = 0
+	r.AcceptanceDigest = ""
+	r.AcceptanceEvidence = ""
+	r.ProvenanceMode = hsync.ProvenanceReduced
+	r.PullRequest = 655
+	if err := hsync.WriteReceipt(dir, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, ".herd", "worktrees", "fac-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, dispatch.CanonicalTaskContextDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, ".herd", "lifecycle.db")); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("reduced landing receipt should approve: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
+		t.Fatalf("expected reduced landing-receipt approval, got:\n%s", out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 1 {
+		t.Fatalf("expected one fenced status write, got %d", got)
+	}
+}
+
+// FAC-629: no landing receipt means no automatic close. The refusal must name
+// the artifact class and the exact completion-evidence path searched.
+func TestApproveCLI_MissingLandingReceiptRefusedWithPath(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+	if err := os.Remove(hsync.ReceiptPath(dir, "FAC-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _ := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
+	wantPath := filepath.Join(".herd", "receipts", "FAC-1.json")
+	if !strings.Contains(string(out), "REFUSED  [FAC-1]") ||
+		!strings.Contains(string(out), "landing completion receipt") || !strings.Contains(string(out), wantPath) {
+		t.Fatalf("refusal must name the landing receipt and searched path %s, got:\n%s", wantPath, out)
 	}
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
-		t.Fatalf("missing receipt still performed %d status write(s)", got)
+		t.Fatalf("missing landing evidence still performed %d status write(s)", got)
+	}
+}
+
+// FAC-629 fail-closed proof: changing a landing receipt after sealing it
+// breaks its digest and performs no provider mutation.
+func TestApproveCLI_TamperedLandingReceiptRefused(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+	path := hsync.ReceiptPath(dir, "FAC-1")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := strings.Replace(string(data), `"risk_tier": "R3"`, `"risk_tier": "R0"`, 1)
+	if tampered == string(data) {
+		t.Fatal("fixture drift: risk tier not found")
+	}
+	if err := os.WriteFile(path, []byte(tampered), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _ := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
+	if !strings.Contains(string(out), "REFUSED  [FAC-1]") || !strings.Contains(string(out), "digest does not match") {
+		t.Fatalf("expected landing-receipt digest refusal, got:\n%s", out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 0 {
+		t.Fatalf("tampered landing evidence still performed %d status write(s)", got)
 	}
 }
 
@@ -1925,13 +2034,10 @@ func TestApproveCLI_StallAlarmFires(t *testing.T) {
 	dir, keyDir, _ := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
 
-	// In approveFixture, one task (FAC-1) is left in-review.
-	// If we remove its receipt, it will fail to approve.
-	// When it fails, approved=0 and failed=1, triggering the alarm.
-	if err := os.Remove(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(filepath.Join(dir, ".herd", "receipts")); err != nil {
+	// In approveFixture, one task (FAC-1) is left in-review. Corrupting the
+	// durable lifecycle/fence store creates a real control-plane failure;
+	// evidence refusals alone are counted separately and are not this alarm.
+	if err := os.WriteFile(filepath.Join(dir, ".herd", "herdforge.db"), []byte("not a sqlite database"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2176,9 +2282,9 @@ func TestTaskBrokerCLI_DetachedReviewerReadAndVerdict(t *testing.T) {
 	}
 }
 
-// FAC-145: a receipt fenced behind the durable callback high-water// FAC-145: a receipt fenced behind the durable callback high-water
-// generation refuses the board mutation entirely.
-func TestApproveCLI_StaleLeaseGenerationFencedOut(t *testing.T) {
+// FAC-629: a newer worker claim generation does not stale already-produced
+// completion evidence. Approval uses a separate live review-mutation lease.
+func TestApproveCLI_NewerWorkerGenerationDoesNotStaleLandingReceipt(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
@@ -2187,14 +2293,14 @@ func TestApproveCLI_StaleLeaseGenerationFencedOut(t *testing.T) {
 	bumpClaimGeneration(t, dir, "FAC-1", 5)
 
 	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
-	if err == nil {
-		t.Fatalf("stale-generation approve must fail:\n%s", out)
+	if err != nil {
+		t.Fatalf("newer worker generation blocked landing evidence: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "live lease") {
-		t.Fatalf("expected live-lease refusal, got:\n%s", out)
+	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
+		t.Fatalf("expected landing-receipt approval, got:\n%s", out)
 	}
-	if got := atomic.LoadInt32(&fk.patches); got != 0 {
-		t.Fatalf("fenced-out receipt still performed %d status write(s)", got)
+	if got := atomic.LoadInt32(&fk.patches); got != 1 {
+		t.Fatalf("expected one fenced status write, got %d", got)
 	}
 }
 

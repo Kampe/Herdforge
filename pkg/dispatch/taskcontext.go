@@ -248,13 +248,17 @@ func (tc TaskContext) BoundCallback(kind mail.CallbackKind, sha, detail string) 
 	}, nil
 }
 
-// CanonicalReceiptDir is the coordinator's DURABLE receipt store, relative
-// to the repository root. Worktrees are ephemeral (GC/reap); the canonical
-// copy of every issued receipt lives here so approval, callback, and
-// readback can still bind after the worktree is gone. Coordinator-written,
-// 0600, signature-verified on every load — this is issued authority, not a
-// config-derived fallback.
-const CanonicalReceiptDir = ".herd/receipts"
+// CanonicalTaskContextDir is the coordinator's DURABLE task-context store,
+// relative to the repository root. Worktrees are ephemeral (GC/reap); the
+// canonical copy of every issued authorization lives here so authorization
+// consumers can still bind after the worktree is gone. Coordinator-written,
+// 0600, signature-verified by authority-bearing consumers — this is issued
+// dispatch authority, not completion evidence or a config-derived fallback.
+//
+// Completion receipts deliberately remain in .herd/receipts/<REF>.json. The
+// schemas must not share a directory: a task context proves authorization to
+// work, while a completion receipt proves that reviewed work landed.
+const CanonicalTaskContextDir = ".herd/task-context-receipts"
 
 // safeRefComponent rejects any task ref that cannot be used as a single
 // path component: untrusted provider refs must never traverse out of the
@@ -284,7 +288,7 @@ func StoreCanonicalReceipt(root string, tc TaskContext) error {
 	if err := safeRefComponent(tc.TaskRef); err != nil {
 		return err
 	}
-	dir := filepath.Join(root, CanonicalReceiptDir)
+	dir := filepath.Join(root, CanonicalTaskContextDir)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create canonical receipt dir: %w", err)
 	}
@@ -416,7 +420,7 @@ func LoadCanonicalReceiptSession(root, providerType, projectID, ref, sessionID s
 	if err := safeRefComponent(ref); err != nil {
 		return tc, err
 	}
-	return readCanonicalFile(filepath.Join(root, CanonicalReceiptDir,
+	return readCanonicalFile(filepath.Join(root, CanonicalTaskContextDir,
 		canonicalReceiptName(providerType, projectID, ref, sessionID)), ref)
 }
 
@@ -427,7 +431,7 @@ func LoadCanonicalReceipt(root, ref string) (TaskContext, error) {
 	if err := safeRefComponent(ref); err != nil {
 		return tc, err
 	}
-	dir := filepath.Join(root, CanonicalReceiptDir)
+	dir := filepath.Join(root, CanonicalTaskContextDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return tc, fmt.Errorf("no canonical receipt for %s (FAC-145): %w", ref, err)

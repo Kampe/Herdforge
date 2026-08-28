@@ -213,6 +213,42 @@ func TestCanonicalReceipt_TraversalAndReviewerCandidate(t *testing.T) {
 	}
 }
 
+// FAC-629: dispatch authorization and landing evidence have different
+// schemas and must never share a loader or directory. A landing receipt at
+// the completion path is invisible to the task-context loader by design.
+func TestCanonicalTaskContextNamespaceDoesNotLoadLandingReceipt(t *testing.T) {
+	root := t.TempDir()
+	landingDir := filepath.Join(root, ".herd", "receipts")
+	if err := os.MkdirAll(landingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	landingPath := filepath.Join(landingDir, "FAC-145.json")
+	if err := os.WriteFile(landingPath, []byte(`{"task_ref":"FAC-145","candidate_sha":"abc","merge_sha":"def","verdict":"PASS"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadCanonicalReceipt(root, "FAC-145")
+	if err == nil {
+		t.Fatal("landing receipt must not load as dispatch task context")
+	}
+	if !strings.Contains(err.Error(), CanonicalTaskContextDir) {
+		t.Fatalf("task-context loader must name its own namespace, got %v", err)
+	}
+
+	signer, _ := testSignerVerifier(t)
+	signed, err := signer.Issue(validTaskContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StoreCanonicalReceipt(root, signed); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, CanonicalTaskContextDir))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("task context was not stored in %s: entries=%d err=%v", CanonicalTaskContextDir, len(entries), err)
+	}
+}
+
 // FAC-145: the canonical store is MONOTONIC — a delayed older-generation
 // writer can never roll authority back — and every commit is read back and
 // must round-trip exactly.

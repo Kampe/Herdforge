@@ -321,6 +321,51 @@ func TestBoardDoneRefusesWithoutLifecycleAuthority(t *testing.T) {
 	}
 }
 
+// FAC-629: post-merge reconciliation may produce a reduced receipt when the
+// dispatch-time task context and lifecycle fields never existed. The receipt
+// must remain usable completion evidence without fabricating those fields.
+func TestReducedCompletionReceiptClosesWithoutDispatchProvenance(t *testing.T) {
+	dir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
+	ref := "FAC-629"
+	r := validReceipt(t, dir, ref, mergeSHA, baseSHA)
+	r.TaskID = ""
+	r.ProviderRevision = ""
+	r.LeaseGeneration = 0
+	r.AcceptanceDigest = ""
+	r.AcceptanceEvidence = ""
+	r.ProvenanceMode = ProvenanceReduced
+	r.PullRequest = 655
+	r.Seal()
+
+	if err := r.Validate(dir, ref, nil); err != nil {
+		t.Fatalf("reduced landing receipt must validate without dispatch provenance: %v", err)
+	}
+
+	mp := provider.NewMemoryProvider()
+	mp.AddTask(&provider.Task{
+		ID: "live-board-task", Ref: ref, Title: "reduced landing evidence",
+		Status: "in-review", ProjectID: "p1",
+		Description: "## Acceptance criteria\n\n- [x] independently reviewed work landed",
+	})
+	cp := &countingProvider{MemoryProvider: mp}
+	res, err := BoardDone(context.Background(), cp, DoneRequest{
+		RepoDir: dir, ProjectID: "p1", Ref: ref, Receipt: r,
+	})
+	if err != nil {
+		t.Fatalf("reduced landing receipt did not close: %v", err)
+	}
+	if res.TaskID != "live-board-task" || cp.updates != 1 || statusOf(t, cp, "live-board-task") != "done" {
+		t.Fatalf("reduced receipt did not close the resolved board task: result=%+v updates=%d", res, cp.updates)
+	}
+
+	bad := *r
+	bad.PullRequest = 0
+	bad.Seal()
+	if err := bad.Validate(dir, ref, nil); err == nil || !strings.Contains(err.Error(), "positive pull request") {
+		t.Fatalf("reduced receipt without PR proof must refuse, got %v", err)
+	}
+}
+
 func TestBoardDoneRefusesReceiptBoundToAnotherTaskID(t *testing.T) {
 	dir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
 	// Same ref, different provider task id: a re-minted card is a new task.

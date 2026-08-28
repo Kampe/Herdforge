@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -219,7 +220,8 @@ type DoneRequest struct {
 	ProjectID string
 	Ref       string
 	// Receipt is the automatic authority: a sealed, task-bound completion
-	// receipt. Requires Lifecycle.
+	// receipt. Full-provenance receipts require Lifecycle; reduced receipts
+	// carry their post-merge PR reconciliation proof instead.
 	Receipt *CompletionReceipt
 	// Lifecycle is the durable state authority consulted for receipt-driven
 	// transitions. Nil refuses.
@@ -235,6 +237,44 @@ type DoneRequest struct {
 	// the card's herd-acceptance-v1 block. It is required for every closure,
 	// including policy-limited manual overrides.
 	AcceptanceEvidence string
+}
+
+// validateAutomaticReceipt applies the lifecycle requirement only to the
+// full-provenance schema that actually carries dispatch lifecycle fields.
+// Reduced post-merge receipts intentionally omit those fields and are
+// validated entirely by CompletionReceipt.Validate.
+func validateAutomaticReceipt(req DoneRequest, repoDir, ref string) error {
+	if req.Receipt == nil {
+		return MissingCompletionReceiptError(repoDir, ref)
+	}
+	var st *lifecycle.TaskState
+	if req.Receipt.ProvenanceMode != ProvenanceReduced {
+		if req.Lifecycle == nil {
+			return fmt.Errorf("%w for %s: no lifecycle state authority configured; "+
+				"a full-provenance receipt cannot prove the task is past integration without it", ErrNoEvidence, ref)
+		}
+		var err error
+		st, err = req.Lifecycle.CurrentState(ref)
+		if err != nil {
+			return fmt.Errorf("lifecycle state for %s: %w", ref, err)
+		}
+	}
+	if err := req.Receipt.Validate(repoDir, ref, st); err != nil {
+		return fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+	}
+	return nil
+}
+
+// authorizeDoneClosureEvidence preserves the pre-declared acceptance contract
+// for full receipts and overrides. A reduced receipt has no such fields by
+// design; its producer already proved exact review verification and PR landing
+// before sealing it, so demanding a post-hoc dispatch-era block would recreate
+// the category error reduced provenance exists to avoid.
+func authorizeDoneClosureEvidence(description, evidence string, receipt *CompletionReceipt, override *OverrideRecord, legacyReview LegacyReviewAuthority, ref string) (string, *LegacyReviewEvidence, error) {
+	if receipt != nil && receipt.ProvenanceMode == ProvenanceReduced {
+		return "reduced_completion_receipt", nil, nil
+	}
+	return authorizeClosureEvidence(description, evidence, override, legacyReview, ref)
 }
 
 // BoardDone moves the ticket with the given ref to done, gated on a task-bound
@@ -262,16 +302,8 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 			"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
 
 	case req.Receipt != nil:
-		if req.Lifecycle == nil {
-			return nil, fmt.Errorf("%w for %s: no lifecycle state authority configured; "+
-				"a receipt alone cannot prove the task is past integration", ErrNoEvidence, ref)
-		}
-		st, err := req.Lifecycle.CurrentState(ref)
-		if err != nil {
-			return nil, fmt.Errorf("lifecycle state for %s: %w", ref, err)
-		}
-		if err := req.Receipt.Validate(repoDir, ref, st); err != nil {
-			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		if err := validateAutomaticReceipt(req, repoDir, ref); err != nil {
+			return nil, err
 		}
 		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
 			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
@@ -288,10 +320,7 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 			rec.Actor, rec.Policy, rec.Decision, rec.Reason, rec.Evidence)
 
 	default:
-		return nil, fmt.Errorf("%w for %s: no completion receipt at %s. A commit naming the ref is a "+
-			"discovery hint, not proof. Supply the receipt the integration produced, or close it manually with "+
-			"--override-policy/--override-actor/--override-reason/--override-evidence",
-			ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
+		return nil, MissingCompletionReceiptError(repoDir, ref)
 	}
 	evidence := req.AcceptanceEvidence
 	if strings.TrimSpace(evidence) == "" && req.Receipt != nil {
@@ -303,7 +332,7 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	// review artifact with a verified merge disposition. Requiring a post-hoc
 	// fence instead would make the closer author the contract after seeing the
 	// result, which is weaker evidence dressed as stricter process.
-	route, legacyEvidence, err := authorizeClosureEvidence(task.Description, evidence, override, req.LegacyReview, ref)
+	route, legacyEvidence, err := authorizeDoneClosureEvidence(task.Description, evidence, req.Receipt, override, req.LegacyReview, ref)
 	if err != nil {
 		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
 	}
@@ -347,7 +376,7 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	// Task binding: the receipt names the provider task it was minted for. A
 	// ref match alone is not enough — refs are re-minted across board
 	// rollbacks, and a re-minted card is a different task.
-	if req.Receipt != nil && req.Receipt.TaskID != task.ID {
+	if req.Receipt != nil && req.Receipt.ProvenanceMode != ProvenanceReduced && req.Receipt.TaskID != task.ID {
 		return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but the board card is %s",
 			ErrNoEvidence, ref, req.Receipt.TaskID, task.ID)
 	}
@@ -523,16 +552,8 @@ func BoardDoneFenced(
 			"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
 
 	case req.Receipt != nil:
-		if req.Lifecycle == nil {
-			return nil, fmt.Errorf("%w for %s: no lifecycle state authority configured; "+
-				"a receipt alone cannot prove the task is past integration", ErrNoEvidence, ref)
-		}
-		st, err := req.Lifecycle.CurrentState(ref)
-		if err != nil {
-			return nil, fmt.Errorf("lifecycle state for %s: %w", ref, err)
-		}
-		if err := req.Receipt.Validate(repoDir, ref, st); err != nil {
-			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		if err := validateAutomaticReceipt(req, repoDir, ref); err != nil {
+			return nil, err
 		}
 		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
 			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
@@ -549,17 +570,14 @@ func BoardDoneFenced(
 			rec.Actor, rec.Policy, rec.Decision, rec.Reason, rec.Evidence)
 
 	default:
-		return nil, fmt.Errorf("%w for %s: no completion receipt at %s. A commit naming the ref is a "+
-			"discovery hint, not proof. Supply the receipt the integration produced, or close it manually with "+
-			"--override-policy/--override-actor/--override-reason/--override-evidence",
-			ErrNoEvidence, ref, ReceiptPath(repoDir, ref))
+		return nil, MissingCompletionReceiptError(repoDir, ref)
 	}
 
 	// Same two-route authorization as the unfenced path: a pre-existing
 	// acceptance block plus literal output, or -- for a legacy-policy override
 	// on a card that never had a block -- an admitted cross-family review
 	// artifact with a verified merge disposition.
-	route, legacyEvidence, err := authorizeClosureEvidence(task.Description, evidence, override, req.LegacyReview, ref)
+	route, legacyEvidence, err := authorizeDoneClosureEvidence(task.Description, evidence, req.Receipt, override, req.LegacyReview, ref)
 	if err != nil {
 		return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
 	}
@@ -594,7 +612,7 @@ func BoardDoneFenced(
 		}
 	}
 
-	if req.Receipt != nil && req.Receipt.TaskID != task.ID {
+	if req.Receipt != nil && req.Receipt.ProvenanceMode != ProvenanceReduced && req.Receipt.TaskID != task.ID {
 		return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but the board card is %s",
 			ErrNoEvidence, ref, req.Receipt.TaskID, task.ID)
 	}

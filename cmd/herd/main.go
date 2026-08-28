@@ -3280,6 +3280,23 @@ func boundBoardProvider(cfg *config.Config, tp provider.TaskProvider, root, ref 
 	return btp, coord, nil
 }
 
+// historicalLaunchMetadata returns authenticated launch identity only for
+// best-effort post-merge notification. It deliberately does not check expiry
+// or live lease state: those fields govern whether an agent may act now, not
+// whether already-landed work may close. Callers must never use this helper as
+// mutation authority.
+func historicalLaunchMetadata(root, ref string) (dispatch.TaskContext, bool) {
+	tc, err := dispatch.LoadCanonicalReceipt(root, hsync.NormalizeRef(ref))
+	if err != nil || !strings.EqualFold(hsync.NormalizeRef(tc.TaskRef), hsync.NormalizeRef(ref)) {
+		return dispatch.TaskContext{}, false
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil || verifier.Verify(tc) != nil {
+		return dispatch.TaskContext{}, false
+	}
+	return tc, true
+}
+
 // reviewLeaseTaskRef isolates post-build review/approve authority from the
 // worker's claim lease. A completed worker is expected to release its claim;
 // reviewers must not revive that worker lease or race a new worker generation.
@@ -3401,24 +3418,29 @@ func acquireCoordinationLease(ctx context.Context, root string, key claim.LeaseK
 	return fmt.Sprintf("claim:%d", lease.ID), lease.Generation, nil
 }
 
-// approveIntent persists the FULL bound identity of one approval operation
-// (FAC-145): repository, provider, project, task, lease — not just ref/sha
-// — and is keyed by its exact DedupeID, so operations from different
-// projects or lease generations can never collapse onto each other.
+// approveIntent persists the FULL completion identity of one approval
+// operation: repository, provider, project, task, landing-receipt digest,
+// merge SHA, and lease generation — not just ref/sha. It is keyed by its
+// exact DedupeID, so operations from different projects, receipts, or lease
+// generations can never collapse onto each other.
 // States: "intent" (internal pending, nothing external published), "done"
 // (fenced board mutation + read-back succeeded), "published" (external
 // completion callback delivered). The externally consumable completion is
 // only ever published from state done.
 type approveIntent struct {
-	Seq             int64  `json:"seq"`
-	PrevHash        string `json:"prev_hash"`
-	Repository      string `json:"repository"`
-	ProviderType    string `json:"provider_type"`
-	ProjectID       string `json:"project_id"`
-	Ref             string `json:"ref"`
-	TaskID          string `json:"task_id"`
-	SHA             string `json:"sha"`
-	LeaseID         string `json:"lease_id"`
+	Seq              int64  `json:"seq"`
+	PrevHash         string `json:"prev_hash"`
+	Repository       string `json:"repository"`
+	ProviderType     string `json:"provider_type"`
+	ProjectID        string `json:"project_id"`
+	Ref              string `json:"ref"`
+	TaskID           string `json:"task_id"`
+	SHA              string `json:"sha"`
+	CompletionDigest string `json:"completion_digest,omitempty"`
+	// LeaseID is retained only so already-journaled pre-FAC-629 operations can
+	// still be authenticated and reconciled. New approvals bind to
+	// CompletionDigest and never invent a dispatch lease identity.
+	LeaseID         string `json:"lease_id,omitempty"`
 	LeaseGeneration int64  `json:"lease_generation"`
 	DedupeID        string `json:"dedupe_id"`
 	State           string `json:"state"` // "intent" | "done" | "published"
@@ -3426,17 +3448,24 @@ type approveIntent struct {
 	Signature       string `json:"signature"`
 }
 
-// matchesContext rejects resuming an operation whose live receipt identity
-// has drifted from the journaled one (e.g. a lease generation switch
-// during recovery) — reconcile completes the EXACT recorded operation or
-// fails.
-func (r approveIntent) matchesContext(tc dispatch.TaskContext) error {
-	if !strings.EqualFold(r.Repository, tc.Repository) || r.ProviderType != tc.ProviderType ||
-		r.ProjectID != tc.ProjectID || r.TaskID != tc.TaskID ||
-		r.LeaseID != tc.LeaseID || r.LeaseGeneration != tc.LeaseGeneration {
-		return fmt.Errorf("journaled approval %s identity (repo=%s project=%s task=%s lease=%s gen=%d) does not match the live receipt (repo=%s project=%s task=%s lease=%s gen=%d) — refusing to resume a drifted operation (FAC-145)",
-			r.DedupeID, r.Repository, r.ProjectID, r.TaskID, r.LeaseID, r.LeaseGeneration,
-			tc.Repository, tc.ProjectID, tc.TaskID, tc.LeaseID, tc.LeaseGeneration)
+// matchesCompletion rejects resuming an operation whose landing receipt or
+// configured board identity drifted from the journaled operation. Reconcile
+// completes the exact completion-evidence-bound effect or fails.
+func (r approveIntent) matchesCompletion(cfg *config.Config, root, taskID string, receipt *hsync.CompletionReceipt) error {
+	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
+	if receipt == nil || !strings.EqualFold(r.Repository, repository) ||
+		r.ProviderType != cfg.TaskProvider.Type || r.ProjectID != cfg.TaskProvider.ProjectID ||
+		r.TaskID != taskID || r.SHA != receipt.MergeSHA || r.LeaseGeneration != receipt.LeaseGeneration ||
+		(r.CompletionDigest != "" && r.CompletionDigest != receipt.Digest) {
+		liveDigest := ""
+		liveGeneration := int64(0)
+		if receipt != nil {
+			liveDigest = receipt.Digest
+			liveGeneration = receipt.LeaseGeneration
+		}
+		return fmt.Errorf("journaled approval %s identity (repo=%s project=%s task=%s completion=%s gen=%d) does not match the landing receipt (repo=%s project=%s task=%s completion=%s gen=%d) — refusing to resume a drifted operation",
+			r.DedupeID, r.Repository, r.ProjectID, r.TaskID, shortSHA12(r.CompletionDigest), r.LeaseGeneration,
+			repository, cfg.TaskProvider.ProjectID, taskID, shortSHA12(liveDigest), liveGeneration)
 	}
 	return nil
 }
@@ -3614,7 +3643,7 @@ func loadApprovalChain(root string) (recs []approveIntent, lastSeq int64, lastHa
 		}
 		if rec.Ref == "" || rec.SHA == "" || rec.DedupeID == "" || rec.Repository == "" ||
 			rec.ProviderType == "" || rec.ProjectID == "" || rec.TaskID == "" ||
-			rec.LeaseID == "" || rec.LeaseGeneration < 1 ||
+			rec.LeaseGeneration < 0 || (rec.CompletionDigest == "" && (rec.LeaseID == "" || rec.LeaseGeneration < 1)) ||
 			(rec.State != "intent" && rec.State != "done" && rec.State != "published") {
 			return nil, 0, "", false, fmt.Errorf("approval journal line %d is incomplete — refusing reconciliation (FAC-145 fail-closed)", i+1)
 		}
@@ -3826,18 +3855,36 @@ func pendingApproveIntents(root string, signer *dispatch.Signer) ([]approveInten
 // switch refuses), the evidence SHA is the recorded one, and no fresh
 // intent is appended.
 func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvider, stack *provider.ClaimStack, root, ref, receiptPath, acceptanceEvidence string, override *hsync.OverrideRequest, resume *approveIntent) (*hsync.DoneResult, error) {
-	// FAC-563: an attributable override must not require the launch receipt it
-	// exists to replace. boundBoardProvider below demands one, so an override
-	// previously failed with "no usable launch receipt" before authorization was
-	// ever reached -- unusable for the pre-receipt and legacy cards it is for.
-	// Resume is receipt-bound crash recovery and is never an override.
+	// FAC-563: an attributable override follows its own explicit authority
+	// route. Resume is receipt-bound crash recovery and is never an override.
 	if override != nil && resume == nil {
 		return approveByOverrideWithAcceptance(ctx, cfg, tp, stack, root, ref, acceptanceEvidence, override)
 	}
-	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
+
+	// FAC-629: approval closes completed work, so its automatic authority is
+	// the landing completion receipt. A dispatch task context is intentionally
+	// short-lived authorization to work and must not gate this transition.
+	req, closeAuthority, err := buildDoneRequest(root, cfg.TaskProvider.ProjectID, ref, receiptPath, acceptanceEvidence, nil)
+	if err != nil {
+		closeAuthority()
+		return nil, err
+	}
+	defer closeAuthority()
+	if req.Receipt == nil {
+		return nil, hsync.MissingCompletionReceiptError(root, ref)
+	}
+	receipt := req.Receipt
+	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
+	approvalTask, err := resolveTaskByRef(ctx, tp, cfg.TaskProvider.ProjectID, ref)
 	if err != nil {
 		return nil, err
 	}
+	proofSHA := receipt.MergeSHA
+	if proofSHA == "" {
+		return nil, fmt.Errorf("%w for %s: landing completion receipt carries no merge commit", hsync.ErrNoEvidence, ref)
+	}
+	proof := fmt.Sprintf("completion receipt %s (merge %s)", receipt.Digest, proofSHA)
+
 	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
 	if err != nil {
 		return nil, fmt.Errorf("coordinator signer unavailable (FAC-145): %w", err)
@@ -3845,12 +3892,13 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	mb := mail.NewMailbox(mail.CallbackMailPath(root))
 
 	publish := func(rec approveIntent, proof string) error {
-		cb, cbErr := coord.BoundCallback(mail.CallbackComplete, rec.SHA, "approved: "+proof)
-		if cbErr != nil {
-			return fmt.Errorf("approval callback binding refused (FAC-145): %w", cbErr)
+		cb := mail.Callback{
+			Ref: rec.Ref, Kind: mail.CallbackComplete, SHA: rec.SHA,
+			Detail: "approved: " + proof, Repo: rec.Repository,
+			LeaseGeneration: rec.LeaseGeneration, SenderRole: dispatch.RoleCoordinator,
+			DedupeID: rec.DedupeID,
 		}
-		cb.DedupeID = rec.DedupeID
-		if _, pErr := mb.PostCallback(coord.Role, cb); pErr != nil {
+		if _, pErr := mb.PostCallback(dispatch.RoleCoordinator, cb); pErr != nil {
 			return fmt.Errorf("approval callback publication failed (board IS done; next approve republishes): %w", pErr)
 		}
 		rec.State = "published"
@@ -3862,7 +3910,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 
 	var rec approveIntent
 	if resume != nil {
-		if err := resume.matchesContext(coord); err != nil {
+		if err := resume.matchesCompletion(cfg, root, approvalTask.ID, receipt); err != nil {
 			return nil, err
 		}
 		rec = *resume
@@ -3880,61 +3928,30 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	// governs the merge decision — a later REJECTED vetoes an earlier
 	// APPROVED and the approval refuses until a fresh admissible APPROVED
 	// lands. Cards with no recorded verdict keep the receipt-gated path.
-	if coord.CandidateSHA != "" {
+	if receipt.CandidateSHA != "" {
 		mbv := mail.NewMailbox(mail.CallbackMailPath(root))
-		eff, found, vErr := mbv.EffectiveVerdict(coord.Repository, coord.TaskRef, coord.CandidateSHA)
+		eff, found, vErr := mbv.EffectiveVerdict(repository, hsync.NormalizeRef(ref), receipt.CandidateSHA)
 		if vErr != nil {
 			return nil, fmt.Errorf("verdict state unreadable — refusing approval (FAC-145): %w", vErr)
 		}
 		if found && eff.Kind != mail.CallbackComplete {
 			return nil, fmt.Errorf("effective verdict for %s@%s is %s — refusing approval until a fresh admissible APPROVED supersedes it (FAC-145): %s",
-				coord.TaskRef, coord.CandidateSHA, eff.Kind, eff.Detail)
+				hsync.NormalizeRef(ref), receipt.CandidateSHA, eff.Kind, eff.Detail)
 		}
-	}
-
-	// FAC-132 owns the closing authority: a task-bound completion receipt or
-	// an explicit policy-limited override. Build it FIRST so the callback can
-	// bind to the same proof commit the board move will use.
-	req, closeAuthority, err := buildDoneRequest(".", cfg.TaskProvider.ProjectID, ref, receiptPath, acceptanceEvidence, override)
-	if err != nil {
-		closeAuthority()
-		return nil, err
-	}
-	defer closeAuthority()
-
-	var proof, proofSHA string
-	switch {
-	case req.Receipt != nil:
-		proofSHA = req.Receipt.MergeSHA
-		proof = fmt.Sprintf("completion receipt %s (merge %s)", req.Receipt.Digest, proofSHA)
-	case req.Override != nil:
-		// A manual override has no merge SHA of its own; bind the callback to
-		// the integration state the operator is attesting to.
-		out, gErr := exec.Command("git", "rev-parse", "origin/main").Output()
-		if gErr != nil {
-			return nil, fmt.Errorf("override approve: cannot resolve integration SHA: %w", gErr)
-		}
-		proofSHA = strings.TrimSpace(string(out))
-		proof = "manual override, no completion receipt"
-	default:
-		return nil, fmt.Errorf("%w for %s: no completion receipt and no override", hsync.ErrNoEvidence, ref)
-	}
-	if proofSHA == "" {
-		return nil, fmt.Errorf("%w for %s: closing authority carries no merge commit", hsync.ErrNoEvidence, ref)
 	}
 
 	if resume == nil {
 		rec = approveIntent{
-			Repository:      coord.Repository,
-			ProviderType:    coord.ProviderType,
-			ProjectID:       coord.ProjectID,
-			Ref:             hsync.NormalizeRef(ref),
-			TaskID:          coord.TaskID,
-			SHA:             proofSHA,
-			LeaseID:         coord.LeaseID,
-			LeaseGeneration: coord.LeaseGeneration,
-			DedupeID:        fmt.Sprintf("approve:%s:%s:%s:gen%d", coord.Repository, hsync.NormalizeRef(ref), proofSHA, coord.LeaseGeneration),
-			State:           "intent",
+			Repository:       repository,
+			ProviderType:     cfg.TaskProvider.Type,
+			ProjectID:        cfg.TaskProvider.ProjectID,
+			Ref:              hsync.NormalizeRef(ref),
+			TaskID:           approvalTask.ID,
+			SHA:              proofSHA,
+			CompletionDigest: receipt.Digest,
+			LeaseGeneration:  receipt.LeaseGeneration,
+			DedupeID:         fmt.Sprintf("approve:%s:%s:%s:receipt:%s", repository, hsync.NormalizeRef(ref), proofSHA, receipt.Digest),
+			State:            "intent",
 		}
 		if err := appendApproveIntent(root, signer, rec); err != nil {
 			return nil, fmt.Errorf("approval intent journal write failed — refusing transition (FAC-145): %w", err)
@@ -3949,7 +3966,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if oerr != nil {
 			return nil, fmt.Errorf("approve: process owner identity: %w", oerr)
 		}
-		key := provider.LeaseKey(coord.Repository, coord.ProviderType, coord.ProjectID, reviewLeaseTaskRef(coord.LeaseTaskRef))
+		key := provider.LeaseKey(repository, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, reviewLeaseTaskRef(ref))
 		taskRole, rerr := provider.TaskOwnershipRole(nil, "worker")
 		if rerr != nil {
 			return nil, rerr
@@ -3961,38 +3978,38 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		defer func() {
 			_ = stack.Manager.Release(context.Background(), key, owner, lease.Generation)
 		}()
-		if ferr := stack.CAS.AdvanceFence(ctx, coord.TaskID, lease.Generation); ferr != nil {
+		if ferr := stack.CAS.AdvanceFence(ctx, approvalTask.ID, lease.Generation); ferr != nil {
 			return nil, ferr
 		}
-		res, err = hsync.BoardDoneFenced(ctx, btp, stack, key, owner, lease.Generation, req)
+		res, err = hsync.BoardDoneFenced(ctx, tp, stack, key, owner, lease.Generation, req)
 	} else {
-		res, err = hsync.BoardDone(ctx, btp, req)
+		res, err = hsync.BoardDone(ctx, tp, req)
 	}
 	if err != nil {
 		// Internal failure signal only — no completion was ever published.
-		ccb, cErr := coord.BoundCallback(mail.CallbackBlocked, "", fmt.Sprintf("board-done failed for %s: %v", rec.SHA, err))
-		if cErr != nil {
-			return nil, fmt.Errorf("%w; COMPENSATION BINDING ALSO FAILED (%v) — reconcile via herd board-sync", err, cErr)
+		ccb := mail.Callback{
+			Ref: rec.Ref, Kind: mail.CallbackBlocked,
+			Detail: fmt.Sprintf("board-done failed for %s: %v", rec.SHA, err),
+			Repo:   rec.Repository, LeaseGeneration: rec.LeaseGeneration,
+			SenderRole: dispatch.RoleCoordinator, DedupeID: rec.DedupeID + ":blocked",
 		}
-		ccb.DedupeID = rec.DedupeID + ":blocked"
-		if _, pErr := mb.PostCallback(coord.Role, ccb); pErr != nil {
+		if _, pErr := mb.PostCallback(dispatch.RoleCoordinator, ccb); pErr != nil {
 			return nil, fmt.Errorf("%w; COMPENSATING CALLBACK ALSO FAILED (%v) — reconcile via herd board-sync", err, pErr)
 		}
 		return nil, err
 	}
-	// FAC-353: the builder's authenticated launch receipt is the only source
-	// of the lane identity. Automatic completion receipts provide the exact
-	// reviewed candidate and base; an override has no reviewed builder
-	// candidate and therefore does not receive a fabricated notification.
-	if req.Receipt != nil && strings.TrimSpace(coord.AgentSessionID) != "" {
+	// FAC-353: a still-available authenticated task context may provide
+	// historical delivery metadata, but it is never closing authority and its
+	// absence, expiry, or released lease cannot block completion.
+	if launch, ok := historicalLaunchMetadata(root, ref); ok && strings.TrimSpace(launch.AgentSessionID) != "" {
 		if _, nErr := mb.PostMergeNotification("coordinator", mail.MergeNotification{
-			TaskRef:      coord.TaskRef,
-			CandidateSHA: req.Receipt.CandidateSHA,
+			TaskRef:      hsync.NormalizeRef(ref),
+			CandidateSHA: receipt.CandidateSHA,
 			LandedCommit: rec.SHA,
-			BaseSHA:      req.Receipt.BaseSHA,
-			Branch:       coord.Branch,
-			Repository:   coord.Repository,
-			BuilderID:    coord.AgentSessionID,
+			BaseSHA:      receipt.BaseSHA,
+			Branch:       launch.Branch,
+			Repository:   repository,
+			BuilderID:    launch.AgentSessionID,
 		}); nErr != nil {
 			return nil, fmt.Errorf("merge notification delivery failed (board IS done; next approve retries): %w", nErr)
 		}
