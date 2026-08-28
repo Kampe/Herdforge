@@ -132,8 +132,16 @@ func TestRefusalNamesANonIndependentReviewerFamily(t *testing.T) {
 	if res == nil {
 		t.Fatal("no result")
 	}
-	if !strings.Contains(res.Reason, "independent") && !strings.Contains(res.Reason, "equals the builder family") {
-		t.Fatalf("refusal does not explain that the reviewer was not independent.\nGot: %s", res.Reason)
+	// The fragment must be one the OLD generic refusal cannot produce. That
+	// refusal was "no independent PASS verdict with durable verification
+	// evidence" — it already contains "independent", so accepting that substring
+	// made this test pass against the pre-FAC-630 code it was written to pin.
+	// A W4 reviewer proved it by restoring the pre-FAC-630 blob: four sibling
+	// tests failed as intended and this one passed.
+	if !strings.Contains(res.Reason, "equals the builder family") {
+		t.Fatalf("refusal does not name the same-family reviewer as the cause. "+
+			"A generic message mentioning \"independent\" is not the discriminating "+
+			"diagnostic FAC-630 exists to provide.\nGot: %s", res.Reason)
 	}
 }
 
