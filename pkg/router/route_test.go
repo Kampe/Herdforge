@@ -704,6 +704,9 @@ func writeCooldown(t *testing.T, dir, name, content string) {
 // defect this catalog was introduced to prevent.
 func TestHeadlessProvidersMatchArgvContract(t *testing.T) {
 	clearRouteEnv(t)
+	if argv, _ := HeadlessArgvFor("grok", "grok-4.5", "high", "prompt.md"); len(argv) != 0 {
+		t.Fatalf("forbidden headless model produced argv: %v", argv)
+	}
 	// A representative governed model per provider so the argv is non-nil.
 	models := map[string]string{
 		"agy":      "gemini-3.1-pro-high",
