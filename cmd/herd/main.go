@@ -3251,7 +3251,16 @@ func boundBoardProvider(cfg *config.Config, tp provider.TaskProvider, root, ref 
 		tc, err = dispatch.LoadCanonicalReceipt(root, hsync.NormalizeRef(ref))
 	}
 	if err != nil {
-		return nil, tc, fmt.Errorf("no usable launch receipt for %s (worktree or canonical store; FAC-145 fail-closed, no config fallback): %w", ref, err)
+		// FAC-629: this is a DISPATCH TASK-CONTEXT — proof an agent was
+		// AUTHORIZED to work the card, bounded and expiring by design — not a
+		// launch receipt and not completion evidence. The prior message named
+		// the wrong artifact ("no usable launch receipt"), which sent an
+		// operator looking in .herd/launch-receipts.jsonl, where a valid
+		// task-bound row sat the whole time. Name the artifact class actually
+		// missing and exactly where both lookups searched.
+		return nil, tc, fmt.Errorf(
+			"no dispatch task-context authorization for %s (checked worktree %s and canonical store %s; FAC-145 fail-closed, no config fallback): %w",
+			ref, filepath.Join(wt, dispatch.TaskContextFile), filepath.Join(root, dispatch.CanonicalReceiptDir), err)
 	}
 	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
 	if err != nil {
@@ -3831,7 +3840,19 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	}
 	btp, coord, err := boundBoardProvider(cfg, tp, root, ref)
 	if err != nil {
-		return nil, err
+		// FAC-629: boundBoardProvider proves DISPATCH-TIME AUTHORIZATION —
+		// bounding what an agent may do while working — and that legitimately
+		// expires, or (for cards dispatched outside herd's own dispatch path)
+		// was never issued at all. Requiring it as evidence that work FINISHED
+		// is a category error: the longer a task takes, the less approvable it
+		// becomes. A completion (landing) receipt — task ref, candidate SHA,
+		// merge SHA, verdict, verification digest — is what actually evidences
+		// completion. Resume is crash recovery for an already-journaled
+		// coordinator-bound intent and must not silently change authority.
+		if resume != nil {
+			return nil, err
+		}
+		return approveByCompletionReceipt(ctx, cfg, tp, stack, root, ref, receiptPath, acceptanceEvidence, err)
 	}
 	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
 	if err != nil {

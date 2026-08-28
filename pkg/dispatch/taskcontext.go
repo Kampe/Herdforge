@@ -254,7 +254,18 @@ func (tc TaskContext) BoundCallback(kind mail.CallbackKind, sha, detail string) 
 // readback can still bind after the worktree is gone. Coordinator-written,
 // 0600, signature-verified on every load — this is issued authority, not a
 // config-derived fallback.
-const CanonicalReceiptDir = ".herd/receipts"
+//
+// FAC-629: this is a SEPARATE subdirectory from pkg/sync's completion
+// (landing) receipts at .herd/receipts/<REF>.json. The two used to share one
+// directory with two unrelated schemas told apart only by filename shape
+// (LoadCanonicalReceipt scanning for a lowercase "<ref>-" prefix) — a dispatch
+// TaskContext (authorization to work, signed, leased, expiring) and a
+// CompletionReceipt (proof the work landed: candidate/merge SHA, verdict,
+// verification digest). Nothing enforced that separation; it held only
+// because the two naming conventions never collided in practice. Every live
+// dispatch receipt at the old flat path predates this change and was already
+// expired (see FAC-629), so moving here loses nothing reachable.
+const CanonicalReceiptDir = ".herd/receipts/dispatch"
 
 // safeRefComponent rejects any task ref that cannot be used as a single
 // path component: untrusted provider refs must never traverse out of the

@@ -1893,30 +1893,75 @@ func TestApproveCLI_TamperedReceiptRejected(t *testing.T) {
 
 // FAC-145: a missing receipt on a managed worktree refuses the approval —
 // there is NO config-derived fallback.
-func TestApproveCLI_MissingReceiptRefusedNoFallback(t *testing.T) {
+// FAC-629: neither dispatch task-context authorization NOR a completion
+// receipt exists at all -- the one case with genuinely nothing to gate on.
+// The refusal must name BOTH classes of missing evidence, not the old
+// "no usable launch receipt" (which named the wrong artifact and sent an
+// operator looking in the wrong file).
+func TestApproveCLI_MissingEverythingRefusedNoFallback(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, fk := approveFixture(t)
 	provisionFence(t, binary, dir, keyDir)
 
 	// Simulate a receipt that never existed anywhere: neither the worktree
-	// copy nor the durable canonical copy remains.
+	// dispatch copy, the durable canonical dispatch copy, nor the completion
+	// (landing) receipt remains.
 	if err := os.Remove(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")); err != nil {
 		t.Fatal(err)
 	}
-	// Canonical copies are session-keyed; remove the whole store.
+	// The canonical dispatch store and the completion-receipt store both
+	// live under .herd/receipts (FAC-629 namespaces the dispatch schema into
+	// its own dispatch/ subdirectory, but does not relocate the completion
+	// receipt) -- removing the whole tree clears both.
 	if err := os.RemoveAll(filepath.Join(dir, ".herd", "receipts")); err != nil {
 		t.Fatal(err)
 	}
 
 	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
 	if err == nil {
-		t.Fatalf("missing receipt must refuse approval:\n%s", out)
+		t.Fatalf("missing everything must refuse approval:\n%s", out)
 	}
-	if !strings.Contains(string(out), "no usable launch receipt") {
-		t.Fatalf("expected fail-closed missing-receipt refusal, got:\n%s", out)
+	if !strings.Contains(string(out), "no dispatch task-context authorization") {
+		t.Fatalf("expected the refusal to name dispatch authorization as missing, got:\n%s", out)
+	}
+	if !strings.Contains(string(out), "no completion receipt") {
+		t.Fatalf("expected the refusal to also name the completion receipt as missing, got:\n%s", out)
 	}
 	if got := atomic.LoadInt32(&fk.patches); got != 0 {
-		t.Fatalf("missing receipt still performed %d status write(s)", got)
+		t.Fatalf("missing everything still performed %d status write(s)", got)
+	}
+}
+
+// FAC-629: `herd approve` reported failed=17 for cards whose work had
+// genuinely landed and passed review -- dispatch task-context authorization
+// had expired or was never issued, and boundBoardProvider refused every one
+// before ever checking whether a completion receipt proved the work was
+// actually done. This is the exact reported shape, end to end through the
+// shipped binary: dispatch authorization gone (worktree AND canonical), a
+// valid completion receipt present. Approval must still succeed.
+func TestApproveCLI_ClosesFromCompletionReceiptWithNoDispatchAuthorization(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+
+	if err := os.Remove(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")); err != nil {
+		t.Fatal(err)
+	}
+	// Only the DISPATCH schema's namespaced subdirectory is removed; the
+	// completion (landing) receipt at .herd/receipts/FAC-1.json is untouched.
+	if err := os.RemoveAll(filepath.Join(dir, ".herd", "receipts", "dispatch")); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "approve", "FAC-1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("approve with no dispatch authorization but a valid completion receipt must succeed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "APPROVED [FAC-1]") {
+		t.Fatalf("expected approval, got:\n%s", out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 1 {
+		t.Fatalf("expected exactly 1 status write, saw %d", got)
 	}
 }
 
