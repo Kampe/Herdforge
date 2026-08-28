@@ -1070,6 +1070,7 @@ func herdrStandingAgents() ([]standing.Agent, error) {
 		out = append(out, standing.Agent{
 			Name: a.Name, Status: a.Status, PaneID: a.PaneID,
 			TabID: a.TabID, Workspace: a.Workspace, Cwd: a.Cwd,
+			Model: a.Model, LaunchModel: a.LaunchModel,
 		})
 	}
 	return out, nil

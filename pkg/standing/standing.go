@@ -22,6 +22,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -91,9 +92,6 @@ func CompareModel(expected, live string) error {
 		return nil
 	}
 	return ModelDrift{Expected: expected, Live: live}
-}
-func ForbiddenModel(provider, model string) bool {
-	return strings.EqualFold(strings.TrimSpace(provider), "grok") && strings.EqualFold(strings.TrimSpace(model), "grok-4.5")
 }
 
 // Tab is a created herdr tab.
@@ -979,7 +977,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 		}
 		rr.Provider = route.Provider
 		rr.Model = route.Model
-		if ForbiddenModel(route.Provider, route.Model) {
+		if router.ForbiddenModel(route.Provider, route.Model) {
 			rr.Outcome = OutcomeFailed
 			rr.Reason = fmt.Sprintf("forbidden model at launch construction: %s/%s", route.Provider, route.Model)
 			result.Failed++

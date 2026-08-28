@@ -1924,7 +1924,8 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 					// FAC-578: the recycle decision must know which harness it
 					// is judging, because idle is not equally trustworthy across
 					// them.
-					Kind: a.Kind,
+					Kind:  a.Kind,
+					Model: a.Model, LaunchModel: a.LaunchModel,
 				})
 			}
 			return out, nil

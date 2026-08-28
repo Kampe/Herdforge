@@ -131,11 +131,8 @@ func TestStandingRouteUsesSameProviderFallbackModel(t *testing.T) {
 		PreferredProvider: "grok", PreferredModel: "grok-4.6",
 		PreferredFallbackModels: []string{"grok-4.5"},
 	})
-	if err != nil {
-		t.Fatalf("standing fallback rejected: %v", err)
-	}
-	if d.Provider != "grok" || d.Model != "grok-4.5" {
-		t.Fatalf("standing fallback crossed provider or did not select sibling model: %+v", d)
+	if err == nil || !strings.Contains(err.Error(), "forbidden model") {
+		t.Fatalf("forbidden standing fallback must be refused: decision=%+v err=%v", d, err)
 	}
 }
 

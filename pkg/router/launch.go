@@ -555,6 +555,12 @@ func ForbiddenDeepSeek(model string) bool {
 	return !IsDeepSeekV4(model)
 }
 
+// ForbiddenModel applies to every launch surface, including reviewer and shot
+// launches; policy must not depend on the caller remembering a local check.
+func ForbiddenModel(provider, model string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "grok") && strings.EqualFold(strings.TrimSpace(model), "grok-4.5")
+}
+
 // FlashFrontierHighForbidden is true when a flash-tier author would be paired
 // with a frontier reviewer at high (or above) effort — an incoherent cost loop.
 func FlashFrontierHighForbidden(authorCap CapabilityTier, reviewerCap CapabilityTier, effort string) bool {
@@ -1296,6 +1302,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		return nil, fmt.Errorf("issue launch capability: %w", err)
 	}
 	d.Proof = decisionProof(*d)
+	if ForbiddenModel(d.Provider, d.Model) {
+		return nil, fmt.Errorf("forbidden model at launch construction: %s/%s", d.Provider, d.Model)
+	}
 	return d, nil
 }
 

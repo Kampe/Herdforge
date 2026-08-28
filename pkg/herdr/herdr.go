@@ -1554,6 +1554,8 @@ type AgentSession struct {
 type AgentEntry struct {
 	Name             string `json:"name,omitempty"`
 	Kind             string `json:"agent,omitempty"`
+	Model            string `json:"model,omitempty"`
+	LaunchModel      string `json:"launch_model,omitempty"`
 	Status           string `json:"agent_status,omitempty"`
 	AssignmentStatus string `json:"assignment_status,omitempty"`
 	LoopMode         string `json:"loop_mode,omitempty"`

@@ -161,6 +161,7 @@ type Sample struct {
 	LastActionTaken Action `json:"last_action_taken,omitempty"`
 	Continuation    int    `json:"continuation,omitempty"`
 	Output          string `json:"output,omitempty"`
+	EmptyLoopHits   int    `json:"empty_loop_hits,omitempty"`
 }
 
 // EmptyContinuationLoop identifies a stop-hook loop that advances without
@@ -210,8 +211,15 @@ func Classify(prev *Sample, now Sample, th Thresholds, workingFor time.Duration)
 		return out, nil
 	}
 	if EmptyContinuationLoop(now.Continuation, now.Output) {
+		if prev != nil {
+			out.EmptyLoopHits = prev.EmptyLoopHits + 1
+		}
+		if out.EmptyLoopHits < th.StallSamples {
+			return out, nil
+		}
 		return out, []Finding{NonProductive}
 	}
+	out.EmptyLoopHits = 0
 
 	var findings []Finding
 	if out.StallHits >= th.StallSamples {
