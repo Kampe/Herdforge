@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/committime"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
@@ -265,10 +266,25 @@ func runReviewIngest() {
 			}
 		}
 		taskIdentity := ingestTaskIdentityFor(a.TaskRef, a.Branch)
+		// FAC-631: Admit requires a risk tier on the EventRecord row
+		// (Ledger.Tier reads only that event), and nothing on this path ever
+		// wrote one -- only herd review-classify's dispatch-time write did.
+		// Measured live: 2.7% of Chainseer record rows carried a tier, so
+		// admission was structurally unreachable for the other ~97%, which is
+		// every review that arrived as an inbox artifact rather than through
+		// classify-gated dispatch.
+		//
+		// The tier is derived HERE, at ingest, from the same deterministic
+		// R0-R3 classifier review-classify uses -- never invented and never
+		// backfilled onto a row after the fact. A candidate whose diff cannot
+		// be read yields no tier rather than a guessed one; Admit already
+		// treats an absent tier as not-yet-admissible, which is the correct,
+		// pre-existing fail-closed behaviour for a real "cannot classify" case.
+		tier := candidateRiskTier(a.SHA)
 		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
-			Artifact: artifactName, Gate: gate, Task: taskIdentity,
+			Artifact: artifactName, Gate: gate, Task: taskIdentity, Tier: tier,
 		}
 		verdictOpts := reviewledger.VerdictOpts{
 			SHA: a.SHA, Reviewer: a.Reviewer, Verdict: reviewledger.Verdict(a.Verdict),
@@ -1889,4 +1905,22 @@ func branchReachesSHA(branch, sha string) bool {
 // once, and two copies means a fix lands on only one of them.
 func commitCreationTime(sha string) time.Time {
 	return committime.Of("", sha)
+}
+
+// candidateRiskTier derives the deterministic R0-R3 risk tier for sha against
+// origin/main, using the SAME classifier herd review-classify uses at
+// dispatch time -- one rule set, not two that could drift.
+//
+// diffStat is review-classify's own diff-to-paths reader; reusing it here
+// (rather than a second `git diff --numstat` in this file) is what keeps
+// pkg/invariant's duplicate-rule gate quiet. An unreadable diff yields "": a
+// candidate that cannot be classified must not be recorded as though it had
+// been, and Admit already treats an absent tier as not-yet-admissible rather
+// than as a refusal.
+func candidateRiskTier(sha string) string {
+	paths, _, _, err := diffStat("origin/main", sha)
+	if err != nil {
+		return ""
+	}
+	return string(classify.Classify(classify.Input{CandidateSHA: sha, Paths: paths}).Tier)
 }
