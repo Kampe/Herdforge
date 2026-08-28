@@ -256,12 +256,11 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 			}
 		}
 	}
-	
 	inReviewTasks, err := tp.ListTasks(ctx, project, "in-review")
-	var inReview int64
-	if err == nil {
-		inReview = int64(len(inReviewTasks))
+	if err != nil {
+		return pulse.ProviderObservation{Known: false, Error: fmt.Sprintf("in-review list: %v", err)}, nil
 	}
+	inReview := int64(len(inReviewTasks))
 
 	obs := pulse.ProviderObservation{
 		Known:      true,
