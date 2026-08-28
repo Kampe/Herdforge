@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -94,6 +95,34 @@ func TestGitHubProvider_ListTasks(t *testing.T) {
 	}
 	if tasks[0].Priority != PriorityHigh {
 		t.Fatalf("expected high priority, got %v", tasks[0].Priority)
+	}
+}
+
+func TestGitHubProvider_ListTasks_InReviewUnsupported(t *testing.T) {
+	// GitHub's open issues are to-do in this adapter; they must never be
+	// presented as in-review work when the provider cannot represent that
+	// lifecycle state.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[
+			{"number":7,"title":"Open to-do issue","body":"","state":"open","created_at":"2026-08-01T20:00:00Z","labels":[]}
+		]`))
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	gp := NewGitHubProvider("mock-token", "testowner", "testrepo")
+	gp.Client = &http.Client{
+		Transport: &customTripper{targetURL: u},
+	}
+
+	tasks, err := gp.ListTasks(context.Background(), "", StatusInReview)
+	if !errors.Is(err, ErrUnsupportedStatus) {
+		t.Fatalf("expected unsupported status error for in-review, got tasks=%d err=%v", len(tasks), err)
+	}
+	if tasks != nil {
+		t.Fatalf("unsupported status must not return tasks, got %d", len(tasks))
 	}
 }
 

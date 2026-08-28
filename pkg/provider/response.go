@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,11 @@ const (
 	StatusArchived   = "archived"
 	StatusUnknown    = "unknown"
 )
+
+// ErrUnsupportedStatus signals that a provider cannot represent the requested
+// lifecycle status. Callers must treat it as unknown board state rather than
+// interpreting an empty result as a clean backlog.
+var ErrUnsupportedStatus = errors.New("provider status unsupported")
 
 // ProviderError is a typed adapter failure preserving HTTP status, retryability,
 // and a safe body snippet for diagnostics. Callers must treat any non-nil
