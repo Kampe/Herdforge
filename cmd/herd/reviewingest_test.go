@@ -103,10 +103,9 @@ func TestBareFamilyIsNotTreatedAsUnrecorded(t *testing.T) {
 // could sit until the next beat purely because nothing announced it.
 func TestReviewAdmissionPostsACompletionCallback(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HERD_ROOT", root)
 	sha := strings.Repeat("a", 40)
 
-	postReviewCompleteCallback(sha, "feat/thing", "pool-03", "PASS")
+	postReviewCompleteCallback(root, sha, "feat/thing", "pool-03", "PASS")
 
 	cbs, err := mail.NewMailbox(mail.CallbackMailPath(root)).DrainCallbacks()
 	if err != nil {
@@ -131,11 +130,10 @@ func TestReviewAdmissionPostsACompletionCallback(t *testing.T) {
 // same admitted verdict must not enqueue a second event.
 func TestReviewCompletionCallbackIsDedupedAcrossReIngest(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HERD_ROOT", root)
 	sha := strings.Repeat("b", 40)
 
 	for i := 0; i < 3; i++ {
-		postReviewCompleteCallback(sha, "feat/thing", "pool-03", "PASS")
+		postReviewCompleteCallback(root, sha, "feat/thing", "pool-03", "PASS")
 	}
 	cbs, err := mail.NewMailbox(mail.CallbackMailPath(root)).DrainCallbacks()
 	if err != nil {
@@ -150,8 +148,7 @@ func TestReviewCompletionCallbackIsDedupedAcrossReIngest(t *testing.T) {
 // callback naming nothing.
 func TestReviewCompletionCallbackRefusesAnEmptySHA(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("HERD_ROOT", root)
-	postReviewCompleteCallback("   ", "feat/thing", "pool-03", "PASS")
+	postReviewCompleteCallback(root, "   ", "feat/thing", "pool-03", "PASS")
 	cbs, _ := mail.NewMailbox(mail.CallbackMailPath(root)).DrainCallbacks()
 	if len(cbs) != 0 {
 		t.Fatalf("an empty SHA must not announce anything, got %d", len(cbs))

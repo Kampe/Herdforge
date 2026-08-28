@@ -14,15 +14,12 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/committime"
-	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
-	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
-	"github.com/Kampe/Herdforge/pkg/reviewroot"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -33,26 +30,20 @@ import (
 // A bad verdict is indistinguishable from a good one once it lands, so every
 // refusal happens before the write.
 func runReviewIngest() {
-	repoRoot, err := filepath.Abs(".")
+	startDir, err := filepath.Abs(".")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve repository root: %v\n", err)
 		os.Exit(1)
 	}
-	// FAC-625: the receipt log must be read from the worktree-INVARIANT project
-	// root, never from the process cwd. Ingest run from a lane worktree has its
-	// own (empty) .herd/launch-receipts.jsonl, so a cwd-relative read found no
-	// receipt reaching the candidate and recorded provenance_unrecorded on a
-	// candidate whose provenance existed all along -- at the project root, one
-	// hop away. HERD_ROOT names the lane, not the project, so it must not be
-	// trusted here; gitroot.ProjectRoot is the one function in the tree that
-	// answers this without depending on which worktree asked.
-	projectRoot, _, err := gitroot.ProjectRoot(context.Background(), repoRoot)
+	roots, err := resolveReviewIngestRoots(startDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: resolve project root: %v\n", err)
 		os.Exit(1)
 	}
-	receiptPath := launch.ReceiptPathFor(projectRoot)
-	parsed, err := parseReviewIngestArgs(os.Args[2:])
+	projectRoot := roots.ProjectRoot
+	receiptPath := roots.ReceiptPath
+	reviewRoot := roots.Review
+	parsed, err := parseReviewIngestArgs(os.Args[2:], roots)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
 		os.Exit(2)
@@ -61,9 +52,14 @@ func runReviewIngest() {
 	// Resolve the review corpus ONCE, before any branch, and say which one it
 	// is. A review tool that does not name its corpus makes "ingested"
 	// unattributable, which is exactly how two roots diverged unnoticed.
-	reviewRoot := resolvedReviewRoot(".")
 	if !parsed.asJSON {
 		fmt.Println("herd review-ingest: " + reviewRoot.Paths.Describe())
+	}
+	if !parsed.dryRun && !parsed.audit {
+		if err := roots.requireMutationSafe(); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	files := parsed.files
@@ -72,7 +68,7 @@ func runReviewIngest() {
 			fmt.Fprintln(os.Stderr, "usage: herd review-ingest --audit [--audit-root <dir>]")
 			os.Exit(2)
 		}
-		ledger, err := reviewledger.NewReviewLedger(".", parsed.ledgerPath)
+		ledger, err := reviewledger.NewReadOnlyReviewLedger(projectRoot, parsed.ledgerPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
 			os.Exit(1)
@@ -118,13 +114,13 @@ func runReviewIngest() {
 
 	commitExists := func(sha string) bool {
 		cmd := exec.Command("git", "rev-parse", "--verify", "-q", sha+"^{commit}")
-		cmd.Dir = repoRoot
+		cmd.Dir = projectRoot
 		return cmd.Run() == nil
 	}
 
 	diffEmpty := func(sha string) (bool, error) {
 		cmd := exec.Command("git", "diff", "origin/main..."+sha)
-		cmd.Dir = repoRoot
+		cmd.Dir = projectRoot
 		out, err := cmd.Output()
 		if err != nil {
 			return false, fmt.Errorf("git diff origin/main...%s: %w", sha[:min(12, len(sha))], err)
@@ -134,9 +130,9 @@ func runReviewIngest() {
 
 	var ledger reviewIngestLedger
 	if parsed.dryRun {
-		ledger, err = reviewledger.NewReadOnlyReviewLedger(".", parsed.ledgerPath)
+		ledger, err = reviewledger.NewReadOnlyReviewLedger(projectRoot, parsed.ledgerPath)
 	} else {
-		ledger, err = reviewledger.NewReviewLedger(".", parsed.ledgerPath)
+		ledger, err = reviewledger.NewReviewLedger(projectRoot, parsed.ledgerPath)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: open ledger: %v\n", err)
@@ -350,7 +346,7 @@ func runReviewIngest() {
 		// into a corpus nobody else read: 255 artifacts in one root, 63 in the
 		// other, and the ledger pointing at whichever the writer happened to
 		// resolve.
-		retained, retainErr := reviewingest.RetainArtifact(reviewRoot.RepoRoot, f, a.SHA, a.Reviewer)
+		retained, retainErr := reviewingest.RetainArtifact(projectRoot, f, a.SHA, a.Reviewer)
 		if retainErr != nil {
 			// FAC-580: per-artifact, not per-batch. See the admission refusal
 			// above: aborting here stalled every later verdict behind one file.
@@ -401,13 +397,13 @@ func runReviewIngest() {
 			// FAC-586: durable ack that canonical ingest admitted this artifact.
 			// Remote-ref transport and ledger admission are distinct; review hosts
 			// must not retire residents on transport alone.
-			if ackErr := reviewack.Emit(reviewRoot.RepoRoot, reviewack.Ack{
+			if ackErr := reviewack.Emit(projectRoot, reviewack.Ack{
 				SHA: a.SHA, Reviewer: a.Reviewer, ArtifactDigest: reviewack.ArtifactDigest(body),
 				LaunchIdentity: a.Reviewer,
 			}); ackErr != nil {
 				fmt.Fprintf(os.Stderr, "review-ingest: ADMITTED %s but ingest ack emit failed: %v\n", a.SHA[:12], ackErr)
 			}
-			postReviewCompleteCallback(a.SHA, a.Branch, a.Reviewer, a.Verdict)
+			postReviewCompleteCallback(projectRoot, a.SHA, a.Branch, a.Reviewer, a.Verdict)
 			reclaimReviewPoolSlotFor(a.SHA)
 		}
 		admitted++
@@ -443,12 +439,12 @@ type reviewIngestArgs struct {
 // flag.FlagSet stops at the first positional argument, so using it directly
 // made `artifact --dry-run` treat the flag as another filename. Parsing the
 // complete argument list first keeps malformed invocations side-effect free.
-func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
+func parseReviewIngestArgs(args []string, roots reviewIngestRoots) (reviewIngestArgs, error) {
 	parsed := reviewIngestArgs{
-		// FAC-572: resolved through the ONE review-root resolver, so this
-		// command cannot audit a different corpus than the queue refers to.
-		auditRoot:  reviewroot.Resolve(".").Root,
-		ledgerPath: reviewledger.DefaultPath(""),
+		// All defaults come from the one root bundle resolved before parsing,
+		// so a lane's cwd cannot redirect a sweep or audit.
+		auditRoot:  roots.Review.Paths.Root,
+		ledgerPath: roots.LedgerPath,
 	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -846,7 +842,7 @@ func reclaimReviewPoolSlotFor(sha string) {
 	}
 }
 
-func postReviewCompleteCallback(sha, branch, reviewer, verdict string) {
+func postReviewCompleteCallback(root, sha, branch, reviewer, verdict string) {
 	sha = strings.TrimSpace(sha)
 	if sha == "" {
 		return
@@ -855,7 +851,6 @@ func postReviewCompleteCallback(sha, branch, reviewer, verdict string) {
 	if ref == "" {
 		ref = sha
 	}
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 	cb := mail.Callback{
 		Ref:      ref,
 		Kind:     mail.CallbackComplete,

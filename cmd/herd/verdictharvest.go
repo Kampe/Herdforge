@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // runVerdictHarvest pulls verdict artifacts pushed by other hosts into the local
@@ -55,7 +58,10 @@ func runVerdictHarvest() error {
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	root, _, err := gitroot.ProjectRoot(context.Background(), ".")
+	if err != nil {
+		return fmt.Errorf("resolve project root: %w", err)
+	}
 	git := func(args ...string) (string, error) {
 		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
 		out, err := cmd.CombinedOutput()
@@ -87,7 +93,7 @@ func runVerdictHarvest() error {
 			}
 			// Never overwrite a local artifact. The local copy may already be
 			// ingested, and clobbering it would resurrect a settled verdict.
-			if _, statErr := os.Stat(path); statErr == nil {
+			if _, statErr := os.Stat(filepath.Join(root, path)); statErr == nil {
 				skipped++
 				continue
 			}
