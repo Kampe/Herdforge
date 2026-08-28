@@ -18,6 +18,24 @@ func TestCompareModelReportsBothValues(t *testing.T) {
 	}
 }
 
+func TestRunRaiseRefusesForbiddenModelThroughShippedPath(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	t.Chdir(repo)
+	for i := range cfg.Lanes {
+		if cfg.Lanes[i].Name == "orch" {
+			cfg.Lanes[i].Provider, cfg.Lanes[i].Model = "grok", "grok-4.5"
+		}
+	}
+	opts := baseOpts(t, repo)
+	opts.Mode = ModeRaise
+	opts.AdmitRoute = func(*config.LaneDef) (Route, error) { return Route{Provider: "grok", Model: "grok-4.5"}, nil }
+	opts.ListAgents = func() ([]Agent, error) { return nil, nil }
+	r, err := Run(cfg, opts)
+	if err == nil || r.Failed == 0 || !strings.Contains(r.Roles[0].Reason, "forbidden model") {
+		t.Fatalf("raise must refuse forbidden model: result=%+v err=%v", r, err)
+	}
+}
+
 func writePrompt(t *testing.T, dir, rel, body string) string {
 	t.Helper()
 	p := filepath.Join(dir, rel)

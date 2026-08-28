@@ -499,6 +499,9 @@ func PiBareModel(model string) string {
 // it. Coordinators therefore run directly on Codex Sol or Claude Fable.
 func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	if ForbiddenModel(provider, model) {
+		return "", nil, fmt.Errorf("forbidden model at harness construction: %s/%s", provider, model)
+	}
 	if surface, ok := SurfaceFor(provider); !ok || (!surface.VendorHarness && !useLegacyPi()) {
 		return "", nil, fmt.Errorf("unsupported launch provider %q", provider)
 	}
