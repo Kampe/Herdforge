@@ -86,6 +86,24 @@ func TestDiagnosticsAreNeverSilent(t *testing.T) {
 	}
 }
 
+func TestFailedReadPreservesPartialResultAndTypedCause(t *testing.T) {
+	typedCause := errors.New("semantic rejection")
+	got, diag, err := BoundedRead(context.Background(), "kaneo", time.Second, "",
+		func(context.Context, *Phases) (int, error) {
+			return 7, typedCause
+		})
+
+	if got != 7 {
+		t.Fatalf("result = %d, want populated callback result 7", got)
+	}
+	if !errors.Is(err, typedCause) {
+		t.Fatalf("error %v does not preserve typed callback cause", err)
+	}
+	if !diag.Unknown() || diag.Outcome != ReadFailed {
+		t.Fatalf("callback error diagnostics = %+v, want failed UNKNOWN until caller classification", diag)
+	}
+}
+
 // A read that never reached the provider must say so rather than implying it
 // got somewhere. "unstarted" is evidence, not a placeholder.
 func TestAReadThatNeverReachedTheProviderSaysUnstarted(t *testing.T) {

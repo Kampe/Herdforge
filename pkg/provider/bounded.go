@@ -143,7 +143,12 @@ func BoundedRead[T any](ctx context.Context, providerName string, budget time.Du
 		if r.err != nil {
 			diag.Outcome = ReadFailed
 			diag.Err = r.err.Error()
-			return zero, diag, fmt.Errorf("%s", diag.String())
+			// Preserve both the callback's populated result and typed cause. A
+			// caller may have completed every provider read before reaching a
+			// semantic decision (for example, an open dependency blocker). The
+			// diagnostics remain failed/UNKNOWN until that caller proves the
+			// returned value and error are a recognized semantic outcome.
+			return r.v, diag, fmt.Errorf("%s: %w", diag.String(), r.err)
 		}
 		diag.Outcome = ReadComplete
 		return r.v, diag, nil
