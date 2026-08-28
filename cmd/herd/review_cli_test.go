@@ -1947,6 +1947,34 @@ func TestApproveCLI_StallAlarmFires(t *testing.T) {
 	}
 }
 
+func TestApproveCLI_StallAlarmFiresOnSuppressed(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+
+	// Seed a legacy tombstone for FAC-1 to trigger suppressed++ instead of failed++
+	tombstonePath := filepath.Join(dir, ".herd", "legacy-receipts.jsonl")
+	if err := appendLegacyReceiptTombstone(tombstonePath, legacyReceiptTombstone{TaskRef: "FAC-1", TaskID: "task-1", Reason: "suppressed", Actor: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	// We must remove the completion receipt so os.Stat(receipt) fails inside the loop and triggers suppressed++
+	if err := os.Remove(filepath.Join(dir, ".herd", "receipts", "FAC-1.json")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	// And we must remove the dispatch context to ensure approveOne wouldn't just work or fail differently
+	if err := os.Remove(filepath.Join(dir, ".herd", "worktrees", "fac-1", "TASK-CONTEXT.json")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err == nil {
+		t.Fatalf("stall must exit non-zero on suppressed-only sweeps, output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "CONTROL-PLANE STALL:") {
+		t.Fatalf("expected control-plane alarm, got:\n%s", out)
+	}
+}
+
 // shortSocketPath returns a unix socket path short enough for the macOS
 // 104-byte sun_path limit, cleaned up with the test.
 // socketSeq guarantees per-process uniqueness; nanos alone collide when
