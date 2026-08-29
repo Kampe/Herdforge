@@ -196,6 +196,7 @@ func (LiveHerdr) DeliverAndProve(target, text string, timeout time.Duration) (*h
 	}
 	return herdr.DeliverAndProve(target, text, timeout)
 }
+
 // TabClose compensates a tab dispatch itself created. It uses the fenced
 // close path (FAC-550); the bare herdr.TabClose stub always refuses, which
 // leaked one tab per failed dispatch.
@@ -2075,6 +2076,14 @@ func (d *Dispatcher) taskContext(task *provider.Task, wtInfo *worktree.WorktreeI
 	role := ""
 	if lane != nil {
 		role = strings.TrimSpace(lane.Role)
+		// Standing repository lanes retain their project-specific role for
+		// ownership and routing, but their signed task context must use the
+		// native FAC-145 session role declared by standing_role_policy.
+		// Otherwise a valid lane such as platform-ops is rejected as an
+		// unknown receipt role before the agent can start.
+		if lane.StandingRolePolicy != nil {
+			role = nativeContextRole(lane.StandingRolePolicy.NativeRole)
+		}
 	}
 	// Every isolated agent role gets its sanctioned op set; an unknown role
 	// yields nil and the receipt fails Validate before any launch.
@@ -2097,6 +2106,21 @@ func (d *Dispatcher) taskContext(task *provider.Task, wtInfo *worktree.WorktreeI
 		SessionID:         NewSessionID(role, task.Ref, wtInfo.BaseSHA, opts.LeaseID),
 		AllowedOps:        ops,
 		ExpiresAt:         time.Now().Add(DefaultReceiptTTL),
+	}
+}
+
+func nativeContextRole(native string) string {
+	switch strings.ToLower(strings.TrimSpace(native)) {
+	case "verification-gate":
+		return RoleVerifier
+	case "recovery-sentinel":
+		return RoleRecovery
+	case "harvest", "review-supervisor":
+		return RoleIntegration
+	case "scout-planner":
+		return RoleWorker
+	default:
+		return strings.TrimSpace(native)
 	}
 }
 
