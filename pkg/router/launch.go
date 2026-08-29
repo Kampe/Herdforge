@@ -1045,7 +1045,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		if haveQuota && weeklyAtOrOverCap(st) {
 			continue
 		}
-		if req.StrictQuota && !haveQuota {
+		if req.StrictQuota && (!haveQuota || st.Stale || st.Reason == "no-quota-data" || st.Reason == "stale" || st.Reason == "provider-error") {
+			surfaceRejections = append(surfaceRejections,
+				fmt.Sprintf("%s/%s: UNKNOWN quota for pool %s (%s)", provider, model, pool, st.Reason))
 			continue
 		}
 
