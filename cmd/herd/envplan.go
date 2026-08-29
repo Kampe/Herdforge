@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/envplan"
 	"github.com/Kampe/Herdforge/pkg/launch"
@@ -64,13 +65,13 @@ type environmentBindingRequest struct {
 }
 
 type environmentBindingAuthorities struct {
-	Provider      string
-	ProjectID     string
-	Tasks         provider.TaskProvider
-	GraphRevision string
-	Runs          *runstate.Store
-	Claims        security.LiveClaimLookup
-	Launches      dispatch.LiveLaunchLookup
+	Provider     string
+	ProjectID    string
+	Tasks        provider.TaskProvider
+	GraphForTask runstate.GraphAuthorityForTask
+	Runs         *runstate.Store
+	Claims       security.LiveClaimLookup
+	Launches     dispatch.LiveLaunchLookup
 }
 
 func environmentBinding(ctx context.Context, ticketRef string) (envplan.Binding, error) {
@@ -86,16 +87,18 @@ func environmentBindingForRequest(ctx context.Context, req environmentBindingReq
 	if err != nil {
 		return envplan.Binding{}, fmt.Errorf("task provider: %w", err)
 	}
-	graph, _ := publishedGraphBinding(".")
-	if strings.TrimSpace(graph) == "" {
-		return envplan.Binding{}, errors.New("published dependency graph revision is required before creating an environment plan")
-	}
 	runs, err := runstate.Open(filepath.Join(".herd", "dispatch-runs.db"))
 	if err != nil {
 		return envplan.Binding{}, fmt.Errorf("open dispatch runstate: %w", err)
 	}
 	defer runs.Close()
-	authorities := environmentBindingAuthorities{Provider: cfg.TaskProvider.Type, ProjectID: cfg.TaskProvider.ProjectID, Tasks: tp, GraphRevision: graph, Runs: runs}
+	authorities := environmentBindingAuthorities{
+		Provider:     cfg.TaskProvider.Type,
+		ProjectID:    cfg.TaskProvider.ProjectID,
+		Tasks:        tp,
+		GraphForTask: environmentTaskGraphAuthority(deps.StoreFor(tp, cfg.TaskProvider.ProjectID)),
+		Runs:         runs,
+	}
 	if req.RecoverStale {
 		if err := security.WireCanonicalClaimAuthority("."); err != nil {
 			return envplan.Binding{}, fmt.Errorf("wire recovery claim authority: %w", err)
@@ -109,8 +112,34 @@ func environmentBindingForRequest(ctx context.Context, req environmentBindingReq
 	return environmentBindingFromAuthorities(ctx, req, authorities)
 }
 
+func environmentTaskGraphAuthority(store deps.RelationStore) runstate.GraphAuthorityForTask {
+	return func(ctx context.Context, saved runstate.TaskState) (string, error) {
+		if store == nil || strings.TrimSpace(saved.ID) == "" || strings.TrimSpace(saved.Ref) == "" {
+			return "", errors.New("dependency graph task snapshot: exact task identity is required")
+		}
+		scoped, ok := store.(interface {
+			SnapshotGraphForTask(context.Context, deps.Ref, deps.TaskID, []deps.DependencyEdge) (*deps.GraphSnapshot, error)
+		})
+		if !ok {
+			return "", errors.New("dependency graph task snapshot: scoped authority unavailable")
+		}
+		snapshot, err := scoped.SnapshotGraphForTask(ctx, deps.Ref(saved.Ref), deps.TaskID(saved.ID), nil)
+		if err != nil {
+			return "", fmt.Errorf("dependency graph task snapshot: %w", err)
+		}
+		if snapshot == nil {
+			return "", errors.New("dependency graph task snapshot returned empty revision")
+		}
+		revision := deps.GraphRevision(snapshot.Edges, nil, snapshot.ProviderRevision)
+		if strings.TrimSpace(revision) == "" {
+			return "", errors.New("dependency graph task snapshot returned empty revision")
+		}
+		return revision, nil
+	}
+}
+
 func environmentBindingFromAuthorities(ctx context.Context, req environmentBindingRequest, a environmentBindingAuthorities) (envplan.Binding, error) {
-	if strings.TrimSpace(req.TicketRef) == "" || strings.TrimSpace(a.Provider) == "" || strings.EqualFold(strings.TrimSpace(a.Provider), "unknown") || strings.TrimSpace(a.ProjectID) == "" || a.Tasks == nil || a.Runs == nil || strings.TrimSpace(a.GraphRevision) == "" {
+	if strings.TrimSpace(req.TicketRef) == "" || strings.TrimSpace(a.Provider) == "" || strings.EqualFold(strings.TrimSpace(a.Provider), "unknown") || strings.TrimSpace(a.ProjectID) == "" || a.Tasks == nil || a.Runs == nil || a.GraphForTask == nil {
 		return envplan.Binding{}, fmt.Errorf("environment binding: %w: incomplete provider, project, graph, or task authority", runstate.ErrAmbiguous)
 	}
 	var task *provider.Task
@@ -140,19 +169,32 @@ func environmentBindingFromAuthorities(ctx context.Context, req environmentBindi
 	}
 
 	runID := "dispatch:" + task.ID
-	graphAuthority := func(context.Context) (string, error) { return a.GraphRevision, nil }
+	graphAuthority := func(ctx context.Context, saved runstate.TaskState) (string, error) {
+		if saved.ID != task.ID || saved.Ref != task.Ref || (saved.ProjectID != "" && saved.ProjectID != task.ProjectID) {
+			return "", fmt.Errorf("environment binding: %w: scoped graph task identity mismatch", runstate.ErrAmbiguous)
+		}
+		saved.ProjectID = task.ProjectID
+		return a.GraphForTask(ctx, saved)
+	}
 	var run *runstate.RunState
 	if req.RecoverStale {
 		if strings.TrimSpace(req.TaskID) == "" {
 			return envplan.Binding{}, fmt.Errorf("environment binding: %w: stale recovery requires exact task id", runstate.ErrAmbiguous)
 		}
-		recovery := dispatch.StaleRunRecovery{Runs: a.Runs, Tasks: a.Tasks, ProjectID: a.ProjectID, Graph: graphAuthority, Claims: a.Claims, Launches: a.Launches}
+		recovery := dispatch.StaleRunRecovery{Runs: a.Runs, Tasks: a.Tasks, ProjectID: a.ProjectID, GraphForTask: graphAuthority, Claims: a.Claims, Launches: a.Launches}
 		run, err = recovery.Recover(ctx, task.ID, task.Ref)
 	} else {
-		authority := runstate.Authority{Tasks: a.Tasks, Graph: graphAuthority}
+		authority := runstate.Authority{Tasks: a.Tasks, GraphForTask: graphAuthority}
 		run, err = a.Runs.Resume(ctx, runID, authority)
 		if errors.Is(err, runstate.ErrNotFound) {
-			next, buildErr := runstate.FromTasks(runID, "dispatch", task.Ref, a.GraphRevision, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
+			graph, graphErr := graphAuthority(ctx, runstate.TaskState{ID: task.ID, Ref: task.Ref, ProjectID: task.ProjectID})
+			if graphErr != nil {
+				return envplan.Binding{}, fmt.Errorf("task-scoped dependency graph: %w", graphErr)
+			}
+			if strings.TrimSpace(graph) == "" {
+				return envplan.Binding{}, errors.New("task-scoped dependency graph returned empty revision")
+			}
+			next, buildErr := runstate.FromTasks(runID, "dispatch", task.Ref, graph, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
 			if buildErr != nil {
 				return envplan.Binding{}, fmt.Errorf("build dispatch runstate: %w", buildErr)
 			}
