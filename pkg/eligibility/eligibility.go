@@ -159,13 +159,20 @@ func ResolveRole(task *provider.Task, roleMap map[string]string) (role string, o
 		if l == "" {
 			continue
 		}
-		// Exact role labels used by herd.yaml / board (forge-smith, worker, …).
-		// Also accept herd-smith as historical alias of forge-smith/smith.
+		// Exact role labels used by herd.yaml / board. Keep the historical
+		// session-role aliases here, and include the provider's configured
+		// implementation-role vocabulary so project lanes (for example
+		// backend-api or platform-ops) are not mistaken for unlabeled cards.
 		switch strings.ToLower(l) {
 		case "worker", "forge-smith", "herd-smith", "smith", "reviewer",
 			"scout-planner", "orchestrator", "verification-gate", "review-supervisor",
 			"harvest", "recovery-sentinel":
 			return l, true
+		}
+		for _, known := range provider.KnownImplementationRoles() {
+			if strings.EqualFold(l, known) {
+				return l, true
+			}
 		}
 		// Labels may be written as role:worker.
 		if strings.HasPrefix(strings.ToLower(l), "role:") {
