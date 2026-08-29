@@ -186,9 +186,15 @@ func runReviewIngest() {
 		}
 		// FAC-631: receipt reconciliation requires a risk tier from a durable
 		// record row, but the normal artifact-ingest path previously wrote none.
-		// Use the same exact-SHA diff and deterministic classifier as
-		// review-classify so every admitted artifact is reachable by admission.
-		paths, _, _, err := diffStat("origin/main", a.SHA)
+		// Use the reviewer's declared range with the same deterministic classifier
+		// as review-classify. origin/main is mutable and may advance after review,
+		// so it cannot replace a base the artifact binds explicitly. Preserve the
+		// legacy fallback only for older artifacts that declare no reviewed-base.
+		riskBase := strings.TrimSpace(a.ReadBase)
+		if riskBase == "" {
+			riskBase = "origin/main"
+		}
+		paths, _, _, err := diffStat(riskBase, a.SHA)
 		if err != nil {
 			emit.refused(f, fmt.Errorf("classify candidate risk: %w", err))
 			refused++
