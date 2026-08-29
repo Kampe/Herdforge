@@ -23,6 +23,20 @@ import (
 	"github.com/Kampe/Herdforge/pkg/worktreebootstrap"
 )
 
+func TestNativeContextRoleMapsStandingPolicies(t *testing.T) {
+	for native, want := range map[string]string{
+		"worker":            RoleWorker,
+		"verification-gate": RoleVerifier,
+		"recovery-sentinel": RoleRecovery,
+		"review-supervisor": RoleIntegration,
+		"scout-planner":     RoleWorker,
+	} {
+		if got := nativeContextRole(native); got != want {
+			t.Fatalf("nativeContextRole(%q) = %q, want %q", native, got, want)
+		}
+	}
+}
+
 // withTestLease injects a durable SQLite launch lease (temp path) so Dispatch
 // never opens the mock RepoRoot (/nonexistent-...).
 func withTestLease(t *testing.T, d *Dispatcher) *Dispatcher {
