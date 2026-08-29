@@ -6,15 +6,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/envplan"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/runstate"
+	"github.com/Kampe/Herdforge/pkg/security"
 )
 
 const environmentPlanStorePath = ".herd/environment-plans.db"
@@ -53,7 +57,27 @@ func parseEnvironmentCapability(value string) (envplan.Capability, error) {
 	}
 }
 
+type environmentBindingRequest struct {
+	TicketRef    string
+	TaskID       string
+	RecoverStale bool
+}
+
+type environmentBindingAuthorities struct {
+	Provider      string
+	ProjectID     string
+	Tasks         provider.TaskProvider
+	GraphRevision string
+	Runs          *runstate.Store
+	Claims        security.LiveClaimLookup
+	Launches      dispatch.LiveLaunchLookup
+}
+
 func environmentBinding(ctx context.Context, ticketRef string) (envplan.Binding, error) {
+	return environmentBindingForRequest(ctx, environmentBindingRequest{TicketRef: ticketRef})
+}
+
+func environmentBindingForRequest(ctx context.Context, req environmentBindingRequest) (envplan.Binding, error) {
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
 		return envplan.Binding{}, fmt.Errorf("load config: %w", err)
@@ -61,20 +85,6 @@ func environmentBinding(ctx context.Context, ticketRef string) (envplan.Binding,
 	tp, err := loadTaskProvider(cfg)
 	if err != nil {
 		return envplan.Binding{}, fmt.Errorf("task provider: %w", err)
-	}
-	tasks, err := tp.ListTasks(ctx, cfg.TaskProvider.ProjectID, "")
-	if err != nil {
-		return envplan.Binding{}, fmt.Errorf("list tasks: %w", err)
-	}
-	var task *provider.Task
-	for _, candidate := range tasks {
-		if candidate != nil && candidate.Ref == ticketRef {
-			task = candidate
-			break
-		}
-	}
-	if task == nil || strings.TrimSpace(task.ID) == "" {
-		return envplan.Binding{}, fmt.Errorf("task %s not found", ticketRef)
 	}
 	graph, _ := publishedGraphBinding(".")
 	if strings.TrimSpace(graph) == "" {
@@ -85,18 +95,72 @@ func environmentBinding(ctx context.Context, ticketRef string) (envplan.Binding,
 		return envplan.Binding{}, fmt.Errorf("open dispatch runstate: %w", err)
 	}
 	defer runs.Close()
-	authority := runstate.Authority{Tasks: tp, Graph: func(context.Context) (string, error) { return graph, nil }}
+	authorities := environmentBindingAuthorities{Provider: cfg.TaskProvider.Type, ProjectID: cfg.TaskProvider.ProjectID, Tasks: tp, GraphRevision: graph, Runs: runs}
+	if req.RecoverStale {
+		if err := security.WireCanonicalClaimAuthority("."); err != nil {
+			return envplan.Binding{}, fmt.Errorf("wire recovery claim authority: %w", err)
+		}
+		authorities.Claims, err = security.RequireClaimAuthority()
+		if err != nil {
+			return envplan.Binding{}, fmt.Errorf("recovery claim authority: %w", err)
+		}
+		authorities.Launches = dispatch.NewReceiptLiveLaunchLookup(launch.DefaultReceiptPath(), nil)
+	}
+	return environmentBindingFromAuthorities(ctx, req, authorities)
+}
+
+func environmentBindingFromAuthorities(ctx context.Context, req environmentBindingRequest, a environmentBindingAuthorities) (envplan.Binding, error) {
+	if strings.TrimSpace(req.TicketRef) == "" || strings.TrimSpace(a.Provider) == "" || strings.EqualFold(strings.TrimSpace(a.Provider), "unknown") || strings.TrimSpace(a.ProjectID) == "" || a.Tasks == nil || a.Runs == nil || strings.TrimSpace(a.GraphRevision) == "" {
+		return envplan.Binding{}, fmt.Errorf("environment binding: %w: incomplete provider, project, graph, or task authority", runstate.ErrAmbiguous)
+	}
+	var task *provider.Task
+	var err error
+	if strings.TrimSpace(req.TaskID) != "" {
+		task, err = a.Tasks.GetTask(ctx, strings.TrimSpace(req.TaskID))
+		if err != nil {
+			return envplan.Binding{}, fmt.Errorf("get exact task: %w", err)
+		}
+	} else {
+		tasks, listErr := a.Tasks.ListTasks(ctx, a.ProjectID, "")
+		if listErr != nil {
+			return envplan.Binding{}, fmt.Errorf("list tasks: %w", listErr)
+		}
+		for _, candidate := range tasks {
+			if candidate == nil || candidate.Ref != req.TicketRef {
+				continue
+			}
+			if task != nil {
+				return envplan.Binding{}, fmt.Errorf("environment binding: %w: multiple tasks have ref %s", runstate.ErrAmbiguous, req.TicketRef)
+			}
+			task = candidate
+		}
+	}
+	if task == nil || task.ID == "" || task.Ref != req.TicketRef || task.ProjectID != a.ProjectID {
+		return envplan.Binding{}, fmt.Errorf("environment binding: %w: exact task/ref/project mismatch", runstate.ErrAmbiguous)
+	}
+
 	runID := "dispatch:" + task.ID
-	run, err := runs.Resume(ctx, runID, authority)
-	if errors.Is(err, runstate.ErrNotFound) {
-		next, buildErr := runstate.FromTasks(runID, "dispatch", task.Ref, graph, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
-		if buildErr != nil {
-			return envplan.Binding{}, fmt.Errorf("build dispatch runstate: %w", buildErr)
+	graphAuthority := func(context.Context) (string, error) { return a.GraphRevision, nil }
+	var run *runstate.RunState
+	if req.RecoverStale {
+		if strings.TrimSpace(req.TaskID) == "" {
+			return envplan.Binding{}, fmt.Errorf("environment binding: %w: stale recovery requires exact task id", runstate.ErrAmbiguous)
 		}
-		if _, checkpointErr := runs.Checkpoint(ctx, next, 0); checkpointErr != nil {
-			return envplan.Binding{}, fmt.Errorf("checkpoint dispatch runstate: %w", checkpointErr)
+		recovery := dispatch.StaleRunRecovery{Runs: a.Runs, Tasks: a.Tasks, ProjectID: a.ProjectID, Graph: graphAuthority, Claims: a.Claims, Launches: a.Launches}
+		run, err = recovery.Recover(ctx, task.ID, task.Ref)
+	} else {
+		authority := runstate.Authority{Tasks: a.Tasks, Graph: graphAuthority}
+		run, err = a.Runs.Resume(ctx, runID, authority)
+		if errors.Is(err, runstate.ErrNotFound) {
+			next, buildErr := runstate.FromTasks(runID, "dispatch", task.Ref, a.GraphRevision, runstate.Policy{Lane: "dispatch", Model: "dispatch"}, 0, 0, []*provider.Task{task})
+			if buildErr != nil {
+				return envplan.Binding{}, fmt.Errorf("build dispatch runstate: %w", buildErr)
+			}
+			if _, checkpointErr := a.Runs.Checkpoint(ctx, next, 0); checkpointErr != nil {
+				return envplan.Binding{}, fmt.Errorf("checkpoint dispatch runstate: %w", checkpointErr)
+			}
+			run, err = a.Runs.Resume(ctx, runID, authority)
 		}
-		run, err = runs.Resume(ctx, runID, authority)
 	}
 	if err != nil {
 		return envplan.Binding{}, fmt.Errorf("resume dispatch runstate: %w", err)
@@ -106,34 +170,56 @@ func environmentBinding(ctx context.Context, ticketRef string) (envplan.Binding,
 	}
 	for _, saved := range run.Tasks {
 		if saved.ID == task.ID && saved.Ref == task.Ref {
-			return envplan.Binding{TaskRef: task.Ref, TaskID: task.ID, Provider: cfg.TaskProvider.Type, ProviderRevision: saved.ProviderRevision, GraphRevision: run.DependencyGraphRevision, RunID: run.ID, RunRevision: run.Revision}, nil
+			return envplan.Binding{TaskRef: task.Ref, TaskID: task.ID, Provider: a.Provider, ProviderRevision: saved.ProviderRevision, GraphRevision: run.DependencyGraphRevision, RunID: run.ID, RunRevision: run.Revision}, nil
 		}
 	}
 	return envplan.Binding{}, errors.New("dispatch runstate omitted requested task")
 }
 
-func runEnvPlanCreate(args []string) {
+type environmentPlanCreateRequest struct {
+	Binding      environmentBindingRequest
+	ExpiresAt    time.Time
+	Capabilities []string
+}
+
+func parseEnvironmentPlanCreateArgs(args []string, now time.Time) (environmentPlanCreateRequest, error) {
 	fs := flag.NewFlagSet("envplan create", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(io.Discard)
 	expiresAt := fs.String("expires-at", "", "RFC3339 expiry (required)")
+	taskID := fs.String("task-id", "", "Exact provider task ID")
+	recoverStale := fs.Bool("recover-stale-run", false, "Explicitly recover the exact stale dispatch run")
 	capabilities := multiStringFlag{}
 	fs.Var(&capabilities, "capability", "Requested capability: board-write, network, credential-broker (repeatable)")
 	if err := fs.Parse(leadingPositionalArgs(args)); err != nil || len(fs.Args()) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: herd envplan create <ticket-ref> --expires-at <RFC3339> --capability <capability>")
-		os.Exit(2)
+		return environmentPlanCreateRequest{}, errors.New("usage: herd envplan create <ticket-ref> --expires-at <RFC3339> --capability <capability> [--task-id <id> --recover-stale-run]")
 	}
 	expiry, err := time.Parse(time.RFC3339, *expiresAt)
-	if err != nil || !expiry.After(time.Now().UTC()) {
-		fmt.Fprintln(os.Stderr, "envplan create: --expires-at must be a future RFC3339 timestamp")
+	if err != nil || !expiry.After(now.UTC()) {
+		return environmentPlanCreateRequest{}, errors.New("--expires-at must be a future RFC3339 timestamp")
+	}
+	if *recoverStale && strings.TrimSpace(*taskID) == "" {
+		return environmentPlanCreateRequest{}, errors.New("--recover-stale-run requires exact --task-id")
+	}
+	return environmentPlanCreateRequest{
+		Binding:      environmentBindingRequest{TicketRef: fs.Args()[0], TaskID: strings.TrimSpace(*taskID), RecoverStale: *recoverStale},
+		ExpiresAt:    expiry.UTC(),
+		Capabilities: append([]string(nil), capabilities...),
+	}, nil
+}
+
+func runEnvPlanCreate(args []string) {
+	req, err := parseEnvironmentPlanCreateArgs(args, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "envplan create: %v\n", err)
 		os.Exit(2)
 	}
-	binding, err := environmentBinding(context.Background(), fs.Args()[0])
+	binding, err := environmentBindingForRequest(context.Background(), req.Binding)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "envplan create: %v\n", err)
 		os.Exit(1)
 	}
-	requests := make([]envplan.Request, 0, len(capabilities))
-	for _, raw := range capabilities {
+	requests := make([]envplan.Request, 0, len(req.Capabilities))
+	for _, raw := range req.Capabilities {
 		capability, capErr := parseEnvironmentCapability(raw)
 		if capErr != nil {
 			fmt.Fprintf(os.Stderr, "envplan create: %v\n", capErr)
@@ -147,7 +233,7 @@ func runEnvPlanCreate(args []string) {
 		os.Exit(1)
 	}
 	defer store.Close()
-	plan, err := store.Create(context.Background(), envplan.Plan{Binding: binding, Requests: requests, ExpiresAt: expiry})
+	plan, err := store.Create(context.Background(), envplan.Plan{Binding: binding, Requests: requests, ExpiresAt: req.ExpiresAt})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "envplan create: %v\n", err)
 		os.Exit(1)
