@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
+	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -21,12 +22,19 @@ import (
 func TestReviewIngestRiskTierReachesReceiptReconcile(t *testing.T) {
 	binary := buildHerd(t)
 	tests := []struct {
-		name     string
-		path     string
-		wantTier string
+		name                   string
+		paths                  []string
+		advanceOriginMainAfter int
+		wantTier               string
 	}{
-		{name: "documentation", path: "docs/fac-631.md", wantTier: "R0"},
-		{name: "control plane", path: "cmd/herd/fac631.go", wantTier: "R3"},
+		{name: "documentation", paths: []string{"docs/fac-631.md"}, wantTier: "R0"},
+		{name: "control plane", paths: []string{"cmd/herd/fac631.go"}, wantTier: "R3"},
+		{
+			name:                   "reviewed base survives origin main advance",
+			paths:                  []string{"cmd/herd/fac631-risk.go", "docs/fac-631-followup.md"},
+			advanceOriginMainAfter: 1,
+			wantTier:               "R3",
+		},
 	}
 
 	for _, tc := range tests {
@@ -48,16 +56,36 @@ func TestReviewIngestRiskTierReachesReceiptReconcile(t *testing.T) {
 
 			branch := "fac-631-" + strings.ReplaceAll(tc.name, " ", "-")
 			git("checkout", "-q", "-b", branch)
-			candidatePath := filepath.Join(root, filepath.FromSlash(tc.path))
-			if err := os.MkdirAll(filepath.Dir(candidatePath), 0o755); err != nil {
-				t.Fatal(err)
+			var commits []string
+			for i, path := range tc.paths {
+				candidatePath := filepath.Join(root, filepath.FromSlash(path))
+				if err := os.MkdirAll(filepath.Dir(candidatePath), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(candidatePath, []byte("FAC-631 candidate\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				git("add", path)
+				git("commit", "-q", "-m", fmt.Sprintf("candidate %d", i+1))
+				commits = append(commits, strings.TrimSpace(runOutput(t, root, "rev-parse", "HEAD")))
 			}
-			if err := os.WriteFile(candidatePath, []byte("FAC-631 candidate\n"), 0o644); err != nil {
-				t.Fatal(err)
+			sha := commits[len(commits)-1]
+			if tc.advanceOriginMainAfter > 0 {
+				git("update-ref", "refs/remotes/origin/main", commits[tc.advanceOriginMainAfter-1])
 			}
-			git("add", tc.path)
-			git("commit", "-q", "-m", "candidate")
-			sha := strings.TrimSpace(runOutput(t, root, "rev-parse", "HEAD"))
+
+			reviewedPaths := strings.Fields(runOutput(t, root, "diff", "--name-only", base+"..."+sha))
+			reviewedTier := classify.Classify(classify.Input{CandidateSHA: sha, Paths: reviewedPaths}).Tier
+			if string(reviewedTier) != tc.wantTier {
+				t.Fatalf("reviewed-base fixture tier = %q, want %q", reviewedTier, tc.wantTier)
+			}
+			if tc.advanceOriginMainAfter > 0 {
+				mutablePaths := strings.Fields(runOutput(t, root, "diff", "--name-only", "origin/main..."+sha))
+				mutableTier := classify.Classify(classify.Input{CandidateSHA: sha, Paths: mutablePaths}).Tier
+				if mutableTier == reviewedTier {
+					t.Fatalf("origin/main fixture tier = %q equals reviewed-base tier; fixture does not expose mutable-base classification", mutableTier)
+				}
+			}
 			commitISO := strings.TrimSpace(runOutput(t, root, "show", "-s", "--format=%cI", sha))
 			commitTime, err := time.Parse(time.RFC3339, commitISO)
 			if err != nil {
@@ -111,7 +139,7 @@ func TestReviewIngestRiskTierReachesReceiptReconcile(t *testing.T) {
 				}
 			}
 			if gotTier != tc.wantTier {
-				t.Fatalf("ingested record tier = %q, want %q; deleting the shipped tier write must fail here\nrows: %+v", gotTier, tc.wantTier, rows)
+				t.Fatalf("ingested record tier = %q, want %q; changing the classifier base or deleting the tier write must fail here\nrows: %+v", gotTier, tc.wantTier, rows)
 			}
 
 			gate := &mergeadmit.Gate{
