@@ -36,3 +36,28 @@ verification:
 		t.Fatalf("configured profile revision = %q, want content revision", revision)
 	}
 }
+
+func TestVerificationCommandProfileSkipsGoBuildForNonGoRepository(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `version: "1"
+project:
+  name: node-fixture
+task_provider:
+  type: memory
+verification:
+  test_command: "bin/ci-local"
+`
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profile, _, err := verificationCommandProfile(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.BuildCommand != "true" {
+		t.Fatalf("non-Go profile build command = %q, want true", profile.BuildCommand)
+	}
+}

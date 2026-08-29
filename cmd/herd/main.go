@@ -8776,9 +8776,17 @@ func containsDrainSHA(shas []string, want string) bool {
 }
 
 func verificationCommandProfile(root string) (verifier.CommandProfile, string, error) {
+	buildCommand := "true"
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+		buildCommand = "go build ./..."
+	}
 	profile := verifier.CommandProfile{
-		ID:           verificationProfile,
-		BuildCommand: "go build ./...",
+		ID: verificationProfile,
+		// Repositories without a Go module must not be forced through a
+		// meaningless Go build. Their declared test command (for example
+		// bin/ci-local) owns build/typecheck coverage; the no-op build keeps
+		// the receipt profile explicit without claiming a Go build ran.
+		BuildCommand: buildCommand,
 		TestCommand:  "go test ./...",
 		TestTimeout:  30 * time.Minute,
 	}
