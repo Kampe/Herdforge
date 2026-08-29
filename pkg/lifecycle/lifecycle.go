@@ -38,6 +38,8 @@ const (
 	EventDefault EventType = "default"
 )
 
+var kaneoErrorEnvelopePattern = regexp.MustCompile(`"error"\s*:`)
+
 // EventRecord is the immutable payload published to the event lease store.
 type EventRecord struct {
 	EventID  string `json:"event_id"`
@@ -866,6 +868,9 @@ func (e *Engine) Observe(act bool) (*Summary, error) {
 		}
 		boardJSON = out
 	}
+	if err := rejectKaneoErrorEnvelope("board observation", boardJSON); err != nil {
+		return nil, fmt.Errorf("board unavailable: %w", err)
+	}
 
 	// Gather lane states.
 	lanes := e.lanes()
@@ -976,25 +981,29 @@ func (e *Engine) observeLaneState(lane string) LaneStateSnapshot {
 }
 
 type boardCard struct {
-	Ref           string   `json:"ref,omitempty"`
-	ID            string   `json:"id,omitempty"`
-	Key           string   `json:"key,omitempty"`
-	Title         string   `json:"title,omitempty"`
-	Status        string   `json:"status,omitempty"`
-	Column        string   `json:"column,omitempty"`
-	State         string   `json:"state,omitempty"`
-	Owner         string   `json:"owner,omitempty"`
-	Assignee      string   `json:"assignee,omitempty"`
-	AssignedTo    string   `json:"assigned_to,omitempty"`
-	AssignedAgent string   `json:"assignedAgent,omitempty"`
-	Lane          string   `json:"lane,omitempty"`
-	Labels        []any    `json:"labels,omitempty"`
-	Blocked       *bool    `json:"blocked,omitempty"`
-	BlockedBy     []string `json:"blocked_by,omitempty"`
-	UpdatedAt     string   `json:"updated_at,omitempty"`
-	CreatedAt     string   `json:"created_at,omitempty"`
-	ReviewedAt    string   `json:"reviewed_at,omitempty"`
-	MergedAt      string   `json:"merged_at,omitempty"`
+	Ref            string   `json:"ref,omitempty"`
+	ID             string   `json:"id,omitempty"`
+	Key            string   `json:"key,omitempty"`
+	Title          string   `json:"title,omitempty"`
+	Status         string   `json:"status,omitempty"`
+	Column         string   `json:"column,omitempty"`
+	State          string   `json:"state,omitempty"`
+	Owner          string   `json:"owner,omitempty"`
+	Assignee       string   `json:"assignee,omitempty"`
+	AssignedTo     string   `json:"assigned_to,omitempty"`
+	AssignedAgent  string   `json:"assignedAgent,omitempty"`
+	AssigneeName   string   `json:"assigneeName,omitempty"`
+	AssigneeID     string   `json:"assigneeId,omitempty"`
+	Lane           string   `json:"lane,omitempty"`
+	Labels         []any    `json:"labels,omitempty"`
+	Blocked        *bool    `json:"blocked,omitempty"`
+	BlockedBy      []string `json:"blocked_by,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+	CreatedAt      string   `json:"created_at,omitempty"`
+	UpdatedAtCamel string   `json:"updatedAt,omitempty"`
+	CreatedAtCamel string   `json:"createdAt,omitempty"`
+	ReviewedAt     string   `json:"reviewed_at,omitempty"`
+	MergedAt       string   `json:"merged_at,omitempty"`
 }
 
 func (e *Engine) computeSummary(agentsWrapper struct {
@@ -1163,6 +1172,12 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			owner = c.AssignedAgent
 		}
 		if owner == "" {
+			owner = c.AssigneeName
+		}
+		if owner == "" {
+			owner = c.AssigneeID
+		}
+		if owner == "" {
 			owner = c.Lane
 		}
 		owner = strings.TrimSpace(owner)
@@ -1196,6 +1211,14 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 				}
 			}
 		}
+		updatedAt := c.UpdatedAt
+		if updatedAt == "" {
+			updatedAt = c.UpdatedAtCamel
+		}
+		createdAt := c.CreatedAt
+		if createdAt == "" {
+			createdAt = c.CreatedAtCamel
+		}
 
 		normalized = append(normalized, cardNorm{
 			Ref:        ref,
@@ -1205,8 +1228,8 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			Lane:       strings.TrimSpace(c.Lane),
 			Role:       recognizedRole(labels, e.HoldRoles),
 			Blocked:    blocked,
-			UpdatedAt:  c.UpdatedAt,
-			CreatedAt:  c.CreatedAt,
+			UpdatedAt:  updatedAt,
+			CreatedAt:  createdAt,
 			ReviewedAt: c.ReviewedAt,
 			MergedAt:   c.MergedAt,
 		})
@@ -1374,6 +1397,7 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 			if held {
 				continue
 			}
+			var mutationOut []byte
 			if reclaimHook != "" {
 				cmd := exec.Command(reclaimHook,
 					"--ref", sc.Ref,
@@ -1381,19 +1405,29 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 					"--reason", "stale in-progress owner",
 					"--return-to-to-do",
 				)
-				if out, err := cmd.CombinedOutput(); err != nil {
+				out, err := cmd.CombinedOutput()
+				if err != nil {
 					return fmt.Errorf("reclaim hook failed for %s: %w\n%s", sc.Ref, err, string(out))
 				}
+				mutationOut = out
 			} else {
 				cmd := exec.Command(e.kaneoBin(), "task", "status", sc.Ref, "to-do")
-				if out, err := cmd.CombinedOutput(); err != nil {
+				out, err := cmd.CombinedOutput()
+				if err != nil {
 					return fmt.Errorf("reclaim via kaneo failed for %s: %w\n%s", sc.Ref, err, string(out))
 				}
+				mutationOut = out
+			}
+			if err := rejectKaneoErrorEnvelope("reclaim status", mutationOut); err != nil {
+				return fmt.Errorf("reclaim via kaneo failed for %s: %w", sc.Ref, err)
 			}
 
 			// Authoritative readback.
 			readbackData, err := e.authoritativeReadback("reclaim", sc.Ref, "", "", "")
-			if err == nil && !e.verifyReclaimReadback(sc.Ref, readbackData) {
+			if err != nil {
+				return fmt.Errorf("reclaim readback failed for %s: %w", sc.Ref, err)
+			}
+			if !e.verifyReclaimReadback(sc.Ref, readbackData) {
 				return fmt.Errorf("reclaim readback did not prove to-do/unassigned for %s", sc.Ref)
 			}
 
@@ -1477,7 +1511,10 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 		}
 
 		readbackData, err := e.authoritativeReadback("route", blockedRefs, replacementRef, routeLane, routeOwner)
-		if err == nil && !e.verifyRoutingReadback(readbackData, replacementRef, routeLane, routeOwner) {
+		if err != nil {
+			return fmt.Errorf("routing readback failed: %w", err)
+		}
+		if !e.verifyRoutingReadback(readbackData, replacementRef, routeLane, routeOwner) {
 			return fmt.Errorf("routing readback did not prove the exact replacement/lane/owner")
 		}
 
@@ -1816,6 +1853,10 @@ func (e *Engine) resolveRoleLane(role string) (string, error) {
 }
 
 func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, owner string) ([]byte, error) {
+	var (
+		out []byte
+		err error
+	)
 	if e.ReadbackHook != "" {
 		args := []string{"--action", action, "--ref", refOrRefs}
 		if replacementRef != "" {
@@ -1828,16 +1869,28 @@ func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, 
 			args = append(args, "--owner", owner)
 		}
 		args = append(args, "--after-action")
-		return exec.Command(e.ReadbackHook, args...).Output()
+		out, err = exec.Command(e.ReadbackHook, args...).Output()
+	} else if action == "reclaim" {
+		out, err = exec.Command(e.kaneoBin(), "task", "get", refOrRefs, "--json").Output()
+	} else if replacementRef != "" {
+		out, err = exec.Command(e.kaneoBin(), "task", "get", replacementRef, "--json").Output()
+	} else {
+		return nil, fmt.Errorf("cannot determine readback target")
 	}
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectKaneoErrorEnvelope("authoritative readback", out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
-	if action == "reclaim" {
-		return exec.Command(e.kaneoBin(), "task", "get", refOrRefs, "--json").Output()
+func rejectKaneoErrorEnvelope(operation string, payload []byte) error {
+	if kaneoErrorEnvelopePattern.Match(payload) {
+		return fmt.Errorf("%s: kaneo exited 0 but returned an error envelope", operation)
 	}
-	if replacementRef != "" {
-		return exec.Command(e.kaneoBin(), "task", "get", replacementRef, "--json").Output()
-	}
-	return nil, fmt.Errorf("cannot determine readback target")
+	return nil
 }
 
 func (e *Engine) verifyReclaimReadback(ref string, payload []byte) bool {
@@ -1852,6 +1905,8 @@ func (e *Engine) verifyReclaimReadback(ref string, payload []byte) bool {
 		Assignee      string `json:"assignee"`
 		AssignedTo    string `json:"assigned_to"`
 		AssignedAgent string `json:"assignedAgent"`
+		AssigneeName  string `json:"assigneeName"`
+		AssigneeID    string `json:"assigneeId"`
 	}
 	if err := json.Unmarshal(payload, &card); err != nil {
 		return false
@@ -1886,6 +1941,12 @@ func (e *Engine) verifyReclaimReadback(ref string, payload []byte) bool {
 	if owner == "" {
 		owner = card.AssignedAgent
 	}
+	if owner == "" {
+		owner = card.AssigneeName
+	}
+	if owner == "" {
+		owner = card.AssigneeID
+	}
 	return owner == ""
 }
 
@@ -1902,6 +1963,8 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 		Assignee      string `json:"assignee"`
 		AssignedTo    string `json:"assigned_to"`
 		AssignedAgent string `json:"assignedAgent"`
+		AssigneeName  string `json:"assigneeName"`
+		AssigneeID    string `json:"assigneeId"`
 		Lane          string `json:"lane"`
 		AssignedLane  string `json:"assigned_lane"`
 		Labels        []any  `json:"labels"`
@@ -1924,6 +1987,8 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 			Assignee      string `json:"assignee"`
 			AssignedTo    string `json:"assigned_to"`
 			AssignedAgent string `json:"assignedAgent"`
+			AssigneeName  string `json:"assigneeName"`
+			AssigneeID    string `json:"assigneeId"`
 			Lane          string `json:"lane"`
 			AssignedLane  string `json:"assigned_lane"`
 			Labels        []any  `json:"labels"`
@@ -1940,6 +2005,8 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 			Assignee      string `json:"assignee"`
 			AssignedTo    string `json:"assigned_to"`
 			AssignedAgent string `json:"assignedAgent"`
+			AssigneeName  string `json:"assigneeName"`
+			AssigneeID    string `json:"assigneeId"`
 			Lane          string `json:"lane"`
 			AssignedLane  string `json:"assigned_lane"`
 			Labels        []any  `json:"labels"`
@@ -1965,6 +2032,8 @@ func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, own
 			Assignee      string `json:"assignee"`
 			AssignedTo    string `json:"assigned_to"`
 			AssignedAgent string `json:"assignedAgent"`
+			AssigneeName  string `json:"assigneeName"`
+			AssigneeID    string `json:"assigneeId"`
 			Lane          string `json:"lane"`
 			AssignedLane  string `json:"assigned_lane"`
 			Labels        []any  `json:"labels"`
@@ -1987,6 +2056,8 @@ func (e *Engine) checkRoutingCard(card struct {
 	Assignee      string `json:"assignee"`
 	AssignedTo    string `json:"assigned_to"`
 	AssignedAgent string `json:"assignedAgent"`
+	AssigneeName  string `json:"assigneeName"`
+	AssigneeID    string `json:"assigneeId"`
 	Lane          string `json:"lane"`
 	AssignedLane  string `json:"assigned_lane"`
 	Labels        []any  `json:"labels"`
@@ -2032,6 +2103,12 @@ func (e *Engine) checkRoutingCard(card struct {
 	}
 	if cardOwner == "" {
 		cardOwner = card.AssignedAgent
+	}
+	if cardOwner == "" {
+		cardOwner = card.AssigneeName
+	}
+	if cardOwner == "" {
+		cardOwner = card.AssigneeID
 	}
 	if cardOwner != owner {
 		return false
