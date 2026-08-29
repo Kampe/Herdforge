@@ -5118,24 +5118,7 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		return revision, nil
 	}
 	d.RunStateGraphForTask = func(ctx context.Context, saved runstate.TaskState) (string, error) {
-		scoped, ok := depStore.(interface {
-			SnapshotGraphForTask(context.Context, deps.Ref, deps.TaskID, []deps.DependencyEdge) (*deps.GraphSnapshot, error)
-		})
-		if !ok {
-			return "", errors.New("dependency graph task snapshot: scoped authority unavailable")
-		}
-		snapshot, snapshotErr := scoped.SnapshotGraphForTask(ctx, deps.Ref(saved.Ref), deps.TaskID(saved.ID), nil)
-		if snapshotErr != nil {
-			return "", fmt.Errorf("dependency graph task snapshot: %w", snapshotErr)
-		}
-		if snapshot == nil {
-			return "", errors.New("dependency graph task snapshot returned empty revision")
-		}
-		revision := deps.GraphRevision(snapshot.Edges, nil, snapshot.ProviderRevision)
-		if strings.TrimSpace(revision) == "" {
-			return "", errors.New("dependency graph task snapshot returned empty revision")
-		}
-		return revision, nil
+		return taskScopedGraphRevision(ctx, depStore, saved)
 	}
 	// FAC-147: hosted board mutations go through ClaimStack Begin/Complete.
 	// Local Herdr mode uses the authenticated single-user Kaneo client directly;
