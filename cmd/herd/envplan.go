@@ -114,28 +114,32 @@ func environmentBindingForRequest(ctx context.Context, req environmentBindingReq
 
 func environmentTaskGraphAuthority(store deps.RelationStore) runstate.GraphAuthorityForTask {
 	return func(ctx context.Context, saved runstate.TaskState) (string, error) {
-		if store == nil || strings.TrimSpace(saved.ID) == "" || strings.TrimSpace(saved.Ref) == "" {
-			return "", errors.New("dependency graph task snapshot: exact task identity is required")
-		}
-		scoped, ok := store.(interface {
-			SnapshotGraphForTask(context.Context, deps.Ref, deps.TaskID, []deps.DependencyEdge) (*deps.GraphSnapshot, error)
-		})
-		if !ok {
-			return "", errors.New("dependency graph task snapshot: scoped authority unavailable")
-		}
-		snapshot, err := scoped.SnapshotGraphForTask(ctx, deps.Ref(saved.Ref), deps.TaskID(saved.ID), nil)
-		if err != nil {
-			return "", fmt.Errorf("dependency graph task snapshot: %w", err)
-		}
-		if snapshot == nil {
-			return "", errors.New("dependency graph task snapshot returned empty revision")
-		}
-		revision := deps.GraphRevision(snapshot.Edges, nil, snapshot.ProviderRevision)
-		if strings.TrimSpace(revision) == "" {
-			return "", errors.New("dependency graph task snapshot returned empty revision")
-		}
-		return revision, nil
+		return taskScopedGraphRevision(ctx, store, saved)
 	}
+}
+
+func taskScopedGraphRevision(ctx context.Context, store deps.RelationStore, saved runstate.TaskState) (string, error) {
+	if store == nil || strings.TrimSpace(saved.ID) == "" || strings.TrimSpace(saved.Ref) == "" {
+		return "", errors.New("dependency graph task snapshot: exact task identity is required")
+	}
+	scoped, ok := store.(interface {
+		SnapshotGraphForTask(context.Context, deps.Ref, deps.TaskID, []deps.DependencyEdge) (*deps.GraphSnapshot, error)
+	})
+	if !ok {
+		return "", errors.New("dependency graph task snapshot: scoped authority unavailable")
+	}
+	snapshot, err := scoped.SnapshotGraphForTask(ctx, deps.Ref(saved.Ref), deps.TaskID(saved.ID), nil)
+	if err != nil {
+		return "", fmt.Errorf("dependency graph task snapshot: %w", err)
+	}
+	if snapshot == nil {
+		return "", errors.New("dependency graph task snapshot returned empty revision")
+	}
+	revision := deps.GraphRevision(snapshot.Edges, nil, snapshot.ProviderRevision)
+	if strings.TrimSpace(revision) == "" {
+		return "", errors.New("dependency graph task snapshot returned empty revision")
+	}
+	return revision, nil
 }
 
 func environmentBindingFromAuthorities(ctx context.Context, req environmentBindingRequest, a environmentBindingAuthorities) (envplan.Binding, error) {
