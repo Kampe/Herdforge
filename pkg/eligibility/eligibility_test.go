@@ -326,6 +326,16 @@ func TestSelectEligible_RequiresClaimRole(t *testing.T) {
 	}
 }
 
+func TestResolveRoleAcceptsConfiguredProjectImplementationRole(t *testing.T) {
+	provider.RegisterProjectImplementationRoles([]string{"platform-ops"})
+	t.Cleanup(func() { provider.RegisterProjectImplementationRoles(nil) })
+
+	role, ok := ResolveRole(&provider.Task{Ref: "CHA-1", Labels: []string{"platform-ops"}}, nil)
+	if !ok || role != "platform-ops" {
+		t.Fatalf("ResolveRole() = (%q, %v), want (platform-ops, true)", role, ok)
+	}
+}
+
 func TestEvaluateBoard_Buckets(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(readyTask("FAC-1"))
