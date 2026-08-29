@@ -22,6 +22,19 @@ func installFakeKaneo(t *testing.T, body string) string {
 	return logPath
 }
 
+func installFakeReclaimHook(t *testing.T, body string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "reclaim-hook")
+	script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_RECLAIM_LOG\"\n" + body + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake reclaim hook: %v", err)
+	}
+	logPath := filepath.Join(dir, "calls.log")
+	t.Setenv("FAKE_RECLAIM_LOG", logPath)
+	return path, logPath
+}
+
 func writeLifecycleAgents(t *testing.T, payload string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "agents.json")
@@ -109,14 +122,11 @@ esac`)
 	}
 }
 
-func TestLifecycleActUsesSupportedKaneoStatusAndExactReadback(t *testing.T) {
+func TestLifecycleActUsesConfiguredReclaimHookAndExactKaneoReadback(t *testing.T) {
 	logPath := installFakeKaneo(t, `
 case "$*" in
   "task list --all --json")
     printf '%s\n' '[{"ref":"FAC-900","status":"in-progress","labels":[{"name":"worker"}]}]'
-    ;;
-  "task status FAC-900 to-do")
-    printf '%s\n' '{"ref":"FAC-900","status":"to-do"}'
     ;;
   "task get FAC-900 --json")
     printf '%s\n' '{"ref":"FAC-900","status":"to-do","assigneeName":null}'
@@ -126,10 +136,13 @@ case "$*" in
     exit 64
     ;;
 esac`)
+	reclaimHook, reclaimLog := installFakeReclaimHook(t, `
+printf '%s\n' '{"ref":"FAC-900","status":"to-do"}'`)
 
 	eng := &Engine{
-		AgentsFile: writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
-		HoldRoles:  []string{"worker"},
+		AgentsFile:  writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
+		HoldRoles:   []string{"worker"},
+		ReclaimHook: reclaimHook,
 	}
 	summary, err := eng.Act()
 	if err != nil {
@@ -140,12 +153,41 @@ esac`)
 	}
 	want := []string{
 		"task list --all --json",
-		"task status FAC-900 to-do",
 		"task get FAC-900 --json",
 	}
 	calls := readKaneoCalls(t, logPath)
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("unexpected kaneo calls:\n got %v\nwant %v", calls, want)
+	}
+	wantHook := "--ref FAC-900 --owner worker --reason stale in-progress owner --return-to-to-do"
+	if calls := readKaneoCalls(t, reclaimLog); len(calls) != 1 || calls[0] != wantHook {
+		t.Fatalf("unexpected reclaim hook calls: got %v want %q", calls, wantHook)
+	}
+}
+
+func TestLifecycleActRefusesStaleReclaimWithoutConfiguredHookBeforeMutation(t *testing.T) {
+	logPath := installFakeKaneo(t, `
+case "$*" in
+  "task list --all --json")
+    printf '%s\n' '[{"ref":"FAC-900","status":"in-progress","labels":[{"name":"worker"}]}]'
+    ;;
+  *)
+    printf 'unexpected mutation/readback: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac`)
+
+	eng := &Engine{
+		AgentsFile: writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
+		HoldRoles:  []string{"worker"},
+	}
+	_, err := eng.Act()
+	wantErr := "lifecycle: stale reclaim requires a configured repository-approved ReclaimHook; refusing direct board mutation"
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("missing hook must fail before mutation: got %v want %q", err, wantErr)
+	}
+	if calls := readKaneoCalls(t, logPath); len(calls) != 1 || calls[0] != "task list --all --json" {
+		t.Fatalf("missing hook attempted a mutation/readback: %v", calls)
 	}
 }
 
@@ -171,30 +213,47 @@ exit 0`)
 	}
 }
 
+func TestLifecycleObserveAcceptsDescriptionContainingErrorFieldText(t *testing.T) {
+	installFakeKaneo(t, `
+printf '%s\n' '[{"ref":"FAC-900","status":"to-do","description":"documents an escaped \"error\": field","labels":[{"name":"worker"}]}]'
+exit 0`)
+	eng := &Engine{
+		AgentsFile: writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
+		HoldRoles:  []string{"worker"},
+	}
+	summary, err := eng.Point()
+	if err != nil {
+		t.Fatalf("legitimate description text was rejected as an error envelope: %v", err)
+	}
+	if summary.Todo != 1 || summary.Dispatchable != 1 {
+		t.Fatalf("legitimate board payload was not observed: %+v", summary)
+	}
+}
+
 func TestLifecycleActFailsClosedOnKaneoStatusErrorEnvelope(t *testing.T) {
 	logPath := installFakeKaneo(t, `
 case "$*" in
   "task list --all --json")
     printf '%s\n' '[{"ref":"FAC-900","status":"in-progress","labels":[{"name":"worker"}]}]'
     ;;
-  "task status FAC-900 to-do")
-    printf '%s\n' '{"error":"write failed"}'
-    ;;
   *)
     printf 'unexpected args: %s\n' "$*" >&2
     exit 64
     ;;
 esac`)
+	reclaimHook, _ := installFakeReclaimHook(t, `
+printf '%s\n' '{"error":"write failed"}'`)
 
 	eng := &Engine{
-		AgentsFile: writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
-		HoldRoles:  []string{"worker"},
+		AgentsFile:  writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
+		HoldRoles:   []string{"worker"},
+		ReclaimHook: reclaimHook,
 	}
 	_, err := eng.Act()
 	if err == nil || !strings.Contains(err.Error(), "error envelope") {
 		t.Fatalf("exit-zero status error must fail closed, got %v", err)
 	}
-	want := []string{"task list --all --json", "task status FAC-900 to-do"}
+	want := []string{"task list --all --json"}
 	if calls := readKaneoCalls(t, logPath); strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("status error must stop before readback: got %v want %v", calls, want)
 	}
@@ -206,9 +265,6 @@ case "$*" in
   "task list --all --json")
     printf '%s\n' '[{"ref":"FAC-900","status":"in-progress","labels":[{"name":"worker"}]}]'
     ;;
-  "task status FAC-900 to-do")
-    printf '%s\n' '{"ref":"FAC-900","status":"to-do"}'
-    ;;
   "task get FAC-900 --json")
     printf '%s\n' '{"error":"read failed"}'
     ;;
@@ -217,10 +273,13 @@ case "$*" in
     exit 64
     ;;
 esac`)
+	reclaimHook, _ := installFakeReclaimHook(t, `
+printf '%s\n' '{"ref":"FAC-900","status":"to-do"}'`)
 
 	eng := &Engine{
-		AgentsFile: writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
-		HoldRoles:  []string{"worker"},
+		AgentsFile:  writeLifecycleAgents(t, `{"result":{"agents":[]}}`),
+		HoldRoles:   []string{"worker"},
+		ReclaimHook: reclaimHook,
 	}
 	_, err := eng.Act()
 	if err == nil || !strings.Contains(err.Error(), "error envelope") {
@@ -228,7 +287,6 @@ esac`)
 	}
 	want := []string{
 		"task list --all --json",
-		"task status FAC-900 to-do",
 		"task get FAC-900 --json",
 	}
 	if calls := readKaneoCalls(t, logPath); strings.Join(calls, "\n") != strings.Join(want, "\n") {

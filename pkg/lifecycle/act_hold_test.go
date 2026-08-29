@@ -60,6 +60,7 @@ func actHoldEngine(reader *actHoldReader) *Engine {
 func TestActModeStaleReclaimUsesConfiguredRoleLaneBeforeCommand(t *testing.T) {
 	reader := &actHoldReader{holdLane: false}
 	e := actHoldEngine(reader)
+	e.ReclaimHook = "/configured/repository-reclaim-hook"
 	s := &Summary{StaleInProgress: 1, StaleCards: []StaleCard{{Ref: "FAC-1", Role: "worker", Owner: "worker", Lane: "wrong"}}}
 	if err := e.executeActMode(t.TempDir(), t.TempDir(), s, nil, nil, nil, nil); err != nil {
 		t.Fatalf("held stale reclaim should skip independently: %v", err)

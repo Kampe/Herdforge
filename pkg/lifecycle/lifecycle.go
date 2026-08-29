@@ -38,8 +38,6 @@ const (
 	EventDefault EventType = "default"
 )
 
-var kaneoErrorEnvelopePattern = regexp.MustCompile(`"error"\s*:`)
-
 // EventRecord is the immutable payload published to the event lease store.
 type EventRecord struct {
 	EventID  string `json:"event_id"`
@@ -1385,7 +1383,10 @@ func (e *Engine) parseCards(boardJSON json.RawMessage) []boardCard {
 func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJSON, boardJSON json.RawMessage, stateEntries []LaneStateSnapshot, eventJSON json.RawMessage) error {
 	// 1. Reclaim stale in-progress cards.
 	if s.StaleInProgress > 0 {
-		reclaimHook := e.ReclaimHook
+		reclaimHook := strings.TrimSpace(e.ReclaimHook)
+		if reclaimHook == "" {
+			return fmt.Errorf("lifecycle: stale reclaim requires a configured repository-approved ReclaimHook; refusing direct board mutation")
+		}
 		for _, sc := range s.StaleCards {
 			if strings.TrimSpace(sc.Role) == "" {
 				return fmt.Errorf("lifecycle: stale card %s has no configured role", sc.Ref)
@@ -1397,29 +1398,18 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 			if held {
 				continue
 			}
-			var mutationOut []byte
-			if reclaimHook != "" {
-				cmd := exec.Command(reclaimHook,
-					"--ref", sc.Ref,
-					"--owner", sc.Owner,
-					"--reason", "stale in-progress owner",
-					"--return-to-to-do",
-				)
-				out, err := cmd.CombinedOutput()
-				if err != nil {
-					return fmt.Errorf("reclaim hook failed for %s: %w\n%s", sc.Ref, err, string(out))
-				}
-				mutationOut = out
-			} else {
-				cmd := exec.Command(e.kaneoBin(), "task", "status", sc.Ref, "to-do")
-				out, err := cmd.CombinedOutput()
-				if err != nil {
-					return fmt.Errorf("reclaim via kaneo failed for %s: %w\n%s", sc.Ref, err, string(out))
-				}
-				mutationOut = out
+			cmd := exec.Command(reclaimHook,
+				"--ref", sc.Ref,
+				"--owner", sc.Owner,
+				"--reason", "stale in-progress owner",
+				"--return-to-to-do",
+			)
+			mutationOut, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("reclaim hook failed for %s: %w\n%s", sc.Ref, err, string(mutationOut))
 			}
 			if err := rejectKaneoErrorEnvelope("reclaim status", mutationOut); err != nil {
-				return fmt.Errorf("reclaim via kaneo failed for %s: %w", sc.Ref, err)
+				return fmt.Errorf("reclaim hook failed for %s: %w", sc.Ref, err)
 			}
 
 			// Authoritative readback.
@@ -1887,7 +1877,11 @@ func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, 
 }
 
 func rejectKaneoErrorEnvelope(operation string, payload []byte) error {
-	if kaneoErrorEnvelopePattern.Match(payload) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &envelope); err != nil || envelope == nil {
+		return nil
+	}
+	if _, ok := envelope["error"]; ok {
 		return fmt.Errorf("%s: kaneo exited 0 but returned an error envelope", operation)
 	}
 	return nil
