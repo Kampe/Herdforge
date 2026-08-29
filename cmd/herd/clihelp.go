@@ -88,11 +88,11 @@ var subcommandUsage = map[string]string{
 	"review-ledger": "Usage: herd review-ledger list|queued|pending|tier <sha>|readiness <sha>...|drift|evidence-gap [--with-board]\n" +
 		"  Append-only review ledger operations; drift reports live standing builder-family mismatches.\n" +
 		"  evidence-gap (FAC-578): lists non-closeable ledger Task values; --with-board also lists in-review cards with no ledger evidence.",
-	"drain":            "Usage: herd drain [flags]\n  Drain control / review backlog.",
-	"approve":          "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
-	"feedback":         "Usage: herd feedback [flags]\n  Census fleet-wide control-plane feedback.",
-	"fence-broker":     "Usage: herd fence-broker [flags]\n  Inspect or enforce the broker authority fence.",
-	"fence-provision":  "Usage: herd fence-provision [flags]\n  Provision the coordinator fence authority.",
+	"drain":           "Usage: herd drain [flags]\n  Drain control / review backlog.",
+	"approve":         "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
+	"feedback":        "Usage: herd feedback [flags]\n  Census fleet-wide control-plane feedback.",
+	"fence-broker":    "Usage: herd fence-broker [flags]\n  Inspect or enforce the broker authority fence.",
+	"fence-provision": "Usage: herd fence-provision [flags]\n  Provision the coordinator fence authority.",
 	"harvest-merge": "Usage: herd harvest-merge <branch> [flags]\n" +
 		"  Cherry-pick reviewed commits onto a fresh base, or prove an existing landing.\n" +
 		"\n" +
@@ -212,7 +212,11 @@ Recovery:
   Releases only that coordinator-dispatch lease generation.`,
 	"envplan": `Usage: herd envplan <create|inspect|grant|revoke> [flags]
   Operator-managed, repository-relative environment capability plans. Plans
-  record capability evidence and bindings only; credential values are refused.`,
+  record capability evidence and bindings only; credential values are refused.
+
+Recovery during create:
+  --recover-stale-run  Explicit coordinator recovery of one exact stale dispatch run
+  --task-id <id>       Exact provider task ID required by --recover-stale-run`,
 	"deps": `Usage: herd deps <selftest|check|reconcile|migrate> [args]
   Packet↔board dependency-graph conformance (FAC-159).
 

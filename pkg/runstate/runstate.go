@@ -26,6 +26,7 @@ var (
 	ErrAmbiguous  = errors.New("runstate: state is ambiguous")
 	ErrConcurrent = errors.New("runstate: checkpoint revision changed")
 	ErrTerminal   = errors.New("runstate: task is terminal")
+	ErrNotStale   = errors.New("runstate: saved state is not stale")
 )
 
 // Policy is the resolved lane/model decision, never an unresolved selector.
@@ -41,6 +42,7 @@ type Policy struct {
 type TaskState struct {
 	Ref              string            `json:"ref"`
 	ID               string            `json:"id"`
+	ProjectID        string            `json:"project_id,omitempty"`
 	ProviderRevision string            `json:"provider_revision"`
 	Status           string            `json:"status"`
 	Terminal         bool              `json:"terminal"`
@@ -48,17 +50,29 @@ type TaskState struct {
 	Residuals        []residual.Record `json:"residuals,omitempty"`
 }
 
+// StaleRecovery binds an idempotent replacement to the exact stale revision
+// and live authorities used to rebuild it.
+type StaleRecovery struct {
+	FromRevision     int64  `json:"from_revision"`
+	TaskRef          string `json:"task_ref"`
+	TaskID           string `json:"task_id"`
+	ProjectID        string `json:"project_id"`
+	ProviderRevision string `json:"provider_revision"`
+	GraphRevision    string `json:"graph_revision"`
+}
+
 // BuildRun is the immutable scheduling snapshot plus mutable per-task states.
 type BuildRun struct {
-	SchemaVersion           int         `json:"schema_version"`
-	ID                      string      `json:"id"`
-	Goal                    string      `json:"goal"`
-	Ref                     string      `json:"ref"`
-	DependencyGraphRevision string      `json:"dependency_graph_revision"`
-	Policy                  Policy      `json:"policy"`
-	Wave                    int         `json:"wave"`
-	Level                   int         `json:"level"`
-	Tasks                   []TaskState `json:"tasks"`
+	SchemaVersion           int            `json:"schema_version"`
+	ID                      string         `json:"id"`
+	Goal                    string         `json:"goal"`
+	Ref                     string         `json:"ref"`
+	DependencyGraphRevision string         `json:"dependency_graph_revision"`
+	Policy                  Policy         `json:"policy"`
+	Wave                    int            `json:"wave"`
+	Level                   int            `json:"level"`
+	Tasks                   []TaskState    `json:"tasks"`
+	Recovery                *StaleRecovery `json:"stale_recovery,omitempty"`
 }
 
 // RunState is one durable optimistic revision of a BuildRun.
@@ -84,6 +98,21 @@ type Authority struct {
 	Tasks        provider.TaskProvider
 	Graph        GraphAuthority
 	GraphForTask GraphAuthorityForTask
+}
+
+// RecoveryRequest is the coordinator's exact selector for one dispatch run.
+type RecoveryRequest struct {
+	RunID     string
+	TaskRef   string
+	TaskID    string
+	ProjectID string
+}
+
+// RecoveryAuthority adds the live lease/launch refusal boundary to the
+// provider and graph authorities already required for resume.
+type RecoveryAuthority struct {
+	Authority
+	Guard func(context.Context, TaskState) error
 }
 
 // Store is a SQLite-backed, cross-process durable run-state store.
@@ -234,6 +263,101 @@ func (s *Store) Resume(ctx context.Context, id string, a Authority) (*RunState, 
 	return state, nil
 }
 
+// RecoverStale atomically replaces one exact stale dispatch row with a fresh
+// provider/graph-bound revision. It never deletes the row, and a retry of the
+// same completed recovery returns the durable readback without rewriting it.
+func (s *Store) RecoverStale(ctx context.Context, req RecoveryRequest, a RecoveryAuthority) (*RunState, error) {
+	if strings.TrimSpace(req.RunID) == "" || strings.TrimSpace(req.TaskRef) == "" || strings.TrimSpace(req.TaskID) == "" || strings.TrimSpace(req.ProjectID) == "" || req.RunID != "dispatch:"+req.TaskID {
+		return nil, fmt.Errorf("%w: incomplete or mismatched recovery identity", ErrAmbiguous)
+	}
+	if a.Tasks == nil || (a.Graph == nil && a.GraphForTask == nil) || a.Guard == nil {
+		return nil, fmt.Errorf("%w: incomplete recovery authority", ErrAmbiguous)
+	}
+	state, err := s.Load(ctx, req.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if len(state.Tasks) != 1 || state.Goal != "dispatch" || state.Ref != req.TaskRef || state.Tasks[0].ID != req.TaskID || state.Tasks[0].Ref != req.TaskRef {
+		return nil, fmt.Errorf("%w: saved dispatch identity does not match request", ErrAmbiguous)
+	}
+
+	live, err := a.Tasks.GetTask(ctx, req.TaskID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: task %s unreadable: %v", ErrStale, req.TaskRef, err)
+	}
+	if live == nil || live.ID != req.TaskID || live.Ref != req.TaskRef || live.ProjectID != req.ProjectID {
+		return nil, fmt.Errorf("%w: live task identity or project does not match request", ErrAmbiguous)
+	}
+	status := provider.NormalizeStatus(live.Status)
+	if status == provider.StatusUnknown || strings.HasPrefix(status, provider.StatusUnknown+":") {
+		return nil, fmt.Errorf("%w: provider status is UNKNOWN", ErrAmbiguous)
+	}
+	if !provider.IsActiveStatus(status) {
+		return nil, fmt.Errorf("%w: %s", ErrTerminal, req.TaskRef)
+	}
+	liveRevision := string(provider.EncodeRevision(live))
+	if strings.TrimSpace(liveRevision) == "" {
+		return nil, fmt.Errorf("%w: provider revision is UNKNOWN", ErrAmbiguous)
+	}
+
+	graph := ""
+	if a.GraphForTask != nil {
+		graph, err = a.GraphForTask(ctx, state.Tasks[0])
+	} else {
+		graph, err = a.Graph(ctx)
+	}
+	if err != nil || strings.TrimSpace(graph) == "" {
+		return nil, fmt.Errorf("%w: graph unreadable: %v", ErrStale, err)
+	}
+	liveTask := TaskState{Ref: live.Ref, ID: live.ID, ProjectID: live.ProjectID, ProviderRevision: liveRevision, Status: status, Terminal: false, Residuals: append([]residual.Record(nil), live.Residuals...)}
+	if err := a.Guard(ctx, liveTask); err != nil {
+		return nil, err
+	}
+	if recoveredStateMatches(state, req, liveRevision, graph) {
+		return state, nil
+	}
+	if state.DependencyGraphRevision == graph && state.Tasks[0].ProviderRevision == liveRevision && provider.NormalizeStatus(state.Tasks[0].Status) == status && !state.Tasks[0].Terminal {
+		return nil, ErrNotStale
+	}
+
+	next, err := FromTasks(state.ID, state.Goal, state.Ref, graph, state.Policy, state.Wave, state.Level, []*provider.Task{live})
+	if err != nil {
+		return nil, fmt.Errorf("rebuild stale runstate: %w", err)
+	}
+	next.Recovery = &StaleRecovery{FromRevision: state.Revision, TaskRef: req.TaskRef, TaskID: req.TaskID, ProjectID: req.ProjectID, ProviderRevision: liveRevision, GraphRevision: graph}
+	if _, err := s.Checkpoint(ctx, next, state.Revision); err != nil {
+		if !errors.Is(err, ErrConcurrent) {
+			return nil, err
+		}
+		current, loadErr := s.Load(ctx, req.RunID)
+		if loadErr != nil || !recoveredStateMatches(current, req, liveRevision, graph) {
+			return nil, ErrConcurrent
+		}
+		return current, nil
+	}
+	current, err := s.Load(ctx, req.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("read back recovered runstate: %w", err)
+	}
+	if !recoveredStateMatches(current, req, liveRevision, graph) {
+		return nil, fmt.Errorf("%w: recovered row readback mismatch", ErrConcurrent)
+	}
+	return current, nil
+}
+
+func recoveredStateMatches(state *RunState, req RecoveryRequest, providerRevision, graph string) bool {
+	if state == nil || state.Recovery == nil || len(state.Tasks) != 1 {
+		return false
+	}
+	r := state.Recovery
+	task := state.Tasks[0]
+	return state.ID == req.RunID && state.Revision == r.FromRevision+1 &&
+		r.TaskRef == req.TaskRef && r.TaskID == req.TaskID && r.ProjectID == req.ProjectID &&
+		r.ProviderRevision == providerRevision && r.GraphRevision == graph &&
+		state.DependencyGraphRevision == graph && task.Ref == req.TaskRef && task.ID == req.TaskID &&
+		task.ProjectID == req.ProjectID && task.ProviderRevision == providerRevision
+}
+
 // Dispatchable rejects tasks terminal in this exact saved run. It is intended
 // to gate all resume redispatch paths before they call lifecycle/dispatch.
 func (r *RunState) Dispatchable(ref string) error {
@@ -254,7 +378,7 @@ func FromTasks(id, goal, ref, graph string, policy Policy, wave, level int, task
 		if t == nil {
 			return RunState{}, fmt.Errorf("%w: nil task", ErrAmbiguous)
 		}
-		r.Tasks = append(r.Tasks, TaskState{Ref: t.Ref, ID: t.ID, ProviderRevision: string(provider.EncodeRevision(t)), Status: provider.NormalizeStatus(t.Status), Terminal: terminal(t.Status), Residuals: append([]residual.Record(nil), t.Residuals...)})
+		r.Tasks = append(r.Tasks, TaskState{Ref: t.Ref, ID: t.ID, ProjectID: t.ProjectID, ProviderRevision: string(provider.EncodeRevision(t)), Status: provider.NormalizeStatus(t.Status), Terminal: terminal(t.Status), Residuals: append([]residual.Record(nil), t.Residuals...)})
 	}
 	if err := validate(&r.BuildRun); err != nil {
 		return RunState{}, err
@@ -308,6 +432,12 @@ func validate(r *BuildRun) error {
 			if residual.TaskID != t.ID || residual.TaskRef != t.Ref || residual.AcceptanceRevision != t.ProviderRevision {
 				return fmt.Errorf("%w: residual binding mismatch for %s", ErrAmbiguous, t.Ref)
 			}
+		}
+	}
+	if r.Recovery != nil {
+		recovery := r.Recovery
+		if recovery.FromRevision < 1 || recovery.TaskRef == "" || recovery.TaskID == "" || recovery.ProjectID == "" || recovery.ProviderRevision == "" || recovery.GraphRevision != r.DependencyGraphRevision || len(r.Tasks) != 1 || r.Tasks[0].Ref != recovery.TaskRef || r.Tasks[0].ID != recovery.TaskID || r.Tasks[0].ProjectID != recovery.ProjectID || r.Tasks[0].ProviderRevision != recovery.ProviderRevision {
+			return fmt.Errorf("%w: invalid stale recovery binding", ErrAmbiguous)
 		}
 	}
 	byID := make(map[string]bool, len(r.Tasks))
