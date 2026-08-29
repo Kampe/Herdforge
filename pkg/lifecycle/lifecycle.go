@@ -238,7 +238,7 @@ func (e *Engine) kaneoBin() string {
 	if e.KaneoBin != "" {
 		return e.KaneoBin
 	}
-	return filepath.Join(repoRoot(), "bin", "herd-kaneo")
+	return "kaneo"
 }
 
 func (e *Engine) sendBin() string {
@@ -860,9 +860,7 @@ func (e *Engine) Observe(act bool) (*Summary, error) {
 		}
 		boardJSON = data
 	} else {
-		out, err := exec.Command(e.kaneoBin(), "list",
-			"--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at",
-		).Output()
+		out, err := exec.Command(e.kaneoBin(), "task", "list", "--all", "--json").Output()
 		if err != nil {
 			return nil, fmt.Errorf("board unavailable: %w", err)
 		}
