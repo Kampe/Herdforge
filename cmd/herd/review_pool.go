@@ -160,7 +160,8 @@ func runPoolReview(ref string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("route resolved in %s: %s/%s\n", time.Since(routeStart).Round(time.Second), resolved.Provider, resolved.Model)
+		fmt.Printf("route resolved in %s: provider=%s model=%s pool=%s cache_age=%s\n",
+			time.Since(routeStart).Round(time.Second), resolved.Provider, resolved.Model, resolved.Pool, resolved.QuotaAge.Round(time.Second))
 		if err := preflightReviewerReadiness(resolved); err != nil {
 			return err
 		}
@@ -460,7 +461,7 @@ func runPoolReview(ref string) error {
 	cleanupTab = false
 	releaseOnFailure = false
 	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
-	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Family)
+	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s pool=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Pool, reviewer.Family)
 	return nil
 }
 
@@ -861,7 +862,9 @@ type poolReviewer struct {
 	Kind     string
 	Provider string
 	Model    string
+	Pool     string
 	Family   string
+	QuotaAge time.Duration
 	Argv     []string
 	Reason   string
 }
@@ -882,30 +885,58 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 		return poolReviewer{}, err
 	}
 	engine := usage.NewQuotaEngine()
-	computed := map[string]usage.BurnState{}
 	// FAC-679: reuse a RECENT quota reading rather than refetching every provider
 	// on every launch. Measured: this fetch was 29-272s while the rest of the
 	// launch was 1.4s. The reading's age is reported rather than hidden, because
 	// routing on quota that is silently minutes old can spend a request against a
 	// surface that has since gone to zero.
-	if snap, age, err := usage.FetchSnapshotCached(); err == nil {
+	snap, age, err := usage.FetchSnapshotCached()
+	if err == nil {
 		if age > 0 {
 			fmt.Printf("using quota reading from %s ago\n", age.Round(time.Second))
 		}
-		computed = engine.ComputeAll(snap)
 	} else {
-		// Fail loud but keep routing on availability: a quota outage must not
-		// silently collapse back onto a single hardcoded surface.
-		fmt.Fprintf(os.Stderr, "review --pool: WARN live quota unavailable (%v); routing on availability only\n", err)
+		return poolReviewer{}, fmt.Errorf("reviewer route rejected provider=%s model=%s pool=%s cache_age=unknown reason=UNKNOWN quota: live quota unavailable: %w",
+			strings.TrimSpace(provider), strings.TrimSpace(model), router.QuotaPoolFor(strings.TrimSpace(provider), strings.TrimSpace(model)), err)
 	}
-	route, err := router.NewRouter(engine, computed).Pick("qa", strings.TrimSpace(provider), strings.TrimSpace(excludeFamily))
+	computed := engine.ComputeAll(snap)
+	surfaceRouter := router.NewRouter(engine, computed)
+	if override := strings.TrimSpace(model); override != "" {
+		// FAC-657: the exact provider/model pair is the route. Running Pick first
+		// evaluated the provider's default model and only substituted the override
+		// afterward, so health, family, and quota evidence belonged to a model that
+		// would never launch.
+		probeResults := map[string]bool{}
+		launchable := surfaceRouter.Probes.Launchable
+		surfaceRouter.Probes.Launchable = func(provider, model string) (bool, string) {
+			ok, reason := launchable(provider, model)
+			probeResults[router.ProbeKey(provider, model)] = ok
+			return ok, reason
+		}
+		decision, decideErr := surfaceRouter.Decide(router.LaunchRequest{
+			Role:              router.RoleReviewSupervisor,
+			Shape:             "qa",
+			RequestedProvider: strings.TrimSpace(provider),
+			RequestedModel:    override,
+			ExcludedFamily:    strings.TrimSpace(excludeFamily),
+			ProbeResults:      probeResults,
+			StrictQuota:       true,
+		})
+		if decideErr != nil {
+			return poolReviewer{}, fmt.Errorf("reviewer route rejected provider=%s model=%s pool=%s cache_age=%s reason=%w",
+				strings.TrimSpace(provider), override, router.QuotaPoolFor(strings.TrimSpace(provider), override), age.Round(time.Second), decideErr)
+		}
+		return poolReviewer{
+			Kind: decision.Harness, Provider: decision.Provider, Model: decision.Model,
+			Pool: decision.Pool, Family: decision.Family, QuotaAge: age,
+			Argv: decision.HarnessArgv, Reason: decision.Rationale,
+		}, nil
+	}
+	route, err := surfaceRouter.Pick("qa", strings.TrimSpace(provider), strings.TrimSpace(excludeFamily))
 	if err != nil {
 		return poolReviewer{}, fmt.Errorf("route reviewer: %w", err)
 	}
 	pickedModel := route.Model
-	if override := strings.TrimSpace(model); override != "" {
-		pickedModel = override
-	}
 	kind, argv, err := router.HarnessArgvFor(route.Provider, pickedModel, route.Effort)
 	if err != nil {
 		return poolReviewer{}, fmt.Errorf("reviewer launch argv for %s/%s: %w", route.Provider, pickedModel, err)
@@ -918,8 +949,10 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 		// Recompute the family from the pair that actually launches: an
 		// operator --model override can change family, and a stale family
 		// makes a legitimate override look like a launch/verdict conflict.
-		Family: router.FamilyFor(route.Provider, pickedModel),
-		Argv:   argv, Reason: route.Reason,
+		Pool:     route.QuotaPool,
+		Family:   router.FamilyFor(route.Provider, pickedModel),
+		QuotaAge: age,
+		Argv:     argv, Reason: route.Reason,
 	}, nil
 }
 
