@@ -3991,6 +3991,23 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if ferr := stack.CAS.AdvanceFence(ctx, approvalTask.ID, lease.Generation); ferr != nil {
 			return nil, ferr
 		}
+		// The receipt-backed approval path is coordinator authority too. Bind
+		// every coordinator mint to this exact review lease before the fenced
+		// status/comment operations begin; shared provider state must not carry
+		// identity across concurrent calls.
+		if k, ok := provider.UnwrapTaskProvider(tp).(*provider.KaneoProvider); ok && k != nil {
+			if stack.Minter != nil {
+				if merr := provider.AttachCoordinatorMinter(k, stack.Minter); merr != nil {
+					return nil, fmt.Errorf("approve: attach coordinator minter: %w", merr)
+				}
+			}
+			if stack.Minter != nil {
+				ctx = provider.WithMintIdentity(ctx, provider.MintIdentity{
+					Repo: lease.Repo, Provider: lease.Provider, Project: lease.Project,
+					TaskRef: lease.TaskRef, OwnerID: lease.OwnerID,
+				})
+			}
+		}
 		res, err = hsync.BoardDoneFenced(ctx, tp, stack, key, owner, lease.Generation, req)
 	} else {
 		res, err = hsync.BoardDone(ctx, tp, req)
