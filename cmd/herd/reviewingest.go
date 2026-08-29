@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/committime"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/mail"
@@ -179,6 +180,17 @@ func runReviewIngest() {
 			refused++
 			continue
 		}
+		// FAC-631: receipt reconciliation requires a risk tier from a durable
+		// record row, but the normal artifact-ingest path previously wrote none.
+		// Use the same exact-SHA diff and deterministic classifier as
+		// review-classify so every admitted artifact is reachable by admission.
+		paths, _, _, err := diffStat("origin/main", a.SHA)
+		if err != nil {
+			emit.refused(f, fmt.Errorf("classify candidate risk: %w", err))
+			refused++
+			continue
+		}
+		riskTier := classify.Classify(classify.Input{CandidateSHA: a.SHA, Paths: paths}).Tier
 		// FAC-620: an asserted builder-family with no launch receipt reaching the
 		// commit and no ledger record proving it is DOWNGRADED to unrecorded, so
 		// it cannot be used to compute reviewer/builder independence. Before the
@@ -264,7 +276,7 @@ func runReviewIngest() {
 		recordOpts := reviewledger.RecordOpts{
 			SHA: a.SHA, Branch: a.Branch, BuilderFamily: a.BuilderFamily,
 			ReviewerFamily: a.ReviewerFamily, Reviewer: a.Reviewer,
-			Artifact: artifactName, Gate: gate, Task: taskIdentity,
+			Artifact: artifactName, Gate: gate, Tier: string(riskTier), Task: taskIdentity,
 		}
 		verdictOpts := reviewledger.VerdictOpts{
 			SHA: a.SHA, Reviewer: a.Reviewer, Verdict: reviewledger.Verdict(a.Verdict),
