@@ -97,6 +97,18 @@ func TestTaskContextValidate_RolePolicy(t *testing.T) {
 	if err := coord.Validate(); err != nil {
 		t.Fatalf("coordinator with mutate must validate: %v", err)
 	}
+
+	planner := validTaskContext()
+	planner.Role = RoleScoutPlanner
+	planner.AllowedOps = OpsForRole(RoleScoutPlanner)
+	if err := planner.Validate(); err != nil {
+		t.Fatalf("scout-planner read-only context must validate: %v", err)
+	}
+	for _, op := range planner.AllowedOps {
+		if op == string(provider.OpMutate) {
+			t.Fatal("scout-planner must never receive mutate authority")
+		}
+	}
 }
 
 // The receipt is the SOLE file written — no provider-native context file is
