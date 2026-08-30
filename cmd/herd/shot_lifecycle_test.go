@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -27,6 +28,36 @@ func TestRecordShotLifecycleLeaseCreatesAndRetriesIdempotently(t *testing.T) {
 	}
 	if state == nil || state.LeaseGeneration != 1 || state.CandidateSHA != shotLifecycleTestSHA {
 		t.Fatalf("lifecycle state = %+v", state)
+	}
+}
+
+func TestRecordShotLifecycleLeaseDrivesRecoveringSupersessionPath(t *testing.T) {
+	root := t.TempDir()
+	oldSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := recordShotLifecycleLease(root, "FAC-662", 1, shotLifecycleTestSHA); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordShotLifecycleLease(root, "FAC-662", 1, oldSHA); err != nil {
+		t.Fatal(err)
+	}
+	original := runShotCandidateSupersession
+	t.Cleanup(func() { runShotCandidateSupersession = original })
+	called := false
+	runShotCandidateSupersession = func(_ context.Context, gotRoot, gotRef string, gotLease int64, gotSHA string, _ *lifecycle.Machine, current *lifecycle.TaskState) error {
+		called = true
+		if gotRoot != root || gotRef != "FAC-662" || gotLease != 1 || gotSHA != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+			t.Fatalf("supersession callback args root=%q ref=%q lease=%d sha=%q", gotRoot, gotRef, gotLease, gotSHA)
+		}
+		if current == nil || current.State != lifecycle.StateRecovering || current.CandidateSHA != oldSHA {
+			t.Fatalf("supersession current state = %+v", current)
+		}
+		return nil
+	}
+	if err := recordShotLifecycleLease(root, "FAC-662", 1, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("Recovering callback did not drive the shipped supersession path")
 	}
 }
 

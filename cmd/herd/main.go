@@ -10144,8 +10144,22 @@ func runReceiptIssue() {
 		return strings.TrimSpace(string(out))
 	}
 	branch, candidate, base := gitOut("rev-parse", "--abbrev-ref", "HEAD"), gitOut("rev-parse", "HEAD"), gitOut("rev-parse", "origin/main")
-	if branch == "" || base == "" {
+	if branch == "" || candidate == "" {
 		fmt.Fprintf(os.Stderr, "herd receipt: %s is not a readable worktree (FAC-145)\n", targetDir)
+		os.Exit(1)
+	}
+	var priorRecovery dispatch.TaskContext
+	if *role == dispatch.RoleRecovery {
+		priorRecovery, err = authenticatedRecoveryIdentity(context.Background(), root, targetDir, ref, branch, candidate, cfg, task)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+			os.Exit(1)
+		}
+		// Preserve all authenticated immutable identity. In particular, never
+		// substitute a later origin/main for the builder's signed base.
+		base = priorRecovery.BaseSHA
+	} else if base == "" {
+		fmt.Fprintf(os.Stderr, "herd receipt: %s has no readable origin/main base (FAC-145)\n", targetDir)
 		os.Exit(1)
 	}
 
@@ -10162,10 +10176,14 @@ func runReceiptIssue() {
 	}
 	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
 		os.Exit(1)
 	}
-	receipt, err := signer.Issue(dispatch.TaskContext{
+	issuedContext := dispatch.TaskContext{
 		ProviderType:      cfg.TaskProvider.Type,
 		ProjectID:         cfg.TaskProvider.ProjectID,
 		ProviderWorkspace: cfg.TaskProvider.WorkspaceID,
@@ -10183,7 +10201,19 @@ func runReceiptIssue() {
 		SessionID:         dispatch.NewSessionID(*role, task.Ref, candidate, leaseID),
 		AllowedOps:        dispatch.OpsForRole(*role),
 		ExpiresAt:         time.Now().Add(dispatch.DefaultReceiptTTL),
-	})
+	}
+	if *role == dispatch.RoleRecovery {
+		issuedContext.ProviderType = priorRecovery.ProviderType
+		issuedContext.ProjectID = priorRecovery.ProjectID
+		issuedContext.ProviderWorkspace = priorRecovery.ProviderWorkspace
+		issuedContext.ProviderProfile = priorRecovery.ProviderProfile
+		issuedContext.Repository = priorRecovery.Repository
+		issuedContext.TaskRef = priorRecovery.TaskRef
+		issuedContext.TaskID = priorRecovery.TaskID
+		issuedContext.Branch = priorRecovery.Branch
+		issuedContext.BaseSHA = priorRecovery.BaseSHA
+	}
+	receipt, err := signer.Issue(issuedContext)
 	if err != nil {
 		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
 			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
@@ -10192,15 +10222,15 @@ func runReceiptIssue() {
 		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
 		os.Exit(1)
 	}
-	if err := dispatch.WriteTaskContext(targetDir, receipt); err != nil {
-		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
-			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
-			os.Exit(1)
+	if *role == dispatch.RoleRecovery {
+		err = persistRecoveryReceipt(root, targetDir, receipt, priorRecovery, dispatch.StoreCanonicalReceipt)
+	} else {
+		err = dispatch.WriteTaskContext(targetDir, receipt)
+		if err == nil {
+			err = dispatch.StoreCanonicalReceipt(root, receipt)
 		}
-		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
-		os.Exit(1)
 	}
-	if err := dispatch.StoreCanonicalReceipt(root, receipt); err != nil {
+	if err != nil {
 		if relErr := releaseCoordinationLease(context.Background(), root, leaseKey, "coordinator-"+*role, leaseGen); relErr != nil {
 			fmt.Fprintf(os.Stderr, "herd receipt: %v; LEASE COMPENSATION FAILED: %v\n", err, relErr)
 			os.Exit(1)

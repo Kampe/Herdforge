@@ -339,6 +339,40 @@ func TestCanonicalReceipt_MonotonicNoRollback(t *testing.T) {
 	}
 }
 
+func TestRemoveCanonicalReceiptSessionIfExactAuthenticatesAndRefusesDifferentContents(t *testing.T) {
+	root := t.TempDir()
+	keyDir := t.TempDir()
+	if err := WriteIsolationAttestation(keyDir, "test-sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	signer, err := LoadOrCreateSigner(keyDir, "herdforge", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := signer.Issue(validTaskContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StoreCanonicalReceipt(root, signed); err != nil {
+		t.Fatal(err)
+	}
+	forged := signed
+	forged.CandidateSHA = strings.Repeat("b", 40)
+	if err := RemoveCanonicalReceiptSessionIfExact(root, forged); err == nil {
+		t.Fatal("forged compensation target removed canonical authority")
+	}
+	back, err := LoadCanonicalReceiptSession(root, signed.ProviderType, signed.ProjectID, signed.TaskRef, signed.SessionID)
+	if err != nil || !back.EqualsIssued(signed) {
+		t.Fatalf("refused compensation changed canonical authority: %v", err)
+	}
+	if err := RemoveCanonicalReceiptSessionIfExact(root, signed); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveCanonicalReceiptSessionIfExact(root, signed); err != nil {
+		t.Fatalf("missing exact session must be idempotently compensated: %v", err)
+	}
+}
+
 func TestWriteTaskContext_InvalidContextWritesNothing(t *testing.T) {
 	dir := t.TempDir()
 	tc := validTaskContext()

@@ -42,7 +42,7 @@ func runShotTask(ref string, args []string) {
 	risk := fs.String("risk", "", "Risk tier for this card (R0-R3) when the board carries no risk label")
 	asJSON := fs.Bool("json", false, "Emit the evidence packet as JSON instead of prose")
 	report := fs.String("report", "", "Post a builder callback instead of running a shot (complete|blocked)")
-	sha := fs.String("sha", "", "Candidate commit SHA for --report complete")
+	sha := fs.String("sha", "", "Exact candidate commit SHA for --report complete; closed-worker supersession requires `herd receipt issue --role recovery <ref> <worktree>`")
 	lease := fs.Int64("lease", 0, "Lease generation the shot reported at dispatch (required with --report)")
 	detail := fs.String("detail", "", "Detail for --report blocked")
 	fs.Parse(args)
@@ -390,6 +390,9 @@ func recordShotLifecycleLease(root, ref string, lease int64, sha string) error {
 			// to the candidate that actually completed. Once work has advanced
 			// beyond eligibility, a same-generation SHA change is still a
 			// conflict and must fail closed.
+			if current.State == lifecycle.StateRecovering {
+				return runShotCandidateSupersession(context.Background(), root, ref, lease, sha, machine, current)
+			}
 			if current.State != lifecycle.StateEligible {
 				return fmt.Errorf("shot: lifecycle candidate %s conflicts with reported %s", current.CandidateSHA, sha)
 			}
