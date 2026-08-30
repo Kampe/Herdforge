@@ -1,13 +1,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
+	"github.com/Kampe/Herdforge/pkg/reviewingest"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -32,12 +43,13 @@ func runPool() {
 	poolDefault := filepath.Join(root, ".herd", "pool")
 	poolRoot := fs.String("pool-root", poolDefault, "pool DIRECTORY (not the repository root)")
 	poolRootAlias := fs.String("root", "", "alias for --pool-root (pool directory, not the repository root)")
+	applyRecovery := fs.Bool("apply", false, "apply an exact recovery manifest (default is validation-only)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		fmt.Fprintf(os.Stderr, "herd pool: %v\n", err)
 		os.Exit(2)
 	}
 	if fs.NArg() < 1 || fs.NArg() > 2 {
-		fmt.Fprintln(os.Stderr, "usage: herd pool [--size N] [--pool-root DIR] <ensure|lease|release|gc|list>")
+		fmt.Fprintln(os.Stderr, "usage: herd pool [--size N] [--pool-root DIR] [--apply] <ensure|lease|release|gc|list|recover> [argument]")
 		os.Exit(2)
 	}
 	resolvedPool := *poolRoot
@@ -95,10 +107,193 @@ func runPool() {
 		for _, slot := range slots {
 			fmt.Printf("%s\t%s\t%s\n", slot.Name, slot.Path, slot.Purpose)
 		}
+	case "recover":
+		if fs.NArg() != 2 {
+			fmt.Fprintln(os.Stderr, "herd pool recover: exact manifest path is required")
+			os.Exit(2)
+		}
+		recoveryCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		result, err := recoverPoolFromManifest(recoveryCtx, root, p, fs.Arg(1), *applyRecovery)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd pool recover: %v\n", err)
+			os.Exit(1)
+		}
+		out, err := json.Marshal(result)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd pool recover: encode result: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
 	default:
 		fmt.Fprintf(os.Stderr, "herd pool: unknown action %s\n", fs.Arg(0))
 		os.Exit(2)
 	}
+}
+
+func recoverPoolFromManifest(ctx context.Context, root string, pool *worktree.Pool, manifestPath string, apply bool) (*worktree.ReviewPoolRecoveryResult, error) {
+	b, err := os.ReadFile(manifestPath) // #nosec G304 -- explicit operator-selected recovery manifest.
+	if err != nil {
+		return nil, fmt.Errorf("read manifest: %w", err)
+	}
+	req, err := decodePoolRecoveryManifest(b)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("load live project config: %w", err)
+	}
+	probes := worktree.ReviewPoolRecoveryProbes{
+		Hostname: func(context.Context) (string, error) { return os.Hostname() },
+		Repository: func(context.Context) (string, error) {
+			return toolchild.RepositoryIdentity(root)
+		},
+		ProjectID: func(context.Context) (string, error) {
+			if strings.TrimSpace(cfg.TaskProvider.ProjectID) == "" {
+				return "", fmt.Errorf("task_provider.project_id is empty")
+			}
+			return cfg.TaskProvider.ProjectID, nil
+		},
+		HolderLive: recoveryHolderLive,
+		OpenFiles:  recoveryOpenFiles,
+		TaskEvidence: func(ctx context.Context, ref, taskID string) (string, string, error) {
+			tp, err := loadTaskProvider(cfg)
+			if err != nil {
+				return "", "", err
+			}
+			task, err := tp.GetTask(ctx, taskID)
+			if err != nil {
+				return "", "", err
+			}
+			if task == nil || !strings.EqualFold(strings.TrimSpace(task.Ref), strings.TrimSpace(ref)) {
+				return "", "", fmt.Errorf("task identity mismatch")
+			}
+			return mergeadmit.TaskContentRevision(ref, task.Title, task.Description), task.Status, nil
+		},
+		VerdictEvidence: func(ctx context.Context, path string) (worktree.ReviewPoolVerdictObservation, error) {
+			b, err := os.ReadFile(path) // #nosec G304 -- exact repo-contained manifest path is validated by pkg/worktree.
+			if err != nil {
+				return worktree.ReviewPoolVerdictObservation{}, err
+			}
+			artifact := reviewingest.Parse(string(b))
+			if err := artifact.Validate(nil, func(sha string) bool {
+				return exec.CommandContext(ctx, "git", "-C", root, "cat-file", "-e", sha+"^{commit}").Run() == nil
+			}); err != nil {
+				return worktree.ReviewPoolVerdictObservation{}, err
+			}
+			return worktree.ReviewPoolVerdictObservation{
+				TaskRef: artifact.TaskRef, CandidateSHA: artifact.SHA, Verdict: artifact.Verdict,
+				Reviewer: artifact.Reviewer, ReviewerFamily: artifact.ReviewerFamily,
+				BuilderFamily: artifact.BuilderFamily, State: filepath.Base(filepath.Dir(path)),
+			}, nil
+		},
+	}
+	return pool.RecoverExact(ctx, req, probes, apply)
+}
+
+func decodePoolRecoveryManifest(b []byte) (worktree.ReviewPoolRecoveryRequest, error) {
+	var req worktree.ReviewPoolRecoveryRequest
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return req, fmt.Errorf("decode manifest: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return req, fmt.Errorf("decode manifest: trailing JSON value")
+		}
+		return req, fmt.Errorf("decode manifest trailer: %w", err)
+	}
+	return req, nil
+}
+
+func recoveryHolderLive(ctx context.Context, purpose string) (bool, error) {
+	agents, err := recoveryAgentList(ctx)
+	if err != nil {
+		return false, err
+	}
+	want := strings.TrimSpace(purpose)
+	for _, agent := range agents {
+		if strings.TrimSpace(agent.Name) == want {
+			return !settledAgentStatuses[strings.ToLower(strings.TrimSpace(agent.Status))], nil
+		}
+	}
+	return false, nil
+}
+
+func recoveryOpenFiles(ctx context.Context, path string) ([]string, error) {
+	// Herdr cwd is authoritative for harnesses even when lsof races process
+	// startup. Both surfaces must be readable and empty.
+	agents, err := recoveryAgentList(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list Herdr agents: %w", err)
+	}
+	var holders []string
+	for _, agent := range agents {
+		if samePoolRecoveryPath(agent.Cwd, path) || poolRecoveryPathWithin(path, agent.Cwd) {
+			holders = append(holders, "herdr:"+agent.Name)
+		}
+	}
+	lsof, err := exec.LookPath("lsof")
+	if err != nil {
+		return nil, fmt.Errorf("lsof unavailable: %w", err)
+	}
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(bounded, lsof, "+D", path)
+	out, cmdErr := cmd.CombinedOutput()
+	if bounded.Err() != nil {
+		return nil, fmt.Errorf("lsof deadline: %w", bounded.Err())
+	}
+	if cmdErr != nil {
+		if exit, ok := cmdErr.(*exec.ExitError); !ok || exit.ExitCode() != 1 || len(bytes.TrimSpace(out)) != 0 {
+			return nil, fmt.Errorf("lsof probe: %v (%s)", cmdErr, strings.TrimSpace(string(out)))
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) > 1 {
+		holders = append(holders, lines[1:]...)
+	}
+	return holders, nil
+}
+
+func recoveryAgentList(ctx context.Context) ([]herdr.AgentEntry, error) {
+	type result struct {
+		agents []herdr.AgentEntry
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		agents, err := herdr.AgentList()
+		done <- result{agents: agents, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("Herdr agent-list deadline: %w", ctx.Err())
+	case got := <-done:
+		return got.agents, got.err
+	}
+}
+
+func samePoolRecoveryPath(a, b string) bool {
+	aa, aerr := filepath.Abs(strings.TrimSpace(a))
+	bb, berr := filepath.Abs(strings.TrimSpace(b))
+	return aerr == nil && berr == nil && filepath.Clean(aa) == filepath.Clean(bb)
+}
+
+func poolRecoveryPathWithin(parent, child string) bool {
+	if strings.TrimSpace(parent) == "" || strings.TrimSpace(child) == "" {
+		return false
+	}
+	pa, perr := filepath.Abs(parent)
+	ca, cerr := filepath.Abs(child)
+	if perr != nil || cerr != nil {
+		return false
+	}
+	rel, err := filepath.Rel(pa, ca)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
 // misdirectedPoolRoot reports whether a pool root looks like a repository root.

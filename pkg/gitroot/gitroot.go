@@ -91,6 +91,17 @@ const EnvProjectRoot = "HERD_PROJECT_ROOT"
 // resolving the project control root.
 const EnvLaneRoot = "HERD_ROOT"
 
+// IgnoredUntrackedArgs is the one argv policy for enumerating ignored,
+// untracked Git paths. Callers append an optional exact pathspec.
+func IgnoredUntrackedArgs(pathspec ...string) []string {
+	args := []string{"--others", "--ignored", "--exclude-standard"}
+	if len(pathspec) > 0 {
+		args = append(args, "--")
+		args = append(args, pathspec...)
+	}
+	return args
+}
+
 // ProjectRoot is the canonical project control-plane root for startDir.
 //
 // Precedence, and the reasoning for it:

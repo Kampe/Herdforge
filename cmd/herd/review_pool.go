@@ -423,7 +423,18 @@ func runPoolReview(ref string) error {
 	// bounded caller cannot tell apart from a hang.
 	startedAt := time.Now()
 	fmt.Printf("starting %s agent %s in pane %s\n", reviewer.Kind, agentName, tab.Pane.ID)
-	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
+	conversationID := ""
+	if strings.EqualFold(strings.TrimSpace(reviewer.Kind), "claude") {
+		conversationID, err = freshPoolReviewConversationID()
+		if err != nil {
+			return err
+		}
+	}
+	launchFlags, err := bindPoolReviewConversation(reviewer.Kind, reviewer.LaunchFlags(), conversationID)
+	if err != nil {
+		return err
+	}
+	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, launchFlags...); err != nil {
 		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
 	// FAC-601: wait for the harness to actually accept input before delivering
@@ -455,8 +466,35 @@ func runPoolReview(ref string) error {
 	if _, statErr := os.Stat(packetAbs); statErr != nil {
 		return errors.Join(fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr), herdr.CloseReviewTab(tab.ID, agentName))
 	}
-	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packetAbs+" in full.", true, 30*time.Second); err != nil {
+	live, err := herdr.LookupAgent(agentName)
+	if err != nil {
+		return errors.Join(fmt.Errorf("read exact reviewer session before packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	if conversationID != "" && strings.TrimSpace(live.Session.Value) != conversationID {
+		return errors.Join(
+			fmt.Errorf("Claude resumed the wrong conversation: live session=%q requested fresh session=%q", live.Session.Value, conversationID),
+			herdr.CloseReviewTab(tab.ID, agentName),
+		)
+	}
+	binding := herdr.BindingFromSpawn(agentName, tab.ID, tab.Pane.ID, live.Session.Value, reviewer.Kind)
+	if err := validatePoolReviewPromptBinding(binding, *live); err != nil {
+		return errors.Join(err, herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	prompt := "Read and execute the review packet at " + packetAbs + " in full."
+	if _, err := herdr.DeliverAndProveExact(binding, prompt, 30*time.Second); err != nil {
 		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	packetBytes, err := os.ReadFile(packetAbs) // #nosec G304 -- path was created and validated by this launch transaction.
+	if err != nil {
+		return errors.Join(fmt.Errorf("read delivered packet for session binding: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	packetDigest := fmt.Sprintf("%x", sha256.Sum256(packetBytes))
+	if err := recordPoolReviewSession(root, poolReviewSessionBinding{
+		TaskRef: ref, CandidateSHA: sha, LeaseID: lease.LeaseID, AgentName: agentName,
+		TabID: tab.ID, PaneID: tab.Pane.ID, Harness: reviewer.Kind,
+		SessionID: binding.AgentSessionID, PacketSHA256: packetDigest,
+	}); err != nil {
+		return errors.Join(fmt.Errorf("bind delivered packet to model session: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
 	cleanupTab = false
 	releaseOnFailure = false

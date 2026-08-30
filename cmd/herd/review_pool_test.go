@@ -1,12 +1,84 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/herdr"
 )
+
+func TestPoolReviewClaudeConversationIsFreshAndExplicit(t *testing.T) {
+	flags, err := bindPoolReviewConversation("claude", []string{"--model", "claude-opus-4-1"}, "123e4567-e89b-12d3-a456-426614174000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(flags, " ") != "--model claude-opus-4-1 --session-id 123e4567-e89b-12d3-a456-426614174000" {
+		t.Fatalf("fresh Claude binding missing: %v", flags)
+	}
+	for _, stale := range [][]string{{"--continue"}, {"--resume", "old"}, {"--session-id", "old"}} {
+		if _, err := bindPoolReviewConversation("claude", stale, "123e4567-e89b-12d3-a456-426614174000"); err == nil {
+			t.Fatalf("stale conversation option accepted: %v", stale)
+		}
+	}
+}
+
+func TestMutation_PoolReviewRejectsStaleClaudeSessionAfterPacket(t *testing.T) {
+	binding := herdr.PromptBinding{
+		Name: "review-fac-654-candidate", TabID: "tab-1", PaneID: "pane-1",
+		AgentSessionID: "123e4567-e89b-12d3-a456-426614174000", Kind: "claude",
+	}
+	live := herdr.AgentEntry{
+		Name: binding.Name, TabID: binding.TabID, PaneID: binding.PaneID, Kind: binding.Kind,
+		Session: herdr.AgentSession{Value: "stale-conversation-id"},
+	}
+	if err := validatePoolReviewPromptBinding(binding, live); err == nil {
+		t.Fatal("mutation: removing exact session comparison accepts stale Claude conversation")
+	}
+	live.Session.Value = binding.AgentSessionID
+	if err := validatePoolReviewPromptBinding(binding, live); err != nil {
+		t.Fatalf("exact live session refused: %v", err)
+	}
+}
+
+func TestPoolReviewSessionBindingJournalFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	record := poolReviewSessionBinding{
+		TaskRef: "FAC-654", CandidateSHA: strings.Repeat("a", 40), LeaseID: "pool-01-1",
+		AgentName: "review-fac-654-a", TabID: "tab-1", PaneID: "pane-1", Harness: "claude",
+		SessionID: "123e4567-e89b-12d3-a456-426614174000", PacketSHA256: strings.Repeat("b", 64),
+	}
+	if err := recordPoolReviewSession(root, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPoolReviewSession(root, record); err != nil {
+		t.Fatalf("exact retry must be idempotent: %v", err)
+	}
+	conflict := record
+	conflict.CandidateSHA = strings.Repeat("c", 40)
+	if err := recordPoolReviewSession(root, conflict); err == nil {
+		t.Fatal("one model session accepted for two candidates")
+	}
+	path := filepath.Join(root, ".herd", "review-session-bindings.jsonl")
+	if err := os.WriteFile(path, append(mustRead(t, path), []byte("{partial")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPoolReviewSession(root, record); err == nil || !errors.Is(err, errPoolReviewSessionJournal) {
+		t.Fatalf("partial journal write did not fail closed: %v", err)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
 
 func TestSafeReviewSurfacePart(t *testing.T) {
 	tests := []struct {

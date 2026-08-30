@@ -71,6 +71,8 @@ type fakeHerdr struct {
 	deliverRec *herdr.PromptReceipt
 	readErr    error
 	readSnap   AgentSnapshot
+	readSnaps  []AgentSnapshot
+	readCount  int
 	// When true, ReadAgent returns empty session (null agent_session case).
 	nullSession bool
 
@@ -189,6 +191,14 @@ func (f *fakeHerdr) ReadAgent(name string) (AgentSnapshot, error) {
 		return AgentSnapshot{}, ErrMissingSession
 	}
 	s := f.readSnap
+	if len(f.readSnaps) > 0 {
+		idx := f.readCount
+		if idx >= len(f.readSnaps) {
+			idx = len(f.readSnaps) - 1
+		}
+		s = f.readSnaps[idx]
+		f.readCount++
+	}
 	if s.Name == "" {
 		s.Name = name
 	}
@@ -450,6 +460,62 @@ func TestLaunch_MissingSessionNullAgentSession(t *testing.T) {
 	}
 	if len(h.closed) != 1 {
 		t.Fatalf("closed = %v", h.closed)
+	}
+}
+
+func TestLaunch_SessionDriftAfterPacketCompensatesBeforeBoard(t *testing.T) {
+	req := baseReq(t)
+	abs, err := filepath.Abs(req.WorktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := AgentSnapshot{
+		Name: "review-assayer-fac-151", PaneID: "pane-new", TabID: "tab-new",
+		Workspace: "wF", Cwd: abs, Session: "claude-session-fresh", Status: "idle", Kind: "pi",
+	}
+	drifted := base
+	drifted.Session = "claude-session-stale"
+	h := &fakeHerdr{readSnaps: []AgentSnapshot{base, drifted}}
+	b := &fakeBoard{}
+	l := &Launcher{Herdr: h, Board: b, ReceiptPath: filepath.Join(t.TempDir(), "r.jsonl")}
+	_, err = l.Launch(context.Background(), req)
+	if err == nil || !errors.Is(err, ErrIdentityDrift) {
+		t.Fatalf("session drift after delivery accepted: %v", err)
+	}
+	if h.deliverCalls != 1 {
+		t.Fatalf("packet delivery calls = %d, want 1", h.deliverCalls)
+	}
+	if b.callCount() != 0 {
+		t.Fatal("board mutated after post-delivery session drift")
+	}
+	if len(h.closed) != 1 || h.closed[0] != "tab-new" {
+		t.Fatalf("exact new tab was not compensated: %v", h.closed)
+	}
+}
+
+func TestMutation_RemovingPostDeliverySessionReadbackWouldAcceptStaleConversation(t *testing.T) {
+	// This is the measured FAC-663 regression: even a fresh Git/pool root can
+	// resume a stale model conversation. The unsafe one-read baseline cannot
+	// distinguish it, while production must observe the session after delivery.
+	req := baseReq(t)
+	abs, err := filepath.Abs(req.WorktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := AgentSnapshot{
+		Name: "review-assayer-fac-151", PaneID: "pane-new", TabID: "tab-new",
+		Workspace: "wF", Cwd: abs, Session: "claude-session-fresh", Status: "idle", Kind: "pi",
+	}
+	drifted := base
+	drifted.Session = "claude-session-stale"
+	h := &fakeHerdr{readSnaps: []AgentSnapshot{base, drifted}}
+	b := &fakeBoard{}
+	l := &Launcher{Herdr: h, Board: b}
+	if _, err := l.Launch(context.Background(), req); err == nil {
+		t.Fatal("mutation: removing the post-delivery readback accepts stale conversation state")
+	}
+	if h.readCount < 2 {
+		t.Fatalf("mutation: session was read only %d time(s), want pre/post delivery", h.readCount)
 	}
 }
 

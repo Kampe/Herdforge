@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/gitdir"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
+	"github.com/Kampe/Herdforge/pkg/reviewroot"
 )
 
 // CheckWorktreeBoundary verifies that no absolute paths leak into git tracking or config files
@@ -72,7 +74,7 @@ func checkWorktreeBoundaryFiles(rootDir string, paths []string, allowlist []stri
 		//
 		// One guard in the shared function covers both callers; a guard per
 		// caller is how the first attempt missed one.
-		if slashed := filepath.ToSlash(path); strings.HasPrefix(slashed, ".herd/review/") ||
+		if slashed := filepath.ToSlash(path); strings.HasPrefix(slashed, reviewroot.Rel+"/") ||
 			strings.HasPrefix(slashed, ".herd/review-packets/") {
 			return nil
 		}
@@ -409,7 +411,8 @@ func gitIgnoredPaths(rootDir string) map[string]bool {
 	if strings.TrimSpace(rootDir) == "" {
 		return ignored
 	}
-	cmd := exec.Command("git", "-C", rootDir, "ls-files", "--others", "--ignored", "--exclude-standard")
+	args := append([]string{"-C", rootDir, "ls-files"}, gitroot.IgnoredUntrackedArgs()...)
+	cmd := exec.Command("git", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return ignored

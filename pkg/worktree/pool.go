@@ -100,12 +100,39 @@ func (p *Pool) writeState(state poolState) error {
 		return fmt.Errorf("worktree pool: encode state: %w", err)
 	}
 	tmp := p.statePath() + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return fmt.Errorf("worktree pool: write state: %w", err)
+	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("worktree pool: write state: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("worktree pool: sync state: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("worktree pool: close state: %w", err)
 	}
 	if err := os.Rename(tmp, p.statePath()); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("worktree pool: publish state: %w", err)
+	}
+	dir, err := os.Open(filepath.Dir(p.statePath()))
+	if err != nil {
+		return fmt.Errorf("worktree pool: open state directory: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("worktree pool: sync state directory: %w", err)
+	}
+	readback, err := os.ReadFile(p.statePath())
+	if err != nil {
+		return fmt.Errorf("worktree pool: state readback: %w", err)
+	}
+	if string(readback) != string(append(data, '\n')) {
+		return errors.New("worktree pool: state readback mismatch")
 	}
 	return nil
 }
@@ -252,13 +279,28 @@ func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string
 		if strings.TrimSpace(slot.Purpose) != "" && p.HolderLive(slot.Purpose) {
 			continue
 		}
+		clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+		if err != nil {
+			return freed, fmt.Errorf("worktree pool: inspect dead lease %s: %w", slot.Name, err)
+		}
+		if !clean {
+			return freed, fmt.Errorf("worktree pool: dead lease %s is dirty; exact recovery is required", slot.Name)
+		}
+		head, err := gitRevision(ctx, slot.Path, "HEAD")
+		if err != nil {
+			return freed, fmt.Errorf("worktree pool: dead lease %s HEAD unknown: %w", slot.Name, err)
+		}
+		baseSHA, err := gitRevision(ctx, slot.Path, base)
+		if err != nil {
+			return freed, fmt.Errorf("worktree pool: dead lease %s base unknown: %w", slot.Name, err)
+		}
+		if head != baseSHA {
+			return freed, fmt.Errorf("worktree pool: dead lease %s holds reviewed candidate %s; exact recovery is required", slot.Name, head)
+		}
 		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base).CombinedOutput(); err != nil {
 			return freed, fmt.Errorf("worktree pool: reclaim reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd").CombinedOutput(); err != nil {
-			return freed, fmt.Errorf("worktree pool: reclaim clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
-		}
-		clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+		clean, err = gitClean(ctx, p.RepoRoot, slot.Path)
 		if err != nil {
 			return freed, err
 		}

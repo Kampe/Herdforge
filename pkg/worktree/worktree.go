@@ -159,6 +159,25 @@ func (w *WorktreeManager) RemoveWorktreeSafely(ctx context.Context, targetDir st
 	return nil
 }
 
+// RemovePoolWorktreeSafely is the non-force removal boundary for a pool slot
+// or recursively registered pool descendant. Pool leases are owned by
+// pool.json rather than pkg/claim, so this uses the pool-specific history
+// fence while retaining Git's clean-worktree refusal.
+func (w *WorktreeManager) RemovePoolWorktreeSafely(ctx context.Context, targetDir string) error {
+	if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, w.RepoRoot, targetDir); err != nil {
+		return err
+	}
+	if w.RemoveWorktreeFunc != nil {
+		return w.RemoveWorktreeFunc(ctx, targetDir)
+	}
+	cmd := execCommandContext(ctx, "git", "worktree", "remove", targetDir)
+	cmd.Dir = w.RepoRoot
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to safely remove pool worktree: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
 // ListWorktrees runs git worktree list and returns structured worktree information
 func (w *WorktreeManager) ListWorktrees(ctx context.Context) ([]*WorktreeInfo, error) {
 	cmd := execCommandContext(ctx, "git", "worktree", "list", "--porcelain")

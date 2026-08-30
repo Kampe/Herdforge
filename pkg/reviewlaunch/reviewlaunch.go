@@ -337,22 +337,15 @@ func (l *Launcher) Launch(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, l.fail(req, tabID, "missing_session", err, true)
 	}
-	if snap.Name != name || snap.TabID != tabID || snap.PaneID != paneID {
-		return Result{}, l.fail(req, tabID, "identity_drift", fmt.Errorf("%w: name/tab/pane mismatch", ErrIdentityDrift), true)
-	}
-	if snap.Workspace != "" && snap.Workspace != ws {
-		return Result{}, l.fail(req, tabID, "workspace_drift", fmt.Errorf("%w: workspace %q != %q", ErrIdentityDrift, snap.Workspace, ws), true)
-	}
-	if snap.Cwd != "" && !sameWorktreePath(snap.Cwd, req.WorktreePath) {
-		return Result{}, l.fail(req, tabID, "cwd_drift", fmt.Errorf("%w: agent cwd %q != %q", ErrIdentityDrift, snap.Cwd, req.WorktreePath), true)
+	if err := validateSnapshot(snap, name, tabID, paneID, ws, req.WorktreePath, ""); err != nil {
+		return Result{}, l.fail(req, tabID, "identity_drift", err, true)
 	}
 
-	// Prefer pane id for prompt address (unique); fall back to name.
-	promptTarget := paneID
-	if promptTarget == "" {
-		promptTarget = name
-	}
-	receipt, err := l.Herdr.DeliverAndProve(promptTarget, req.Packet, timeout)
+	// Herdr prompt addressing is name-based. The surrounding exact identity
+	// reads bind that name to this tab, pane, cwd, harness and real model
+	// session; a terminal/pane fallback is never accepted as conversation
+	// identity (FAC-663).
+	receipt, err := l.Herdr.DeliverAndProve(name, req.Packet, timeout)
 	if err != nil {
 		return Result{}, l.fail(req, tabID, "packet_delivery", fmt.Errorf("%w: %v", ErrPacketRejected, err), true)
 	}
@@ -361,6 +354,13 @@ func (l *Launcher) Launch(ctx context.Context, req Request) (Result, error) {
 	}
 	if !herdr.ConsumptionProvenSeen(receipt.BaselineStatus, receipt.FinalStatus, receipt.SawWorking) {
 		return Result{}, l.fail(req, tabID, "packet_sequence", fmt.Errorf("%w: sequence %s", ErrPacketRejected, receipt.SequenceToken), true)
+	}
+	post, err := l.Herdr.ReadAgent(name)
+	if err != nil {
+		return Result{}, l.fail(req, tabID, "post_delivery_session", fmt.Errorf("%w: %v", ErrIdentityDrift, err), true)
+	}
+	if err := validateSnapshot(post, name, tabID, paneID, ws, req.WorktreePath, snap.Session); err != nil {
+		return Result{}, l.fail(req, tabID, "post_delivery_identity", err, true)
 	}
 
 	// --- only now mutate the board ---
@@ -377,10 +377,29 @@ func (l *Launcher) Launch(ctx context.Context, req Request) (Result, error) {
 		PaneID:    paneID,
 		Workspace: ws,
 		Cwd:       req.WorktreePath,
-		Session:   snap.Session,
+		Session:   post.Session,
 		Receipt:   receipt,
 		BoardTo:   status,
 	}, nil
+}
+
+func validateSnapshot(s AgentSnapshot, name, tabID, paneID, workspace, cwd, expectedSession string) error {
+	if s.Name != name || s.TabID != tabID || s.PaneID != paneID {
+		return fmt.Errorf("%w: name/tab/pane mismatch", ErrIdentityDrift)
+	}
+	if s.Workspace != "" && s.Workspace != workspace {
+		return fmt.Errorf("%w: workspace %q != %q", ErrIdentityDrift, s.Workspace, workspace)
+	}
+	if s.Cwd != "" && !sameWorktreePath(s.Cwd, cwd) {
+		return fmt.Errorf("%w: agent cwd %q != %q", ErrIdentityDrift, s.Cwd, cwd)
+	}
+	if !herdr.RealModelSessionID(s.Session) {
+		return fmt.Errorf("%w: no real model session for %s", ErrMissingSession, name)
+	}
+	if expectedSession != "" && s.Session != expectedSession {
+		return fmt.Errorf("%w: model session changed after packet delivery: want %q got %q", ErrIdentityDrift, expectedSession, s.Session)
+	}
+	return nil
 }
 
 func (l *Launcher) fail(req Request, tabID, stage string, primary error, closeTab bool) error {

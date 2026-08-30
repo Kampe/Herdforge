@@ -131,3 +131,9 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl
 .herd/review-ledger.jsonl.*
 .herd/harvest-queue.jsonl.*
+
+# FAC-663 exact review-pool recovery and post-delivery model-session authority.
+# These are append-only host runtime records; they must survive pool repair but
+# must never be staged as repository source.
+.herd/recovery/
+.herd/review-session-bindings.jsonl
