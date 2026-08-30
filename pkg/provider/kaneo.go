@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -503,10 +504,22 @@ func decodeKaneoTaskBody(statusCode int, body []byte, wantID string) (kaneoTaskD
 		if len(dtos) == 0 {
 			return kaneoTaskDTO{}, fmt.Errorf("kaneo task not found: empty list")
 		}
+		matches := make([]kaneoTaskDTO, 0, 1)
 		for _, d := range dtos {
 			if kaneoTaskMatches(d, wantID) {
-				return d, nil
+				matches = append(matches, d)
 			}
+		}
+		if len(matches) > 1 {
+			ids := make([]string, 0, len(matches))
+			for _, match := range matches {
+				ids = append(ids, match.ID)
+			}
+			sort.Strings(ids)
+			return kaneoTaskDTO{}, fmt.Errorf("kaneo task %q is ambiguous across ids %v", wantID, ids)
+		}
+		if len(matches) == 1 {
+			return matches[0], nil
 		}
 		// Sole nonmatching element is still a hard error (not implicit accept).
 		return kaneoTaskDTO{}, fmt.Errorf("kaneo task %q not found in list of %d", wantID, len(dtos))

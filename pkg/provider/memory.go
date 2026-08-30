@@ -180,12 +180,25 @@ func (m *MemoryProvider) GetTask(ctx context.Context, id string) (*Task, error) 
 	defer m.mu.Unlock()
 	t, ok := m.tasks[id]
 	if !ok {
-		// Also allow lookup by ref.
+		// Also allow lookup by ref, but never choose nondeterministically
+		// between duplicate immutable identities.
+		var matches []*Task
 		for _, cand := range m.tasks {
 			if cand.Ref == id {
-				cp := *cand
-				return &cp, nil
+				matches = append(matches, cand)
 			}
+		}
+		if len(matches) > 1 {
+			ids := make([]string, 0, len(matches))
+			for _, match := range matches {
+				ids = append(ids, match.ID)
+			}
+			sort.Strings(ids)
+			return nil, fmt.Errorf("duplicate task ref %q maps to ids %v", id, ids)
+		}
+		if len(matches) == 1 {
+			cp := *matches[0]
+			return &cp, nil
 		}
 		return nil, fmt.Errorf("task not found: %s", id)
 	}
