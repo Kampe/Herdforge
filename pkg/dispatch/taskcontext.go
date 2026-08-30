@@ -431,6 +431,63 @@ func LoadCanonicalReceiptSession(root, providerType, projectID, ref, sessionID s
 		canonicalReceiptName(providerType, projectID, ref, sessionID)), ref)
 }
 
+// RemoveCanonicalReceiptSessionIfExact compensates a failed multi-file
+// issuance. It removes only the exact signed session supplied by the caller;
+// a missing session is already compensated, while any different contents are
+// refused. The same store lock and directory fsync rules as issuance apply.
+func RemoveCanonicalReceiptSessionIfExact(root string, expected TaskContext) error {
+	if err := expected.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(expected.Signature) == "" {
+		return fmt.Errorf("refusing to compensate an unsigned canonical receipt")
+	}
+	verifier, err := LoadVerifier(root)
+	if err != nil {
+		return fmt.Errorf("load canonical compensation verifier: %w", err)
+	}
+	if err := verifier.Verify(expected); err != nil {
+		return fmt.Errorf("authenticate canonical compensation target: %w", err)
+	}
+	if err := safeRefComponent(expected.TaskRef); err != nil {
+		return err
+	}
+	dir := filepath.Join(root, CanonicalTaskContextDir)
+	lock, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open receipt store lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock receipt store: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	path := filepath.Join(dir, canonicalReceiptName(expected.ProviderType, expected.ProjectID, expected.TaskRef, expected.SessionID))
+	actual, err := readCanonicalFile(path, expected.TaskRef)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("audit canonical compensation target: %w", err)
+	}
+	if !actual.EqualsIssued(expected) {
+		return fmt.Errorf("canonical compensation target differs from the exact issued session")
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove compensated canonical receipt: %w", err)
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open canonical receipt dir for compensation sync: %w", err)
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("sync canonical receipt compensation: %w", err)
+	}
+	return d.Close()
+}
+
 // LoadCanonicalReceipt returns the newest durable receipt for ref across
 // sessions — the recovery entry when only the task ref is known.
 func LoadCanonicalReceipt(root, ref string) (TaskContext, error) {
