@@ -1385,7 +1385,11 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 		reclaimHook := e.ReclaimHook
 		for _, sc := range s.StaleCards {
 			if strings.TrimSpace(sc.Role) == "" {
-				return fmt.Errorf("lifecycle: stale card %s has no configured role", sc.Ref)
+				// An orphan without a configured role cannot be safely reclaimed:
+				// there is no canonical owner/lane identity to fence.  Isolate it
+				// and continue processing independently actionable cards.
+				s.BlockedRefs = append(s.BlockedRefs, sc.Ref)
+				continue
 			}
 			held, err := e.targetHeld(context.Background(), sc.Role, sc.Ref)
 			if err != nil {
