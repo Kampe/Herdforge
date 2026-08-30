@@ -18,6 +18,23 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 )
 
+func TestCoordinatorPromptDrainsIndependentWork(t *testing.T) {
+	for _, required := range []string{
+		"Own the board-drain loop",
+		"process completed builders",
+		"admit exact PASS reviews",
+		"approve only evidence-gated merges",
+		"dispatch eligible to-do work",
+		"continue every other eligible card",
+		"Never fabricate provenance",
+		"CHA-2796 or PR #3321",
+	} {
+		if !strings.Contains(coordinatorPrompt, required) {
+			t.Fatalf("coordinator prompt missing %q: %s", required, coordinatorPrompt)
+		}
+	}
+}
+
 func TestParseMaxLanes(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string

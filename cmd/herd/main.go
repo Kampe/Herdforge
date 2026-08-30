@@ -10654,6 +10654,12 @@ func bindCoordinatorControlTab(root, workspace string) (herdr.TabBinding, error)
 	return binding, nil
 }
 
+// coordinatorPrompt is the durable control contract for a newly provisioned
+// coordinator. Keep the execution order explicit: a generic "report
+// blockers" prompt caused coordinators to stop after the first inadmissible
+// card even when independent cards could still be dispatched or merged.
+const coordinatorPrompt = `You are the durable Herdforge coordinator. Own the board-drain loop until no actionable in-progress or in-review cards remain. Each tick: reconcile the live board, process completed builders, admit exact PASS reviews, approve only evidence-gated merges, dispatch eligible to-do work when capacity exists, and revisit failed or rejected work. Do not treat an observation or hold as completion. If one card lacks evidence, isolate it with an exact blocker and continue every other eligible card. Never fabricate provenance, bypass gates, touch forbidden CHA-2796 or PR #3321, or edit the shared root checkout.`
+
 func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error) {
 	promptFile, err := os.CreateTemp("", "herd-coordinator-*.md")
 	if err != nil {
@@ -10661,7 +10667,7 @@ func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error)
 	}
 	promptPath := promptFile.Name()
 	defer os.Remove(promptPath)
-	if _, err := promptFile.WriteString("You are the durable Herdforge coordinator. Drive the forge loop, dispatch work through Herdr, and report blockers. Do not edit the shared root checkout.\n"); err != nil {
+	if _, err := promptFile.WriteString(coordinatorPrompt + "\n"); err != nil {
 		promptFile.Close()
 		return herdr.TabBinding{}, fmt.Errorf("write coordinator prompt: %w", err)
 	}
@@ -10705,8 +10711,7 @@ func provisionCoordinatorAgent(root, workspace string) (herdr.TabBinding, error)
 	if out, startErr := exec.Command(startArgs[0], startArgs[1:]...).CombinedOutput(); startErr != nil {
 		return herdr.TabBinding{}, fmt.Errorf("start native Sol/Fable coordinator: %w: %s", startErr, strings.TrimSpace(string(out)))
 	}
-	prompt := "You are the durable Herdforge coordinator. Drive the forge loop, dispatch work through Herdr, and report blockers. Do not edit the shared root checkout."
-	_ = exec.Command("herdr", "agent", "prompt", "coordinator", prompt).Run()
+	_ = exec.Command("herdr", "agent", "prompt", "coordinator", coordinatorPrompt).Run()
 	if tabResp.Result.Tab.TabID == "" {
 		return herdr.TabBinding{}, fmt.Errorf("coordinator tab id missing")
 	}
