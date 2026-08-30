@@ -238,7 +238,20 @@ func (e *Engine) kaneoBin() string {
 	if e.KaneoBin != "" {
 		return e.KaneoBin
 	}
-	return filepath.Join(repoRoot(), "bin", "herd-kaneo")
+	repositoryBin := filepath.Join(repoRoot(), "bin", "herd-kaneo")
+	// The repository wrapper is authoritative when it is installed and
+	// executable. Development checkouts and packaged installs may not carry
+	// that wrapper, however; use the authenticated PATH client in that case so
+	// readbacks and lifecycle actions do not fail merely because the optional
+	// adapter is absent. Keep the repository path as the final fallback so the
+	// eventual exec error remains actionable when neither client is available.
+	if info, err := os.Stat(repositoryBin); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+		return repositoryBin
+	}
+	if path, err := exec.LookPath("kaneo"); err == nil {
+		return path
+	}
+	return repositoryBin
 }
 
 func (e *Engine) sendBin() string {
