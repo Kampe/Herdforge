@@ -497,6 +497,11 @@ var ErrUnknownCritical = errors.New("pulse: unknown critical state")
 // ErrDispatchBlocked is returned when Apply is asked to dispatch while blocked.
 var ErrDispatchBlocked = errors.New("pulse: dispatch blocked")
 
+// ErrPausedGoalEscalation marks a beat that stopped resuming a lane after the
+// bounded no-progress attempt limit. It is a failed beat, not an informational
+// would-run, because operator intervention is now required.
+var ErrPausedGoalEscalation = errors.New("pulse: paused goal resume attempts exhausted")
+
 // ClassifyStatusWithPane maps a raw status into the taxonomy, consulting pane
 // content so a paused goal is not reported as work in progress.
 //
@@ -1008,8 +1013,9 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	snap.Actions = actions
 	snap.Counts = CountActions(agents, actions)
 
-	// Exit posture: unknown critical → non-zero; no dispatch when critical.
-	if snap.UnknownCritical {
+	// Exit posture: unknown critical or an exhausted paused-goal recovery is a
+	// failed beat. The latter must not disappear as a successful would-run.
+	if snap.UnknownCritical || hasPausedGoalEscalation(actions) {
 		snap.ExitCode = 1
 	}
 	return snap, nil
@@ -1282,7 +1288,8 @@ func Apply(ctx context.Context, snap Snapshot, actor Actor) (Snapshot, error) {
 	}
 
 	out.Counts = CountActions(out.Agents, out.Actions)
-	if out.UnknownCritical || hardErr {
+	pausedEscalation := hasPausedGoalEscalation(out.Actions)
+	if out.UnknownCritical || hardErr || pausedEscalation {
 		out.ExitCode = 1
 	} else {
 		out.ExitCode = 0
@@ -1290,7 +1297,19 @@ func Apply(ctx context.Context, snap Snapshot, actor Actor) (Snapshot, error) {
 	if hardErr {
 		return out, fmt.Errorf("pulse: one or more act steps failed")
 	}
+	if pausedEscalation {
+		return out, ErrPausedGoalEscalation
+	}
 	return out, nil
+}
+
+func hasPausedGoalEscalation(actions []Action) bool {
+	for _, action := range actions {
+		if action.Kind == ActionWouldRun && strings.HasPrefix(action.WouldRun, "escalate_paused ") {
+			return true
+		}
+	}
+	return false
 }
 
 // FormatHuman renders the beat for operators. Counts match Snapshot.Counts.
@@ -1351,7 +1370,7 @@ func FormatHuman(snap Snapshot) string {
 		}
 	}
 	if snap.ExitCode != 0 {
-		fmt.Fprintf(&b, "herd-pulse: BEAT ACTION REQUIRED (exit %d)\n", snap.ExitCode)
+		fmt.Fprintf(&b, "herd-pulse: FAILED — BEAT ACTION REQUIRED (exit %d)\n", snap.ExitCode)
 	} else {
 		fmt.Fprintf(&b, "=== herd-pulse: complete (%d actions) ===\n", len(snap.Actions))
 	}

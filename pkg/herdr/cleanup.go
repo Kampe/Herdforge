@@ -34,6 +34,7 @@ type TabClass string
 
 const (
 	TabActive          TabClass = "active"
+	TabPaused          TabClass = "paused"
 	TabStanding        TabClass = "standing"
 	TabPreservedReview TabClass = "preserved-review"
 	TabUserShell       TabClass = "user-shell"
@@ -199,6 +200,7 @@ func NormalizeAssignmentStatus(status string) string {
 
 type FleetStatus struct {
 	Working      int
+	Paused       int
 	Queued       int
 	Capacity     int
 	Unknown      int
@@ -292,6 +294,8 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 			class = TabUserShell
 		case NormalizeAssignmentStatus(agent.AssignmentStatus) == "queued":
 			class = TabQueued
+		case strings.EqualFold(strings.TrimSpace(agent.Status), "paused"):
+			class = TabPaused
 		// FAC-660 residual / seq 3130: a standing-named agent that is WORKING
 		// is productive capacity, not idle standing inventory. Classifying
 		// standing names before live status made herd status report
@@ -310,6 +314,8 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 		switch class {
 		case TabActive:
 			p.Working++
+		case TabPaused:
+			p.Paused++
 		case TabQueued:
 			p.Queued++
 		case TabStanding:
@@ -322,7 +328,7 @@ func ProjectLiveFleetStatus(agents []AgentEntry, standing map[string]bool, works
 			p.Unknown++
 		}
 	}
-	p.Capacity = maxLanes - p.Working - p.Queued - p.Recovering
+	p.Capacity = maxLanes - p.Working - p.Paused - p.Queued - p.Recovering
 	if p.Unknown > 0 || p.Capacity < 0 {
 		p.Capacity = 0
 	}

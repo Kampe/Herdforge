@@ -2,6 +2,7 @@ package pulse
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -147,6 +148,37 @@ func TestThrottleSurvivesBetweenBeats(t *testing.T) {
 	for _, a := range second.Actions {
 		if a.Kind == ActionResumeGoal {
 			t.Fatal("second beat resumed the same lane immediately; cadence state did not survive, so every beat re-sends the verb")
+		}
+	}
+}
+
+func TestFAC614RepeatedResumeEscalationFailsTheRealBeat(t *testing.T) {
+	opts := planOpts(t, true)
+	state := ResumeState{Lanes: map[string]ResumeRecord{
+		"forge-orchestrator": {
+			Lane:            "forge-orchestrator",
+			LastAttempt:     opts.Now.Add(-2 * ResumeCadence),
+			Consecutive:     ResumeAttemptLimit,
+			LastProgressSeq: 10,
+		},
+	}}
+	if err := SaveResumeState(ResumeStatePath(opts.StateDir), state); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := Beat(context.Background(), pausedObs("forge-orchestrator", 10), opts, &recordingActor{})
+	if !errors.Is(err, ErrPausedGoalEscalation) {
+		t.Fatalf("exhausted resume loop error = %v, want %v", err, ErrPausedGoalEscalation)
+	}
+	if snap.ExitCode == 0 {
+		t.Fatal("exhausted resume loop returned exit 0")
+	}
+	if !strings.Contains(FormatHuman(snap), "FAILED") {
+		t.Fatalf("failed escalation is not visible in human output:\n%s", FormatHuman(snap))
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == ActionResumeGoal {
+			t.Fatalf("exhausted lane was resumed again: %+v", action)
 		}
 	}
 }
