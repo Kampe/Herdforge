@@ -986,7 +986,7 @@ func runHarvestMerge() {
 		os.Exit(1)
 	}
 	fs := flag.NewFlagSet("harvest-merge", flag.ExitOnError)
-	branch := fs.String("branch", "", "Lane branch to harvest (required)")
+	branch := fs.String("branch", "", "Lane branch to harvest (required for ordinary harvest; optional with positional --verify-landed identity)")
 	title := fs.String("title", "", "PR title (required)")
 	// FAC-156: --verdict is no longer merge authority. Consent comes from the
 	// durable review ledger for the exact branch head; this flag can only
@@ -1041,15 +1041,19 @@ func runHarvestMerge() {
 	}
 	fs.Parse(args)
 
-	if lane == "" || *branch == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--candidate-range <base>..<sha>] [--verdict PASS]")
-		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <branch> --verify-landed --ref <FAC-x> [...]")
-		os.Exit(2)
-	}
-
 	// FAC-213 + FAC-379: --verify-landed is the post-merge "did this merge?"
 	// check, then the sealed completion-receipt reconcile for approve.
 	if *verifyLanded {
+		if *branch == "" {
+			*branch = lane
+		} else if lane != "" && lane != *branch {
+			fmt.Fprintf(os.Stderr, "herd harvest-merge: positional branch %s disagrees with --branch %s\n", lane, *branch)
+			os.Exit(2)
+		}
+		if *branch == "" {
+			fmt.Fprintln(os.Stderr, "herd harvest-merge: branch identity is required for --verify-landed (use <branch> or --branch <branch>)")
+			os.Exit(2)
+		}
 		binding := verifyLandedBinding{
 			Ref: *verifyRef, TaskID: *verifyTaskID, Candidate: *candidate,
 			BaseSHA: *verifyBaseSHA, Lease: *verifyLease, LeaseGeneration: *verifyLeaseGen,
@@ -1063,6 +1067,12 @@ func runHarvestMerge() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	if lane == "" || *branch == "" {
+		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--candidate-range <base>..<sha>] [--verdict PASS]")
+		fmt.Fprintln(os.Stderr, "       herd harvest-merge <branch> --verify-landed --ref <FAC-x> [...]")
+		os.Exit(2)
 	}
 
 	if *title == "" {

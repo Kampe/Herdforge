@@ -93,7 +93,8 @@ var subcommandUsage = map[string]string{
 	"feedback":        "Usage: herd feedback [flags]\n  Census fleet-wide control-plane feedback.",
 	"fence-broker":    "Usage: herd fence-broker [flags]\n  Inspect or enforce the broker authority fence.",
 	"fence-provision": "Usage: herd fence-provision [flags]\n  Provision the coordinator fence authority.",
-	"harvest-merge": "Usage: herd harvest-merge <branch> [flags]\n" +
+	"harvest-merge": "Usage: herd harvest-merge <lane> --branch <branch> --title <title> [flags]\n" +
+		"       herd harvest-merge <branch> --verify-landed --ref <REF> [flags]\n" +
 		"  Cherry-pick reviewed commits onto a fresh base, or prove an existing landing.\n" +
 		"\n" +
 		"  Candidate selection:\n" +
@@ -106,6 +107,8 @@ var subcommandUsage = map[string]string{
 		"\n" +
 		"  Landing proof:\n" +
 		"    --verify-landed          prove the branch content is already on origin/main\n" +
+		"                             The leading positional supplies the branch when --branch\n" +
+		"                             is absent; when both are present they must match exactly.\n" +
 		"    --ref <REF>              task ref; records a landed disposition and reconciles\n" +
 		"                             the completion receipt\n" +
 		"    --pr <n>                 pull request that carried the merge\n" +
