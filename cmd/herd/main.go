@@ -7424,8 +7424,16 @@ func liveRouteCount(provider, model, pool string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	workspace := strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	count := 0
 	for _, agent := range agents {
+		// Herdr's agent inventory spans workspaces. A route advertised from W4
+		// must not count a matching process in W3 and then hand review launch a
+		// decision about a different host profile than the one the operator
+		// queried. An explicit workspace is an authority boundary, not a hint.
+		if workspace != "" && !strings.EqualFold(strings.TrimSpace(agent.Workspace), workspace) {
+			continue
+		}
 		if agent.Status != "working" && agent.Status != "starting" {
 			continue
 		}
@@ -7453,37 +7461,65 @@ func liveRouteCount(provider, model, pool string) (int, error) {
 
 // runRoute is the herd-route CLI: pick a surface for a task shape.
 func runRoute() {
-	fs := flag.NewFlagSet("route", flag.ExitOnError)
+	if err := runRouteCommand(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "herd route: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runRouteCommand is the testable implementation of the shipped route
+// command. QA is a launch-shaped decision: it deliberately shares the strict
+// reviewer authority below instead of advertising with Pick and launching
+// with Decide.
+func runRouteCommand(args []string, out, errOut io.Writer) error {
+	fs := flag.NewFlagSet("route", flag.ContinueOnError)
+	fs.SetOutput(errOut)
 	provider := fs.String("provider", "", "Pin the candidate set to one provider")
+	model := fs.String("model", "", "Pin the exact model (requires --provider; QA only)")
 	excludeFamily := fs.String("exclude-family", "", "Exclude a model family (e.g. anthropic)")
 	wantJSON := fs.Bool("json", false, "Output the full route JSON")
-	fs.Parse(os.Args[2:])
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	shape := fs.Arg(0)
 	if len(fs.Args()) > 1 {
-		fs.Parse(fs.Args()[1:]) // allow flags after the positional shape
+		if err := fs.Parse(fs.Args()[1:]); err != nil { // allow flags after the positional shape
+			return err
+		}
 	}
 	if shape == "" {
-		fmt.Fprintf(os.Stderr, "Usage: herd route <shape> [--provider P] [--exclude-family F] [--json]\n")
-		fmt.Fprintf(os.Stderr, "Shapes: coordinator, architecture, implementation, research, bounded, advisory, qa-light, qa, adversarial\n")
-		os.Exit(2)
+		return errors.New("usage: herd route <shape> [--provider P] [--model M] [--exclude-family F] [--json]; shapes: coordinator, architecture, implementation, research, bounded, advisory, qa-light, qa, adversarial")
+	}
+	if strings.TrimSpace(*model) != "" && strings.TrimSpace(*provider) == "" {
+		return errors.New("--model requires --provider (a model without its surface is not a route)")
+	}
+	if strings.TrimSpace(*model) != "" && shape != reviewerRouteTaskShape {
+		return fmt.Errorf("--model is supported only for the authoritative reviewer task shape %q", reviewerRouteTaskShape)
 	}
 
-	e := usage.NewQuotaEngine()
-	computed := map[string]usage.BurnState{}
-	if snap, err := usage.FetchSnapshot(); err == nil {
-		computed = e.ComputeAll(snap)
-	}
-	sr := router.NewRouter(e, computed)
-	// CHA-2451: same advertising probe budget as resolve-lane. Launch Decide
-	// keeps defaultProbes via its own NewRouter path.
-	router.InstallReadPathProbes(sr)
-	sr.Probes.LiveCount = liveRouteCount
-
-	rt, err := sr.Pick(shape, *provider, *excludeFamily)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "herd route: %v\n", err)
-		os.Exit(1)
+	var rt *router.Route
+	if shape == reviewerRouteTaskShape {
+		resolved, err := resolveReviewerRouteAuthority(*provider, *model, *excludeFamily)
+		if err != nil {
+			return err
+		}
+		rt = routeFromReviewerDecision(resolved)
+	} else {
+		e := usage.NewQuotaEngine()
+		computed := map[string]usage.BurnState{}
+		if snap, err := usage.FetchSnapshot(); err == nil {
+			computed = e.ComputeAll(snap)
+		}
+		sr := router.NewRouter(e, computed)
+		// CHA-2451: non-review advertising keeps the bounded read-path probes.
+		router.InstallReadPathProbes(sr)
+		sr.Probes.LiveCount = liveRouteCount
+		var err error
+		rt, err = sr.Pick(shape, *provider, *excludeFamily)
+		if err != nil {
+			return err
+		}
 	}
 	routeLog := firstEnv("HERD_ROUTE_DECISION_LOG", "HERD_THROUGHPUT_ROUTE_LOG",
 		filepath.Join(stateDir(), "route-decisions.log"))
@@ -7491,15 +7527,29 @@ func runRoute() {
 		// FAC-462 follow-up: a route decision was already computed
 		// successfully; a failure to durably log it is an audit-trail
 		// gap, not a routing failure, so it must not fail the command.
-		fmt.Fprintf(os.Stderr, "herd route: warning: route decision log: %v\n", err)
+		fmt.Fprintf(errOut, "herd route: warning: route decision log: %v\n", err)
 	}
 	if *wantJSON {
-		json.NewEncoder(os.Stdout).Encode(rt)
-		return
+		return json.NewEncoder(out).Encode(rt)
 	}
-	fmt.Printf("%s\t%s\t%s\t%s\tpool=%s\tpressure=%d\n",
+	fmt.Fprintf(out, "%s\t%s\t%s\t%s\tpool=%s\tpressure=%d\n",
 		rt.Provider, rt.Model, rt.Effort, rt.Family, rt.QuotaPool, rt.QuotaPressure)
-	fmt.Fprintf(os.Stderr, "%s\n", rt.Reason)
+	fmt.Fprintf(errOut, "%s\n", rt.Reason)
+	return nil
+}
+
+func routeFromReviewerDecision(resolved reviewerRouteResolution) *router.Route {
+	d := resolved.Decision
+	return &router.Route{
+		Provider: d.Provider, Model: d.Model, Effort: d.Effort,
+		EffortApplicable: d.EffortApplicable, Family: d.Family, Task: d.Shape,
+		LazerLastResort: d.LazerLastResort, Availability: d.Availability,
+		QuotaPool: d.Pool, QuotaPressure: d.QuotaPressure, Score: d.Score,
+		Reason: d.Rationale, Argv: d.Argv, ArgvAuthoritative: d.ArgvAuthoritative,
+		DecisionAuthority: reviewerRouteDecisionAuthority,
+		CacheAge:          resolved.QuotaAge.Round(time.Second).String(),
+		Workspace:         resolved.Workspace,
+	}
 }
 
 func runResolveLane() {
