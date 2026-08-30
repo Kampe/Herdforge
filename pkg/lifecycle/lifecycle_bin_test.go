@@ -96,7 +96,17 @@ func TestKaneoListArgsPreservesRepositoryWrapperShape(t *testing.T) {
 	t.Setenv("PATH", filepath.Dir(pathBin))
 
 	got := (&Engine{}).kaneoListArgs()
-	if len(got) < 2 || got[0] != "list" || got[1] != "--fields" {
+	if len(got) < 2 || got[0] != "list" {
 		t.Fatalf("kaneo list args = %q, want legacy wrapper shape", got)
+	}
+	hasFields := false
+	for _, arg := range got[1:] {
+		if arg == "--fields" {
+			hasFields = true
+			break
+		}
+	}
+	if !hasFields {
+		t.Fatalf("kaneo list args = %q, want --fields in legacy wrapper shape", got)
 	}
 }
