@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -35,6 +36,19 @@ type receiptLiveLaunchLookup struct {
 	list func() ([]herdr.AgentEntry, error)
 }
 
+type receiptLaunchPhase uint8
+
+const (
+	receiptPhasePreEdit receiptLaunchPhase = iota + 1
+	receiptPhasePostLaunch
+)
+
+type receiptLaunchEvidence struct {
+	receipt   launch.Receipt
+	phase     receiptLaunchPhase
+	workspace string
+}
+
 func NewReceiptLiveLaunchLookup(path string, list func() ([]herdr.AgentEntry, error)) LiveLaunchLookup {
 	if list == nil {
 		list = herdr.AgentList
@@ -50,31 +64,136 @@ func (l *receiptLiveLaunchLookup) HasLiveLaunch(_ context.Context, taskID, taskR
 	if err != nil {
 		return false, err
 	}
-	candidates := make([]launch.Receipt, 0)
+	candidates := make([]receiptLaunchEvidence, 0)
 	for _, receipt := range receipts {
 		if !receipt.Accepted || receipt.TaskRef != taskRef {
 			continue
 		}
-		if receipt.Name == "" || receipt.TabID == "" || receipt.PaneID == "" {
-			return false, fmt.Errorf("dispatch: accepted launch receipt for %s has incomplete identity", taskRef)
+		evidence, err := classifyReceiptLaunchEvidence(receipt)
+		if err != nil {
+			return false, fmt.Errorf("dispatch: accepted launch receipt for %s is UNKNOWN: %w", taskRef, err)
 		}
-		candidates = append(candidates, receipt)
+		candidates = append(candidates, evidence)
 	}
 	if len(candidates) == 0 {
-		return false, nil
+		return false, fmt.Errorf("dispatch: no accepted launch receipt proves exact task %s", taskRef)
 	}
 	agents, err := l.list()
 	if err != nil {
 		return false, err
 	}
-	for _, receipt := range candidates {
-		for _, agent := range agents {
-			if agent.Name == receipt.Name && agent.TabID == receipt.TabID && agent.PaneID == receipt.PaneID && (receipt.HerdrSession == "" || agent.Session.Value == "" || agent.Session.Value == receipt.HerdrSession) {
-				return true, nil
+	if agents == nil {
+		return false, fmt.Errorf("dispatch: Herdr agent inventory is UNKNOWN")
+	}
+	matched := make(map[string]struct{})
+	for _, agent := range agents {
+		related := make([]receiptLaunchEvidence, 0)
+		for _, candidate := range candidates {
+			if strings.TrimSpace(agent.Name) != strings.TrimSpace(candidate.receipt.Name) {
+				continue
+			}
+			if strings.TrimSpace(agent.Cwd) == "" {
+				return false, fmt.Errorf("dispatch: matching Herdr agent %s has UNKNOWN worktree identity", candidate.receipt.Name)
+			}
+			if !sameWorktree(agent.Cwd, candidate.receipt.CWD) {
+				continue
+			}
+			related = append(related, candidate)
+		}
+		if len(related) == 0 {
+			continue
+		}
+		identity, err := exactHerdrAgentIdentity(agent)
+		if err != nil {
+			return false, err
+		}
+		admitted := false
+		for _, candidate := range related {
+			if candidate.phase == receiptPhasePreEdit || postLaunchIdentityMatches(candidate, agent) {
+				admitted = true
+				break
 			}
 		}
+		if !admitted {
+			return false, fmt.Errorf("dispatch: live Herdr identity for %s does not match an exact admitted post-launch receipt", taskRef)
+		}
+		matched[identity] = struct{}{}
 	}
-	return false, nil
+	if len(matched) > 1 {
+		return false, fmt.Errorf("dispatch: accepted launch receipt for %s matches ambiguous live Herdr identities", taskRef)
+	}
+	return len(matched) == 1, nil
+}
+
+func classifyReceiptLaunchEvidence(receipt launch.Receipt) (receiptLaunchEvidence, error) {
+	name := strings.TrimSpace(receipt.Name)
+	cwd := strings.TrimSpace(receipt.CWD)
+	if name == "" || cwd == "" {
+		return receiptLaunchEvidence{}, fmt.Errorf("missing exact name or worktree")
+	}
+	tabID := strings.TrimSpace(receipt.TabID)
+	paneID := strings.TrimSpace(receipt.PaneID)
+	session := strings.TrimSpace(receipt.HerdrSession)
+	claimsPostLaunch := tabID != "" || paneID != "" || session != ""
+	if !claimsPostLaunch {
+		if receipt.CreatedAt.IsZero() || strings.TrimSpace(receipt.Branch) == "" ||
+			strings.TrimSpace(receipt.Provider) == "" || strings.TrimSpace(receipt.Model) == "" ||
+			strings.TrimSpace(receipt.BuilderFamily) == "" {
+			return receiptLaunchEvidence{}, fmt.Errorf("incomplete pre-edit provenance")
+		}
+		return receiptLaunchEvidence{receipt: receipt, phase: receiptPhasePreEdit}, nil
+	}
+	if tabID == "" || paneID == "" || session == "" {
+		return receiptLaunchEvidence{}, fmt.Errorf("partial post-launch identity")
+	}
+	workspace, err := workspaceFromHerdrIDs(tabID, paneID)
+	if err != nil {
+		return receiptLaunchEvidence{}, err
+	}
+	return receiptLaunchEvidence{receipt: receipt, phase: receiptPhasePostLaunch, workspace: workspace}, nil
+}
+
+func workspaceFromHerdrIDs(tabID, paneID string) (string, error) {
+	tabWorkspace, tabResource, tabOK := strings.Cut(strings.TrimSpace(tabID), ":")
+	paneWorkspace, paneResource, paneOK := strings.Cut(strings.TrimSpace(paneID), ":")
+	if !tabOK || !paneOK || strings.TrimSpace(tabWorkspace) == "" || strings.TrimSpace(tabResource) == "" ||
+		strings.TrimSpace(paneWorkspace) == "" || strings.TrimSpace(paneResource) == "" || tabWorkspace != paneWorkspace {
+		return "", fmt.Errorf("post-launch identity has incomplete or conflicting Herdr workspace")
+	}
+	return tabWorkspace, nil
+}
+
+func exactHerdrAgentIdentity(agent herdr.AgentEntry) (string, error) {
+	name := strings.TrimSpace(agent.Name)
+	workspace := strings.TrimSpace(agent.Workspace)
+	tabID := strings.TrimSpace(agent.TabID)
+	paneID := strings.TrimSpace(agent.PaneID)
+	session := strings.TrimSpace(agent.Session.Value)
+	cwd := strings.TrimSpace(agent.Cwd)
+	if name == "" || workspace == "" || tabID == "" || paneID == "" || session == "" || cwd == "" {
+		return "", fmt.Errorf("dispatch: matching Herdr agent has incomplete live identity")
+	}
+	qualifiedWorkspace, err := workspaceFromHerdrIDs(tabID, paneID)
+	if err != nil || qualifiedWorkspace != workspace {
+		return "", fmt.Errorf("dispatch: matching Herdr agent has ambiguous workspace identity")
+	}
+	return strings.Join([]string{name, workspace, tabID, paneID, session, filepath.Clean(cwd)}, "\x00"), nil
+}
+
+func postLaunchIdentityMatches(candidate receiptLaunchEvidence, agent herdr.AgentEntry) bool {
+	receipt := candidate.receipt
+	return candidate.phase == receiptPhasePostLaunch &&
+		strings.TrimSpace(agent.Name) == strings.TrimSpace(receipt.Name) &&
+		sameWorktree(agent.Cwd, receipt.CWD) &&
+		strings.TrimSpace(agent.Workspace) == candidate.workspace &&
+		strings.TrimSpace(agent.TabID) == strings.TrimSpace(receipt.TabID) &&
+		strings.TrimSpace(agent.PaneID) == strings.TrimSpace(receipt.PaneID) &&
+		strings.TrimSpace(agent.Session.Value) == strings.TrimSpace(receipt.HerdrSession)
+}
+
+func sameWorktree(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a != "" && b != "" && filepath.Clean(a) == filepath.Clean(b)
 }
 
 func readLaunchReceiptsStrict(path string) ([]launch.Receipt, error) {
