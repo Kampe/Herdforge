@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -81,6 +82,32 @@ func TestToplevelIsPerWorktree(t *testing.T) {
 		if !filepath.IsAbs(p) {
 			t.Errorf("toplevel must be absolute, got %q", p)
 		}
+	}
+}
+
+func TestCommitIsAncestorDistinguishesReachabilityFromEquality(t *testing.T) {
+	repo := t.TempDir()
+	grGit(t, repo, "init", "-q", "-b", "main")
+	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	baseOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.TrimSpace(string(baseOut))
+	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "descendant")
+	descendantOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descendant := strings.TrimSpace(string(descendantOut))
+
+	contains, err := CommitIsAncestor(context.Background(), repo, base, descendant)
+	if err != nil || !contains {
+		t.Fatalf("base must be reachable from descendant: contains=%v err=%v", contains, err)
+	}
+	contains, err = CommitIsAncestor(context.Background(), repo, descendant, base)
+	if err != nil || contains {
+		t.Fatalf("descendant must not be reachable from base: contains=%v err=%v", contains, err)
 	}
 }
 

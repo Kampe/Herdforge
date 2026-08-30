@@ -61,6 +61,25 @@ func TestNoCapabilitiesCreatesNoApprovalPrompt(t *testing.T) {
 	}
 }
 
+func TestRecoveryBindingRequiresExactAdjacentRunRevision(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "plans.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	now := time.Now().UTC()
+	b := binding()
+	b.RunRevision = 3
+	b.RecoveryFromRevision = 1
+	if _, err := s.Create(context.Background(), Plan{Binding: b, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); !errors.Is(err, ErrStale) {
+		t.Fatalf("non-adjacent recovery binding err=%v, want ErrStale", err)
+	}
+	b.RunRevision = 2
+	if _, err := s.Create(context.Background(), Plan{Binding: b, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatalf("exact adjacent recovery binding: %v", err)
+	}
+}
+
 func TestGrantIsIdempotentAndNeverStoresCredentials(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "plans.db"))
 	if err != nil {

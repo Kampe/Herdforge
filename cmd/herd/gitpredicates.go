@@ -1,8 +1,10 @@
 package main
 
 import (
-	"os/exec"
+	"context"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // One definition each for two git questions this tree kept re-asking.
@@ -28,10 +30,6 @@ func commitIsAncestor(root, sha, ref string) bool {
 	if sha == "" || ref == "" {
 		return false
 	}
-	args := []string{}
-	if strings.TrimSpace(root) != "" {
-		args = append(args, "-C", root)
-	}
-	args = append(args, "merge-base", "--is-ancestor", sha, ref)
-	return exec.Command("git", args...).Run() == nil
+	contains, err := gitroot.CommitIsAncestor(context.Background(), root, sha, ref)
+	return err == nil && contains
 }

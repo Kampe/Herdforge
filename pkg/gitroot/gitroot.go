@@ -71,6 +71,31 @@ func Toplevel(ctx context.Context, startDir string) (string, error) {
 	return filepath.Clean(top), nil
 }
 
+// CommitIsAncestor reports whether ancestor is reachable from descendant.
+// A non-zero git answer is a clean false; malformed or unreadable repository
+// evidence is returned as an error so security-sensitive callers can refuse.
+func CommitIsAncestor(ctx context.Context, root, ancestor, descendant string) (bool, error) {
+	ancestor = strings.TrimSpace(ancestor)
+	descendant = strings.TrimSpace(descendant)
+	if ancestor == "" || descendant == "" {
+		return false, fmt.Errorf("git ancestry requires exact ancestor and descendant")
+	}
+	args := []string{}
+	if strings.TrimSpace(root) != "" {
+		args = append(args, "-C", root)
+	}
+	args = append(args, "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd := exec.CommandContext(ctx, "git", args...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git ancestry %s -> %s: %v (%s)", ancestor, descendant, err, strings.TrimSpace(string(out)))
+}
+
 // EnvProjectRoot names the canonical PROJECT CONTROL root.
 //
 // FAC-573: HERD_ROOT was overloaded. The launch environment sets it to the

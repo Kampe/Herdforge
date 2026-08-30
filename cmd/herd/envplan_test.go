@@ -125,7 +125,7 @@ func TestEnvironmentBindingExplicitRecoveryReturnsFreshExactRunRevision(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.TaskRef != task.Ref || binding.TaskID != task.ID || binding.Provider != "memory" || binding.GraphRevision != "graph-new" || binding.RunID != stale.ID || binding.RunRevision != 2 {
+	if binding.TaskRef != task.Ref || binding.TaskID != task.ID || binding.Provider != "memory" || binding.GraphRevision != "graph-new" || binding.RunID != stale.ID || binding.RunRevision != 2 || binding.RecoveryFromRevision != 1 || !binding.Recovered() {
 		t.Fatalf("fresh binding=%+v", binding)
 	}
 }
@@ -187,7 +187,7 @@ func TestEnvironmentBindingRecoveryUsesGenuinePreEditReceiptAuthority(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.RunID != stale.ID || binding.RunRevision != 2 || binding.GraphRevision != "graph-new" {
+	if binding.RunID != stale.ID || binding.RunRevision != 2 || binding.RecoveryFromRevision != 1 || !binding.Recovered() || binding.GraphRevision != "graph-new" {
 		t.Fatalf("recovered binding=%+v", binding)
 	}
 	firstReadback, err := runs.Load(ctx, stale.ID)

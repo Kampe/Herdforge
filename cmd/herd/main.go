@@ -5186,6 +5186,13 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		fmt.Fprintf(os.Stderr, "dispatch: cannot resolve canonical root: %v\n", rootErr)
 		os.Exit(1)
 	}
+	d.RecoveredLifecycle = dispatch.NewLifecycleGenerationRebinder(
+		dispatchRoot,
+		filepath.Join(dispatchRoot, defaultLifecycleDB),
+		reviewLedgerPath(),
+		mail.CallbackMailPath(dispatchRoot),
+		plans,
+	)
 	// FAC-145: broker ADMISSION precedes the durable claim — a dispatch
 	// that cannot possibly launch a provider-capable agent never strands a
 	// lease on the ticket.

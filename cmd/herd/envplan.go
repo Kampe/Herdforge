@@ -216,7 +216,11 @@ func environmentBindingFromAuthorities(ctx context.Context, req environmentBindi
 	}
 	for _, saved := range run.Tasks {
 		if saved.ID == task.ID && saved.Ref == task.Ref {
-			return envplan.Binding{TaskRef: task.Ref, TaskID: task.ID, Provider: a.Provider, ProviderRevision: saved.ProviderRevision, GraphRevision: run.DependencyGraphRevision, RunID: run.ID, RunRevision: run.Revision}, nil
+			binding := envplan.Binding{TaskRef: task.Ref, TaskID: task.ID, Provider: a.Provider, ProviderRevision: saved.ProviderRevision, GraphRevision: run.DependencyGraphRevision, RunID: run.ID, RunRevision: run.Revision}
+			if run.Recovery != nil {
+				binding.RecoveryFromRevision = run.Recovery.FromRevision
+			}
+			return binding, nil
 		}
 	}
 	return envplan.Binding{}, errors.New("dispatch runstate omitted requested task")

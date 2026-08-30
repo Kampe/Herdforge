@@ -281,6 +281,10 @@ type DispatchResult struct {
 	SecurityEvents int
 }
 
+// TaskPacketFile is the one coordinator-issued packet name shared by dispatch
+// and every pre-launch readback gate.
+const TaskPacketFile = "TASK-PACKET.md"
+
 // ReplyTarget carries the coordinator identity a packet embeds so agents
 // know where to report completion and BLOCKED (FAC-222). Before this, no
 // packet carried a reply address — the coordinator discovered every finished
@@ -386,6 +390,11 @@ type Dispatcher struct {
 	// EnvironmentPlans is the FAC-241 durable capability authority. It is
 	// consulted before scope, worktree, board, harness, or credential effects.
 	EnvironmentPlans *envplan.Store
+	// RecoveredLifecycle is the coordinator-owned FAC-669 generation fence.
+	// An explicitly recovered environment binding cannot become launchable
+	// until its signed receipts, failed candidate, callback history, worktree,
+	// and lifecycle CAS have all been proved by this authority.
+	RecoveredLifecycle RecoveredLifecycleAuthority
 	// Bootstrap executes the repository-declared worktree bootstrap only after
 	// dispatch owns the task and has admitted its worktree. Nil uses the
 	// production-safe executor; tests may inject an attributable failure seam.
@@ -799,7 +808,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if err != nil {
 		return nil, err
 	}
-	if err := d.admitEnvironmentPlan(ctx, task, opts); err != nil {
+	environmentBinding, err := d.admitEnvironmentPlan(ctx, task, opts)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1107,7 +1117,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if depProv != nil {
 		packet = packet + "\n" + deps.PacketSection(depProv)
 	}
-	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
+	packetPath := filepath.Join(wtInfo.Path, TaskPacketFile)
 	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
 		return nil, failOwned("task_packet_write_failed", fmt.Errorf("failed to write task packet: %w", err))
 	}
@@ -1130,6 +1140,41 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if err := StoreCanonicalReceipt(d.Worktree.RepoRoot(), tc0); err != nil {
 		return nil, failOwned("task_context_write_failed",
 			fmt.Errorf("failed to store canonical receipt: %w", err))
+	}
+	// FAC-669: recovered packets are not launchable merely because their new
+	// receipt and packet are signed and durable. Advance the lifecycle fence
+	// atomically only after those exact bytes can be read back, and before the
+	// post-side-effect admission or launcher can observe a launchable result.
+	if environmentBinding != nil && environmentBinding.Recovered() {
+		if tok.Generation != opts.LeaseGeneration {
+			return nil, failOwned("lifecycle_generation_rebind_failed", fmt.Errorf(
+				"recovered dispatch lease generation %d differs from signed coordination generation %d", tok.Generation, opts.LeaseGeneration))
+		}
+		if d.RecoveredLifecycle == nil {
+			return nil, failOwned("lifecycle_generation_rebind_failed",
+				errors.New("dispatch recovery: lifecycle generation authority is required"))
+		}
+		if _, err := d.RecoveredLifecycle.RebindRecovered(ctx, RecoveredLifecycleRequest{
+			Binding:             *environmentBinding,
+			EnvironmentPlanID:   opts.EnvironmentPlanID,
+			ProviderType:        d.Config.TaskProvider.Type,
+			ProjectID:           d.Config.TaskProvider.ProjectID,
+			TaskID:              task.ID,
+			TaskRef:             task.Ref,
+			Repository:          tc0.Repository,
+			LifecycleRepository: strings.ToLower(strings.TrimSpace(d.Config.Project.Name)),
+			LeaseID:             opts.LeaseID,
+			LeaseGeneration:     opts.LeaseGeneration,
+			Branch:              branch,
+			WorktreePath:        wtInfo.Path,
+			WorktreeHead:        wtInfo.Commit,
+			BaseSHA:             wtInfo.BaseSHA,
+			AnchorRef:           wtInfo.AnchorRef,
+			TaskPacket:          packet,
+			NewReceipt:          tc0,
+		}); err != nil {
+			return nil, failOwned("lifecycle_generation_rebind_failed", err)
+		}
 	}
 
 	result := &DispatchResult{
@@ -1266,22 +1311,22 @@ func (d *Dispatcher) graphRevisionForTask(ctx context.Context, task *provider.Ta
 
 // admitEnvironmentPlan derives the live FAC-235 binding and checks all plan
 // requests before scope admission. It deliberately has no side effects.
-func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Task, opts DispatchOptions) error {
-	if !d.Production {
-		return nil
+func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Task, opts DispatchOptions) (*envplan.Binding, error) {
+	if !d.Production && strings.TrimSpace(opts.EnvironmentPlanID) == "" {
+		return nil, nil
 	}
 	if d.EnvironmentPlans == nil {
-		return errors.New("dispatch envplan: durable environment plan store is required in production")
+		return nil, errors.New("dispatch envplan: durable environment plan store is required")
 	}
 	if strings.TrimSpace(opts.EnvironmentPlanID) == "" {
-		return errors.New("dispatch envplan: plan id is required in production")
+		return nil, errors.New("dispatch envplan: plan id is required in production")
 	}
 	if task == nil || d.RunStates == nil || (d.RunStateGraph == nil && d.RunStateGraphForTask == nil) {
-		return errors.New("dispatch envplan: task and runstate authorities are required")
+		return nil, errors.New("dispatch envplan: task and runstate authorities are required")
 	}
 	run, err := d.RunStates.Resume(ctx, "dispatch:"+task.ID, runstate.Authority{Tasks: d.TaskProvider, Graph: d.RunStateGraph, GraphForTask: d.RunStateGraphForTask})
 	if err != nil {
-		return fmt.Errorf("dispatch envplan runstate: %w", err)
+		return nil, fmt.Errorf("dispatch envplan runstate: %w", err)
 	}
 	var saved *runstate.TaskState
 	for i := range run.Tasks {
@@ -1291,16 +1336,19 @@ func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Ta
 		}
 	}
 	if saved == nil {
-		return fmt.Errorf("dispatch envplan: %w: task absent from run", envplan.ErrStale)
+		return nil, fmt.Errorf("dispatch envplan: %w: task absent from run", envplan.ErrStale)
 	}
 	binding := envplan.Binding{TaskRef: task.Ref, TaskID: task.ID, Provider: d.Config.TaskProvider.Type, ProviderRevision: saved.ProviderRevision, GraphRevision: run.DependencyGraphRevision, RunID: run.ID, RunRevision: run.Revision}
+	if run.Recovery != nil {
+		binding.RecoveryFromRevision = run.Recovery.FromRevision
+	}
 	plan, err := d.EnvironmentPlans.Load(ctx, opts.EnvironmentPlanID)
 	if err != nil {
-		return fmt.Errorf("dispatch envplan load: %w", err)
+		return nil, fmt.Errorf("dispatch envplan load: %w", err)
 	}
 	for _, request := range plan.Requests {
 		if err := d.EnvironmentPlans.Authorize(ctx, plan.ID, binding, request.Capability, time.Now().UTC()); err != nil {
-			return fmt.Errorf("dispatch envplan admission %s: %w", request.Capability, err)
+			return nil, fmt.Errorf("dispatch envplan admission %s: %w", request.Capability, err)
 		}
 	}
 	// External effects dispatch will perform must be explicitly planned too;
@@ -1314,7 +1362,7 @@ func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Ta
 		}
 		lane, err := config.ResolveLane(d.Config, laneName)
 		if err != nil {
-			return fmt.Errorf("dispatch envplan lane: %w", err)
+			return nil, fmt.Errorf("dispatch envplan lane: %w", err)
 		}
 		for _, cap := range lane.Capabilities {
 			if cap == config.CapabilityNetwork {
@@ -1325,10 +1373,10 @@ func (d *Dispatcher) admitEnvironmentPlan(ctx context.Context, task *provider.Ta
 	}
 	for _, cap := range required {
 		if err := d.EnvironmentPlans.Authorize(ctx, plan.ID, binding, cap, time.Now().UTC()); err != nil {
-			return fmt.Errorf("dispatch envplan required %s: %w", cap, err)
+			return nil, fmt.Errorf("dispatch envplan required %s: %w", cap, err)
 		}
 	}
-	return nil
+	return &binding, nil
 }
 
 // launchFailure is intent-only: launch never calls Compensator.Compensate.

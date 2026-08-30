@@ -46,6 +46,14 @@ type Binding struct {
 	GraphRevision    string `json:"graph_revision"`
 	RunID            string `json:"run_id"`
 	RunRevision      int64  `json:"run_revision"`
+	// RecoveryFromRevision is non-zero only for an explicit, exact-task
+	// stale-run recovery. It makes recovery authority part of the immutable
+	// plan binding instead of inferring it from an ordinary revision number.
+	RecoveryFromRevision int64 `json:"recovery_from_revision,omitempty"`
+}
+
+func (b Binding) Recovered() bool {
+	return b.RecoveryFromRevision > 0 && b.RunRevision == b.RecoveryFromRevision+1
 }
 
 type Evidence struct {
@@ -287,7 +295,7 @@ func planID(b Binding, r []Request) string {
 	return "env-" + hex.EncodeToString(sum[:16])
 }
 func validate(p Plan) error {
-	if p.SchemaVersion != SchemaVersion || p.ID == "" || p.Binding.TaskRef == "" || p.Binding.TaskID == "" || p.Binding.Provider == "" || p.Binding.ProviderRevision == "" || p.Binding.GraphRevision == "" || p.Binding.RunID == "" || p.Binding.RunRevision < 1 || p.ExpiresAt.IsZero() || !p.ExpiresAt.After(p.CreatedAt) {
+	if p.SchemaVersion != SchemaVersion || p.ID == "" || p.Binding.TaskRef == "" || p.Binding.TaskID == "" || p.Binding.Provider == "" || p.Binding.ProviderRevision == "" || p.Binding.GraphRevision == "" || p.Binding.RunID == "" || p.Binding.RunRevision < 1 || p.Binding.RecoveryFromRevision < 0 || (p.Binding.RecoveryFromRevision > 0 && !p.Binding.Recovered()) || p.ExpiresAt.IsZero() || !p.ExpiresAt.After(p.CreatedAt) {
 		return fmt.Errorf("%w: incomplete plan", ErrStale)
 	}
 	seen := map[Capability]bool{}
