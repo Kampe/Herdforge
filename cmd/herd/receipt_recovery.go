@@ -55,6 +55,9 @@ func authenticatedRecoveryIdentity(ctx context.Context, root, targetDir, ref, br
 	if role != dispatch.RoleWorker && role != dispatch.RoleRecovery {
 		return zero, fmt.Errorf("recovery receipt: prior role %q is not worker/recovery provenance", prior.Role)
 	}
+	if role == dispatch.RoleRecovery && prior.AuthorityScope != dispatch.AuthorityScopeCandidateSupersession {
+		return zero, fmt.Errorf("recovery receipt: generic recovery sentinel is not candidate-supersession provenance")
+	}
 	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
 	if prior.Repository != repository || prior.ProviderType != cfg.TaskProvider.Type ||
 		prior.ProjectID == "" || prior.ProjectID != cfg.TaskProvider.ProjectID {

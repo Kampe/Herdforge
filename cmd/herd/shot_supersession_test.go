@@ -82,6 +82,7 @@ func TestValidateShotSupersessionFactsAcceptsCoordinatorIssuedRecoveryReceiptFor
 	facts := validShotSupersessionFacts()
 	facts.ReportedRef, facts.TaskRef, facts.ProviderTaskRef = "FAC-631", "FAC-631", "FAC-631"
 	facts.Role = "recovery"
+	facts.AuthorityScope = "candidate-supersession"
 	facts.LeaseTaskRef = "FAC-631:recovery"
 	facts.ReplacementSHA = "7767a0b613d8449f36f4722cbd43356664d8f1bf"
 	facts.AuthorizedCandidateSHA = facts.ReplacementSHA
@@ -101,6 +102,7 @@ func TestValidateShotSupersessionFactsAcceptsCoordinatorIssuedRecoveryReceiptFor
 	}{
 		{"wrong recovery lease", func(f *shotSupersessionFacts) { f.LeaseTaskRef = "FAC-631" }},
 		{"wrong authorized candidate", func(f *shotSupersessionFacts) { f.AuthorizedCandidateSHA = strings.Repeat("c", 40) }},
+		{"generic recovery scope", func(f *shotSupersessionFacts) { f.AuthorityScope = "" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			invalid := facts
@@ -109,6 +111,17 @@ func TestValidateShotSupersessionFactsAcceptsCoordinatorIssuedRecoveryReceiptFor
 				t.Fatal("invalid coordinator recovery receipt was accepted")
 			}
 		})
+	}
+}
+
+func TestCandidateSupersessionRecoveryAuthorityCannotDowngradeToGenericSentinel(t *testing.T) {
+	facts := validShotSupersessionFacts()
+	facts.Role = "recovery"
+	facts.LeaseTaskRef = "FAC-662:recovery"
+	facts.AuthorizedCandidateSHA = facts.ReplacementSHA
+	facts.LiveLaunch = false
+	if err := validateShotSupersessionFacts(facts); err == nil {
+		t.Fatal("generic recovery-sentinel receipt was accepted as candidate-supersession authority")
 	}
 }
 

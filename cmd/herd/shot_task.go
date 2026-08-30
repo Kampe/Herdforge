@@ -42,7 +42,7 @@ func runShotTask(ref string, args []string) {
 	risk := fs.String("risk", "", "Risk tier for this card (R0-R3) when the board carries no risk label")
 	asJSON := fs.Bool("json", false, "Emit the evidence packet as JSON instead of prose")
 	report := fs.String("report", "", "Post a builder callback instead of running a shot (complete|blocked)")
-	sha := fs.String("sha", "", "Exact candidate commit SHA for --report complete; closed-worker supersession requires `herd receipt issue --role recovery <ref> <worktree>`")
+	sha := fs.String("sha", "", "Exact candidate commit SHA for --report complete; closed-worker supersession requires `herd receipt issue --role recovery --candidate-supersession <ref> <worktree>`")
 	lease := fs.Int64("lease", 0, "Lease generation the shot reported at dispatch (required with --report)")
 	detail := fs.String("detail", "", "Detail for --report blocked")
 	fs.Parse(args)

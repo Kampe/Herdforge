@@ -111,6 +111,36 @@ func TestTaskContextValidate_RolePolicy(t *testing.T) {
 	}
 }
 
+func TestTaskContextValidate_CandidateSupersessionScopeIsExplicitAndRecoveryOnly(t *testing.T) {
+	generic := validTaskContext()
+	generic.Role = RoleRecovery
+	generic.AllowedOps = OpsForRole(RoleRecovery)
+	if err := generic.Validate(); err != nil {
+		t.Fatalf("generic recovery sentinel must remain valid: %v", err)
+	}
+
+	scoped := generic
+	scoped.AuthorityScope = AuthorityScopeCandidateSupersession
+	scoped.CandidateSHA = strings.Repeat("a", 40)
+	if err := scoped.Validate(); err != nil {
+		t.Fatalf("explicit candidate-supersession recovery must validate: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*TaskContext){
+		"unknown scope":     func(tc *TaskContext) { tc.AuthorityScope = "generic-recovery" },
+		"wrong role":        func(tc *TaskContext) { tc.Role = RoleWorker },
+		"missing candidate": func(tc *TaskContext) { tc.CandidateSHA = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := scoped
+			mutate(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatal("invalid candidate-supersession scope was accepted")
+			}
+		})
+	}
+}
+
 // The receipt is the SOLE file written — no provider-native context file is
 // seeded (that was an ambient-mutation affordance), and the write is
 // atomic: a failed commit leaves no partial receipt and no temp litter.

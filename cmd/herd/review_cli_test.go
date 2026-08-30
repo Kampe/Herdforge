@@ -1556,6 +1556,9 @@ func TestReceiptIssueCLI_AdmitsEveryIsolatedAgentClass(t *testing.T) {
 		if tc.Role != role {
 			t.Fatalf("issued role = %q, want %q", tc.Role, role)
 		}
+		if role == dispatch.RoleRecovery && tc.AuthorityScope != "" {
+			t.Fatalf("generic recovery sentinel unexpectedly received authority scope %q", tc.AuthorityScope)
+		}
 		if tc.LeaseTaskRef != "FAC-1:"+role {
 			t.Fatalf("role lease scope = %q", tc.LeaseTaskRef)
 		}
@@ -1580,7 +1583,70 @@ func TestReceiptIssueCLI_AdmitsEveryIsolatedAgentClass(t *testing.T) {
 	if !strings.Contains(string(out), "may not run the verification gate") {
 		t.Fatalf("expected gate-role refusal, got:\n%s", out)
 	}
-	_ = wt
+	before, err := dispatch.ReadTaskContext(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "--candidate-supersession", "FAC-1", wt).CombinedOutput(); err == nil {
+		t.Fatalf("non-recovery candidate-supersession scope must be refused:\n%s", out)
+	}
+	after, err := dispatch.ReadTaskContext(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.EqualsIssued(before) {
+		t.Fatal("refused candidate-supersession role mutation changed generic sentinel authority")
+	}
+}
+
+func TestReceiptIssueCLI_ExplicitCandidateSupersessionRecoveryIsScopedAndBasePreserving(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	base := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-1", target, base)
+	candidate := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+
+	signer := fixtureSigner(t, keyDir, dir)
+	prior, err := signer.Issue(dispatch.TaskContext{
+		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
+		Role: dispatch.RoleWorker, TaskRef: "FAC-1", TaskID: "t1", Branch: "herd/fac-1",
+		BaseSHA: base, CandidateSHA: candidate, LeaseID: "worker-prior", LeaseGeneration: 1,
+		LeaseTaskRef: "FAC-1", SessionID: "worker-prior-session", AllowedOps: dispatch.OpsForRole(dispatch.RoleWorker),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(target, prior); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(dir, prior); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "recovery", "--candidate-supersession", "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("explicit candidate-supersession recovery admission failed: %v\n%s", err, out)
+	}
+	issued, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued.Role != dispatch.RoleRecovery || issued.AuthorityScope != dispatch.AuthorityScopeCandidateSupersession {
+		t.Fatalf("explicit recovery authority = role %q scope %q", issued.Role, issued.AuthorityScope)
+	}
+	if issued.BaseSHA != base || issued.CandidateSHA != candidate || issued.TaskID != prior.TaskID || issued.ProjectID != prior.ProjectID {
+		t.Fatalf("explicit recovery changed immutable identity: %+v", issued)
+	}
 }
 
 // FAC-145 (blocker 1 regression): a REVIEWER receipt whose lease was
