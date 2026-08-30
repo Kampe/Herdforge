@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -360,6 +361,15 @@ func TestDecodeKaneoTaskBody_MismatchFailsClosed(t *testing.T) {
 	), "FAC-99")
 	if err != nil || dto.ID != "internal-uuid" {
 		t.Fatalf("matching object by ref: dto=%+v err=%v", dto, err)
+	}
+}
+
+func TestDecodeKaneoTaskBody_DuplicateExactRefFailsClosed(t *testing.T) {
+	_, err := decodeKaneoTaskBody(http.StatusOK, []byte(
+		`[{"id":"task-b","ref":"FAC-646","status":"to-do","projectId":"p"},{"id":"task-a","ref":"FAC-646","status":"to-do","projectId":"p"}]`,
+	), "FAC-646")
+	if err == nil || !strings.Contains(err.Error(), `ambiguous across ids [task-a task-b]`) {
+		t.Fatalf("duplicate exact ref error = %v", err)
 	}
 }
 
