@@ -151,6 +151,37 @@ func TestThrottleSurvivesBetweenBeats(t *testing.T) {
 	}
 }
 
+func TestFAC614RepeatedResumeEscalationFailsTheRealBeat(t *testing.T) {
+	opts := planOpts(t, true)
+	state := ResumeState{Lanes: map[string]ResumeRecord{
+		"forge-orchestrator": {
+			Lane:            "forge-orchestrator",
+			LastAttempt:     opts.Now.Add(-2 * ResumeCadence),
+			Consecutive:     ResumeAttemptLimit,
+			LastProgressSeq: 10,
+		},
+	}}
+	if err := SaveResumeState(ResumeStatePath(opts.StateDir), state); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := Beat(context.Background(), pausedObs("forge-orchestrator", 10), opts, &recordingActor{})
+	if err == nil {
+		t.Fatal("exhausted resume loop returned a successful beat; escalation must fail visibly")
+	}
+	if snap.ExitCode == 0 {
+		t.Fatal("exhausted resume loop returned exit 0")
+	}
+	if !strings.Contains(FormatHuman(snap), "FAILED") {
+		t.Fatalf("failed escalation is not visible in human output:\n%s", FormatHuman(snap))
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == ActionResumeGoal {
+			t.Fatalf("exhausted lane was resumed again: %+v", action)
+		}
+	}
+}
+
 func TestResumeStatePathHonoursTheStateDir(t *testing.T) {
 	dir := t.TempDir()
 	if got := ResumeStatePath(dir); got != filepath.Join(dir, ".herd", "run", "resume-state.json") {

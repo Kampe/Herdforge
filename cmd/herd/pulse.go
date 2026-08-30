@@ -367,12 +367,8 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 	ev := loadReapEvidence(ctx, agents, doneRefs)
 	out := make([]pulse.AgentObservation, 0, len(agents))
 	for _, a := range agents {
-		paneBody := ""
-		if a.PaneID != "" {
-			if body, readErr := herdr.PaneRead(a.PaneID, 40); readErr == nil {
-				paneBody = body
-			}
-		}
+		rawStatus := a.Status
+		_, paneBody := classifyPulseAndStatusAgent(a, herdr.PaneRead)
 		processName := ""
 		if a.PaneID != "" {
 			if processes, processErr := herdr.PaneProcessInfo(a.PaneID); processErr == nil && len(processes) > 0 {
@@ -386,13 +382,13 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		explain, explainErr := herdr.ExplainAgent(explainTarget)
 		agent := pulse.AgentObservation{
 			Name: a.Name,
-			Raw:  a.Status,
+			Raw:  rawStatus,
 			// FAC-614: pane-AWARE classification. readPulseHerdr already pays
 			// for the pane read above; classifying without it is what made a
 			// paused goal indistinguishable from work in progress. An
 			// independent review FAILed the first version of this change for
 			// exactly this -- the policy existed and the beat never used it.
-			Status: pulse.ClassifyStatusWithPane(a.Status, false, paneBody),
+			Status: pulse.ClassifyStatusWithPane(rawStatus, false, paneBody),
 			// FAC-614: the harness's own transition counter. Resume escalation
 			// measures PROGRESS against this, not elapsed time -- a lane can be
 			// legitimately slow without being stuck.
@@ -438,6 +434,34 @@ func readPulseHerdr(ctx context.Context, doneRefs map[string]bool) pulse.HerdrOb
 		out = append(out, agent)
 	}
 	return pulse.HerdrObservation{Known: true, Agents: out}
+}
+
+type paneTailReader func(paneID string, tailLines int) (string, error)
+
+// classifyPulseAndStatusAgent is the shared live-census seam for the two
+// operator surfaces that report lane activity. The marker vocabulary remains
+// owned by pkg/kick through pulse.ClassifyStatusWithPane; this function only
+// supplies the real pane observation and preserves the raw status on unknown.
+func classifyPulseAndStatusAgent(agent herdr.AgentEntry, readPane paneTailReader) (herdr.AgentEntry, string) {
+	if pulse.ClassifyStatus(agent.Status, false) != pulse.StatusBusy || strings.TrimSpace(agent.PaneID) == "" || readPane == nil {
+		return agent, ""
+	}
+	body, err := readPane(agent.PaneID, 40)
+	if err != nil {
+		return agent, ""
+	}
+	if status := pulse.ClassifyStatusWithPane(agent.Status, false, body); status == pulse.StatusPaused {
+		agent.Status = string(status)
+	}
+	return agent, body
+}
+
+func classifyPulseAndStatusAgents(agents []herdr.AgentEntry, readPane paneTailReader) []herdr.AgentEntry {
+	classified := append([]herdr.AgentEntry(nil), agents...)
+	for i := range classified {
+		classified[i], _ = classifyPulseAndStatusAgent(classified[i], readPane)
+	}
+	return classified
 }
 
 func packetPendingFromExplain(explain herdr.AgentExplain) bool {

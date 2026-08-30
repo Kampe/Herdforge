@@ -1284,19 +1284,20 @@ func runStatus() {
 	err = observer.ObserveReconciliation(context.Background())
 	fleet := herdr.ProjectFleetStatus(observer.Decisions(), len(cfg.Lanes))
 	if len(observer.LiveAgents()) > 0 {
+		liveAgents := classifyPulseAndStatusAgents(observer.LiveAgents(), herdr.PaneRead)
 		standingNames := make(map[string]bool)
 		for _, lane := range standing.StandingLanes(cfg) {
 			standingNames[standing.AgentNameForRepository(lane.Name, repositoryIdentityForLaunch(cfg))] = true
 		}
-		fleet = herdr.ProjectLiveFleetStatus(observer.LiveAgents(), standingNames, cfg.Fleet.HerdrWorkspace, len(cfg.Lanes))
-		fleet.Reclaimable = herdr.CountReclaimable(observer.LiveAgents())
+		fleet = herdr.ProjectLiveFleetStatus(liveAgents, standingNames, cfg.Fleet.HerdrWorkspace, len(cfg.Lanes))
+		fleet.Reclaimable = herdr.CountReclaimable(liveAgents)
 	}
 	if err != nil {
-		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
-			err, fleet.Working, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+		fmt.Printf("Reconciliation: BLOCKED (%v)\nFleet: working=%d paused=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+			err, fleet.Working, fleet.Paused, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	} else {
-		fmt.Printf("Reconciliation: observed\nFleet: working=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
-			fleet.Working, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
+		fmt.Printf("Reconciliation: observed\nFleet: working=%d paused=%d queued=%d capacity=%d standing=%d preserved=%d recovering=%d control=%d unknown=%d\n",
+			fleet.Working, fleet.Paused, fleet.Queued, fleet.Capacity, fleet.Standing, fleet.Preserved, fleet.Recovering, fleet.ControlSeats, fleet.Unknown)
 	}
 	// FAC-714: a saturated fleet with reclaimable lanes and a saturated fleet
 	// with none read identically as capacity=0. Say which one this is, and name
