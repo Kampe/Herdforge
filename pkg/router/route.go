@@ -677,6 +677,12 @@ type Route struct {
 	Reason            string   `json:"reason"`
 	Argv              []string `json:"argv,omitempty"`
 	ArgvAuthoritative bool     `json:"argv_authoritative"`
+	// DecisionAuthority and CacheAge make it possible to prove that an
+	// advertised reviewer route and the launch gate consumed the same decision
+	// path and quota reading. They are omitted for legacy/non-review routes.
+	DecisionAuthority string `json:"decision_authority,omitempty"`
+	CacheAge          string `json:"cache_age,omitempty"`
+	Workspace         string `json:"workspace,omitempty"`
 }
 
 // Probes abstracts the live availability checks so tests are hermetic.
