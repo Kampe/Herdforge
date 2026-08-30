@@ -60,6 +60,8 @@ func actHoldEngine(reader *actHoldReader) *Engine {
 func TestActModeStaleReclaimUsesConfiguredRoleLaneBeforeCommand(t *testing.T) {
 	reader := &actHoldReader{holdLane: false}
 	e := actHoldEngine(reader)
+	e.ReclaimHook = "./test-reclaim-hook"
+	e.ApprovedReclaimHooks = []string{e.ReclaimHook}
 	s := &Summary{StaleInProgress: 1, StaleCards: []StaleCard{{Ref: "FAC-1", Role: "worker", Owner: "worker", Lane: "wrong"}}}
 	if err := e.executeActMode(t.TempDir(), t.TempDir(), s, nil, nil, nil, nil); err != nil {
 		t.Fatalf("held stale reclaim should skip independently: %v", err)
@@ -106,8 +108,8 @@ func TestConfiguredLiveForgeSmithSettledKickUsesSmithWorkerHold(t *testing.T) {
 		} `json:"result"`
 	}{}
 	agents.Result.Agents = []json.RawMessage{json.RawMessage(`{"name":"forge-smith","status":"idle","interactive":true}`)}
-	board := json.RawMessage(`{"tasks":[{"ref":"FAC-202","status":"to-do","labels":["worker"]}]}`)
-	s := e.computeSummary(agents, board, nil, nil)
+	board := json.RawMessage(`[{"id":"task-202","ref":"FAC-202","status":"to-do","labels":["worker"]}]`)
+	s := e.computeSummary(agents, mustParseBoardCards(t, board), nil, nil)
 	if len(s.Settled) != 1 || s.Settled[0].Lane != "smith" || s.Settled[0].Role != "worker" {
 		t.Fatalf("live forge-smith was not resolved as smith/worker: %+v", s.Settled)
 	}
@@ -136,7 +138,7 @@ func TestUnknownLiveIdentityIsCriticalAndNotSettled(t *testing.T) {
 		} `json:"result"`
 	}{}
 	agents.Result.Agents = []json.RawMessage{json.RawMessage(`{"name":"legacy-worker","status":"idle"}`)}
-	s := e.computeSummary(agents, json.RawMessage(`{"tasks":[]}`), nil, nil)
+	s := e.computeSummary(agents, mustParseBoardCards(t, json.RawMessage(`[]`)), nil, nil)
 	e.computeRedCodes(s)
 	if len(s.Settled) != 0 || len(s.Critical) != 1 || s.Healthy {
 		t.Fatalf("unknown live identity was not fail-closed: %+v", s)
@@ -158,7 +160,7 @@ func TestDuplicateLiveIdentityIsCriticalAndNotSettled(t *testing.T) {
 		json.RawMessage(`{"name":"forge-smith","status":"idle"}`),
 		json.RawMessage(`{"name":"Forge-Smith","status":"idle"}`),
 	}
-	s := e.computeSummary(agents, json.RawMessage(`{"tasks":[]}`), nil, nil)
+	s := e.computeSummary(agents, mustParseBoardCards(t, json.RawMessage(`[]`)), nil, nil)
 	e.computeRedCodes(s)
 	if len(s.Settled) != 0 || len(s.Critical) != 1 || s.Healthy {
 		t.Fatalf("duplicate live identity was admitted: %+v", s)

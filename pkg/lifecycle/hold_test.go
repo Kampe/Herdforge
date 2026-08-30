@@ -363,8 +363,8 @@ func TestKaneoShapeRolesFenceOnlyMatchingLaneAndTask(t *testing.T) {
 			Agents []json.RawMessage `json:"agents"`
 		} `json:"result"`
 	}{}
-	board := json.RawMessage(`{"tasks":[{"ref":"FAC-1","status":"to-do","assignee":null,"labels":["forge-smith"]},{"ref":"FAC-2","status":"to-do","assignee":null,"labels":["worker"]}]}`)
-	s := e.computeSummary(agents, board, nil, nil)
+	board := json.RawMessage(`[{"id":"task-1","ref":"FAC-1","status":"to-do","userId":null,"labels":["forge-smith"]},{"id":"task-2","ref":"FAC-2","status":"to-do","userId":null,"labels":["worker"]}]`)
+	s := e.computeSummary(agents, mustParseBoardCards(t, board), nil, nil)
 	if s.Dispatchable != 1 || len(s.OccupiedRefs) != 1 || s.OccupiedRefs[0] != "FAC-1" {
 		t.Fatalf("summary=%+v", s)
 	}

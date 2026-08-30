@@ -7,9 +7,11 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -22,6 +24,19 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/gitroot"
+)
+
+var (
+	// ErrBoardObservation marks a board read or stock-schema decode that cannot
+	// safely be treated as an empty or healthy board.
+	ErrBoardObservation = errors.New("lifecycle: board observation failed")
+	// ErrReclaimHookRequired marks stale Act requests that have no exact,
+	// explicitly approved reclaim hook. Such requests must stop before any
+	// board command is attempted.
+	ErrReclaimHookRequired = errors.New("lifecycle: approved reclaim hook required")
+	// ErrReclaimReadback marks a reclaim whose authoritative stock-task
+	// readback failed or did not prove the exact requested postcondition.
+	ErrReclaimReadback = errors.New("lifecycle: reclaim readback failed")
 )
 
 // ============================================================================
@@ -168,6 +183,9 @@ type Engine struct {
 	KaneoBin    string
 	SendBin     string
 	StandingBin string
+	// BoardReadTimeout bounds stock Kaneo list/get commands. Zero uses the
+	// provider's ordinary 30-second list deadline.
+	BoardReadTimeout time.Duration
 
 	AgentsFile string // if set, read agents from file instead of herdr
 	BoardFile  string // if set, read board from file instead of kaneo
@@ -180,13 +198,14 @@ type Engine struct {
 	StandingRoster *CanonicalLaneRegistry
 
 	// Hooks for act mode.
-	ReclaimHook  string // executable for reclaim actions
-	RoutingHook  string // executable for routing repair
-	ReviewHook   string // executable for review handoff
-	NextHook     string // executable for next-task handoff
-	ReadbackHook string // executable for authoritative readback
-	HoldReader   HoldReader
-	HoldIdentity func(task, lane, owner string) HoldIdentity
+	ReclaimHook          string   // executable for reclaim actions
+	ApprovedReclaimHooks []string // exact executable allowlist; empty denies all
+	RoutingHook          string   // executable for routing repair
+	ReviewHook           string   // executable for review handoff
+	NextHook             string   // executable for next-task handoff
+	ReadbackHook         string   // executable for authoritative readback
+	HoldReader           HoldReader
+	HoldIdentity         func(task, lane, owner string) HoldIdentity
 	// HoldLaneResolver maps a configured role label to its canonical lane.
 	// Production composition must provide it when HoldReader is configured.
 	HoldLaneResolver func(role string) (string, error)
@@ -238,37 +257,36 @@ func (e *Engine) kaneoBin() string {
 	if e.KaneoBin != "" {
 		return e.KaneoBin
 	}
-	repositoryBin := filepath.Join(repoRoot(), "bin", "herd-kaneo")
-	// The repository wrapper is authoritative when it is installed and
-	// executable. Development checkouts and packaged installs may not carry
-	// that wrapper, however; use the authenticated PATH client in that case so
-	// readbacks and lifecycle actions do not fail merely because the optional
-	// adapter is absent. Keep the repository path as the final fallback so the
-	// eventual exec error remains actionable when neither client is available.
-	if info, err := os.Stat(repositoryBin); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
-		return repositoryBin
-	}
 	if path, err := exec.LookPath("kaneo"); err == nil {
 		return path
 	}
-	return repositoryBin
+	// Keep the stock binary name so exec returns an actionable not-found error.
+	return "kaneo"
 }
 
-// kaneoListArgs returns the command shape for the board census. The optional
-// repository wrapper owns the legacy interface; a PATH client is the current
-// Kaneo CLI and requires the task subcommand plus JSON output.
+// kaneoListArgs returns the supported stock Kaneo board-census command.
 func (e *Engine) kaneoListArgs() []string {
-	if e.KaneoBin != "" {
-		return []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+	return []string{"task", "list", "--json", "--all"}
+}
+
+func (e *Engine) boardReadDeadline() time.Duration {
+	if e.BoardReadTimeout > 0 {
+		return e.BoardReadTimeout
 	}
-	repositoryBin := filepath.Join(repoRoot(), "bin", "herd-kaneo")
-	if info, err := os.Stat(repositoryBin); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
-		return []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+	return 30 * time.Second
+}
+
+func (e *Engine) readCommand(bin string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), e.boardReadDeadline())
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, args...).Output()
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("provider command timeout: %w", ctx.Err())
 	}
-	if _, err := exec.LookPath("kaneo"); err == nil {
-		return []string{"task", "list", "--json", "--all"}
+	if err != nil {
+		return nil, err
 	}
-	return []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+	return out, nil
 }
 
 func (e *Engine) sendBin() string {
@@ -886,18 +904,19 @@ func (e *Engine) Observe(act bool) (*Summary, error) {
 	if e.BoardFile != "" {
 		data, err := os.ReadFile(e.BoardFile)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read board file: %w", err)
+			return nil, fmt.Errorf("%w: cannot read board file: %v", ErrBoardObservation, err)
 		}
 		boardJSON = data
 	} else {
-		// The retired repository wrapper accepted the legacy `list --fields`
-		// surface.  Modern Kaneo exposes the same board as `task list --json`.
-		// Keep the wrapper contract intact while adapting only the PATH fallback.
-		out, err := exec.Command(e.kaneoBin(), e.kaneoListArgs()...).Output()
+		out, err := e.readCommand(e.kaneoBin(), e.kaneoListArgs()...)
 		if err != nil {
-			return nil, fmt.Errorf("board unavailable: %w", err)
+			return nil, fmt.Errorf("%w: stock Kaneo list unavailable: %v", ErrBoardObservation, err)
 		}
 		boardJSON = out
+	}
+	cards, err := e.parseCards(boardJSON)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBoardObservation, err)
 	}
 
 	// Gather lane states.
@@ -925,7 +944,7 @@ func (e *Engine) Observe(act bool) (*Summary, error) {
 	}
 
 	// Compute summary via jq-compatible logic.
-	summary := e.computeSummary(agentsWrapper, boardJSON, stateEntries, eventJSON)
+	summary := e.computeSummary(agentsWrapper, cards, stateEntries, eventJSON)
 
 	// ====================================================================
 	// Act mode
@@ -1008,33 +1027,58 @@ func (e *Engine) observeLaneState(lane string) LaneStateSnapshot {
 	return entry
 }
 
+type boardLabels []string
+
+func (l *boardLabels) UnmarshalJSON(payload []byte) error {
+	if bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
+		*l = nil
+		return nil
+	}
+	var rawLabels []json.RawMessage
+	if err := json.Unmarshal(payload, &rawLabels); err != nil {
+		return fmt.Errorf("labels must be an array: %w", err)
+	}
+	labels := make([]string, 0, len(rawLabels))
+	for i, raw := range rawLabels {
+		var name string
+		if err := json.Unmarshal(raw, &name); err == nil {
+			if strings.TrimSpace(name) == "" {
+				return fmt.Errorf("label %d has no name", i)
+			}
+			labels = append(labels, name)
+			continue
+		}
+		var object struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &object); err != nil || strings.TrimSpace(object.Name) == "" {
+			return fmt.Errorf("label %d is not a stock Kaneo label", i)
+		}
+		labels = append(labels, object.Name)
+	}
+	*l = labels
+	return nil
+}
+
 type boardCard struct {
-	Ref           string   `json:"ref,omitempty"`
-	ID            string   `json:"id,omitempty"`
-	Key           string   `json:"key,omitempty"`
-	Title         string   `json:"title,omitempty"`
-	Status        string   `json:"status,omitempty"`
-	Column        string   `json:"column,omitempty"`
-	State         string   `json:"state,omitempty"`
-	Owner         string   `json:"owner,omitempty"`
-	Assignee      string   `json:"assignee,omitempty"`
-	AssignedTo    string   `json:"assigned_to,omitempty"`
-	AssignedAgent string   `json:"assignedAgent,omitempty"`
-	Lane          string   `json:"lane,omitempty"`
-	Labels        []any    `json:"labels,omitempty"`
-	Blocked       *bool    `json:"blocked,omitempty"`
-	BlockedBy     []string `json:"blocked_by,omitempty"`
-	UpdatedAt     string   `json:"updated_at,omitempty"`
-	CreatedAt     string   `json:"created_at,omitempty"`
-	ReviewedAt    string   `json:"reviewed_at,omitempty"`
-	MergedAt      string   `json:"merged_at,omitempty"`
+	ID        string      `json:"id"`
+	Ref       string      `json:"ref"`
+	Title     string      `json:"title"`
+	Status    string      `json:"status"`
+	UserID    string      `json:"userId"`
+	Assignee  string      `json:"assignee"`
+	Labels    boardLabels `json:"labels"`
+	Blocked   *bool       `json:"blocked"`
+	BlockedBy []string    `json:"blockedBy"`
+	UpdatedAt string      `json:"updatedAt"`
+	CreatedAt string      `json:"createdAt"`
 }
 
 func (e *Engine) computeSummary(agentsWrapper struct {
 	Result struct {
 		Agents []json.RawMessage `json:"agents"`
 	} `json:"result"`
-}, boardJSON json.RawMessage, stateEntries []LaneStateSnapshot, eventJSON json.RawMessage) *Summary {
+}, cards []boardCard, stateEntries []LaneStateSnapshot, eventJSON json.RawMessage) *Summary {
 	s := &Summary{}
 	liveCounts := make(map[string]int)
 	for _, raw := range agentsWrapper.Result.Agents {
@@ -1146,9 +1190,6 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 		}
 	}
 
-	// Parse board cards.
-	cards := e.parseCards(boardJSON)
-
 	// Normalize labels and status.
 	type cardNorm struct {
 		Ref        string
@@ -1167,51 +1208,15 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 	normalized := make([]cardNorm, 0, len(cards))
 	for _, c := range cards {
 		ref := c.Ref
-		if ref == "" {
-			ref = c.ID
-		}
-		if ref == "" {
-			ref = c.Key
-		}
-		if ref == "" {
-			continue
-		}
-
-		st := strings.ToLower(c.Status)
-		if st == "" {
-			st = strings.ToLower(c.Column)
-		}
-		if st == "" {
-			st = strings.ToLower(c.State)
-		}
-
-		owner := c.Owner
+		st := strings.ToLower(strings.TrimSpace(c.Status))
+		owner := c.UserID
 		if owner == "" {
 			owner = c.Assignee
 		}
-		if owner == "" {
-			owner = c.AssignedTo
-		}
-		if owner == "" {
-			owner = c.AssignedAgent
-		}
-		if owner == "" {
-			owner = c.Lane
-		}
-		owner = strings.TrimSpace(owner)
 
 		labels := make([]string, 0, len(c.Labels))
 		for _, l := range c.Labels {
-			switch v := l.(type) {
-			case string:
-				labels = append(labels, strings.ToLower(v))
-			case map[string]any:
-				if n, ok := v["name"].(string); ok {
-					labels = append(labels, strings.ToLower(n))
-				} else if lb, ok := v["label"].(string); ok {
-					labels = append(labels, strings.ToLower(lb))
-				}
-			}
+			labels = append(labels, strings.ToLower(l))
 		}
 
 		blocked := false
@@ -1231,17 +1236,15 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 		}
 
 		normalized = append(normalized, cardNorm{
-			Ref:        ref,
-			Status:     st,
-			Labels:     labels,
-			Owner:      owner,
-			Lane:       strings.TrimSpace(c.Lane),
-			Role:       recognizedRole(labels, e.HoldRoles),
-			Blocked:    blocked,
-			UpdatedAt:  c.UpdatedAt,
-			CreatedAt:  c.CreatedAt,
-			ReviewedAt: c.ReviewedAt,
-			MergedAt:   c.MergedAt,
+			Ref:       ref,
+			Status:    st,
+			Labels:    labels,
+			Owner:     owner,
+			Lane:      "",
+			Role:      recognizedRole(labels, e.HoldRoles),
+			Blocked:   blocked,
+			UpdatedAt: c.UpdatedAt,
+			CreatedAt: c.CreatedAt,
 		})
 	}
 
@@ -1310,7 +1313,7 @@ func (e *Engine) computeSummary(agentsWrapper struct {
 			s.InProgress++
 			if c.Owner == "" || !liveOwner(c.Owner) {
 				s.StaleInProgress++
-				s.StaleCards = append(s.StaleCards, StaleCard{Ref: c.Ref, Owner: c.Role, Lane: c.Lane, Role: c.Role})
+				s.StaleCards = append(s.StaleCards, StaleCard{Ref: c.Ref, Owner: c.Owner, Lane: c.Lane, Role: c.Role})
 				s.Unutilized = append(s.Unutilized, c.Ref)
 			} else {
 				s.Utilized = append(s.Utilized, c.Ref)
@@ -1358,33 +1361,61 @@ func recognizedRole(labels, configured []string) string {
 	return role
 }
 
-func (e *Engine) parseCards(boardJSON json.RawMessage) []boardCard {
-	// Try array first.
+func (e *Engine) parseCards(boardJSON json.RawMessage) ([]boardCard, error) {
+	trimmed := bytes.TrimSpace(boardJSON)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("stock Kaneo task list is empty")
+	}
+	if trimmed[0] != '[' {
+		if err := rejectLifecycleErrorEnvelope(trimmed); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("stock Kaneo task list must be a JSON array")
+	}
+
 	var cards []boardCard
-	if err := json.Unmarshal(boardJSON, &cards); err == nil {
-		return cards
+	if err := json.Unmarshal(trimmed, &cards); err != nil {
+		return nil, fmt.Errorf("decode stock Kaneo task list: %w", err)
 	}
+	ids := make(map[string]struct{}, len(cards))
+	refs := make(map[string]struct{}, len(cards))
+	for i, card := range cards {
+		if strings.TrimSpace(card.ID) == "" || strings.TrimSpace(card.Ref) == "" {
+			return nil, fmt.Errorf("stock Kaneo task %d missing id or ref", i)
+		}
+		if strings.TrimSpace(card.Status) == "" {
+			return nil, fmt.Errorf("stock Kaneo task %q missing status", card.Ref)
+		}
+		if card.UserID != "" && card.Assignee != "" && card.UserID != card.Assignee {
+			return nil, fmt.Errorf("stock Kaneo task %q has ambiguous owner", card.Ref)
+		}
+		if _, exists := ids[card.ID]; exists {
+			return nil, fmt.Errorf("stock Kaneo task list has duplicate id %q", card.ID)
+		}
+		if _, exists := refs[card.Ref]; exists {
+			return nil, fmt.Errorf("stock Kaneo task list has duplicate ref %q", card.Ref)
+		}
+		ids[card.ID] = struct{}{}
+		refs[card.Ref] = struct{}{}
+	}
+	return cards, nil
+}
 
-	// Try object wrappers.
-	var wrapper struct {
-		Tasks  []boardCard `json:"tasks"`
-		Result struct {
-			Tasks []boardCard `json:"tasks"`
-		} `json:"result"`
-		Items []boardCard `json:"items"`
+func rejectLifecycleErrorEnvelope(payload []byte) error {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return fmt.Errorf("decode stock Kaneo payload: %w", err)
 	}
-	if err := json.Unmarshal(boardJSON, &wrapper); err == nil {
-		if len(wrapper.Tasks) > 0 {
-			return wrapper.Tasks
+	for _, key := range []string{"error", "errors"} {
+		raw, exists := envelope[key]
+		if !exists {
+			continue
 		}
-		if len(wrapper.Result.Tasks) > 0 {
-			return wrapper.Result.Tasks
-		}
-		if len(wrapper.Items) > 0 {
-			return wrapper.Items
+		value := bytes.TrimSpace(raw)
+		if len(value) > 0 && !bytes.Equal(value, []byte("null")) && !bytes.Equal(value, []byte("[]")) {
+			return fmt.Errorf("stock Kaneo returned %s envelope: %s", key, value)
 		}
 	}
-
 	return nil
 }
 
@@ -1392,10 +1423,25 @@ func (e *Engine) parseCards(boardJSON json.RawMessage) []boardCard {
 // Act mode
 // ============================================================================
 
+func (e *Engine) approvedReclaimHook() (string, error) {
+	if strings.TrimSpace(e.ReclaimHook) == "" {
+		return "", ErrReclaimHookRequired
+	}
+	for _, approved := range e.ApprovedReclaimHooks {
+		if approved != "" && approved == e.ReclaimHook {
+			return e.ReclaimHook, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %q is not allowlisted", ErrReclaimHookRequired, e.ReclaimHook)
+}
+
 func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJSON, boardJSON json.RawMessage, stateEntries []LaneStateSnapshot, eventJSON json.RawMessage) error {
 	// 1. Reclaim stale in-progress cards.
 	if s.StaleInProgress > 0 {
-		reclaimHook := e.ReclaimHook
+		reclaimHook, err := e.approvedReclaimHook()
+		if err != nil {
+			return fmt.Errorf("%w: %d stale in-progress task(s)", err, s.StaleInProgress)
+		}
 		for _, sc := range s.StaleCards {
 			if strings.TrimSpace(sc.Role) == "" {
 				// An orphan without a configured role cannot be safely reclaimed:
@@ -1411,27 +1457,23 @@ func (e *Engine) executeActMode(stateRoot, leaseRoot string, s *Summary, agentsJ
 			if held {
 				continue
 			}
-			if reclaimHook != "" {
-				cmd := exec.Command(reclaimHook,
-					"--ref", sc.Ref,
-					"--owner", sc.Owner,
-					"--reason", "stale in-progress owner",
-					"--return-to-to-do",
-				)
-				if out, err := cmd.CombinedOutput(); err != nil {
-					return fmt.Errorf("reclaim hook failed for %s: %w\n%s", sc.Ref, err, string(out))
-				}
-			} else {
-				cmd := exec.Command(e.kaneoBin(), "task", "status", sc.Ref, "to-do")
-				if out, err := cmd.CombinedOutput(); err != nil {
-					return fmt.Errorf("reclaim via kaneo failed for %s: %w\n%s", sc.Ref, err, string(out))
-				}
+			cmd := exec.Command(reclaimHook,
+				"--ref", sc.Ref,
+				"--owner", sc.Owner,
+				"--reason", "stale in-progress owner",
+				"--return-to-to-do",
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("reclaim hook failed for %s: %w\n%s", sc.Ref, err, string(out))
 			}
 
 			// Authoritative readback.
 			readbackData, err := e.authoritativeReadback("reclaim", sc.Ref, "", "", "")
-			if err == nil && !e.verifyReclaimReadback(sc.Ref, readbackData) {
-				return fmt.Errorf("reclaim readback did not prove to-do/unassigned for %s", sc.Ref)
+			if err != nil {
+				return fmt.Errorf("%w for %s: %v", ErrReclaimReadback, sc.Ref, err)
+			}
+			if err := e.validateReclaimReadback(sc.Ref, readbackData); err != nil {
+				return fmt.Errorf("%w for %s: %v", ErrReclaimReadback, sc.Ref, err)
 			}
 
 			s.Actions = append(s.Actions, ActionLogEntry{
@@ -1865,65 +1907,55 @@ func (e *Engine) authoritativeReadback(action, refOrRefs, replacementRef, lane, 
 			args = append(args, "--owner", owner)
 		}
 		args = append(args, "--after-action")
-		return exec.Command(e.ReadbackHook, args...).Output()
+		return e.readCommand(e.ReadbackHook, args...)
 	}
 
 	if action == "reclaim" {
-		return exec.Command(e.kaneoBin(), "task", "get", refOrRefs, "--json").Output()
+		return e.readCommand(e.kaneoBin(), "task", "get", refOrRefs, "--json")
 	}
 	if replacementRef != "" {
-		return exec.Command(e.kaneoBin(), "task", "get", replacementRef, "--json").Output()
+		return e.readCommand(e.kaneoBin(), "task", "get", replacementRef, "--json")
 	}
 	return nil, fmt.Errorf("cannot determine readback target")
 }
 
-func (e *Engine) verifyReclaimReadback(ref string, payload []byte) bool {
-	var card struct {
-		Ref           string `json:"ref"`
-		ID            string `json:"id"`
-		Key           string `json:"key"`
-		Status        string `json:"status"`
-		Column        string `json:"column"`
-		State         string `json:"state"`
-		Owner         string `json:"owner"`
-		Assignee      string `json:"assignee"`
-		AssignedTo    string `json:"assigned_to"`
-		AssignedAgent string `json:"assignedAgent"`
+func (e *Engine) validateReclaimReadback(ref string, payload []byte) error {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return fmt.Errorf("stock Kaneo task readback is empty")
 	}
-	if err := json.Unmarshal(payload, &card); err != nil {
-		return false
+	if trimmed[0] != '{' {
+		return fmt.Errorf("stock Kaneo task readback must be a JSON object")
 	}
-	cardRef := card.Ref
-	if cardRef == "" {
-		cardRef = card.ID
+	if err := rejectLifecycleErrorEnvelope(trimmed); err != nil {
+		return err
 	}
-	if cardRef == "" {
-		cardRef = card.Key
+	var card boardCard
+	if err := json.Unmarshal(trimmed, &card); err != nil {
+		return fmt.Errorf("decode stock Kaneo task readback: %w", err)
 	}
-	if cardRef != ref {
-		return false
+	if strings.TrimSpace(card.ID) == "" || strings.TrimSpace(card.Ref) == "" {
+		return fmt.Errorf("stock Kaneo task readback missing id or ref")
 	}
-	st := strings.ToLower(card.Status)
-	if st == "" {
-		st = strings.ToLower(card.Column)
+	if card.Ref != ref {
+		return fmt.Errorf("requested ref %q, read back %q", ref, card.Ref)
 	}
-	if st == "" {
-		st = strings.ToLower(card.State)
+	if card.Status != "to-do" {
+		return fmt.Errorf("task %q status is %q, want %q", ref, card.Status, "to-do")
 	}
-	if !strings.Contains(st, "to-do") && !strings.Contains(st, "todo") && !strings.Contains(st, "backlog") {
-		return false
+	if card.UserID != "" || card.Assignee != "" {
+		return fmt.Errorf("task %q remains assigned to %q", ref, firstNonempty(card.UserID, card.Assignee))
 	}
-	owner := card.Owner
-	if owner == "" {
-		owner = card.Assignee
+	return nil
+}
+
+func firstNonempty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
 	}
-	if owner == "" {
-		owner = card.AssignedTo
-	}
-	if owner == "" {
-		owner = card.AssignedAgent
-	}
-	return owner == ""
+	return ""
 }
 
 func (e *Engine) verifyRoutingReadback(payload []byte, replacementRef, lane, owner string) bool {
