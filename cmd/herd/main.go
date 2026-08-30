@@ -1434,9 +1434,23 @@ func runUsage() {
 		os.Exit(1)
 	}
 	fmt.Println("Current usage snapshot:")
+	if snap.QuotaHandoffError != "" {
+		fmt.Printf("  quota handoff: UNKNOWN %s\n", snap.QuotaHandoffError)
+	}
 	for name, p := range snap.Providers {
+		label := p.DisplayName
+		if label == "" {
+			label = name
+		}
+		if p.Plan != "" {
+			label += " (" + p.Plan + ")"
+		}
+		if p.Entitlement == usage.EntitlementUnmetered {
+			fmt.Printf("  %s: entitlement=%s\n", label, p.Entitlement)
+			continue
+		}
 		util := snap.Utilization(name)
-		fmt.Printf("  %s (%s): utilization=%.0f%%", p.DisplayName, p.Plan, util*100)
+		fmt.Printf("  %s: utilization=%.0f%%", label, util*100)
 		for rname, r := range p.Resources {
 			if r.Kind == "consumption" {
 				fmt.Printf("  %s: %.0f/%.0f", rname, r.Used, r.Limit)
@@ -1445,6 +1459,14 @@ func runUsage() {
 			}
 		}
 		fmt.Println()
+	}
+	errorNames := make([]string, 0, len(snap.ProviderErrors))
+	for name := range snap.ProviderErrors {
+		errorNames = append(errorNames, name)
+	}
+	sort.Strings(errorNames)
+	for _, name := range errorNames {
+		fmt.Printf("  %s: UNKNOWN provider error: %s\n", name, snap.ProviderErrors[name])
 	}
 }
 
@@ -1473,6 +1495,9 @@ func runQuota() {
 	}
 
 	computed := e.ComputeAll(snap)
+	if !*wantJSON && snap.QuotaHandoffError != "" {
+		fmt.Printf("quota handoff: UNKNOWN %s\n", snap.QuotaHandoffError)
+	}
 
 	// --provider mode
 	if *oneProvider != "" {
@@ -1496,6 +1521,18 @@ func runQuota() {
 		}
 		if !p.Available && p.Reason == "no-quota-data" {
 			fmt.Printf("%s: no quota data (plan=%s)\n", resolved, p.Plan)
+			return
+		}
+		if p.Reason == "quota-handoff-error" {
+			fmt.Printf("%s: UNKNOWN quota handoff -- %s\n", resolved, p.QuotaHandoffError)
+			return
+		}
+		if p.Entitlement == usage.EntitlementUnmetered {
+			status := "AVAILABLE"
+			if !p.Available {
+				status = strings.ToUpper(p.Reason)
+			}
+			fmt.Printf("%s: authenticated %s entitlement -- %s\n", resolved, p.Entitlement, status)
 			return
 		}
 		status := "AVAILABLE"
@@ -1600,6 +1637,18 @@ func runQuota() {
 		p := computed[name]
 		if p.Reason == "no-quota-data" {
 			rows = append(rows, row{name, "-", "-", "-", "no-data", orEmpty(p.Plan)})
+			continue
+		}
+		if p.Entitlement == usage.EntitlementUnmetered {
+			state := "UNMETERED"
+			if !p.Available {
+				state = strings.ToUpper(p.Reason)
+			}
+			rows = append(rows, row{name, "-", "-", "-", state, orEmpty(p.Plan)})
+			continue
+		}
+		if p.Reason == "provider-error" {
+			rows = append(rows, row{name, "-", "-", "-", "PROVIDER-ERROR", orEmpty(p.Plan)})
 			continue
 		}
 		flag := "OK"

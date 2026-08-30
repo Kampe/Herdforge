@@ -59,8 +59,7 @@ exists — an explicit file list — rather than inventing a merge story.
 
 ## Per-host configuration
 
-Two runtime overrides make this work without touching tracked config. Both
-already exist; nothing here needs a code change.
+Runtime overrides make this work without touching tracked config.
 
 `HERD_CONFIG_PATH` selects a config profile at runtime. It exists precisely so a
 host does not have to edit the repository default. The chainseer `.herd/herd.yaml`
@@ -75,12 +74,51 @@ call. A mismatch against the registered workspace is refused outright
 # ~/.herd/env.sh on the WSL host, sourced by its shell profile
 export HERD_CONFIG_PATH="$HOME/chainseer/.herd/herd.wsl.yaml"
 export HERD_WORKSPACE="<the herdr workspace id on THIS host>"
+export HERD_QUOTA_HANDOFF_REQUIRED=1
+export HERD_QUOTA_HANDOFF_BIN="$HOME/bin/openusage-handoff"
 export GOCACHE=/tmp/shared-gocache
 unset GOROOT   # a persisted Go env pins a stale GOROOT and outranks PATH
 ```
 
 `herd.wsl.yaml` is a copy of `herd.yaml` with `herdr_workspace` set to this
 host's id.
+
+### Shared-account quota handoff
+
+The review host must consume the same account snapshot that governs routing on
+the primary host. Native provider polling on WSL is diagnostic-only when
+`HERD_QUOTA_HANDOFF_REQUIRED=1`; it cannot silently become shared-account
+admission evidence.
+
+`HERD_QUOTA_HANDOFF_BIN` names an executable that prints one OpenUsage JSON
+snapshot to stdout. It may accept an optional provider argument. The payload
+must retain `schema: openusage.limits.v1` and the source `generatedAt`; Herd
+rejects missing, corrupt, ambiguous, future-dated, or older-than-two-minute
+source evidence. The command itself is bounded to 30 seconds by default
+(`HERD_QUOTA_COMMAND_TIMEOUT_SECONDS` can set another positive bound).
+
+A host-local wrapper may obtain the payload from the quota authority, for
+example:
+
+```bash
+#!/bin/sh
+exec ssh -o BatchMode=yes -o ConnectTimeout=5 primary-quota-host openusage "$@"
+```
+
+This is a contract example, not evidence that W4 is configured. Do not call the
+handoff ready until this readback succeeds on that host and reports canonical
+provider keys with no `quotaHandoffError`:
+
+```bash
+./bin/herdforge quota --json | jq '{
+  keys: keys,
+  source: .grok.quotaSource,
+  generatedAt: .grok.quotaGeneratedAt,
+  handoffError: .grok.quotaHandoffError,
+  grok: {available: .grok.available, remaining: .grok.remaining},
+  agyGemini: .antigravity.pools.gemini
+}'
+```
 
 ### Container protection list
 
@@ -113,7 +151,7 @@ cp .herd/herd.yaml .herd/herd.wsl.yaml
 source ~/.herd/env.sh
 
 ./bin/herdforge preflight        # must pass before dispatching anything
-./bin/herdforge quota            # confirm this host sees its own provider quota
+./bin/herdforge quota --json     # confirm the configured shared-account handoff
 ./bin/herdforge containers reap  # dry run; confirm it proposes nothing surprising
 ```
 

@@ -1,7 +1,9 @@
 package router
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -687,6 +689,54 @@ func TestDecideStrictQuotaMissingFailsClosed(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("StrictQuota with missing ledger must fail closed")
+	}
+}
+
+func TestDecideStrictQuotaRequiresFreshEntitlementAndExactProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stale        bool
+		handoffError string
+		wantErr      bool
+	}{
+		{name: "fresh authenticated flat rate", wantErr: false},
+		{name: "stale entitlement", stale: true, wantErr: true},
+		{name: "remote handoff unavailable", handoffError: "OpenUsage command not found (exit 127)", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearRouteEnv(t)
+			fixture := `{"generatedAt":"2026-08-30T15:00:00Z","providers":{"grok":{"displayName":"Grok","entitlement":"` +
+				"unmetered" + `","resources":{},"stale":` + fmt.Sprint(tc.stale) + `}}}`
+			var snap usage.UsageSnapshot
+			if err := json.Unmarshal([]byte(fixture), &snap); err != nil {
+				t.Fatal(err)
+			}
+			snap.QuotaHandoffError = tc.handoffError
+			computed := usage.NewQuotaEngine().ComputeAll(&snap)
+			r := testRouter(computed, "grok")
+			probeCalls := 0
+			r.Probes.Launchable = func(provider, model string) (bool, string) {
+				probeCalls++
+				if provider != "grok" || model != "grok-4.6" {
+					t.Fatalf("probe target = %s/%s, want exact Grok tuple", provider, model)
+				}
+				return true, ""
+			}
+			_, err := r.Decide(LaunchRequest{
+				Role: RoleReviewSupervisor, Shape: "qa",
+				RequestedProvider: "grok", RequestedModel: "grok-4.6",
+				ExcludedFamily: "openai", StrictQuota: true,
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("strict route error = %v, wantErr=%t", err, tc.wantErr)
+			}
+			if tc.handoffError != "" && (err == nil || !strings.Contains(strings.ToLower(err.Error()), "handoff")) {
+				t.Fatalf("strict route hid the handoff gate: %v", err)
+			}
+			if probeCalls == 0 {
+				t.Fatal("strict route did not obtain exact live probe evidence")
+			}
+		})
 	}
 }
 

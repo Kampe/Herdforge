@@ -91,6 +91,27 @@ func TestPersistedReadingSurvivesAcrossProcesses(t *testing.T) {
 	}
 }
 
+func TestFreshReceiveTimeCannotRestampAStaleHandoff(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "q.json"))
+	t.Setenv("HERD_QUOTA_HANDOFF_REQUIRED", "1")
+	previousNow := quotaNow
+	quotaNow = func() time.Time { return time.Date(2026, 8, 30, 15, 8, 0, 0, time.UTC) }
+	t.Cleanup(func() { quotaNow = previousNow })
+
+	writeSnapshotFile(&UsageSnapshot{
+		GeneratedAt: time.Date(2026, 8, 30, 14, 0, 0, 0, time.UTC),
+		Schema:      "openusage.limits.v1",
+		QuotaSource: QuotaSourceOpenUsageHandoff,
+		Providers: map[string]ProviderUsage{
+			"grok": {DisplayName: "Grok", Resources: map[string]ResourceUsage{}},
+		},
+	})
+	if _, _, ok := readSnapshotFile(time.Minute); ok {
+		t.Fatal("fresh cache receive time revived a stale source generatedAt")
+	}
+}
+
 // Aged-out, corrupt and missing readings all fetch live. A cache is an
 // optimisation and must never be a source of truth it cannot prove.
 func TestUnusableReadingsFallThroughToLive(t *testing.T) {

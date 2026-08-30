@@ -165,6 +165,34 @@ func TestExactReviewModelOverrideRefreshesStaleQuotaCache(t *testing.T) {
 	}
 }
 
+func TestExactGrokReviewAcceptsFreshFlatRateEntitlement(t *testing.T) {
+	quota := `{"generatedAt":"2026-08-30T15:00:00Z","providers":{"grok":{"displayName":"Grok","entitlement":"unmetered","resources":{},"stale":false}}}`
+	fixture := installExactReviewRouteFixture(t, quota, "")
+
+	got, err := resolvePoolReviewer("grok", "grok-4.6", "openai")
+	if err != nil {
+		t.Fatalf("fresh authenticated flat-rate Grok review was rejected: %v", err)
+	}
+	if got.Provider != "grok" || got.Model != "grok-4.6" || got.Family != "xai" {
+		t.Fatalf("review route = %+v, want exact independent Grok tuple", got)
+	}
+	probes, err := os.ReadFile(filepath.Join(fixture.dir, "provider-probes.log"))
+	if err != nil {
+		t.Fatalf("exact Grok probe was not recorded: %v", err)
+	}
+	joined := string(probes)
+	for _, want := range []string{"--no-subagents", "--disable-web-search", "-p Reply with exactly: HERD_PROVIDER_PROBE_OK"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("exact Grok probe log is missing %q: %s", want, joined)
+		}
+	}
+	for _, forbidden := range []string{"--resume", "--continue", "--session"} {
+		if strings.Contains(joined, forbidden) {
+			t.Errorf("exact Grok probe resumed session state via %q: %s", forbidden, joined)
+		}
+	}
+}
+
 type exactReviewRouteFixture struct {
 	dir           string
 	tabLog        string
@@ -179,10 +207,11 @@ func installExactReviewRouteFixture(t *testing.T, quota, providerProbe string) e
 	if providerProbe == "" {
 		providerProbe = "printf 'HERD_PROVIDER_PROBE_OK\\n'"
 	}
-	agy := filepath.Join(dir, "agy")
-	agyScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_PROBE_LOG\"\n" + providerProbe + "\n"
-	if err := os.WriteFile(agy, []byte(agyScript), 0o755); err != nil {
-		t.Fatal(err)
+	probeScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_PROBE_LOG\"\n" + providerProbe + "\n"
+	for _, provider := range []string{"agy", "grok"} {
+		if err := os.WriteFile(filepath.Join(dir, provider), []byte(probeScript), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	quotaFetchLog := filepath.Join(dir, "quota-fetch.log")
 	openusage := filepath.Join(dir, "openusage")

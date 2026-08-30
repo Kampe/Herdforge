@@ -42,6 +42,43 @@ func TestAdvertisingProbeBoundsStuckProvider(t *testing.T) {
 	}
 }
 
+func TestGrokProviderProbeUsesTheHeadlessSinglePromptContract(t *testing.T) {
+	previous := execProviderProbe
+	t.Cleanup(func() { execProviderProbe = previous })
+
+	execProviderProbe = func(_ context.Context, command string, args []string, stdin string) (string, string, error, bool) {
+		if command != "grok" {
+			t.Errorf("command = %q, want grok", command)
+		}
+		if stdin != "" {
+			t.Errorf("Grok probe supplied stdin in non-TTY mode: %q", stdin)
+		}
+		joined := strings.Join(args, "\x00")
+		for _, sequence := range []string{
+			"--model\x00grok-4.6",
+			"--always-approve",
+			"--no-subagents",
+			"--disable-web-search",
+			"-p\x00Reply with exactly: " + providerProbeSentinel,
+		} {
+			if !strings.Contains(joined, sequence) {
+				t.Errorf("headless Grok argv %q is missing %q", joined, sequence)
+			}
+		}
+		for _, forbidden := range []string{"--resume", "--continue", "--session"} {
+			if containsProbeArg(args, forbidden) {
+				t.Errorf("Grok readiness probe must not resume a session: %v", args)
+			}
+		}
+		return providerProbeSentinel, "", nil, false
+	}
+
+	ok, reason := runProviderProbe("grok", "grok-4.6", time.Second)
+	if !ok || reason != "" {
+		t.Fatalf("headless exact-token probe = (%t, %q), want (true, empty)", ok, reason)
+	}
+}
+
 func TestAdvertisingProbeCacheAvoidsRepeatStuckProbe(t *testing.T) {
 	resetAdvertisingProbeCacheForTest()
 	prev := execProviderProbe

@@ -663,20 +663,52 @@ const MaxArgPromptBytes = 200 * 1024
 
 // Route is the routing decision, mirroring herd-route's route_json payload.
 type Route struct {
-	Provider          string   `json:"provider"`
-	Model             string   `json:"model,omitempty"`
-	Effort            string   `json:"effort"`
-	EffortApplicable  bool     `json:"effort_applicable"`
-	Family            string   `json:"family"`
-	Task              string   `json:"task"`
-	LazerLastResort   bool     `json:"lazer_last_resort"`
-	Availability      string   `json:"availability"`
-	QuotaPool         string   `json:"quota_pool"`
-	QuotaPressure     int      `json:"quota_pressure"`
-	Score             int      `json:"score"`
-	Reason            string   `json:"reason"`
-	Argv              []string `json:"argv,omitempty"`
-	ArgvAuthoritative bool     `json:"argv_authoritative"`
+	Provider          string             `json:"provider"`
+	Model             string             `json:"model,omitempty"`
+	Effort            string             `json:"effort"`
+	EffortApplicable  bool               `json:"effort_applicable"`
+	Family            string             `json:"family"`
+	Task              string             `json:"task"`
+	LazerLastResort   bool               `json:"lazer_last_resort"`
+	Availability      string             `json:"availability"`
+	QuotaPool         string             `json:"quota_pool"`
+	QuotaPressure     int                `json:"quota_pressure"`
+	Score             int                `json:"score"`
+	Reason            string             `json:"reason"`
+	QuotaSource       string             `json:"quota_source,omitempty"`
+	QuotaGeneratedAt  string             `json:"quota_generated_at,omitempty"`
+	QuotaHandoffError string             `json:"quota_handoff_error,omitempty"`
+	Rejections        []SurfaceRejection `json:"rejections,omitempty"`
+	Argv              []string           `json:"argv,omitempty"`
+	ArgvAuthoritative bool               `json:"argv_authoritative"`
+}
+
+type SurfaceRejection struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model,omitempty"`
+	Pool     string `json:"quota_pool,omitempty"`
+	Gate     string `json:"gate"`
+	Detail   string `json:"detail"`
+}
+
+func availabilityGate(detail string) string {
+	lower := strings.ToLower(detail)
+	switch {
+	case strings.Contains(lower, "quota handoff"):
+		return "quota-handoff"
+	case strings.Contains(lower, "unknown"):
+		return "unknown"
+	case strings.Contains(lower, "concurrency"):
+		return "concurrency"
+	case strings.Contains(lower, "cooldown"):
+		return "cooldown"
+	case strings.Contains(lower, "probe") || strings.Contains(lower, "provider unavailable"):
+		return "provider-probe"
+	case strings.HasPrefix(lower, "quota ") || strings.Contains(lower, "exhausted"):
+		return "quota"
+	default:
+		return "policy"
+	}
 }
 
 // Probes abstracts the live availability checks so tests are hermetic.
@@ -966,6 +998,9 @@ func (r *SurfaceRouter) available(provider, model, pool string) (bool, string) {
 	if !forcedAvailable {
 		if st, ok := r.quotaState(provider, pool); ok {
 			if !st.Available && st.Reason != "no-quota-data" {
+				if st.QuotaHandoffError != "" {
+					return false, "quota handoff unavailable: " + st.QuotaHandoffError
+				}
 				return false, "quota " + st.Reason
 			}
 		}
@@ -1066,13 +1101,17 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 	floor := pressureFloor()
 
 	type scored struct {
-		rank     int
-		provider string
-		model    string
-		pressure int
-		detail   string
+		rank              int
+		provider          string
+		model             string
+		pressure          int
+		detail            string
+		quotaSource       string
+		quotaGeneratedAt  string
+		quotaHandoffError string
 	}
 	var picks []scored
+	var rejections []SurfaceRejection
 	modelOverride := map[string]string{}
 
 	for pref, provider := range candidates {
@@ -1115,6 +1154,10 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 			}
 		}
 		if !ok {
+			rejections = append(rejections, SurfaceRejection{
+				Provider: provider, Model: model, Pool: pool,
+				Gate: availabilityGate(detail), Detail: detail,
+			})
 			continue
 		}
 
@@ -1123,6 +1166,10 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		var haveQuota bool
 		st, haveQuota = r.quotaState(provider, pool)
 		if haveQuota && weeklyAtOrOverCap(st) {
+			detail := "quota exhausted"
+			rejections = append(rejections, SurfaceRejection{
+				Provider: provider, Model: model, Pool: pool, Gate: "quota", Detail: detail,
+			})
 			continue
 		}
 		// Non-v4 deepseek is never a valid pick.
@@ -1155,7 +1202,10 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 			}
 			rank = effective*100 + fit*fitWeight*100 + pref
 		}
-		picks = append(picks, scored{rank, provider, model, pressure, detail})
+		picks = append(picks, scored{
+			rank: rank, provider: provider, model: model, pressure: pressure, detail: detail,
+			quotaSource: st.QuotaSource, quotaGeneratedAt: st.QuotaGeneratedAt, quotaHandoffError: st.QuotaHandoffError,
+		})
 	}
 
 	// Lazer precedence: any available non-lazer wins; lazer only when alone.
@@ -1213,6 +1263,10 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		QuotaPressure:     best.pressure,
 		Score:             best.rank,
 		Reason:            reason,
+		QuotaSource:       best.quotaSource,
+		QuotaGeneratedAt:  best.quotaGeneratedAt,
+		QuotaHandoffError: best.quotaHandoffError,
+		Rejections:        rejections,
 		Argv:              ArgvFor(best.provider, model, effort),
 		ArgvAuthoritative: true,
 	}, nil

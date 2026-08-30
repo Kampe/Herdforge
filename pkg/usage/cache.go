@@ -89,6 +89,11 @@ func readSnapshotFile(ttl time.Duration) (*UsageSnapshot, time.Duration, bool) {
 		// as infinitely fresh.
 		return nil, 0, false
 	}
+	if quotaHandoffRequired() && validateQuotaHandoffSnapshot(c.Snapshot, quotaNow()) != nil {
+		// FetchedAt is receive time, not source freshness. A freshly copied
+		// cache record must never restamp an old OpenUsage observation.
+		return nil, 0, false
+	}
 	return c.Snapshot, age, true
 }
 
@@ -123,7 +128,9 @@ func FetchSnapshotCached() (*UsageSnapshot, time.Duration, error) {
 
 	if ttl > 0 && quotaCache.snap != nil {
 		if age := time.Since(quotaCache.fetchedAt); age < ttl {
-			return quotaCache.snap, age, nil
+			if !quotaHandoffRequired() || validateQuotaHandoffSnapshot(quotaCache.snap, quotaNow()) == nil {
+				return quotaCache.snap, age, nil
+			}
 		}
 	}
 	// FAC-679 (second pass): the in-process cache alone did nothing for the case

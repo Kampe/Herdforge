@@ -94,7 +94,11 @@ var execProviderProbe = defaultExecProviderProbe
 
 func defaultExecProviderProbe(ctx context.Context, command string, args []string, stdin string) (stdout, stderr string, err error, timedOut bool) {
 	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.Stdin = strings.NewReader(stdin)
+	// A provider with a native single-prompt flag (Grok) gets no stdin at all;
+	// os/exec then attaches no terminal and no interactive input surface.
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	out, runErr := cmd.Output()

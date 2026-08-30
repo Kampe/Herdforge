@@ -81,7 +81,13 @@ func providerProbeCommand(provider, model string) (string, []string, string, err
 	case "codex":
 		return "codex", []string{"exec", "--model", model, "-s", "read-only"}, prompt, nil
 	case "grok":
-		return "grok", []string{"--model", model, "--always-approve", prompt}, "", nil
+		return "grok", []string{
+			"--model", model,
+			"--always-approve",
+			"--no-subagents",
+			"--disable-web-search",
+			"-p", prompt,
+		}, "", nil
 	case "kimi":
 		return "kimi", []string{"--auto"}, prompt, nil
 	case "opencode", "ollama", "lazer":

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -141,5 +142,76 @@ func TestTheConcurrencyReasonIsDistinguishableFromQuota(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(reason), "quota") {
 		t.Fatalf("reason %q blames quota for a concurrency condition", reason)
+	}
+}
+
+func TestMachineRouteRecordsConcurrencySeparatelyFromHealthyQuota(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(map[string]usage.BurnState{
+		"codex": {
+			Available: true, Reason: "ok", Remaining: 79, Class: usage.BurnOverpace,
+			Pools: map[string]usage.BurnState{
+				"default": {Available: true, Reason: "ok", Remaining: 79, Class: usage.BurnOverpace},
+			},
+		},
+		"grok": {Available: true, Reason: "ok", Remaining: 100, Class: usage.BurnUnderspent},
+	}, "codex", "grok")
+	r.Probes.LiveCount = func(provider, _, _ string) (int, error) {
+		if provider == "codex" {
+			return 3, nil
+		}
+		return 0, nil
+	}
+
+	route, err := r.Pick("implementation", "", "")
+	if err != nil {
+		t.Fatalf("healthy Grok fallback was not selected: %v", err)
+	}
+	if route.Provider != "grok" {
+		t.Fatalf("selected %s, want Grok while Codex concurrency is full", route.Provider)
+	}
+	raw, err := json.Marshal(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var machine struct {
+		Rejections []struct {
+			Provider string `json:"provider"`
+			Gate     string `json:"gate"`
+			Detail   string `json:"detail"`
+		} `json:"rejections"`
+	}
+	if err := json.Unmarshal(raw, &machine); err != nil {
+		t.Fatal(err)
+	}
+	for _, rejection := range machine.Rejections {
+		if rejection.Provider != "codex" {
+			continue
+		}
+		if rejection.Gate != "concurrency" || !strings.Contains(rejection.Detail, "live=3 cap=1") {
+			t.Fatalf("Codex rejection did not preserve the concurrency cause: %+v", rejection)
+		}
+		if strings.Contains(strings.ToLower(rejection.Detail), "quota") {
+			t.Fatalf("healthy Codex quota was blamed for its occupied slot: %+v", rejection)
+		}
+		return
+	}
+	t.Fatalf("machine route omitted the rejected Codex surface: %s", raw)
+}
+
+func TestMachineAvailabilityGatePreservesUnknownAndCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		detail string
+		want   string
+	}{
+		{detail: "at concurrency cap live=3 cap=1", want: "concurrency"},
+		{detail: "live concurrency unknown: herdr census unreadable", want: "unknown"},
+		{detail: "global cooldown: quota backoff", want: "cooldown"},
+		{detail: "quota exhausted", want: "quota"},
+		{detail: "quota handoff unavailable: command not found", want: "quota-handoff"},
+	} {
+		if got := availabilityGate(tc.detail); got != tc.want {
+			t.Errorf("availabilityGate(%q) = %q, want %q", tc.detail, got, tc.want)
+		}
 	}
 }

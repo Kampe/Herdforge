@@ -25,16 +25,16 @@ const (
 )
 
 type BurnState struct {
-	Resource            string               `json:"resource"`
-	Window              string               `json:"window"`
-	WindowSeconds       int                  `json:"windowSeconds"`
-	Used                float64              `json:"used"`
-	Remaining           float64              `json:"remaining"`
+	Resource            string               `json:"resource,omitempty"`
+	Window              string               `json:"window,omitempty"`
+	WindowSeconds       int                  `json:"windowSeconds,omitempty"`
+	Used                float64              `json:"used,omitempty"`
+	Remaining           float64              `json:"remaining,omitempty"`
 	ResetsAt            string               `json:"resetsAt,omitempty"`
-	ResetsIn            string               `json:"resetsIn"`
-	Class               BurnClass            `json:"class"`
-	Pace                int                  `json:"pace"`
-	Pressure            float64              `json:"pressure"`
+	ResetsIn            string               `json:"resetsIn,omitempty"`
+	Class               BurnClass            `json:"class,omitempty"`
+	Pace                int                  `json:"pace,omitempty"`
+	Pressure            float64              `json:"pressure,omitempty"`
 	RunwayMinutes       *int                 `json:"runwayMinutes,omitempty"`
 	ExhaustsBeforeReset *bool                `json:"exhaustsBeforeReset,omitempty"`
 	SoonestResetWindow  string               `json:"soonestResetWindow,omitempty"`
@@ -45,6 +45,11 @@ type BurnState struct {
 	Reason              string               `json:"reason"`
 	Stale               bool                 `json:"stale"`
 	Plan                string               `json:"plan,omitempty"`
+	Entitlement         EntitlementKind      `json:"entitlement,omitempty"`
+	ProviderError       string               `json:"providerError,omitempty"`
+	QuotaSource         string               `json:"quotaSource,omitempty"`
+	QuotaGeneratedAt    string               `json:"quotaGeneratedAt,omitempty"`
+	QuotaHandoffError   string               `json:"quotaHandoffError,omitempty"`
 	Windows             []BurnState          `json:"windows,omitempty"`
 	Pools               map[string]BurnState `json:"pools,omitempty"`
 }
@@ -287,6 +292,44 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 	return &result
 }
 
+// computeMeteredBinding converts a real non-temporal meter into the percentage
+// BurnState used by admission without inventing a reset or temporal window.
+// The source resource retains its native credit values; only the routing view
+// derives used/remaining percent from the explicit total.
+func computeMeteredBinding(prov ProviderUsage, resourceNames map[string]bool, exhaustedPct float64) *BurnState {
+	names := make([]string, 0, len(prov.Resources))
+	for name := range prov.Resources {
+		if resourceNames == nil || resourceNames[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var binding *BurnState
+	for _, name := range names {
+		r := prov.Resources[name]
+		if r.Kind != "consumption" || r.Limit <= 0 || r.Utilization < 0 || r.Utilization > 1 {
+			continue
+		}
+		used := r.Utilization * 100
+		class := BurnUntracked
+		if used >= exhaustedPct {
+			class = BurnExhausted
+		}
+		state := &BurnState{
+			Resource:    name,
+			Used:        used,
+			Remaining:   math.Max(100-used, 0),
+			Class:       class,
+			Pressure:    used,
+			Entitlement: EntitlementMetered,
+		}
+		if binding == nil || state.Used > binding.Used {
+			binding = state
+		}
+	}
+	return binding
+}
+
 func poolResources(name string, prov ProviderUsage) map[string]map[string]bool {
 	names := make(map[string]bool)
 	for n := range prov.Resources {
@@ -379,16 +422,35 @@ func (e *QuotaEngine) ComputeAll(snap *UsageSnapshot) map[string]BurnState {
 	if snap == nil {
 		return nil
 	}
+	snap = normalizedSnapshot(snap)
 	now := e.now()
 	computed := make(map[string]BurnState)
 	for name, prov := range snap.Providers {
 		stale := prov.Stale
 		plan := prov.Plan
+		if prov.Entitlement == EntitlementUnmetered {
+			state := BurnState{
+				Available:   !stale,
+				Reason:      "unmetered",
+				Stale:       stale,
+				Plan:        plan,
+				Entitlement: EntitlementUnmetered,
+				Class:       BurnUntracked,
+			}
+			if stale {
+				state.Reason = "stale"
+			}
+			computed[name] = state
+			continue
+		}
 		pools := make(map[string]BurnState)
 		providerError := false
 
 		for pool, resources := range poolResources(name, prov) {
 			bs := computeBinding(prov, resources, e.ExhaustedPct, now)
+			if bs == nil && prov.Entitlement == EntitlementMetered {
+				bs = computeMeteredBinding(prov, resources, e.ExhaustedPct)
+			}
 			d := decorate(bs, stale, plan, providerError, e.ExhaustedPct)
 			if pool != "all" {
 				pools[pool] = d
@@ -400,7 +462,39 @@ func (e *QuotaEngine) ComputeAll(snap *UsageSnapshot) map[string]BurnState {
 			}
 		}
 	}
+	// A named provider failure overrides any partial usage for that provider.
+	// Mixing a failed poll with remembered/partial numbers would turn UNKNOWN
+	// into an admission fact, so keep the aggregate fail-closed per provider.
+	for name, detail := range snap.ProviderErrors {
+		computed[name] = BurnState{
+			Available:     false,
+			Reason:        "provider-error",
+			ProviderError: detail,
+		}
+	}
+	for name, state := range computed {
+		computed[name] = applyQuotaEvidence(state, snap.QuotaSource, snap.GeneratedAt, snap.QuotaHandoffError)
+	}
 	return computed
+}
+
+func applyQuotaEvidence(state BurnState, source string, generatedAt time.Time, handoffError string) BurnState {
+	state.QuotaSource = source
+	if !generatedAt.IsZero() {
+		state.QuotaGeneratedAt = generatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	state.QuotaHandoffError = handoffError
+	for name, pool := range state.Pools {
+		state.Pools[name] = applyQuotaEvidence(pool, source, generatedAt, handoffError)
+	}
+	for i := range state.Windows {
+		state.Windows[i] = applyQuotaEvidence(state.Windows[i], source, generatedAt, handoffError)
+	}
+	if handoffError != "" {
+		state.Available = false
+		state.Reason = "quota-handoff-error"
+	}
+	return state
 }
 
 func (e *QuotaEngine) PickProvider(computed map[string]BurnState, among []string) (string, BurnState, error) {
