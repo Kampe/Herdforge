@@ -254,6 +254,23 @@ func (e *Engine) kaneoBin() string {
 	return repositoryBin
 }
 
+// kaneoListArgs returns the command shape for the board census. The optional
+// repository wrapper owns the legacy interface; a PATH client is the current
+// Kaneo CLI and requires the task subcommand plus JSON output.
+func (e *Engine) kaneoListArgs() []string {
+	if e.KaneoBin != "" {
+		return []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+	}
+	repositoryBin := filepath.Join(repoRoot(), "bin", "herd-kaneo")
+	if info, err := os.Stat(repositoryBin); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+		return []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+	}
+	if _, err := exec.LookPath("kaneo"); err == nil {
+		return []string{"task", "list", "--json", "--all"}
+	}
+	return []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+}
+
 func (e *Engine) sendBin() string {
 	if e.SendBin != "" {
 		return e.SendBin
@@ -876,11 +893,7 @@ func (e *Engine) Observe(act bool) (*Summary, error) {
 		// The retired repository wrapper accepted the legacy `list --fields`
 		// surface.  Modern Kaneo exposes the same board as `task list --json`.
 		// Keep the wrapper contract intact while adapting only the PATH fallback.
-		args := []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
-		if filepath.Base(e.kaneoBin()) == "kaneo" {
-			args = []string{"task", "list", "--json", "--all"}
-		}
-		out, err := exec.Command(e.kaneoBin(), args...).Output()
+		out, err := exec.Command(e.kaneoBin(), e.kaneoListArgs()...).Output()
 		if err != nil {
 			return nil, fmt.Errorf("board unavailable: %w", err)
 		}
