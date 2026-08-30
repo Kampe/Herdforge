@@ -873,9 +873,14 @@ func (e *Engine) Observe(act bool) (*Summary, error) {
 		}
 		boardJSON = data
 	} else {
-		out, err := exec.Command(e.kaneoBin(), "list",
-			"--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at",
-		).Output()
+		// The retired repository wrapper accepted the legacy `list --fields`
+		// surface.  Modern Kaneo exposes the same board as `task list --json`.
+		// Keep the wrapper contract intact while adapting only the PATH fallback.
+		args := []string{"list", "--fields", "ref,title,status,owner,assignee,labels,blocked_by,updated_at,created_at,reviewed_at,merged_at"}
+		if filepath.Base(e.kaneoBin()) == "kaneo" {
+			args = []string{"task", "list", "--json", "--all"}
+		}
+		out, err := exec.Command(e.kaneoBin(), args...).Output()
 		if err != nil {
 			return nil, fmt.Errorf("board unavailable: %w", err)
 		}
