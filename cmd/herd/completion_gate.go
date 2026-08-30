@@ -28,6 +28,16 @@ const (
 )
 
 func openCompletionGate(cfg *config.Config) (*daemon.CompletionGate, *lifecycle.Machine, error) {
+	// Review and completion may be invoked from a linked candidate worktree
+	// (or a lane-specific cwd).  Both the lifecycle journal and verification
+	// receipts are repository-wide authority, so resolving them relative to
+	// process cwd can silently create a second store and make a valid PASS
+	// receipt invisible to the next stage.  Anchor both stores at the Git
+	// common root, just like the other coordinator evidence stores.
+	root, err := canonicalHerdRoot()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve canonical root for completion gate: %w", err)
+	}
 	testCmd := ""
 	if cfg != nil {
 		testCmd = strings.TrimSpace(cfg.Verification.TestCommand)
@@ -36,11 +46,11 @@ func openCompletionGate(cfg *config.Config) (*daemon.CompletionGate, *lifecycle.
 		return nil, nil, fmt.Errorf("verification.test_command is required for completion admission")
 	}
 	v := verifier.NewVerifier(testCmd)
-	machine, err := lifecycle.NewMachine(defaultLifecycleDB)
+	machine, err := lifecycle.NewMachine(filepath.Join(root, defaultLifecycleDB))
 	if err != nil {
 		return nil, nil, fmt.Errorf("open lifecycle machine: %w", err)
 	}
-	gate, err := daemon.NewCompletionGate(v, defaultReceiptDir, machine)
+	gate, err := daemon.NewCompletionGate(v, filepath.Join(root, defaultReceiptDir), machine)
 	if err != nil {
 		_ = machine.Close()
 		return nil, nil, err
