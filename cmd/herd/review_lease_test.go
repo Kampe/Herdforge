@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -50,6 +51,50 @@ func TestRequireLiveLeaseReacquiresReviewLeaseAfterWorkerRelease(t *testing.T) {
 	}
 	if review == nil || review.Status != claim.StatusActive || review.Role != dispatch.RoleWorker {
 		t.Fatalf("review lease not active: %+v", review)
+	}
+}
+
+func TestOpenCompletionGateAnchorsStoresAtCommonRoot(t *testing.T) {
+	root := t.TempDir()
+	gitIn(t, root, "init", "-b", "main")
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	caller := filepath.Join(root, "nested", "lane")
+	if err := os.MkdirAll(caller, 0755); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(caller); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(previous) }()
+
+	cfg := &config.Config{Verification: config.Verification{TestCommand: "true"}}
+	gate, machine, err := openCompletionGate(cfg)
+	if err != nil {
+		t.Fatalf("open completion gate: %v", err)
+	}
+	if gate == nil || machine == nil {
+		t.Fatal("completion gate returned nil authority")
+	}
+	defer machine.Close()
+	if _, err := os.Stat(filepath.Join(root, defaultLifecycleDB)); err != nil {
+		t.Fatalf("common-root lifecycle store missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(caller, defaultLifecycleDB)); !os.IsNotExist(err) {
+		t.Fatalf("nested lifecycle store created from caller cwd: %v", err)
+	}
+	canonicalRoot, err := canonicalHerdRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReceiptDir := filepath.Join(canonicalRoot, defaultReceiptDir)
+	if filepath.Clean(gate.Store.(*verifier.FileReceiptStore).Dir) != wantReceiptDir {
+		t.Fatalf("receipt store dir = %q, want common root %q", gate.Store.(*verifier.FileReceiptStore).Dir, wantReceiptDir)
 	}
 }
 
