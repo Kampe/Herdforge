@@ -100,7 +100,7 @@ func TestKaneoListArgsPreservesRepositoryWrapperShape(t *testing.T) {
 		t.Fatalf("kaneo list args = %q, want legacy wrapper shape", got)
 	}
 	hasFields := false
-	for _, arg := range got[1:] {
+	for _, arg := range got {
 		if arg == "--fields" {
 			hasFields = true
 			break
