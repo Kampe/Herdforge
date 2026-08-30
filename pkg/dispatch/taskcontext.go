@@ -41,6 +41,11 @@ const (
 	RoleRecovery    = "recovery"    // recovery-sentinel agents
 	RoleIntegration = "integration" // harvest/integration owners
 	RoleCoordinator = "coordinator"
+	// RoleScoutPlanner is a read-mostly lane role. It is deliberately scoped
+	// to worker operations (get/list/comment) and can never authorize board
+	// mutation, but must remain a first-class task-context role because the
+	// configured scout-planner lane signs its own dispatch receipts.
+	RoleScoutPlanner = "scout-planner"
 )
 
 // WorkerOps / ReviewerOps / CoordinatorOps are the default allowed-operation
@@ -74,6 +79,8 @@ func OpsForRole(role string) []string {
 		return RecoveryOps
 	case RoleIntegration:
 		return IntegrationOps
+	case RoleScoutPlanner:
+		return WorkerOps
 	case RoleCoordinator:
 		return CoordinatorOps
 	default:
@@ -148,7 +155,7 @@ func (tc TaskContext) Validate() error {
 		return fmt.Errorf("task context lease_generation %d is invalid (FAC-145: unfenced receipts carry no authority)", tc.LeaseGeneration)
 	}
 	switch tc.Role {
-	case RoleWorker, RoleCoordinator, RoleVerifier, RoleRecovery, RoleIntegration:
+	case RoleWorker, RoleCoordinator, RoleVerifier, RoleRecovery, RoleIntegration, RoleScoutPlanner:
 	case RoleReviewer:
 		// Exact-candidate review: a reviewer receipt without the precise
 		// commit under review can verdict nothing.
