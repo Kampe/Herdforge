@@ -26,6 +26,12 @@ import (
 // crash-consistency hazard).
 const TaskContextFile = "TASK-CONTEXT.json"
 
+// AuthorityScopeCandidateSupersession distinguishes the explicit coordinator
+// recovery packet that may replace a Recovering lifecycle candidate from the
+// long-standing lightweight recovery-sentinel role. Empty scope remains the
+// generic sentinel authority and must never be accepted for supersession.
+const AuthorityScopeCandidateSupersession = "candidate-supersession"
+
 // DefaultReceiptTTL bounds how long a launch receipt authorizes provider
 // operations when the dispatch carries no explicit lease expiry. Cards run
 // long; a day covers any legitimate build without leaving an immortal
@@ -107,6 +113,7 @@ type TaskContext struct {
 	Branch            string `json:"branch"`
 	BaseSHA           string `json:"base_sha"`
 	CandidateSHA      string `json:"candidate_sha,omitempty"` // exact commit under review (review-issued receipts)
+	AuthorityScope    string `json:"authority_scope,omitempty"`
 	AnchorRef         string `json:"anchor_ref,omitempty"`
 	HerdrWorkspace    string `json:"herdr_workspace,omitempty"` // set once launch resolves it
 	LeaseID           string `json:"lease_id"`
@@ -165,6 +172,14 @@ func (tc TaskContext) Validate() error {
 	default:
 		return fmt.Errorf("task context role %q is unknown — unknown roles carry no authority (FAC-145 fail-closed)", tc.Role)
 	}
+	if tc.AuthorityScope != "" {
+		if tc.AuthorityScope != AuthorityScopeCandidateSupersession {
+			return fmt.Errorf("task context authority_scope %q is unknown — unknown scopes carry no authority", tc.AuthorityScope)
+		}
+		if tc.Role != RoleRecovery || strings.TrimSpace(tc.CandidateSHA) == "" {
+			return fmt.Errorf("task context candidate-supersession scope requires recovery role and exact candidate_sha")
+		}
+	}
 	if len(tc.AllowedOps) == 0 {
 		return fmt.Errorf("task context allowed_ops is required (FAC-145 fail-closed; a receipt with no operations authorizes nothing and must say so explicitly)")
 	}
@@ -193,7 +208,7 @@ func (tc TaskContext) Validate() error {
 		{"task_ref", tc.TaskRef}, {"task_id", tc.TaskID},
 		{"branch", tc.Branch}, {"base_sha", tc.BaseSHA},
 		{"candidate_sha", tc.CandidateSHA},
-		{"anchor_ref", tc.AnchorRef}, {"herdr_workspace", tc.HerdrWorkspace},
+		{"authority_scope", tc.AuthorityScope}, {"anchor_ref", tc.AnchorRef}, {"herdr_workspace", tc.HerdrWorkspace},
 		{"lease_id", tc.LeaseID}, {"lease_task_ref", tc.LeaseTaskRef},
 		{"session_id", tc.SessionID}, {"agent_session_id", tc.AgentSessionID},
 	} {

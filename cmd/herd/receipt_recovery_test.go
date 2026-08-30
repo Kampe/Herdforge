@@ -167,7 +167,7 @@ func TestPersistRecoveryReceiptRollsBackPostCanonicalWriteFailure(t *testing.T) 
 	recovery, err := f.signer.Issue(dispatch.TaskContext{
 		ProviderType: f.prior.ProviderType, ProjectID: f.prior.ProjectID,
 		ProviderWorkspace: f.prior.ProviderWorkspace, ProviderProfile: f.prior.ProviderProfile,
-		Repository: f.prior.Repository, Role: dispatch.RoleRecovery, TaskRef: f.prior.TaskRef, TaskID: f.prior.TaskID,
+		Repository: f.prior.Repository, Role: dispatch.RoleRecovery, AuthorityScope: dispatch.AuthorityScopeCandidateSupersession, TaskRef: f.prior.TaskRef, TaskID: f.prior.TaskID,
 		Branch: f.prior.Branch, BaseSHA: f.prior.BaseSHA, CandidateSHA: f.candidate,
 		LeaseID: "recovery-lease", LeaseGeneration: 1, LeaseTaskRef: f.task.Ref + ":recovery", SessionID: "fac-631-recovery",
 		AllowedOps: dispatch.OpsForRole(dispatch.RoleRecovery), ExpiresAt: time.Now().Add(time.Hour),
@@ -194,5 +194,29 @@ func TestPersistRecoveryReceiptRollsBackPostCanonicalWriteFailure(t *testing.T) 
 	}
 	if _, err := dispatch.LoadCanonicalReceiptSession(f.root, recovery.ProviderType, recovery.ProjectID, recovery.TaskRef, recovery.SessionID); err == nil {
 		t.Fatal("partially committed recovery canonical receipt survived compensation")
+	}
+}
+
+func TestAuthenticatedRecoveryIdentityRejectsGenericRecoverySentinelAsSupersessionSource(t *testing.T) {
+	f := newRecoveryReceiptFixture(t)
+	generic := f.prior
+	generic.Role = dispatch.RoleRecovery
+	generic.LeaseID = "sentinel-lease"
+	generic.LeaseTaskRef = f.task.Ref + ":recovery"
+	generic.SessionID = "fac-631-generic-recovery"
+	generic.AllowedOps = dispatch.OpsForRole(dispatch.RoleRecovery)
+	generic.Signature = ""
+	generic, err := f.signer.Issue(generic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(f.worktree, generic); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, generic); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authenticatedRecoveryIdentity(context.Background(), f.root, f.worktree, f.task.Ref, f.prior.Branch, f.candidate, f.cfg, f.task); err == nil {
+		t.Fatal("generic recovery-sentinel receipt was promoted into candidate-supersession provenance")
 	}
 }

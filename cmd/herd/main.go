@@ -10086,17 +10086,18 @@ func runBrokerEnsure() {
 // lease, issues the signed receipt into the target worktree, and stores
 // the canonical copy — the same authority pipeline dispatch uses.
 //
-//	herd receipt issue --role verifier|recovery|integration <ref> <worktree>
+//	herd receipt issue --role verifier|recovery|integration [--candidate-supersession] <ref> <worktree>
 func runReceiptIssue() {
 	fs := flag.NewFlagSet("receipt issue", flag.ExitOnError)
 	role := fs.String("role", "", "verifier|recovery|integration")
+	candidateSupersession := fs.Bool("candidate-supersession", false, "issue exact candidate-supersession authority (recovery role only)")
 	args := os.Args[2:]
 	if len(args) > 0 && args[0] == "issue" {
 		args = args[1:]
 	}
 	fs.Parse(args)
 	if fs.NArg() < 2 || *role == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration <ref> <worktree>")
+		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration [--candidate-supersession] <ref> <worktree>")
 		os.Exit(2)
 	}
 	ref, targetDir := hsync.NormalizeRef(fs.Arg(0)), fs.Arg(1)
@@ -10106,6 +10107,11 @@ func runReceiptIssue() {
 		fmt.Fprintf(os.Stderr, "herd receipt: role %q is not an admissible isolated-agent role (FAC-145)\n", *role)
 		os.Exit(2)
 	}
+	if *candidateSupersession && *role != dispatch.RoleRecovery {
+		fmt.Fprintln(os.Stderr, "herd receipt: --candidate-supersession requires --role recovery")
+		os.Exit(2)
+	}
+	scopedRecovery := *role == dispatch.RoleRecovery && *candidateSupersession
 
 	root, err := canonicalHerdRoot()
 	if err != nil {
@@ -10149,7 +10155,7 @@ func runReceiptIssue() {
 		os.Exit(1)
 	}
 	var priorRecovery dispatch.TaskContext
-	if *role == dispatch.RoleRecovery {
+	if scopedRecovery {
 		priorRecovery, err = authenticatedRecoveryIdentity(context.Background(), root, targetDir, ref, branch, candidate, cfg, task)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
@@ -10202,7 +10208,7 @@ func runReceiptIssue() {
 		AllowedOps:        dispatch.OpsForRole(*role),
 		ExpiresAt:         time.Now().Add(dispatch.DefaultReceiptTTL),
 	}
-	if *role == dispatch.RoleRecovery {
+	if scopedRecovery {
 		issuedContext.ProviderType = priorRecovery.ProviderType
 		issuedContext.ProjectID = priorRecovery.ProjectID
 		issuedContext.ProviderWorkspace = priorRecovery.ProviderWorkspace
@@ -10212,6 +10218,7 @@ func runReceiptIssue() {
 		issuedContext.TaskID = priorRecovery.TaskID
 		issuedContext.Branch = priorRecovery.Branch
 		issuedContext.BaseSHA = priorRecovery.BaseSHA
+		issuedContext.AuthorityScope = dispatch.AuthorityScopeCandidateSupersession
 	}
 	receipt, err := signer.Issue(issuedContext)
 	if err != nil {
@@ -10222,7 +10229,7 @@ func runReceiptIssue() {
 		fmt.Fprintf(os.Stderr, "herd receipt (lease released): %v\n", err)
 		os.Exit(1)
 	}
-	if *role == dispatch.RoleRecovery {
+	if scopedRecovery {
 		err = persistRecoveryReceipt(root, targetDir, receipt, priorRecovery, dispatch.StoreCanonicalReceipt)
 	} else {
 		err = dispatch.WriteTaskContext(targetDir, receipt)

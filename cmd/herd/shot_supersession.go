@@ -35,6 +35,7 @@ type shotSupersessionFacts struct {
 	ProviderStatus                                   string
 	ReceiptVerified, CanonicalReceiptMatches         bool
 	Role                                             string
+	AuthorityScope                                   string
 	LeaseGeneration                                  int64
 	LeaseLive                                        bool
 	LeaseTaskRef, AuthorizedCandidateSHA             string
@@ -87,7 +88,11 @@ func validateShotSupersessionFacts(f shotSupersessionFacts) error {
 	if role == dispatch.RoleWorker && !f.LiveLaunch {
 		return fmt.Errorf("candidate supersession: normal worker authority requires its exact live launch")
 	}
-	if role == dispatch.RoleRecovery && (!equalFold(f.LeaseTaskRef, f.TaskRef+":"+dispatch.RoleRecovery) || f.AuthorizedCandidateSHA != f.ReplacementSHA) {
+	if role == dispatch.RoleWorker && f.AuthorityScope != "" {
+		return fmt.Errorf("candidate supersession: worker authority must not carry a recovery scope")
+	}
+	if role == dispatch.RoleRecovery && (f.AuthorityScope != dispatch.AuthorityScopeCandidateSupersession ||
+		!equalFold(f.LeaseTaskRef, f.TaskRef+":"+dispatch.RoleRecovery) || f.AuthorizedCandidateSHA != f.ReplacementSHA) {
 		return fmt.Errorf("candidate supersession: coordinator-issued recovery receipt is not bound to the exact recovery lease and replacement")
 	}
 	if strings.TrimSpace(f.Model) == "" || f.Model != f.LaunchModel ||
@@ -166,7 +171,7 @@ func collectShotSupersessionFacts(ctx context.Context, root, ref string, lease i
 		return facts, authority, fmt.Errorf("candidate supersession: read signed task context: %w", err)
 	}
 	facts.ProviderType, facts.ProjectID = authority.ProviderType, authority.ProjectID
-	facts.TaskRef, facts.TaskID, facts.Role = authority.TaskRef, authority.TaskID, authority.Role
+	facts.TaskRef, facts.TaskID, facts.Role, facts.AuthorityScope = authority.TaskRef, authority.TaskID, authority.Role, authority.AuthorityScope
 	facts.LeaseGeneration, facts.SessionID = authority.LeaseGeneration, authority.SessionID
 	facts.LeaseTaskRef, facts.AuthorizedCandidateSHA = authority.LeaseTaskRef, authority.CandidateSHA
 	facts.Branch, facts.BaseSHA = authority.Branch, authority.BaseSHA
