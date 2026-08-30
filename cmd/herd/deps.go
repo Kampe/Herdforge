@@ -253,7 +253,19 @@ func runDepsMigrate() {
 	apply := fs.Bool("apply", false, "Coordinator-only: write description fences (requires HERD_DEPS_MIGRATE_APPLY=1)")
 	asJSON := fs.Bool("json", false, "JSON plan output")
 	journalDir := fs.String("journal", filepath.Join(".herd", "migrate-journal"), "Per-apply before-image journal dir (repo-relative)")
+	taskRef := fs.String("ref", "", "Migrate exactly one task ref without scanning the active board")
 	_ = fs.Parse(os.Args[3:])
+	refSelected := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "ref" {
+			refSelected = true
+		}
+	})
+	selectedRef := strings.TrimSpace(*taskRef)
+	if refSelected && selectedRef == "" {
+		fmt.Fprintln(os.Stderr, "deps migrate --ref: task ref must not be empty")
+		os.Exit(1)
+	}
 
 	cfg, err := config.LoadConfig(config.DefaultConfigPath)
 	if err != nil {
@@ -271,10 +283,17 @@ func runDepsMigrate() {
 	// Default path: revision-fenced dry-run. Workers ship this; they never apply live.
 	if !*apply {
 		totalCards, processedCards := 0, 0
-		plan, perr := deps.PlanMigrationWithProgress(ctx, store, tp, cfg.TaskProvider.ProjectID, func(item deps.MigrateItem, processed, total int) {
+		progress := func(item deps.MigrateItem, processed, total int) {
 			totalCards, processedCards = total, processed
 			fmt.Fprintf(os.Stderr, "herd deps migrate dry-run: processed %d/%d cards (current=%s action=%s)\n", processed, total, item.Ref, item.Action)
-		})
+		}
+		var plan *deps.MigratePlan
+		var perr error
+		if refSelected {
+			plan, perr = deps.PlanMigrationForRefWithProgress(ctx, store, tp, cfg.TaskProvider.ProjectID, selectedRef, progress)
+		} else {
+			plan, perr = deps.PlanMigrationWithProgress(ctx, store, tp, cfg.TaskProvider.ProjectID, progress)
+		}
 		if perr != nil {
 			fmt.Fprintf(os.Stderr, "migrate dry-run: partial progress migrated=%d remaining=%d: %v\n", processedCards, totalCards-processedCards, perr)
 			if *asJSON && plan != nil {
@@ -326,7 +345,13 @@ workers write/test this command; they never apply live (no sidecar authority)`)
 		os.Exit(1)
 	}
 
-	plan, perr := deps.ApplyMigration(ctx, store, tp, cfg.TaskProvider.ProjectID, writer, *journalDir)
+	var plan *deps.MigratePlan
+	var perr error
+	if refSelected {
+		plan, perr = deps.ApplyMigrationForRef(ctx, store, tp, cfg.TaskProvider.ProjectID, selectedRef, writer, *journalDir)
+	} else {
+		plan, perr = deps.ApplyMigration(ctx, store, tp, cfg.TaskProvider.ProjectID, writer, *journalDir)
+	}
 	if perr != nil {
 		fmt.Fprintf(os.Stderr, "migrate apply: %v\n", perr)
 		os.Exit(1)

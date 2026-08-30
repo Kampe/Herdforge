@@ -405,6 +405,9 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 	if err != nil {
 		return nil, err
 	}
+	if migrationScopedSnapshot(ctx) {
+		return s.snapshotGraphForMigrationTask(ctx, rp, taskRef, taskID, desired)
+	}
 	if err := s.hydrateFresh(ctx); err != nil {
 		return nil, err
 	}
@@ -482,6 +485,115 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 	rels := make([]provider.Relation, 0, len(seenRelations))
 	for _, r := range seenRelations {
 		rels = append(rels, r)
+	}
+	return s.snapshotFromRelations(ctx, rels)
+}
+
+// snapshotGraphForMigrationTask performs the same complete-component walk as
+// SnapshotGraphForTask without hydrating the project task list. Every task it
+// encounters is fetched by exact immutable ID and checked against the selected
+// project, so an endpoint cannot smuggle an external or mismatched identity
+// into the scoped graph.
+func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp provider.RelationProvider, taskRef Ref, taskID TaskID, desired []DependencyEdge) (*GraphSnapshot, error) {
+	queue := make([]string, 0, 1+len(desired)*2)
+	seenTasks := map[string]bool{}
+	tasksByID := map[string]*provider.Task{}
+	tasksByRef := map[string]*provider.Task{}
+
+	addTask := func(id TaskID, ref Ref) error {
+		lookup := strings.TrimSpace(string(id))
+		if lookup == "" {
+			lookup = strings.TrimSpace(string(ref))
+		}
+		if lookup == "" {
+			return fmt.Errorf("deps: scoped migration graph task identity missing")
+		}
+		task, err := s.TP.GetTask(ctx, lookup)
+		if err != nil {
+			return fmt.Errorf("deps: scoped migration graph get %s: %w", lookup, err)
+		}
+		if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
+			return fmt.Errorf("deps: scoped migration graph task %s has incomplete identity", lookup)
+		}
+		if id.Valid() && task.ID != string(id) {
+			return fmt.Errorf("deps: scoped migration graph task id mismatch: requested %s got %s", id, task.ID)
+		}
+		if ref.Valid() && !strings.EqualFold(strings.TrimSpace(task.Ref), strings.TrimSpace(string(ref))) {
+			return fmt.Errorf("deps: scoped migration graph task ref mismatch: requested %s got %s", ref, task.Ref)
+		}
+		if strings.TrimSpace(s.ProjectID) != "" && task.ProjectID != s.ProjectID {
+			return fmt.Errorf("deps: scoped migration graph task %s project mismatch: want %q got %q", task.Ref, s.ProjectID, task.ProjectID)
+		}
+		if prior := tasksByID[task.ID]; prior != nil && prior.Ref != task.Ref {
+			return fmt.Errorf("deps: scoped migration graph duplicate task id %q maps to %q and %q", task.ID, prior.Ref, task.Ref)
+		}
+		if prior := tasksByRef[task.Ref]; prior != nil && prior.ID != task.ID {
+			return fmt.Errorf("deps: scoped migration graph duplicate task ref %q maps to %q and %q", task.Ref, prior.ID, task.ID)
+		}
+		cp := *task
+		tasksByID[cp.ID] = &cp
+		tasksByRef[cp.Ref] = &cp
+		if !seenTasks[cp.ID] {
+			seenTasks[cp.ID] = true
+			queue = append(queue, cp.ID)
+		}
+		return nil
+	}
+
+	if err := addTask(taskID, taskRef); err != nil {
+		return nil, err
+	}
+	for _, edge := range desired {
+		if err := addTask(edge.SourceID, edge.SourceRef); err != nil {
+			return nil, err
+		}
+		if err := addTask(edge.TargetID, edge.TargetRef); err != nil {
+			return nil, err
+		}
+	}
+
+	seenRelations := map[string]provider.Relation{}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		s.ListRelCalls.Add(1)
+		rels, err := rp.ListRelations(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("deps: scoped migration graph list %s: %w", id, err)
+		}
+		for _, relation := range rels {
+			if relation.ID == "" || (relation.SourceTaskID != id && relation.TargetTaskID != id) {
+				return nil, fmt.Errorf("deps: scoped migration graph relation %q is unrelated to task %s", relation.ID, id)
+			}
+			if prior, exists := seenRelations[relation.ID]; exists && !relationEqual(prior, relation) {
+				return nil, fmt.Errorf("deps: scoped migration graph relation %s disagrees across endpoint listings", relation.ID)
+			}
+			seenRelations[relation.ID] = relation
+			if !seenTasks[relation.SourceTaskID] {
+				if err := addTask(TaskID(relation.SourceTaskID), ""); err != nil {
+					return nil, err
+				}
+			}
+			if !seenTasks[relation.TargetTaskID] {
+				if err := addTask(TaskID(relation.TargetTaskID), ""); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	s.mu.Lock()
+	for id, task := range tasksByID {
+		s.idCache[id] = task
+	}
+	for ref, task := range tasksByRef {
+		s.refCache[ref] = task
+	}
+	s.mu.Unlock()
+
+	rels := make([]provider.Relation, 0, len(seenRelations))
+	for _, relation := range seenRelations {
+		rels = append(rels, relation)
 	}
 	return s.snapshotFromRelations(ctx, rels)
 }
