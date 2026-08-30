@@ -769,6 +769,26 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 				break
 			}
 		}
+		// Some providers expose a card through an exact task read and their
+		// filtered list endpoint but omit it from one active-column page during
+		// concurrent board churn. Resolve the exact ref once from the provider's
+		// canonical inventory before declaring it absent. This fallback is still
+		// bounded and only accepts a non-terminal task, so it cannot resurrect a
+		// done/archive card or bypass the lifecycle gate.
+		if task == nil {
+			fallbackCtx, fallbackCancel := context.WithTimeout(ctx, activeFanOutDeadline(d.deadlines()))
+			allTasks, fallbackErr := d.TaskProvider.ListTasks(fallbackCtx, d.Config.TaskProvider.ProjectID, "")
+			fallbackCancel()
+			if fallbackErr != nil {
+				return nil, formatBoardErr("failed to resolve task ref", fallbackErr)
+			}
+			for _, t := range allTasks {
+				if t != nil && t.Ref == opts.TicketRef && provider.IsActiveStatus(t.Status) {
+					task = t
+					break
+				}
+			}
+		}
 	}
 	if task == nil {
 		// Scoped to active columns, so say so: a ref that is merely done reads
