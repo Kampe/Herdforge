@@ -42,3 +42,14 @@ func TestResultJSON_LanesNeedingEyesIsAttention(t *testing.T) {
 		t.Fatalf("lanes needing eyes must report ATTENTION: %s", raw)
 	}
 }
+
+func TestResultJSON_ReadyCandidateIsCriticalAttention(t *testing.T) {
+	raw, err := json.Marshal(Result{Total: 14, ReadyCandidates: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	if !strings.Contains(body, `"state":"ATTENTION"`) || !strings.Contains(body, `"summary":"herd-attention: CRITICAL`) {
+		t.Fatalf("a ready candidate must make the shipped JSON surface critical attention: %s", body)
+	}
+}

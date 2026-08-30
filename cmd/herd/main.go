@@ -7123,6 +7123,10 @@ func runAttention() {
 		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
 		os.Exit(1)
 	}
+	if err := appendReadyCandidateAttention(result, reviewLedgerPath(), ghPullRequestsForBranch); err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *asJSON {
 		out, err := json.MarshalIndent(result, "", "  ")
@@ -7144,11 +7148,11 @@ func runAttention() {
 		fmt.Println("  " + attention.FormatItem(item))
 	}
 
-	if result.Needing > 0 {
+	if result.Needing > 0 || result.ReadyCandidates > 0 {
 		fmt.Println()
 		fmt.Println("herd-attention: triage complete. Actions: review/harvest done lanes,")
 		fmt.Println("  unblock blocked lanes, kick idle lanes (herd kick), raise missing")
-		fmt.Println("  lanes (herd standing), reroute provider-death lanes.")
+		fmt.Println("  lanes (herd standing), reroute provider-death lanes, integrate ready candidates.")
 	}
 }
 

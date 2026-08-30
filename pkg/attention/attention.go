@@ -54,21 +54,26 @@ const (
 
 // Item is one lane in the attention triage.
 type Item struct {
-	Name       string         `json:"name"`
-	Status     string         `json:"status"`
-	Level      AttentionLevel `json:"level"`
-	Reason     string         `json:"reason"`
-	PaneID     string         `json:"pane_id,omitempty"`
-	Held       bool           `json:"held,omitempty"`
-	HeldReason string         `json:"held_reason,omitempty"`
+	Name        string         `json:"name"`
+	Status      string         `json:"status"`
+	Level       AttentionLevel `json:"level"`
+	Reason      string         `json:"reason"`
+	PaneID      string         `json:"pane_id,omitempty"`
+	Held        bool           `json:"held,omitempty"`
+	HeldReason  string         `json:"held_reason,omitempty"`
+	SHA         string         `json:"sha,omitempty"`
+	PullRequest int            `json:"pull_request,omitempty"`
+	Beats       int            `json:"beats,omitempty"`
+	Escalated   bool           `json:"escalated,omitempty"`
 }
 
 // Result is the full attention triage.
 type Result struct {
-	Items   []Item                 `json:"items"`
-	Counts  map[AttentionLevel]int `json:"counts"`
-	Total   int                    `json:"total"`
-	Needing int                    `json:"needing"`
+	Items           []Item                 `json:"items"`
+	Counts          map[AttentionLevel]int `json:"counts"`
+	Total           int                    `json:"total"`
+	Needing         int                    `json:"needing"`
+	ReadyCandidates int                    `json:"ready_candidates_needing_integration,omitempty"`
 }
 
 // urgencyRank maps a level to a numeric urgency (higher = more urgent).
@@ -254,6 +259,14 @@ func Triage(
 
 // Summary returns a one-line human-readable triage summary.
 func Summary(r Result) string {
+	if r.ReadyCandidates > 0 {
+		laneSummary := fmt.Sprintf("%d lane(s) scanned", r.Total)
+		if r.Needing > 0 {
+			laneSummary = fmt.Sprintf("%d of %d lane(s) also need eyes", r.Needing, r.Total)
+		}
+		return fmt.Sprintf("herd-attention: CRITICAL — %d canonically ready candidate(s) need integration; %s",
+			r.ReadyCandidates, laneSummary)
+	}
 	// FAC-604: scanning nothing is not a clean bill of health. When the standing
 	// roster resolves empty -- as it does whenever lane-registry.json parses with
 	// lanes but no standing flags, since that path never falls back to
@@ -527,6 +540,8 @@ func (r Result) MarshalJSON() ([]byte, error) {
 // nothing wrong.
 func attentionState(r Result) string {
 	switch {
+	case r.ReadyCandidates > 0:
+		return "ATTENTION"
 	case r.Total == 0:
 		return "UNKNOWN"
 	case r.Needing > 0:
