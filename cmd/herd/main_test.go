@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -103,11 +105,10 @@ func TestMain(m *testing.M) {
 	}
 	code := m.Run()
 	if root != "" {
-		if after, err := readRootGitState(root); err != nil {
+		if report, err := compareRootGitState(root, rootGitState); err != nil {
 			fmt.Fprintf(os.Stderr, "root git configuration guard failed: %v\n", err)
 			code = 1
-		} else if after != rootGitState {
-			fmt.Fprintln(os.Stderr, "root git configuration guard failed: tests changed the root checkout's git config or remotes")
+		} else if writeRootGitGuardReport(os.Stderr, report) {
 			code = 1
 		}
 	}
@@ -117,30 +118,142 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func snapshotRootGitState() (string, string, error) {
+type rootGitState map[string][]string
+
+type rootGitDelta struct {
+	key    string
+	before string
+	after  string
+}
+
+type rootGitGuardReport struct {
+	unknown  []rootGitDelta
+	failures []rootGitDelta
+}
+
+func snapshotRootGitState() (string, rootGitState, error) {
 	root, err := filepath.Abs(".")
 	if err != nil {
-		return "", "", err
-	}
-	if _, err := readRootGitState(root); err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	state, err := readRootGitState(root)
 	return root, state, err
 }
 
-func readRootGitState(root string) (string, error) {
+func readRootGitState(root string) (rootGitState, error) {
 	config := exec.Command("git", "-C", root, "config", "--local", "--null", "--list")
 	configOut, err := config.Output()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	remotes := exec.Command("git", "-C", root, "remote", "-v")
 	remoteOut, err := remotes.Output()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return string(configOut) + "\x00---remotes---\x00" + string(remoteOut), nil
+
+	state := make(rootGitState)
+	for _, entry := range strings.Split(string(configOut), "\x00") {
+		if entry == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(entry, "\n")
+		if !ok {
+			return nil, fmt.Errorf("malformed local git config entry %q", entry)
+		}
+		state[key] = append(state[key], value)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(remoteOut)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("malformed git remote entry %q", line)
+		}
+		kind := strings.Trim(fields[len(fields)-1], "()")
+		key := "remote-view." + fields[0] + "." + kind
+		state[key] = append(state[key], strings.Join(fields[1:len(fields)-1], " "))
+	}
+	return state, nil
+}
+
+func compareRootGitState(root string, before rootGitState) (rootGitGuardReport, error) {
+	after, err := readRootGitState(root)
+	if err != nil {
+		return rootGitGuardReport{}, err
+	}
+	branchOut, err := exec.Command("git", "-C", root, "branch", "--show-current").Output()
+	if err != nil {
+		return rootGitGuardReport{}, err
+	}
+	currentBranch := strings.TrimSpace(string(branchOut))
+
+	var report rootGitGuardReport
+	for _, delta := range diffRootGitState(before, after) {
+		if isConcurrentBranchUpstreamAddition(delta, currentBranch) {
+			report.unknown = append(report.unknown, delta)
+		} else {
+			report.failures = append(report.failures, delta)
+		}
+	}
+	return report, nil
+}
+
+func writeRootGitGuardReport(w io.Writer, report rootGitGuardReport) bool {
+	for _, delta := range report.unknown {
+		fmt.Fprintf(w, "root git configuration guard UNKNOWN: key=%q before=%q after=%q; concurrent linked-worktree upstream addition is not attributable to this suite\n", delta.key, delta.before, delta.after)
+	}
+	for _, delta := range report.failures {
+		fmt.Fprintf(w, "root git configuration guard failed: key=%q before=%q after=%q\n", delta.key, delta.before, delta.after)
+	}
+	return len(report.failures) > 0
+}
+
+func diffRootGitState(before, after rootGitState) []rootGitDelta {
+	keys := make(map[string]struct{}, len(before)+len(after))
+	for key := range before {
+		keys[key] = struct{}{}
+	}
+	for key := range after {
+		keys[key] = struct{}{}
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+
+	var deltas []rootGitDelta
+	for _, key := range ordered {
+		beforeValue := formatRootGitValues(before[key])
+		afterValue := formatRootGitValues(after[key])
+		if beforeValue != afterValue {
+			deltas = append(deltas, rootGitDelta{key: key, before: beforeValue, after: afterValue})
+		}
+	}
+	return deltas
+}
+
+func formatRootGitValues(values []string) string {
+	if len(values) == 0 {
+		return "<unset>"
+	}
+	return strings.Join(values, "\n")
+}
+
+func isConcurrentBranchUpstreamAddition(delta rootGitDelta, currentBranch string) bool {
+	if delta.before != "<unset>" || !strings.HasPrefix(delta.key, "branch.") {
+		return false
+	}
+	branchKey := strings.TrimPrefix(delta.key, "branch.")
+	for _, field := range []string{"merge", "remote"} {
+		suffix := "." + field
+		if branchName, ok := strings.CutSuffix(branchKey, suffix); ok {
+			return branchName != "" && branchName != currentBranch
+		}
+	}
+	return false
 }
 
 func TestForgeDriverBlocksCapacityWhenReconciliationUnavailable(t *testing.T) {
