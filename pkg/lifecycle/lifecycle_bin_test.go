@@ -54,3 +54,49 @@ func TestKaneoBinIgnoresNonExecutableRepositoryWrapper(t *testing.T) {
 		t.Fatalf("kaneo binary = %q, want PATH client %q", got, pathBin)
 	}
 }
+
+func TestKaneoListArgsUsesCurrentPATHClientShape(t *testing.T) {
+	repo := t.TempDir()
+	pathBin := filepath.Join(t.TempDir(), "kaneo")
+	if err := os.WriteFile(pathBin, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REPO_ROOT", repo)
+	t.Setenv("PATH", filepath.Dir(pathBin))
+
+	got := (&Engine{}).kaneoListArgs()
+	want := []string{"task", "list", "--json", "--all"}
+	if len(got) != len(want) {
+		t.Fatalf("kaneo list args = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("kaneo list args = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestKaneoListArgsPreservesRepositoryWrapperShape(t *testing.T) {
+	repo := t.TempDir()
+	pathBin := filepath.Join(t.TempDir(), "kaneo")
+	if err := os.WriteFile(pathBin, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(repo, "bin", "herd-kaneo")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_REPO_ROOT", repo)
+	t.Setenv("PATH", filepath.Dir(pathBin))
+
+	got := (&Engine{}).kaneoListArgs()
+	if len(got) < 2 || got[0] != "list" || got[1] != "--fields" {
+		t.Fatalf("kaneo list args = %q, want legacy wrapper shape", got)
+	}
+}
