@@ -58,17 +58,63 @@ func (b *BoundClient) wrap(op string, kind OpKind, err error) error {
 	if err == nil {
 		return nil
 	}
+	original := err
+	var wrapped error
 	// Preserve AmbiguousMutationError before AsTimeout (which would surface the
 	// nested TimeoutError and drop the ambiguous classification).
 	if IsAmbiguous(err) {
-		return fmt.Errorf("%s: BLOCKED(provider_timeout): %w", op, err)
+		wrapped = fmt.Errorf("%s: BLOCKED(provider_timeout): %w", op, err)
+	} else {
+		err = AsTimeout(b.providerName(), op, kind, b.deadlines().For(kind), err)
+		class := ClassifyOpError(err)
+		if class == OpTimeout || class == OpAmbiguous {
+			wrapped = fmt.Errorf("%s: BLOCKED(provider_timeout): %w", op, err)
+		} else {
+			wrapped = fmt.Errorf("%s: %w", op, err)
+		}
 	}
-	err = AsTimeout("provider", op, kind, b.deadlines().For(kind), err)
-	class := ClassifyOpError(err)
-	if class == OpTimeout || class == OpAmbiguous {
-		return fmt.Errorf("%s: BLOCKED(provider_timeout): %w", op, err)
+
+	// Reads are evidence acquisition, not semantic decisions. Any failed read
+	// leaves the truth UNKNOWN and carries the same bounded structured fields
+	// regardless of which shipped CLI consumer called it. Mutation errors keep
+	// their existing authority/classification path unchanged.
+	if kind == OpGet || kind == OpList {
+		outcome := ReadFailed
+		if IsTimeout(original) || IsAmbiguous(original) {
+			outcome = ReadTimedOut
+		}
+		diag := ReadDiagnostics{
+			Provider: b.providerName(),
+			Phase:    op,
+			Budget:   b.deadlines().For(kind),
+			Outcome:  outcome,
+			Err:      original.Error(),
+		}
+		return fmt.Errorf("%s: %w", diag.String(), wrapped)
 	}
-	return fmt.Errorf("%s: %w", op, err)
+	return wrapped
+}
+
+func (b *BoundClient) providerName() string {
+	if b == nil {
+		return "task-provider"
+	}
+	switch UnwrapTaskProvider(b).(type) {
+	case *KaneoProvider:
+		return "kaneo"
+	case *LinearProvider:
+		return "linear"
+	case *GitHubProvider:
+		return "github"
+	case *JiraProvider:
+		return "jira"
+	case *AzureDevOpsProvider:
+		return "azure-devops"
+	case *MemoryProvider:
+		return "memory"
+	default:
+		return "task-provider"
+	}
 }
 
 func (b *BoundClient) GetTask(ctx context.Context, id string) (*Task, error) {

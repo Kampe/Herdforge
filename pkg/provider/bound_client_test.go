@@ -48,11 +48,42 @@ func TestBoundClient_ListTimeout_NeverEmptySuccess(t *testing.T) {
 	if !strings.Contains(err.Error(), "BLOCKED(provider_timeout)") {
 		t.Fatalf("want BLOCKED label: %v", err)
 	}
+	for _, want := range []string{
+		`"provider":"task-provider"`,
+		`"phase":"ListTasks"`,
+		`"applied_deadline":"40ms"`,
+		`"last_successful_cache_revision":"none"`,
+		`"outcome":"timed-out"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("structured diagnostics omit %q: %v", want, err)
+		}
+	}
 	if ClassifyOpError(err) != OpTimeout {
 		t.Fatalf("class=%q", ClassifyOpError(err))
 	}
 	if inner.lists.Load() != 1 {
 		t.Fatalf("lists=%d", inner.lists.Load())
+	}
+}
+
+func TestBoundClient_ReadFailureIsStructuredUnknown(t *testing.T) {
+	bc := NewBoundClient(&staticInner{}, Deadlines{Get: 2 * time.Second})
+	_, err := bc.GetTask(context.Background(), "FAC-607")
+	if err == nil {
+		t.Fatal("provider failure returned success")
+	}
+	for _, want := range []string{
+		"UNKNOWN, not an empty or clean result",
+		`"provider":"task-provider"`,
+		`"phase":"GetTask"`,
+		`"applied_deadline":"2s"`,
+		`"last_successful_cache_revision":"none"`,
+		`"outcome":"failed"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("structured diagnostics omit %q: %v", want, err)
+		}
 	}
 }
 

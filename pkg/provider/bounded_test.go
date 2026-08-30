@@ -80,7 +80,7 @@ func TestDiagnosticsAreNeverSilent(t *testing.T) {
 		if strings.TrimSpace(diag.String()) == "" {
 			t.Fatalf("%s produced an empty diagnostic line", name)
 		}
-		if !strings.Contains(diag.String(), "provider=kaneo") {
+		if !strings.Contains(diag.String(), `"provider":"kaneo"`) {
 			t.Fatalf("%s diagnostics do not name the provider: %s", name, diag.String())
 		}
 	}

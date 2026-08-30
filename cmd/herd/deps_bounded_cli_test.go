@@ -11,28 +11,13 @@ import (
 	"testing"
 )
 
-// FAC-607: the reported symptom was rc=124 with ZERO stdout from `herd deps
-// check`. This runs the REAL binary and asserts on what an operator sees.
-//
-// SCOPE, stated honestly. This proves the command never exits silently on a
-// failed read. It does NOT yet reach provider.BoundedRead: `herd deps check`
-// first requires a git repo, a valid config, and a provider claim stack
-// (.herd/claim/fences.db), and this fixture stops at the last of those. So the
-// wiring of BoundedRead into runDepsCheck is covered by the diff and by
-// pkg/provider's own tests, NOT by an end-to-end CLI assertion.
-//
-// That limitation is named rather than papered over because FAC-602 shipped an
-// exemption its own tests proved and the CLI never executed. A test whose title
-// implies more than it checks is how that happened. Closing this gap needs a
-// CLI-reachable provider fixture and is tracked as residual on the card.
-
-func TestDepsCheckIsNeverSilentOnAFailedRead(t *testing.T) {
+// FAC-607: this is the named real-CLI regression for the incident. The Kaneo
+// fixture accepts the request and then stops answering, so the command must
+// beat an external rc=124 kill with its own UNKNOWN diagnostic.
+func TestFAC607DepsCheckTimeoutEmitsStructuredDiagnostics(t *testing.T) {
 	binary := buildHerd(t)
+	server := newDepsCheckKaneoServer(t, false, true)
 	repo := t.TempDir()
-
-	// A config pointing at a provider endpoint that accepts the connection and
-	// never answers would need a live socket; pointing at an unroutable address
-	// gets the same shape -- the read cannot complete within its budget.
 	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"commit", "-q", "--allow-empty", "-m", "base"}} {
 		c := exec.Command("git", append([]string{"-C", repo}, args...)...)
 		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
@@ -51,32 +36,40 @@ func TestDepsCheckIsNeverSilentOnAFailedRead(t *testing.T) {
 		"project:\n  name: bounded-read-probe\n" +
 		"task_provider:\n" +
 		"  type: kaneo\n" +
-		"  project_id: probe\n" +
-		"  base_url: http://127.0.0.1:9\n" // discard port: connections hang or refuse
+		"  project_id: proj-deps\n" +
+		"  api_url: " + server.URL + "\n"
 	if err := os.WriteFile(filepath.Join(herdDir, "herd.yaml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(binary, "deps", "check", "FAC-1")
-	cmd.Dir = repo
-	cmd.Env = append(os.Environ(),
+	keyDir := t.TempDir()
+	provisionFence(t, binary, repo, keyDir)
+	cmd := herdCmd(binary, repo, keyDir, "deps", "check", "FAC-607")
+	cmd.Env = append(cmd.Env,
 		"HERD_ROOT="+repo,
 		"HERD_REPO_ROOT="+repo,
-		// Short budget so the test is fast; the property under test is that the
-		// command reports rather than dying mute, not the specific duration.
-		"HERD_PROVIDER_READ_BUDGET=2s",
+		"HERD_PROVIDER_READ_BUDGET=50ms",
+		"KANEO_API_KEY=deps-check-test-key",
+		"KANEO_API_URL="+server.URL,
 	)
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 	text := string(out)
-
-	if strings.TrimSpace(text) == "" {
-		t.Fatal("herd deps check produced ZERO output on an unreachable provider; " +
-			"that is exactly the rc=124 silence FAC-607 exists to prevent")
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 3 {
+		t.Fatalf("exit = %v, want UNKNOWN exit 3\n%s", err, text)
 	}
-
-	// The command may legitimately fail earlier than the bounded read (config or
-	// provider construction). What it may never do is exit silently.
-	t.Logf("observed output:\n%s", text)
+	for _, want := range []string{
+		"UNKNOWN FAC-607",
+		`"provider":"kaneo"`,
+		`"phase":"GetTask FAC-607"`,
+		`"applied_deadline":"50ms"`,
+		`"last_successful_cache_revision":"none"`,
+		`"outcome":"timed-out"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("structured timeout diagnostic omits %q:\n%s", want, text)
+		}
+	}
 }
 
 func TestDepsCheckClassifiesSemanticBlockerSeparatelyFromProviderFailure(t *testing.T) {
@@ -115,7 +108,7 @@ func TestDepsCheckClassifiesSemanticBlockerSeparatelyFromProviderFailure(t *test
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := newDepsCheckKaneoServer(t, tt.failProviderGet)
+			server := newDepsCheckKaneoServer(t, tt.failProviderGet, false)
 			repo := t.TempDir()
 			for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"commit", "-q", "--allow-empty", "-m", "base"}} {
 				c := exec.Command("git", append([]string{"-C", repo}, args...)...)
@@ -178,7 +171,7 @@ func TestDepsCheckClassifiesSemanticBlockerSeparatelyFromProviderFailure(t *test
 	}
 }
 
-func newDepsCheckKaneoServer(t *testing.T, failProviderGet bool) *httptest.Server {
+func newDepsCheckKaneoServer(t *testing.T, failProviderGet, hangProviderGet bool) *httptest.Server {
 	t.Helper()
 	edge := `{"source_ref":"FAC-643","target_ref":"FAC-639","type":"blocks"}`
 	targetDescription := "```herd-deps-v1\n" +
@@ -206,6 +199,10 @@ func newDepsCheckKaneoServer(t *testing.T, failProviderGet bool) *httptest.Serve
 	})
 	mux.HandleFunc("/api/task/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if hangProviderGet {
+			<-r.Context().Done()
+			return
+		}
 		if failProviderGet {
 			http.Error(w, `{"error":"provider unavailable"}`, http.StatusServiceUnavailable)
 			return

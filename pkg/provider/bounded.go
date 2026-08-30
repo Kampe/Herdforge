@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -59,17 +60,35 @@ func (d ReadDiagnostics) Unknown() bool {
 
 // String is the one line an operator sees instead of silence.
 func (d ReadDiagnostics) String() string {
+	lastRevision := strings.TrimSpace(d.LastRevision)
+	if lastRevision == "" {
+		lastRevision = "none"
+	}
+	structured, err := json.Marshal(struct {
+		Provider                    string      `json:"provider"`
+		Phase                       string      `json:"phase"`
+		AppliedDeadline             string      `json:"applied_deadline"`
+		Elapsed                     string      `json:"elapsed"`
+		LastSuccessfulCacheRevision string      `json:"last_successful_cache_revision"`
+		Outcome                     ReadOutcome `json:"outcome"`
+		Error                       string      `json:"error,omitempty"`
+	}{
+		Provider:                    d.Provider,
+		Phase:                       d.Phase,
+		AppliedDeadline:             d.Budget.String(),
+		Elapsed:                     d.Elapsed.Round(time.Millisecond).String(),
+		LastSuccessfulCacheRevision: lastRevision,
+		Outcome:                     d.Outcome,
+		Error:                       d.Err,
+	})
+	if err != nil {
+		// The view contains only strings and a string-backed enum, so this is a
+		// defensive fallback rather than an expected path. It must still speak.
+		structured = []byte(`{"provider":"unknown","phase":"diagnostic-encoding","applied_deadline":"unknown","last_successful_cache_revision":"none","outcome":"failed"}`)
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "provider read %s: provider=%s phase=%q budget=%s elapsed=%s",
-		d.Outcome, d.Provider, d.Phase, d.Budget, d.Elapsed.Round(time.Millisecond))
-	if d.LastRevision != "" {
-		fmt.Fprintf(&b, " last-successful-cache-revision=%s", d.LastRevision)
-	} else {
-		b.WriteString(" last-successful-cache-revision=none")
-	}
-	if d.Err != "" {
-		fmt.Fprintf(&b, " error=%q", d.Err)
-	}
+	fmt.Fprintf(&b, "provider read %s: %s", d.Outcome, structured)
 	if d.Unknown() {
 		b.WriteString("; this is UNKNOWN, not an empty or clean result -- do not infer clean state from it")
 	}
