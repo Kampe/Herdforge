@@ -106,7 +106,7 @@ func runReviewIngest() {
 			fmt.Println("herd review-ingest: sweep found no uningested verdicts (inbox is drained)")
 			return
 		}
-		fmt.Fprintln(os.Stderr, "usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run]")
+		fmt.Fprintln(os.Stderr, reviewIngestUsage)
 		os.Exit(2)
 	}
 
@@ -153,6 +153,13 @@ func runReviewIngest() {
 			continue
 		}
 		a := reviewingest.Parse(string(body))
+		// Historical re-resolution never treats the artifact header as builder
+		// provenance. The durable launch receipt is the only source permitted to
+		// supersede an unrecorded row; without one, keep the family honestly
+		// unrecorded so validation cannot mistake an assertion for evidence.
+		if parsed.reresolveProvenance {
+			a.BuilderFamily = ""
+		}
 		// FAC-620: reconcile the CLAIMED builder family against recorded launch
 		// provenance BEFORE Validate and before anything reaches the ledger.
 		//
@@ -172,6 +179,9 @@ func runReviewIngest() {
 			emit.refused(f, err)
 			refused++
 			continue
+		}
+		if parsed.reresolveProvenance && !proven {
+			a.BuilderFamily = reviewledger.FamilyUnrecorded
 		}
 		if err := a.Validate(coordinators, commitExists); err != nil {
 			emit.refused(f, err)
@@ -317,6 +327,38 @@ func runReviewIngest() {
 			Reviewer: a.Reviewer, ReviewerFamily: a.ReviewerFamily,
 			BuilderFamily: a.BuilderFamily, Verdict: a.Verdict, Gate: gate,
 		}
+		if parsed.reresolveProvenance {
+			if decision != reviewIngestSkipDuplicate {
+				emit.refused(f, fmt.Errorf("provenance re-resolution refused: admission_condition=historical_verdict observed duplicate_verdict=false sha=%q reviewer=%q",
+					a.SHA, a.Reviewer))
+				refused++
+				continue
+			}
+			resolution, resolveErr := ledger.ReResolveLaunchProvenance(reviewledger.LaunchProvenanceResolutionOpts{
+				SHA: a.SHA, Reviewer: a.Reviewer, ReceiptPath: receiptPath,
+				CommitTime: commitCreationTime(a.SHA),
+				Reaches:    func(branch string) bool { return branchReachesSHA(branch, a.SHA) },
+				Apply:      !parsed.dryRun,
+			})
+			if resolveErr != nil {
+				emit.refused(f, resolveErr)
+				refused++
+				continue
+			}
+			o := base
+			o.BuilderFamily = resolution.ResolvedFamily
+			if parsed.dryRun {
+				o.Disposition = "would_reresolve_provenance"
+				emit.record(o, fmt.Sprintf("WOULD_RERESOLVE_PROVENANCE %s reviewer=%s sha=%s builder_family=%s append=%v idempotent=%v\n",
+					filepath.Base(f), a.Reviewer, a.SHA[:12], resolution.ResolvedFamily, resolution.WouldAppend, resolution.Idempotent), false)
+			} else {
+				o.Disposition = "provenance_reresolved"
+				emit.record(o, fmt.Sprintf("RERESOLVED_PROVENANCE %s reviewer=%s sha=%s builder_family=%s appended=%v readback=%v idempotent=%v\n",
+					filepath.Base(f), a.Reviewer, a.SHA[:12], resolution.ResolvedFamily, resolution.Appended, resolution.ReadbackVerified, resolution.Idempotent), false)
+			}
+			admitted++
+			continue
+		}
 		if parsed.dryRun {
 			if decision == reviewIngestSkipDuplicate {
 				o := base
@@ -436,8 +478,11 @@ type reviewIngestArgs struct {
 	ledgerPath string
 	files      []string
 	// asJSON emits structured outcomes instead of prose (FAC-556).
-	asJSON bool
+	asJSON              bool
+	reresolveProvenance bool
 }
+
+const reviewIngestUsage = "usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run] [--json] [--reresolve-provenance]"
 
 // parseReviewIngestArgs parses flags independently of positional artifacts.
 // flag.FlagSet stops at the first positional argument, so using it directly
@@ -465,6 +510,8 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 			parsed.asJSON = true
 		case arg == "--dry-run" || arg == "-dry-run":
 			parsed.dryRun = true
+		case arg == "--reresolve-provenance" || arg == "-reresolve-provenance":
+			parsed.reresolveProvenance = true
 		case arg == "--sweep" || arg == "-sweep":
 			parsed.sweep = true
 		case arg == "--audit" || arg == "-audit":
@@ -495,6 +542,9 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 	if parsed.sweep && len(parsed.files) != 0 {
 		return reviewIngestArgs{}, fmt.Errorf("--sweep discovers artifacts itself; do not also name them")
 	}
+	if parsed.sweep && parsed.reresolveProvenance {
+		return reviewIngestArgs{}, fmt.Errorf("--reresolve-provenance requires explicit historical artifacts; --sweep omits already-ingested verdicts")
+	}
 	if parsed.sweep {
 		found, err := sweepUningestedArtifacts(parsed.auditRoot, parsed.ledgerPath)
 		if err != nil {
@@ -509,11 +559,14 @@ func parseReviewIngestArgs(args []string) (reviewIngestArgs, error) {
 	if parsed.audit && parsed.dryRun {
 		return reviewIngestArgs{}, fmt.Errorf("--audit and --dry-run are mutually exclusive")
 	}
+	if parsed.audit && parsed.reresolveProvenance {
+		return reviewIngestArgs{}, fmt.Errorf("--audit and --reresolve-provenance are mutually exclusive")
+	}
 	if parsed.audit && len(parsed.files) != 0 {
 		return reviewIngestArgs{}, fmt.Errorf("--audit cannot be combined with verdict artifacts")
 	}
 	if !parsed.audit && len(parsed.files) == 0 {
-		return reviewIngestArgs{}, fmt.Errorf("usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run]")
+		return reviewIngestArgs{}, fmt.Errorf("%s", reviewIngestUsage)
 	}
 	return parsed, nil
 }
@@ -692,6 +745,7 @@ type reviewIngestLedger interface {
 	// FAC-620: the corroboration an asserted builder-family needs when no
 	// launch receipt reaches the commit.
 	ProvenBuilderFamily(string) (string, error)
+	ReResolveLaunchProvenance(reviewledger.LaunchProvenanceResolutionOpts) (reviewledger.LaunchProvenanceResolution, error)
 }
 
 type reviewIngestDecision string

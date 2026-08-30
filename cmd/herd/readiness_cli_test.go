@@ -27,7 +27,8 @@ func TestReadinessCLI_ExitsNonZeroWhenAnyCandidateIsBlocked(t *testing.T) {
 	}
 	pass := strings.Repeat("a", 40)
 	fail := strings.Repeat("b", 40)
-	rows := `{"event":"verdict","sha":"` + pass + `","reviewer":"r1","verdict":"PASS","builder_family":"xai"}` + "\n" +
+	rows := `{"event":"record","sha":"` + pass + `","reviewer":"r1","builder_family":"anthropic","reviewer_family":"xai","tier":"R3"}` + "\n" +
+		`{"event":"verdict","sha":"` + pass + `","reviewer":"r1","verdict":"PASS","builder_family":"anthropic","reviewer_family":"xai","verification_digest":"digest"}` + "\n" +
 		`{"event":"verdict","sha":"` + fail + `","reviewer":"r2","verdict":"FAIL","builder_family":"xai"}` + "\n"
 	if err := os.WriteFile(filepath.Join(root, ".herd", "review-ledger.jsonl"), []byte(rows), 0o600); err != nil {
 		t.Fatal(err)

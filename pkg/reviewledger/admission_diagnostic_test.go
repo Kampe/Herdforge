@@ -158,3 +158,270 @@ func TestRefusalDistinguishesNoVerdictAtAll(t *testing.T) {
 		t.Fatalf("refusal does not distinguish an absent verdict from a disqualified one.\nGot: %s", res.Reason)
 	}
 }
+
+// Every reduced-admission refusal must identify the failed condition and only
+// the safe observed values needed to act on it. This drives AdmitReduced itself
+// so a formatter that is never called cannot satisfy the regression.
+func TestReducedAdmissionNamesEveryRefusalConditionAndObservedValue(t *testing.T) {
+	tests := []struct {
+		name string
+		rows []map[string]any
+		want []string
+	}{
+		{
+			name: "no launch rows",
+			rows: []map[string]any{verdictRow(nil)},
+			want: []string{"admission_condition=launch_record", "launch_rows=0"},
+		},
+		{
+			name: "no matching launch row",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"reviewer": "other", "tier": "R3"}),
+				verdictRow(nil),
+			},
+			want: []string{"condition=launch_record", "launch_record_present=false", `reviewer="rv"`},
+		},
+		{
+			name: "empty builder family",
+			rows: []map[string]any{record("", map[string]any{"tier": "R3"}), verdictRow(nil)},
+			want: []string{"condition=builder_family", `builder_family=""`},
+		},
+		{
+			name: "unallowlisted builder family",
+			rows: []map[string]any{record(FamilyUnrecorded, map[string]any{"tier": "R3"}), verdictRow(nil)},
+			want: []string{"condition=builder_family", `builder_family="unrecorded"`, "allowlisted=false"},
+		},
+		{
+			name: "reviewer family conflict",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3", "reviewer_family": "xai"}),
+				verdictRow(map[string]any{"reviewer_family": "openai"}),
+			},
+			want: []string{"condition=reviewer_family", "reviewer_family_state=conflict", `launch_reviewer_family="xai"`, `verdict_reviewer_family="openai"`},
+		},
+		{
+			name: "builder family conflict",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3"}),
+				verdictRow(map[string]any{"builder_family": "openai"}),
+			},
+			want: []string{"condition=reviewer_family", "reviewer_family_state=conflict", `launch_builder_family="anthropic"`, `verdict_builder_family="openai"`},
+		},
+		{
+			name: "reviewer family unset",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3", "reviewer_family": ""}),
+				verdictRow(map[string]any{"reviewer_family": ""}),
+			},
+			want: []string{"condition=reviewer_family", "reviewer_family_state=unset", `reviewer_family=""`},
+		},
+		{
+			name: "same family",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3", "reviewer_family": "anthropic"}),
+				verdictRow(map[string]any{"reviewer_family": "anthropic"}),
+			},
+			want: []string{"condition=family_independence", `reviewer_family="anthropic"`, `builder_family="anthropic"`, "independent=false"},
+		},
+		{
+			name: "reviewer family not allowlisted",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3", "reviewer_family": "unknown"}),
+				verdictRow(map[string]any{"reviewer_family": "unknown"}),
+			},
+			want: []string{"condition=reviewer_family", `reviewer_family="unknown"`, "allowlisted=false"},
+		},
+		{
+			name: "empty reviewer identity",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"reviewer": "", "tier": "R3"}),
+				verdictRow(map[string]any{"reviewer": ""}),
+			},
+			want: []string{"condition=reviewer_identity", `reviewer=""`},
+		},
+		{
+			name: "reviewer equals builder identity",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3", "builder_identity": "rv"}),
+				verdictRow(nil),
+			},
+			want: []string{"condition=identity_independence", `reviewer="rv"`, "builder_identity_match=true", "independent=false"},
+		},
+		{
+			name: "empty verification digest",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"tier": "R3"}),
+				verdictRow(map[string]any{"verification_digest": ""}),
+			},
+			want: []string{"condition=verification_digest", `verification_digest=""`},
+		},
+		{
+			name: "empty risk tier",
+			rows: []map[string]any{record("anthropic", nil), verdictRow(nil)},
+			want: []string{"condition=risk_tier", `risk_tier=""`},
+		},
+		{
+			name: "coordinator reviewer",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"reviewer": "coordinator", "tier": "R3"}),
+				verdictRow(map[string]any{"reviewer": "coordinator"}),
+			},
+			want: []string{"condition=reviewer_authority", `reviewer="coordinator"`, "coordinator=true", "independent=false"},
+		},
+		{
+			name: "non pass verdict",
+			rows: []map[string]any{
+				record("anthropic", map[string]any{"reviewer": "coordinator", "tier": "R3"}),
+				verdictRow(map[string]any{"reviewer": "coordinator", "verdict": "FAIL"}),
+			},
+			want: []string{"condition=verdict", `verdict="FAIL"`, `required="PASS"`},
+		},
+		{
+			name: "no verdict rows",
+			rows: []map[string]any{record("anthropic", map[string]any{"tier": "R3"})},
+			want: []string{"admission_condition=verdict", "verdict_rows=0"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := diagLedger(t, tc.rows...)
+			res, err := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+			if err == nil || res == nil || res.Admitted {
+				t.Fatalf("expected refusal, got result=%+v err=%v", res, err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(res.Reason, want) {
+					t.Errorf("reason %q does not contain %q", res.Reason, want)
+				}
+			}
+		})
+	}
+}
+
+func TestReducedAdmissionNamesEarlyRefusalConditions(t *testing.T) {
+	t.Run("candidate sha", func(t *testing.T) {
+		l := diagLedger(t, record("anthropic", map[string]any{"tier": "R3"}))
+		res, err := l.AdmitReduced(ReducedAdmissionOpts{})
+		if err == nil || res == nil || !strings.Contains(res.Reason, `admission_condition=candidate_sha observed candidate_sha=""`) {
+			t.Fatalf("result=%+v err=%v", res, err)
+		}
+	})
+
+	t.Run("consumed", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := NewReviewLedger(dir, DefaultPath(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Record(RecordOpts{SHA: diagSHA, Reviewer: "rv", BuilderFamily: "anthropic", ReviewerFamily: "xai", Tier: "R3"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := l.Verdict(VerdictOpts{SHA: diagSHA, Reviewer: "rv", Verdict: VerdictPASS, BuilderFamily: "anthropic", ReviewerFamily: "xai", VfyDigest: "digest"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Consumed(diagSHA, "merged-sha"); err != nil {
+			t.Fatal(err)
+		}
+		res, err := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+		if err == nil || res == nil || !strings.Contains(res.Reason, "admission_condition=consumption observed consumed=true") {
+			t.Fatalf("result=%+v err=%v", res, err)
+		}
+	})
+
+	t.Run("veto", func(t *testing.T) {
+		l := diagLedger(t,
+			record("anthropic", map[string]any{"tier": "R3"}),
+			verdictRow(map[string]any{"verdict": "BLOCKED"}),
+		)
+		res, err := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+		if err == nil || res == nil {
+			t.Fatalf("result=%+v err=%v", res, err)
+		}
+		for _, want := range []string{"admission_condition=veto", `verdict="BLOCKED"`, "superseded=false"} {
+			if !strings.Contains(res.Reason, want) {
+				t.Errorf("reason %q does not contain %q", res.Reason, want)
+			}
+		}
+	})
+}
+
+func TestReducedAdmissionReadFailuresNameTheEvidenceSource(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakAt func(t *testing.T, l *Ledger)
+		want    string
+	}{
+		{
+			name: "ledger",
+			breakAt: func(t *testing.T, l *Ledger) {
+				t.Helper()
+				if err := os.Remove(l.Path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(l.Path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "admission_condition=review_ledger observed ledger_readable=false",
+		},
+		{
+			name: "queue",
+			breakAt: func(t *testing.T, l *Ledger) {
+				t.Helper()
+				if err := os.Mkdir(l.QueuePath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "admission_condition=admission_queue observed queue_readable=false",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := diagLedger(t, record("anthropic", map[string]any{"tier": "R3"}), verdictRow(nil))
+			tc.breakAt(t, l)
+			res, err := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+			if err == nil || res != nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("result=%+v err=%v, want %q", res, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestReducedAdmissionDiagnosticsDoNotExposeSecretBearingFields(t *testing.T) {
+	const diagnosticFieldSentinel = "fac630-secret-sentinel"
+	l := diagLedger(t,
+		record("anthropic", map[string]any{
+			"artifact": diagnosticFieldSentinel, "lease": diagnosticFieldSentinel, "patch_url": diagnosticFieldSentinel,
+			"pid": diagnosticFieldSentinel, "tier": "R3",
+		}),
+		verdictRow(map[string]any{"verification_digest": ""}),
+	)
+	res, _ := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+	if res == nil {
+		t.Fatal("no result")
+	}
+	if strings.Contains(res.Reason, diagnosticFieldSentinel) {
+		t.Fatalf("refusal leaked a secret-bearing field: %q", res.Reason)
+	}
+}
+
+func TestReducedAdmissionVetoAlwaysOutranksAnIndependentPass(t *testing.T) {
+	rows := []map[string]any{
+		record("anthropic", map[string]any{"reviewer": "pass-reviewer", "tier": "R3"}),
+		verdictRow(map[string]any{"reviewer": "pass-reviewer"}),
+		record("anthropic", map[string]any{"reviewer": "veto-reviewer", "tier": "R3"}),
+		verdictRow(map[string]any{"reviewer": "veto-reviewer", "verdict": "BLOCKED"}),
+	}
+	for i := 0; i < 100; i++ {
+		l := diagLedger(t, rows...)
+		res, err := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+		if err == nil || res == nil || res.Admitted {
+			t.Fatalf("iteration %d: veto did not refuse: result=%+v err=%v", i, res, err)
+		}
+		for _, want := range []string{"admission_condition=veto", `verdict="BLOCKED"`, `reviewer="veto-reviewer"`} {
+			if !strings.Contains(res.Reason, want) {
+				t.Fatalf("iteration %d: reason %q does not contain %q", i, res.Reason, want)
+			}
+		}
+	}
+}

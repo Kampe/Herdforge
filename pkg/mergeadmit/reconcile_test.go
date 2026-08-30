@@ -222,3 +222,60 @@ func TestReconcileLandedReducedProvenanceRefusesMissingMinimum(t *testing.T) {
 		})
 	}
 }
+
+// This is the shipped receipt-reconcile path, not a diagnostic formatter. A
+// regression that restores the old generic refusal makes these assertions RED.
+func TestReconcileLandedReducedNamesExactAdmissionCondition(t *testing.T) {
+	sha := strings.Repeat("d", 40)
+	for _, tc := range []struct {
+		name          string
+		builderFamily string
+		gate          string
+		digest        string
+		want          []string
+	}{
+		{
+			name:          "historical unrecorded launch family",
+			builderFamily: reviewledger.FamilyUnrecorded,
+			gate:          reviewledger.GateProvenanceUnrecorded,
+			digest:        "2344575ebd590030e9c06cfd230e1896",
+			want:          []string{"condition=builder_family", `builder_family="unrecorded"`, "allowlisted=false"},
+		},
+		{
+			name:          "missing verification digest",
+			builderFamily: "anthropic",
+			gate:          "independent",
+			want:          []string{"condition=verification_digest", `verification_digest=""`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			l := newLedger(t, dir)
+			if err := l.Record(reviewledger.RecordOpts{
+				SHA: sha, Reviewer: "reviewer-a", BuilderFamily: tc.builderFamily,
+				ReviewerFamily: "xai", Gate: tc.gate, Tier: "R3",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.Verdict(reviewledger.VerdictOpts{
+				SHA: sha, Reviewer: "reviewer-a", Verdict: reviewledger.VerdictPASS,
+				BuilderFamily: "anthropic", ReviewerFamily: "xai", VfyDigest: tc.digest,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy()}
+			_, err := g.ReconcileLanded(Request{
+				Ref: testRef, CandidateSHA: sha, BaseSHA: strings.Repeat("b", 40),
+				ReducedProvenance: &ReducedProvenance{PullRequest: 630, VerifyLanded: true},
+			})
+			if err == nil {
+				t.Fatal("receipt reconcile unexpectedly admitted the incomplete evidence")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("reconcile refusal %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}

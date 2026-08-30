@@ -41,40 +41,102 @@ type AdmissionResult struct {
 
 type ReducedAdmissionOpts struct{ CandidateSHA string }
 
+// reducedAdmissionEvidence is one immutable ledger/queue observation. Reduced
+// admission and merge readiness both evaluate this exact shape rather than
+// independently selecting different rows for the same candidate.
+type reducedAdmissionEvidence struct {
+	RequestedSHA string
+	CandidateSHA string
+	MatchingSHAs []string
+	Rows         []LedgerRow
+	QueueRows    []LedgerRow
+}
+
+type reducedAdmissionPolicy struct {
+	// allowUnrecordedProvenance preserves FAC-668's explicit operator choice.
+	// It relaxes only the builder-family proof; all digest, tier, reviewer,
+	// identity, veto, and exactly-once gates remain active.
+	allowUnrecordedProvenance bool
+}
+
 // AdmitReduced preserves exact-SHA and independent-review evidence for
 // legacy verdicts that predate lease and patch bindings. It never fabricates
 // those absent fields and is separate from the full Admit gate.
 func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, error) {
-	if opts.CandidateSHA == "" {
-		return reject("", "candidate sha required")
-	}
-	sha := l.NormalizeSHA(opts.CandidateSHA)
-	rows, err := readRows(l.Path)
+	evidence, err := l.loadReducedAdmissionEvidence(opts.CandidateSHA)
 	if err != nil {
 		return nil, err
+	}
+	return l.admitReducedEvidence(evidence, reducedAdmissionPolicy{})
+}
+
+func (l *Ledger) loadReducedAdmissionEvidence(candidateSHA string) (reducedAdmissionEvidence, error) {
+	requested := strings.TrimSpace(candidateSHA)
+	evidence := reducedAdmissionEvidence{RequestedSHA: requested}
+	if requested == "" {
+		return evidence, nil
+	}
+	evidence.CandidateSHA = l.NormalizeSHA(requested)
+
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return evidence, fmt.Errorf("load reduced admission evidence: admission_condition=review_ledger observed ledger_readable=false: %w", err)
 	}
 	qrows, err := readRows(l.QueuePath)
 	if err != nil {
-		return nil, err
+		return evidence, fmt.Errorf("load reduced admission evidence: admission_condition=admission_queue observed queue_readable=false: %w", err)
 	}
-	for _, row := range qrows {
-		if row.Event == string(EventConsumed) && row.SHA == sha {
-			return reject(sha, "candidate already consumed (exactly-once admission spent)")
+	evidence.Rows = rows
+	evidence.QueueRows = qrows
+
+	matches := make(map[string]struct{})
+	for _, row := range rows {
+		if row.Event != string(EventRecord) && row.Event != string(EventVerdict) {
+			continue
+		}
+		if shaMatches(row.SHA, evidence.CandidateSHA) {
+			matches[row.SHA] = struct{}{}
 		}
 	}
-	launch := map[string]LedgerRow{}
-	for _, r := range rows {
-		if r.Event == string(EventRecord) && r.SHA == sha {
-			launch[r.SHA+":"+r.Reviewer] = r
+	for sha := range matches {
+		evidence.MatchingSHAs = append(evidence.MatchingSHAs, sha)
+	}
+	sort.Strings(evidence.MatchingSHAs)
+	if len(evidence.MatchingSHAs) == 1 {
+		evidence.CandidateSHA = evidence.MatchingSHAs[0]
+	}
+	return evidence, nil
+}
+
+// admitReducedEvidence is the single reduced-admission predicate. It performs
+// no reads and mutates neither the snapshot nor ledger state.
+func (l *Ledger) admitReducedEvidence(evidence reducedAdmissionEvidence, policy reducedAdmissionPolicy) (*AdmissionResult, error) {
+	if evidence.RequestedSHA == "" {
+		return reject("", `admission_condition=candidate_sha observed candidate_sha="" required=true`)
+	}
+	sha := evidence.CandidateSHA
+	if len(evidence.MatchingSHAs) > 1 {
+		return reject(sha, fmt.Sprintf("admission_condition=candidate_sha observed candidate_sha=%q ambiguous=true matching_shas=%q",
+			evidence.RequestedSHA, evidence.MatchingSHAs))
+	}
+	for _, row := range evidence.QueueRows {
+		if row.Event == string(EventConsumed) && shaMatches(row.SHA, sha) {
+			return reject(sha, "admission_condition=consumption observed consumed=true (exactly-once admission spent)")
+		}
+	}
+	launch := make(map[string]LedgerRow)
+	for _, row := range evidence.Rows {
+		if row.Event == string(EventRecord) && shaMatches(row.SHA, sha) {
+			launch[strings.TrimSpace(row.Reviewer)] = row
 		}
 	}
 	if len(launch) == 0 {
-		return reject(sha, "no launch record for exact candidate sha")
+		return reject(sha, "admission_condition=launch_record observed launch_rows=0 for exact candidate sha")
 	}
-	latest := map[string]LedgerRow{}
-	for _, r := range rows {
-		if r.Event == string(EventVerdict) && r.SHA == sha {
-			latest[r.SHA+":"+r.Reviewer] = r
+	latest := make(map[string]LedgerRow)
+	for _, row := range evidence.Rows {
+		if row.Event == string(EventVerdict) && shaMatches(row.SHA, sha) {
+			latest[strings.TrimSpace(row.Reviewer)] = row
 		}
 	}
 	// FAC-630: every `continue` below used to land on one generic refusal, so an
@@ -85,72 +147,114 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 	// Absence of a reason is not a reason: record why each candidate verdict was
 	// skipped and report the most specific one.
 	var skipped []string
-	note := func(reviewer, why string) {
-		skipped = append(skipped, fmt.Sprintf("reviewer=%s: %s", reviewer, why))
+	note := func(reviewer, condition, observed string) {
+		skipped = append(skipped, fmt.Sprintf("reviewer=%q condition=%s observed %s", reviewer, condition, observed))
 	}
-	for key, verdict := range latest {
-		if (verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED)) && !l.isCoordinator(verdict.Reviewer) {
-			if launchRow, ok := launch[key]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
-				return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", verdict.Verdict, verdict.Reviewer))
-			}
-		}
-		if verdict.Verdict != string(VerdictPASS) {
-			note(verdict.Reviewer, "verdict is "+verdict.Verdict+", not PASS")
+	keys := make([]string, 0, len(latest))
+	for key := range latest {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	// Vetoes are evaluated before PASS candidates. Returning from one map walk
+	// made admission depend on randomized iteration order when a PASS and veto
+	// coexisted for the same SHA.
+	for _, key := range keys {
+		verdict := latest[key]
+		if verdict.Verdict != string(VerdictFAIL) && verdict.Verdict != string(VerdictBLOCKED) {
 			continue
 		}
-		if l.isCoordinator(verdict.Reviewer) {
-			note(verdict.Reviewer, "reviewer is a coordinator; a self-review is not independent")
+		if l.isCoordinator(strings.TrimSpace(verdict.Reviewer)) {
+			continue
+		}
+		launchRow, ok := launch[key]
+		if ok && strings.TrimSpace(launchRow.BuilderFamily) != "" && FamilyAllowlist[strings.TrimSpace(launchRow.BuilderFamily)] {
+			return reject(sha, fmt.Sprintf("admission_condition=veto observed verdict=%q reviewer=%q superseded=false",
+				verdict.Verdict, strings.TrimSpace(verdict.Reviewer)))
+		}
+	}
+
+	tier := ""
+	for _, row := range evidence.Rows {
+		if row.Event == string(EventRecord) && shaMatches(row.SHA, sha) && strings.TrimSpace(row.Tier) != "" {
+			tier = strings.TrimSpace(row.Tier)
+		}
+	}
+	for _, key := range keys {
+		verdict := latest[key]
+		reviewer := strings.TrimSpace(verdict.Reviewer)
+		if verdict.Verdict != string(VerdictPASS) {
+			note(reviewer, "verdict", fmt.Sprintf("verdict=%q required=%q", verdict.Verdict, VerdictPASS))
+			continue
+		}
+		if l.isCoordinator(reviewer) {
+			note(reviewer, "reviewer_authority", fmt.Sprintf("reviewer=%q coordinator=true independent=false", reviewer))
 			continue
 		}
 		launchRow, ok := launch[key]
 		if !ok {
-			note(verdict.Reviewer, "no launch record row for this reviewer on this candidate")
+			note(reviewer, "launch_record", fmt.Sprintf("launch_record_present=false reviewer=%q", reviewer))
 			continue
 		}
-		if launchRow.BuilderFamily == "" {
-			note(verdict.Reviewer, "launch record has no builder family")
+		builderFamily := strings.TrimSpace(launchRow.BuilderFamily)
+		if builderFamily == "" {
+			note(reviewer, "builder_family", `builder_family=""`)
 			continue
 		}
-		if !FamilyAllowlist[launchRow.BuilderFamily] {
-			note(verdict.Reviewer, fmt.Sprintf("launch record builder family %q is not an allowlisted vendor family "+
-				"(a candidate whose provenance was recorded as %q cannot establish cross-family independence)",
-				launchRow.BuilderFamily, launchRow.BuilderFamily))
+		allowUnrecorded := policy.allowUnrecordedProvenance && isUnrecordedProvenance(launchRow.Gate, builderFamily)
+		if !FamilyAllowlist[builderFamily] && !allowUnrecorded {
+			note(reviewer, "builder_family", fmt.Sprintf("builder_family=%q allowlisted=false independent=false", builderFamily))
 			continue
 		}
-		families := resolveFamily(launchRow.BuilderFamily, launchRow.ReviewerFamily, verdict.BuilderFamily, verdict.ReviewerFamily)
+		families := resolveFamily(builderFamily, strings.TrimSpace(launchRow.ReviewerFamily),
+			strings.TrimSpace(verdict.BuilderFamily), strings.TrimSpace(verdict.ReviewerFamily))
+		if allowUnrecorded {
+			// The explicit override accepts unknown builder provenance; it must not
+			// launder the verdict row's later assertion into a builder identity.
+			families = resolveFamily("", strings.TrimSpace(launchRow.ReviewerFamily), "", strings.TrimSpace(verdict.ReviewerFamily))
+		}
 		if families.State != familySet {
-			note(verdict.Reviewer, "reviewer family could not be resolved from the launch and verdict rows")
+			state := "unset"
+			if families.State == familyConflict {
+				state = "conflict"
+			}
+			note(reviewer, "reviewer_family", fmt.Sprintf(
+				"reviewer_family_state=%s reviewer_family=%q launch_reviewer_family=%q verdict_reviewer_family=%q launch_builder_family=%q verdict_builder_family=%q",
+				state, families.Value, strings.TrimSpace(launchRow.ReviewerFamily), strings.TrimSpace(verdict.ReviewerFamily),
+				builderFamily, strings.TrimSpace(verdict.BuilderFamily)))
 			continue
 		}
-		if families.Value == launchRow.BuilderFamily {
-			note(verdict.Reviewer, fmt.Sprintf("reviewer family %q equals the builder family; not independent", families.Value))
+		if !allowUnrecorded && families.Value == builderFamily {
+			note(reviewer, "family_independence", fmt.Sprintf(
+				"reviewer family %q equals the builder family; reviewer_family=%q builder_family=%q independent=false",
+				families.Value, families.Value, builderFamily))
 			continue
 		}
 		if !FamilyAllowlist[families.Value] {
-			note(verdict.Reviewer, fmt.Sprintf("reviewer family %q is not an allowlisted vendor family", families.Value))
+			note(reviewer, "reviewer_family", fmt.Sprintf("reviewer_family=%q allowlisted=false", families.Value))
 			continue
 		}
-		if verdict.Reviewer == "" {
-			note("(unnamed)", "verdict has no reviewer identity")
+		if reviewer == "" {
+			note("", "reviewer_identity", `reviewer=""`)
 			continue
 		}
-		if launchRow.BuilderIdentity != "" && verdict.Reviewer == launchRow.BuilderIdentity {
-			note(verdict.Reviewer, "reviewer identity equals the builder identity; a self-review is not independent")
+		if strings.TrimSpace(launchRow.BuilderIdentity) != "" && reviewer == strings.TrimSpace(launchRow.BuilderIdentity) {
+			note(reviewer, "identity_independence", fmt.Sprintf("reviewer=%q builder_identity_match=true independent=false", reviewer))
 			continue
 		}
-		if verdict.VerificationDigest == "" {
-			note(verdict.Reviewer, "verdict carries no verification digest")
+		if strings.TrimSpace(verdict.VerificationDigest) == "" {
+			note(reviewer, "verification_digest", `verdict carries no verification digest; verification_digest=""`)
 			continue
-		}
-		tier, err := l.Tier(sha)
-		if err != nil {
-			return nil, err
 		}
 		if tier == "" {
-			note(verdict.Reviewer, "no risk tier is recorded for this candidate on any launch record row")
+			note(reviewer, "risk_tier", `no risk tier is recorded for this candidate; risk_tier=""`)
 			continue
 		}
-		return &AdmissionResult{Admitted: true, Reason: "validated independent verdict for exact candidate (reduced provenance)", SHA: sha, Reviewer: verdict.Reviewer, ReviewerFamily: families.Value, Tier: tier, VerificationDigest: verdict.VerificationDigest, AuthorFamily: launchRow.BuilderFamily}, nil
+		reason := "validated independent verdict for exact candidate (reduced provenance)"
+		if allowUnrecorded {
+			reason = "validated verdict under explicit unrecorded-provenance policy; cross-family independence is not claimed"
+		}
+		return &AdmissionResult{Admitted: true, Reason: reason, SHA: sha, Reviewer: reviewer, ReviewerFamily: families.Value, Tier: tier, VerificationDigest: strings.TrimSpace(verdict.VerificationDigest), AuthorFamily: builderFamily}, nil
 	}
 	if len(skipped) > 0 {
 		sort.Strings(skipped)
@@ -158,7 +262,7 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			strings.Join(skipped, "; "))
 	}
 	return reject(sha, "no independent PASS verdict with durable verification evidence: "+
-		"no verdict rows exist for this candidate")
+		"no verdict rows exist for this candidate; admission_condition=verdict observed verdict_rows=0")
 }
 
 // admissionRejected is the sentinel error Admit returns alongside a non-nil,

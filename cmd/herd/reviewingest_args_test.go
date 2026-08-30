@@ -14,21 +14,25 @@ func TestParseReviewIngestArgs(t *testing.T) {
 	defaultRoot := reviewroot.Resolve(".").Root
 	defaultLedger := filepath.Join(".herd", "review-ledger.jsonl")
 	tests := []struct {
-		name      string
-		args      []string
-		wantFiles []string
-		wantDry   bool
-		wantAudit bool
-		wantErr   bool
+		name          string
+		args          []string
+		wantFiles     []string
+		wantDry       bool
+		wantAudit     bool
+		wantReresolve bool
+		wantErr       bool
 	}{
 		{name: "artifact then dry run", args: []string{"review.md", "--dry-run"}, wantFiles: []string{"review.md"}, wantDry: true},
 		{name: "dry run then artifact", args: []string{"--dry-run", "review.md"}, wantFiles: []string{"review.md"}, wantDry: true},
+		{name: "historical provenance re-resolution", args: []string{"review.md", "--reresolve-provenance"}, wantFiles: []string{"review.md"}, wantReresolve: true},
 		{name: "flags between artifacts", args: []string{"one.md", "--dry-run", "two.md"}, wantFiles: []string{"one.md", "two.md"}, wantDry: true},
 		{name: "audit", args: []string{"--audit", "--audit-root", "review"}, wantAudit: true},
 		{name: "unknown flag fails before side effects", args: []string{"review.md", "--dry-run", "--typo"}, wantErr: true},
 		{name: "missing flag value fails", args: []string{"review.md", "--ledger"}, wantErr: true},
 		{name: "audit artifact ambiguity fails", args: []string{"review.md", "--audit"}, wantErr: true},
 		{name: "audit dry run ambiguity fails", args: []string{"--audit", "--dry-run"}, wantErr: true},
+		{name: "audit re-resolution ambiguity fails", args: []string{"--audit", "--reresolve-provenance"}, wantErr: true},
+		{name: "sweep cannot find historical duplicates", args: []string{"--sweep", "--reresolve-provenance"}, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -44,6 +48,9 @@ func TestParseReviewIngestArgs(t *testing.T) {
 			}
 			if got.dryRun != tc.wantDry || got.audit != tc.wantAudit {
 				t.Fatalf("flags = dry-run:%v audit:%v, want dry-run:%v audit:%v", got.dryRun, got.audit, tc.wantDry, tc.wantAudit)
+			}
+			if got.reresolveProvenance != tc.wantReresolve {
+				t.Fatalf("reresolve-provenance=%v, want %v", got.reresolveProvenance, tc.wantReresolve)
 			}
 			if len(got.files) != len(tc.wantFiles) {
 				t.Fatalf("files = %v, want %v", got.files, tc.wantFiles)

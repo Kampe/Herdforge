@@ -98,10 +98,12 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		out.Reason = "no candidate sha supplied"
 		return out, nil
 	}
-	rows, err := l.AllRows()
+	evidence, err := l.loadReducedAdmissionEvidence(sha)
 	if err != nil {
-		// Fail closed: an unreadable ledger is not an absence of dissent.
-		return MergeReadiness{SHA: sha, Reason: "review ledger unreadable"}, err
+		// Fail closed and retain the exact evidence source named by the shared
+		// loader. An unreadable queue is not an unreadable ledger, and neither is
+		// an absence of dissent.
+		return MergeReadiness{SHA: sha, Reason: err.Error()}, err
 	}
 	// FAC-641: an EMPTY ledger is not "nothing has been reviewed".
 	//
@@ -115,19 +117,30 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 	// absence treated as a definitive negative. A ledger with no rows at all means
 	// the caller is pointed at the wrong file, not that the fleet has never
 	// reviewed anything, so it fails closed and says so.
-	if len(rows) == 0 {
+	if len(evidence.Rows) == 0 {
 		return MergeReadiness{SHA: sha, Reason: "review ledger is EMPTY; refusing to report no-verdict from a ledger with zero rows (wrong repo root?)"},
 			fmt.Errorf("review ledger has no rows: refusing to infer review state from an empty ledger")
 	}
+	if len(evidence.MatchingSHAs) > 1 {
+		out.Reason = fmt.Sprintf("candidate sha prefix is ambiguous: matched %q", evidence.MatchingSHAs)
+		return out, fmt.Errorf("review readiness candidate sha %q matches multiple ledger shas", sha)
+	}
 	reviewers := map[string]string{}
-	unrecorded := map[string]bool{}
-	for _, row := range rows {
+	latestVerdict := map[string]LedgerRow{}
+	launch := map[string]LedgerRow{}
+	for _, row := range evidence.Rows {
+		if row.Event != string(EventRecord) || !shaMatches(row.SHA, evidence.CandidateSHA) {
+			continue
+		}
+		launch[strings.TrimSpace(row.Reviewer)] = row
+	}
+	for _, row := range evidence.Rows {
 		// Match by PREFIX. The ledger stores 40-char SHAs while callers routinely
 		// hold a 12-char short form (PR head refs, packet names, pane names).
 		// Exact matching returned "no verdict recorded" for candidates that had
 		// several -- an absence that reads as safe and is wrong for the wrong
 		// reason, which is the failure mode this whole type exists to prevent.
-		if row.Event != string(EventVerdict) || !shaMatches(row.SHA, sha) {
+		if row.Event != string(EventVerdict) || !shaMatches(row.SHA, evidence.CandidateSHA) {
 			continue
 		}
 		verdict := strings.ToUpper(strings.TrimSpace(row.Verdict))
@@ -138,9 +151,7 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		// from DIFFERENT reviewers never supersede each other.
 		name := strings.TrimSpace(row.Reviewer)
 		reviewers[name] = verdict
-		if row.Gate == GateProvenanceUnrecorded || strings.EqualFold(strings.TrimSpace(row.BuilderFamily), FamilyUnrecorded) {
-			unrecorded[name] = true
-		}
+		latestVerdict[name] = row
 	}
 	if len(reviewers) == 0 {
 		out.Reason = "no verdict recorded for this candidate"
@@ -154,7 +165,17 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 	for _, name := range names {
 		v := reviewers[name]
 		out.Verdicts = append(out.Verdicts, name+"="+v)
-		if unrecorded[name] {
+		verdictRow := latestVerdict[name]
+		launchRow, hasLaunch := launch[name]
+		provenanceUnrecorded := false
+		if hasLaunch {
+			provenanceUnrecorded = isUnrecordedProvenance(launchRow.Gate, launchRow.BuilderFamily)
+		} else {
+			// Keep a verdict's historical marker visible, but never let that
+			// marker substitute for the launch row the admission predicate needs.
+			provenanceUnrecorded = isUnrecordedProvenance(verdictRow.Gate, verdictRow.BuilderFamily)
+		}
+		if provenanceUnrecorded {
 			out.ProvenanceUnrecorded++
 		}
 		switch v {
@@ -174,26 +195,49 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 			out.Passes, out.Failures)
 	case out.Failures > 0:
 		out.Reason = fmt.Sprintf("%d reviewer(s) recorded FAIL", out.Failures)
-	case out.ProvenanceUnrecorded > 0 && out.ProvenanceUnrecorded >= out.Passes:
-		// Every passing review lacks provable authorship. The review is kept and
-		// visible; the independence claim is not granted. Nothing else is wrong
-		// with this candidate, which is exactly what makes it decidable rather
-		// than failed (FAC-668).
-		out.OperatorDecidable = true
-		if allowUnrecorded {
+	default:
+		strict, strictErr := l.admitReducedEvidence(evidence, reducedAdmissionPolicy{})
+		if strictErr == nil && strict != nil && strict.Admitted {
 			out.Ready = true
-			out.AdmittedWithoutProvenance = true
-			out.Reason = fmt.Sprintf("%d PASS, admitted WITHOUT provable builder provenance by explicit operator choice; "+
-				"cross-family independence is NOT claimed for this merge", out.Passes)
+			out.Reason = fmt.Sprintf("%d PASS, no dissent; reduced admission agrees", out.Passes)
 			break
 		}
-		out.Reason = fmt.Sprintf("%d PASS but provenance was never recorded; review is admitted, "+
-			"cross-family independence cannot be claimed. Nothing else blocks this candidate: "+
-			"re-run with --allow-unrecorded-provenance to merge on that basis, or record the builder "+
-			"family at dispatch with `herd launch-record` so future candidates carry it", out.Passes)
-	default:
-		out.Ready = true
-		out.Reason = fmt.Sprintf("%d PASS, no dissent", out.Passes)
+
+		// FAC-668 remains a one-condition explicit choice. Evaluating the SAME
+		// predicate with only that policy bit changed proves no missing digest,
+		// tier, identity, reviewer family, veto, or exactly-once condition is
+		// accidentally rescued by the flag.
+		override, overrideErr := l.admitReducedEvidence(evidence, reducedAdmissionPolicy{allowUnrecordedProvenance: true})
+		if overrideErr == nil && override != nil && override.Admitted && out.ProvenanceUnrecorded >= out.Passes {
+			out.OperatorDecidable = true
+			if allowUnrecorded {
+				out.Ready = true
+				out.AdmittedWithoutProvenance = true
+				out.Reason = fmt.Sprintf("%d PASS, admitted WITHOUT provable builder provenance by explicit operator choice; "+
+					"cross-family independence is NOT claimed for this merge", out.Passes)
+				break
+			}
+		}
+
+		decision, decisionErr := strict, strictErr
+		if allowUnrecorded {
+			// The operator already chose to waive only unknown provenance. Name
+			// the next condition from that exact policy evaluation, rather than
+			// repeating the strict provenance refusal the operator just resolved.
+			decision, decisionErr = override, overrideErr
+		}
+		admissionReason := "admission refused the candidate"
+		if decision != nil && decision.Reason != "" {
+			admissionReason = decision.Reason
+		} else if decisionErr != nil {
+			admissionReason = decisionErr.Error()
+		}
+		out.Reason = "reduced admission would refuse: " + admissionReason
+		if out.OperatorDecidable {
+			out.Reason += "; re-run with --allow-unrecorded-provenance to accept only the unknown-provenance condition, " +
+				"or use `herd review-ingest <artifact> --reresolve-provenance` when a reaching historical launch receipt now exists; " +
+				"record the builder family at dispatch with `herd launch-record` for future candidates"
+		}
 	}
 	return out, nil
 }

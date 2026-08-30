@@ -71,8 +71,9 @@ func TestMergeReadiness_BlockedAlwaysBlocks(t *testing.T) {
 // candidate can become ready without a second reviewer.
 func TestMergeReadiness_SameReviewerSupersedes(t *testing.T) {
 	l := ledgerWith(t,
-		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"FAIL"}`,
-		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"PASS"}`)
+		`{"event":"record","sha":"ddd","reviewer":"r1","builder_family":"anthropic","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"FAIL","builder_family":"anthropic","reviewer_family":"xai","verification_digest":"digest"}`,
+		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"PASS","builder_family":"anthropic","reviewer_family":"xai","verification_digest":"digest"}`)
 	got, _ := l.MergeReadinessFor("ddd")
 	if !got.Ready {
 		t.Fatalf("a reviewer's own later PASS must supersede its FAIL: %+v", got)
@@ -91,7 +92,9 @@ func TestMergeReadiness_NoVerdictIsNotReady(t *testing.T) {
 // A genuine clean pass must still be ready, so the guard cannot be satisfied by
 // never returning true.
 func TestMergeReadiness_CleanPassIsReady(t *testing.T) {
-	l := ledgerWith(t, `{"event":"verdict","sha":"fff","reviewer":"r1","verdict":"PASS"}`)
+	l := ledgerWith(t,
+		`{"event":"record","sha":"fff","reviewer":"r1","builder_family":"anthropic","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"fff","reviewer":"r1","verdict":"PASS","builder_family":"anthropic","reviewer_family":"xai","verification_digest":"digest"}`)
 	got, _ := l.MergeReadinessFor("fff")
 	if !got.Ready || got.Passes != 1 {
 		t.Fatalf("a clean PASS must be ready: %+v", got)
@@ -135,7 +138,8 @@ func TestMergeReadiness_RejectsTooShortPrefix(t *testing.T) {
 // review host with 7 free lanes and ~20 candidates it was forbidden to touch.
 func TestMergeReadiness_UnrecordedProvenancePassIsAdmittedButNotReady(t *testing.T) {
 	l := ledgerWith(t,
-		`{"event":"verdict","sha":"aaa1111111111111111111111111111111111111","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+		`{"event":"record","sha":"aaa1111111111111111111111111111111111111","reviewer":"r1","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"aaa1111111111111111111111111111111111111","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","verification_digest":"digest"}`)
 	got, err := l.MergeReadinessFor("aaa1111111111111111111111111111111111111")
 	if err != nil {
 		t.Fatal(err)
@@ -156,11 +160,128 @@ func TestMergeReadiness_UnrecordedProvenancePassIsAdmittedButNotReady(t *testing
 func TestMergeReadiness_ProvableePassAlongsideUnrecordedIsReady(t *testing.T) {
 	sha := "bbb1111111111111111111111111111111111111"
 	l := ledgerWith(t,
-		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`,
-		`{"event":"verdict","sha":"`+sha+`","reviewer":"r2","verdict":"PASS","gate":"independent","builder_family":"openai"}`)
+		`{"event":"record","sha":"`+sha+`","reviewer":"r1","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"google","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"google","verification_digest":"digest-1"}`,
+		`{"event":"record","sha":"`+sha+`","reviewer":"r2","gate":"independent","builder_family":"anthropic","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r2","verdict":"PASS","gate":"independent","builder_family":"anthropic","reviewer_family":"xai","verification_digest":"digest-2"}`)
 	got, _ := l.MergeReadinessFor(sha)
 	if !got.Ready {
 		t.Fatalf("a provable PASS must still carry the candidate: %+v", got)
+	}
+}
+
+// FAC-630 live shape: the verdict row was complete and said anthropic/xai,
+// while the older launch record still said unrecorded. Readiness used only the
+// verdict and returned ready=true; reduced landed-receipt admission used the
+// record and refused. One candidate cannot have two provenance answers.
+func TestMergeReadinessAndReducedAdmissionAgreeOnHistoricalRecordProvenance(t *testing.T) {
+	sha := strings.Repeat("9", 40)
+	l := ledgerWith(t,
+		`{"event":"record","sha":"`+sha+`","reviewer":"reviewer-a","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"reviewer-a","verdict":"PASS","builder_family":"anthropic","reviewer_family":"xai","verification_digest":"2344575ebd590030e9c06cfd230e1896"}`,
+	)
+
+	ready, err := l.MergeReadinessFor(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, admitErr := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: sha})
+	if admitErr == nil || admitted == nil || admitted.Admitted {
+		t.Fatalf("fixture must be refused by reduced admission: result=%+v err=%v", admitted, admitErr)
+	}
+	if ready.Ready != admitted.Admitted {
+		t.Fatalf("readiness/admission disagree: readiness=%+v admission=%+v err=%v", ready, admitted, admitErr)
+	}
+	if ready.ProvenanceUnrecorded != 1 {
+		t.Fatalf("readiness did not use launch-row provenance: %+v", ready)
+	}
+	for _, want := range []string{`builder_family="unrecorded"`, "allowlisted=false"} {
+		if !strings.Contains(ready.Reason, want) {
+			t.Errorf("readiness reason %q does not contain %q", ready.Reason, want)
+		}
+	}
+}
+
+// FAC-667 landed symptom: a literal Verification section can still produce a
+// durable PASS row with no digest. Readiness must not invent one or claim ready
+// when the exact admission predicate will refuse it.
+func TestMergeReadinessRefusesPassWithoutVerificationDigest(t *testing.T) {
+	sha := strings.Repeat("8", 40)
+	l := ledgerWith(t,
+		`{"event":"record","sha":"`+sha+`","reviewer":"reviewer-a","builder_family":"anthropic","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"reviewer-a","verdict":"PASS","builder_family":"anthropic","reviewer_family":"xai"}`,
+	)
+
+	got, err := l.MergeReadinessFor(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Ready {
+		t.Fatalf("a PASS with no verification digest must not be ready: %+v", got)
+	}
+	if !strings.Contains(got.Reason, `verification_digest=""`) {
+		t.Fatalf("missing digest refusal was not named exactly: %q", got.Reason)
+	}
+}
+
+func TestMergeReadinessAndReducedAdmissionShareThePassPredicate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []map[string]any
+	}{
+		{name: "clean", rows: []map[string]any{record("anthropic", map[string]any{"tier": "R3"}), verdictRow(nil)}},
+		{name: "digest", rows: []map[string]any{record("anthropic", map[string]any{"tier": "R3"}), verdictRow(map[string]any{"verification_digest": ""})}},
+		{name: "tier", rows: []map[string]any{record("anthropic", nil), verdictRow(nil)}},
+		{name: "provenance", rows: []map[string]any{record(FamilyUnrecorded, map[string]any{"gate": GateProvenanceUnrecorded, "tier": "R3"}), verdictRow(nil)}},
+		{name: "family independence", rows: []map[string]any{record("anthropic", map[string]any{"reviewer_family": "anthropic", "tier": "R3"}), verdictRow(map[string]any{"reviewer_family": "anthropic"})}},
+		{name: "identity independence", rows: []map[string]any{record("anthropic", map[string]any{"builder_identity": "rv", "tier": "R3"}), verdictRow(nil)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := diagLedger(t, tc.rows...)
+			readiness, readinessErr := l.MergeReadinessFor(diagSHA)
+			if readinessErr != nil {
+				t.Fatal(readinessErr)
+			}
+			admission, _ := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+			if admission == nil {
+				t.Fatal("no reduced-admission result")
+			}
+			if readiness.Ready != admission.Admitted {
+				t.Fatalf("same evidence produced different decisions: readiness=%+v admission=%+v", readiness, admission)
+			}
+		})
+	}
+}
+
+func TestMergeReadinessAndReducedAdmissionBothRefuseAConsumedCandidate(t *testing.T) {
+	l := diagLedger(t, record("anthropic", map[string]any{"tier": "R3"}), verdictRow(nil))
+	if err := os.WriteFile(l.QueuePath, []byte(`{"event":"consumed","sha":"`+diagSHA+`"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readiness, err := l.MergeReadinessFor(diagSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, _ := l.AdmitReduced(ReducedAdmissionOpts{CandidateSHA: diagSHA})
+	if readiness.Ready || admission == nil || admission.Admitted {
+		t.Fatalf("consumed evidence did not refuse both surfaces: readiness=%+v admission=%+v", readiness, admission)
+	}
+	if !strings.Contains(readiness.Reason, "admission_condition=consumption") {
+		t.Fatalf("readiness did not name the consumed gate: %q", readiness.Reason)
+	}
+}
+
+func TestMergeReadinessNamesAnUnreadableAdmissionQueue(t *testing.T) {
+	l := diagLedger(t, record("anthropic", map[string]any{"tier": "R3"}), verdictRow(nil))
+	if err := os.Mkdir(l.QueuePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := l.MergeReadinessFor(diagSHA)
+	if err == nil || got.Ready {
+		t.Fatalf("unreadable queue did not fail closed: readiness=%+v err=%v", got, err)
+	}
+	if !strings.Contains(got.Reason, "admission_condition=admission_queue observed queue_readable=false") {
+		t.Fatalf("readiness misnamed the unreadable evidence source: %q", got.Reason)
 	}
 }
 
@@ -169,7 +290,8 @@ func TestMergeReadiness_ProvableePassAlongsideUnrecordedIsReady(t *testing.T) {
 func TestMergeReadiness_UnrecordedFailStillBlocks(t *testing.T) {
 	sha := "ccc1111111111111111111111111111111111111"
 	l := ledgerWith(t,
-		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"FAIL","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+		`{"event":"record","sha":"`+sha+`","reviewer":"r1","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"FAIL","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai"}`)
 	got, _ := l.MergeReadinessFor(sha)
 	if got.Ready {
 		t.Fatalf("a FAIL must block regardless of provenance: %+v", got)
@@ -249,7 +371,8 @@ func TestDefaultPath_HonoursExplicitLedgerOverride(t *testing.T) {
 func TestUnrecordedProvenanceIsOperatorDecidableNotADeadEnd(t *testing.T) {
 	sha := strings.Repeat("f", 40)
 	l := ledgerWith(t,
-		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+		`{"event":"record","sha":"`+sha+`","reviewer":"pool-06","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","verification_digest":"digest"}`)
 
 	got, err := l.MergeReadinessFor(sha)
 	if err != nil {
@@ -275,7 +398,8 @@ func TestUnrecordedProvenanceIsOperatorDecidableNotADeadEnd(t *testing.T) {
 func TestAcceptingUnrecordedProvenanceIsRecordedOnTheResult(t *testing.T) {
 	sha := strings.Repeat("f", 40)
 	l := ledgerWith(t,
-		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`)
+		`{"event":"record","sha":"`+sha+`","reviewer":"pool-06","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","tier":"R3"}`,
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"pool-06","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","verification_digest":"digest"}`)
 
 	got, err := l.MergeReadinessAllowingUnrecordedProvenance(sha)
 	if err != nil {
@@ -309,5 +433,34 @@ func TestAcceptingUnrecordedProvenanceNeverRescuesAFailure(t *testing.T) {
 		if got.OperatorDecidable {
 			t.Errorf("%s is not operator-decidable: something other than provenance is wrong", verdict)
 		}
+	}
+}
+
+func TestAcceptingUnrecordedProvenanceNeverRescuesMissingDurableEvidence(t *testing.T) {
+	sha := strings.Repeat("e", 40)
+	for _, tc := range []struct {
+		name       string
+		tier       string
+		digest     string
+		wantReason string
+	}{
+		{name: "verification digest", tier: "R3", wantReason: `verification_digest=""`},
+		{name: "risk tier", digest: "digest", wantReason: `risk_tier=""`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := ledgerWith(t,
+				`{"event":"record","sha":"`+sha+`","reviewer":"r1","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","tier":"`+tc.tier+`"}`,
+				`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded","reviewer_family":"xai","verification_digest":"`+tc.digest+`"}`)
+			got, err := l.MergeReadinessAllowingUnrecordedProvenance(sha)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Ready || got.OperatorDecidable || got.AdmittedWithoutProvenance {
+				t.Fatalf("provenance override rescued missing %s: %+v", tc.name, got)
+			}
+			if !strings.Contains(got.Reason, tc.wantReason) {
+				t.Fatalf("reason %q does not name missing %s as %q", got.Reason, tc.name, tc.wantReason)
+			}
+		})
 	}
 }
