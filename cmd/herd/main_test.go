@@ -16,6 +16,9 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/coordinator"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/mail"
+	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/standing"
 )
 
 func TestCoordinatorPromptDrainsIndependentWork(t *testing.T) {
@@ -158,7 +161,7 @@ func TestForgeDriverBlocksCapacityWhenReconciliationUnavailable(t *testing.T) {
 }
 
 func TestNewProductionForgeObserverBindsWorkspaceAndDurableRecorder(t *testing.T) {
-	observer, err := newProductionForgeObserver(&config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wK"}})
+	observer, err := newProductionForgeObserver(&config.Config{Fleet: config.FleetConfig{HerdrWorkspace: "wK"}}, provider.NewMemoryProvider())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,12 +178,85 @@ func TestNewProductionForgeObserverBindsWorkspaceAndDurableRecorder(t *testing.T
 
 func TestNewProductionForgeObserverUsesAuthoritativeWorkspaceFallback(t *testing.T) {
 	t.Setenv("HERDR_WORKSPACE_ID", "wK")
-	observer, err := newProductionForgeObserver(&config.Config{})
+	observer, err := newProductionForgeObserver(&config.Config{}, provider.NewMemoryProvider())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if observer.Workspace != "wK" {
 		t.Fatalf("workspace = %q, want wK", observer.Workspace)
+	}
+}
+
+func TestHerdrControlCompletionProofRequiresProviderSettlement(t *testing.T) {
+	const (
+		taskID     = "nnnv5hdqhgwlzwdvzuhev52i"
+		taskRef    = "FAC-594"
+		candidate  = "d7fa8b21f432571930ac887111bfbef2077cd97c"
+		projectID  = "herdforge-project"
+		repository = "Herdforge"
+	)
+	mb := mail.NewMailbox(filepath.Join(t.TempDir(), "callbacks.jsonl"))
+	if _, err := mb.PostCallback("worker", mail.Callback{
+		Ref: taskRef, Kind: mail.CallbackComplete, SHA: candidate,
+		Repo: repository, LeaseGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tp := provider.NewMemoryProvider()
+	tp.AddTask(&provider.Task{ID: taskID, Ref: taskRef, ProjectID: projectID, Status: provider.StatusInReview})
+	proofReader := &herdrControlCompletionProof{mailbox: mb, tasks: tp, project: projectID, repository: repository}
+	req := herdr.CompletedTaskProofRequest{TaskRef: taskRef, TaskID: taskID, CandidateSHA: candidate, LeaseGeneration: 1}
+
+	proof := proofReader.CompletedTaskProof(context.Background(), req)
+	if proof.State != herdr.EvidencePresent || proof.Value.DeliverySettled {
+		t.Fatalf("in-review proof=%+v, want present handoff but unsettled delivery", proof)
+	}
+	if err := tp.UpdateStatus(context.Background(), taskID, provider.StatusDone); err != nil {
+		t.Fatal(err)
+	}
+	proof = proofReader.CompletedTaskProof(context.Background(), req)
+	if proof.State != herdr.EvidencePresent || !proof.Value.DeliverySettled || proof.Value.TaskID != taskID {
+		t.Fatalf("done proof=%+v, want exact settled delivery", proof)
+	}
+	if err := tp.UpdateStatus(context.Background(), taskID, "provider-mystery"); err != nil {
+		t.Fatal(err)
+	}
+	proof = proofReader.CompletedTaskProof(context.Background(), req)
+	if proof.State != herdr.EvidenceError || !strings.Contains(proof.Detail, "UNKNOWN") {
+		t.Fatalf("unknown proof=%+v, want fail-closed UNKNOWN", proof)
+	}
+}
+
+func TestHerdrControlCompletionProofRequiresExactRepository(t *testing.T) {
+	mb := mail.NewMailbox(filepath.Join(t.TempDir(), "callbacks.jsonl"))
+	if _, err := mb.PostCallback("worker", mail.Callback{
+		Ref: "FAC-594", Kind: mail.CallbackComplete, SHA: "candidate-594",
+		Repo: "other-repository", LeaseGeneration: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tp := provider.NewMemoryProvider()
+	tp.AddTask(&provider.Task{ID: "task-594", Ref: "FAC-594", ProjectID: "project", Status: provider.StatusDone})
+	proofReader := &herdrControlCompletionProof{mailbox: mb, tasks: tp, project: "project", repository: "Herdforge"}
+	proof := proofReader.CompletedTaskProof(context.Background(), herdr.CompletedTaskProofRequest{
+		TaskRef: "FAC-594", TaskID: "task-594", CandidateSHA: "candidate-594", LeaseGeneration: 1,
+	})
+	if proof.State != herdr.EvidenceAbsent {
+		t.Fatalf("cross-repository callback proof=%+v, want absent", proof)
+	}
+}
+
+func TestConfiguredStandingLaneForAgentUsesExactRosterIdentity(t *testing.T) {
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "review-supervisor", Standing: true}}}
+	wantName := standing.AgentNameForRepository("review-supervisor", repositoryIdentityForLaunch(cfg))
+	got, err := configuredStandingLaneForAgent(cfg, wantName)
+	if err != nil || got != "review-supervisor" {
+		t.Fatalf("configuredStandingLaneForAgent(%q)=(%q, %v)", wantName, got, err)
+	}
+	for _, name := range []string{"review-supervisor", wantName + "-lookalike"} {
+		if got, err := configuredStandingLaneForAgent(cfg, name); err != nil || got != "" {
+			t.Fatalf("mutable/non-exact name %q resolved to (%q, %v)", name, got, err)
+		}
 	}
 }
 

@@ -87,6 +87,7 @@ type TabBinding struct {
 	Workspace       string
 	Generation      string
 	TaskRef         string
+	TaskID          string
 	CandidateSHA    string
 	LeaseGeneration int64
 	PaneID          string
@@ -94,6 +95,10 @@ type TabBinding struct {
 	Label           string
 	Role            string
 	ControlSeat     bool
+	// StandingLane is the exact configured lane identity for a standing owner.
+	// Empty means this is an ephemeral task lane. It is derived from the
+	// repository roster and exact live agent name, never from pane text.
+	StandingLane string
 }
 
 type BoardTruth struct{ TaskRef, Status string }
@@ -152,7 +157,11 @@ type TabDecision struct {
 	Generation    string   `json:"generation"`
 	Class         TabClass `json:"class"`
 	CloseEligible bool     `json:"close_eligible"`
-	Evidence      []string `json:"evidence"`
+	// RearmLane requests a repository-owned standing raise after the exact
+	// generation has been closed. It is present only for a terminal standing
+	// lane with a completed, settled handoff.
+	RearmLane string   `json:"rearm_lane,omitempty"`
+	Evidence  []string `json:"evidence"`
 }
 
 func NormalizeTaskStatus(status string) string {

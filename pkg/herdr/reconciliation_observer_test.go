@@ -158,9 +158,9 @@ func TestProductionObserverAllowsIdleGenerationlessTaskWithDurableCompletionProo
 	o := &ProductionReconciliationObserver{
 		Workspace: "wK", Reader: r,
 		TaskBinding: func(context.Context, TabRecord, AgentEntry) Authority[TabBinding] {
-			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", CandidateSHA: candidate, LeaseGeneration: 10, Role: "worker"})
+			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", TaskID: "task-304", CandidateSHA: candidate, LeaseGeneration: 10, Role: "worker"})
 		},
-		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", CandidateSHA: candidate, Complete: true, Authenticated: true})},
+		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", TaskID: "task-304", CandidateSHA: candidate, Complete: true, Authenticated: true, DeliverySettled: true})},
 	}
 	if err := o.ObserveReconciliation(context.Background()); err != nil {
 		t.Fatalf("durably completed idle lane must not block reconciliation: %v", err)
@@ -195,9 +195,9 @@ func TestProductionObserverAllowsDoneGenerationlessTaskWithEmptyContextCandidate
 	o := &ProductionReconciliationObserver{
 		Workspace: "wK", Reader: r,
 		TaskBinding: func(context.Context, TabRecord, AgentEntry) Authority[TabBinding] {
-			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", LeaseGeneration: 10, Role: "worker"})
+			return present(TabBinding{TabID: "wK:t60", Workspace: "wK", PaneID: "wK:p60", TaskRef: "FAC-304", TaskID: "task-304", LeaseGeneration: 10, Role: "worker"})
 		},
-		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", CandidateSHA: candidate, Complete: true, Authenticated: true})},
+		Completion: fixtureCompletionProof{proof: present(CompletedTaskProof{TaskRef: "FAC-304", TaskID: "task-304", CandidateSHA: candidate, Complete: true, Authenticated: true, DeliverySettled: true})},
 	}
 	if err := o.ObserveReconciliation(context.Background()); err != nil {
 		t.Fatalf("done generationless lane with HEAD-derived candidate must not block: %v", err)
@@ -224,6 +224,93 @@ func TestProductionObserverDoesNotUseCompletionProofForActiveGenerationlessTask(
 	}
 	if got := o.Decisions()[0]; got.Class != TabBlocked || got.Evidence[0] != "BLOCKED: missing immutable tab generation" {
 		t.Fatalf("decision=%+v, want missing-generation block", got)
+	}
+}
+
+func TestStandingLaneRearmDecisionMutationGuard(t *testing.T) {
+	tests := []struct {
+		name           string
+		agentStatus    string
+		proof          Authority[CompletedTaskProof]
+		wantClass      TabClass
+		wantClosed     bool
+		wantRearmed    bool
+		wantObserveErr bool
+	}{
+		{
+			name:        "terminal done with completed settled handoff",
+			agentStatus: "done",
+			proof:       present(CompletedTaskProof{TaskRef: "FAC-594", TaskID: "task-594", CandidateSHA: "candidate-594", Complete: true, Authenticated: true, DeliverySettled: true}),
+			wantClass:   TabSafeFinished, wantClosed: true, wantRearmed: true,
+		},
+		{
+			name:        "idle standing owner is not terminal done",
+			agentStatus: "idle",
+			proof:       present(CompletedTaskProof{TaskRef: "FAC-594", TaskID: "task-594", CandidateSHA: "candidate-594", Complete: true, Authenticated: true, DeliverySettled: true}),
+			wantClass:   TabStanding,
+		},
+		{
+			name:        "builder awaiting review verdict is not settled",
+			agentStatus: "done",
+			proof:       present(CompletedTaskProof{TaskRef: "FAC-594", TaskID: "task-594", CandidateSHA: "candidate-594", Complete: true, Authenticated: true, DeliverySettled: false}),
+			wantClass:   TabPreservedReview,
+		},
+		{
+			name:        "unknown provider evidence blocks",
+			agentStatus: "done",
+			proof:       Authority[CompletedTaskProof]{State: EvidenceError, Detail: "provider task status is UNKNOWN"},
+			wantClass:   TabBlocked, wantObserveErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewFakeCompareCloseServer()
+			srv.PutTab(LiveTab{WorkspaceID: "wF", TabID: "wF:t594", Generation: 7})
+			restore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+				return srv.CompareAndClose(req), nil
+			})
+			defer restore()
+
+			r := fixtureReader{
+				tabs:   present([]TabRecord{{TabID: "wF:t594", WorkspaceID: "wF", Generation: "7", AgentStatus: tc.agentStatus}}),
+				agents: present([]AgentEntry{{Kind: "codex", Name: "forge-review-supervisor", TabID: "wF:t594", PaneID: "wF:p594", Workspace: "wF", Status: tc.agentStatus}}),
+			}
+			rearmed := 0
+			o := &ProductionReconciliationObserver{
+				Workspace: "wF", Reader: r,
+				TaskBinding: func(context.Context, TabRecord, AgentEntry) Authority[TabBinding] {
+					return present(TabBinding{
+						TabID: "wF:t594", Workspace: "wF", Generation: "7", PaneID: "wF:p594",
+						TaskRef: "FAC-594", TaskID: "task-594", CandidateSHA: "candidate-594", LeaseGeneration: 1,
+						Role: "review-supervisor", StandingLane: "review-supervisor",
+					})
+				},
+				Completion: fixtureCompletionProof{proof: tc.proof},
+				RearmStanding: func(_ context.Context, lane string) error {
+					if lane != "review-supervisor" {
+						t.Fatalf("rearm lane=%q, want review-supervisor", lane)
+					}
+					rearmed++
+					return nil
+				},
+			}
+
+			err := o.ObserveReconciliation(context.Background())
+			if (err != nil) != tc.wantObserveErr {
+				t.Fatalf("ObserveReconciliation error=%v, want error=%v", err, tc.wantObserveErr)
+			}
+			decisions := o.Decisions()
+			if len(decisions) != 1 || decisions[0].Class != tc.wantClass {
+				t.Fatalf("decisions=%+v, want class %s", decisions, tc.wantClass)
+			}
+			if decisions[0].CloseEligible != tc.wantClosed || (decisions[0].RearmLane != "") != tc.wantRearmed {
+				t.Fatalf("decision=%+v, want close=%v rearm=%v", decisions[0], tc.wantClosed, tc.wantRearmed)
+			}
+			if srv.IsClosed("wF:t594") != tc.wantClosed || (rearmed == 1) != tc.wantRearmed {
+				t.Fatalf("closed=%v rearmed=%d, want closed=%v rearmed=%v", srv.IsClosed("wF:t594"), rearmed, tc.wantClosed, tc.wantRearmed)
+			}
+		})
 	}
 }
 
@@ -312,6 +399,30 @@ func TestReapCompletedTaskLanes_ReapsSafeAndPreservesActive(t *testing.T) {
 	}
 	if len(res.Errs) != 0 {
 		t.Fatalf("unexpected reap errors: %v", res.Errs)
+	}
+}
+
+func TestReapCompletedTaskLanesRefusesStandingCloseWithoutRearm(t *testing.T) {
+	srv := NewFakeCompareCloseServer()
+	srv.PutTab(LiveTab{WorkspaceID: "wF", TabID: "t-standing-done", Generation: 4})
+	restore := SetCompareCloseTransportForTest(func(req CompareAndCloseRequest) (CloseReceipt, error) {
+		return srv.CompareAndClose(req), nil
+	})
+	defer restore()
+
+	o := &ProductionReconciliationObserver{
+		Workspace: "wF",
+		Last: ReconciliationResult{Decisions: []TabDecision{{
+			TabID: "t-standing-done", Generation: "4", Class: TabSafeFinished,
+			CloseEligible: true, RearmLane: "review-supervisor",
+		}}},
+	}
+	res, err := o.ReapCompletedTaskLanes(context.Background())
+	if err == nil || len(res.Reaped) != 0 || len(res.Rearmed) != 0 {
+		t.Fatalf("result=%+v error=%v, want fail-closed without close or rearm", res, err)
+	}
+	if srv.IsClosed("t-standing-done") {
+		t.Fatal("standing generation closed without a rearm adapter")
 	}
 }
 
