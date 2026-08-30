@@ -32,13 +32,19 @@ type ReconciliationReader interface {
 // closing a generationless tab.
 type CompletedTaskProof struct {
 	TaskRef       string
+	TaskID        string
 	CandidateSHA  string
 	Complete      bool
 	Authenticated bool
+	// DeliverySettled is true only after the provider reports the exact task
+	// done. A completion callback proves the handoff happened; it does not prove
+	// a builder awaiting review has received its verdict.
+	DeliverySettled bool
 }
 
 type CompletedTaskProofRequest struct {
 	TaskRef         string
+	TaskID          string
 	CandidateSHA    string
 	LeaseGeneration int64
 }
@@ -67,7 +73,11 @@ type ProductionReconciliationObserver struct {
 	Record         func(context.Context, []TabDecision) error
 	TaskBinding    func(context.Context, TabRecord, AgentEntry) Authority[TabBinding]
 	Completion     CompletedTaskProofReader
-	LegacyStore    LegacyTabStateStore
+	// RearmStanding re-raises one exact configured standing lane after its old
+	// generation has been compare-and-closed. Nil refuses the close rather than
+	// converting a standing owner into an absent lane.
+	RearmStanding func(context.Context, string) error
+	LegacyStore   LegacyTabStateStore
 }
 
 // SocketAuthorityReader is the real Herdr transport adapter. It only claims
@@ -190,12 +200,37 @@ func (o *ProductionReconciliationObserver) ObserveReconciliation(ctx context.Con
 		}
 		if bindingAuth.State != EvidencePresent && found && isTerminalAgent(agent.Status) && o.TaskBinding != nil {
 			fallback := o.TaskBinding(ctx, tab, agent)
-			if fallback.State == EvidencePresent && fallback.Value.TabID == tab.TabID && fallback.Value.TaskRef != "" && fallback.Value.LeaseGeneration > 0 && o.Completion != nil {
-				proof := o.Completion.CompletedTaskProof(ctx, CompletedTaskProofRequest{TaskRef: fallback.Value.TaskRef, CandidateSHA: fallback.Value.CandidateSHA, LeaseGeneration: fallback.Value.LeaseGeneration})
+			if fallback.State == EvidencePresent && fallback.Value.TabID == tab.TabID && fallback.Value.TaskRef != "" && fallback.Value.TaskID != "" && fallback.Value.LeaseGeneration > 0 && o.Completion != nil {
+				proof := o.Completion.CompletedTaskProof(ctx, CompletedTaskProofRequest{TaskRef: fallback.Value.TaskRef, TaskID: fallback.Value.TaskID, CandidateSHA: fallback.Value.CandidateSHA, LeaseGeneration: fallback.Value.LeaseGeneration})
 				candidateMatches := fallback.Value.CandidateSHA == "" || proof.Value.CandidateSHA == fallback.Value.CandidateSHA
-				if proof.State == EvidencePresent && proof.Value.Complete && proof.Value.Authenticated && proof.Value.TaskRef == fallback.Value.TaskRef && proof.Value.CandidateSHA != "" && candidateMatches {
-					decisions = append(decisions, TabDecision{TabID: tab.TabID, Class: TabSafeFinished,
-						Evidence: []string{"durable task context and authenticated completion proof; idle generationless tab retained"}})
+				proofMatches := proof.Value.TaskRef == fallback.Value.TaskRef && proof.Value.TaskID == fallback.Value.TaskID && proof.Value.CandidateSHA != "" && candidateMatches
+				if proof.State == EvidenceError {
+					decisions = append(decisions, TabDecision{TabID: tab.TabID, Generation: tab.Generation, Class: TabBlocked,
+						Evidence: []string{"BLOCKED: completion handoff/provider proof: " + proof.Detail}})
+					continue
+				}
+				if proof.State == EvidencePresent && proof.Value.Complete && proof.Value.Authenticated && proofMatches {
+					// A standing lane may rotate only from explicit terminal done. Idle is
+					// a warm or paused owner, not proof that its work is finished.
+					if fallback.Value.StandingLane != "" && NormalizeTaskStatus(agent.Status) != "done" {
+						decisions = append(decisions, TabDecision{TabID: tab.TabID, Generation: tab.Generation, Class: TabStanding,
+							Evidence: []string{"standing owner retained: completed handoff is not terminal done"}})
+						continue
+					}
+					// The callback proves a handoff, but an exact task that is not done
+					// is still awaiting the review/merge verdict. Preserve its builder.
+					if !proof.Value.DeliverySettled {
+						decisions = append(decisions, TabDecision{TabID: tab.TabID, Generation: tab.Generation, Class: TabPreservedReview,
+							Evidence: []string{"completion handoff recorded; exact provider task is not done and may still await a review verdict"}})
+						continue
+					}
+					d := TabDecision{TabID: tab.TabID, Generation: tab.Generation, Class: TabSafeFinished,
+						CloseEligible: tab.Generation != "", RearmLane: fallback.Value.StandingLane,
+						Evidence: []string{"durable task context, authenticated completion handoff, and exact provider done proof"}}
+					if tab.Generation == "" {
+						d.Evidence = append(d.Evidence, "immutable tab generation unavailable; retained")
+					}
+					decisions = append(decisions, d)
 					continue
 				}
 			}
@@ -376,8 +411,9 @@ func (o *ProductionReconciliationObserver) isExactControlTab(tab TabRecord, agen
 
 // ReapResult records the outcome of an automated task lane reap attempt.
 type ReapResult struct {
-	Reaped []string `json:"reaped"`
-	Errs   []error  `json:"errors,omitempty"`
+	Reaped  []string `json:"reaped"`
+	Rearmed []string `json:"rearmed,omitempty"`
+	Errs    []error  `json:"errors,omitempty"`
 }
 
 // ReapCompletedTaskLanes iterates over eligible reconciliation decisions and executes
@@ -392,6 +428,10 @@ func (o *ProductionReconciliationObserver) ReapCompletedTaskLanes(ctx context.Co
 		if !d.CloseEligible || (d.Class != TabSafeFinished && d.Class != TabSafeOrphan) {
 			continue
 		}
+		if d.RearmLane != "" && o.RearmStanding == nil {
+			res.Errs = append(res.Errs, fmt.Errorf("tab %s (gen %s): standing lane %s has no rearm adapter", d.TabID, d.Generation, d.RearmLane))
+			continue
+		}
 		req := CloseRequest{
 			WorkspaceID: o.Workspace,
 			TabID:       d.TabID,
@@ -402,6 +442,13 @@ func (o *ProductionReconciliationObserver) ReapCompletedTaskLanes(ctx context.Co
 			res.Errs = append(res.Errs, fmt.Errorf("tab %s (gen %s): %w", d.TabID, d.Generation, err))
 		} else {
 			res.Reaped = append(res.Reaped, d.TabID)
+			if d.RearmLane != "" {
+				if err := o.RearmStanding(ctx, d.RearmLane); err != nil {
+					res.Errs = append(res.Errs, fmt.Errorf("tab %s (gen %s): rearm standing lane %s: %w", d.TabID, d.Generation, d.RearmLane, err))
+				} else {
+					res.Rearmed = append(res.Rearmed, d.RearmLane)
+				}
+			}
 		}
 	}
 	if len(res.Errs) > 0 {

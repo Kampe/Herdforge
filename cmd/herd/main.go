@@ -10471,9 +10471,12 @@ type cliForgeDriver struct {
 // forge driver's fleet census. The socket reader is authoritative for the
 // live Herdr workspace, while the JSONL recorder preserves the observe-only
 // evidence used to explain a blocked or recovering tick.
-func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconciliationObserver, error) {
+func newProductionForgeObserver(cfg *config.Config, tp provider.TaskProvider) (*herdr.ProductionReconciliationObserver, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("forge reconciliation observer: config is required")
+	}
+	if tp == nil {
+		return nil, fmt.Errorf("forge reconciliation observer: task provider is required")
 	}
 	workspace := strings.TrimSpace(cfg.Fleet.HerdrWorkspace)
 	if workspace == "" {
@@ -10490,7 +10493,12 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 	if err != nil {
 		return nil, fmt.Errorf("forge reconciliation observer: repository root: %w", err)
 	}
-	completion := &herdrControlCompletionProof{mailbox: mail.NewMailbox(mail.CallbackMailPath(root))}
+	completion := &herdrControlCompletionProof{
+		mailbox:    mail.NewMailbox(mail.CallbackMailPath(root)),
+		tasks:      tp,
+		project:    strings.TrimSpace(cfg.TaskProvider.ProjectID),
+		repository: repositoryIdentityForLaunch(cfg),
+	}
 	return &herdr.ProductionReconciliationObserver{
 		Workspace: workspace, ControlBinding: control,
 		Reader: herdr.SocketAuthorityReader{}, Record: (&herdr.JSONLRecorder{Path: ".herd/reconciliation.jsonl"}).Record,
@@ -10498,27 +10506,75 @@ func newProductionForgeObserver(cfg *config.Config) (*herdr.ProductionReconcilia
 			if strings.TrimSpace(agent.Cwd) == "" {
 				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: "task context cwd is unavailable"}
 			}
-			tc, readErr := dispatch.ReadTaskContext(agent.Cwd)
+			tc, readErr := verifiedTaskContextForWorktree(root, agent.Cwd)
 			if readErr != nil {
 				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: readErr.Error()}
 			}
-			verifier, verifyErr := dispatch.LoadVerifier(root)
-			if verifyErr != nil {
-				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: verifyErr.Error()}
+			if want := strings.TrimSpace(cfg.TaskProvider.ProjectID); want != "" && tc.ProjectID != want {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: fmt.Sprintf("task context project %q does not match configured project %q", tc.ProjectID, want)}
 			}
-			if verifyErr = verifier.Verify(tc); verifyErr != nil {
-				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: verifyErr.Error()}
+			if want := repositoryIdentityForLaunch(cfg); want != "" && tc.Repository != want {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: fmt.Sprintf("task context repository %q does not match configured repository %q", tc.Repository, want)}
+			}
+			standingLane, laneErr := configuredStandingLaneForAgent(cfg, agent.Name)
+			if laneErr != nil {
+				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: laneErr.Error()}
 			}
 			candidateSHA, candidateErr := verifiedTaskCandidate(agent.Cwd, tc.CandidateSHA)
 			if candidateErr != nil {
 				return herdr.Authority[herdr.TabBinding]{State: herdr.EvidenceError, Detail: candidateErr.Error()}
 			}
 			return herdr.Authority[herdr.TabBinding]{State: herdr.EvidencePresent, Value: herdr.TabBinding{
-				TabID: tab.TabID, Generation: tab.Generation, Workspace: tab.WorkspaceID, PaneID: agent.PaneID, TaskRef: tc.TaskRef, CandidateSHA: candidateSHA, LeaseGeneration: tc.LeaseGeneration, Role: tc.Role,
+				TabID: tab.TabID, Generation: tab.Generation, Workspace: tab.WorkspaceID, PaneID: agent.PaneID,
+				TaskRef: tc.TaskRef, TaskID: tc.TaskID, CandidateSHA: candidateSHA, LeaseGeneration: tc.LeaseGeneration,
+				Role: tc.Role, StandingLane: standingLane,
 			}}
 		},
 		Completion: completion,
+		RearmStanding: func(ctx context.Context, lane string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return runStandingConfigMode(cfg, herdr.IsAvailable(), standing.ModeRaise, []string{lane}, true, false)
+		},
 	}, nil
+}
+
+func verifiedTaskContextForWorktree(root, worktree string) (*dispatch.TaskContext, error) {
+	tc, err := dispatch.ReadTaskContext(worktree)
+	if err != nil {
+		return nil, err
+	}
+	verifier, err := dispatch.LoadVerifier(root)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifier.Verify(tc); err != nil {
+		return nil, err
+	}
+	return &tc, nil
+}
+
+// configuredStandingLaneForAgent resolves only exact repository-scoped or
+// legacy standing names from the configured roster. A mutable pane label or a
+// name prefix never grants rearm authority.
+func configuredStandingLaneForAgent(cfg *config.Config, agentName string) (string, error) {
+	name := strings.TrimSpace(agentName)
+	if cfg == nil || name == "" {
+		return "", nil
+	}
+	repository := repositoryIdentityForLaunch(cfg)
+	var matched string
+	for _, lane := range standing.StandingLanes(cfg) {
+		if name != standing.AgentNameForRepository(lane.Name, repository) && name != standing.AgentName(lane.Name) {
+			continue
+		}
+		if matched != "" && matched != lane.Name {
+			return "", fmt.Errorf("standing agent %q ambiguously matches lanes %q and %q", name, matched, lane.Name)
+		}
+		matched = lane.Name
+	}
+	return matched, nil
 }
 
 func coordinatorControlBinding(root, workspace string) (herdr.TabBinding, error) {
@@ -10536,7 +10592,10 @@ func coordinatorControlBinding(root, workspace string) (herdr.TabBinding, error)
 }
 
 type herdrControlCompletionProof struct {
-	mailbox *mail.Mailbox
+	mailbox    *mail.Mailbox
+	tasks      provider.TaskProvider
+	project    string
+	repository string
 }
 
 // verifiedTaskCandidate authenticates a task candidate against its managed
@@ -10586,7 +10645,7 @@ func taskWorktreeHead(worktree string) (string, error) {
 }
 
 func (p *herdrControlCompletionProof) CompletedTaskProof(ctx context.Context, req herdr.CompletedTaskProofRequest) herdr.Authority[herdr.CompletedTaskProof] {
-	if p == nil || p.mailbox == nil || req.TaskRef == "" || req.LeaseGeneration <= 0 {
+	if p == nil || p.mailbox == nil || p.tasks == nil || req.TaskRef == "" || req.TaskID == "" || req.LeaseGeneration <= 0 {
 		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: "completion proof request is incomplete"}
 	}
 	envelopes, err := p.mailbox.ReadInboxContext(ctx, mail.CoordinatorInbox)
@@ -10603,15 +10662,27 @@ func (p *herdrControlCompletionProof) CompletedTaskProof(ctx context.Context, re
 		if err := json.Unmarshal([]byte(envelope.Body), &callback); err != nil {
 			return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: fmt.Sprintf("completion callback %s is corrupt: %v", envelope.ID, err)}
 		}
-		if callback.Kind == mail.CallbackComplete && callback.Ref == req.TaskRef && callback.SHA != "" && callback.LeaseGeneration == req.LeaseGeneration && (req.CandidateSHA == "" || callback.SHA == req.CandidateSHA) && envelope.Sequence >= bestSeq {
+		if callback.Kind == mail.CallbackComplete && callback.Ref == req.TaskRef && callback.SHA != "" && callback.LeaseGeneration == req.LeaseGeneration && (req.CandidateSHA == "" || callback.SHA == req.CandidateSHA) && (p.repository == "" || callback.Repo == p.repository) && envelope.Sequence >= bestSeq {
 			best, bestSeq = callback, envelope.Sequence
 		}
 	}
 	if best.Ref == "" {
 		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceAbsent, Detail: "no exact durable completion callback"}
 	}
+	task, err := p.tasks.GetTask(ctx, req.TaskID)
+	if err != nil {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: "read exact provider task after completion handoff: " + err.Error()}
+	}
+	if task == nil || task.ID != req.TaskID || task.Ref != req.TaskRef || (p.project != "" && task.ProjectID != p.project) {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: "provider task identity does not match completion handoff"}
+	}
+	status := provider.NormalizeStatus(task.Status)
+	if status == provider.StatusUnknown || strings.HasPrefix(status, provider.StatusUnknown+":") {
+		return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidenceError, Detail: "provider task status is UNKNOWN after completion handoff"}
+	}
 	return herdr.Authority[herdr.CompletedTaskProof]{State: herdr.EvidencePresent, Value: herdr.CompletedTaskProof{
-		TaskRef: best.Ref, CandidateSHA: best.SHA, Complete: true, Authenticated: true,
+		TaskRef: best.Ref, TaskID: task.ID, CandidateSHA: best.SHA, Complete: true, Authenticated: true,
+		DeliverySettled: status == provider.StatusDone,
 	}}
 }
 
@@ -11421,7 +11492,7 @@ func forgeLoopMain() int {
 		})
 	}
 
-	observer, observerErr := newProductionForgeObserver(cfg)
+	observer, observerErr := newProductionForgeObserver(cfg, tp)
 	if observerErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", observerErr)
 		return 1
