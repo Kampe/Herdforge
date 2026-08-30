@@ -129,8 +129,25 @@ same check is the contract for any remote launcher (including
 `herd-review-remote`):
 
 ```text
+herd review-host --host <review-host> --check-version \
+  --require-command capacity --remote-herd '$HOME/Projects/Herdforge/bin/herd'
 ssh <review-host> 'cd <repo> && herd capacity --json --claim'
 ```
+
+A launcher must run the version check first. It compares its local herd build
+revision with the remote binary and verifies that `capacity` exists without
+claiming admission. Revision mismatch or an `unknown command` response is a
+hard version-drift error naming the required subcommand and both revisions; do
+not fetch, create a worktree, claim capacity, or launch after that refusal.
+
+Live acceptance evidence (W4, 2026-08-30): the host source and repository-built
+binary were exact main `4336f1db222d98678881e4d42a43ed108e4f6cdb`, while
+the default PATH binary reported revision
+`29e2d50d2579ee0b94f04ffded528c2f17e16e95`. The stale binary collapsed the
+provider failure to generic `route reviewer: no healthy provider`; the exact-main
+binary named provider, model, pool, cache age, and the Grok probe error `No such
+device or address`. Neither observation created a lease or tab, and the host
+installation was not changed.
 
 A non-zero exit or `"admit": false` means do not create a remote worktree and do
 not launch a reviewer. `--claim` holds a host-local admission lease so concurrent

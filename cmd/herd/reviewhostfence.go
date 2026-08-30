@@ -1,14 +1,37 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/provenance"
+	"github.com/Kampe/Herdforge/pkg/reviewlaunch"
 )
+
+var (
+	reviewHostNameRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
+	reviewHostRemoteHerdRE  = regexp.MustCompile(`^(?:[A-Za-z0-9][A-Za-z0-9._-]*|\$HOME/[A-Za-z0-9._/-]+|/[A-Za-z0-9._/-]+)$`)
+	reviewHostCommandRE     = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+	reviewHostVersionCheck  = checkReviewHostVersion
+	reviewHostLocalRevision = currentHerdRevision
+	reviewHostRemoteCommand = runRemoteHerdCommand
+)
+
+type reviewHostVersionEvidence struct {
+	Host            string
+	RequiredCommand string
+	LocalRevision   string
+	RemoteRevision  string
+}
 
 // runReviewHostFence is the circuit breaker for a remote review host.
 //
@@ -36,6 +59,10 @@ func runReviewHostFence(args []string) error {
 	trip := fs.String("fence", "", "fence the host: the reason it stopped answering")
 	recover := fs.Bool("recover", false, "clear the fence; requires --evidence")
 	evidence := fs.String("evidence", "", "what was actually inspected on the host before recovering it")
+	checkVersion := fs.Bool("check-version", false, "verify remote herd revision and required subcommand before dispatch")
+	requiredCommand := fs.String("require-command", "capacity", "remote herd subcommand the launcher requires")
+	remoteHerd := fs.String("remote-herd", "herd", "remote herd executable (name or absolute/$HOME path)")
+	timeout := fs.Duration("timeout", 15*time.Second, "bounded remote version check timeout")
 	asJSON := fs.Bool("json", false, "emit the structured fence record")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -71,6 +98,29 @@ func runReviewHostFence(args []string) error {
 		}
 		fmt.Printf("RECOVERED %s (was fenced %s: %s)\n  evidence: %s\n", *host, f.FencedAt, f.Reason, strings.TrimSpace(*evidence))
 		return nil
+
+	case *checkVersion:
+		// Honor the circuit breaker before contacting a host. The version check
+		// is the first remote launch gate and must not become a probe storm.
+		f, fenced, err := readHostFence(*host)
+		if err != nil {
+			return err
+		}
+		if fenced {
+			return fmt.Errorf("review host %s is fenced since %s: %s", *host, f.FencedAt, f.Reason)
+		}
+		if *timeout <= 0 {
+			return errors.New("review-host: --timeout must be positive")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+		proof, err := reviewHostVersionCheck(ctx, *host, *remoteHerd, *requiredCommand)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("CURRENT %s required_command=%s local_revision=%s remote_revision=%s\n",
+			proof.Host, proof.RequiredCommand, proof.LocalRevision, proof.RemoteRevision)
+		return nil
 	}
 
 	// Default: report status, and exit non-zero while fenced so a shell caller
@@ -97,6 +147,68 @@ func runReviewHostFence(args []string) error {
 		os.Exit(3)
 	}
 	return nil
+}
+
+func checkReviewHostVersion(ctx context.Context, host, remoteHerd, requiredCommand string) (reviewHostVersionEvidence, error) {
+	host = strings.TrimSpace(host)
+	remoteHerd = strings.TrimSpace(remoteHerd)
+	requiredCommand = strings.TrimSpace(requiredCommand)
+	if !reviewHostNameRE.MatchString(host) {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: unsafe host %q", host)
+	}
+	if !reviewHostRemoteHerdRE.MatchString(remoteHerd) {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: unsafe remote herd executable %q", remoteHerd)
+	}
+	if !reviewHostCommandRE.MatchString(requiredCommand) {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: unsafe required command %q", requiredCommand)
+	}
+	localRevision, err := reviewHostLocalRevision()
+	if err != nil {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: local herd revision: %w", err)
+	}
+	localRevision = strings.TrimSpace(localRevision)
+	if localRevision == "" {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: local herd revision is unknown; refusing an unprovable remote dispatch")
+	}
+
+	versionOut, versionErr := reviewHostRemoteCommand(ctx, host, remoteHerd, "--version")
+	if versionErr != nil {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: read remote herd revision from %s: %w: %s", host, versionErr, strings.TrimSpace(string(versionOut)))
+	}
+	remoteRevision, err := reviewlaunch.ParseHerdVersion(string(versionOut))
+	if err != nil {
+		return reviewHostVersionEvidence{}, fmt.Errorf("review-host: %s: %w", host, err)
+	}
+	requirement := reviewlaunch.VersionRequirement{
+		RequiredCommand: requiredCommand,
+		LocalRevision:   localRevision,
+		RemoteRevision:  remoteRevision,
+	}
+	// Compare before invoking the command the launcher depends on. This is the
+	// fail-closed boundary that keeps a stale binary from reaching capacity
+	// claim, worktree preparation, lease creation, or tab creation.
+	if err := reviewlaunch.RequireRemoteHerd(requirement, "", nil); err != nil {
+		return reviewHostVersionEvidence{}, err
+	}
+	commandOut, commandErr := reviewHostRemoteCommand(ctx, host, remoteHerd, requiredCommand, "--help")
+	if err := reviewlaunch.RequireRemoteHerd(requirement, string(commandOut), commandErr); err != nil {
+		return reviewHostVersionEvidence{}, err
+	}
+	return reviewHostVersionEvidence{Host: host, RequiredCommand: requiredCommand, LocalRevision: localRevision, RemoteRevision: remoteRevision}, nil
+}
+
+func currentHerdRevision() (string, error) {
+	local, err := provenance.CurrentExecutable()
+	if err != nil {
+		return "", err
+	}
+	return local.BinaryRevision, nil
+}
+
+func runRemoteHerdCommand(ctx context.Context, host, remoteHerd string, args ...string) ([]byte, error) {
+	sshArgs := []string{"-o", "ConnectTimeout=15", host, remoteHerd}
+	sshArgs = append(sshArgs, args...)
+	return exec.CommandContext(ctx, "ssh", sshArgs...).CombinedOutput()
 }
 
 type hostFence struct {
