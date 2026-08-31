@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -44,38 +43,18 @@ func processUIDPlatform(pid int) (int, bool) {
 }
 
 func peerPIDOfSocket(socketPath string) int {
-	// Parse /proc/net/unix is heavy; use abstract connect + SO_PEERCRED after dial.
-	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	// Let x/sys own Linux's filesystem/abstract sockaddr encoding and length
+	// validation, then ask the connected socket for its authenticated peer.
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return 0
 	}
-	defer syscall.Close(fd)
-	var addr syscall.RawSockaddrUnix
-	addr.Family = syscall.AF_UNIX
-	path := []byte(socketPath)
-	if len(path) >= len(addr.Path) {
+	defer unix.Close(fd)
+	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: socketPath}); err != nil {
 		return 0
 	}
-	for i, b := range path {
-		addr.Path[i] = int8(b)
-	}
-	_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd),
-		uintptr(unsafe.Pointer(&addr)), unsafe.Sizeof(addr))
-	if errno != 0 {
-		return 0
-	}
-	// SO_PEERCRED
-	const solSocket = 1
-	const soPeerCred = 17
-	var cred struct {
-		Pid int32
-		Uid uint32
-		Gid uint32
-	}
-	size := unsafe.Sizeof(cred)
-	_, _, errno = syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd), solSocket, soPeerCred,
-		uintptr(unsafe.Pointer(&cred)), uintptr(unsafe.Pointer(&size)), 0)
-	if errno != 0 {
+	cred, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED)
+	if err != nil {
 		return 0
 	}
 	return int(cred.Pid)
