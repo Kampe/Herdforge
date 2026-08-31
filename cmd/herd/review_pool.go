@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -365,7 +366,7 @@ func runPoolReview(ref string) error {
 	// the authority for that. A failure here costs admissibility later, which is
 	// recoverable and visible, whereas failing the launch would waste a leased
 	// slot and a provider call for a bookkeeping problem.
-	if err := completeReviewLaunchProvenance(root, ref, sha, lease.LeaseID); err != nil {
+	if err := completeReviewLaunchProvenance(root, ref, sha, lease.LeaseID, provenFamily); err != nil {
 		fmt.Fprintf(os.Stderr, "review --pool: reviewer launched but launch provenance is INCOMPLETE (%v); "+
 			"this candidate will be refused at harvest admission until a record row carries its lease and patch id\n", err)
 	}
@@ -1141,7 +1142,12 @@ func sharedCheckoutDirtyPaths(root string) []string {
 // Patch identity comes from git, never from the reviewer: it is what allows a
 // REBASED candidate to keep its verdict rather than be re-reviewed, and it must
 // therefore be computed from the tree rather than asserted by anyone.
-func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
+var completeReviewLaunchProvenanceMu sync.Mutex
+
+func completeReviewLaunchProvenance(root, ref, sha, leaseID, provenFamily string) error {
+	completeReviewLaunchProvenanceMu.Lock()
+	defer completeReviewLaunchProvenanceMu.Unlock()
+
 	patch, err := candidatePatchIdentity(root, sha)
 	if err != nil {
 		return fmt.Errorf("patch identity for %s: %w", shortSHA(sha), err)
@@ -1151,6 +1157,51 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 		return err
 	}
 	reviewer := reviewAgentName(ref, sha)
+	family := strings.TrimSpace(provenFamily)
+	gate := "launch-provenance"
+	if family == "" {
+		family = reviewledger.FamilyUnrecorded
+		gate = reviewledger.GateProvenanceUnrecorded
+	} else if !reviewledger.FamilyAllowlist[family] {
+		return fmt.Errorf("complete launch provenance: unknown proven builder family %q", family)
+	}
+
+	rows, err := l.AllRows()
+	if err != nil {
+		return fmt.Errorf("read launch provenance: %w", err)
+	}
+	var prior *reviewledger.LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(reviewledger.EventRecord) && rows[i].SHA == sha && rows[i].Reviewer == reviewer {
+			prior = &rows[i]
+		}
+	}
+	if prior != nil {
+		if prior.Task != "" && prior.Task != ref {
+			return fmt.Errorf("launch provenance conflict: task %q contradicts %q for %s", prior.Task, ref, shortSHA(sha))
+		}
+		if prior.Lease != "" && prior.Lease != strings.TrimSpace(leaseID) {
+			return fmt.Errorf("launch provenance conflict: lease %q contradicts %q for %s", prior.Lease, leaseID, shortSHA(sha))
+		}
+		if prior.PatchURL != "" && prior.PatchURL != patch {
+			return fmt.Errorf("launch provenance conflict: patch identity %q contradicts %q for %s", prior.PatchURL, patch, shortSHA(sha))
+		}
+		priorFamily := strings.TrimSpace(prior.BuilderFamily)
+		if reviewledger.FamilyAllowlist[priorFamily] {
+			if family != reviewledger.FamilyUnrecorded && !strings.EqualFold(priorFamily, family) {
+				return fmt.Errorf("launch provenance conflict: builder family %q contradicts proven family %q for %s", priorFamily, family, shortSHA(sha))
+			}
+			family = priorFamily
+			gate = prior.Gate
+			if gate == "" {
+				gate = "launch-provenance"
+			}
+		}
+		if prior.Task == ref && prior.Lease == strings.TrimSpace(leaseID) && prior.PatchURL == patch &&
+			strings.EqualFold(prior.BuilderFamily, family) && prior.Gate == gate {
+			return nil
+		}
+	}
 	// FAC-667: ensure the record row EXISTS before completing it.
 	//
 	// FAC-656 completed a launch record, and completion requires a prior row --
@@ -1169,10 +1220,22 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 		SHA:           sha,
 		Reviewer:      reviewer,
 		Task:          ref,
-		BuilderFamily: reviewledger.FamilyUnrecorded,
-		Gate:          reviewledger.GateProvenanceUnrecorded,
+		BuilderFamily: family,
+		Gate:          gate,
 	}); err != nil {
 		return fmt.Errorf("seed launch record: %w", err)
+	}
+	// CompleteLaunchProvenance deliberately inherits the prior family. When a
+	// genuine receipt arrives after an older unrecorded row, append the proven
+	// row directly: history stays immutable and last-row-wins readers see the
+	// stronger evidence. This path is reachable only from provenFamily resolved
+	// before pool launch; operator assertions already have their own durable gate.
+	if prior != nil && strings.EqualFold(strings.TrimSpace(prior.BuilderFamily), reviewledger.FamilyUnrecorded) &&
+		family != reviewledger.FamilyUnrecorded {
+		return l.Record(reviewledger.RecordOpts{
+			SHA: sha, Reviewer: reviewer, Task: ref, BuilderFamily: family,
+			Lease: strings.TrimSpace(leaseID), PatchURL: patch, Gate: gate,
+		})
 	}
 	return l.CompleteLaunchProvenance(reviewledger.RecordOpts{
 		SHA:      sha,
