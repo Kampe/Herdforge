@@ -36,7 +36,13 @@ const (
 	quotaHandoffFutureSkew     = 30 * time.Second
 )
 
-var quotaNow = time.Now
+var (
+	quotaNow                 = time.Now
+	quotaRuntimeGOOS         = runtime.GOOS
+	readQuotaKernelOSRelease = func() ([]byte, error) {
+		return os.ReadFile("/proc/sys/kernel/osrelease")
+	}
+)
 
 type EntitlementKind string
 
@@ -228,10 +234,10 @@ func quotaHandoffRequired() bool {
 			return false
 		}
 	}
-	if runtime.GOOS != "linux" {
+	if quotaRuntimeGOOS != "linux" {
 		return false
 	}
-	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	release, err := readQuotaKernelOSRelease()
 	return err == nil && strings.Contains(strings.ToLower(string(release)), "microsoft")
 }
 

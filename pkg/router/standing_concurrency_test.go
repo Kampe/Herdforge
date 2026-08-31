@@ -199,6 +199,50 @@ func TestMachineRouteRecordsConcurrencySeparatelyFromHealthyQuota(t *testing.T) 
 	t.Fatalf("machine route omitted the rejected Codex surface: %s", raw)
 }
 
+func TestMachineRouteKeepsSparkPoolEvidenceWhenSharedCodexAccountIsFull(t *testing.T) {
+	clearRouteEnv(t)
+	r := testRouter(map[string]usage.BurnState{
+		"codex": {
+			Available: false, Reason: "weekly-exhausted",
+			Pools: map[string]usage.BurnState{
+				"default": {Available: false, Reason: "weekly-exhausted", Class: usage.BurnExhausted},
+				"spark":   {Available: true, Reason: "ok", Remaining: 100, Class: usage.BurnUnderspent},
+			},
+		},
+		"grok": {Available: true, Reason: "ok", Remaining: 100, Class: usage.BurnUnderspent},
+	}, "codex", "grok")
+	r.Probes.LiveCount = func(provider, _, _ string) (int, error) {
+		if provider == "codex" {
+			return 3, nil
+		}
+		return 0, nil
+	}
+
+	route, err := r.Pick("implementation", "", "")
+	if err != nil {
+		t.Fatalf("healthy Grok fallback was not selected: %v", err)
+	}
+	if route.Provider != "grok" {
+		t.Fatalf("selected %s, want Grok while the shared Codex account is full", route.Provider)
+	}
+	for _, rejection := range route.Rejections {
+		if rejection.Provider != "codex" {
+			continue
+		}
+		if rejection.Model != "gpt-5.3-codex-spark" || rejection.Pool != "spark" {
+			t.Fatalf("Codex rejection lost the exact attempted Spark pool: %+v", rejection)
+		}
+		if rejection.Gate != "concurrency" || !strings.Contains(rejection.Detail, "live=3 cap=3") {
+			t.Fatalf("Spark rejection did not preserve shared-account concurrency: %+v", rejection)
+		}
+		if strings.Contains(strings.ToLower(rejection.Detail), "quota") {
+			t.Fatalf("healthy Spark quota was blamed for shared-account occupancy: %+v", rejection)
+		}
+		return
+	}
+	t.Fatal("machine route omitted the rejected Codex Spark surface")
+}
+
 func TestMachineAvailabilityGatePreservesUnknownAndCooldown(t *testing.T) {
 	for _, tc := range []struct {
 		detail string

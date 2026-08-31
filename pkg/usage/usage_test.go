@@ -62,6 +62,58 @@ const fixtureJSON = `{
   "schema": "openusage.limits.v1"
 }`
 
+func pinNonHandoffQuotaTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("HERD_QUOTA_HANDOFF_REQUIRED", "0")
+	t.Setenv("HERD_QUOTA_HANDOFF_BIN", "")
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+}
+
+func TestWSLQuotaPolicyRequiresHandoffUnlessExplicitlyDisabled(t *testing.T) {
+	previousGOOS := quotaRuntimeGOOS
+	previousRead := readQuotaKernelOSRelease
+	previousRequired, hadRequired := os.LookupEnv("HERD_QUOTA_HANDOFF_REQUIRED")
+	previousBin, hadBin := os.LookupEnv("HERD_QUOTA_HANDOFF_BIN")
+	t.Cleanup(func() {
+		quotaRuntimeGOOS = previousGOOS
+		readQuotaKernelOSRelease = previousRead
+		if hadRequired {
+			_ = os.Setenv("HERD_QUOTA_HANDOFF_REQUIRED", previousRequired)
+		} else {
+			_ = os.Unsetenv("HERD_QUOTA_HANDOFF_REQUIRED")
+		}
+		if hadBin {
+			_ = os.Setenv("HERD_QUOTA_HANDOFF_BIN", previousBin)
+		} else {
+			_ = os.Unsetenv("HERD_QUOTA_HANDOFF_BIN")
+		}
+	})
+
+	quotaRuntimeGOOS = "linux"
+	readQuotaKernelOSRelease = func() ([]byte, error) {
+		return []byte("6.6.87.2-microsoft-standard-WSL2"), nil
+	}
+	_ = os.Unsetenv("HERD_QUOTA_HANDOFF_REQUIRED")
+	_ = os.Unsetenv("HERD_QUOTA_HANDOFF_BIN")
+	if !quotaHandoffRequired() {
+		t.Fatal("WSL2 without an explicit policy must require a quota handoff")
+	}
+
+	if err := os.Setenv("HERD_QUOTA_HANDOFF_REQUIRED", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if quotaHandoffRequired() {
+		t.Fatal("an explicit non-handoff fixture did not override inherited WSL2 policy")
+	}
+
+	if err := os.Setenv("HERD_QUOTA_HANDOFF_BIN", "quota-handoff-fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if !quotaHandoffRequired() {
+		t.Fatal("an explicitly configured handoff command must remain required")
+	}
+}
+
 func TestParseSnapshot(t *testing.T) {
 	var snap UsageSnapshot
 	if err := json.Unmarshal([]byte(fixtureJSON), &snap); err != nil {

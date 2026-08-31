@@ -808,6 +808,7 @@ func pinHealthyQuota(t *testing.T, dir string, providers ...string) {
 // pinQuota pins each named provider's weekly window to an exact used percent.
 func pinQuota(t *testing.T, dir string, used map[string]float64) {
 	t.Helper()
+	pinNonHandoffQuotaTest(t)
 	res := func(used float64) map[string]any {
 		return map[string]any{"kind": "consumption", "limit": 100, "remaining": 100 - used,
 			"resetsAt": "2099-01-01T00:00:00Z", "unit": "percent", "used": used,

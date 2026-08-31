@@ -55,6 +55,8 @@ func TestRouteSucceedsWhenDecisionLogWriteFails(t *testing.T) {
 		"HERD_NO_CLAUDE=0",
 		"HERD_ROUTE_DECISION_LOG=" + logAsDir,
 		"HERD_OPENUSAGE_BIN=" + filepath.Join(providerPath, "openusage"),
+		"HERD_QUOTA_HANDOFF_REQUIRED=0",
+		"HERD_QUOTA_HANDOFF_BIN=",
 		"HERD_STATE_DIR=" + filepath.Join(dir, "state"),
 		"XDG_STATE_HOME=" + filepath.Join(dir, "state"),
 		"HERDR_ROUTE_STATE_DIR=" + filepath.Join(dir, "routing-state"),

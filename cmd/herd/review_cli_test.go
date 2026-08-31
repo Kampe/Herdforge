@@ -2619,6 +2619,7 @@ func TestReviewCLI_CandidateIndexMergedDiscovery(t *testing.T) {
 // snapshot instead of the machine's live provider balances.
 func pinSubprocessQuota(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
+	cmd.Env = nonHandoffQuotaEnv(cmd.Env)
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "openusage")
 	body := `{"generatedAt":"2026-08-26T00:00:00.000Z","schema":"openusage.limits.v1","providers":{` +

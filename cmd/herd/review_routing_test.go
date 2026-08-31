@@ -54,6 +54,7 @@ func TestModelWithoutProviderIsRejected(t *testing.T) {
 // QA must not reject a healthy exact Gemini request, and the live probe must
 // target the exact Gemini model rather than a healthy sibling.
 func TestExactReviewModelOverrideUsesItsOwnHealthyPool(t *testing.T) {
+	pinNonHandoffQuotaTest(t)
 	usage.InvalidateSnapshotCache()
 	t.Cleanup(usage.InvalidateSnapshotCache)
 
@@ -202,6 +203,7 @@ type exactReviewRouteFixture struct {
 
 func installExactReviewRouteFixture(t *testing.T, quota, providerProbe string) exactReviewRouteFixture {
 	t.Helper()
+	pinNonHandoffQuotaTest(t)
 	dir := t.TempDir()
 	probeLog := filepath.Join(dir, "provider-probes.log")
 	if providerProbe == "" {

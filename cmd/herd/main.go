@@ -7464,11 +7464,13 @@ func liveScorer() resolve.RouteScorer {
 	}
 }
 
-// liveRouteCount reconciles concurrency against the live Herdr roster. The
-// roster only identifies the harness; pane argv supplies the routed model.
-// Counting by harness alone lets unrelated Claude lanes consume the
-// coordinator's Fable slots and permanently strand a relaunch after a crash.
-func liveRouteCount(provider, model, pool string) (int, error) {
+// liveRouteCount reconciles concurrency against the live Herdr roster at the
+// authenticated provider-account boundary. Quota pools remain independently
+// metered, but sibling models on one provider still occupy the same account's
+// live slots: a Luna process must therefore count against a Spark candidate.
+// The exact model and pool stay in the probe signature because the router uses
+// them to select quota state and its cap; occupancy itself is provider-wide.
+func liveRouteCount(provider, _, _ string) (int, error) {
 	agents, err := herdr.AgentList()
 	if err != nil {
 		return 0, err
@@ -7481,21 +7483,7 @@ func liveRouteCount(provider, model, pool string) (int, error) {
 		if !strings.EqualFold(agent.Kind, provider) {
 			continue
 		}
-		processes, processErrs := herdr.PaneProcessArgv(agent.PaneID)
-		if len(processErrs) > 0 && len(processes) == 0 {
-			return 0, fmt.Errorf("agent %q process argv: %v", agent.Name, processErrs[0])
-		}
-		matched := false
-		for _, process := range processes {
-			routedModel := quotasup.ModelFromArgv(process.Argv)
-			if routedModel == model && quotasup.QuotaPool(provider, routedModel) == pool {
-				matched = true
-				break
-			}
-		}
-		if matched {
-			count++
-		}
+		count++
 	}
 	return count, nil
 }

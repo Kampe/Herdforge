@@ -38,6 +38,7 @@ func TestSnapshotTTLIsShortAndOverridable(t *testing.T) {
 // A held reading is reused only while it is young, and its AGE is returned so a
 // caller can report what it acted on instead of implying the number was live.
 func TestCachedSnapshotReportsItsAge(t *testing.T) {
+	pinNonHandoffQuotaTest(t)
 	InvalidateSnapshotCache()
 	quotaCache.Lock()
 	quotaCache.snap = &UsageSnapshot{}
@@ -78,6 +79,7 @@ func TestInvalidateForcesARefetch(t *testing.T) {
 // which is exactly where the 29-272 seconds were spent. Caught by measuring two
 // consecutive launches and seeing no improvement the cache could account for.
 func TestPersistedReadingSurvivesAcrossProcesses(t *testing.T) {
+	pinNonHandoffQuotaTest(t)
 	dir := t.TempDir()
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "q.json"))
 
@@ -115,6 +117,7 @@ func TestFreshReceiveTimeCannotRestampAStaleHandoff(t *testing.T) {
 // Aged-out, corrupt and missing readings all fetch live. A cache is an
 // optimisation and must never be a source of truth it cannot prove.
 func TestUnusableReadingsFallThroughToLive(t *testing.T) {
+	pinNonHandoffQuotaTest(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "q.json")
 	t.Setenv("HERD_QUOTA_CACHE_PATH", path)

@@ -721,9 +721,11 @@ type Probes struct {
 	ProviderProbe func(provider, model string) (bool, string)
 	// Now supplies the clock for cooldown expiry.
 	Now func() time.Time
-	// LiveCount reports the number of live agents using the exact routed
-	// provider/model/pool tuple. A nil function preserves library callers that
-	// do not have a live Herdr roster; production route commands install it.
+	// LiveCount reports the number of live agents sharing the routed provider
+	// account. Model and pool remain explicit inputs so the caller can retain
+	// exact quota-pool evidence and derive that pool's concurrency cap; they do
+	// not imply that independently metered pools have independent login slots.
+	// A nil function preserves library callers without a live Herdr roster.
 	LiveCount func(provider, model, pool string) (int, error)
 }
 
@@ -1133,11 +1135,11 @@ func (r *SurfaceRouter) Pick(shape, requestedProvider, excludedFamily string) (*
 		// retries the independently metered spark model before abandoning codex.
 		if !ok && provider == "codex" && model != "gpt-5.3-codex-spark" &&
 			strings.Contains(detail, "exhausted") {
-			if ok2, d2 := r.available("codex", "gpt-5.3-codex-spark", "spark"); ok2 {
-				model = "gpt-5.3-codex-spark"
+			model = "gpt-5.3-codex-spark"
+			pool = "spark"
+			ok, detail = r.available("codex", model, pool)
+			if ok {
 				modelOverride["codex"] = model
-				pool = "spark"
-				ok, detail = true, d2
 			}
 		}
 		// AGY Gemini pool fallback: exhausted nonGemini must not strand work

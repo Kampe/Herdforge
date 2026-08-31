@@ -11,8 +11,30 @@ import (
 	"time"
 )
 
+func pinNonHandoffQuotaTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("HERD_QUOTA_HANDOFF_REQUIRED", "0")
+	t.Setenv("HERD_QUOTA_HANDOFF_BIN", "")
+}
+
+func nonHandoffQuotaEnv(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	out := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "HERD_QUOTA_HANDOFF_REQUIRED=") ||
+			strings.HasPrefix(entry, "HERD_QUOTA_HANDOFF_BIN=") {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, "HERD_QUOTA_HANDOFF_REQUIRED=0", "HERD_QUOTA_HANDOFF_BIN=")
+}
+
 func installUnmeteredUsageFixture(t *testing.T) string {
 	t.Helper()
+	pinNonHandoffQuotaTest(t)
 	dir := t.TempDir()
 	openusage := filepath.Join(dir, "openusage")
 	snapshot := `{"generatedAt":"2026-08-30T15:00:00Z","providers":{"grok":{"displayName":"Grok","entitlement":"unmetered","resources":{},"stale":false}}}`
