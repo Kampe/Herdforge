@@ -15,6 +15,7 @@ var (
 	ErrCandidateSupersessionState       = errors.New("lifecycle: candidate supersession requires recovering state")
 	ErrCandidateSupersessionConflict    = errors.New("lifecycle: candidate supersession exact fence mismatch")
 	ErrCandidateSupersessionIntegration = errors.New("lifecycle: candidate supersession refused during active integration")
+	ErrCandidateSupersessionEncoding    = errors.New("candidate supersession: encode evidence")
 )
 
 // CandidateSupersessionRequest is the fully prevalidated authority packet for
@@ -59,6 +60,17 @@ type CandidateSupersessionEvidence struct {
 	BuilderFamily   string `json:"builder_family"`
 }
 
+// EncodeCandidateSupersessionEvidence is the single owner of candidate
+// supersession JSON encoding and its failure contract. The command adapter and
+// lifecycle transaction encode different evidence shapes through this helper.
+func EncodeCandidateSupersessionEvidence(evidence any) ([]byte, error) {
+	payload, err := json.Marshal(evidence)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCandidateSupersessionEncoding, err)
+	}
+	return payload, nil
+}
+
 func validateCandidateSupersessionRequest(req CandidateSupersessionRequest) error {
 	for name, value := range map[string]string{
 		"task_ref": req.TaskRef, "task_id": req.TaskID, "project_id": req.ProjectID,
@@ -97,9 +109,9 @@ func (m *Machine) SupersedeCandidate(req CandidateSupersessionRequest) (Transiti
 		PriorSequence: req.ExpectedSequence, BuilderSession: req.BuilderSession,
 		BuilderModel: req.BuilderModel, BuilderFamily: req.BuilderFamily,
 	}
-	payloadBytes, err := json.Marshal(evidence)
+	payloadBytes, err := EncodeCandidateSupersessionEvidence(evidence)
 	if err != nil {
-		return TransitionResult{}, fmt.Errorf("candidate supersession: encode evidence: %w", err)
+		return TransitionResult{}, err
 	}
 	payload := string(payloadBytes)
 

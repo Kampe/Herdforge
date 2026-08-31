@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/committime"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 )
 
 func validShotSupersessionFacts() shotSupersessionFacts {
@@ -26,6 +32,42 @@ func validShotSupersessionFacts() shotSupersessionFacts {
 		BaseSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", GitBaseSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		GitHeadSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Clean: true, ReplacementReachable: true, LiveLaunch: true,
 	}
+}
+
+func TestShotCandidateSupersessionEncodingHasOneLifecycleOwner(t *testing.T) {
+	_, ownerErr := lifecycle.EncodeCandidateSupersessionEvidence(make(chan struct{}))
+	if !errors.Is(ownerErr, lifecycle.ErrCandidateSupersessionEncoding) {
+		t.Fatalf("lifecycle encoder did not expose its shared error owner: %v", ownerErr)
+	}
+
+	source, err := os.ReadFile("shot_supersession.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), "lifecycle.EncodeCandidateSupersessionEvidence(facts)") {
+		t.Fatal("shot supersession does not use the shared lifecycle evidence encoder")
+	}
+
+	file, err := parser.ParseFile(token.NewFileSet(), "shot_supersession.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		value, unquoteErr := strconv.Unquote(literal.Value)
+		if unquoteErr != nil {
+			t.Fatalf("unquote %s: %v", literal.Value, unquoteErr)
+		}
+		value = strings.ToLower(value)
+		if strings.Contains(value, "supersession") &&
+			(strings.Contains(value, "encode") || strings.Contains(value, "marshal") || strings.Contains(value, "serializ")) {
+			t.Errorf("cmd/herd independently owns supersession encoding message %q", value)
+		}
+		return true
+	})
 }
 
 func TestValidateShotSupersessionFactsRejectsEveryAuthorityAndGitMismatch(t *testing.T) {
