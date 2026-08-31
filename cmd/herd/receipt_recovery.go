@@ -92,8 +92,8 @@ func authenticatedRecoveryIdentity(ctx context.Context, root, targetDir, ref, br
 	if err != nil || head != candidate {
 		return zero, fmt.Errorf("recovery receipt: candidate is not exact worktree HEAD")
 	}
-	if !shotGitOK(ctx, targetDir, "merge-base", "--is-ancestor", prior.BaseSHA, candidate) ||
-		!shotGitOK(ctx, targetDir, "merge-base", "--is-ancestor", candidate, branch) {
+	if !commitIsAncestor(targetDir, prior.BaseSHA, candidate) ||
+		!commitIsAncestor(targetDir, candidate, branch) {
 		return zero, fmt.Errorf("recovery receipt: candidate is not reachable from the authenticated base and branch")
 	}
 	statusOut, err := shotGit(ctx, targetDir, "status", "--porcelain", "--untracked-files=all")

@@ -134,7 +134,7 @@ func supersedeShotLifecycleCandidate(ctx context.Context, root, ref string, leas
 	}
 	evidenceJSON, err := json.Marshal(facts)
 	if err != nil {
-		return fmt.Errorf("candidate supersession: encode evidence: %w", err)
+		return fmt.Errorf("shot: encode candidate supersession facts: %w", err)
 	}
 	sum := sha256.Sum256(evidenceJSON)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
@@ -238,8 +238,8 @@ func collectShotSupersessionFacts(ctx context.Context, root, ref string, lease i
 		return facts, authority, fmt.Errorf("candidate supersession: inspect worktree cleanliness: %w", err)
 	}
 	facts.Clean = status == ""
-	baseReachable := shotGitOK(ctx, cwd, "merge-base", "--is-ancestor", authority.BaseSHA, sha)
-	branchReachable := shotGitOK(ctx, cwd, "merge-base", "--is-ancestor", sha, authority.Branch)
+	baseReachable := commitIsAncestor(cwd, authority.BaseSHA, sha)
+	branchReachable := commitIsAncestor(cwd, sha, authority.Branch)
 	commitExists := shotGitOK(ctx, cwd, "cat-file", "-e", sha+"^{commit}")
 	facts.ReplacementReachable = baseReachable && branchReachable && commitExists
 
