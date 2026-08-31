@@ -10,6 +10,36 @@ import (
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	if err := os.Unsetenv(EnvHeld); err != nil {
+		fmt.Fprintf(os.Stderr, "clear inherited %s: %v\n", EnvHeld, err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
+func TestSemaphoreInheritedHeldMarkerStillAcquiresRealSlot(t *testing.T) {
+	s, err := New(filepath.Join(t.TempDir(), "slots"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.Acquire(context.Background(), "inherited-marker-regression", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := lease.Release(); err != nil {
+			t.Errorf("release real slot: %v", err)
+		}
+	})
+	if lease.held || lease.slot == "" {
+		t.Fatal("inherited held marker bypassed real filesystem acquisition")
+	}
+	if _, err := os.Stat(filepath.Join(lease.slot, "holder")); err != nil {
+		t.Fatalf("real slot holder was not created: %v", err)
+	}
+}
+
 func TestSemaphoreNPlusOneTimesOutAndReleaseUnblocks(t *testing.T) {
 	s, err := New(filepath.Join(t.TempDir(), "slots"), 2)
 	if err != nil {

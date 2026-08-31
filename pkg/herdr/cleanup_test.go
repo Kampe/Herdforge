@@ -169,19 +169,57 @@ func TestAuthorizeAndLiveCloseRemainSeparate(t *testing.T) {
 }
 
 func TestLegacyAgentListCannotAuthorizeCandidate(t *testing.T) {
-	// Status-based SelectCleanupCandidates is observe-only (main behavior).
-	// It must never become a close authorization: mutation Cleanup and
-	// unfenced TabClose remain BLOCKED without FAC-180 compare-and-close.
-	got := SelectCleanupCandidates([]AgentEntry{{Name: "task-fac-72", Status: "done", TabID: "wF:t1"}}, nil)
-	if len(got) != 1 {
-		t.Fatalf("observe candidates = %+v, want 1 status-based candidate", got)
+	tests := []struct {
+		name           string
+		inventory      string
+		inventoryErr   error
+		wantCandidates int
+		wantErrors     int
+		wantBlocked    bool
+	}{
+		{name: "empty", inventory: `{"result":{"agents":[],"type":"agents"}}`},
+		{name: "active", inventory: `{"result":{"agents":[{"name":"task-fac-72","agent_status":"working","tab_id":"wF:t1"}],"type":"agents"}}`},
+		{name: "done", inventory: `{"result":{"agents":[{"name":"task-fac-72","agent_status":"done","tab_id":"wF:t1"}],"type":"agents"}}`, wantCandidates: 1, wantErrors: 1, wantBlocked: true},
+		{name: "malformed", inventory: `{`, wantErrors: 1},
+		{name: "unavailable", inventoryErr: errors.New("herdr unavailable"), wantErrors: 1},
 	}
-	_, errs := Cleanup(nil, false)
-	if len(errs) == 0 {
-		t.Fatal("mutation Cleanup must fail closed without FAC-180 fence")
-	}
-	if err := TabClose(got[0].TabID); err == nil {
-		t.Fatal("unfenced TabClose must fail closed")
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			restore := SetRunHerdrForTest(func(args ...string) (string, error) {
+				calls++
+				if len(args) != 2 || args[0] != "agent" || args[1] != "list" {
+					t.Fatalf("unexpected herdr call: %v", args)
+				}
+				return tc.inventory, tc.inventoryErr
+			})
+			t.Cleanup(restore)
+
+			got, errs := Cleanup(nil, false)
+			if calls != 1 {
+				t.Fatalf("agent list calls = %d, want 1", calls)
+			}
+			if len(got) != tc.wantCandidates {
+				t.Fatalf("candidates = %+v, want %d", got, tc.wantCandidates)
+			}
+			if len(errs) != tc.wantErrors {
+				t.Fatalf("errors = %v, want %d", errs, tc.wantErrors)
+			}
+
+			if tc.wantBlocked {
+				var blocked *CloseUnavailableError
+				if !errors.As(errs[0], &blocked) {
+					t.Fatalf("mutation Cleanup error = %T, want *CloseUnavailableError", errs[0])
+				}
+				if blocked.TabID != got[0].TabID {
+					t.Fatalf("blocked tab = %q, want %q", blocked.TabID, got[0].TabID)
+				}
+				if err := TabClose(got[0].TabID); !errors.As(err, &blocked) {
+					t.Fatalf("unfenced TabClose error = %T, want *CloseUnavailableError", err)
+				}
+			}
+		})
 	}
 }
 
