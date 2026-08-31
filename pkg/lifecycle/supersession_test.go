@@ -38,6 +38,20 @@ func supersessionRequest(task, oldSHA, newSHA string) CandidateSupersessionReque
 	}
 }
 
+func TestEncodeCandidateSupersessionEvidenceOwnsUnsupportedTypeError(t *testing.T) {
+	_, err := EncodeCandidateSupersessionEvidence(make(chan struct{}))
+	if err == nil {
+		t.Fatal("unsupported evidence type encoded successfully")
+	}
+	if !errors.Is(err, ErrCandidateSupersessionEncoding) {
+		t.Fatalf("encoding error lost shared owner: %v", err)
+	}
+	var unsupported *json.UnsupportedTypeError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("encoding error lost JSON cause: %v", err)
+	}
+}
+
 func TestCandidateSupersessionPreservesHistoryAndWinnerRetryIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lifecycle.db")
 	oldSHA, newSHA := testSHA("a"), testSHA("b")

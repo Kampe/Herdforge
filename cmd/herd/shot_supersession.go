@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -132,9 +131,9 @@ func supersedeShotLifecycleCandidate(ctx context.Context, root, ref string, leas
 	if current == nil || current.State != lifecycle.StateRecovering || current.CandidateSHA == "" || current.CandidateSHA == sha {
 		return fmt.Errorf("candidate supersession: lifecycle must hold a distinct candidate in Recovering")
 	}
-	evidenceJSON, err := json.Marshal(facts)
+	evidenceJSON, err := lifecycle.EncodeCandidateSupersessionEvidence(facts)
 	if err != nil {
-		return fmt.Errorf("shot: encode candidate supersession facts: %w", err)
+		return err
 	}
 	sum := sha256.Sum256(evidenceJSON)
 	digest := "sha256:" + hex.EncodeToString(sum[:])
