@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -535,7 +536,7 @@ func (d *Drain) freshness(ctx context.Context, sha, branch, worktree string) Pin
 	if _, e := gitOut(ctx, d.RepoRoot, "cat-file", "-e", sha+"^{commit}"); e != nil {
 		return p
 	}
-	cmd := procsignal.CommandContext(ctx, "git", "merge-tree", "--write-tree", "--merge-base="+strings.TrimSpace(mb), "origin/main", sha)
+	cmd := procsignal.CommandContext(ctx, "git", "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base="+strings.TrimSpace(mb), "origin/main", sha)
 	cmd.Dir = d.RepoRoot
 	if e := cmd.Run(); e == nil {
 		p.Conflict = ConflictClean
@@ -559,7 +560,7 @@ func mergeTreeCapable(ctx context.Context, dir string) bool {
 	if v, ok := mergeTreeCache.Load(dir); ok {
 		return v.(bool)
 	}
-	c := procsignal.CommandContext(ctx, "git", "merge-tree", "--write-tree", "--merge-base=HEAD", "HEAD", "HEAD")
+	c := procsignal.CommandContext(ctx, "git", "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base=HEAD", "HEAD", "HEAD")
 	c.Dir = dir
 	ok := c.Run() == nil
 	mergeTreeCache.Store(dir, ok)

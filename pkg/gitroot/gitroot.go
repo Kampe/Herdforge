@@ -22,6 +22,11 @@ import (
 	"strings"
 )
 
+// MergeTreeWriteFlag asks git merge-tree to write and return the merged tree
+// object. Keep this repository-wide Git capability rule here so conflict
+// probes and landing proofs cannot drift onto different invocations.
+const MergeTreeWriteFlag = "--write-tree"
+
 // CommonDir returns the absolute shared git directory for the repository
 // containing startDir.
 //
