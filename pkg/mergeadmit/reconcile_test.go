@@ -222,3 +222,127 @@ func TestReconcileLandedReducedProvenanceRefusesMissingMinimum(t *testing.T) {
 		})
 	}
 }
+
+// FAC-681: GitHub rebases a reviewed stack onto the current main. A main-side
+// context change can alter an intermediate stable patch ID even though the
+// complete reviewed change is preserved. The generated empty worktree anchor
+// is administrative history, not one of the two reviewed content commits.
+func TestProveEquivalentLandedContextChangedStack(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "shared.txt", "alpha\ncontext one\ncontext two\nold context\ncontext four\nomega\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "work")
+	run(t, dir, "git", "commit", "-q", "--allow-empty", "-m", "worktree anchor")
+	first := commit(t, dir, "shared.txt", "alpha\nreviewed one\ncontext one\ncontext two\nold context\ncontext four\nomega\n", "reviewed one")
+	candidate := commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+
+	run(t, dir, "git", "checkout", "-q", "-B", "landed", base)
+	commit(t, dir, "shared.txt", "alpha\ncontext one\ncontext two\nnew main context\ncontext four\nomega\n", "main advances")
+	landedFirst := commit(t, dir, "shared.txt", "alpha\nreviewed one\ncontext one\ncontext two\nnew main context\ncontext four\nomega\n", "reviewed one")
+	landed := commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+
+	wantFirst, err := commitPatchID(dir, first)
+	if err != nil {
+		t.Fatalf("candidate first patch id: %v", err)
+	}
+	gotFirst, err := commitPatchID(dir, landedFirst)
+	if err != nil {
+		t.Fatalf("landed first patch id: %v", err)
+	}
+	if wantFirst == gotFirst {
+		t.Fatal("fixture first patch IDs match; this does not reproduce FAC-681")
+	}
+
+	proof, err := ProveEquivalentLanded(dir, ProofRequest{
+		BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed,
+	})
+	if err != nil {
+		t.Fatalf("context-changed stacked proof: %v", err)
+	}
+	if proof.MergeSHA != landed {
+		t.Fatalf("merge sha = %s, want landed stack tip %s", proof.MergeSHA, landed)
+	}
+	if proof.Method != "combined-range-replay-on-landed" {
+		t.Fatalf("method = %q", proof.Method)
+	}
+
+	l := newLedger(t, dir)
+	launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
+	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
+	g := &Gate{
+		RepoDir: dir, Ledger: l, Policy: testPolicy(),
+		Live: LiveState{OriginMain: StaticProbe(landed)},
+	}
+	receipt, err := g.ReconcileLanded(okRequest(base, candidate))
+	if err != nil {
+		t.Fatalf("reconcile context-changed stack: %v", err)
+	}
+	if receipt.BaseSHA != base || receipt.CandidateSHA != candidate || receipt.MergeSHA != landed {
+		t.Fatalf("receipt identity base=%s candidate=%s merge=%s", short(receipt.BaseSHA), short(receipt.CandidateSHA), short(receipt.MergeSHA))
+	}
+	readBack, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, testRef))
+	if err != nil {
+		t.Fatalf("read back reconciled receipt: %v", err)
+	}
+	if readBack.Digest != receipt.Digest || readBack.Digest != readBack.ComputeDigest() {
+		t.Fatal("reconciled receipt did not read back with its exact sealed identity")
+	}
+}
+
+func TestProveEquivalentLandedContextChangedStackMutationControls(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutation string
+	}{
+		{name: "omitted reviewed commit", mutation: "omit"},
+		{name: "changed reviewed commit", mutation: "change"},
+		{name: "reordered reviewed commits", mutation: "reorder"},
+		{name: "substituted unreviewed commit", mutation: "substitute"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := gitRepo(t)
+			base := commit(t, dir, "shared.txt", "alpha\ncontext one\ncontext two\nold context\ncontext four\nomega\n", "base")
+			run(t, dir, "git", "checkout", "-q", "-b", "work")
+			first := commit(t, dir, "shared.txt", "alpha\nreviewed one\ncontext one\ncontext two\nold context\ncontext four\nomega\n", "reviewed one")
+			candidate := commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+
+			run(t, dir, "git", "checkout", "-q", "-B", "landed", base)
+			commit(t, dir, "shared.txt", "alpha\ncontext one\ncontext two\nnew main context\ncontext four\nomega\n", "main advances")
+			switch tc.mutation {
+			case "omit":
+				commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+			case "change":
+				commit(t, dir, "shared.txt", "alpha\naltered one\ncontext one\ncontext two\nnew main context\ncontext four\nomega\n", "altered one")
+				commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+			case "reorder":
+				commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+				commit(t, dir, "shared.txt", "alpha\nreviewed one\ncontext one\ncontext two\nnew main context\ncontext four\nomega\n", "reviewed one")
+			case "substitute":
+				commit(t, dir, "unreviewed.txt", "not reviewed\n", "unreviewed substitute")
+				commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
+			}
+			landed := revParse(t, dir, "HEAD")
+
+			// The reordered control must truly end in the other reviewed patch;
+			// otherwise it would not isolate the ordered endpoint binding.
+			if tc.mutation == "reorder" {
+				candidateTip, err := commitPatchID(dir, candidate)
+				if err != nil {
+					t.Fatalf("candidate tip patch: %v", err)
+				}
+				landedTip, err := commitPatchID(dir, landed)
+				if err != nil {
+					t.Fatalf("landed tip patch: %v", err)
+				}
+				if candidateTip == landedTip {
+					t.Fatal("reordered fixture retained the reviewed tip patch")
+				}
+			}
+
+			if _, err := ProveEquivalentLanded(dir, ProofRequest{
+				BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed,
+			}); err == nil {
+				t.Fatalf("proof admitted %s (candidate first commit %s)", tc.name, short(first))
+			}
+		})
+	}
+}
