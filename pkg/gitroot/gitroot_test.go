@@ -5,8 +5,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestMergeTreeWriteFlag(t *testing.T) {
+	want := strings.Join([]string{"", "", "write", "tree"}, "-")
+	if MergeTreeWriteFlag != want {
+		t.Fatalf("merge-tree write flag = %q, want %q", MergeTreeWriteFlag, want)
+	}
+}
 
 func grGit(t *testing.T, dir string, args ...string) {
 	t.Helper()

@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
@@ -371,7 +372,7 @@ func matchCombinedRangeReplay(repoDir, base, candidate string, candidateContent,
 		if start > 0 {
 			windowBase = landedCommits[start-1]
 		}
-		replayedTree, mergeErr := gitOut(repoDir, "merge-tree", "--write-tree", "--merge-base", base, windowBase, candidate)
+		replayedTree, mergeErr := gitOut(repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, windowBase, candidate)
 		if mergeErr != nil {
 			continue
 		}
