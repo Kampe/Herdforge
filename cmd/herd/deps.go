@@ -279,11 +279,26 @@ func runDepsMigrate() {
 	}
 	store := deps.StoreFor(tp, cfg.TaskProvider.ProjectID)
 	ctx := context.Background()
+	if refSelected {
+		var cancel context.CancelFunc
+		ctx, cancel = deps.WithMigrationRequestBudget(ctx, providerReadBudget())
+		defer cancel()
+		if *apply {
+			ctx = deps.WithMigrationComponentProgress(ctx, func(component deps.MigrationComponentProgress) {
+				b, _ := json.Marshal(component)
+				fmt.Fprintf(os.Stderr, "herd deps migrate apply: component %s\n", b)
+			})
+		}
+	}
 
 	// Default path: revision-fenced dry-run. Workers ship this; they never apply live.
 	if !*apply {
 		totalCards, processedCards := 0, 0
 		progress := func(item deps.MigrateItem, processed, total int) {
+			if item.Action == deps.MigrationActionComponentProgress {
+				fmt.Fprintf(os.Stderr, "herd deps migrate dry-run: component %s\n", item.Detail)
+				return
+			}
 			totalCards, processedCards = total, processed
 			fmt.Fprintf(os.Stderr, "herd deps migrate dry-run: processed %d/%d cards (current=%s action=%s)\n", processed, total, item.Ref, item.Action)
 		}

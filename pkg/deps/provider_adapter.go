@@ -406,7 +406,7 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 		return nil, err
 	}
 	if migrationScopedSnapshot(ctx) {
-		return s.snapshotGraphForMigrationTask(ctx, rp, taskRef, taskID, desired)
+		return s.snapshotGraphForMigrationTask(ctx, rp, nil, taskRef, taskID, desired)
 	}
 	if err := s.hydrateFresh(ctx); err != nil {
 		return nil, err
@@ -489,31 +489,37 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 	return s.snapshotFromRelations(ctx, rels)
 }
 
+// SnapshotGraphForResolvedMigrationTask seeds the exact component walk with
+// the root already authenticated by PlanMigrationForRef. This is intentionally
+// separate from the launch snapshot API: launch callers may only have an ID,
+// while exact migration must not fetch its root twice.
+func (s *ProviderStore) SnapshotGraphForResolvedMigrationTask(ctx context.Context, task *provider.Task, desired []DependencyEdge) (*GraphSnapshot, error) {
+	if s == nil || s.TP == nil || task == nil {
+		return nil, ErrCapabilityUnknown
+	}
+	rp, err := s.rel()
+	if err != nil {
+		return nil, err
+	}
+	return s.snapshotGraphForMigrationTask(ctx, rp, task, Ref(task.Ref), TaskID(task.ID), desired)
+}
+
 // snapshotGraphForMigrationTask performs the same complete-component walk as
 // SnapshotGraphForTask without hydrating the project task list. Every task it
 // encounters is fetched by exact immutable ID and checked against the selected
 // project, so an endpoint cannot smuggle an external or mismatched identity
 // into the scoped graph.
-func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp provider.RelationProvider, taskRef Ref, taskID TaskID, desired []DependencyEdge) (*GraphSnapshot, error) {
-	queue := make([]string, 0, 1+len(desired)*2)
-	seenTasks := map[string]bool{}
+func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp provider.RelationProvider, seed *provider.Task, taskRef Ref, taskID TaskID, desired []DependencyEdge) (*GraphSnapshot, error) {
+	rootRef := strings.TrimSpace(string(taskRef))
 	tasksByID := map[string]*provider.Task{}
 	tasksByRef := map[string]*provider.Task{}
+	seenTasks := map[string]bool{}
+	tasksRead := 0
+	relationSetsRead := 0
 
-	addTask := func(id TaskID, ref Ref) error {
-		lookup := strings.TrimSpace(string(id))
-		if lookup == "" {
-			lookup = strings.TrimSpace(string(ref))
-		}
-		if lookup == "" {
-			return fmt.Errorf("deps: scoped migration graph task identity missing")
-		}
-		task, err := s.TP.GetTask(ctx, lookup)
-		if err != nil {
-			return fmt.Errorf("deps: scoped migration graph get %s: %w", lookup, err)
-		}
+	acceptTask := func(task *provider.Task, id TaskID, ref Ref) error {
 		if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
-			return fmt.Errorf("deps: scoped migration graph task %s has incomplete identity", lookup)
+			return fmt.Errorf("deps: scoped migration graph task has incomplete identity")
 		}
 		if id.Valid() && task.ID != string(id) {
 			return fmt.Errorf("deps: scoped migration graph task id mismatch: requested %s got %s", id, task.ID)
@@ -533,53 +539,155 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 		cp := *task
 		tasksByID[cp.ID] = &cp
 		tasksByRef[cp.Ref] = &cp
-		if !seenTasks[cp.ID] {
-			seenTasks[cp.ID] = true
-			queue = append(queue, cp.ID)
-		}
 		return nil
 	}
 
-	if err := addTask(taskID, taskRef); err != nil {
+	if seed == nil {
+		lookup := strings.TrimSpace(string(taskID))
+		if lookup == "" {
+			lookup = rootRef
+		}
+		resolved, err := retryMigrationProviderRead(ctx, func() (*provider.Task, error) {
+			return s.TP.GetTask(ctx, lookup)
+		})
+		if err != nil {
+			return nil, migrationTimeout(ctx, "tasks", rootRef, tasksRead, relationSetsRead, 1,
+				fmt.Errorf("deps: scoped migration graph get %s: %w", lookup, err))
+		}
+		seed = resolved
+	}
+	if err := acceptTask(seed, taskID, taskRef); err != nil {
 		return nil, err
 	}
+	seenTasks[seed.ID] = true
+	tasksRead++
+	frontier := []string{seed.ID}
+	emitMigrationComponentProgress(ctx, MigrationComponentProgress{
+		Phase: "tasks", Ref: rootRef, TasksRead: tasksRead, RelationSetsRead: relationSetsRead,
+		Pending: len(frontier), Deadline: migrationProgressDeadline(ctx),
+	})
+
 	for _, edge := range desired {
-		if err := addTask(edge.SourceID, edge.SourceRef); err != nil {
-			return nil, err
-		}
-		if err := addTask(edge.TargetID, edge.TargetRef); err != nil {
-			return nil, err
+		for _, endpoint := range []struct {
+			id  TaskID
+			ref Ref
+		}{{edge.SourceID, edge.SourceRef}, {edge.TargetID, edge.TargetRef}} {
+			if endpoint.id.Valid() && seenTasks[string(endpoint.id)] {
+				continue
+			}
+			lookup := strings.TrimSpace(string(endpoint.id))
+			if lookup == "" {
+				lookup = strings.TrimSpace(string(endpoint.ref))
+			}
+			if lookup == "" {
+				return nil, fmt.Errorf("deps: scoped migration graph task identity missing")
+			}
+			resolved, err := retryMigrationProviderRead(ctx, func() (*provider.Task, error) {
+				return s.TP.GetTask(ctx, lookup)
+			})
+			if err != nil {
+				return nil, migrationTimeout(ctx, "tasks", rootRef, tasksRead, relationSetsRead, len(frontier)+1,
+					fmt.Errorf("deps: scoped migration graph get %s: %w", lookup, err))
+			}
+			if err := acceptTask(resolved, endpoint.id, endpoint.ref); err != nil {
+				return nil, err
+			}
+			if !seenTasks[resolved.ID] {
+				seenTasks[resolved.ID] = true
+				frontier = append(frontier, resolved.ID)
+				tasksRead++
+			}
 		}
 	}
 
 	seenRelations := map[string]provider.Relation{}
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		s.ListRelCalls.Add(1)
-		rels, err := rp.ListRelations(ctx, id)
-		if err != nil {
-			return nil, fmt.Errorf("deps: scoped migration graph list %s: %w", id, err)
-		}
-		for _, relation := range rels {
-			if relation.ID == "" || (relation.SourceTaskID != id && relation.TargetTaskID != id) {
-				return nil, fmt.Errorf("deps: scoped migration graph relation %q is unrelated to task %s", relation.ID, id)
+	for len(frontier) > 0 {
+		sort.Strings(frontier)
+		relationReads := runMigrationReadBatch(len(frontier), func(index int) migrationRelationRead {
+			id := frontier[index]
+			s.ListRelCalls.Add(1)
+			relations, err := retryMigrationProviderRead(ctx, func() ([]provider.Relation, error) {
+				return rp.ListRelations(ctx, id)
+			})
+			return migrationRelationRead{id: id, relations: relations, err: err}
+		})
+		newIDs := map[string]bool{}
+		var firstErr error
+		frontierRelationSetsRead := 0
+		for index, read := range relationReads {
+			if read.err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("deps: scoped migration graph list %s: %w", read.id, read.err)
+				}
+				continue
 			}
-			if prior, exists := seenRelations[relation.ID]; exists && !relationEqual(prior, relation) {
-				return nil, fmt.Errorf("deps: scoped migration graph relation %s disagrees across endpoint listings", relation.ID)
-			}
-			seenRelations[relation.ID] = relation
-			if !seenTasks[relation.SourceTaskID] {
-				if err := addTask(TaskID(relation.SourceTaskID), ""); err != nil {
-					return nil, err
+			relationSetsRead++
+			frontierRelationSetsRead++
+			for _, relation := range read.relations {
+				if relation.ID == "" || (relation.SourceTaskID != read.id && relation.TargetTaskID != read.id) {
+					return nil, fmt.Errorf("deps: scoped migration graph relation %q is unrelated to task %s", relation.ID, read.id)
+				}
+				if prior, exists := seenRelations[relation.ID]; exists && !relationEqual(prior, relation) {
+					return nil, fmt.Errorf("deps: scoped migration graph relation %s disagrees across endpoint listings", relation.ID)
+				}
+				seenRelations[relation.ID] = relation
+				if !seenTasks[relation.SourceTaskID] {
+					newIDs[relation.SourceTaskID] = true
+				}
+				if !seenTasks[relation.TargetTaskID] {
+					newIDs[relation.TargetTaskID] = true
 				}
 			}
-			if !seenTasks[relation.TargetTaskID] {
-				if err := addTask(TaskID(relation.TargetTaskID), ""); err != nil {
-					return nil, err
-				}
-			}
+			emitMigrationComponentProgress(ctx, MigrationComponentProgress{
+				Phase: "relations", Ref: rootRef, TasksRead: tasksRead, RelationSetsRead: relationSetsRead,
+				Pending: len(frontier) - index - 1 + len(newIDs), Deadline: migrationProgressDeadline(ctx),
+			})
 		}
+		if firstErr != nil {
+			return nil, migrationTimeout(ctx, "relations", rootRef, tasksRead, relationSetsRead, len(frontier)-frontierRelationSetsRead+len(newIDs), firstErr)
+		}
+
+		nextFrontier := make([]string, 0, len(newIDs))
+		for id := range newIDs {
+			if strings.TrimSpace(id) == "" {
+				return nil, fmt.Errorf("deps: scoped migration graph task identity missing")
+			}
+			nextFrontier = append(nextFrontier, id)
+		}
+		sort.Strings(nextFrontier)
+		taskReads := runMigrationReadBatch(len(nextFrontier), func(index int) migrationTaskRead {
+			id := nextFrontier[index]
+			task, err := retryMigrationProviderRead(ctx, func() (*provider.Task, error) {
+				return s.TP.GetTask(ctx, id)
+			})
+			return migrationTaskRead{id: id, task: task, err: err}
+		})
+		var taskErr error
+		frontierTasksRead := 0
+		for index, read := range taskReads {
+			if read.err != nil {
+				if taskErr == nil {
+					taskErr = fmt.Errorf("deps: scoped migration graph get %s: %w", read.id, read.err)
+				}
+				continue
+			}
+			if err := acceptTask(read.task, TaskID(read.id), ""); err != nil {
+				return nil, err
+			}
+			if !seenTasks[read.task.ID] {
+				seenTasks[read.task.ID] = true
+				tasksRead++
+				frontierTasksRead++
+			}
+			emitMigrationComponentProgress(ctx, MigrationComponentProgress{
+				Phase: "tasks", Ref: rootRef, TasksRead: tasksRead, RelationSetsRead: relationSetsRead,
+				Pending: len(nextFrontier) - index - 1, Deadline: migrationProgressDeadline(ctx),
+			})
+		}
+		if taskErr != nil {
+			return nil, migrationTimeout(ctx, "tasks", rootRef, tasksRead, relationSetsRead, len(nextFrontier)-frontierTasksRead, taskErr)
+		}
+		frontier = nextFrontier
 	}
 
 	s.mu.Lock()
@@ -596,6 +704,68 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 		rels = append(rels, relation)
 	}
 	return s.snapshotFromRelations(ctx, rels)
+}
+
+type migrationRelationRead struct {
+	id        string
+	relations []provider.Relation
+	err       error
+}
+
+type migrationTaskRead struct {
+	id   string
+	task *provider.Task
+	err  error
+}
+
+func runMigrationReadBatch[T any](count int, read func(int) T) []T {
+	results := make([]T, count)
+	if count == 0 {
+		return results
+	}
+	workers := min(count, DefaultMigrationFrontierConcurrency)
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				results[index] = read(index)
+			}
+		}()
+	}
+	for index := range count {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
+func retryMigrationProviderRead[T any](ctx context.Context, read func() (T, error)) (T, error) {
+	const maxAttempts = 2
+	var zero T
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		value, err := read()
+		if err == nil {
+			return value, nil
+		}
+		if provider.ClassifyOpError(err) != provider.OpTimeout || attempt == maxAttempts || ctx.Err() != nil {
+			return zero, err
+		}
+		timer := time.NewTimer(migrationSnapshotRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return zero, ctx.Err()
 }
 
 func (s *ProviderStore) snapshotFromRelations(ctx context.Context, rels []provider.Relation) (*GraphSnapshot, error) {
