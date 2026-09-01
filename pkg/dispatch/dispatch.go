@@ -390,6 +390,9 @@ type Dispatcher struct {
 	// dispatch owns the task and has admitted its worktree. Nil uses the
 	// production-safe executor; tests may inject an attributable failure seam.
 	Bootstrap WorktreeBootstrapper
+	// taskArtifacts is the FAC-666 generation-fenced packet/context publisher.
+	// Nil selects the production implementation; tests inject only phase faults.
+	taskArtifacts *taskArtifactPublisher
 
 	// health projects BLOCKED(provider_timeout) for board calls (FAC-150).
 	health dispatchHealth
@@ -414,6 +417,13 @@ func (d *Dispatcher) bootstrapWorktree(ctx context.Context, worktreePath string)
 		return fmt.Errorf("worktree bootstrap failed: %w\n  recovery: inspect .herd/bootstrap/receipt.json and repair the declared worktree_bootstrap command", err)
 	}
 	return nil
+}
+
+func (d *Dispatcher) taskArtifactPublisher() taskArtifactPublisher {
+	if d.taskArtifacts != nil {
+		return *d.taskArtifacts
+	}
+	return taskArtifactPublisher{}
 }
 
 // coordinatorName returns the reply target name for packets. An explicitly
@@ -884,11 +894,22 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	var scopeOwned bool
 	var scopeRelease scopefence.ReleaseRequest
 	worktreeCreated := false
+	artifactsCommitted := false
+	artifactWorktree := ""
 	// Exactly-one durable compensation WHILE owner+generation still held.
 	// Release only after durable compensate succeeds. On compensate failure
 	// retain the lease (Recovering) — never release-then-compensate (B can
 	// acquire and get stomped by stale A). Audit: h5d6pay5vamxvv277qtt5qmk.
 	failOwned := func(reason string, primary error) error {
+		// The commit receipt is the production consumer gate. Invalidate it on
+		// every post-publication failure before shared compensation/release so a
+		// mixed or abandoned pair can never launch under this failed dispatch.
+		if artifactsCommitted {
+			if aErr := invalidateTaskArtifacts(artifactWorktree); aErr != nil {
+				primary = errors.Join(primary, fmt.Errorf("invalidate task artifacts: %w", aErr))
+			}
+			artifactsCommitted = false
+		}
 		owns, oerr := own.StillOwns(ctx, tok)
 		if oerr != nil {
 			return errors.Join(primary, oerr)
@@ -1092,10 +1113,20 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		rolePath = ".herd/prompts/worker.md"
 	}
 
-	packet := buildTaskPacket(task, branch, rolePath, d.Config.TaskProvider.Type, d.Config.TaskProvider.ProjectID, lane, d.Config.Verification, ReplyTarget{
+	// Issue the signed task context first. Every packet identity and callback is
+	// then projected from this exact authority, never from the internal launch
+	// mutex generation (which may describe an older recovered dispatch).
+	baseReceipt := d.taskContext(task, wtInfo, branch, lane, opts)
+	tc0, err := d.signReceipt(baseReceipt)
+	if err != nil {
+		return nil, failOwned("task_context_write_failed",
+			fmt.Errorf("failed to sign task context: %w", err))
+	}
+
+	packet := buildTaskPacket(task, tc0.Branch, rolePath, tc0.ProviderType, tc0.ProjectID, lane, d.Config.Verification, ReplyTarget{
 		Name:             d.coordinatorName(),
 		ReviewSupervisor: d.reviewSupervisorName(),
-		LeaseGeneration:  tok.Generation,
+		LeaseGeneration:  tc0.LeaseGeneration,
 	})
 	if len(task.Residuals) > 0 {
 		section, residualErr := residual.PacketSection(task.Residuals)
@@ -1107,24 +1138,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if depProv != nil {
 		packet = packet + "\n" + deps.PacketSection(depProv)
 	}
-	packetPath := filepath.Join(wtInfo.Path, "TASK-PACKET.md")
-	if err := os.WriteFile(packetPath, []byte(packet), 0644); err != nil {
-		return nil, failOwned("task_packet_write_failed", fmt.Errorf("failed to write task packet: %w", err))
-	}
-
-	// 7b. Inject the task-provider context receipt (FAC-145): every isolated
-	// agent gets provider + project + task binding at spawn — NoLaunch
-	// worktrees included, so a later manual/review launch inherits it too.
-	baseReceipt := d.taskContext(task, wtInfo, branch, lane, opts)
-	tc0, err := d.signReceipt(baseReceipt)
+	packet, err = d.taskArtifactPublisher().Publish(wtInfo.Path, packet, tc0)
 	if err != nil {
-		return nil, failOwned("task_context_write_failed",
-			fmt.Errorf("failed to sign task context: %w", err))
+		return nil, failOwned("task_artifact_publish_failed",
+			fmt.Errorf("failed to publish generation-bound task artifacts: %w", err))
 	}
-	if err := WriteTaskContext(wtInfo.Path, tc0); err != nil {
-		return nil, failOwned("task_context_write_failed",
-			fmt.Errorf("failed to write task context: %w", err))
-	}
+	packetPath := filepath.Join(wtInfo.Path, TaskPacketFile)
+	artifactWorktree = wtInfo.Path
+	artifactsCommitted = true
+
 	// Durable canonical copy OUTSIDE the ephemeral worktree (FAC-145):
 	// approval/callback/readback bind through it after worktree GC.
 	if err := StoreCanonicalReceipt(d.Worktree.RepoRoot(), tc0); err != nil {
@@ -1141,7 +1163,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 		AnchorRef:       wtInfo.AnchorRef,
 		TaskPacket:      packetPath,
 		Lane:            lane.Name,
-		LeaseGeneration: tok.Generation,
+		LeaseGeneration: tc0.LeaseGeneration,
 	}
 
 	// 8. Still own the lease generation; re-validate bound to pre-claim GraphRev.
@@ -1160,7 +1182,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// once via failOwned while the generation lease is still held.
 	h := d.launcher()
 	if !opts.NoLaunch && h.Available() {
-		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result, tok, baseReceipt); err != nil {
+		if err := d.launch(ctx, opts, task, lane, wtInfo, branch, packet, result, tok, tc0); err != nil {
 			reason := "agent_launch_failed"
 			var lf *launchFailure
 			if errors.As(err, &lf) && lf.Reason != "" {
@@ -1616,6 +1638,15 @@ func (d *Dispatcher) launch(
 	if request.Repository == "" || request.Lane == "" {
 		return &launchFailure{Reason: "launch_identity_missing", Err: fmt.Errorf("repository and lane identity are required")}
 	}
+	if d.Production {
+		verifier, verr := LoadVerifier(d.Worktree.RepoRoot())
+		if verr != nil {
+			return &launchFailure{Reason: "task_artifact_unverifiable", Err: verr}
+		}
+		if verr := validateTaskArtifacts(wtInfo.Path, packet, baseReceipt, verifier); verr != nil {
+			return &launchFailure{Reason: "task_artifact_mismatch", Err: verr}
+		}
+	}
 	model := request.Decision.Model
 	result.Model = model
 
@@ -1827,10 +1858,11 @@ func (d *Dispatcher) launch(
 				Err:    fmt.Errorf("failed to sign task context: %w", err),
 			}
 		}
-		if err := WriteTaskContext(wtInfo.Path, tc); err != nil {
+		packet, err = d.taskArtifactPublisher().Publish(wtInfo.Path, packet, tc)
+		if err != nil {
 			return &launchFailure{
-				Reason: "task_context_write_failed",
-				Err:    fmt.Errorf("failed to stamp herdr workspace into task context: %w", err),
+				Reason: "task_artifact_publish_failed",
+				Err:    fmt.Errorf("failed to stamp herdr workspace into generation-bound task artifacts: %w", err),
 			}
 		}
 		if err := StoreCanonicalReceipt(d.Worktree.RepoRoot(), tc); err != nil {
