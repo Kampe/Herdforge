@@ -428,10 +428,7 @@ func (l *LinearProvider) ListProjectRelations(ctx context.Context, projectID str
 		return []Relation{}, nil
 	}
 
-	concurrency := l.BulkConcurrency
-	if concurrency <= 0 {
-		concurrency = DefaultBulkRelationConcurrency
-	}
+	concurrency := ResolveRelationTraversalConcurrency(l)
 	if concurrency > len(ids) {
 		concurrency = len(ids)
 	}

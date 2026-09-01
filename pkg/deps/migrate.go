@@ -73,13 +73,10 @@ const (
 	// when its caller forgot to provide a deadline. Callers may provide a
 	// shorter deadline; the earlier bound always wins.
 	DefaultMigrationRequestBudget = 20 * time.Second
-	// DefaultMigrationFrontierConcurrency permits parallel reads only within a
-	// discovered component frontier. It is deliberately much smaller than the
-	// broad-board provider fan-out limits.
-	DefaultMigrationFrontierConcurrency = 8
-	// DefaultMigrationRollbackBudget is independent of the canceled request so
-	// a completed mutation still has time to restore and verify its before image.
-	DefaultMigrationRollbackBudget = 5 * time.Second
+	// DefaultMigrationRollbackBudget is independent of the canceled request and
+	// covers the bounded reconcile-read, restore-write, and exact-readback
+	// sequence. It remains below the operator's external request envelope.
+	DefaultMigrationRollbackBudget = 3 * DefaultMigrationRequestBudget
 )
 
 // MigrationActionComponentProgress distinguishes traversal events from the
@@ -733,23 +730,29 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			continue
 		}
 
-		if err := writer.SetDescription(ctx, t.ID, newDesc); err != nil {
-			item.Action = "error"
-			item.Detail = "set description: " + err.Error()
-			restored, rbErr := restoreMigrationDescriptionIfChanged(ctx, writer, t.ID, before)
-			if rbErr != nil {
-				item.Detail += "; ambiguous-write rollback failed: " + rbErr.Error()
-			} else if restored {
-				item.RolledBack = true
-				journal.Entries[len(journal.Entries)-1].RolledBack = true
-				if jerr := writeJournal(jPath, journal); jerr != nil && taskRef != "" {
-					item.Detail += "; rollback journal: " + jerr.Error()
+		if setErr := writer.SetDescription(ctx, t.ID, newDesc); setErr != nil {
+			ambiguous := provider.IsTimeout(setErr) || provider.IsAmbiguous(setErr)
+			recovery, recoveryErr := reconcileMigrationDescriptionWrite(ctx, writer, t.ID, before, newDesc, ambiguous)
+			if ambiguous && recovery.Landed && !recovery.RolledBack && recoveryErr == nil {
+				item.Detail = "set description timeout reconciled by exact readback"
+			} else {
+				item.Action = "error"
+				item.Detail = "set description: " + setErr.Error()
+				item.Applied = recovery.Landed
+				if recoveryErr != nil {
+					item.Detail += "; ambiguous-write rollback failed: " + recoveryErr.Error()
+				} else if recovery.RolledBack {
+					item.RolledBack = true
+					journal.Entries[len(journal.Entries)-1].RolledBack = true
+					if jerr := writeJournal(jPath, journal); jerr != nil && taskRef != "" {
+						item.Detail += "; rollback journal: " + jerr.Error()
+					}
 				}
+				plan.OK = false
+				plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+				plan.Items = append(plan.Items, item)
+				continue
 			}
-			plan.OK = false
-			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
-			plan.Items = append(plan.Items, item)
-			continue
 		}
 		item.Applied = true
 		journal.Entries[len(journal.Entries)-1].AfterDesc = newDesc
@@ -854,8 +857,47 @@ func rollbackMigrationDescription(ctx context.Context, writer DescriptionWriter,
 	return err
 }
 
+type migrationWriteRecovery struct {
+	Landed     bool
+	RolledBack bool
+}
+
+func migrationRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), DefaultMigrationRollbackBudget)
+}
+
+func reconcileMigrationDescriptionWrite(ctx context.Context, writer DescriptionWriter, taskID, before, after string, acceptLanded bool) (migrationWriteRecovery, error) {
+	recoveryCtx, cancel := migrationRecoveryContext(ctx)
+	defer cancel()
+
+	current, readErr := writer.GetDescription(recoveryCtx, taskID)
+	recovery := migrationWriteRecovery{Landed: readErr == nil && current == after}
+	requestActive := ctx == nil || ctx.Err() == nil
+	if recovery.Landed && acceptLanded && requestActive {
+		return recovery, nil
+	}
+	if readErr == nil && current == before {
+		return recovery, nil
+	}
+	if err := writer.SetDescription(recoveryCtx, taskID, before); err != nil {
+		return recovery, fmt.Errorf("restore before image: %w", err)
+	}
+	readback, err := writer.GetDescription(recoveryCtx, taskID)
+	if err != nil {
+		return recovery, fmt.Errorf("exact readback: %w", err)
+	}
+	if readback != before {
+		return recovery, fmt.Errorf("exact readback mismatch after rollback")
+	}
+	recovery.RolledBack = true
+	return recovery, nil
+}
+
 func restoreMigrationDescriptionIfChanged(ctx context.Context, writer DescriptionWriter, taskID, before string) (bool, error) {
-	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultMigrationRollbackBudget)
+	rollbackCtx, cancel := migrationRecoveryContext(ctx)
 	defer cancel()
 	current, readErr := writer.GetDescription(rollbackCtx, taskID)
 	if readErr == nil && current == before {
@@ -928,36 +970,34 @@ type KaneoDescriptionWriter struct {
 	Run       func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
-func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, description string) error {
-	run := w.Run
-	if run == nil {
-		run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			res, err := provider.RunCLI(ctx, name, args...)
-			if res == nil {
-				return nil, err
-			}
-			return res.Stdout, err
-		}
+func (w KaneoDescriptionWriter) runner() func(context.Context, string, ...string) ([]byte, error) {
+	if w.Run != nil {
+		return w.Run
 	}
+	return func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		res, err := provider.RunCLI(ctx, name, args...)
+		if res == nil {
+			return nil, err
+		}
+		return res.Stdout, err
+	}
+}
+
+func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, description string) error {
 	args := []string{"task", "description", taskID, description}
 	if strings.TrimSpace(w.ProjectID) != "" {
 		args = append(args, "--project", w.ProjectID)
 	}
-	_, err := run(ctx, "kaneo", args...)
+	_, err := w.runner()(ctx, "kaneo", args...)
 	return err
 }
 
 func (w KaneoDescriptionWriter) GetDescription(ctx context.Context, taskID string) (string, error) {
-	// Caller should use TaskProvider.GetTask; this is a minimal CLI get.
-	run := w.Run
-	if run == nil {
-		return "", fmt.Errorf("kaneo get description: no runner; use TaskProvider.GetTask")
-	}
 	args := []string{"task", "get", taskID, "--json"}
 	if strings.TrimSpace(w.ProjectID) != "" {
 		args = append(args, "--project", w.ProjectID)
 	}
-	out, err := run(ctx, "kaneo", args...)
+	out, err := w.runner()(ctx, "kaneo", args...)
 	if err != nil {
 		return "", err
 	}

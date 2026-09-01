@@ -516,6 +516,7 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 	seenTasks := map[string]bool{}
 	tasksRead := 0
 	relationSetsRead := 0
+	frontierConcurrency := provider.ResolveRelationTraversalConcurrency(s.TP)
 
 	acceptTask := func(task *provider.Task, id TaskID, ref Ref) error {
 		if task == nil || strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Ref) == "" {
@@ -603,32 +604,30 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 	seenRelations := map[string]provider.Relation{}
 	for len(frontier) > 0 {
 		sort.Strings(frontier)
-		relationReads := runMigrationReadBatch(len(frontier), func(index int) migrationRelationRead {
+		newIDs := map[string]bool{}
+		frontierRelationSetsRead := 0
+		frontierCompleted := 0
+		firstErr := runMigrationReadBatch(ctx, len(frontier), frontierConcurrency, func(readCtx context.Context, index int) (migrationRelationRead, error) {
 			id := frontier[index]
 			s.ListRelCalls.Add(1)
-			relations, err := retryMigrationProviderRead(ctx, func() ([]provider.Relation, error) {
-				return rp.ListRelations(ctx, id)
+			relations, err := retryMigrationProviderRead(readCtx, func() ([]provider.Relation, error) {
+				return rp.ListRelations(readCtx, id)
 			})
-			return migrationRelationRead{id: id, relations: relations, err: err}
-		})
-		newIDs := map[string]bool{}
-		var firstErr error
-		frontierRelationSetsRead := 0
-		for index, read := range relationReads {
-			if read.err != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("deps: scoped migration graph list %s: %w", read.id, read.err)
-				}
-				continue
+			read := migrationRelationRead{id: id, relations: relations}
+			if err != nil {
+				return read, fmt.Errorf("deps: scoped migration graph list %s: %w", id, err)
 			}
+			return read, nil
+		}, func(_ int, read migrationRelationRead) error {
+			frontierCompleted++
 			relationSetsRead++
 			frontierRelationSetsRead++
 			for _, relation := range read.relations {
 				if relation.ID == "" || (relation.SourceTaskID != read.id && relation.TargetTaskID != read.id) {
-					return nil, fmt.Errorf("deps: scoped migration graph relation %q is unrelated to task %s", relation.ID, read.id)
+					return fmt.Errorf("deps: scoped migration graph relation %q is unrelated to task %s", relation.ID, read.id)
 				}
 				if prior, exists := seenRelations[relation.ID]; exists && !relationEqual(prior, relation) {
-					return nil, fmt.Errorf("deps: scoped migration graph relation %s disagrees across endpoint listings", relation.ID)
+					return fmt.Errorf("deps: scoped migration graph relation %s disagrees across endpoint listings", relation.ID)
 				}
 				seenRelations[relation.ID] = relation
 				if !seenTasks[relation.SourceTaskID] {
@@ -640,9 +639,10 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 			}
 			emitMigrationComponentProgress(ctx, MigrationComponentProgress{
 				Phase: "relations", Ref: rootRef, TasksRead: tasksRead, RelationSetsRead: relationSetsRead,
-				Pending: len(frontier) - index - 1 + len(newIDs), Deadline: migrationProgressDeadline(ctx),
+				Pending: len(frontier) - frontierCompleted + len(newIDs), Deadline: migrationProgressDeadline(ctx),
 			})
-		}
+			return nil
+		})
 		if firstErr != nil {
 			return nil, migrationTimeout(ctx, "relations", rootRef, tasksRead, relationSetsRead, len(frontier)-frontierRelationSetsRead+len(newIDs), firstErr)
 		}
@@ -655,24 +655,22 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 			nextFrontier = append(nextFrontier, id)
 		}
 		sort.Strings(nextFrontier)
-		taskReads := runMigrationReadBatch(len(nextFrontier), func(index int) migrationTaskRead {
-			id := nextFrontier[index]
-			task, err := retryMigrationProviderRead(ctx, func() (*provider.Task, error) {
-				return s.TP.GetTask(ctx, id)
-			})
-			return migrationTaskRead{id: id, task: task, err: err}
-		})
-		var taskErr error
 		frontierTasksRead := 0
-		for index, read := range taskReads {
-			if read.err != nil {
-				if taskErr == nil {
-					taskErr = fmt.Errorf("deps: scoped migration graph get %s: %w", read.id, read.err)
-				}
-				continue
+		frontierCompleted = 0
+		taskErr := runMigrationReadBatch(ctx, len(nextFrontier), frontierConcurrency, func(readCtx context.Context, index int) (migrationTaskRead, error) {
+			id := nextFrontier[index]
+			task, err := retryMigrationProviderRead(readCtx, func() (*provider.Task, error) {
+				return s.TP.GetTask(readCtx, id)
+			})
+			read := migrationTaskRead{id: id, task: task}
+			if err != nil {
+				return read, fmt.Errorf("deps: scoped migration graph get %s: %w", id, err)
 			}
+			return read, nil
+		}, func(_ int, read migrationTaskRead) error {
+			frontierCompleted++
 			if err := acceptTask(read.task, TaskID(read.id), ""); err != nil {
-				return nil, err
+				return err
 			}
 			if !seenTasks[read.task.ID] {
 				seenTasks[read.task.ID] = true
@@ -681,9 +679,10 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 			}
 			emitMigrationComponentProgress(ctx, MigrationComponentProgress{
 				Phase: "tasks", Ref: rootRef, TasksRead: tasksRead, RelationSetsRead: relationSetsRead,
-				Pending: len(nextFrontier) - index - 1, Deadline: migrationProgressDeadline(ctx),
+				Pending: len(nextFrontier) - frontierCompleted, Deadline: migrationProgressDeadline(ctx),
 			})
-		}
+			return nil
+		})
 		if taskErr != nil {
 			return nil, migrationTimeout(ctx, "tasks", rootRef, tasksRead, relationSetsRead, len(nextFrontier)-frontierTasksRead, taskErr)
 		}
@@ -709,38 +708,68 @@ func (s *ProviderStore) snapshotGraphForMigrationTask(ctx context.Context, rp pr
 type migrationRelationRead struct {
 	id        string
 	relations []provider.Relation
-	err       error
 }
 
 type migrationTaskRead struct {
 	id   string
 	task *provider.Task
-	err  error
 }
 
-func runMigrationReadBatch[T any](count int, read func(int) T) []T {
-	results := make([]T, count)
+type migrationBatchResult[T any] struct {
+	index int
+	value T
+	err   error
+}
+
+func runMigrationReadBatch[T any](ctx context.Context, count, concurrency int, read func(context.Context, int) (T, error), accept func(int, T) error) error {
 	if count == 0 {
-		return results
+		return nil
 	}
-	workers := min(count, DefaultMigrationFrontierConcurrency)
-	jobs := make(chan int)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	batchCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	workers := min(count, max(1, concurrency))
+	results := make(chan migrationBatchResult[T], workers)
+	var next atomic.Int64
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for index := range jobs {
-				results[index] = read(index)
+			for {
+				if batchCtx.Err() != nil {
+					return
+				}
+				index := int(next.Add(1)) - 1
+				if index >= count {
+					return
+				}
+				value, err := read(batchCtx, index)
+				if err != nil {
+					cancel(err)
+				}
+				results <- migrationBatchResult[T]{index: index, value: value, err: err}
+				if err != nil {
+					return
+				}
 			}
 		}()
 	}
-	for index := range count {
-		jobs <- index
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for result := range results {
+		if result.err != nil {
+			continue
+		}
+		if err := accept(result.index, result.value); err != nil {
+			cancel(err)
+		}
 	}
-	close(jobs)
-	wg.Wait()
-	return results
+	return context.Cause(batchCtx)
 }
 
 func retryMigrationProviderRead[T any](ctx context.Context, read func() (T, error)) (T, error) {

@@ -60,6 +60,30 @@ type BulkRelationProvider interface {
 	ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error)
 }
 
+// RelationTraversalPolicy declares how many exact task/relation reads a
+// provider permits in flight. Callers must resolve this policy instead of
+// inventing an independent fan-out width.
+type RelationTraversalPolicy interface {
+	RelationTraversalConcurrency() int
+}
+
+// ResolveRelationTraversalConcurrency returns a bounded provider-declared
+// traversal width. Providers without an explicit policy are read serially.
+func ResolveRelationTraversalConcurrency(tp TaskProvider) int {
+	policy, ok := tp.(RelationTraversalPolicy)
+	if !ok || policy == nil {
+		return 1
+	}
+	concurrency := policy.RelationTraversalConcurrency()
+	if concurrency < 1 {
+		return 1
+	}
+	if concurrency > MaxRelationTraversalConcurrency {
+		return MaxRelationTraversalConcurrency
+	}
+	return concurrency
+}
+
 // DefaultBulkRelationConcurrency bounds concurrent per-task relation fetches
 // for ordinary O(board) project graph snapshots (measured ~4s for 164 tasks
 // @16). Kaneo uses a larger, still bounded pool for genuinely large boards;
@@ -71,8 +95,9 @@ const DefaultBulkRelationConcurrency = 16
 // capped: ordinary list deadlines remain unchanged and a large board cannot
 // turn into an unbounded request storm.
 const (
+	MaxRelationTraversalConcurrency   = 128
 	KaneoLargeBoardThreshold          = 500
 	DefaultKaneoLargeBoardConcurrency = 64
-	MaxKaneoGraphConcurrency          = 128
+	MaxKaneoGraphConcurrency          = MaxRelationTraversalConcurrency
 	KaneoGraphBatchSize               = 256
 )

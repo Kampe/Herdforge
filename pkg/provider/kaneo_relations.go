@@ -227,15 +227,9 @@ func (k *KaneoProvider) ListProjectRelations(ctx context.Context, projectID stri
 	graphCtx, graphCancel := context.WithTimeout(ctx, graphDeadline)
 	defer graphCancel()
 
-	conc := k.BulkConcurrency
-	if conc <= 0 {
-		conc = DefaultBulkRelationConcurrency
-		if len(ids) > KaneoLargeBoardThreshold {
-			conc = DefaultKaneoLargeBoardConcurrency
-		}
-	}
-	if conc > MaxKaneoGraphConcurrency {
-		conc = MaxKaneoGraphConcurrency
+	conc := k.RelationTraversalConcurrency()
+	if k.BulkConcurrency <= 0 && len(ids) > KaneoLargeBoardThreshold {
+		conc = DefaultKaneoLargeBoardConcurrency
 	}
 	if conc > len(ids) && len(ids) > 0 {
 		conc = len(ids)
