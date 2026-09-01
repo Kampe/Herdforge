@@ -14,6 +14,10 @@ func TestMergeTreeWriteFlag(t *testing.T) {
 	if MergeTreeWriteFlag != want {
 		t.Fatalf("merge-tree write flag = %q, want %q", MergeTreeWriteFlag, want)
 	}
+	wantBase := strings.Join([]string{"", "", "merge", "base=HEAD"}, "-")
+	if MergeTreeHeadBaseFlag != wantBase {
+		t.Fatalf("merge-tree HEAD base flag = %q, want %q", MergeTreeHeadBaseFlag, wantBase)
+	}
 }
 
 func grGit(t *testing.T, dir string, args ...string) {

@@ -55,6 +55,11 @@ func runPoolReview(ref string) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
+	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	toolchain, err := preflightReviewToolchain(root)
+	if err != nil {
+		return err
+	}
 	// FAC-584: capacity BEFORE candidate resolution. resolvePoolReviewCandidateAt
 	// can prepare a detached worktree when none holds the SHA; that is already
 	// repository mutation. The W4 incident prepared a worktree and then died
@@ -66,7 +71,6 @@ func runPoolReview(ref string) error {
 	if releaseCapacity != nil {
 		defer releaseCapacity()
 	}
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.
 	candidateDir, err := resolvePoolReviewCandidateAt(root, ref, strings.TrimSpace(*shaFlag))
@@ -75,7 +79,7 @@ func runPoolReview(ref string) error {
 	}
 	sha := strings.TrimSpace(*shaFlag)
 	if sha == "" {
-		out, err := exec.Command("git", "-C", candidateDir, "rev-parse", "HEAD").Output()
+		out, err := exec.Command(reviewGitCommand(), "-C", candidateDir, "rev-parse", "HEAD").Output()
 		if err != nil {
 			return fmt.Errorf("resolve candidate HEAD: %w", err)
 		}
@@ -84,7 +88,7 @@ func runPoolReview(ref string) error {
 	if len(sha) < 12 {
 		return fmt.Errorf("candidate SHA %q is too short", sha)
 	}
-	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", sha+"^{commit}").CombinedOutput(); err != nil {
+	if out, err := exec.Command(reviewGitCommand(), "-C", root, "rev-parse", "--verify", sha+"^{commit}").CombinedOutput(); err != nil {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
@@ -221,6 +225,7 @@ func runPoolReview(ref string) error {
 	}
 
 	p := worktree.NewPool(root, *poolRoot, 2)
+	p.GitPath = toolchain.GitPath
 	// FAC-591: teach the pool which lease holders are still alive so it can
 	// reclaim the rest itself. Every launch that died after leasing used to
 	// leave an ownerless lease no command could free, and the pool wedged at
@@ -265,7 +270,7 @@ func runPoolReview(ref string) error {
 		fmt.Printf("evicted %d stale occupant(s) from %s before pinning %s\n",
 			evicted, lease.Name, shortSHA(sha))
 	}
-	if out, err := exec.Command("git", "-C", lease.Path, "reset", "--hard", sha).CombinedOutput(); err != nil {
+	if out, err := exec.Command(reviewGitCommand(), "-C", lease.Path, "reset", "--hard", sha).CombinedOutput(); err != nil {
 		return fmt.Errorf("pin pool slot %s: %v (%s)", lease.Name, err, strings.TrimSpace(string(out)))
 	}
 
@@ -399,7 +404,10 @@ func runPoolReview(ref string) error {
 	if st, statErr := os.Stat(surfaceAbs); statErr != nil || !st.IsDir() {
 		return fmt.Errorf("reviewer cwd %q does not resolve to a directory: %v", surfaceAbs, statErr)
 	}
-	tab, err := herdr.TabCreate(herdr.TabCreateOptions{Workspace: ws, Label: tabLabel, Cwd: surfaceAbs, NoFocus: true, Env: []string{herdr.AgentRoleEnv}})
+	tab, err := herdr.TabCreate(herdr.TabCreateOptions{
+		Workspace: ws, Label: tabLabel, Cwd: surfaceAbs, NoFocus: true,
+		Env: reviewerTabEnvironment(toolchain),
+	})
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}
@@ -575,7 +583,7 @@ func prepareCandidateSurface(root, ref, sha string) (string, error) {
 	if len(strings.TrimSpace(sha)) < 12 {
 		return "", nil
 	}
-	if err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", sha+"^{commit}").Run(); err != nil {
+	if err := exec.Command(reviewGitCommand(), "-C", root, "rev-parse", "--verify", "-q", sha+"^{commit}").Run(); err != nil {
 		return "", nil // not a commit here; not ours to prepare
 	}
 	dir := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart(ref)+"-"+shortSHA(sha))
@@ -587,7 +595,7 @@ func prepareCandidateSurface(root, ref, sha string) (string, error) {
 		}
 		return "", fmt.Errorf("surface %s exists but is not at %s", dir, shortSHA(sha))
 	}
-	if out, err := exec.Command("git", "-C", root, "worktree", "add", "-q", "--detach", dir, sha).CombinedOutput(); err != nil {
+	if out, err := exec.Command(reviewGitCommand(), "-C", root, "worktree", "add", "-q", "--detach", dir, sha).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return dir, nil
@@ -608,7 +616,7 @@ func candidateSurfaceDirs(root, ref string) []string {
 // headMatchesSHA reports whether dir's HEAD is exactly sha. A resolution error
 // is NOT a match: an unreadable surface is unknown, never confirmation.
 func headMatchesSHA(dir, sha string) bool {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	out, err := exec.Command(reviewGitCommand(), "-C", dir, "rev-parse", "HEAD").Output()
 	if err != nil {
 		return false
 	}
@@ -622,7 +630,7 @@ func headMatchesSHA(dir, sha string) bool {
 // detachedSurfaceAtSHA finds any registered worktree whose HEAD is the exact
 // SHA, so a surface prepared under an unexpected directory name still resolves.
 func detachedSurfaceAtSHA(root, sha string) string {
-	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	out, err := exec.Command(reviewGitCommand(), "-C", root, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return ""
 	}
@@ -668,10 +676,10 @@ func detachedSurfaceAtSHA(root, sha string) string {
 
 func checkedOutBranchWorktree(root, ref string) (string, error) {
 	branchRef := "refs/heads/" + ref
-	if _, err := exec.Command("git", "-C", root, "rev-parse", "--verify", branchRef+"^{commit}").Output(); err != nil {
+	if _, err := exec.Command(reviewGitCommand(), "-C", root, "rev-parse", "--verify", branchRef+"^{commit}").Output(); err != nil {
 		return "", nil
 	}
-	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	out, err := exec.Command(reviewGitCommand(), "-C", root, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return "", fmt.Errorf("list Git worktrees: %w", err)
 	}
@@ -1118,7 +1126,7 @@ func sharedCheckoutDirtyPaths(root string) []string {
 	if strings.TrimSpace(os.Getenv("HERD_ALLOW_DIRTY_SHARED_CHECKOUT")) == "1" {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", root, "status", "--porcelain").Output()
+	out, err := exec.Command(reviewGitCommand(), "-C", root, "status", "--porcelain").Output()
 	if err != nil {
 		return nil
 	}
@@ -1188,12 +1196,12 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 // its merge base. Verified stable across a clean rebase, which is the property
 // the admission binding depends on.
 func candidatePatchIdentity(root, sha string) (string, error) {
-	base, err := exec.Command("git", "-C", root, "merge-base", sha, "origin/main").Output()
+	base, err := exec.Command(reviewGitCommand(), "-C", root, "merge-base", sha, "origin/main").Output()
 	if err != nil {
 		return "", fmt.Errorf("resolve merge base: %w", err)
 	}
-	diff := exec.Command("git", "-C", root, "diff", strings.TrimSpace(string(base)), sha)
-	pipe := exec.Command("git", "-C", root, "patch-id", "--stable")
+	diff := exec.Command(reviewGitCommand(), "-C", root, "diff", strings.TrimSpace(string(base)), sha)
+	pipe := exec.Command(reviewGitCommand(), "-C", root, "patch-id", "--stable")
 	out, err := diff.Output()
 	if err != nil {
 		return "", fmt.Errorf("read candidate diff: %w", err)

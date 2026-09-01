@@ -560,7 +560,7 @@ func mergeTreeCapable(ctx context.Context, dir string) bool {
 	if v, ok := mergeTreeCache.Load(dir); ok {
 		return v.(bool)
 	}
-	c := procsignal.CommandContext(ctx, "git", "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base=HEAD", "HEAD", "HEAD")
+	c := procsignal.CommandContext(ctx, "git", "merge-tree", gitroot.MergeTreeWriteFlag, gitroot.MergeTreeHeadBaseFlag, "HEAD", "HEAD")
 	c.Dir = dir
 	ok := c.Run() == nil
 	mergeTreeCache.Store(dir, ok)

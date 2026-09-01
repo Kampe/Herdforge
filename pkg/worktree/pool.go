@@ -1,10 +1,12 @@
 package worktree
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -12,17 +14,26 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
+// EnvReviewGit names the machine-local Git binary selected for W4 review
+// admission and warm-pool operations. Herdforge validates and uses this path;
+// it never installs or rewrites the host's Git distribution.
+const EnvReviewGit = "HERD_REVIEW_GIT"
+
 // PoolSlot is the durable lease record for one warm worktree.
 type PoolSlot struct {
-	Name     string    `json:"name"`
-	Path     string    `json:"path"`
-	Purpose  string    `json:"purpose,omitempty"`
-	LeaseID  string    `json:"lease_id,omitempty"`
-	LeasedAt time.Time `json:"leased_at,omitempty"`
-	Base     string    `json:"base,omitempty"`
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Purpose string `json:"purpose,omitempty"`
+	LeaseID string `json:"lease_id,omitempty"`
+	// ReleasedLeaseID makes an exact release retry idempotent without treating
+	// an unknown lease as success or disturbing a newer live lease.
+	ReleasedLeaseID string    `json:"released_lease_id,omitempty"`
+	LeasedAt        time.Time `json:"leased_at,omitempty"`
+	Base            string    `json:"base,omitempty"`
 }
 
 type poolState struct {
@@ -33,10 +44,17 @@ type poolState struct {
 // Pool manages long-lived, dependency-bearing worktrees. The state file is
 // deliberately repo-relative so it can be moved with a worktree.
 type Pool struct {
+	mu          sync.Mutex
 	RepoRoot    string
 	Root        string
 	Size        int
 	DefaultBase string
+	// GitPath pins pool commands to the same binary admitted for the reviewer.
+	// Empty means resolve "git" from PATH for backward compatibility.
+	GitPath string
+	// Diagnostics receives successful Git stderr. Git warnings remain visible
+	// without being confused with porcelain stdout dirt.
+	Diagnostics io.Writer
 	Now         func() time.Time
 	// HolderLive reports whether a lease's holder is still a live, unsettled
 	// worker. It is injected so this package stays free of any dependency on the
@@ -55,7 +73,10 @@ func NewPool(repoRoot, root string, size int) *Pool {
 	if size < 0 {
 		size = 0
 	}
-	return &Pool{RepoRoot: repoRoot, Root: root, Size: size, DefaultBase: "origin/main", Now: time.Now}
+	return &Pool{
+		RepoRoot: repoRoot, Root: root, Size: size, DefaultBase: "origin/main",
+		GitPath: strings.TrimSpace(os.Getenv(EnvReviewGit)), Diagnostics: os.Stderr, Now: time.Now,
+	}
 }
 
 func (p *Pool) statePath() string { return filepath.Join(p.Root, "pool.json") }
@@ -65,6 +86,8 @@ func (p *Pool) withLock(fn func() error) error {
 	if p == nil || strings.TrimSpace(p.Root) == "" {
 		return errors.New("worktree pool: root is required")
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if err := os.MkdirAll(p.Root, 0o755); err != nil {
 		return fmt.Errorf("worktree pool: create root: %w", err)
 	}
@@ -74,6 +97,25 @@ func (p *Pool) withLock(fn func() error) error {
 	}
 	defer func() { _ = f.Close(); _ = os.Remove(p.lockPath()) }()
 	return fn()
+}
+
+func (p *Pool) gitBinary() string {
+	if p != nil && strings.TrimSpace(p.GitPath) != "" {
+		return strings.TrimSpace(p.GitPath)
+	}
+	return "git"
+}
+
+func (p *Pool) reportGitDiagnostics(slotName, diagnostics string) {
+	diagnostics = strings.TrimSpace(diagnostics)
+	if diagnostics == "" {
+		return
+	}
+	w := p.Diagnostics
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, "worktree pool: git status diagnostic for %s: %s\n", slotName, diagnostics)
 }
 
 func (p *Pool) readState() (poolState, error) {
@@ -145,7 +187,7 @@ func (p *Pool) Ensure(ctx context.Context) error {
 			if err := os.MkdirAll(filepath.Dir(slot.Path), 0o755); err != nil {
 				return fmt.Errorf("worktree pool: create parent: %w", err)
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "add", "--detach", slot.Path, base)
+			cmd := exec.CommandContext(ctx, p.gitBinary(), "-C", p.RepoRoot, "worktree", "add", "--detach", slot.Path, base)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: create %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
@@ -171,10 +213,11 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			if slot.LeaseID != "" {
 				continue
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, diagnostics, err := gitClean(ctx, p.gitBinary(), slot.Path)
 			if err != nil {
 				return fmt.Errorf("worktree pool: inspect %s: %w", slot.Name, err)
 			}
+			p.reportGitDiagnostics(slot.Name, diagnostics)
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s is dirty; refusing lease", slot.Name)
 			}
@@ -207,10 +250,11 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			if slot.LeaseID != "" {
 				continue
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, diagnostics, err := gitClean(ctx, p.gitBinary(), slot.Path)
 			if err != nil || !clean {
 				continue
 			}
+			p.reportGitDiagnostics(slot.Name, diagnostics)
 			stamp := p.Now
 			if stamp == nil {
 				stamp = time.Now
@@ -252,19 +296,21 @@ func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string
 		if strings.TrimSpace(slot.Purpose) != "" && p.HolderLive(slot.Purpose) {
 			continue
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base).CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(ctx, p.gitBinary(), "-C", slot.Path, "reset", "--hard", base).CombinedOutput(); err != nil {
 			return freed, fmt.Errorf("worktree pool: reclaim reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd").CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(ctx, p.gitBinary(), "-C", slot.Path, "clean", "-fd").CombinedOutput(); err != nil {
 			return freed, fmt.Errorf("worktree pool: reclaim clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 		}
-		clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+		clean, diagnostics, err := gitClean(ctx, p.gitBinary(), slot.Path)
 		if err != nil {
 			return freed, err
 		}
+		p.reportGitDiagnostics(slot.Name, diagnostics)
 		if !clean {
 			continue
 		}
+		slot.ReleasedLeaseID = slot.LeaseID
 		slot.Purpose, slot.LeaseID = "", ""
 		slot.LeasedAt = time.Time{}
 		freed = append(freed, slot.Name)
@@ -314,24 +360,31 @@ func (p *Pool) Release(ctx context.Context, leaseID string) error {
 			if base == "" {
 				base = "origin/main"
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base)
+			cmd := exec.CommandContext(ctx, p.gitBinary(), "-C", slot.Path, "reset", "--hard", base)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			cmd = exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd")
+			cmd = exec.CommandContext(ctx, p.gitBinary(), "-C", slot.Path, "clean", "-fd")
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, diagnostics, err := gitClean(ctx, p.gitBinary(), slot.Path)
 			if err != nil {
 				return err
 			}
+			p.reportGitDiagnostics(slot.Name, diagnostics)
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
+			slot.ReleasedLeaseID = slot.LeaseID
 			slot.Purpose, slot.LeaseID = "", ""
 			slot.LeasedAt = time.Time{}
 			return p.writeState(state)
+		}
+		for i := range state.Slots {
+			if state.Slots[i].ReleasedLeaseID == leaseID {
+				return nil
+			}
 		}
 		return errors.New("worktree pool: lease not found")
 	})
@@ -355,7 +408,7 @@ func (p *Pool) GC(ctx context.Context) error {
 			if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, slot.Path); err != nil {
 				return fmt.Errorf("worktree pool: gc lease fence for %s: %w", slot.Name, err)
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
+			cmd := exec.CommandContext(ctx, p.gitBinary(), "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
@@ -376,13 +429,24 @@ func (p *Pool) Slots() ([]PoolSlot, error) {
 	return append([]PoolSlot(nil), state.Slots...), nil
 }
 
-func gitClean(ctx context.Context, repoRoot, path string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain")
-	out, err := cmd.CombinedOutput()
+func gitClean(ctx context.Context, gitPath, path string) (bool, string, error) {
+	cmd := exec.CommandContext(ctx, gitPath, "-C", path, "status", "--porcelain")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	diagnostics := strings.TrimSpace(stderr.String())
 	if err != nil {
-		return false, fmt.Errorf("git status %s: %v (%s)", path, err, strings.TrimSpace(string(out)))
+		detail := diagnostics
+		if porcelain := strings.TrimSpace(stdout.String()); porcelain != "" {
+			if detail != "" {
+				detail += "; "
+			}
+			detail += porcelain
+		}
+		return false, diagnostics, fmt.Errorf("git status %s: %v (%s)", path, err, detail)
 	}
-	return strings.TrimSpace(string(out)) == "", nil
+	return strings.TrimSpace(stdout.String()) == "", diagnostics, nil
 }
 
 // SeedClone copies a warm template using APFS clonefiles when available, with
