@@ -16,7 +16,9 @@ type FailureRouter interface {
 // PersistAndRouteTerminal stores a terminal result first. The router is called
 // only for the first durable failed settlement, which makes recovery routing
 // exactly once even after poller retries or process crashes.
-func PersistAndRouteTerminal(ctx context.Context, store *Store, settlement Settlement, router FailureRouter) error {
+func PersistAndRouteTerminal(ctx context.Context, store interface {
+	PersistTerminal(Settlement) (bool, error)
+}, settlement Settlement, router FailureRouter) error {
 	written, err := store.PersistTerminal(settlement)
 	if err != nil || !written || settlement.State != StateFailed {
 		return err

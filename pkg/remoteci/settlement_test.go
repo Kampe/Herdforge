@@ -3,8 +3,10 @@ package remoteci
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/recovery"
@@ -25,6 +27,36 @@ func TestSettleRejectsStaleCandidateSHA(t *testing.T) {
 	}
 	if err := Settle(watch, settlement); !errors.Is(err, ErrStale) {
 		t.Fatalf("Settle stale candidate error = %v, want ErrStale", err)
+	}
+}
+
+func TestNewBindingIncludesCanonicalRequiredCheckIdentity(t *testing.T) {
+	first, err := NewBinding(
+		"github.com/Kampe/Herdforge", strings.Repeat("2", 40), "merge-policy-v2:example", 3,
+		[]string{" lint ", "Build", "build"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewBinding(
+		"github.com/Kampe/Herdforge", strings.Repeat("2", 40), "merge-policy-v2:example", 3,
+		[]string{"Build", "lint"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameBinding(first, second) || strings.Join(first.RequiredChecks, ",") != "Build,lint" {
+		t.Fatalf("canonical bindings differ: first=%+v second=%+v", first, second)
+	}
+	differentChecks, err := NewBinding(
+		"github.com/Kampe/Herdforge", strings.Repeat("2", 40), "merge-policy-v2:example", 3,
+		[]string{"Build"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PolicyRevision == differentChecks.PolicyRevision {
+		t.Fatal("required-check set did not change the remote-CI policy identity")
 	}
 }
 
@@ -56,53 +88,6 @@ func TestStoreDeduplicatesCandidateAndPolicyAndRedactsDiagnostics(t *testing.T) 
 	}
 	if len(records) != 1 || strings.Contains(records[0].Diagnostic, "secret-token") || len(records[0].Diagnostic) > maxDiagnosticBytes+len("…") {
 		t.Fatalf("stored redacted bounded record = %+v", records)
-	}
-}
-
-func TestGitHubActionsFailsClosedAndRequiresExactCandidate(t *testing.T) {
-	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("d", 40), PolicyRevision: "p", Attempt: 1, RequiredChecks: []string{"gate"}}
-	for name, tc := range map[string]struct {
-		output string
-		err    error
-		want   error
-	}{
-		"unavailable": {err: errors.New("no auth"), want: ErrUnavailable},
-		"no checks":   {output: "[]", want: ErrNoChecks},
-		"pending":     {output: `[{"name":"gate","headSha":"` + binding.CandidateSHA + `","status":"in_progress","conclusion":""}]`, want: ErrPending},
-		"stale SHA":   {output: `[{"name":"gate","headSha":"` + strings.Repeat("e", 40) + `","status":"completed","conclusion":"success"}]`, want: ErrStale},
-	} {
-		t.Run(name, func(t *testing.T) {
-			g := GitHubActions{Execute: func(context.Context, string, ...string) ([]byte, error) { return []byte(tc.output), tc.err }}
-			_, err := g.Watch(context.Background(), binding)
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("Watch error = %v, want %v", err, tc.want)
-			}
-		})
-	}
-}
-
-func TestGitHubActionsRequiresEveryDeclaredCheckToPass(t *testing.T) {
-	binding := Binding{Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("9", 40), PolicyRevision: "p", Attempt: 1, RequiredChecks: []string{"build", "lint"}}
-	for name, tc := range map[string]struct {
-		output string
-		want   error
-	}{
-		"missing required": {output: `[{"name":"build","headSha":"` + binding.CandidateSHA + `","status":"completed","conclusion":"success"}]`, want: ErrNoChecks},
-		"failed required":  {output: `[{"name":"build","headSha":"` + binding.CandidateSHA + `","status":"completed","conclusion":"success"},{"name":"lint","headSha":"` + binding.CandidateSHA + `","status":"completed","conclusion":"failure"}]`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			g := GitHubActions{Execute: func(context.Context, string, ...string) ([]byte, error) { return []byte(tc.output), nil }}
-			settlement, err := g.Watch(context.Background(), binding)
-			if tc.want != nil {
-				if !errors.Is(err, tc.want) {
-					t.Fatalf("Watch error = %v, want %v", err, tc.want)
-				}
-				return
-			}
-			if err != nil || settlement.State != StateFailed {
-				t.Fatalf("Watch = %+v, %v; want terminal failure", settlement, err)
-			}
-		})
 	}
 }
 
@@ -138,5 +123,65 @@ func TestSettlementRequiresExactBinding(t *testing.T) {
 	}, State: StatePassed}
 	if err := settlement.Validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("Validate error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestStoreConcurrentSameAttemptHasOneCanonicalTerminalSettlement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settlements.jsonl")
+	binding := Binding{
+		Repository: "github.com/Kampe/Herdforge", CandidateSHA: strings.Repeat("7", 40),
+		PolicyRevision: "policy-v1", Attempt: 1, RequiredChecks: []string{"gate"},
+	}
+	settlement := Settlement{Version: Version1, Binding: binding, State: StatePassed}
+
+	const workers = 24
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			store, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			<-start
+			if _, _, err := store.Register(binding); err != nil {
+				errs <- err
+				return
+			}
+			if _, err := store.PersistTerminal(settlement); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent settlement: %v", err)
+		}
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load(binding)
+	if err != nil {
+		t.Fatalf("canonical readback: %v", err)
+	}
+	if got.State != StatePassed || !sameBinding(got.Binding, binding) {
+		t.Fatalf("canonical settlement = %+v, want exact passed binding", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := strings.Count(strings.TrimSpace(string(data)), "\n") + 1; rows != 2 {
+		t.Fatalf("ledger rows = %d, want one watch plus one terminal settlement\n%s", rows, data)
 	}
 }

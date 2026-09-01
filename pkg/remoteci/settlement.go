@@ -15,9 +15,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
-const Version1 = 1
+const (
+	Version1          = 1
+	DefaultLedgerPath = ".herd/remote-ci.jsonl"
+)
 
 var (
 	ErrInvalid     = errors.New("remote-ci: invalid settlement")
@@ -25,6 +29,13 @@ var (
 	ErrPending     = errors.New("remote-ci: checks are pending")
 	ErrNoChecks    = errors.New("remote-ci: no checks reported")
 	ErrUnavailable = errors.New("remote-ci: watcher unavailable")
+	ErrAmbiguous   = errors.New("remote-ci: provider state is ambiguous")
+	ErrLockTimeout = errors.New("remote-ci: ledger lock timeout")
+)
+
+const (
+	defaultLockTimeout      = 5 * time.Second
+	ledgerLockRetryInterval = 5 * time.Millisecond
 )
 
 type State string
@@ -44,6 +55,24 @@ type Binding struct {
 	PolicyRevision string   `json:"policy_revision"`
 	Attempt        int64    `json:"attempt"`
 	RequiredChecks []string `json:"required_checks"`
+}
+
+// NewBinding constructs the one canonical remote-CI identity used by both the
+// settlement producer and merge admission. The caller supplies the live merge
+// policy revision; this function binds it to the normalized required-check set.
+func NewBinding(repository, candidateSHA, mergePolicyRevision string, attempt int64, requiredChecks []string) (Binding, error) {
+	checks := normalizeChecks(requiredChecks)
+	binding := Binding{
+		Repository:     strings.TrimSpace(repository),
+		CandidateSHA:   strings.TrimSpace(candidateSHA),
+		PolicyRevision: Revision(strings.TrimSpace(mergePolicyRevision), strings.Join(checks, "\x00")),
+		Attempt:        attempt,
+		RequiredChecks: checks,
+	}
+	if err := binding.Validate(); err != nil {
+		return Binding{}, err
+	}
+	return binding, nil
 }
 
 // Settlement is the minimal durable, versioned remote-CI result.
@@ -117,8 +146,9 @@ type Watcher interface {
 // retries of the same candidate under the same policy deduplicate instead of
 // creating a second authority record.
 type Store struct {
-	path string
-	mu   sync.Mutex
+	path        string
+	mu          sync.Mutex
+	lockTimeout time.Duration
 }
 
 type record struct {
@@ -133,7 +163,7 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("remote-ci: create store directory: %w", err)
 	}
-	return &Store{path: path}, nil
+	return &Store{path: path, lockTimeout: defaultLockTimeout}, nil
 }
 
 // Register creates a pending watch once. Existing watches must have the same
@@ -145,27 +175,32 @@ func (s *Store) Register(binding Binding) (Settlement, bool, error) {
 	if err := binding.Validate(); err != nil {
 		return Settlement{}, false, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	records, err := s.readLocked()
-	if err != nil {
-		return Settlement{}, false, err
-	}
-	key := watchKey(binding)
-	for _, prior := range records {
-		if watchKey(prior.Binding) != key {
-			continue
+	var result Settlement
+	var created bool
+	err := s.withExclusiveLock(func() error {
+		records, err := s.readLocked()
+		if err != nil {
+			return err
 		}
-		if !sameBinding(prior.Binding, binding) {
-			return Settlement{}, false, fmt.Errorf("%w: candidate/policy watch already belongs to another binding", ErrInvalid)
+		key := watchKey(binding)
+		for _, prior := range records {
+			if watchKey(prior.Binding) != key {
+				continue
+			}
+			if !sameBinding(prior.Binding, binding) {
+				return fmt.Errorf("%w: candidate/policy watch already belongs to another binding", ErrInvalid)
+			}
+			result = prior
+			return nil
 		}
-		return prior, false, nil
-	}
-	created := Settlement{Version: Version1, Binding: binding, State: StatePending}
-	if err := s.appendLocked(record{Kind: "watch", Settlement: created}); err != nil {
-		return Settlement{}, false, err
-	}
-	return created, true, nil
+		result = Settlement{Version: Version1, Binding: binding, State: StatePending}
+		if err := s.appendLocked(record{Kind: "watch", Settlement: result}); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	return result, created, err
 }
 
 // PersistTerminal records one immutable terminal outcome. It never turns a
@@ -181,36 +216,39 @@ func (s *Store) PersistTerminal(settlement Settlement) (bool, error) {
 		return false, fmt.Errorf("%w: pending is not terminal", ErrInvalid)
 	}
 	settlement.Diagnostic = redactBounded(settlement.Diagnostic)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	records, err := s.readLocked()
-	if err != nil {
-		return false, err
-	}
-	key := watchKey(settlement.Binding)
-	found := false
-	for _, prior := range records {
-		if watchKey(prior.Binding) != key {
-			continue
+	written := false
+	err := s.withExclusiveLock(func() error {
+		records, err := s.readLocked()
+		if err != nil {
+			return err
 		}
-		if !sameBinding(prior.Binding, settlement.Binding) {
-			return false, fmt.Errorf("%w: settlement binding does not match registered watch", ErrInvalid)
-		}
-		found = true
-		if prior.State != StatePending {
-			if prior.State == settlement.State && prior.Diagnostic == settlement.Diagnostic {
-				return false, nil
+		key := watchKey(settlement.Binding)
+		found := false
+		for _, prior := range records {
+			if watchKey(prior.Binding) != key {
+				continue
 			}
-			return false, fmt.Errorf("%w: terminal settlement already exists", ErrInvalid)
+			if !sameBinding(prior.Binding, settlement.Binding) {
+				return fmt.Errorf("%w: settlement binding does not match registered watch", ErrInvalid)
+			}
+			found = true
+			if prior.State != StatePending {
+				if prior.State == settlement.State && prior.Diagnostic == settlement.Diagnostic {
+					return nil
+				}
+				return fmt.Errorf("%w: terminal settlement already exists", ErrInvalid)
+			}
 		}
-	}
-	if !found {
-		return false, fmt.Errorf("%w: no registered watch", ErrInvalid)
-	}
-	if err := s.appendLocked(record{Kind: "settlement", Settlement: settlement}); err != nil {
-		return false, err
-	}
-	return true, nil
+		if !found {
+			return fmt.Errorf("%w: no registered watch", ErrInvalid)
+		}
+		if err := s.appendLocked(record{Kind: "settlement", Settlement: settlement}); err != nil {
+			return err
+		}
+		written = true
+		return nil
+	})
+	return written, err
 }
 
 // Load returns the current durable record for one exact binding.
@@ -221,23 +259,26 @@ func (s *Store) Load(binding Binding) (Settlement, error) {
 	if err := binding.Validate(); err != nil {
 		return Settlement{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	records, err := s.readLocked()
-	if err != nil {
-		return Settlement{}, err
-	}
-	key := watchKey(binding)
-	for _, prior := range records {
-		if watchKey(prior.Binding) != key {
-			continue
+	var result Settlement
+	err := s.withExclusiveLock(func() error {
+		records, err := s.readLocked()
+		if err != nil {
+			return err
 		}
-		if !sameBinding(prior.Binding, binding) {
-			return Settlement{}, fmt.Errorf("%w: candidate/policy watch belongs to another binding", ErrInvalid)
+		key := watchKey(binding)
+		for _, prior := range records {
+			if watchKey(prior.Binding) != key {
+				continue
+			}
+			if !sameBinding(prior.Binding, binding) {
+				return fmt.Errorf("%w: candidate/policy watch belongs to another binding", ErrInvalid)
+			}
+			result = prior
+			return nil
 		}
-		return prior, nil
-	}
-	return Settlement{}, fmt.Errorf("%w: no registered watch", ErrInvalid)
+		return fmt.Errorf("%w: no registered watch", ErrInvalid)
+	})
+	return result, err
 }
 
 // List returns every current settlement in deterministic binding order. It is
@@ -246,9 +287,12 @@ func (s *Store) List() ([]Settlement, error) {
 	if s == nil {
 		return nil, fmt.Errorf("%w: nil store", ErrInvalid)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	records, err := s.readLocked()
+	var records []Settlement
+	err := s.withExclusiveLock(func() error {
+		var err error
+		records, err = s.readLocked()
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +307,63 @@ func (s *Store) List() ([]Settlement, error) {
 		return left.Attempt < right.Attempt
 	})
 	return records, nil
+}
+
+func (s *Store) withExclusiveLock(fn func() error) (retErr error) {
+	timeout := s.lockTimeout
+	if timeout <= 0 {
+		timeout = defaultLockTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := acquireLedgerProcessLock(ctx, &s.mu); err != nil {
+		return fmt.Errorf("%w after %s: %v", ErrLockTimeout, timeout, err)
+	}
+	defer s.mu.Unlock()
+	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("remote-ci: open ledger lock: %w", err)
+	}
+	locked := false
+	defer func() {
+		var unlockErr error
+		if locked {
+			unlockErr = releaseLedgerFileLock(lock)
+		}
+		closeErr := lock.Close()
+		if unlockErr != nil {
+			unlockErr = fmt.Errorf("remote-ci: unlock ledger: %w", unlockErr)
+		}
+		if closeErr != nil {
+			closeErr = fmt.Errorf("remote-ci: close ledger lock: %w", closeErr)
+		}
+		retErr = errors.Join(retErr, unlockErr, closeErr)
+	}()
+	if err := acquireLedgerFileLock(ctx, lock); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("%w after %s: %v", ErrLockTimeout, timeout, err)
+		}
+		return fmt.Errorf("remote-ci: lock ledger: %w", err)
+	}
+	locked = true
+	return fn()
+}
+
+func acquireLedgerProcessLock(ctx context.Context, mu *sync.Mutex) error {
+	for {
+		if mu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(ledgerLockRetryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Store) readLocked() ([]Settlement, error) {
@@ -315,15 +416,57 @@ func (s *Store) appendLocked(r record) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	prior, err := os.ReadFile(s.path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remote-ci: stage ledger: %w", err)
+	}
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, ".remote-ci-*.tmp")
 	if err != nil {
-		return fmt.Errorf("remote-ci: append ledger: %w", err)
+		return fmt.Errorf("remote-ci: create ledger transaction: %w", err)
 	}
-	defer f.Close()
-	if _, err := f.Write(append(b, '\n')); err != nil {
-		return fmt.Errorf("remote-ci: append ledger: %w", err)
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("remote-ci: chmod ledger transaction: %w", err)
 	}
-	return f.Sync()
+	if len(prior) > 0 {
+		if _, err := tmp.Write(prior); err != nil {
+			_ = tmp.Close()
+			return fmt.Errorf("remote-ci: copy ledger transaction: %w", err)
+		}
+		if prior[len(prior)-1] != '\n' {
+			if _, err := tmp.Write([]byte{'\n'}); err != nil {
+				_ = tmp.Close()
+				return fmt.Errorf("remote-ci: delimit ledger transaction: %w", err)
+			}
+		}
+	}
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("remote-ci: append ledger transaction: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("remote-ci: sync ledger transaction: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("remote-ci: close ledger transaction: %w", err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("remote-ci: commit ledger transaction: %w", err)
+	}
+	dirHandle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("remote-ci: open ledger directory: %w", err)
+	}
+	syncErr := dirHandle.Sync()
+	closeErr := dirHandle.Close()
+	if syncErr != nil || closeErr != nil {
+		return errors.Join(syncErr, closeErr)
+	}
+	return nil
 }
 
 func watchKey(b Binding) string {
@@ -341,6 +484,27 @@ func sameBinding(left, right Binding) bool {
 		}
 	}
 	return true
+}
+
+func normalizeChecks(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		name := strings.TrimSpace(raw)
+		key := strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i]) < strings.ToLower(out[j])
+	})
+	return out
 }
 
 // Revision creates an opaque deterministic revision for a policy snapshot.
@@ -365,3 +529,7 @@ func redactBounded(in string) string {
 	}
 	return in
 }
+
+// SanitizeDiagnostic returns the bounded redacted form safe for durable or
+// machine-readable operator diagnostics.
+func SanitizeDiagnostic(in string) string { return redactBounded(in) }

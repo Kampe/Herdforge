@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -74,7 +73,7 @@ func registerMergeAdmitFlags(fs *flag.FlagSet) *mergeAdmitFlags {
 		mode:            fs.String("mode", "", "How the merge will be published: merge, rebase, or squash (required)"),
 		pr:              fs.Int("pr", 0, "Pull request number to probe for head/mergeability/CI (required)"),
 		remoteCIAttempt: fs.Int64("remote-ci-attempt", 0, "Remote CI attempt bound to this candidate (required)"),
-		remoteCIFile:    fs.String("remote-ci-file", ".herd/remote-ci.jsonl", "Durable remote CI settlement ledger"),
+		remoteCIFile:    fs.String("remote-ci-file", remoteci.DefaultLedgerPath, "Durable remote CI settlement ledger"),
 		asJSON:          fs.Bool("json", false, "Emit the decision as JSON"),
 	}
 }
@@ -169,11 +168,11 @@ func bindRemoteCIAdmission(gate *mergeadmit.Gate, req *mergeadmit.Request, ledge
 	if err != nil {
 		return fmt.Errorf("remote CI repository identity: %w", err)
 	}
-	checks := append([]string(nil), gate.Policy.RemoteCI.RequiredChecks...)
-	sort.Strings(checks)
-	policyRevision := remoteci.Revision(preflight.PolicyRevision(gate.Policy), strings.Join(checks, "\x00"))
-	binding := remoteci.Binding{Repository: repo, CandidateSHA: req.CandidateSHA, PolicyRevision: policyRevision, Attempt: attempt, RequiredChecks: checks}
-	gate.RemoteCIRepository, gate.RemoteCIPolicyRevision = repo, policyRevision
+	binding, err := remoteci.NewBinding(repo, req.CandidateSHA, preflight.PolicyRevision(gate.Policy), attempt, gate.Policy.RemoteCI.RequiredChecks)
+	if err != nil {
+		return fmt.Errorf("remote CI binding: %w", err)
+	}
+	gate.RemoteCIRepository, gate.RemoteCIPolicyRevision = repo, binding.PolicyRevision
 	store, err := remoteci.Open(ledgerPath)
 	if err != nil {
 		return err

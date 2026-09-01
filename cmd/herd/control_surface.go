@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 25
+const controlSurfaceVersion = 26
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "candidate", "capacity", "handoffs", "utilization", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "kick", "labels", "lane-cut", "worktree-reap", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-host", "integrate", "review-classify", "review-ingest", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "kick", "labels", "lane-cut", "worktree-reap", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "remote-ci-settle", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "review", "review-host", "integrate", "review-classify", "review-ingest", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -110,6 +110,7 @@ func controlSurface() controlSurfaceManifest {
 // or reclassifying a command changes the hash and fails tests until the author
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
+	26: "9192e793a775fdb5e71916c93af36097285092de9f0f70d3f87b45cea2e81099",
 	1:  "ec8bcd82bb03cc6e33e6a87515cbd9236aa997a2efca802f5d800b8ba0afe121",
 	2:  "96f0e6e4ef2653c583b4580efe3ea5d5b6d537dfc8282e2eda62c0905dcd5287",
 	3:  "d2e75d61dec1d2cd0dac05dac7b3515ef6d7f113a52a08d8e0735447e040be80",

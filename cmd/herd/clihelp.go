@@ -118,6 +118,7 @@ var subcommandUsage = map[string]string{
 	"hostcreds":        "Usage: herd hostcreds <diagnose|session|selftest> [flags]\n  Query the host credentials oracle without launching OpenCode.",
 	"labels":           "Usage: herd labels [flags]\n  Reconcile drifted Herdforge tab labels in place.",
 	"merge-admit":      "Usage: herd merge-admit [flags]\n  Admit a reviewed candidate to the coordinator merge path.",
+	"remote-ci-settle": "Usage: herd remote-ci-settle --ref REF --candidate SHA --remote-ci-attempt N [--timeout DURATION --poll-interval DURATION --max-polls N]\n  Poll and durably settle exact-candidate remote CI; emits JSON.",
 	"merge-complete":   "Usage: herd merge-complete [flags]\n  Record and validate completion of an admitted merge.",
 	"netbroker-serve":  "Usage: herd netbroker-serve [flags]\n  Run the durable network allowlist broker process.",
 	"no-claude":        "Usage: herd no-claude <on|off|status>\n  Legacy alias for herd posture no-claude.",

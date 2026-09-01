@@ -285,6 +285,9 @@ func main() {
 	case "merge-admit":
 		runMergeAdmit()
 
+	case "remote-ci-settle":
+		runRemoteCISettle()
+
 	case "merge-complete":
 		runMergeComplete()
 
