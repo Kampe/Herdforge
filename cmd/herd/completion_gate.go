@@ -88,6 +88,10 @@ func bindingForWorktreeAtRoot(_ *config.Config, machine *lifecycle.Machine, ref,
 	if profileErr != nil {
 		return daemon.CompletionBinding{}, fmt.Errorf("load verification profile: %w", profileErr)
 	}
+	executionProfile, executionProfileErr := verificationExecutionProfile(profile, configRevision)
+	if executionProfileErr != nil {
+		return daemon.CompletionBinding{}, fmt.Errorf("derive verification execution profile: %w", executionProfileErr)
+	}
 	profileName := profile.ID
 	if profile.PreflightCommand != "" {
 		profileName += "+preflight"
@@ -98,7 +102,7 @@ func bindingForWorktreeAtRoot(_ *config.Config, machine *lifecycle.Machine, ref,
 		CandidateSHA:        sha,
 		WorktreeDir:         wt,
 		VerificationProfile: profileName,
-		ProfileDigest:       profile.Digest(),
+		ProfileDigest:       executionProfile.Digest(),
 		ConfigRevision:      configRevision,
 		Branch:              "herd/" + strings.ToLower(ref),
 	}

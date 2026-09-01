@@ -8838,6 +8838,21 @@ func verificationCommandProfile(root string) (verifier.CommandProfile, string, e
 	return profile, "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
+// verificationExecutionProfile derives the exact command profile executed by
+// managed verification. Callers must validate any supplied commands against
+// the raw configured profile before using this derived profile.
+func verificationExecutionProfile(profile verifier.CommandProfile, configRevision string) (verifier.CommandProfile, error) {
+	if configRevision == "default" {
+		return profile, nil
+	}
+	testCommand, err := verifier.ApplyTestTimeout(profile.TestCommand, profile.TestTimeout)
+	if err != nil {
+		return verifier.CommandProfile{}, fmt.Errorf("apply test timeout: %w", err)
+	}
+	profile.TestCommand = testCommand
+	return profile, nil
+}
+
 // runVerify is the FAC-98/FAC-116 completion gate: `herd verify <worktree>`
 // exits 0 only when the worktree has real committed work, builds, and tests
 // pass — the check an agent must pass before reporting done, and the forge
@@ -8922,33 +8937,27 @@ func runVerify() {
 		fmt.Fprintf(os.Stderr, "herd verify: load verification profile: %v\n", profileErr)
 		os.Exit(2)
 	}
+	if tcErr == nil && configRevision != "default" && !profile.Matches(*buildCmd, *testCmd, profile.PreflightCommand) {
+		fmt.Fprintf(os.Stderr, "herd verify: managed verification commands must match repository profile %s (FAC-377)\n", profile.Digest())
+		os.Exit(2)
+	}
 	verificationProfileName := profile.ID
 	preflightCommand := profile.PreflightCommand
 	if preflightCommand != "" {
 		verificationProfileName += "+preflight"
 	}
-	executionProfile := profile
+	executionProfile, executionProfileErr := verificationExecutionProfile(profile, configRevision)
+	if executionProfileErr != nil {
+		fmt.Fprintf(os.Stderr, "herd verify: derive verification execution profile: %v\n", executionProfileErr)
+		os.Exit(2)
+	}
 	if configRevision == "default" {
 		// Local development has no repository-owned profile, so retain the
 		// explicit command flags and bind receipts to exactly what ran.
 		executionProfile.BuildCommand = strings.TrimSpace(*buildCmd)
 		executionProfile.TestCommand = strings.TrimSpace(*testCmd)
-	} else {
-		var timeoutErr error
-		executionProfile.TestCommand, timeoutErr = verifier.ApplyTestTimeout(executionProfile.TestCommand, executionProfile.TestTimeout)
-		if timeoutErr != nil {
-			fmt.Fprintf(os.Stderr, "herd verify: apply test timeout: %v\n", timeoutErr)
-			os.Exit(2)
-		}
 	}
 	if tcErr == nil {
-		// A checkout without a repository profile is local-development mode;
-		// preserve its historical explicit command flags. Once the repository
-		// declares a profile, managed evidence must use it exactly.
-		if configRevision != "default" && !profile.Matches(*buildCmd, *testCmd, preflightCommand) {
-			fmt.Fprintf(os.Stderr, "herd verify: managed verification commands must match repository profile %s (FAC-377)\n", profile.Digest())
-			os.Exit(2)
-		}
 		sha, shaErr := worktreeHeadSHA(wt)
 		if shaErr != nil {
 			// A malformed/empty managed worktree can still emit its bound
