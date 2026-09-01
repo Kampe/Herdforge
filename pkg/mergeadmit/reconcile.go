@@ -1,6 +1,7 @@
 package mergeadmit
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strings"
@@ -276,34 +277,121 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 		return nil, fmt.Errorf("landed %s adds no commits over base %s", short(landed), short(base))
 	}
 
-	want, err := patchIDs(repoDir, candidateCommits)
+	candidateContent, err := nonEmptyCommits(repoDir, candidateCommits)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidateContent) == 0 {
+		return nil, fmt.Errorf("candidate %s adds no content over base %s: an empty candidate has no content to prove landed",
+			short(candidate), short(base))
+	}
+
+	want, err := patchIDs(repoDir, candidateContent)
 	if err != nil {
 		return nil, err
 	}
 	got, err := patchIDs(repoDir, landedCommits)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedCommits)
+		if matchErr == nil {
+			return equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA,
+				"ordered-patch-subsequence-on-landed")
+		}
+		err = matchErr
 	}
 
-	mergeSHA, err := matchOrderedPatchSubsequence(want, got, landedCommits)
-	if err != nil {
+	// Keep the established single-content-commit predicate unchanged. The
+	// combined fallback exists only for a reviewed stack whose intermediate
+	// patch context was rewritten by a newer main.
+	if len(candidateContent) == 1 {
 		return nil, fmt.Errorf("equivalent-patch proof failed: %w", err)
 	}
 
+	mergeSHA, replayErr := matchCombinedRangeReplay(repoDir, base, candidate, candidateContent, landedCommits)
+	if replayErr != nil {
+		return nil, fmt.Errorf("equivalent-patch proof failed: ordered proof: %v; combined proof: %w", err, replayErr)
+	}
+	return equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA,
+		"combined-range-replay-on-landed")
+}
+
+func equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA, method string) (*Proof, error) {
 	pid, err := commitPatchID(repoDir, mergeSHA)
 	if err != nil {
 		return nil, fmt.Errorf("patch id for proved merge commit %s: %w", short(mergeSHA), err)
 	}
-
 	return &Proof{
-		Mode:         ModeRebase,
-		BaseSHA:      base,
-		CandidateSHA: candidate,
-		LandedSHA:    landed,
-		MergeSHA:     mergeSHA,
-		PatchID:      pid,
-		Method:       "ordered-patch-subsequence-on-landed",
+		Mode: ModeRebase, BaseSHA: base, CandidateSHA: candidate,
+		LandedSHA: landed, MergeSHA: mergeSHA, PatchID: pid, Method: method,
 	}, nil
+}
+
+// nonEmptyCommits removes generated administrative anchors while preserving
+// the order of every content-bearing commit. A wholly empty range is still a
+// hard refusal, enforced by the caller.
+func nonEmptyCommits(repoDir string, commits []string) ([]string, error) {
+	content := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		diff, err := gitOutBytes(repoDir, "diff-tree", "-p", "--no-color", commit)
+		if err != nil {
+			return nil, fmt.Errorf("inspect patch for %s: %w", short(commit), err)
+		}
+		if len(bytes.TrimSpace(diff)) != 0 {
+			content = append(content, commit)
+		}
+	}
+	return content, nil
+}
+
+// matchCombinedRangeReplay proves the context-rewritten GitHub rebase shape.
+// The candidate tip patch anchors the ordered stack endpoint. For each
+// candidate-sized contiguous landed window ending at that patch, git
+// merge-tree replays the exact reviewed base..candidate result onto the
+// window's parent using the exact reviewed base as the merge base. Only one
+// window may produce the exact landed end tree; zero is missing/altered and
+// more than one is an ambiguous reconstruction.
+func matchCombinedRangeReplay(repoDir, base, candidate string, candidateContent, landedCommits []string) (string, error) {
+	stackLen := len(candidateContent)
+	if stackLen < 2 {
+		return "", fmt.Errorf("combined replay requires a multi-commit candidate")
+	}
+	tipPatch, err := commitPatchID(repoDir, candidateContent[stackLen-1])
+	if err != nil {
+		return "", fmt.Errorf("candidate tip patch: %w", err)
+	}
+
+	var matches []string
+	for end := stackLen - 1; end < len(landedCommits); end++ {
+		landedTipPatch, patchErr := commitPatchID(repoDir, landedCommits[end])
+		if patchErr != nil || landedTipPatch != tipPatch {
+			continue
+		}
+		start := end - stackLen + 1
+		windowBase := base
+		if start > 0 {
+			windowBase = landedCommits[start-1]
+		}
+		replayedTree, mergeErr := gitOut(repoDir, "merge-tree", "--write-tree", "--merge-base", base, windowBase, candidate)
+		if mergeErr != nil {
+			continue
+		}
+		landedTree, treeErr := gitOut(repoDir, "rev-parse", "--verify", "-q", landedCommits[end]+"^{tree}")
+		if treeErr != nil {
+			return "", fmt.Errorf("resolve landed tree %s: %w", short(landedCommits[end]), treeErr)
+		}
+		if replayedTree == landedTree {
+			matches = append(matches, landedCommits[end])
+		}
+	}
+
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf("no candidate-sized landed stack with the reviewed tip patch reproduces the combined reviewed change")
+	default:
+		return "", fmt.Errorf("ambiguous reconstruction: %d landed stacks reproduce the combined reviewed change", len(matches))
+	}
 }
 
 // matchOrderedPatchSubsequence finds want as an ordered subsequence of got and
