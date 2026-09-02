@@ -255,10 +255,17 @@ func TestKaneoCLI_LabelArgvContract(t *testing.T) {
 			return &CLIResult{Stdout: []byte(`[{"id":"l1","name":"forge-smith","taskId":"t1"}]`)}, nil
 		case strings.HasPrefix(strings.Join(args, " "), "label list"):
 			workspaceLists++
-			if workspaceLists == 1 {
+			switch workspaceLists {
+			case 1:
+				// create precondition: the row does not exist yet
 				return &CLIResult{Stdout: []byte(`[]`)}, nil
+			case 3:
+				// attach readback: the row now belongs to the target
+				return &CLIResult{Stdout: []byte(`[{"id":"l2","name":"forge-smith","taskId":"t2"}]`)}, nil
+			default:
+				// attach donor preimage: the row is unattached
+				return &CLIResult{Stdout: []byte(`[{"id":"l2","name":"forge-smith","taskId":""}]`)}, nil
 			}
-			return &CLIResult{Stdout: []byte(`[{"id":"l2","name":"forge-smith","taskId":""}]`)}, nil
 		case strings.HasPrefix(strings.Join(args, " "), "label create"):
 			return &CLIResult{Stdout: []byte(`{"id":"l2","name":"forge-smith","taskId":""}`)}, nil
 		default:
@@ -279,10 +286,20 @@ func TestKaneoCLI_LabelArgvContract(t *testing.T) {
 	if err := k.DetachTaskLabel(context.Background(), "l2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := k.DeleteTaskLabel(context.Background(), "l2"); err != nil {
-		t.Fatal(err)
+	// A workspace label delete resolves by name and is refused outright, so it
+	// contributes no argv. See TestDeleteTaskLabelFailsClosedWithoutArgv.
+	if err := k.DeleteTaskLabel(context.Background(), "l2"); !errors.Is(err, ErrWorkspaceLabelDeleteUnguarded) {
+		t.Fatalf("workspace label delete must fail closed, got %v", err)
 	}
-	want := []string{"task label list t1 --json --project project-1", "label list --json --project project-1", "label create --color #808080 forge-smith --json --project project-1", "task label add t2 l2 --project project-1", "task label delete l2 --project project-1", "label delete l2 --project project-1"}
+	want := []string{
+		"task label list t1 --json --project project-1",
+		"label list --json --project project-1",
+		"label create --color #808080 forge-smith --json --project project-1",
+		"label list --json --project project-1",
+		"task label add t2 l2 --project project-1",
+		"label list --json --project project-1",
+		"task label delete l2 --project project-1",
+	}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("CLI argv mismatch:\n got %v\nwant %v", calls, want)
 	}
@@ -291,7 +308,12 @@ func TestKaneoCLI_LabelArgvContract(t *testing.T) {
 func TestKaneoCLI_RedundantAttachNullIsTypedFailure(t *testing.T) {
 	old := kaneoRunCLI
 	t.Cleanup(func() { kaneoRunCLI = old })
-	kaneoRunCLI = func(context.Context, string, ...string) (*CLIResult, error) {
+	kaneoRunCLI = func(_ context.Context, _ string, args ...string) (*CLIResult, error) {
+		// The attach needs a donor preimage before it can classify the null
+		// response; only the add itself returns null here.
+		if strings.HasPrefix(strings.Join(args, " "), "label list") {
+			return &CLIResult{Stdout: []byte(`[{"id":"l1","name":"forge-smith","taskId":"t1"}]`)}, nil
+		}
 		return &CLIResult{Stdout: []byte("null")}, nil
 	}
 	k := NewKaneoProvider("", "project-1", true)

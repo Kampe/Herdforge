@@ -74,6 +74,16 @@ func (m *MemoryProvider) ProveLabelCreation(_ context.Context, created TaskLabel
 	return nil
 }
 
+// LookupWorkspaceLabel models Kaneo's workspace-wide label read, so the donor
+// proof in the label transaction is exercised against the same fake that models
+// the destructive attach.
+func (m *MemoryProvider) LookupWorkspaceLabel(_ context.Context, labelID string) (TaskLabel, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.labels[labelID]
+	return row, ok, nil
+}
+
 func (m *MemoryProvider) AttachTaskLabel(_ context.Context, taskID, labelID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
