@@ -125,3 +125,28 @@ func IsolateDefaultSlotDir() (restore func(), err error) {
 	}
 	return restore, nil
 }
+
+const nestedSlotHeldVar = "HERD_HEAVY_PHASE_SLOT_HELD"
+
+// NestedSlotReentryEnv copies env for a nested CLI subprocess. When held is
+// true it stamps HERD_HEAVY_PHASE_SLOT_HELD=1 so a child of an already-held
+// managed verifier does not reacquire the outer host slot. It does not restore
+// root, role, pane, mode, or routing metadata — those stay stripped from the
+// in-process test context. A nil env means inherit os.Environ().
+func NestedSlotReentryEnv(env []string, held bool) []string {
+	if !held {
+		return env
+	}
+	if env == nil {
+		env = os.Environ()
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		name, _, ok := strings.Cut(kv, "=")
+		if ok && name == nestedSlotHeldVar {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, nestedSlotHeldVar+"=1")
+}
