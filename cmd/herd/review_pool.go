@@ -370,7 +370,26 @@ func runPoolReview(ref string) error {
 			"this candidate will be refused at harvest admission until a record row carries its lease and patch id\n", err)
 	}
 
+	// FAC-626: verify the surface's actual content agrees with the candidate
+	// BEFORE reporting anything ready or launching anything into it. The
+	// reset above pins THIS process's own leased slot, which is sound on its
+	// own -- this re-reads through the exact symlink a reviewer (or an
+	// operator reading the "ready" line) would follow, so a defect anywhere
+	// in that chain (a reused lease, a symlink pointing somewhere unexpected)
+	// is caught here rather than trusted because a path merely exists.
+	if err := verifySurfaceCandidate(surface, sha); err != nil {
+		return err
+	}
+
 	if *noLaunch {
+		// FAC-626: --no-launch hands the surface to a LATER, manual reviewer
+		// dispatch (see the top-of-file doc comment: "the lease remains held
+		// for the review supervisor to release after verdict ingest"). This
+		// path used to release the lease anyway on the way out, which is what
+		// let a later, unrelated `herd review --pool` invocation lease and
+		// reset this SAME slot before anyone had dispatched into it -- the
+		// live incident. The lease stays held.
+		releaseOnFailure = false
 		fmt.Printf("review surface ready ref=%s sha=%s lease=%s path=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, packet)
 		return nil
 	}
@@ -454,6 +473,14 @@ func runPoolReview(ref string) error {
 	}
 	if _, statErr := os.Stat(packetAbs); statErr != nil {
 		return errors.Join(fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr), herdr.CloseReviewTab(tab.ID, agentName))
+	}
+	// FAC-626: re-verify immediately before the reviewer is actually handed
+	// anything. Tab creation and AwaitInteractiveReady above can take 30+
+	// seconds; re-checking here -- not only once, right after the reset --
+	// is what "before any reviewer is launched against a pooled surface"
+	// means literally, and costs one git call against an already-warm slot.
+	if err := verifySurfaceCandidate(surface, sha); err != nil {
+		return errors.Join(err, herdr.CloseReviewTab(tab.ID, agentName))
 	}
 	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packetAbs+" in full.", true, 30*time.Second); err != nil {
 		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
@@ -603,6 +630,48 @@ func candidateSurfaceDirs(root, ref string) []string {
 		return []string{raw}
 	}
 	return []string{raw, safe}
+}
+
+// verifySurfaceCandidate refuses a pooled review surface whose git HEAD is
+// not the exact requested candidate.
+//
+// FAC-626: a warm-pool slot's lease can outlive the process that leased it
+// (--no-launch is meant to hand a pinned surface to a LATER, manual reviewer
+// dispatch), and any window in which that lease is not held lets a later,
+// unrelated `herd review --pool` invocation lease and reset the SAME slot
+// out from under an already-reported surface. Live incident: a surface named
+// for FAC-625's candidate resolved to a pool slot whose HEAD was trunk. A
+// reviewer dispatched there would produce a plausible, fully-formed verdict
+// for a commit it never examined, attributed to the requested candidate --
+// not a missing review, a FABRICATED one, and it ingests as canonical
+// cross-family evidence. Existence of the symlink was treated as agreement
+// with the candidate; only re-reading HEAD through it proves that.
+//
+// Refuses rather than repoints: a stale alias means something ELSE already
+// decided this candidate's evidence, and silently repointing it to whatever
+// the slot now holds would be serving one candidate's review packet against
+// another candidate's code without anyone asking for that substitution.
+func verifySurfaceCandidate(surface, wantSHA string) error {
+	target, err := os.Readlink(surface)
+	if err != nil {
+		return fmt.Errorf("resolve review surface %s: %w", surface, err)
+	}
+	resolvedTarget := target
+	if !filepath.IsAbs(resolvedTarget) {
+		resolvedTarget = filepath.Join(filepath.Dir(surface), target)
+	}
+	if headMatchesSHA(resolvedTarget, wantSHA) {
+		return nil
+	}
+	gotHead := "unresolvable"
+	if out, herr := exec.Command("git", "-C", resolvedTarget, "rev-parse", "HEAD").Output(); herr == nil {
+		gotHead = strings.TrimSpace(string(out))
+	}
+	return fmt.Errorf(
+		"review surface %s is STALE: requested candidate %s but its resolved target %s (symlink -> %s) has HEAD %s; "+
+			"a reviewer dispatched here would review a different commit and its verdict would be misattributed to the "+
+			"requested candidate (FAC-626 refuses rather than serve it)",
+		surface, wantSHA, resolvedTarget, target, gotHead)
 }
 
 // headMatchesSHA reports whether dir's HEAD is exactly sha. A resolution error
