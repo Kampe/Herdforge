@@ -288,10 +288,11 @@ func TestPSubscribe_PatternMatchesMultipleChannels(t *testing.T) {
 	mock := newMockRedisClient()
 	tmpDir := t.TempDir()
 	mb := NewMailbox(filepath.Join(tmpDir, "mail.jsonl"))
+	// PSubscribe is called synchronously before NewMessageBroker returns
+	// (see startSubscriber's doc comment), so the pattern is already
+	// registered here — no sleep needed to "wait for the subscriber".
 	broker := NewMessageBroker(mb, WithRedis(mock, "herd"))
 	defer broker.Close()
-
-	time.Sleep(50 * time.Millisecond)
 
 	for _, recipient := range []string{"alice", "bob", "carol"} {
 		env := &Envelope{ID: "remote-" + recipient, Sender: "dave", Recipient: recipient, Subject: "s", Body: "b", Timestamp: time.Now()}
@@ -300,16 +301,34 @@ func TestPSubscribe_PatternMatchesMultipleChannels(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
 
 	for _, recipient := range []string{"alice", "bob", "carol"} {
-		envs, err := broker.ReadInbox(recipient)
+		envs, err := waitForInboxCount(t, broker, recipient, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(envs) != 1 {
 			t.Errorf("expected 1 relayed envelope for %s via pattern subscription, got %d", recipient, len(envs))
 		}
+	}
+}
+
+// waitForInboxCount polls ReadInbox until it observes at least want
+// envelopes, or fails once the delivery goroutine can no longer plausibly
+// still be draining. This ties the wait to the actual observable state
+// (the mailbox content the relay path writes to) instead of a fixed sleep.
+func waitForInboxCount(t *testing.T, broker *MessageBroker, recipient string, want int) ([]*Envelope, error) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		envs, err := broker.ReadInbox(recipient)
+		if err != nil {
+			return nil, err
+		}
+		if len(envs) >= want || time.Now().After(deadline) {
+			return envs, nil
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
