@@ -93,3 +93,35 @@ func Leaked() []string {
 	}
 	return found
 }
+
+const nestedSlotDirVar = "HERD_HEAVY_PHASE_SLOT_DIR"
+
+// IsolateDefaultSlotDir points slot.Default at a private directory so
+// in-process tests that Strip the re-entrancy marker cannot wait on a parent
+// managed-verifier host slot. Runtime temp paths are not written into the
+// repository.
+//
+// The returned restore removes the directory and puts HERD_HEAVY_PHASE_SLOT_DIR
+// back to its previous state. TestMain must call restore before os.Exit;
+// process exit skips defers, including after a failing m.Run.
+func IsolateDefaultSlotDir() (restore func(), err error) {
+	nop := func() {}
+	prev, hadPrev := os.LookupEnv(nestedSlotDirVar)
+	dir, err := os.MkdirTemp("", "herd-test-heavy-phase-slots-")
+	if err != nil {
+		return nop, err
+	}
+	restore = func() {
+		_ = os.RemoveAll(dir)
+		if hadPrev {
+			_ = os.Setenv(nestedSlotDirVar, prev)
+		} else {
+			_ = os.Unsetenv(nestedSlotDirVar)
+		}
+	}
+	if err := os.Setenv(nestedSlotDirVar, dir); err != nil {
+		restore()
+		return nop, err
+	}
+	return restore, nil
+}

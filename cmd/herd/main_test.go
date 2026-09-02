@@ -97,6 +97,11 @@ func TestMain(m *testing.M) {
 	// HERD_WORKSPACE and HERDR_* pane vars, which made five cmd/herd tests fail
 	// in a lane's shell and pass in the coordinator's on the same commit.
 	laneenv.Strip()
+	restoreSlots, err := laneenv.IsolateDefaultSlotDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "isolate test heavy-phase slots: %v\n", err)
+		os.Exit(1)
+	}
 
 	root, rootGitState, guardErr := snapshotRootGitState()
 	if guardErr != nil {
@@ -117,6 +122,7 @@ func TestMain(m *testing.M) {
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
 		_ = os.RemoveAll(dir)
 	}
+	restoreSlots()
 	os.Exit(code)
 }
 
