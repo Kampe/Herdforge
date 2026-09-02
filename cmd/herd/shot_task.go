@@ -381,6 +381,9 @@ func recordShotLifecycleLease(root, ref string, lease int64, sha string) error {
 	}
 	if current != nil {
 		if current.LeaseGeneration != lease {
+			if current.LeaseGeneration < lease {
+				return runShotGenerationReconcile(context.Background(), root, ref, lease, sha, machine, current)
+			}
 			return fmt.Errorf("shot: lifecycle lease generation %d conflicts with reported %d", current.LeaseGeneration, lease)
 		}
 		if current.CandidateSHA != "" && current.CandidateSHA != sha {
