@@ -648,6 +648,44 @@ func (s *SQLiteLeaseStore) LeaseByGeneration(ctx context.Context, key LeaseKey, 
 	return s.byGeneration(ctx, key, ownerID, generation)
 }
 
+// LeasesByGeneration returns every historical row at exact generation for
+// key, regardless of owner. Dual-store cancel uses this to refuse an
+// ambiguous identity before any mutation.
+func (s *SQLiteLeaseStore) LeasesByGeneration(ctx context.Context, key LeaseKey, generation int64) ([]*Lease, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+leaseColumns+` FROM leases
+		WHERE repo = ? AND provider = ? AND project = ? AND task_ref = ? AND generation = ?
+		ORDER BY id ASC`,
+		key.Repo, key.Provider, key.Project, key.TaskRef, generation)
+	if err != nil {
+		return nil, fmt.Errorf("leases by generation: %w", err)
+	}
+	defer rows.Close()
+	var out []*Lease
+	for rows.Next() {
+		l, err := scanLease(rows)
+		if err != nil {
+			return nil, fmt.Errorf("leases by generation: scan: %w", err)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// ProviderLockHeld reports whether leaseID currently has a nonempty
+// provider-lock owner. Dual-store cancel must observe this before mutating
+// either store so a live lock cannot create a new split.
+func (s *SQLiteLeaseStore) ProviderLockHeld(ctx context.Context, leaseID int64) (bool, error) {
+	var owner string
+	err := s.db.QueryRowContext(ctx, `SELECT provider_lock_owner FROM leases WHERE id = ?`, leaseID).Scan(&owner)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("provider lock held: %w", err)
+	}
+	return owner != "", nil
+}
+
 // fencingError distinguishes "a newer generation now owns this key"
 // (stale fencing token) from "no such lease ever existed" (not found).
 func (s *SQLiteLeaseStore) fencingError(ctx context.Context, key LeaseKey, ownerID string, generation int64) error {

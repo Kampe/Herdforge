@@ -5020,11 +5020,18 @@ func runDispatchCancel() {
 		Project:  cfg.TaskProvider.ProjectID,
 		TaskRef:  hsync.NormalizeRef(req.TicketRef),
 	}
-	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", req.LeaseGeneration); err != nil {
+	result, err := releaseCoordinationAndLaunchLeaseBounded(root, key, claim.CoordinatorDispatchOwner, req.LeaseGeneration)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch cancel: release %s generation %d: %v\n", req.TicketRef, req.LeaseGeneration, err)
 		os.Exit(1)
 	}
-	fmt.Printf("dispatch cancel: released %s generation %d\n", req.TicketRef, req.LeaseGeneration)
+	fmt.Printf("dispatch cancel: %s generation %d\n", req.TicketRef, req.LeaseGeneration)
+	printDispatchCancelStore(os.Stdout, result.Coordinator)
+	printDispatchCancelStore(os.Stdout, result.Launch)
+}
+
+func printDispatchCancelStore(w io.Writer, rep claim.StoreReport) {
+	fmt.Fprintf(w, "  store=%s task=%s generation=%d disposition=%s\n", rep.Store, rep.TaskRef, rep.Generation, rep.Disposition)
 }
 
 // dispatchTicketDecision is the production claim + isolated dispatch for ONE
@@ -9850,6 +9857,37 @@ func releaseCoordinationLeaseBounded(root string, key claim.LeaseKey, owner stri
 	ctx, cancel := context.WithTimeout(context.Background(), dispatchCompensationTimeout)
 	defer cancel()
 	return releaseCoordinationLease(ctx, root, key, owner, generation)
+}
+
+func releaseCoordinationAndLaunchLeaseBounded(root string, key claim.LeaseKey, owner string, generation int64) (*claim.DualCancelResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchCompensationTimeout)
+	defer cancel()
+	coord, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		return nil, fmt.Errorf("%w: coordinator store: %v", claim.ErrDualCancelPartialStore, err)
+	}
+	defer coord.Close()
+	launch, err := claim.NewSQLiteLeaseStore(deps.ResolveLaunchLeasePath(root))
+	if err != nil {
+		return nil, fmt.Errorf("%w: launch store: %v", claim.ErrDualCancelPartialStore, err)
+	}
+	defer launch.Close()
+	holds, err := lifecycle.NewHoldAuthority(lifecycle.CanonicalStatePath(root))
+	if err != nil {
+		return nil, fmt.Errorf("%w: hold authority: %v", claim.ErrDualCancelPartialStore, err)
+	}
+	defer holds.Close()
+	return claim.CancelMatchingGeneration(ctx, claim.DualCancelRequest{
+		Key:             key,
+		Owner:           owner,
+		Generation:      generation,
+		Coordinator:     coord,
+		Launch:          launch,
+		CoordinatorPath: lifecycle.CanonicalStatePath(""),
+		LaunchPath:      deps.DefaultLaunchLeasePath(),
+		JournalPath:     filepath.Join(root, ".herd", "dispatch-cancel-journal.jsonl"),
+		HoldReader:      holds,
+	})
 }
 
 // verdictClaimPrefix marks provider-side ownership claims.
