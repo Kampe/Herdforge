@@ -14,6 +14,7 @@ import (
 // the package directory. Individual tests that need a specific receipt path
 // override this via t.Setenv.
 func TestMain(m *testing.M) {
+	laneenv.Strip()
 	restore, err := laneenv.IsolateDefaultSlotDir()
 	if err != nil {
 		os.Exit(1)
@@ -34,4 +35,12 @@ func TestMain(m *testing.M) {
 	_ = os.RemoveAll(testCWD)
 	restore()
 	os.Exit(code)
+}
+
+func TestDispatchTestMainStripsInheritedRoutingMetadata(t *testing.T) {
+	for _, name := range []string{"HERD_MODE", "HERD_USE_PI"} {
+		if _, ok := os.LookupEnv(name); ok {
+			t.Fatalf("dispatch TestMain leaked inherited routing metadata %s", name)
+		}
+	}
 }
