@@ -249,6 +249,12 @@ func TestShotGenerationReconcileHashesCompleteGenerationEvidence(t *testing.T) {
 	if strings.Contains(src, "EncodeCandidateSupersessionEvidence(facts)") {
 		t.Fatal("generation reconcile digest hashes narrower shotSupersessionFacts")
 	}
+	if strings.Contains(src, "shot: lifecycle lease generation %d conflicts with reported %d") {
+		t.Fatal("generation reconcile reimplemented the shot lease-generation conflict message")
+	}
+	if !strings.Contains(src, "shotLeaseGenerationConflict") {
+		t.Fatal("generation reconcile must use the canonical shot lease-generation conflict owner")
+	}
 	for _, needle := range []string{
 		"EncodeWorkerGenerationReconcileEvidence",
 		"WorkerGenerationReconcileEvidence{",

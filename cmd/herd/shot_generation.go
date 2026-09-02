@@ -41,7 +41,7 @@ func reconcileShotLifecycleGeneration(ctx context.Context, root, ref string, lea
 		return fmt.Errorf("worker generation reconcile: canonical lifecycle is not eligible or recovering")
 	}
 	if current.LeaseGeneration >= lease {
-		return fmt.Errorf("shot: lifecycle lease generation %d conflicts with reported %d", current.LeaseGeneration, lease)
+		return shotLeaseGenerationConflict(current.LeaseGeneration, lease)
 	}
 	facts, authority, err := collectShotSupersessionFacts(ctx, root, ref, lease, sha)
 	if err != nil {

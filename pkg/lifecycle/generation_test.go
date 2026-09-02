@@ -258,9 +258,14 @@ func TestWorkerGenerationReconcileSourceKeepsGenerationSessionCandidateFences(t 
 		"req.SessionID",
 		"AND lease_generation = ?",
 		"AND candidate_sha = ?",
+		"insertSameStateLifecycleEvent",
+		"exactCandidateFenceMismatch",
 	} {
 		if !strings.Contains(src, needle) {
 			t.Errorf("removing fence %q would silently mutate; production source is missing it", needle)
 		}
+	}
+	if strings.Contains(src, "INSERT INTO lifecycle_events") {
+		t.Fatal("generation reconcile reimplemented the supersession event insert")
 	}
 }

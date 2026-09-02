@@ -174,9 +174,8 @@ func (m *Machine) ReconcileWorkerGeneration(req WorkerGenerationReconcileRequest
 	if current.Repo != req.Repo || current.Seq != req.ExpectedSequence ||
 		current.LeaseGeneration != req.OldLeaseGeneration || current.Branch != req.Branch ||
 		current.CandidateSHA != req.OldCandidateSHA {
-		return TransitionResult{}, fmt.Errorf("%w: task=%s expected seq=%d lease=%d branch=%s candidate=%s; held seq=%d lease=%d branch=%s candidate=%s",
-			ErrWorkerGenerationReconcileConflict, req.TaskRef, req.ExpectedSequence, req.OldLeaseGeneration, req.Branch, req.OldCandidateSHA,
-			current.Seq, current.LeaseGeneration, current.Branch, current.CandidateSHA)
+		return TransitionResult{}, exactCandidateFenceMismatch(
+			ErrWorkerGenerationReconcileConflict, req.TaskRef, req.ExpectedSequence, req.OldLeaseGeneration, req.Branch, req.OldCandidateSHA, current)
 	}
 	if locked, err := activeIntegrationTx(tx, req.TaskRef); err != nil {
 		return TransitionResult{}, err
@@ -191,17 +190,10 @@ func (m *Machine) ReconcileWorkerGeneration(req WorkerGenerationReconcileRequest
 		Actor: req.Actor, EvidenceDigest: req.EvidenceDigest, Payload: payload,
 		IdempotencyKey: req.IdempotencyKey, CreatedAt: time.Now().UTC(),
 	}
-	res, err := tx.Exec(`INSERT INTO lifecycle_events (
-		task_ref, repo, seq, from_state, to_state, provider_revision,
-		lease_generation, branch, candidate_sha, actor, evidence_digest,
-		payload, idempotency_key, created_at
-	) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.TaskRef, ev.Repo, ev.Seq, string(ev.FromState), string(ev.ToState), ev.LeaseGeneration,
-		ev.Branch, ev.CandidateSHA, ev.Actor, ev.EvidenceDigest, ev.Payload, ev.IdempotencyKey, ev.CreatedAt)
+	ev, err = insertSameStateLifecycleEvent(tx, ev)
 	if err != nil {
 		return TransitionResult{}, fmt.Errorf("%w: insert worker generation reconcile event: %v", ErrConcurrentModification, err)
 	}
-	ev.ID, _ = res.LastInsertId()
 	cas, err := tx.Exec(`UPDATE lifecycle_task_state SET
 		seq = ?, lease_generation = ?, candidate_sha = ?, updated_at = ?
 		WHERE task_ref = ? AND repo = ? AND state = ? AND seq = ? AND lease_generation = ? AND branch = ? AND candidate_sha = ?`,
