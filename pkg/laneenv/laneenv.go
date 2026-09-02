@@ -37,6 +37,8 @@ var Vars = []string{
 	"HERD_ROLE",
 	"HERD_LANE",
 	"HERD_HEAVY_PHASE_SLOT_HELD",
+	"HERD_MODE",
+	"HERD_USE_PI",
 }
 
 // Prefixes are cleared wholesale: HERDR_* is pane metadata injected by the

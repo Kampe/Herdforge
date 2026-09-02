@@ -14,6 +14,10 @@ func TestStripRemovesEveryLaunchVariable(t *testing.T) {
 	for _, v := range Vars {
 		t.Setenv(v, "set-by-launch")
 	}
+	// Managed verification must not let inherited routing policy change the
+	// behavior of an in-process package test.
+	t.Setenv("HERD_MODE", "production")
+	t.Setenv("HERD_USE_PI", "0")
 	t.Setenv("HERDR_PANE", "wK:p1")
 	t.Setenv("HERDR_WORKSPACE", "wK")
 
@@ -21,6 +25,11 @@ func TestStripRemovesEveryLaunchVariable(t *testing.T) {
 
 	if leaked := Leaked(); len(leaked) != 0 {
 		t.Fatalf("launch metadata survived Strip: %v", leaked)
+	}
+	for _, v := range []string{"HERD_MODE", "HERD_USE_PI"} {
+		if _, ok := os.LookupEnv(v); ok {
+			t.Fatalf("routing metadata survived Strip: %s", v)
+		}
 	}
 }
 
