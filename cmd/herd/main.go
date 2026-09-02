@@ -8860,6 +8860,8 @@ func runVerify() {
 	}
 
 	var c *verifier.CompletionCheck
+	var verifyReceipts *verifier.CompletionReceipts
+	var verifyStore *verifier.FileReceiptStore
 	// Keep the candidate identity used by persisted receipts. Re-reading HEAD
 	// after the commands finish can observe a concurrent movement and publish
 	// a callback for a different candidate than the one actually verified.
@@ -8946,6 +8948,7 @@ func runVerify() {
 				fmt.Fprintf(os.Stderr, "herd verify: cannot open receipt store: %v\n", storeErr)
 				os.Exit(2)
 			}
+			verifyStore = store
 			req := verifier.VerificationRequest{
 				TaskRef: tc.TaskRef, LeaseGeneration: fmt.Sprintf("%d", tc.LeaseGeneration),
 				CandidateSHA: sha, BaseSHA: baseSHA, EnvironmentPolicy: verifier.EnvironmentPolicyInherited,
@@ -8964,7 +8967,7 @@ func runVerify() {
 				preflightPassed = preReceipt.Outcome == verifier.OutcomePASS
 			}
 			var persistErr error
-			c, _, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, executionProfile.BuildCommand, executionProfile.TestCommand, req, store)
+			c, verifyReceipts, persistErr = verifier.NewVerifier("").CheckCompletionAndPersist(context.Background(), wt, executionProfile.BuildCommand, executionProfile.TestCommand, req, store)
 			if persistErr != nil {
 				fmt.Fprintf(os.Stderr, "herd verify: persist verification receipts: %v\n", persistErr)
 				os.Exit(2)
@@ -9017,9 +9020,28 @@ func runVerify() {
 		for _, r := range c.Reasons {
 			fmt.Printf("  - %s\n", r)
 		}
+		printVerifierOutputEvidence(verifyStore, verifyReceipts)
 	}
 	if !c.Passed {
 		os.Exit(1)
+	}
+}
+
+func printVerifierOutputEvidence(store *verifier.FileReceiptStore, receipts *verifier.CompletionReceipts) {
+	if store == nil || receipts == nil {
+		return
+	}
+	for _, receipt := range []*verifier.Receipt{receipts.Build, receipts.Test} {
+		if receipt == nil {
+			continue
+		}
+		if receipt.Outcome != verifier.OutcomeFAIL && receipt.Outcome != verifier.OutcomeBLOCKED {
+			continue
+		}
+		art, err := store.LookupOutput(context.Background(), receipt.OutputDigest)
+		if text := verifier.FormatOutputEvidence(art, err); text != "" {
+			fmt.Fprintln(os.Stderr, text)
+		}
 	}
 }
 

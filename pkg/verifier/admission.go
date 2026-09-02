@@ -49,6 +49,11 @@ func (s *FileReceiptStore) Persist(ctx context.Context, receipt Receipt) error {
 	if err := receipt.ValidateDigest(); err != nil {
 		return fmt.Errorf("refuse invalid receipt: %w", err)
 	}
+	if receipt.Outcome == OutcomeFAIL || receipt.Outcome == OutcomeBLOCKED {
+		if err := s.persistRequiredOutput(ctx, receipt); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return fmt.Errorf("create receipt store: %w", err)
 	}
