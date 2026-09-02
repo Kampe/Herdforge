@@ -11,20 +11,53 @@ import (
 	"github.com/Kampe/Herdforge/pkg/toolprobe"
 )
 
+// isolateLaunchBoundaryRoutingEnv owns HERD_MODE / HERD_USE_PI so inherited
+// fleet metadata cannot select native Codex routing against this Pi-only
+// fixture (FAC-711). PATH is a temp dir with no Codex and no live herd-route.
+func isolateLaunchBoundaryRoutingEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERD_USE_PI", "1")
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HERD_STATE_DIR", t.TempDir())
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+}
+
+func launchBoundaryDecideRequest() router.LaunchRequest {
+	return router.LaunchRequest{
+		Role: router.RoleWorker, Shape: launch.Implementation,
+		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
+		RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane,
+		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
+	}
+}
+
+// Removing isolateLaunchBoundaryRoutingEnv from the table test turns this RED
+// under the exact FAC-709 self-gate env: HERD_MODE=local HERD_USE_PI=0 and no
+// Codex CLI on PATH (CLI missing at Decide, boundary_fac139_test.go:29).
+func TestSixLaunchPaths_InheritedFleetMetadataFailsWithoutIsolation(t *testing.T) {
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERD_USE_PI", "0")
+	t.Setenv("PATH", t.TempDir())
+	_, err := testLaunchRouter(t).Decide(launchBoundaryDecideRequest())
+	if err == nil {
+		t.Fatal("inherited HERD_USE_PI=0 must fail the Pi-only fixture when Codex CLI is absent")
+	}
+	if !strings.Contains(err.Error(), "CLI missing") {
+		t.Fatalf("want CLI missing under inherited native routing, got %v", err)
+	}
+}
+
 // Six production launch entrypoints (pulse, standing, up, review, forge, and
 // dispatch) share openWriteCapableTab / launch.Open. This table proves each
 // named path's boundary rejects missing decision/probe before any tab side
 // effect and that an admitted plan carries exact model+effort from the
 // LaunchDecision (FAC-139).
 func TestSixLaunchPaths_BoundaryFailClosedAndArgvFromDecision(t *testing.T) {
+	isolateLaunchBoundaryRoutingEnv(t)
 	paths := []string{"dispatch", "pulse", "standing", "up", "review", "forge"}
 	now := time.Unix(1_800_000_000, 0).UTC()
-	d, err := testLaunchRouter(t).Decide(router.LaunchRequest{
-		Role: router.RoleWorker, Shape: launch.Implementation,
-		RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel,
-		RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane,
-		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
-	})
+	d, err := testLaunchRouter(t).Decide(launchBoundaryDecideRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
