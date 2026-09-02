@@ -133,6 +133,31 @@ func (s *InMemoryLeaseStore) LeaseByGeneration(_ context.Context, key LeaseKey, 
 	return cloneLease(l), nil
 }
 
+func (s *InMemoryLeaseStore) LeasesByGeneration(_ context.Context, key LeaseKey, generation int64) ([]*Lease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Lease
+	for _, l := range s.rows {
+		if l.LeaseKey == key && l.Generation == generation {
+			out = append(out, cloneLease(l))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (s *InMemoryLeaseStore) ProviderLockHeld(_ context.Context, leaseID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.providerLockHeldAtAllLocked(leaseID), nil
+}
+
+func (s *InMemoryLeaseStore) PeekLatestGeneration(_ context.Context, key LeaseKey) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.latestGenerationLocked(key), nil
+}
+
 func (s *InMemoryLeaseStore) latestGenerationLocked(key LeaseKey) int64 {
 	var max int64
 	for _, l := range s.rows {

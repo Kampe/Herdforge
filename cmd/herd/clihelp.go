@@ -209,7 +209,7 @@ to --help is accepted only as:
 
 Recovery:
   herd dispatch cancel <ticket-ref> --lease <generation>
-  Releases only that coordinator-dispatch lease generation.`,
+  Releases that exact coordinator-dispatch and launch-claim generation.`,
 	"envplan": `Usage: herd envplan <create|inspect|grant|revoke> [flags]
   Operator-managed, repository-relative environment capability plans. Plans
   record capability evidence and bindings only; credential values are refused.

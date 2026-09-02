@@ -58,6 +58,11 @@ type Result struct {
 	OutputDigest string
 	ExitCode     int
 	Duration     time.Duration
+
+	outputBody      string
+	outputBytes     int
+	outputTruncated bool
+	outputBound     bool
 }
 
 // MutationResult describes both the negative run and the restoration gate.
@@ -110,6 +115,10 @@ type Receipt struct {
 	ProfileDigest       string            `json:"profile_digest,omitempty"`
 	ConfigRevision      string            `json:"config_revision,omitempty"`
 	Digest              string            `json:"digest"`
+
+	outputBody      string
+	outputBytes     int
+	outputTruncated bool
 }
 
 type receiptForDigest struct {
@@ -194,7 +203,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	}
 	lease, err := heavy.Acquire(ctx, "verification: "+v.Argv[0], wait)
 	if err != nil {
-		return &Result{Outcome: OutcomeBLOCKED, Output: err.Error(), OutputDigest: digestBytes([]byte(err.Error())), ExitCode: -1}, nil
+		return newOutputResult(OutcomeBLOCKED, []byte(err.Error()), -1, 0), nil
 	}
 	defer func() { _ = lease.Release() }()
 
@@ -206,14 +215,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		var err error
 		commandPath, err = resolveHermeticExecutable(commandPath, environmentValue(commandEnv, "PATH"))
 		if err != nil {
-			output := []byte(err.Error())
-			return &Result{
-				Outcome:      OutcomeBLOCKED,
-				Output:       boundedOutput(output),
-				OutputDigest: digestBytes(output),
-				ExitCode:     -1,
-				Duration:     time.Since(started),
-			}, nil
+			return newOutputResult(OutcomeBLOCKED, []byte(err.Error()), -1, time.Since(started)), nil
 		}
 	}
 	var env []string
@@ -225,14 +227,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// Marker FD (ExtraFiles FD5) is the unforgeable lineage for escaped writers.
 	cmd, statusR, statusW, ackR, ackW, marker, markerPath, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
 	if prepErr != nil {
-		output := []byte(prepErr.Error())
-		return &Result{
-			Outcome:      OutcomeBLOCKED,
-			Output:       boundedOutput(output),
-			OutputDigest: digestBytes(output),
-			ExitCode:     -1,
-			Duration:     time.Since(started),
-		}, nil
+		return newOutputResult(OutcomeBLOCKED, []byte(prepErr.Error()), -1, time.Since(started)), nil
 	}
 	childEnv := cmd.Env
 	if childEnv == nil {
@@ -259,14 +254,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			_ = marker.Close()
 			_ = os.Remove(markerPath)
 		}
-		output := []byte(err.Error())
-		return &Result{
-			Outcome:      OutcomeBLOCKED,
-			Output:       boundedOutput(output),
-			OutputDigest: digestBytes(output),
-			ExitCode:     -1,
-			Duration:     time.Since(started),
-		}, nil
+		return newOutputResult(OutcomeBLOCKED, []byte(err.Error()), -1, time.Since(started)), nil
 	}
 	// Parent keeps statusR + ackW + marker; close child-only ends in parent.
 	_ = statusW.Close()
@@ -289,14 +277,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		if waitErr != nil {
 			parts = append(parts, "wait: "+waitErr.Error())
 		}
-		output := []byte(strings.Join(parts, "\n"))
-		return &Result{
-			Outcome:      OutcomeBLOCKED,
-			Output:       boundedOutput(output),
-			OutputDigest: digestBytes(output),
-			ExitCode:     exitCode(cmd, waitErr),
-			Duration:     time.Since(started),
-		}, nil
+		return newOutputResult(OutcomeBLOCKED, []byte(strings.Join(parts, "\n")), exitCode(cmd, waitErr), time.Since(started)), nil
 	}
 	if ctx.Err() != nil {
 		reapErr := owned.Reap()
@@ -304,14 +285,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		if reapErr != nil {
 			msg += "\n" + reapErr.Error()
 		}
-		output := []byte(msg)
-		return &Result{
-			Outcome:      OutcomeBLOCKED,
-			Output:       boundedOutput(output),
-			OutputDigest: digestBytes(output),
-			ExitCode:     -1,
-			Duration:     time.Since(started),
-		}, nil
+		return newOutputResult(OutcomeBLOCKED, []byte(msg), -1, time.Since(started)), nil
 	}
 
 	// Protocol: start → (sample while running) → done → drain while supervisor
@@ -333,25 +307,12 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		if waitErr != nil {
 			msg = fmt.Sprintf("verification failed: %v\nownership: %v\noutput:\n%s", waitErr, ownErr, string(output))
 		}
-		out := []byte(msg)
-		return &Result{
-			Outcome:      OutcomeBLOCKED,
-			Output:       boundedOutput(out),
-			OutputDigest: digestBytes(out),
-			ExitCode:     exitCode(cmd, waitErr),
-			Duration:     time.Since(started),
-		}, nil
+		return newOutputResult(OutcomeBLOCKED, []byte(msg), exitCode(cmd, waitErr), time.Since(started)), nil
 	}
 
-	result := &Result{
-		Passed:       waitErr == nil,
-		Outcome:      OutcomePASS,
-		Output:       boundedOutput(output),
-		OutputDigest: digestBytes(output),
-		ExitCode:     exitCode(cmd, waitErr),
-		Duration:     time.Since(started),
-	}
+	result := newOutputResult(OutcomePASS, output, exitCode(cmd, waitErr), time.Since(started))
 	if waitErr != nil {
+		result.Passed = false
 		result.Outcome = OutcomeFAIL
 		if ctx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
@@ -625,20 +586,18 @@ func makeReceipt(req VerificationRequest, argv []string, result *Result, outcome
 		ProfileDigest:       req.ProfileDigest,
 		ConfigRevision:      req.ConfigRevision,
 	}
+	receipt.outputBody, receipt.outputBytes, receipt.outputTruncated = artifactFromResult(result)
 	receipt.Digest = digestReceipt(receipt)
 	return receipt
 }
 
 func blockedReceipt(req VerificationRequest, argv []string, exitCode int, output []byte, cause error) *Receipt {
-	result := &Result{Outcome: OutcomeBLOCKED, ExitCode: exitCode, Output: cause.Error()}
+	complete := []byte(cause.Error())
 	if output != nil {
-		result.Output += "\n" + string(output)
+		complete = append(complete, '\n')
+		complete = append(complete, output...)
 	}
-	// OutputDigest always describes the complete output retained for this
-	// synthetic blocked result. Process results instead provide the digest of
-	// the complete raw process output before Result.Output is bounded.
-	result.Output = boundedOutput([]byte(result.Output))
-	result.OutputDigest = digestBytes([]byte(result.Output))
+	result := newOutputResult(OutcomeBLOCKED, complete, exitCode, 0)
 	receipt := makeReceipt(req, argv, result, OutcomeBLOCKED)
 	return &receipt
 }

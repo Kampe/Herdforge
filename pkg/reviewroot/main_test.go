@@ -14,5 +14,11 @@ import (
 // commit, same worktree, same machine.
 func TestMain(m *testing.M) {
 	laneenv.Strip()
-	os.Exit(m.Run())
+	restore, err := laneenv.IsolateDefaultSlotDir()
+	if err != nil {
+		os.Exit(1)
+	}
+	code := m.Run()
+	restore()
+	os.Exit(code)
 }

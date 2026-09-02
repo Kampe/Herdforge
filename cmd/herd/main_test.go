@@ -18,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/slot"
 	"github.com/Kampe/Herdforge/pkg/standing"
 )
 
@@ -85,6 +86,9 @@ var (
 	herdBinary     string
 	herdBinaryErr  error
 	herdBinaryOut  []byte
+	// nestedVerifierSlotHeld is captured before Strip so nested herd CLI
+	// children can retain only the managed-verifier re-entrancy authority.
+	nestedVerifierSlotHeld bool
 )
 
 func TestMain(m *testing.M) {
@@ -96,7 +100,13 @@ func TestMain(m *testing.M) {
 	// of a class. A lane also inherits HERD_ROOT, HERD_PROJECT_ROOT,
 	// HERD_WORKSPACE and HERDR_* pane vars, which made five cmd/herd tests fail
 	// in a lane's shell and pass in the coordinator's on the same commit.
+	nestedVerifierSlotHeld = os.Getenv(slot.EnvHeld) == "1"
 	laneenv.Strip()
+	restoreSlots, err := laneenv.IsolateDefaultSlotDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "isolate test heavy-phase slots: %v\n", err)
+		os.Exit(1)
+	}
 
 	root, rootGitState, guardErr := snapshotRootGitState()
 	if guardErr != nil {
@@ -117,6 +127,7 @@ func TestMain(m *testing.M) {
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
 		_ = os.RemoveAll(dir)
 	}
+	restoreSlots()
 	os.Exit(code)
 }
 
@@ -335,6 +346,22 @@ func TestVerifiedTaskCandidateChecksSignedHEADWithoutRejectingUntrackedFiles(t *
 	if _, err := verifiedTaskCandidate(root, "0000000000000000000000000000000000000000"); err == nil {
 		t.Fatal("signed candidate mismatch must fail closed")
 	}
+}
+
+func herdCommand(name string, args ...string) *exec.Cmd {
+	return applyNestedSlotReentry(exec.Command(name, args...))
+}
+
+func herdCommandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return applyNestedSlotReentry(exec.CommandContext(ctx, name, args...))
+}
+
+func applyNestedSlotReentry(cmd *exec.Cmd) *exec.Cmd {
+	if cmd == nil {
+		return nil
+	}
+	cmd.Env = laneenv.NestedSlotReentryEnv(cmd.Env, nestedVerifierSlotHeld)
+	return cmd
 }
 
 func buildHerd(t *testing.T) string {
