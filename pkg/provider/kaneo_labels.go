@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,15 @@ import (
 )
 
 var ErrRedundantLabelAttach = fmt.Errorf("redundant label attach returned null success")
+
+// ErrWorkspaceLabelDeleteUnguarded reports that no guarded path exists for a
+// workspace label delete. `kaneo label delete <ID>` documents its argument as a
+// label ID but resolves it by NAME across the workspace: two calls intended to
+// remove two orphan rows removed 2375 rows from the live Chainseer board on
+// 2026-08-28. The blast radius is every row sharing the passed row's name, and
+// the identity assertion can only run after the delete has already happened.
+// DetachTaskLabel removes one instance and is the safe operation.
+var ErrWorkspaceLabelDeleteUnguarded = errors.New("kaneo workspace label delete resolves by name and has no guarded path")
 
 func (k *KaneoProvider) LabelMutationAuthority() (string, error) {
 	if k == nil || strings.TrimSpace(k.ProjectID) == "" {
@@ -223,6 +233,16 @@ func (k *KaneoProvider) ProveLabelCreation(ctx context.Context, created TaskLabe
 
 func (k *KaneoProvider) AttachTaskLabel(ctx context.Context, taskID, labelID string) error {
 	if k.UseCLI {
+		// `task label add` has been observed MOVING an attached row off its
+		// holder (four times, including the FAC-161 live incident) and CLONING
+		// it (once, on the same build as one of the move observations). Both
+		// cannot be true of one build and this provider does not claim to know
+		// which it will get, so the donor row and its prior holder are read
+		// around the call and the outcome is proven either way.
+		donor, priorHolder, err := k.readDonorRow(ctx, labelID)
+		if err != nil {
+			return err
+		}
 		args := []string{"task", "label", "add", taskID, labelID}
 		if k.ProjectID != "" {
 			args = append(args, "--project", k.ProjectID)
@@ -242,7 +262,7 @@ func (k *KaneoProvider) AttachTaskLabel(ctx context.Context, taskID, labelID str
 		if len(rows) != 1 || rows[0].ID != labelID || rows[0].TaskID != taskID {
 			return fmt.Errorf("kaneo label attach identity mismatch")
 		}
-		return nil
+		return k.proveAttachedDonor(ctx, taskID, donor, priorHolder)
 	}
 	payload, _ := json.Marshal(map[string]string{"taskId": taskID})
 	rows, err := k.kaneoLabelHTTP(ctx, http.MethodPost, fmt.Sprintf("%s/api/label/%s/task", k.APIURL, url.PathEscape(labelID)), payload)
@@ -253,6 +273,69 @@ func (k *KaneoProvider) AttachTaskLabel(ctx context.Context, taskID, labelID str
 		return fmt.Errorf("kaneo label attach identity/readback mismatch")
 	}
 	return nil
+}
+
+// readDonorRow resolves the row about to be attached and the task holding it,
+// before any mutation. An unknown row fails closed: without a preimage neither
+// attach semantic can be proven afterward.
+func (k *KaneoProvider) readDonorRow(ctx context.Context, labelID string) (TaskLabel, string, error) {
+	rows, err := k.listWorkspaceLabels(ctx)
+	if err != nil {
+		return TaskLabel{}, "", fmt.Errorf("kaneo task label attach donor preimage: %w", err)
+	}
+	donor, known := rows[labelID]
+	if !known {
+		return TaskLabel{}, "", fmt.Errorf("kaneo task label attach: donor row %q absent from workspace", labelID)
+	}
+	return donor, donor.TaskID, nil
+}
+
+// proveAttachedDonor asserts the post-state the caller actually needs: the
+// target holds a row of the intended name, and no prior holder was silently
+// stripped. Under a clone the donor keeps its row and the target gains a new
+// one; under a move the row itself relocates. Both satisfy the target
+// assertion, and only a move off a third task fails the donor assertion.
+func (k *KaneoProvider) proveAttachedDonor(ctx context.Context, taskID string, donor TaskLabel, priorHolder string) error {
+	after, err := k.listWorkspaceLabels(ctx)
+	if err != nil {
+		return fmt.Errorf("kaneo task label attach readback: %w", err)
+	}
+	if _, present := after[donor.ID]; !present {
+		return fmt.Errorf("kaneo label attach readback: row %q vanished", donor.ID)
+	}
+	if !holdsLabelName(after, taskID, donor.Name) {
+		return fmt.Errorf("kaneo label attach readback: target %q holds no %q row", taskID, donor.Name)
+	}
+	if priorHolder == "" || priorHolder == taskID {
+		return nil
+	}
+	if !holdsLabelName(after, priorHolder, donor.Name) {
+		return fmt.Errorf("kaneo label attach readback: donor task %q lost its %q row to %q", priorHolder, donor.Name, taskID)
+	}
+	return nil
+}
+
+func holdsLabelName(rows map[string]TaskLabel, taskID, name string) bool {
+	if taskID == "" || name == "" {
+		return false
+	}
+	for _, row := range rows {
+		if row.TaskID == taskID && row.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// LookupWorkspaceLabel satisfies WorkspaceLabelReader so the label transaction
+// can prove a created donor row is unattached before using it.
+func (k *KaneoProvider) LookupWorkspaceLabel(ctx context.Context, labelID string) (TaskLabel, bool, error) {
+	rows, err := k.listWorkspaceLabels(ctx)
+	if err != nil {
+		return TaskLabel{}, false, err
+	}
+	row, found := rows[labelID]
+	return row, found, nil
 }
 
 func (k *KaneoProvider) DetachTaskLabel(ctx context.Context, labelID string) error {
@@ -284,26 +367,11 @@ func (k *KaneoProvider) DetachTaskLabel(ctx context.Context, labelID string) err
 	return nil
 }
 
-func (k *KaneoProvider) DeleteTaskLabel(ctx context.Context, labelID string) error {
-	if k.UseCLI {
-		args := []string{"label", "delete", labelID}
-		if k.ProjectID != "" {
-			args = append(args, "--project", k.ProjectID)
-		}
-		res, err := kaneoRunCLI(ctx, "kaneo", args...)
-		if err != nil {
-			return fmt.Errorf("kaneo task label delete: %w", err)
-		}
-		rows, err := decodeKaneoLabels(http.StatusOK, res.Stdout)
-		if err != nil {
-			return err
-		}
-		if len(rows) != 1 || rows[0].ID != labelID {
-			return fmt.Errorf("kaneo label delete identity mismatch")
-		}
-		return nil
-	}
-	return fmt.Errorf("kaneo workspace label delete over HTTP is unsupported without a proven contract")
+// DeleteTaskLabel fails closed on every branch and issues no argv. Removing one
+// label instance is DetachTaskLabel; there is no proven way to remove a single
+// workspace row, so this provider refuses rather than guessing.
+func (k *KaneoProvider) DeleteTaskLabel(_ context.Context, labelID string) error {
+	return fmt.Errorf("%w: refusing to delete row %q, detach removes one instance", ErrWorkspaceLabelDeleteUnguarded, labelID)
 }
 
 func (k *KaneoProvider) kaneoLabelHTTP(ctx context.Context, method, endpoint string, payload []byte) ([]TaskLabel, error) {

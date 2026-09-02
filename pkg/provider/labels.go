@@ -94,6 +94,38 @@ type TaskLabelProvider interface {
 	DeleteTaskLabel(context.Context, string) error
 }
 
+// WorkspaceLabelReader resolves one workspace label row by identity. It is
+// optional so adapters without a workspace-wide label projection stay
+// compatible. Where it is implemented, a row this transaction believes it just
+// created is proven unattached before it is used as a donor: `kaneo label
+// create` is idempotent by name and has been observed returning a
+// three-week-old row instead of creating one, so "create fresh, then attach" is
+// only safe once the returned row is known to belong to nobody.
+type WorkspaceLabelReader interface {
+	LookupWorkspaceLabel(context.Context, string) (TaskLabel, bool, error)
+}
+
+// assertDonorUnattached fails closed when the row is missing, unreadable, or
+// held by a task other than the target. A caller that gets an error here must
+// not detach or delete the row: it is somebody else's live label.
+func assertDonorUnattached(ctx context.Context, p TaskLabelProvider, created TaskLabel, targetID string) error {
+	reader, ok := p.(WorkspaceLabelReader)
+	if !ok {
+		return nil
+	}
+	row, found, err := reader.LookupWorkspaceLabel(ctx, created.ID)
+	if err != nil {
+		return fmt.Errorf("donor row %q unreadable: %w", created.ID, err)
+	}
+	if !found {
+		return fmt.Errorf("donor row %q absent from workspace", created.ID)
+	}
+	if row.TaskID != "" && row.TaskID != targetID {
+		return fmt.Errorf("%w: donor row %q is held by task %q, label create returned a live row", ErrLabelOwnershipUnknown, created.ID, row.TaskID)
+	}
+	return nil
+}
+
 // BulkTaskLabels is the result of a board-wide label read. Complete is based
 // on the requested task identities, not on whether the provider returned an
 // error. Consumers must check it before using Labels for board analytics.
@@ -433,6 +465,12 @@ func repairTaskRoleLabel(ctx context.Context, p TaskLabelProvider, sourceID, tar
 		} else if err := proof.ProveLabelCreation(ctx, created, targetID, role, opts); err != nil {
 			return compensateLabel(ctx, p, sourceID, targetID, source, target, beforeSource, beforeTarget, TaskLabel{}, nil, err)
 		}
+		// Prove the row is unattached before adopting it as this transaction's
+		// own. A foreign live row is reported with an empty created identity so
+		// no compensation path detaches another card's label.
+		if err := assertDonorUnattached(ctx, p, created, targetID); err != nil {
+			return compensateLabel(ctx, p, sourceID, targetID, source, target, beforeSource, beforeTarget, TaskLabel{}, nil, err)
+		}
 		createdForComp = created
 		if err := p.AttachTaskLabel(ctx, targetID, created.ID); err != nil {
 			return compensateLabel(ctx, p, sourceID, targetID, source, target, beforeSource, beforeTarget, created, nil, err)
@@ -686,6 +724,11 @@ func ensureTaskRoleLabel(ctx context.Context, p TaskLabelProvider, targetID, rol
 		} else if err := proof.ProveLabelCreation(ctx, created, targetID, role, opts); err != nil {
 			return compensateTargetLabel(ctx, p, targetID, before, beforeTask, TaskLabel{}, err)
 		}
+		// Same donor proof as the repair path: an attached row is somebody
+		// else's, so it is never adopted and never compensated against.
+		if err := assertDonorUnattached(ctx, p, created, targetID); err != nil {
+			return compensateTargetLabel(ctx, p, targetID, before, beforeTask, TaskLabel{}, err)
+		}
 		createdForComp = created
 		if err := p.AttachTaskLabel(ctx, targetID, created.ID); err != nil {
 			return compensateTargetLabel(ctx, p, targetID, before, beforeTask, created, err)
@@ -729,13 +772,14 @@ func ensureTaskRoleLabel(ctx context.Context, p TaskLabelProvider, targetID, rol
 	return compensateTargetLabel(ctx, p, targetID, before, beforeTask, created, readErr)
 }
 
+// compensateTargetLabel undoes a label this transaction attached. It detaches
+// only: a workspace-label delete resolves by name and would take every row
+// sharing this row's name with it, and rollback fires exactly when a
+// reconciliation is already failing. The row is left unattached instead.
 func compensateTargetLabel(ctx context.Context, p TaskLabelProvider, targetID string, original []TaskLabel, originalTask *Task, created TaskLabel, cause error) error {
 	var comp error
 	if created.ID != "" {
 		if err := p.DetachTaskLabel(ctx, created.ID); err != nil {
-			comp = err
-		}
-		if err := p.DeleteTaskLabel(ctx, created.ID); err != nil && comp == nil {
 			comp = err
 		}
 	}
@@ -943,13 +987,13 @@ func sameLabels(a, b []TaskLabel) bool {
 	return true
 }
 
+// compensateLabel detaches only, for the same reason as compensateTargetLabel:
+// the row this transaction created is left orphaned rather than risking a
+// name-wide workspace delete on a failing rollback path.
 func compensateLabel(ctx context.Context, p TaskLabelProvider, sourceID, targetID string, source, originalTarget []TaskLabel, originalSourceTask, originalTargetTask *Task, created TaskLabel, target []TaskLabel, cause error) error {
 	var comp error
 	if created.ID != "" {
 		if err := p.DetachTaskLabel(ctx, created.ID); err != nil {
-			comp = err
-		}
-		if err := p.DeleteTaskLabel(ctx, created.ID); err != nil && comp == nil {
 			comp = err
 		}
 	}
