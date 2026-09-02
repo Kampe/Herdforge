@@ -5168,7 +5168,11 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	}
 	closeControl := func() error { return nil }
 	if production {
-		closeControl, err = configureProductionControl(d, ".")
+		controlRoot, rootErr := canonicalHerdRoot()
+		if rootErr != nil {
+			return nil, nil, fmt.Errorf("control store init failed: %w", rootErr)
+		}
+		closeControl, err = configureProductionControl(d, controlRoot)
 		if err != nil {
 			return nil, nil, fmt.Errorf("control store init failed: %w", err)
 		}
@@ -5339,37 +5343,43 @@ func configureProductionControl(d *dispatch.Dispatcher, root string) (func() err
 	}
 	d.Compensator = compensator
 	// FAC-133 MAC control plane (pkg/envelope) — distinct from coordinator orders above.
-	if secret := strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET")); secret != "" {
-		mailPath := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
-		if mailPath == "" {
-			mailPath = mail.CallbackMailPath(root)
-		} else {
-			if filepath.IsAbs(mailPath) {
-				return nil, fmt.Errorf("HERD_MAIL_FILE must be relative to workspace root")
-			}
-			mailPath = filepath.Clean(filepath.Join(root, mailPath))
-			rel, relErr := filepath.Rel(root, mailPath)
-			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				return nil, fmt.Errorf("HERD_MAIL_FILE escapes workspace root")
-			}
+	// Coordinator startup bootstraps or loads the durable MAC secret so issue/drain
+	// and review-ingest can run without an ambient env var.
+	secret, err := coordinatorControlMACSecret(root)
+	if err != nil {
+		_ = compensator.Close()
+		_ = controlStore.Close()
+		return nil, err
+	}
+	mailPath := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
+	if mailPath == "" {
+		mailPath = mail.CallbackMailPath(root)
+	} else {
+		if filepath.IsAbs(mailPath) {
+			return nil, fmt.Errorf("HERD_MAIL_FILE must be relative to workspace root")
 		}
-		_ = os.MkdirAll(filepath.Dir(mailPath), 0o755)
-		issuer := strings.TrimSpace(os.Getenv("HERD_CONTROL_ISSUER"))
-		if issuer == "" {
-			issuer = "coordinator"
+		mailPath = filepath.Clean(filepath.Join(root, mailPath))
+		rel, relErr := filepath.Rel(root, mailPath)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("HERD_MAIL_FILE escapes workspace root")
 		}
-		d.ControlSecret = secret
-		d.Control = &dispatch.ControlPlane{
-			Secret:        secret,
-			Mailbox:       mail.NewMailbox(mailPath),
-			IssuerRole:    "coordinator",
-			IssuerSession: issuer,
-			DurableRoot:   root,
-		}
-		if id, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil {
-			d.RepoIdentity = id
-			d.RepoAllowlist = []string{id}
-		}
+	}
+	_ = os.MkdirAll(filepath.Dir(mailPath), 0o755)
+	issuer := strings.TrimSpace(os.Getenv("HERD_CONTROL_ISSUER"))
+	if issuer == "" {
+		issuer = "coordinator"
+	}
+	d.ControlSecret = secret
+	d.Control = &dispatch.ControlPlane{
+		Secret:        secret,
+		Mailbox:       mail.NewMailbox(mailPath),
+		IssuerRole:    "coordinator",
+		IssuerSession: issuer,
+		DurableRoot:   root,
+	}
+	if id, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil {
+		d.RepoIdentity = id
+		d.RepoAllowlist = []string{id}
 	}
 	return func() error {
 		return errors.Join(compensator.Close(), controlStore.Close())

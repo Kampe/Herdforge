@@ -258,6 +258,7 @@ func DefaultSecretDeny() []string {
 		"ANTHROPIC_API_KEY",
 		// Control secret itself must not leak into the agent process env
 		// as a general secret; coordinator holds it out-of-band.
+		"HERD_CONTROL_SECRET",
 		"HERD_MERGE_TOKEN",
 		"HERD_APPROVE_TOKEN",
 	}
