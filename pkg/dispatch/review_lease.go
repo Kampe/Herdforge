@@ -3,13 +3,13 @@ package dispatch
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/envelope"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/security"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
@@ -31,16 +31,12 @@ func isReviewerControlBind(taskRef, agentName string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(agentName)), "review-")
 }
 
-func coordinatorReviewLeaseDBPath(root string) string {
-	return filepath.Join(root, ".herd", "herdforge.db")
-}
-
 func lookupActiveCoordinatorReviewLease(ctx context.Context, root, taskRef string) (*claim.Lease, error) {
 	reviewRef := CanonicalReviewLeaseTaskRef(taskRef)
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("%w: review lease store root required", security.ErrLeaseNotLive)
 	}
-	st, err := claim.NewSQLiteLeaseStore(coordinatorReviewLeaseDBPath(root))
+	st, err := claim.NewSQLiteLeaseStore(lifecycle.CanonicalStatePath(root))
 	if err != nil {
 		return nil, fmt.Errorf("%w: open coordinator-review lease store: %v", security.ErrLeaseNotLive, err)
 	}
@@ -79,6 +75,29 @@ func (c *ControlPlane) liveAgentLookup() security.LiveAgentResolver {
 	return herdr.LiveResolver{}
 }
 
+func (c *ControlPlane) bindLiveAgentSession(workerHint, agentName string) (string, error) {
+	if agentName != "" {
+		live, herr := c.liveAgentLookup().Lookup(agentName)
+		if herr != nil || live == nil || live.AgentSessionID == "" {
+			return "", fmt.Errorf("%w: live AgentSessionID unresolved for %s: %v", envelope.ErrMissingBinding, agentName, herr)
+		}
+		if workerHint != "" && workerHint != live.AgentSessionID {
+			return "", fmt.Errorf("%w: --worker %q does not match live AgentSessionID %q", envelope.ErrWorkerMismatch, workerHint, live.AgentSessionID)
+		}
+		return live.AgentSessionID, nil
+	}
+	if workerHint == "" {
+		return "", fmt.Errorf("%w: --worker or --agent required to resolve live AgentSessionID", envelope.ErrMissingBinding)
+	}
+	if live, herr := c.liveAgentLookup().Lookup(workerHint); herr == nil && live != nil && live.AgentSessionID != "" {
+		return live.AgentSessionID, nil
+	}
+	if c != nil && c.RequireLiveBind {
+		return "", fmt.Errorf("%w: cannot resolve live AgentSessionID for worker %q", envelope.ErrMissingBinding, workerHint)
+	}
+	return workerHint, nil
+}
+
 func (c *ControlPlane) resolveReviewLeaseBinding(taskRef, workerHint string, leaseHint int64, agentName string) (string, int64, error) {
 	lease, err := lookupActiveCoordinatorReviewLease(context.Background(), c.DurableRoot, taskRef)
 	if err != nil {
@@ -91,24 +110,9 @@ func (c *ControlPlane) resolveReviewLeaseBinding(taskRef, workerHint string, lea
 	if agentName != "" && !strings.Contains(strings.ToLower(agentName), slug) {
 		return "", 0, fmt.Errorf("%w: reviewer agent %q is not bound to %s", security.ErrLeaseNotLive, agentName, slug)
 	}
-	if agentName != "" {
-		live, herr := c.liveAgentLookup().Lookup(agentName)
-		if herr != nil || live == nil || live.AgentSessionID == "" {
-			return "", 0, fmt.Errorf("%w: live AgentSessionID unresolved for %s: %v", envelope.ErrMissingBinding, agentName, herr)
-		}
-		if workerHint != "" && workerHint != live.AgentSessionID {
-			return "", 0, fmt.Errorf("%w: --worker %q does not match live AgentSessionID %q", envelope.ErrWorkerMismatch, workerHint, live.AgentSessionID)
-		}
-		return live.AgentSessionID, lease.Generation, nil
+	ws, err := c.bindLiveAgentSession(workerHint, agentName)
+	if err != nil {
+		return "", 0, err
 	}
-	if workerHint == "" {
-		return "", 0, fmt.Errorf("%w: --worker or --agent required to resolve live AgentSessionID", envelope.ErrMissingBinding)
-	}
-	if live, herr := c.liveAgentLookup().Lookup(workerHint); herr == nil && live != nil && live.AgentSessionID != "" {
-		return live.AgentSessionID, lease.Generation, nil
-	}
-	if c.RequireLiveBind {
-		return "", 0, fmt.Errorf("%w: cannot resolve live AgentSessionID for worker %q", envelope.ErrMissingBinding, workerHint)
-	}
-	return workerHint, lease.Generation, nil
+	return ws, lease.Generation, nil
 }
