@@ -151,9 +151,8 @@ func (m *Machine) SupersedeCandidate(req CandidateSupersessionRequest) (Transiti
 	}
 	if current.Repo != req.Repo || current.Seq != req.ExpectedSequence || current.LeaseGeneration != req.LeaseGeneration ||
 		current.Branch != req.Branch || current.CandidateSHA != req.OldCandidateSHA {
-		return TransitionResult{}, fmt.Errorf("%w: task=%s expected seq=%d lease=%d branch=%s candidate=%s; held seq=%d lease=%d branch=%s candidate=%s",
-			ErrCandidateSupersessionConflict, req.TaskRef, req.ExpectedSequence, req.LeaseGeneration, req.Branch, req.OldCandidateSHA,
-			current.Seq, current.LeaseGeneration, current.Branch, current.CandidateSHA)
+		return TransitionResult{}, exactCandidateFenceMismatch(
+			ErrCandidateSupersessionConflict, req.TaskRef, req.ExpectedSequence, req.LeaseGeneration, req.Branch, req.OldCandidateSHA, current)
 	}
 	if locked, err := activeIntegrationTx(tx, req.TaskRef); err != nil {
 		return TransitionResult{}, err
@@ -168,17 +167,10 @@ func (m *Machine) SupersedeCandidate(req CandidateSupersessionRequest) (Transiti
 		Actor: req.Actor, EvidenceDigest: req.EvidenceDigest, Payload: payload,
 		IdempotencyKey: req.IdempotencyKey, CreatedAt: time.Now().UTC(),
 	}
-	res, err := tx.Exec(`INSERT INTO lifecycle_events (
-		task_ref, repo, seq, from_state, to_state, provider_revision,
-		lease_generation, branch, candidate_sha, actor, evidence_digest,
-		payload, idempotency_key, created_at
-	) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.TaskRef, ev.Repo, ev.Seq, string(ev.FromState), string(ev.ToState), ev.LeaseGeneration,
-		ev.Branch, ev.CandidateSHA, ev.Actor, ev.EvidenceDigest, ev.Payload, ev.IdempotencyKey, ev.CreatedAt)
+	ev, err = insertSameStateLifecycleEvent(tx, ev)
 	if err != nil {
 		return TransitionResult{}, fmt.Errorf("%w: insert candidate supersession event: %v", ErrConcurrentModification, err)
 	}
-	ev.ID, _ = res.LastInsertId()
 	cas, err := tx.Exec(`UPDATE lifecycle_task_state SET
 		seq = ?, candidate_sha = ?, updated_at = ?
 		WHERE task_ref = ? AND repo = ? AND state = ? AND seq = ? AND lease_generation = ? AND branch = ? AND candidate_sha = ?`,
@@ -209,6 +201,32 @@ func (m *Machine) SupersedeCandidate(req CandidateSupersessionRequest) (Transiti
 		}
 	}
 	return result, nil
+}
+
+// insertSameStateLifecycleEvent is the single owner of the same-state
+// lifecycle_events insert used by candidate supersession and worker generation
+// reconcile. Callers wrap the error with their own operation name.
+func insertSameStateLifecycleEvent(tx *sql.Tx, ev Event) (Event, error) {
+	res, err := tx.Exec(`INSERT INTO lifecycle_events (
+		task_ref, repo, seq, from_state, to_state, provider_revision,
+		lease_generation, branch, candidate_sha, actor, evidence_digest,
+		payload, idempotency_key, created_at
+	) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.TaskRef, ev.Repo, ev.Seq, string(ev.FromState), string(ev.ToState), ev.LeaseGeneration,
+		ev.Branch, ev.CandidateSHA, ev.Actor, ev.EvidenceDigest, ev.Payload, ev.IdempotencyKey, ev.CreatedAt)
+	if err != nil {
+		return Event{}, err
+	}
+	ev.ID, _ = res.LastInsertId()
+	return ev, nil
+}
+
+// exactCandidateFenceMismatch is the single owner of the CAS fence-mismatch
+// message shared by candidate supersession and worker generation reconcile.
+func exactCandidateFenceMismatch(err error, taskRef string, expectedSeq, expectedLease int64, expectedBranch, expectedCandidate string, held *TaskState) error {
+	return fmt.Errorf("%w: task=%s expected seq=%d lease=%d branch=%s candidate=%s; held seq=%d lease=%d branch=%s candidate=%s",
+		err, taskRef, expectedSeq, expectedLease, expectedBranch, expectedCandidate,
+		held.Seq, held.LeaseGeneration, held.Branch, held.CandidateSHA)
 }
 
 func supersessionEventMatches(ev Event, req CandidateSupersessionRequest, payload string) bool {

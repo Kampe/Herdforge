@@ -381,7 +381,10 @@ func recordShotLifecycleLease(root, ref string, lease int64, sha string) error {
 	}
 	if current != nil {
 		if current.LeaseGeneration != lease {
-			return fmt.Errorf("shot: lifecycle lease generation %d conflicts with reported %d", current.LeaseGeneration, lease)
+			if current.LeaseGeneration < lease {
+				return runShotGenerationReconcile(context.Background(), root, ref, lease, sha, machine, current)
+			}
+			return shotLeaseGenerationConflict(current.LeaseGeneration, lease)
 		}
 		if current.CandidateSHA != "" && current.CandidateSHA != sha {
 			// An eligible row can be left behind when a worker is retried
@@ -425,6 +428,10 @@ func recordShotLifecycleLease(root, ref string, lease int64, sha string) error {
 		return fmt.Errorf("shot: record lifecycle lease: %w", err)
 	}
 	return nil
+}
+
+func shotLeaseGenerationConflict(held, reported int64) error {
+	return fmt.Errorf("shot: lifecycle lease generation %d conflicts with reported %d", held, reported)
 }
 
 func validShotSHA(value string) bool {
