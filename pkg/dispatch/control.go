@@ -39,6 +39,8 @@ type ControlPlane struct {
 	OnBlocked func(workerSession, task, reason string) error
 	// ClaimLookup resolves live lease (required for IssueAndEnforce live bind).
 	ClaimLookup security.LiveClaimLookup
+	// AgentResolver resolves live Herdr identity. Empty uses herdr.LiveResolver.
+	AgentResolver security.LiveAgentResolver
 	// RequireLiveBind forces AgentSessionID + lease resolution from live state.
 	RequireLiveBind bool
 	// EnforceHook machine-enforces applied control on policy/containment.
@@ -311,6 +313,9 @@ func (c *ControlPlane) ResolveLiveControlBinding(taskRef, workerHint string, lea
 	if strings.TrimSpace(taskRef) == "" {
 		return "", 0, fmt.Errorf("%w: task required", envelope.ErrMissingBinding)
 	}
+	if isReviewerControlBind(taskRef, agentName) {
+		return c.resolveReviewLeaseBinding(taskRef, workerHint, leaseHint, agentName)
+	}
 	// Lease from FAC-147 authority.
 	lookup := c.ClaimLookup
 	if lookup == nil {
@@ -327,34 +332,11 @@ func (c *ControlPlane) ResolveLiveControlBinding(taskRef, workerHint string, lea
 	if leaseHint > 0 && leaseHint != lease {
 		return "", 0, fmt.Errorf("%w: --lease %d does not match live generation %d", security.ErrLeaseNotLive, leaseHint, lease)
 	}
-	// Worker session from live Herdr when agent name known.
-	if agentName != "" {
-		live, herr := (herdr.LiveResolver{}).Lookup(agentName)
-		if herr != nil || live == nil || live.AgentSessionID == "" {
-			return "", 0, fmt.Errorf("%w: live AgentSessionID unresolved for %s: %v", envelope.ErrMissingBinding, agentName, herr)
-		}
-		workerSession = live.AgentSessionID
-		if workerHint != "" && workerHint != workerSession {
-			return "", 0, fmt.Errorf("%w: --worker %q does not match live AgentSessionID %q", envelope.ErrWorkerMismatch, workerHint, workerSession)
-		}
-		return workerSession, lease, nil
+	workerSession, err = c.bindLiveAgentSession(workerHint, agentName)
+	if err != nil {
+		return "", 0, err
 	}
-	if workerHint == "" {
-		return "", 0, fmt.Errorf("%w: --worker or --agent required to resolve live AgentSessionID", envelope.ErrMissingBinding)
-	}
-	// If only worker hint provided, verify it is a live session when possible.
-	if live, herr := (herdr.LiveResolver{}).Lookup(workerHint); herr == nil && live != nil && live.AgentSessionID != "" {
-		if live.AgentSessionID != workerHint && live.Name != workerHint {
-			// workerHint may already be the session id
-		}
-		workerSession = live.AgentSessionID
-		return workerSession, lease, nil
-	}
-	// Fail closed when RequireLiveBind: cannot invent session without herdr.
-	if c.RequireLiveBind {
-		return "", 0, fmt.Errorf("%w: cannot resolve live AgentSessionID for worker %q", envelope.ErrMissingBinding, workerHint)
-	}
-	return workerHint, lease, nil
+	return workerSession, lease, nil
 }
 
 // launchControlScope builds an exclusive package scope from structured

@@ -412,93 +412,6 @@ func FormatWorkerControlPayload(ctrl *envelope.Envelope) (string, error) {
 	return "HERD_CONTROL_ENVELOPE_JSON_V1 " + string(raw) + "\n", nil
 }
 
-// ControlMACSecretPath is the coordinator-only secret used by wrapper re-verify.
-func ControlMACSecretPath(sharedRoot string) string {
-	return filepath.Join(sharedRoot, ".herd", "control", "mac.secret")
-}
-
-// WriteControlMACSecret stores the MAC secret under shared root with flock,
-// unique tmp, O_EXCL, no-follow replace, file+dir fsync, and readback.
-func WriteControlMACSecret(sharedRoot, secret string) error {
-	if sharedRoot == "" || secret == "" {
-		return fmt.Errorf("%w: shared root and secret required", ErrUnknownPolicy)
-	}
-	path := ControlMACSecretPath(sharedRoot)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	lockPath := path + ".lock"
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	defer lf.Close()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("mac.secret flock timeout")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	defer func() { _ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN) }()
-
-	tmp := fmt.Sprintf("%s.%d.tmp", path, time.Now().UnixNano())
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write([]byte(secret)); err != nil {
-		f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("mac.secret path is symlink (refused)")
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		if serr := d.Sync(); serr != nil {
-			_ = d.Close()
-			return serr
-		}
-		_ = d.Close()
-	}
-	// Readback exact secret.
-	got, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("mac.secret readback: %w", err)
-	}
-	if string(got) != secret {
-		return fmt.Errorf("mac.secret readback mismatch")
-	}
-	return nil
-}
-
-// ReadControlMACSecret loads the coordinator MAC secret from shared root.
-func ReadControlMACSecret(sharedRoot string) (string, error) {
-	b, err := os.ReadFile(ControlMACSecretPath(sharedRoot))
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(b)), nil
-}
-
 // WorkerVerifySealed is the trusted worker-side re-verification hook invoked
 // by the containment wrapper (before sandbox-exec) or by herd control verify.
 // Exact task/worker/lease must match; provisional pending-* workers are refused.
@@ -557,12 +470,14 @@ func WorkerVerifySealedFile(sealedPath, task, worker string, lease int64) error 
 			lease = n
 		}
 	}
-	dir := filepath.Dir(filepath.Dir(sealedPath)) // .../control
-	secret, err := os.ReadFile(filepath.Join(dir, "mac.secret"))
+	// sealed: <shared>/.herd/control/sealed/<name>; mac.secret sits beside sealed/.
+	controlDir := filepath.Dir(filepath.Dir(sealedPath))
+	sharedRoot := filepath.Dir(filepath.Dir(controlDir))
+	secret, err := ReadControlMACSecret(sharedRoot)
 	if err != nil {
 		return err
 	}
-	return WorkerVerifySealed(sealedPath, strings.TrimSpace(string(secret)), task, worker, lease)
+	return WorkerVerifySealed(sealedPath, secret, task, worker, lease)
 }
 
 // WaitForSealedControl polls until the barrier seal exists (start barrier).

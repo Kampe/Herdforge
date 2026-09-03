@@ -36,6 +36,8 @@ func runControlArgs(args []string) {
 		runControlIssue(args[1:])
 	case "drain":
 		runControlDrain(args[1:])
+	case "bootstrap":
+		runControlBootstrap(args[1:])
 	case "verify-sealed":
 		runControlVerifySealed(args[1:])
 	case "classify":
@@ -51,6 +53,7 @@ func runControlArgs(args []string) {
 const controlUsage = `Usage:
   herd control issue  --task REF --agent NAME [--worker SESSION] [--lease N] --body TEXT [--packages csv] [--mail path]
   herd control drain  --task REF --agent NAME [--worker SESSION] [--lease N] [--mail path]
+  herd control bootstrap
   herd control verify-sealed --file PATH
   herd control classify <free-form text>
 
@@ -58,13 +61,25 @@ Worker AgentSessionID and lease generation are resolved from live Herdr + FAC-14
 Optional --worker/--lease must match live state (invented values fail closed).
 
 Env:
-  HERD_CONTROL_SECRET   shared MAC secret (required for issue/drain)
+  HERD_CONTROL_SECRET   optional; must match durable mac.secret or fail closed
   HERD_MAIL_FILE        canonical callback/control mailbox path (default .herd/control-mail.jsonl)
   HERD_CONTROL_ISSUER   issuer session id (default coordinator)
   HERD_CLAIMS_DB        optional override for FAC-147 lease DB`
 
 func controlSecret() string {
 	return strings.TrimSpace(os.Getenv("HERD_CONTROL_SECRET"))
+}
+
+func controlSharedRoot() (string, error) {
+	if root := strings.TrimSpace(os.Getenv("HERD_ROOT")); root != "" {
+		return root, nil
+	}
+	return canonicalHerdRoot()
+}
+
+func coordinatorControlMACSecret(sharedRoot string) (string, error) {
+	secret, _, err := security.BootstrapOrLoadControlMACSecret(sharedRoot, controlSecret(), envelope.RoleCoordinator)
+	return secret, err
 }
 
 // controlMailPath resolves the native mail bus from the repository's common
@@ -95,10 +110,43 @@ func controlMailPath(override string) (string, error) {
 	return path, nil
 }
 
+func runControlBootstrap(args []string) {
+	fs := flag.NewFlagSet("control bootstrap", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	root, err := controlSharedRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control bootstrap: %v\n", err)
+		os.Exit(1)
+	}
+	_, created, err := security.BootstrapOrLoadControlMACSecret(root, controlSecret(), envelope.RoleCoordinator)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control bootstrap: %v\n", err)
+		os.Exit(1)
+	}
+	out := map[string]any{
+		"ok":          true,
+		"created":     created,
+		"path":        ".herd/control/mac.secret",
+		"mode":        "0600",
+		"coordinator": true,
+	}
+	_ = json.NewEncoder(os.Stdout).Encode(out)
+}
+
 func newControlPlane(mailPath string) (*dispatch.ControlPlane, error) {
-	secret := controlSecret()
-	if secret == "" {
-		return nil, fmt.Errorf("HERD_CONTROL_SECRET is required (fail-closed)")
+	root := strings.TrimSpace(os.Getenv("HERD_ROOT"))
+	if root == "" {
+		resolved, err := canonicalHerdRoot()
+		if err != nil {
+			return nil, err
+		}
+		root = resolved
+	}
+	secret, err := coordinatorControlMACSecret(root)
+	if err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(mailPath), 0o755); err != nil {
 		return nil, err
@@ -106,10 +154,6 @@ func newControlPlane(mailPath string) (*dispatch.ControlPlane, error) {
 	issuer := strings.TrimSpace(os.Getenv("HERD_CONTROL_ISSUER"))
 	if issuer == "" {
 		issuer = "coordinator"
-	}
-	root := strings.TrimSpace(os.Getenv("HERD_ROOT"))
-	if root == "" {
-		root = "."
 	}
 	// Wire exact FAC-147 authority before any issue/drain.
 	if err := security.WireCanonicalClaimAuthority(root); err != nil {

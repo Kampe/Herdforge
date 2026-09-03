@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/security"
 )
 
 func TestProductionControlFactoryScopesSequentialIdentities(t *testing.T) {
@@ -38,6 +40,73 @@ func TestProductionControlFactoryScopesSequentialIdentities(t *testing.T) {
 	_, err = oA.Delivery.Deliver(context.Background(), control.Order{LaneIdentity: b, Kind: control.KindRepair, Body: "wrong task"})
 	if !errors.Is(err, control.ErrStaleIdentity) {
 		t.Fatalf("stale sequential task reached sender: %v", err)
+	}
+}
+
+func TestConfigureProductionControlBootstrapsDurableMACSecret(t *testing.T) {
+	t.Setenv("HERD_CONTROL_SECRET", "")
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d := dispatch.NewProductionDispatcher(nil, nil, nil)
+	closeControl, err := configureProductionControl(d, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeControl()
+	if d.Control == nil || strings.TrimSpace(d.Control.Secret) == "" {
+		t.Fatal("coordinator startup must load a durable MAC secret without env")
+	}
+	path := security.ControlMACSecretPath(root)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("durable mac.secret missing: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode=%o want 0600", fi.Mode().Perm())
+	}
+	reload := dispatch.NewProductionDispatcher(nil, nil, nil)
+	closeReload, err := configureProductionControl(reload, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReload()
+	if reload.Control.Secret != d.Control.Secret {
+		t.Fatal("restart must drain the same durable secret")
+	}
+}
+
+func TestConfigureProductionControlEnvMismatchFailClosed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := security.WriteControlMACSecret(root, "durable-coordinator-mac-secret"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONTROL_SECRET", "other-coordinator-mac-secret")
+	d := dispatch.NewProductionDispatcher(nil, nil, nil)
+	if _, err := configureProductionControl(d, root); err == nil {
+		t.Fatal("mismatched env secret must fail closed")
+	}
+	got, err := security.ReadControlMACSecret(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "durable-coordinator-mac-secret" {
+		t.Fatal("mismatch must preserve the durable secret")
+	}
+}
+
+func TestCoordinatorControlMACSecretRefusesWorkerRole(t *testing.T) {
+	root := t.TempDir()
+	_, _, err := security.BootstrapOrLoadControlMACSecret(root, "", "worker")
+	if err == nil {
+		t.Fatal("worker must not bootstrap the control MAC secret")
+	}
+	if _, statErr := os.Lstat(security.ControlMACSecretPath(root)); !os.IsNotExist(statErr) {
+		t.Fatal("worker bootstrap must not create mac.secret")
 	}
 }
 
