@@ -1972,9 +1972,12 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			if err := validateLaneLaunchConfig(lane); err != nil {
 				return standing.Route{}, err
 			}
-			if err := admitStandingQuota(lane); err != nil {
-				return standing.Route{}, err
-			}
+			// The launch decision is the sole standing admission authority. Do
+			// not run a separate quota-only pre-gate here: it reads a different
+			// snapshot from the router and cannot account for live concurrency,
+			// provider probes, cooldowns, or the router's fallback decision.
+			// FAC-618: two health authorities must not silently disagree and
+			// strand a standing lane before the actual launch decision runs.
 			decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
 			if err != nil {
 				return standing.Route{}, err
