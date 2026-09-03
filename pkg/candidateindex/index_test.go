@@ -65,6 +65,23 @@ func TestCandidateIndex_DeterministicSorting(t *testing.T) {
 	}
 }
 
+func TestAuthoritativeCandidate_PrefersHighestCompletedLeaseGeneration(t *testing.T) {
+	oldSHA := "283f5c958818126e82bf38db4d5127c3f933cf4c"
+	newSHA := "cb6b6c55b8aa799357d78129f2a61a7f6ce25cb9"
+	when := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+	old := &Candidate{Ref: "FAC-703", CandidateSHA: oldSHA, LeaseGeneration: 8, CompletionCallback: true}
+	new := &Candidate{Ref: "FAC-703", CandidateSHA: newSHA, LeaseGeneration: 9, CompletionCallback: true}
+	evidence := map[candidateKey]candidateEvidence{
+		{ref: "FAC-703", sha: oldSHA}: {observedAt: when, source: SourceReviewLedger, sequence: 10},
+		{ref: "FAC-703", sha: newSHA}: {observedAt: when, source: SourceReviewLedger, sequence: 10},
+	}
+
+	got := authoritativeCandidate([]*Candidate{old, new}, evidence)
+	if got != new {
+		t.Fatalf("selected %s, want newest lease-generation candidate %s", got.CandidateSHA, newSHA)
+	}
+}
+
 func TestCandidateIndexDiscoversForgeTaskInConfiguredLaneWorktree(t *testing.T) {
 	dir := t.TempDir()
 	lane := filepath.Join(dir, "chainseer-forge-worker-live")
