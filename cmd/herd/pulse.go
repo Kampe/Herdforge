@@ -928,6 +928,13 @@ type reapEvidence struct {
 // the reap planner must KEEP the lane. This is a pure function — no
 // I/O — so it is directly unit-testable.
 func applyReapEvidence(agent pulse.AgentObservation, ref string, ev reapEvidence) pulse.AgentObservation {
+	// FAC-747: carry the dispatch identity onto the observation so the
+	// open_review planner can gate on the SAME identity the TicketDone and
+	// SafeRef guards below are keyed on. CommittedWork stays keyed on the agent
+	// name deliberately (a standing lane's committed work is still worth
+	// reporting); it is selection, not observation, that must ask whether the
+	// lane was dispatched for a task.
+	agent.TaskRef = ref
 	if ref != "" {
 		if ev.doneRefs != nil && ev.doneRefs[ref] {
 			agent.TicketDone = true

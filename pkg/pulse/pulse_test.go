@@ -652,13 +652,13 @@ func reapObs() Observation {
 		Herdr: HerdrObservation{
 			Known: true,
 			Agents: []AgentObservation{
-				{Name: "idle-committed", Raw: "idle", CommittedWork: true, TabID: "wK:t1", Workspace: "wK"},
-				{Name: "done-ticket", Raw: "done", TicketDone: true, TabID: "wK:t2", Workspace: "wK"},
-				{Name: "idle-saferef", Raw: "idle", SafeRef: "safe/fac-201", TabID: "wK:t3", Workspace: "wK"},
-				{Name: "idle-awaiting-verdict", Raw: "idle", CommittedWork: true, AwaitingVerdict: true, TabID: "wK:t4", Workspace: "wK"},
-				{Name: "busy-worker", Raw: "working", CommittedWork: true, TabID: "wK:t5", Workspace: "wK"},
+				{Name: "idle-committed", TaskRef: "FAC-101", Raw: "idle", CommittedWork: true, TabID: "wK:t1", Workspace: "wK"},
+				{Name: "done-ticket", TaskRef: "FAC-102", Raw: "done", TicketDone: true, TabID: "wK:t2", Workspace: "wK"},
+				{Name: "idle-saferef", TaskRef: "FAC-103", Raw: "idle", SafeRef: "safe/fac-201", TabID: "wK:t3", Workspace: "wK"},
+				{Name: "idle-awaiting-verdict", TaskRef: "FAC-104", Raw: "idle", CommittedWork: true, AwaitingVerdict: true, TabID: "wK:t4", Workspace: "wK"},
+				{Name: "busy-worker", TaskRef: "FAC-105", Raw: "working", CommittedWork: true, TabID: "wK:t5", Workspace: "wK"},
 				{Name: "idle-no-evidence", Raw: "idle", TabID: "wK:t6", Workspace: "wK"},
-				{Name: "blocked-lane", Raw: "blocked", CommittedWork: true, TabID: "wK:t7", Workspace: "wK"},
+				{Name: "blocked-lane", TaskRef: "FAC-107", Raw: "blocked", CommittedWork: true, TabID: "wK:t7", Workspace: "wK"},
 			},
 		},
 		Review:   ReviewObservation{Known: true},
@@ -853,17 +853,17 @@ func finishedObs() Observation {
 			Known: true,
 			Agents: []AgentObservation{
 				// FINISHED: idle + committed work, no SafeRef, not TicketDone.
-				{Name: "finished-lane", Raw: "idle", CommittedWork: true, TabID: "wK:t10", Workspace: "wK"},
+				{Name: "finished-lane", TaskRef: "FAC-200", Raw: "idle", CommittedWork: true, TabID: "wK:t10", Workspace: "wK"},
 				// Already out for review: should be reaped, not open-reviewed.
-				{Name: "review-pending", Raw: "idle", CommittedWork: true, SafeRef: "safe/fac-200", TabID: "wK:t11", Workspace: "wK"},
+				{Name: "review-pending", TaskRef: "FAC-201", Raw: "idle", CommittedWork: true, SafeRef: "safe/fac-200", TabID: "wK:t11", Workspace: "wK"},
 				// Ticket done: should be reaped, not open-reviewed.
-				{Name: "landed-lane", Raw: "done", TicketDone: true, TabID: "wK:t12", Workspace: "wK"},
+				{Name: "landed-lane", TaskRef: "FAC-202", Raw: "done", TicketDone: true, TabID: "wK:t12", Workspace: "wK"},
 				// Awaiting verdict: KEPT — no action.
-				{Name: "verdict-pending", Raw: "idle", CommittedWork: true, AwaitingVerdict: true, TabID: "wK:t13", Workspace: "wK"},
+				{Name: "verdict-pending", TaskRef: "FAC-203", Raw: "idle", CommittedWork: true, AwaitingVerdict: true, TabID: "wK:t13", Workspace: "wK"},
 				// Idle but no committed work: no action.
 				{Name: "idle-empty", Raw: "idle", TabID: "wK:t14", Workspace: "wK"},
 				// Busy: no action.
-				{Name: "busy-lane", Raw: "working", CommittedWork: true, TabID: "wK:t15", Workspace: "wK"},
+				{Name: "busy-lane", TaskRef: "FAC-205", Raw: "working", CommittedWork: true, TabID: "wK:t15", Workspace: "wK"},
 			},
 		},
 		Review:   ReviewObservation{Known: true},
@@ -935,7 +935,7 @@ func TestPlanDoesNotOpenReviewForAwaitingVerdictOrBusyOrEmpty(t *testing.T) {
 func TestPlanKeepsPacketPendingIdleLane(t *testing.T) {
 	obs := healthyObs()
 	obs.Herdr.Agents = []AgentObservation{{
-		Name: "packet-pending", Raw: "idle", Status: StatusHealthyIdle,
+		Name: "packet-pending", TaskRef: "FAC-300", Raw: "idle", Status: StatusHealthyIdle,
 		CommittedWork: true, PacketPending: true, TicketDone: true,
 		TabID: "tab-packet", Workspace: "w", PaneID: "pane-packet",
 	}}

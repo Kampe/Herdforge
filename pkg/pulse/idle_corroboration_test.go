@@ -15,7 +15,7 @@ func TestWorkingOpenCodePaneIsNotReaped(t *testing.T) {
 	// The exact reported condition: opencode, reported idle, live process, and
 	// reap evidence present (ticket done) so the old code would have closed it.
 	agents := []AgentObservation{{
-		Name: "reviewer", Kind: "opencode", Status: StatusHealthyIdle,
+		Name: "reviewer", TaskRef: "FAC-1", Kind: "opencode", Status: StatusHealthyIdle,
 		PaneID: "wB:p1", TabID: "wB:t1", ForegroundProcess: "opencode",
 		TicketDone: true,
 	}}
@@ -50,7 +50,7 @@ func TestWorkingOpenCodePaneIsNotReaped(t *testing.T) {
 // turns into a fleet-wide resource leak.
 func TestReliableHarnessStillReaped(t *testing.T) {
 	agents := []AgentObservation{{
-		Name: "worker", Kind: "claude", Status: StatusHealthyIdle,
+		Name: "worker", TaskRef: "FAC-1", Kind: "claude", Status: StatusHealthyIdle,
 		PaneID: "wK:p1", TabID: "wK:t1", ForegroundProcess: "claude",
 		TicketDone: true,
 	}}
