@@ -278,6 +278,13 @@ func main() {
 	case "review-ingest":
 		runReviewIngest()
 
+	case "review-bind-evidence":
+		if err := runReviewBindEvidence(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd review-bind-evidence:", err)
+			os.Exit(1)
+		}
+		return
+
 	case "harvest-merge":
 		runHarvestMerge()
 
