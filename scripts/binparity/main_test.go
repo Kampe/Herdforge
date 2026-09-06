@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 func TestCommandResolvesDefaultSourceFromGitRoot(t *testing.T) {
@@ -219,4 +222,83 @@ func TestAuditSourceDetectsMissingExecutable(t *testing.T) {
 	if err := auditSource(dir, m); err == nil {
 		t.Fatal("audit accepted an unmanifested executable")
 	}
+}
+
+const checkLogNoisePath = "bin/check-log-noise"
+const staleSourceRevision = "882da80df38db85d05ebdcf262920f0a3c3f0ed3"
+
+func TestShippedManifestIncludesCheckLogNoiseDisposition(t *testing.T) {
+	m := readShippedManifest(t)
+	found := findDisposition(m, checkLogNoisePath)
+	if found == nil {
+		t.Fatal("shipped manifest is missing bin/check-log-noise disposition")
+	}
+	if found.Disposition != "chainseer_product_exemption" {
+		t.Fatalf("disposition=%q, want chainseer_product_exemption for the Chainseer Docker log-noise product gate", found.Disposition)
+	}
+	if strings.TrimSpace(found.Rationale) == "" {
+		t.Fatal("bin/check-log-noise rationale is empty")
+	}
+	if m.SourceRevision == staleSourceRevision {
+		t.Fatal("source_revision still pins the pre-check-log-noise revision; do not hide drift with an old pin")
+	}
+	if m.SourceExecutableCount != len(m.Entries) {
+		t.Fatalf("source_executable_count=%d but entries=%d", m.SourceExecutableCount, len(m.Entries))
+	}
+}
+
+func TestOmittingCheckLogNoiseDispositionIsParityMismatch(t *testing.T) {
+	source, err := defaultSourcePath(context.Background(), ".")
+	if err != nil || sourceDirectoryAvailable(source) != nil {
+		t.Skip("default Chainseer source unavailable")
+	}
+	m := readShippedManifest(t)
+	filtered := m
+	filtered.Entries = nil
+	for _, e := range m.Entries {
+		if e.Path != checkLogNoisePath {
+			filtered.Entries = append(filtered.Entries, e)
+		}
+	}
+	filtered.SourceExecutableCount = len(filtered.Entries)
+	err = auditSource(source, filtered)
+	if err == nil {
+		t.Fatal("audit must fail when bin/check-log-noise is omitted from the manifest")
+	}
+	if !errors.Is(err, errParityMismatch) {
+		t.Fatalf("error=%v, want parity mismatch", err)
+	}
+}
+
+func TestShippedManifestMatchesDefaultSource(t *testing.T) {
+	source, err := defaultSourcePath(context.Background(), ".")
+	if err != nil || sourceDirectoryAvailable(source) != nil {
+		t.Skip("default Chainseer source unavailable")
+	}
+	m := readShippedManifest(t)
+	if err := auditSource(source, m); err != nil {
+		t.Fatalf("shipped manifest must match the current default source: %v", err)
+	}
+}
+
+func readShippedManifest(t *testing.T) Manifest {
+	t.Helper()
+	top, err := gitroot.Toplevel(context.Background(), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := readManifest(filepath.Join(top, defaultManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func findDisposition(m Manifest, path string) *Disposition {
+	for i := range m.Entries {
+		if m.Entries[i].Path == path {
+			return &m.Entries[i]
+		}
+	}
+	return nil
 }
