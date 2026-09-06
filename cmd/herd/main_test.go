@@ -89,6 +89,11 @@ var (
 	// nestedVerifierSlotHeld is captured before Strip so nested herd CLI
 	// children can retain only the managed-verifier re-entrancy authority.
 	nestedVerifierSlotHeld bool
+	// cliTestGit is the real git executable resolved from PATH in TestMain
+	// before any test calls installFakeGit. exec.Command("git") looks up
+	// PATH at call time, so buildHerd must use this absolute path.
+	cliTestGit    string
+	cliTestGitErr error
 )
 
 func TestMain(m *testing.M) {
@@ -102,6 +107,7 @@ func TestMain(m *testing.M) {
 	// in a lane's shell and pass in the coordinator's on the same commit.
 	nestedVerifierSlotHeld = os.Getenv(slot.EnvHeld) == "1"
 	laneenv.Strip()
+	cliTestGit, cliTestGitErr = gitBinaryOnPATH(os.Getenv("PATH"))
 	restoreSlots, err := laneenv.IsolateDefaultSlotDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "isolate test heavy-phase slots: %v\n", err)
@@ -373,12 +379,12 @@ func buildHerd(t *testing.T) string {
 			return
 		}
 		binary := filepath.Join(dir, "herd")
-		revision, err := exec.Command("git", "rev-parse", "HEAD").Output()
+		revision, err := cliTestRevision()
 		if err != nil {
 			herdBinaryErr = err
 			return
 		}
-		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+strings.TrimSpace(string(revision)), "-o", binary, ".").CombinedOutput()
+		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+revision, "-o", binary, ".").CombinedOutput()
 		if herdBinaryErr == nil {
 			herdBinary = binary
 		}
@@ -387,6 +393,60 @@ func buildHerd(t *testing.T) string {
 		t.Fatalf("build failed: %v, output: %s", herdBinaryErr, herdBinaryOut)
 	}
 	return herdBinary
+}
+
+// cliTestRevision returns the checkout HEAD from the TestMain-captured git
+// binary. PATH at call time is ignored so a test fake cannot poison ldflags.
+func cliTestRevision() (string, error) {
+	if cliTestGitErr != nil {
+		return "", cliTestGitErr
+	}
+	if strings.TrimSpace(cliTestGit) == "" {
+		return "", fmt.Errorf("git not captured for CLI test build")
+	}
+	out, err := exec.Command(cliTestGit, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", err
+	}
+	return validateCLITestRevision(string(out))
+}
+
+func gitBinaryOnPATH(pathEnv string) (string, error) {
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, "git")
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if info.Mode()&0o111 == 0 {
+			continue
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("git not found on captured PATH")
+}
+
+func validateCLITestRevision(raw string) (string, error) {
+	rev := strings.TrimSpace(raw)
+	if rev == "" {
+		return "", fmt.Errorf("empty git revision")
+	}
+	if strings.ContainsAny(rev, " \t\n\r") {
+		return "", fmt.Errorf("malformed git revision %q", raw)
+	}
+	if len(rev) != 40 && len(rev) != 64 {
+		return "", fmt.Errorf("malformed git revision %q", raw)
+	}
+	for i := 0; i < len(rev); i++ {
+		c := rev[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return "", fmt.Errorf("malformed git revision %q", raw)
+		}
+	}
+	return rev, nil
 }
 
 func TestVersionFlag(t *testing.T) {
