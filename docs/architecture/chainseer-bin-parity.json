@@ -2,8 +2,8 @@
   "version": 1,
   "task": "FAC-309",
   "source_root": "chainseer/bin",
-  "source_revision": "882da80df38db85d05ebdcf262920f0a3c3f0ed3",
-  "source_executable_count": 51,
+  "source_revision": "010c6b9590b6959868720254b230c2a84026d847",
+  "source_executable_count": 52,
   "entries": [
     {
       "path": "bin/apply-migrations",
@@ -54,6 +54,11 @@
       "path": "bin/check-lasso-runtime",
       "disposition": "chainseer_product_exemption",
       "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-log-noise",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product observability gate: read-only Docker json-file log-dominance monitor for the chainseer-e0 stack. It is not a Herdforge control-plane surface."
     },
     {
       "path": "bin/check-morpho-blue-decimals",

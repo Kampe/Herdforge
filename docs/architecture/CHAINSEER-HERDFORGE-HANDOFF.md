@@ -19,7 +19,7 @@ env -u GOROOT go run ./scripts/binparity \
   -manifest docs/architecture/chainseer-bin-parity.json
 ```
 
-The manifest currently covers 124 executable files. Chainseer’s live command
+The manifest currently covers 52 executable files. Chainseer’s live command
 invocation measurement remains a separate compatibility figure: 79
 non-library scripts, 55 implemented by invocation, and 24 unknown. Name
 matches are not proof of behavioral parity; use the manifest and differential
