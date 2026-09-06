@@ -97,7 +97,26 @@ var (
 	toolChildByPane       = map[string]ToolChildLifecycle{}
 	toolChildByTab        = map[string]ToolChildLifecycle{}
 	newToolChildLifecycle = defaultToolChildLifecycle
+	newToolChildTree      = defaultToolChildTree
 )
+
+func defaultToolChildTree() toolchild.DescendantTree {
+	return toolchild.SystemTree{}
+}
+
+func toolChildTreeLocked() toolchild.DescendantTree {
+	f := newToolChildTree
+	if f == nil {
+		return defaultToolChildTree()
+	}
+	return f()
+}
+
+func activeToolChildTree() toolchild.DescendantTree {
+	toolChildMu.Lock()
+	defer toolChildMu.Unlock()
+	return toolChildTreeLocked()
+}
 
 func defaultToolChildLifecycle(req launch.Request, name, paneID string) (ToolChildLifecycle, error) {
 	p := os.Getenv("HERD_TOOLCHILD_RECEIPTS")
@@ -113,7 +132,7 @@ func defaultToolChildLifecycle(req launch.Request, name, paneID string) (ToolChi
 		role = string(req.Decision.Role)
 	}
 	owner := toolchild.Identity{SessionGeneration: req.SessionGeneration, LaunchID: launch.DecisionDigest(req.Decision), Role: role, Lane: name}
-	return toolchild.NewLifecycle(owner, toolchild.SystemTree{}, &toolchild.JSONLSink{Path: p}), nil
+	return toolchild.NewLifecycle(owner, toolChildTreeLocked(), &toolchild.JSONLSink{Path: p}), nil
 }
 
 // SetToolChildLifecycleFactory is intentionally test-facing injection. A nil
@@ -128,6 +147,20 @@ func SetToolChildLifecycleFactory(f func(launch.Request, string, string) (ToolCh
 	}
 	toolChildMu.Unlock()
 	return func() { toolChildMu.Lock(); newToolChildLifecycle = old; toolChildMu.Unlock() }
+}
+
+// SetToolChildTreeForTest replaces the process-tree adapter used by new and
+// recovered lifecycles. A nil tree restores the production SystemTree.
+func SetToolChildTreeForTest(tree toolchild.DescendantTree) func() {
+	toolChildMu.Lock()
+	old := newToolChildTree
+	if tree == nil {
+		newToolChildTree = defaultToolChildTree
+	} else {
+		newToolChildTree = func() toolchild.DescendantTree { return tree }
+	}
+	toolChildMu.Unlock()
+	return func() { toolChildMu.Lock(); newToolChildTree = old; toolChildMu.Unlock() }
 }
 
 // PrepareToolChildLifecycle reserves a durable session generation and publishes
@@ -797,10 +830,11 @@ func loadToolChildLifecycle(tabID string) (ToolChildLifecycle, error) {
 	if lc == nil {
 		path := os.Getenv("HERD_TOOLCHILD_RECEIPTS")
 		var err error
+		tree := activeToolChildTree()
 		if path != "" {
-			lc, err = toolchild.LoadLifecycle(path, tabID, toolchild.SystemTree{}, &toolchild.JSONLSink{Path: path})
+			lc, err = toolchild.LoadLifecycle(path, tabID, tree, &toolchild.JSONLSink{Path: path})
 		} else {
-			lc, err = toolchild.DiscoverLifecycle(tabID, toolchild.SystemTree{}, &toolchild.JSONLSink{})
+			lc, err = toolchild.DiscoverLifecycle(tabID, tree, &toolchild.JSONLSink{})
 		}
 		if err != nil {
 			return nil, err
