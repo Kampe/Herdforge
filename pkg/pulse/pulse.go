@@ -185,6 +185,17 @@ type AgentObservation struct {
 	// CommittedWork is true when the lane's worktree has committed (non-empty)
 	// work. An idle agent with uncommitted work is never reaped.
 	CommittedWork bool `json:"committed_work,omitempty"`
+	// TaskRef is the board task this lane was dispatched for, empty for any
+	// lane that was not (reviewer panes, standing lanes, the coordinator).
+	//
+	// FAC-747: CommittedWork is keyed on the agent NAME, which every lane has,
+	// while TicketDone and SafeRef are keyed on a task ref that only dispatched
+	// lanes have. That asymmetry made the open_review trigger reachable for
+	// lanes whose suppressors could never be populated, so every beat planned
+	// reviews of reviewer panes (whose worktree legitimately holds the
+	// candidate's unlanded commits) and of standing lanes. Carrying the ref on
+	// the observation lets selection ask the same question the guards do.
+	TaskRef string `json:"task_ref,omitempty"`
 	// TicketDone is true when the board status for the lane's task is done.
 	TicketDone bool `json:"ticket_done,omitempty"`
 	// SafeRef is the safe/fac-<ref> pin protecting the lane's tip. A non-empty
@@ -839,6 +850,17 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		if a.PacketPending {
 			continue
 		}
+		// FAC-747: only a lane dispatched for a task can have work to review.
+		// This is the same identity the TicketDone and SafeRef guards below are
+		// keyed on; without it the trigger (CommittedWork, keyed on the agent
+		// name every lane has) fires for lanes whose suppressors can never be
+		// populated. A reviewer pane's worktree is a checkout of the candidate
+		// under review, so its unlanded commits are the candidate's and
+		// CommittedWork is legitimately true; a standing lane accumulates
+		// commits in its resident home. Neither is a finished builder lane.
+		if strings.TrimSpace(a.TaskRef) == "" {
+			continue
+		}
 		if !a.CommittedWork {
 			continue
 		}
@@ -879,6 +901,16 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	// eligible lanes so they cannot be left resident by forgetfulness.
 	for _, a := range agents {
 		if a.Name == "" {
+			continue
+		}
+		// FAC-747: same identity gate as open_review above. TicketDone and
+		// SafeRef are keyed on the dispatch ref, which only a dispatched task
+		// lane has -- but that is exactly why a lane whose ref is missing must
+		// never be treated as reap-eligible even if one of those fields is set
+		// by some other path. Reap depending on the ref being unreachable for
+		// non-task lanes, rather than asking directly, is the same fragility
+		// this ticket exists to remove.
+		if strings.TrimSpace(a.TaskRef) == "" {
 			continue
 		}
 		if a.Status != StatusHealthyIdle && a.Status != StatusDone {

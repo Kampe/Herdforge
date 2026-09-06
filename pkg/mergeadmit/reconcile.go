@@ -287,13 +287,25 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 			short(candidate), short(base))
 	}
 
+	// FAC-736: GitHub merge-commit landing (and empty worktree anchors) leave
+	// administrative commits with no patch content on the landed range. Patch
+	// identity is associated with the content-bearing counterpart, never the
+	// empty merge tip.
+	landedContent, err := nonEmptyCommits(repoDir, landedCommits)
+	if err != nil {
+		return nil, err
+	}
+	if len(landedContent) == 0 {
+		return nil, fmt.Errorf("landed %s adds no content over base %s", short(landed), short(base))
+	}
+
 	want, err := patchIDs(repoDir, candidateContent)
 	if err != nil {
 		return nil, err
 	}
-	got, err := patchIDs(repoDir, landedCommits)
+	got, err := patchIDs(repoDir, landedContent)
 	if err == nil {
-		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedCommits)
+		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedContent)
 		if matchErr == nil {
 			return equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA,
 				"ordered-patch-subsequence-on-landed")
@@ -308,7 +320,7 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 		return nil, fmt.Errorf("equivalent-patch proof failed: %w", err)
 	}
 
-	mergeSHA, replayErr := matchCombinedRangeReplay(repoDir, base, candidate, candidateContent, landedCommits)
+	mergeSHA, replayErr := matchCombinedRangeReplay(repoDir, base, candidate, candidateContent, landedContent)
 	if replayErr != nil {
 		return nil, fmt.Errorf("equivalent-patch proof failed: ordered proof: %v; combined proof: %w", err, replayErr)
 	}

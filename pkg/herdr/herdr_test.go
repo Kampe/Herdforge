@@ -1451,7 +1451,11 @@ func standingResumeFixture(t *testing.T, durable bool) (launch.Request, *toolchi
 	req := launch.Request{Decision: d, TaskRef: "FAC-188", Name: "forge-worker", PaneID: "pane-standing", LeaseGeneration: 7, Scope: router.ScopeTask, Repository: "repo-standing", Lane: "worker"}
 	digest := launch.DecisionDigest(d)
 	owner := toolchild.Identity{PID: 900, StartToken: "owner-start", SessionGeneration: 42, LaunchID: digest, Repository: req.Repository, Role: string(d.Role), Lane: req.Lane, SessionID: d.HarnessSession, PaneID: req.PaneID, TabID: "tab-standing", Provider: d.Harness, ArgvDigest: digest, Argv: append([]string(nil), d.HarnessArgv...), TaskRef: req.TaskRef, Name: req.Name}
-	lc := toolchild.NewLifecycle(owner, &toolchild.FakeTree{}, &toolchild.MemorySink{})
+	tree := &toolchild.FakeTree{Nodes: map[int]toolchild.Node{
+		owner.PID: {Identity: owner, ParentPID: owner.ParentPID},
+	}}
+	t.Cleanup(SetToolChildTreeForTest(tree))
+	lc := toolchild.NewLifecycle(owner, tree, &toolchild.MemorySink{})
 	path := t.TempDir() + "/toolchild.jsonl"
 	if durable {
 		sink := &toolchild.JSONLSink{Path: path}
@@ -1516,14 +1520,10 @@ func TestStandingResumeRecoversGenerationFromTaskLaunchRequestShape(t *testing.T
 	}
 }
 
-func TestStandingResumeRecoversGenerationAfterCoordinatorRestart(t *testing.T) {
-	req, _, agent, path := standingResumeFixture(t, true)
+func stubStandingResumeHerdr(t *testing.T, agent AgentEntry) {
+	t.Helper()
 	oldRun := runHerdr
-	defer func() { runHerdr = oldRun }()
-	toolChildMu.Lock()
-	toolChildByTab = map[string]ToolChildLifecycle{}
-	toolChildByPane = map[string]ToolChildLifecycle{}
-	toolChildMu.Unlock()
+	t.Cleanup(func() { runHerdr = oldRun })
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) == 2 && args[0] == "agent" && args[1] == "list" {
 			return fmt.Sprintf(`{"result":{"agents":[{"name":%q,"agent":%q,"agent_status":"working","pane_id":%q,"tab_id":%q,"workspace_id":%q,"agent_session":{"value":%q}}]}}`, agent.Name, agent.Kind, agent.PaneID, agent.TabID, agent.Workspace, agent.Session.Value), nil
@@ -1533,11 +1533,137 @@ func TestStandingResumeRecoversGenerationAfterCoordinatorRestart(t *testing.T) {
 		}
 		return "", fmt.Errorf("unexpected process or tab side effect: %v", args)
 	}
+}
+
+func clearStandingResumeMemory(t *testing.T) {
+	t.Helper()
+	toolChildMu.Lock()
+	toolChildByTab = map[string]ToolChildLifecycle{}
+	toolChildByPane = map[string]ToolChildLifecycle{}
+	toolChildMu.Unlock()
+}
+
+func TestStandingResumeRecoversGenerationAfterCoordinatorRestart(t *testing.T) {
+	req, _, agent, path := standingResumeFixture(t, true)
+	clearStandingResumeMemory(t)
+	stubStandingResumeHerdr(t, agent)
 	if _, err := ResolveAgentTabWithDecision(agent.Name, req); err != nil {
 		t.Fatalf("restart recovery from %s failed: %v", path, err)
 	}
 	if lifecycleForTab(agent.TabID) == nil {
 		t.Fatal("restart recovery did not retain exact lifecycle authority")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("durable JSONL was not reloaded: %v", err)
+	}
+}
+
+func TestToolChildTreeDefaultsToSystemTree(t *testing.T) {
+	restore := SetToolChildTreeForTest(&toolchild.FakeTree{})
+	restore()
+	if _, ok := activeToolChildTree().(toolchild.SystemTree); !ok {
+		t.Fatal("production recovery tree default is not SystemTree")
+	}
+}
+
+func TestStandingResumeRestartTreeOwnership(t *testing.T) {
+	cases := []struct {
+		name       string
+		tree       func(owner toolchild.Identity) *toolchild.FakeTree
+		inventory  func(owner toolchild.Identity) *toolchild.Identity
+		wantErr    error
+		wantReaped []int
+	}{
+		{
+			name: "owned descendant recovers",
+			tree: func(owner toolchild.Identity) *toolchild.FakeTree {
+				child := toolchild.Identity{PID: 901, ParentPID: owner.PID, StartToken: "owned-child"}
+				return &toolchild.FakeTree{Nodes: map[int]toolchild.Node{
+					owner.PID: {Identity: owner, ParentPID: owner.ParentPID},
+					child.PID: {Identity: child, ParentPID: owner.PID},
+				}}
+			},
+			wantReaped: []int{901},
+		},
+		{
+			name: "unrelated descendants at synthetic owner PID refuse",
+			tree: func(owner toolchild.Identity) *toolchild.FakeTree {
+				live := owner
+				live.StartToken = "live-host-start"
+				unrelated := toolchild.Identity{PID: 902, ParentPID: owner.PID, StartToken: "host-unrelated"}
+				return &toolchild.FakeTree{Nodes: map[int]toolchild.Node{
+					owner.PID:     {Identity: live, ParentPID: live.ParentPID},
+					unrelated.PID: {Identity: unrelated, ParentPID: owner.PID},
+				}}
+			},
+			wantErr: toolchild.ErrNotOwned,
+		},
+		{
+			name: "wrong start-token child refuses",
+			tree: func(owner toolchild.Identity) *toolchild.FakeTree {
+				// Same PID as the durable inventory child, but not a descendant of
+				// the recorded owner: Begin must not adopt it, Teardown must refuse.
+				liveChild := toolchild.Identity{PID: 903, ParentPID: 1, StartToken: "live-wrong-start"}
+				return &toolchild.FakeTree{Nodes: map[int]toolchild.Node{
+					owner.PID:     {Identity: owner, ParentPID: owner.ParentPID},
+					liveChild.PID: {Identity: liveChild, ParentPID: 1},
+				}}
+			},
+			inventory: func(owner toolchild.Identity) *toolchild.Identity {
+				child := owner
+				child.PID = 903
+				child.ParentPID = owner.PID
+				child.StartToken = "recorded-child"
+				child.OwnerPID = owner.PID
+				child.OwnerStartToken = owner.StartToken
+				return &child
+			},
+			wantErr: toolchild.ErrUnsafeTeardown,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _, agent, path := standingResumeFixture(t, true)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			line, _, _ := strings.Cut(string(data), "\n")
+			var rec toolchild.Receipt
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatal(err)
+			}
+			owner := rec.Identity
+			if tc.inventory != nil {
+				child := tc.inventory(owner)
+				if err := (&toolchild.JSONLSink{Path: path}).Write(toolchild.Receipt{Action: "inventory", Identity: *child, Reason: "recorded child"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tree := tc.tree(owner)
+			t.Cleanup(SetToolChildTreeForTest(tree))
+			clearStandingResumeMemory(t)
+			stubStandingResumeHerdr(t, agent)
+			_, err = ResolveAgentTabWithDecision(agent.Name, req)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tc.wantErr)
+				}
+				if len(tree.Reaped) != 0 {
+					t.Fatalf("refused recovery reaped %v", tree.Reaped)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("restart recovery from %s failed: %v", path, err)
+			}
+			if lifecycleForTab(agent.TabID) == nil {
+				t.Fatal("restart recovery did not retain exact lifecycle authority")
+			}
+			if got, want := fmt.Sprintf("%v", tree.Reaped), fmt.Sprintf("%v", tc.wantReaped); got != want {
+				t.Fatalf("reaped %s, want %s", got, want)
+			}
+		})
 	}
 }
 
