@@ -346,3 +346,245 @@ func TestProveEquivalentLandedContextChangedStackMutationControls(t *testing.T) 
 		})
 	}
 }
+
+// FAC-736: GitHub merge-commit landing leaves origin/main on an empty
+// administrative merge whose tree equals the harvested content commit. The
+// equivalent-patch proof must bind the content-bearing landed commit, never
+// the empty merge tip.
+func TestProveEquivalentLandedEmptyMergeTipReturnsContentCommit(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "a.txt", "one\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "work")
+	candidate := commit(t, dir, "b.txt", "two\n", "candidate work")
+	harvested := rewriteOnto(t, dir, "landed", base, []string{candidate})
+	if harvested == candidate {
+		t.Fatal("fixture did not rewrite the candidate sha; the test would prove nothing")
+	}
+	mergeTip := githubEmptyMerge(t, dir, base, harvested, "Merge pull request #710")
+	if mergeTip == harvested {
+		t.Fatal("fixture merge tip equals the harvested content commit")
+	}
+
+	proof, err := ProveEquivalentLanded(dir, ProofRequest{
+		BaseSHA: base, CandidateSHA: candidate, LandedSHA: mergeTip,
+	})
+	if err != nil {
+		t.Fatalf("empty-merge equivalent proof: %v", err)
+	}
+	if proof.MergeSHA == mergeTip {
+		t.Fatal("proof bound the empty merge commit; patch identity would be empty")
+	}
+	if proof.MergeSHA != harvested {
+		t.Fatalf("merge sha = %s, want harvested content %s (not empty merge %s)",
+			short(proof.MergeSHA), short(harvested), short(mergeTip))
+	}
+	if proof.LandedSHA != mergeTip {
+		t.Fatalf("landed sha = %s, want origin/main tip %s", short(proof.LandedSHA), short(mergeTip))
+	}
+	if proof.PatchID == "" {
+		t.Fatal("proof patch id is empty")
+	}
+	wantPatch, err := commitPatchID(dir, harvested)
+	if err != nil {
+		t.Fatalf("harvested content patch id: %v", err)
+	}
+	if proof.PatchID != wantPatch {
+		t.Fatalf("proof patch %s != harvested content patch %s", short(proof.PatchID), short(wantPatch))
+	}
+	if _, err := commitPatchID(dir, mergeTip); err == nil {
+		t.Fatal("empty merge tip unexpectedly has a patch id; fixture is not FAC-733")
+	}
+	if proof.Method != "ordered-patch-subsequence-on-landed" {
+		t.Fatalf("method = %q, want ordered-patch-subsequence-on-landed", proof.Method)
+	}
+}
+
+func TestProveEquivalentLandedLinearEmptyCommitTipReturnsContentCommit(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "a.txt", "one\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "work")
+	candidate := commit(t, dir, "b.txt", "two\n", "candidate work")
+	harvested := rewriteOnto(t, dir, "landed", base, []string{candidate})
+	run(t, dir, "git", "commit", "-q", "--allow-empty", "-m", "empty administrative merge")
+	emptyTip := revParse(t, dir, "HEAD")
+	if emptyTip == harvested {
+		t.Fatal("empty tip equals the harvested content commit")
+	}
+	if _, err := commitPatchID(dir, emptyTip); err == nil {
+		t.Fatal("linear empty tip has patch content; fixture is not administrative")
+	}
+
+	proof, err := ProveEquivalentLanded(dir, ProofRequest{
+		BaseSHA: base, CandidateSHA: candidate, LandedSHA: emptyTip,
+	})
+	if err != nil {
+		t.Fatalf("linear empty-tip proof: %v", err)
+	}
+	if proof.MergeSHA != harvested {
+		t.Fatalf("merge sha = %s, want harvested content %s (not empty tip %s)",
+			short(proof.MergeSHA), short(harvested), short(emptyTip))
+	}
+	wantPatch, err := commitPatchID(dir, harvested)
+	if err != nil {
+		t.Fatalf("harvested content patch id: %v", err)
+	}
+	if proof.PatchID != wantPatch || proof.PatchID == "" {
+		t.Fatalf("proof patch %s, want harvested %s", short(proof.PatchID), short(wantPatch))
+	}
+}
+
+func TestProveEquivalentLandedEmptyMergeTipMutationControls(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "a.txt", "one\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "work")
+	candidate := commit(t, dir, "b.txt", "two\n", "candidate work")
+	harvested := rewriteOnto(t, dir, "landed", base, []string{candidate})
+	mergeTip := githubEmptyMerge(t, dir, base, harvested, "Merge pull request #710")
+
+	landedCommits, err := rangeCommits(dir, base, mergeTip)
+	if err != nil {
+		t.Fatalf("range commits: %v", err)
+	}
+	if len(landedCommits) < 2 {
+		t.Fatal("fixture landed range is missing the empty merge")
+	}
+	if landedCommits[len(landedCommits)-1] != mergeTip {
+		t.Fatal("fixture landed range does not end at the empty merge")
+	}
+
+	// Pre-fix path: patch IDs of the unfiltered landed range fail on the empty
+	// merge, and binding that merge as MergeSHA is a hard refusal. Removing
+	// the empty-commit mapping must make the success test RED because this
+	// unfiltered association is still illegal.
+	if _, err := patchIDs(dir, landedCommits); err == nil {
+		t.Fatal("unfiltered landed patch IDs succeeded; empty-merge mapping is not under test")
+	}
+	if _, err := equivalentLandedProof(dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed"); err == nil {
+		t.Fatal("equivalentLandedProof accepted the empty merge commit")
+	}
+
+	want, err := patchIDs(dir, []string{harvested})
+	if err != nil {
+		t.Fatalf("harvested patch id: %v", err)
+	}
+	if _, err := patchIDs(dir, []string{harvested, mergeTip}); err == nil {
+		t.Fatal("patch IDs of [content, empty merge] succeeded; mapping must skip the empty commit before patch-id")
+	}
+
+	matched, err := matchOrderedPatchSubsequence(want, want, []string{harvested})
+	if err != nil {
+		t.Fatalf("content-only subsequence: %v", err)
+	}
+	if matched != harvested {
+		t.Fatalf("content-only subsequence = %s, want harvested %s", short(matched), short(harvested))
+	}
+}
+
+func TestReconcileLandedEmptyMergeTipSealsContentCommit(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "a.txt", "one\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "work")
+	candidate := commit(t, dir, "b.txt", "two\n", "candidate work")
+	harvested := rewriteOnto(t, dir, "landed", base, []string{candidate})
+	mergeTip := githubEmptyMerge(t, dir, base, harvested, "Merge pull request #710")
+
+	l := newLedger(t, dir)
+	launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
+	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
+
+	g := &Gate{
+		RepoDir: dir, Ledger: l, Policy: testPolicy(),
+		Live: LiveState{
+			OriginMain:    StaticProbe(mergeTip),
+			CandidateHead: StaticProbe(candidate),
+			Mergeable:     StaticProbe("CLEAN"),
+			TaskRevision:  StaticProbe(testRevision),
+			Checks:        func() (map[string]string, error) { return map[string]string{testCheck: "success"}, nil },
+		},
+	}
+	req := okRequest(base, candidate)
+	receipt, err := g.ReconcileLanded(req)
+	if err != nil {
+		t.Fatalf("ReconcileLanded empty-merge tip: %v", err)
+	}
+	if receipt.CandidateSHA != candidate {
+		t.Fatalf("receipt candidate = %s, want reviewed %s", receipt.CandidateSHA, candidate)
+	}
+	if receipt.MergeSHA == mergeTip {
+		t.Fatal("receipt bound the empty merge commit")
+	}
+	if receipt.MergeSHA != harvested {
+		t.Fatalf("receipt merge sha = %s, want harvested content %s", short(receipt.MergeSHA), short(harvested))
+	}
+	if receipt.PatchID == "" {
+		t.Fatal("receipt patch id is empty")
+	}
+	wantPatch, err := hsync.PatchID(dir, harvested)
+	if err != nil {
+		t.Fatalf("harvested patch id: %v", err)
+	}
+	if receipt.PatchID != wantPatch {
+		t.Fatalf("receipt patch %s != harvested content patch %s", short(receipt.PatchID), short(wantPatch))
+	}
+	if receipt.VerificationDigest != testVfy {
+		t.Fatalf("receipt verification digest = %q, want ledger %q", receipt.VerificationDigest, testVfy)
+	}
+	if receipt.LeaseGeneration != req.LeaseGeneration {
+		t.Fatalf("receipt lease generation = %d, want %d", receipt.LeaseGeneration, req.LeaseGeneration)
+	}
+	if receipt.AuthorFamily != "anthropic" || receipt.ReviewerFamily != "openai" {
+		t.Fatalf("receipt families author=%s reviewer=%s", receipt.AuthorFamily, receipt.ReviewerFamily)
+	}
+	if receipt.AcceptanceDigest != req.AcceptanceDigest {
+		t.Fatalf("receipt acceptance digest = %s, want %s", short(receipt.AcceptanceDigest), short(req.AcceptanceDigest))
+	}
+	if receipt.Digest == "" || receipt.Digest != receipt.ComputeDigest() {
+		t.Fatal("receipt digest does not match its own contents")
+	}
+
+	run(t, dir, "git", "update-ref", "refs/remotes/origin/main", mergeTip)
+	st := &lifecycle.TaskState{
+		TaskRef: testRef, State: lifecycle.StateIntegrated,
+		LeaseGeneration: req.LeaseGeneration, CandidateSHA: candidate,
+	}
+	if err := receipt.Validate(dir, testRef, st); err != nil {
+		t.Fatalf("BoardDone would REFUSE the empty-merge reconciled receipt: %v", err)
+	}
+}
+
+func TestReconcileLandedEmptyMergeTipRefusesWithoutExactPASS(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		prep func(*testing.T, *reviewledger.Ledger, string)
+	}{
+		{name: "missing verdict", prep: func(t *testing.T, l *reviewledger.Ledger, candidate string) {
+			launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
+		}},
+		{name: "FAIL verdict", prep: func(t *testing.T, l *reviewledger.Ledger, candidate string) {
+			launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
+			verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictFAIL)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := gitRepo(t)
+			base := commit(t, dir, "a.txt", "one\n", "base")
+			run(t, dir, "git", "checkout", "-q", "-b", "work")
+			candidate := commit(t, dir, "b.txt", "two\n", "candidate work")
+			harvested := rewriteOnto(t, dir, "landed", base, []string{candidate})
+			mergeTip := githubEmptyMerge(t, dir, base, harvested, "Merge pull request #710")
+			l := newLedger(t, dir)
+			tc.prep(t, l, candidate)
+			g := &Gate{
+				RepoDir: dir, Ledger: l, Policy: testPolicy(),
+				Live: LiveState{OriginMain: StaticProbe(mergeTip)},
+			}
+			_, err := g.ReconcileLanded(okRequest(base, candidate))
+			if err == nil {
+				t.Fatal("ReconcileLanded sealed the FAC-733 fixture without exact PASS evidence")
+			}
+			if _, statErr := os.Stat(hsync.ReceiptPath(dir, testRef)); statErr == nil {
+				t.Fatal("refused reconcile still wrote a receipt")
+			}
+		})
+	}
+}
