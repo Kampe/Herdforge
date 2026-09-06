@@ -72,6 +72,29 @@ func rewriteOnto(t *testing.T, dir, branch, base string, commits []string) strin
 	return revParse(t, dir, "HEAD")
 }
 
+// githubEmptyMerge creates the FAC-733 GitHub merge-commit shape: a two-parent
+// merge whose tree equals the second parent and whose default diff-tree patch
+// is empty. Administrative history, not reviewed content.
+func githubEmptyMerge(t *testing.T, dir, firstParent, secondParent, msg string) string {
+	t.Helper()
+	run(t, dir, "git", "checkout", "-q", "-B", "main", firstParent)
+	run(t, dir, "git", "merge", "--no-ff", "--no-edit", "-m", msg, secondParent)
+	sha := revParse(t, dir, "HEAD")
+	if n := strings.Count(strings.TrimSpace(runOut(t, dir, "git", "rev-list", "--parents", "-n", "1", sha)), " "); n != 2 {
+		t.Fatalf("fixture merge %s is not a two-parent commit (parent tokens=%d)", short(sha), n)
+	}
+	if revParse(t, dir, sha+"^1") != firstParent {
+		t.Fatalf("merge first parent = %s, want %s", short(revParse(t, dir, sha+"^1")), short(firstParent))
+	}
+	if revParse(t, dir, sha+"^{tree}") != revParse(t, dir, secondParent+"^{tree}") {
+		t.Fatal("fixture merge tree does not equal the content parent; not an empty administrative merge")
+	}
+	if out := runOut(t, dir, "git", "diff-tree", "-p", "--no-color", sha); len(strings.TrimSpace(out)) != 0 {
+		t.Fatal("fixture merge has patch content; the empty-merge mapping would not be under test")
+	}
+	return sha
+}
+
 func revParse(t *testing.T, dir, rev string) string {
 	t.Helper()
 	return strings.TrimSpace(runOut(t, dir, "git", "rev-parse", rev))
