@@ -138,7 +138,12 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			note(verdict.Reviewer, "reviewer identity equals the builder identity; a self-review is not independent")
 			continue
 		}
-		if verdict.VerificationDigest == "" {
+		digest, digestErr := verificationDigestFor(rows, verdict)
+		if digestErr != nil {
+			note(verdict.Reviewer, digestErr.Error())
+			continue
+		}
+		if digest == "" {
 			note(verdict.Reviewer, "verdict carries no verification digest")
 			continue
 		}
@@ -150,7 +155,7 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			note(verdict.Reviewer, "no risk tier is recorded for this candidate on any launch record row")
 			continue
 		}
-		return &AdmissionResult{Admitted: true, Reason: "validated independent verdict for exact candidate (reduced provenance)", SHA: sha, Reviewer: verdict.Reviewer, ReviewerFamily: families.Value, Tier: tier, VerificationDigest: verdict.VerificationDigest, AuthorFamily: launchRow.BuilderFamily}, nil
+		return &AdmissionResult{Admitted: true, Reason: "validated independent verdict for exact candidate (reduced provenance)", SHA: sha, Reviewer: verdict.Reviewer, ReviewerFamily: families.Value, Tier: tier, VerificationDigest: digest, AuthorFamily: launchRow.BuilderFamily}, nil
 	}
 	if len(skipped) > 0 {
 		sort.Strings(skipped)
@@ -334,7 +339,12 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 			lastReason = "verdict patch id does not match candidate patch id"
 			continue
 		}
-		if verdict.VerificationDigest == "" {
+		digest, digestErr := verificationDigestFor(rows, verdict)
+		if digestErr != nil {
+			lastReason = digestErr.Error()
+			continue
+		}
+		if digest == "" {
 			lastReason = "verdict missing verification digest"
 			continue
 		}
@@ -357,7 +367,7 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 			Tier:               tier,
 			Lease:              verdict.Lease,
 			PatchURL:           verdict.PatchURL,
-			VerificationDigest: verdict.VerificationDigest,
+			VerificationDigest: digest,
 			AuthorFamily:       launchRow.BuilderFamily,
 		}, nil
 	}

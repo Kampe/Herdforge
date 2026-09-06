@@ -22,6 +22,9 @@ const (
 	// reconstruction rather than literal ancestry.
 	EventReconstruction Event = "reconstruction"
 	EventRetired        Event = "retired"
+	// EventEvidenceBind appends an immutable full-suite PASS receipt digest
+	// onto an already-recorded independent PASS without rewriting that verdict.
+	EventEvidenceBind Event = "evidence-bind"
 )
 
 // Verdict values.
