@@ -65,10 +65,12 @@ type Item struct {
 
 // Result is the full attention triage.
 type Result struct {
-	Items   []Item                 `json:"items"`
-	Counts  map[AttentionLevel]int `json:"counts"`
-	Total   int                    `json:"total"`
-	Needing int                    `json:"needing"`
+	Candidates     []CandidateItem        `json:"candidates,omitempty"`
+	CandidateError string                 `json:"candidate_error,omitempty"`
+	Items          []Item                 `json:"items"`
+	Counts         map[AttentionLevel]int `json:"counts"`
+	Total          int                    `json:"total"`
+	Needing        int                    `json:"needing"`
 }
 
 // urgencyRank maps a level to a numeric urgency (higher = more urgent).
@@ -254,6 +256,25 @@ func Triage(
 
 // Summary returns a one-line human-readable triage summary.
 func Summary(r Result) string {
+	if len(r.Candidates) == 0 && r.CandidateError == "" {
+		return laneSummary(r)
+	}
+	var summary string
+	if r.Total == 0 {
+		summary = laneSummary(r)
+	} else {
+		summary = fmt.Sprintf("herd-attention: %d of %d lane(s) need eyes", r.Needing, r.Total)
+	}
+	if len(r.Candidates) > 0 {
+		summary += fmt.Sprintf("; CRITICAL: %d candidate(s) need integration attention", len(r.Candidates))
+	}
+	if r.CandidateError != "" {
+		summary += "; UNKNOWN candidate evidence: " + r.CandidateError
+	}
+	return summary
+}
+
+func laneSummary(r Result) string {
 	// FAC-604: scanning nothing is not a clean bill of health. When the standing
 	// roster resolves empty -- as it does whenever lane-registry.json parses with
 	// lanes but no standing flags, since that path never falls back to
@@ -527,9 +548,9 @@ func (r Result) MarshalJSON() ([]byte, error) {
 // nothing wrong.
 func attentionState(r Result) string {
 	switch {
-	case r.Total == 0:
+	case r.Total == 0 || r.CandidateError != "":
 		return "UNKNOWN"
-	case r.Needing > 0:
+	case r.Needing > 0 || len(r.Candidates) > 0:
 		return "ATTENTION"
 	default:
 		return "HEALTHY"
