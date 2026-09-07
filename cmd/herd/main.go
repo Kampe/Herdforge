@@ -3966,6 +3966,17 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if ferr := stack.CAS.AdvanceFence(ctx, approvalTask.ID, lease.Generation); ferr != nil {
 			return nil, ferr
 		}
+		// Bind broker capability issuance to this acquired lease, never mutable
+		// provider state shared by approvals for other tasks (FAC-652).
+		if k, ok := provider.UnwrapTaskProvider(tp).(*provider.KaneoProvider); ok && k != nil && stack.Minter != nil {
+			if merr := provider.AttachCoordinatorMinter(k, stack.Minter); merr != nil {
+				return nil, fmt.Errorf("approve: attach coordinator minter: %w", merr)
+			}
+			ctx = provider.WithMintIdentity(ctx, provider.MintIdentity{
+				Repo: lease.Repo, Provider: lease.Provider, Project: lease.Project,
+				TaskRef: lease.TaskRef, OwnerID: lease.OwnerID,
+			})
+		}
 		res, err = hsync.BoardDoneFenced(ctx, tp, stack, key, owner, lease.Generation, req)
 	} else {
 		res, err = hsync.BoardDone(ctx, tp, req)
