@@ -15,3 +15,7 @@ Put this checkout's `bin` directory on PATH for the coordinator process and set 
 Rollback: set `core_task_reads: false`; the previous CLI transport remains intact. An older helper failing a read never triggers automatic transport fallback. An actual task timeout remains UNKNOWN, never an empty graph.
 
 The core fixture proves four reads for a ref (search/task/project/labels) and rejects partial or inconsistent evidence. No optional activity/time/link/relation reads are made. Live latency and successful migration must be measured separately from fixture success.
+
+Search requests respect the server maximum of 50 results; a truncated result still refuses via the completeness count. After task identity validation, required project and label reads overlap, and both must pass their original identity checks before any output is admitted. The fixture server enforces the search cap and uses a request barrier to prove overlap without a wall-clock performance assertion.
+
+Core reads require a configured workspace. Project identity comes from the authenticated workspace-scoped project list (including archived projects), with exactly one matching project ID and the original workspace/slug checks. The project-detail endpoint is intentionally not used because it embeds every task. Missing, duplicate, malformed, or wrong-workspace metadata refuses; no cached or inferred identity substitutes for the response.
