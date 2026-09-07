@@ -1,8 +1,11 @@
 package reviewledger
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSameReviewerReassessment(t *testing.T) {
@@ -96,5 +99,79 @@ func TestReassessmentRefusesIdentityAndEvidenceChanges(t *testing.T) {
 				t.Fatal("invalid correction accepted")
 			}
 		})
+	}
+}
+
+func TestReassessmentSerializesLedgerInstances(t *testing.T) {
+	t.Run("same path", func(t *testing.T) { checkReassessmentSerialization(t, false) })
+	t.Run("symlink alias", func(t *testing.T) { checkReassessmentSerialization(t, true) })
+}
+
+func checkReassessmentSerialization(t *testing.T, alias bool) {
+	dir := t.TempDir()
+	path := DefaultPath(dir)
+	first, err := NewReviewLedger(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := VerdictOpts{SHA: strings.Repeat("a", 40), Reviewer: "r", Task: "FAC-493", ReviewerFamily: "google", BuilderFamily: "anthropic", Verdict: VerdictFAIL, VfyDigest: "old"}
+	if _, err := first.Verdict(old); err != nil {
+		t.Fatal(err)
+	}
+	prior, _, err := first.VerdictForReviewer(old.SHA, old.Reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := old
+	next.Reassesses = VerdictEventDigest(prior)
+	next.ArtifactDigest = strings.Repeat("b", 64)
+	next.VfyDigest = "new"
+	next.Verdict = VerdictPASS
+	secondPath := path
+	if alias {
+		secondPath = filepath.Join(dir, "ledger-link")
+		if err := os.Symlink(path, secondPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second, err := NewReviewLedger(dir, secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	first.Now = func() time.Time {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return time.Now()
+	}
+	result1 := make(chan error, 1)
+	result2 := make(chan error, 1)
+	go func() { _, err := first.Verdict(next); result1 <- err }()
+	<-entered
+	other := next
+	other.ArtifactDigest = strings.Repeat("c", 64)
+	other.VfyDigest = "different evidence"
+	go func() { _, err := second.Verdict(other); result2 <- err }()
+	var secondErr error
+	finished := false
+	select {
+	case secondErr = <-result2:
+		finished = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	firstErr := <-result1
+	if !finished {
+		secondErr = <-result2
+	}
+	if firstErr == nil && secondErr == nil {
+		t.Fatal("two corrections consumed the same prior event")
+	}
+	if firstErr != nil && secondErr != nil {
+		t.Fatalf("both corrections refused: %v / %v", firstErr, secondErr)
 	}
 }
