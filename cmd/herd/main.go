@@ -279,6 +279,13 @@ func main() {
 	case "review-ingest":
 		runReviewIngest()
 
+	case "review-complete-record":
+		if err := runReviewCompleteRecord(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd review-complete-record:", err)
+			os.Exit(1)
+		}
+		return
+
 	case "review-bind-evidence":
 		if err := runReviewBindEvidence(); err != nil {
 			fmt.Fprintln(os.Stderr, "herd review-bind-evidence:", err)
