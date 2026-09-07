@@ -23,9 +23,10 @@ type KaneoProvider struct {
 	ProjectID string
 	UseCLI    bool
 	// CoreTaskReads requires an explicitly supported minimal CLI read mode.
-	CoreTaskReads bool
-	coreReadOnce  sync.Once
-	coreReadErr   error
+	CoreTaskReads   bool
+	coreReadMu      sync.Mutex
+	coreReadReady   bool
+	coreReadPending chan struct{}
 	// APIKey authenticates HTTP calls (Bearer). Loaded from api_key_env / KANEO_API_KEY.
 	// Bulk project graph snapshots prefer HTTP fan-out even when UseCLI is true
 	// to avoid N CLI subprocesses (FAC-159 live-path stampede).

@@ -14,29 +14,58 @@ func (k *KaneoProvider) requireCoreRead(ctx context.Context) error {
 	if strings.TrimSpace(k.ProjectID) == "" {
 		return fmt.Errorf("core task read requires project identity")
 	}
-	k.coreReadOnce.Do(func() {
-		res, err := kaneoRunCLI(ctx, kaneoCoreReadExecutable, "task", "get", "--help")
-		if err != nil {
-			k.coreReadErr = fmt.Errorf("core task read capability: %w", err)
-			return
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if res == nil {
-			k.coreReadErr = fmt.Errorf("empty core task read capability response")
-			return
+		k.coreReadMu.Lock()
+		if k.coreReadReady {
+			k.coreReadMu.Unlock()
+			return nil
 		}
-		help := string(res.Stdout)
-		hasCore := false
-		for _, line := range strings.Split(help, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) > 0 && fields[0] == "--core" {
-				hasCore = true
+		pending := k.coreReadPending
+		if pending != nil {
+			k.coreReadMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-pending:
+				continue
 			}
 		}
-		if !strings.Contains(help, "Usage: "+kaneoCoreReadExecutable+" task get") || !hasCore {
-			k.coreReadErr = fmt.Errorf("installed Kaneo CLI lacks core task read capability")
+		pending = make(chan struct{})
+		k.coreReadPending = pending
+		k.coreReadMu.Unlock()
+		err := probeCoreRead(ctx)
+		k.coreReadMu.Lock()
+		k.coreReadReady = err == nil
+		k.coreReadPending = nil
+		close(pending)
+		k.coreReadMu.Unlock()
+		return err
+	}
+}
+
+func probeCoreRead(ctx context.Context) error {
+	res, err := kaneoRunCLI(ctx, kaneoCoreReadExecutable, "task", "get", "--help")
+	if err != nil {
+		return fmt.Errorf("core task read capability: %w", err)
+	}
+	if res == nil {
+		return fmt.Errorf("empty core task read capability response")
+	}
+	help := string(res.Stdout)
+	hasCore := false
+	for _, line := range strings.Split(help, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "--core" {
+			hasCore = true
 		}
-	})
-	return k.coreReadErr
+	}
+	if !strings.Contains(help, "Usage: "+kaneoCoreReadExecutable+" task get") || !hasCore {
+		return fmt.Errorf("installed Kaneo CLI lacks core task read capability")
+	}
+	return ctx.Err()
 }
 
 func validateCoreTaskBody(body []byte, dto kaneoTaskDTO, project string) error {
