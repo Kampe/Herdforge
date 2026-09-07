@@ -88,7 +88,7 @@ var subcommandUsage = map[string]string{
 	"review-ledger": "Usage: herd review-ledger list|queued|pending|tier <sha>|readiness <sha>...|drift|evidence-gap|host-ingest [--with-board]\n" +
 		"  Append-only review ledger operations; drift reports live standing builder-family mismatches.\n" +
 		"  evidence-gap (FAC-578): lists non-closeable ledger Task values; --with-board also lists in-review cards with no ledger evidence.\n" +
-		"  host-ingest --candidate SHA --reviewer NAME --receipt FILE [--artifact FILE] [--base SHA]: append-only authenticated identity and builder-provenance reconciliation. Host/family come from the receipt chain, not flags.",
+		"  host-ingest --candidate SHA --reviewer NAME --receipt FILE [--artifact FILE] [--base SHA]: append-only authenticated identity and builder-provenance reconciliation. Host/family come from the canonical accepted launch log, not flags or caller JSON.",
 	"drain":           "Usage: herd drain [flags]\n  Drain control / review backlog.",
 	"approve":         "Usage: herd approve [flags]\n  Approve a reviewed candidate.",
 	"feedback":        "Usage: herd feedback [flags]\n  Census fleet-wide control-plane feedback.",

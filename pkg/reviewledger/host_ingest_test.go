@@ -51,6 +51,7 @@ func reachingReceipt(string) LaunchProvenance {
 		BuilderFamily: "openai", Branch: "fix/fac-652-direct",
 		CreatedAt: time.Date(2026, 9, 7, 3, 9, 34, 0, time.UTC),
 		Accepted:  true,
+		Member:    true,
 	}
 }
 
@@ -185,7 +186,7 @@ func TestHostIngestAuthenticatedBuilderFamilyCorrectionPreservesVerdict(t *testi
 		Receipt: LaunchProvenance{
 			Host: "w4-session-pane", Session: "w4-session-pane",
 			BuilderFamily: "openai", Branch: "fix/fac-652-direct",
-			CreatedAt: time.Date(2026, 9, 7, 3, 9, 34, 0, time.UTC), Accepted: true,
+			CreatedAt: time.Date(2026, 9, 7, 3, 9, 34, 0, time.UTC), Accepted: true, Member: true,
 		},
 	})
 	if err != nil {
@@ -218,6 +219,30 @@ func TestHostIngestAuthenticatedBuilderFamilyCorrectionPreservesVerdict(t *testi
 	}
 	if verdicts != 1 {
 		t.Fatalf("correction must not add or rewrite verdicts, got %d", verdicts)
+	}
+}
+
+func TestHostIngestRefusesNonmemberProvenance(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, DefaultPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedLocalGooglePass(t, l, fac652SHA, fac652Rev)
+	before, _ := l.AllRows()
+	p := reachingReceipt(fac652SHA)
+	p.Member = false
+	_, err = l.HostIngest(HostIngestOpts{
+		SHA: fac652SHA, Reviewer: fac652Rev, Task: "FAC-652",
+		CommitTime: fac652CommitTime(), Reaches: reachesFixFac652,
+		Receipt: p,
+	})
+	if err == nil || !strings.Contains(err.Error(), "canonical accepted member") {
+		t.Fatalf("nonmember provenance error = %v", err)
+	}
+	after, _ := l.AllRows()
+	if len(after) != len(before) {
+		t.Fatalf("nonmember ingest mutated history: %d -> %d", len(before), len(after))
 	}
 }
 

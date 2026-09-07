@@ -19,6 +19,10 @@ type LaunchProvenance struct {
 	Branch        string
 	CreatedAt     time.Time
 	Accepted      bool
+	// Member is set only after the proof is an accepted row in the
+	// canonical launch log. Caller JSON and package-local structs are not
+	// membership; CLI must never set this without a log match.
+	Member bool
 }
 
 // HostIngestOpts is the coordinator API for append-only authenticated identity
@@ -77,6 +81,9 @@ func candidUnrecordedFamily(raw string) bool {
 }
 
 func authenticateLaunchProvenance(p LaunchProvenance, sha string, commitTime time.Time, reaches func(branch, sha string) bool) (host, builderFamily string, err error) {
+	if !p.Member {
+		return "", "", fmt.Errorf("launch receipt is not a canonical accepted member")
+	}
 	if !p.Accepted {
 		return "", "", fmt.Errorf("launch receipt is not accepted")
 	}

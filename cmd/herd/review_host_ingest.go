@@ -38,7 +38,7 @@ func parseReviewHostIngestArgs(args []string) (reviewHostIngestArgs, error) {
 		}
 		switch {
 		case a == "--host" || strings.HasPrefix(a, "--host=") || a == "--family" || strings.HasPrefix(a, "--family="):
-			return out, fmt.Errorf("%s is not authentication; host and family must come from the launch receipt chain", strings.SplitN(a, "=", 2)[0])
+			return out, fmt.Errorf("%s is not authentication; host and family must come from the canonical accepted launch log", strings.SplitN(a, "=", 2)[0])
 		case a == "--candidate" || strings.HasPrefix(a, "--candidate="):
 			if strings.HasPrefix(a, "--candidate=") {
 				out.Candidate = strings.TrimSpace(strings.TrimPrefix(a, "--candidate="))
@@ -103,19 +103,45 @@ func parseReviewHostIngestArgs(args []string) (reviewHostIngestArgs, error) {
 	return out, nil
 }
 
-func launchProvenanceFromReceipt(receipt launch.Receipt) (reviewledger.LaunchProvenance, error) {
-	host := reviewledger.HostFromLaunchProof(receipt.ProcessIdentity, receipt.HerdrSession, receipt.PaneID, receipt.CWD, receipt.Worktree)
+func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, reviewer, sha string, commitTime time.Time, reaches func(branch, sha string) bool) (reviewledger.LaunchProvenance, error) {
+	path := launch.ReceiptPathFor(root)
+	members, err := launch.ReadReceipts(path)
+	if err != nil {
+		return reviewledger.LaunchProvenance{}, fmt.Errorf("read canonical launch log: %w", err)
+	}
+	if len(members) == 0 {
+		return reviewledger.LaunchProvenance{}, fmt.Errorf("canonical launch log is missing")
+	}
+	if _, err := launch.AcceptedCanonicalMember(members, locator); err != nil {
+		return reviewledger.LaunchProvenance{}, err
+	}
+	reviewLaunch, err := launch.AcceptedReviewLaunchFor(members, reviewer)
+	if err != nil {
+		return reviewledger.LaunchProvenance{}, err
+	}
+	host := reviewledger.HostFromLaunchProof(reviewLaunch.ProcessIdentity, reviewLaunch.HerdrSession, reviewLaunch.PaneID, reviewLaunch.CWD, reviewLaunch.Worktree)
 	if host == "" {
-		return reviewledger.LaunchProvenance{}, fmt.Errorf("launch receipt does not authenticate a host or session")
+		return reviewledger.LaunchProvenance{}, fmt.Errorf("canonical review launch does not authenticate a host or session")
+	}
+	builder, ok := launch.ReachingBuilderReceipt(path, sha, commitTime, func(branch string) bool {
+		return reaches != nil && reaches(branch, sha)
+	})
+	if !ok {
+		return reviewledger.LaunchProvenance{}, fmt.Errorf("canonical launch log does not authenticate a reaching builder family")
+	}
+	family := strings.TrimSpace(builder.BuilderFamily)
+	if family == "" {
+		return reviewledger.LaunchProvenance{}, fmt.Errorf("canonical launch log does not authenticate a reaching builder family")
 	}
 	return reviewledger.LaunchProvenance{
-		CandidateSHA:  strings.TrimSpace(receipt.CandidateSHA),
+		CandidateSHA:  strings.TrimSpace(sha),
 		Host:          host,
-		Session:       firstNonEmptyCLI(receipt.ProcessIdentity, receipt.HerdrSession, receipt.PaneID),
-		BuilderFamily: strings.TrimSpace(receipt.BuilderFamily),
-		Branch:        strings.TrimSpace(receipt.Branch),
-		CreatedAt:     receipt.CreatedAt,
-		Accepted:      receipt.Accepted,
+		Session:       firstNonEmptyCLI(reviewLaunch.ProcessIdentity, reviewLaunch.HerdrSession, reviewLaunch.PaneID),
+		BuilderFamily: family,
+		Branch:        strings.TrimSpace(builder.Branch),
+		CreatedAt:     builder.CreatedAt,
+		Accepted:      true,
+		Member:        true,
 	}, nil
 }
 
@@ -155,23 +181,25 @@ func runReviewHostIngest(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read launch receipt: %w", err)
 	}
-	var receipt launch.Receipt
-	if err := json.Unmarshal(raw, &receipt); err != nil {
+	var locator launch.Receipt
+	if err := json.Unmarshal(raw, &locator); err != nil {
 		return fmt.Errorf("decode launch receipt: %w", err)
-	}
-	proof, err := launchProvenanceFromReceipt(receipt)
-	if err != nil {
-		return err
 	}
 	root, _, err := gitroot.ProjectRoot(context.Background(), ".")
 	if err != nil {
 		root = "."
 	}
+	commitTime := commitTimeOf(root, parsed.Candidate)
+	reaches := func(branch, sha string) bool { return branchReaches(root, branch, sha) }
+	proof, err := resolveCanonicalLaunchProvenance(root, locator, parsed.Reviewer, parsed.Candidate, commitTime, reaches)
+	if err != nil {
+		return err
+	}
 	opts := reviewledger.HostIngestOpts{
 		SHA: parsed.Candidate, Reviewer: parsed.Reviewer, Receipt: proof,
 		ProductionBase: parsed.ProductionBase,
-		CommitTime:     commitTimeOf(root, parsed.Candidate),
-		Reaches:        func(branch, sha string) bool { return branchReaches(root, branch, sha) },
+		CommitTime:     commitTime,
+		Reaches:        reaches,
 	}
 	if parsed.Artifact != "" {
 		body, err := os.ReadFile(parsed.Artifact)
@@ -194,8 +222,7 @@ func runReviewHostIngest(args []string) error {
 		opts.ReadBase = a.ReadBase
 		opts.ReadHead = a.ReadHead
 	} else {
-		opts.Task = reviewledger.CloseableCardRef(receipt.TaskRef)
-		opts.Branch = receipt.Branch
+		opts.Branch = proof.Branch
 	}
 
 	ledger, err := reviewledger.NewReviewLedger(root, reviewLedgerPath())
