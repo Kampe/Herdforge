@@ -26,12 +26,12 @@ const (
 // Ack is bound to the exact candidate SHA, the reviewer launch identity, and
 // the SHA-256 digest of the admitted artifact bytes.
 type Ack struct {
-	SHA              string `json:"sha"`
-	Reviewer         string `json:"reviewer"`
-	ArtifactDigest   string `json:"artifact_digest"`
-	AdmittedAt       string `json:"admitted_at"`
-	LaunchIdentity   string `json:"launch_identity"`
-	SchemaVersion    int    `json:"schema_version"`
+	SHA            string `json:"sha"`
+	Reviewer       string `json:"reviewer"`
+	ArtifactDigest string `json:"artifact_digest"`
+	AdmittedAt     string `json:"admitted_at"`
+	LaunchIdentity string `json:"launch_identity"`
+	SchemaVersion  int    `json:"schema_version"`
 }
 
 // ConsumeResult is the structured gate a review host must reason over before
@@ -44,10 +44,10 @@ type ConsumeResult struct {
 }
 
 var (
-	ErrMissing      = errors.New("reviewack: acknowledgment missing")
-	ErrMismatch     = errors.New("reviewack: acknowledgment mismatch")
-	ErrAmbiguous    = errors.New("reviewack: acknowledgment ambiguous")
-	ErrStale        = errors.New("reviewack: acknowledgment stale")
+	ErrMissing   = errors.New("reviewack: acknowledgment missing")
+	ErrMismatch  = errors.New("reviewack: acknowledgment mismatch")
+	ErrAmbiguous = errors.New("reviewack: acknowledgment ambiguous")
+	ErrStale     = errors.New("reviewack: acknowledgment stale")
 )
 
 // ArtifactDigest returns the full SHA-256 hex of the verdict artifact bytes.
@@ -152,8 +152,11 @@ func Consume(root, sha, reviewer, wantDigest, launchIdentity string) ConsumeResu
 		}
 	}
 
-	path := Path(root, sha, reviewer)
+	path := ArtifactPath(root, sha, reviewer, wantDigest)
 	body, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		body, err = os.ReadFile(Path(root, sha, reviewer))
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return ConsumeResult{OK: false, Layer: layer, Reason: ErrMissing.Error() + "; canonical ledger admission not acknowledged"}
@@ -190,6 +193,9 @@ func Consume(root, sha, reviewer, wantDigest, launchIdentity string) ConsumeResu
 }
 
 func markConsumed(root string, ack Ack) error {
+	if ack.SchemaVersion == 2 {
+		return publishImmutable(artifactConsumedPath(root, ack.SHA, ack.Reviewer, ack.ArtifactDigest), ack)
+	}
 	dir := filepath.Join(root, ConsumedDirRel)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
