@@ -53,6 +53,13 @@ func (l *LinearProvider) readRetry() RetryPolicy {
 	return l.Retry.normalize()
 }
 
+func (l *LinearProvider) RelationTraversalConcurrency() int {
+	if l == nil || l.BulkConcurrency <= 0 {
+		return DefaultBulkRelationConcurrency
+	}
+	return l.BulkConcurrency
+}
+
 func (l *LinearProvider) httpClient() *http.Client {
 	if l != nil && l.Client != nil {
 		return l.Client

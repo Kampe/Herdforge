@@ -3,6 +3,7 @@ package deps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -65,12 +66,153 @@ type Journal struct {
 	Entries          []JournalEntry `json:"entries"`
 }
 
-const migrationProgressEvery = 10
+const (
+	migrationProgressEvery = 10
 
-// MigrationProgress receives one item as soon as it has been planned. The
-// callback is deliberately per-card so long migrations expose forward
-// progress instead of appearing idle while a project-wide snapshot runs.
+	// DefaultMigrationRequestBudget bounds one exact-ref migration request even
+	// when its caller forgot to provide a deadline. Callers may provide a
+	// shorter deadline; the earlier bound always wins.
+	DefaultMigrationRequestBudget = 20 * time.Second
+	// DefaultMigrationRollbackBudget is independent of the canceled request and
+	// covers the bounded reconcile-read, restore-write, and exact-readback
+	// sequence. It remains below the operator's external request envelope.
+	DefaultMigrationRollbackBudget = 3 * DefaultMigrationRequestBudget
+)
+
+// MigrationActionComponentProgress distinguishes traversal events from the
+// final planned MigrateItem delivered through MigrationProgress.
+const MigrationActionComponentProgress = "component_progress"
+
+// MigrationProgress receives structured component events followed by each
+// final planned item. Project-wide migrations emit final items only.
 type MigrationProgress func(item MigrateItem, processed, total int)
+
+// MigrationComponentProgress is the structured state emitted while an exact
+// relation component is still being traversed. Counts describe unique reads
+// completed successfully; provider retry attempts are not counted as new
+// component members.
+type MigrationComponentProgress struct {
+	Phase            string `json:"phase"`
+	Ref              string `json:"ref"`
+	TasksRead        int    `json:"tasks_read"`
+	RelationSetsRead int    `json:"relation_sets_read"`
+	Pending          int    `json:"pending"`
+	Deadline         string `json:"deadline"`
+}
+
+// MigrationTimeoutError preserves provider timeout classification while
+// naming the exact phase and bounded traversal state that failed.
+type MigrationTimeoutError struct {
+	Phase            string    `json:"phase"`
+	Ref              string    `json:"ref"`
+	TasksRead        int       `json:"tasks_read"`
+	RelationSetsRead int       `json:"relation_sets_read"`
+	Pending          int       `json:"pending"`
+	Deadline         time.Time `json:"deadline"`
+	Cause            error     `json:"-"`
+}
+
+func (e *MigrationTimeoutError) Error() string {
+	if e == nil {
+		return "deps migrate --ref: <nil timeout>"
+	}
+	deadline := "unknown"
+	if !e.Deadline.IsZero() {
+		deadline = e.Deadline.UTC().Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("deps migrate --ref timeout: phase=%s ref=%s tasks=%d relations=%d pending=%d deadline=%s: %v",
+		e.Phase, e.Ref, e.TasksRead, e.RelationSetsRead, e.Pending, deadline, e.Cause)
+}
+
+func (e *MigrationTimeoutError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+type migrationBudgetKey struct{}
+type migrationComponentProgressKey struct{}
+
+func migrationRequestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return WithMigrationRequestBudget(ctx, DefaultMigrationRequestBudget)
+}
+
+// WithMigrationRequestBudget marks an exact migration request with its
+// caller-selected internal budget. The marker prevents nested plan/apply
+// helpers from restarting or shortening the same request deadline.
+func WithMigrationRequestBudget(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if active, _ := ctx.Value(migrationBudgetKey{}).(bool); active {
+		return ctx, func() {}
+	}
+	if budget <= 0 {
+		budget = DefaultMigrationRequestBudget
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, budget)
+	return context.WithValue(requestCtx, migrationBudgetKey{}, true), cancel
+}
+
+// WithMigrationComponentProgress attaches a structured traversal sink. It is
+// used by exact apply, whose final plan callback is intentionally private to
+// the planner but whose component reads must still remain observable.
+func WithMigrationComponentProgress(ctx context.Context, progress func(MigrationComponentProgress)) context.Context {
+	if progress == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, migrationComponentProgressKey{}, progress)
+}
+
+func emitMigrationComponentProgress(ctx context.Context, progress MigrationComponentProgress) {
+	if ctx == nil {
+		return
+	}
+	callback, _ := ctx.Value(migrationComponentProgressKey{}).(func(MigrationComponentProgress))
+	if callback != nil {
+		callback(progress)
+	}
+}
+
+func migrationProgressDeadline(ctx context.Context) string {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline.UTC().Format(time.RFC3339Nano)
+	}
+	return "unknown"
+}
+
+func migrationTimeout(ctx context.Context, phase, ref string, tasksRead, relationSetsRead, pending int, cause error) error {
+	if cause == nil || !provider.IsTimeout(cause) {
+		return cause
+	}
+	var existing *MigrationTimeoutError
+	if errors.As(cause, &existing) {
+		return cause
+	}
+	var deadline time.Time
+	if ctx != nil {
+		deadline, _ = ctx.Deadline()
+	}
+	return &MigrationTimeoutError{
+		Phase:            phase,
+		Ref:              ref,
+		TasksRead:        tasksRead,
+		RelationSetsRead: relationSetsRead,
+		Pending:          pending,
+		Deadline:         deadline,
+		Cause:            cause,
+	}
+}
+
+func migrationComponentItem(progress MigrationComponentProgress) MigrateItem {
+	detail, _ := json.Marshal(progress)
+	return MigrateItem{
+		Ref:    progress.Ref,
+		Action: MigrationActionComponentProgress,
+		Detail: string(detail),
+	}
+}
 
 type scopedSnapshotter interface {
 	SnapshotGraphForTask(context.Context, Ref, TaskID, []DependencyEdge) (*GraphSnapshot, error)
@@ -125,15 +267,25 @@ func PlanMigrationForRefWithProgress(ctx context.Context, store RelationStore, t
 	if !ok {
 		return nil, fmt.Errorf("deps migrate --ref %s: scoped relation snapshot capability required", ref)
 	}
+	ctx, cancel := migrationRequestContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, migrationTimeout(ctx, "resolve", ref, 0, 0, 1, err)
+	}
+	if progress != nil {
+		ctx = WithMigrationComponentProgress(ctx, func(component MigrationComponentProgress) {
+			progress(migrationComponentItem(component), component.TasksRead, component.TasksRead+component.Pending)
+		})
+	}
 
 	task, err := resolveMigrationTask(ctx, tp, projectID, ref, "")
 	if err != nil {
-		return nil, err
+		return nil, migrationTimeout(ctx, "resolve", ref, 0, 0, 1, err)
 	}
 	ctx, _ = WithSnapshotFence(ctx)
 	snap, err := snapshotForTaskMigration(ctx, scoped, task)
 	if err != nil {
-		return nil, fmt.Errorf("deps migrate --ref %s: snapshot: %w", ref, err)
+		return nil, fmt.Errorf("deps migrate --ref %s: snapshot: %w", ref, migrationTimeout(ctx, "relations", ref, 1, 0, 1, err))
 	}
 	plan.ProviderRevision = snap.ProviderRevision
 	item := planOne(task, snap)
@@ -257,23 +409,12 @@ func PlanMigrationWithProgress(ctx context.Context, store RelationStore, tp prov
 }
 
 func snapshotForTaskMigration(ctx context.Context, store scopedSnapshotter, task *provider.Task) (*GraphSnapshot, error) {
-	const maxAttempts = 2
-	var snap *GraphSnapshot
-	var err error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		snap, err = store.SnapshotGraphForTask(migrationScopedContext(ctx), Ref(task.Ref), TaskID(task.ID), nil)
-		if err == nil || provider.ClassifyOpError(err) != provider.OpTimeout || attempt == maxAttempts {
-			return snap, err
-		}
-		timer := time.NewTimer(migrationSnapshotRetryBackoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
+	if resolved, ok := store.(interface {
+		SnapshotGraphForResolvedMigrationTask(context.Context, *provider.Task, []DependencyEdge) (*GraphSnapshot, error)
+	}); ok {
+		return resolved.SnapshotGraphForResolvedMigrationTask(migrationScopedContext(ctx), task, nil)
 	}
-	return snap, err
+	return store.SnapshotGraphForTask(migrationScopedContext(ctx), Ref(task.Ref), TaskID(task.ID), nil)
 }
 
 const migrationSnapshotRetryBackoff = 100 * time.Millisecond
@@ -435,6 +576,14 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 	if writer == nil {
 		return nil, fmt.Errorf("deps migrate apply: DescriptionWriter required (description fences are authority; no sidecar)")
 	}
+	if taskRef != "" {
+		var cancel context.CancelFunc
+		ctx, cancel = migrationRequestContext(ctx)
+		defer cancel()
+		if err := ctx.Err(); err != nil {
+			return nil, migrationTimeout(ctx, "pre-mutation", taskRef, 0, 0, 1, err)
+		}
+	}
 	ctx, _ = WithSnapshotFence(ctx)
 	plan := &MigratePlan{ProjectID: projectID, OK: true, Mode: "apply-description"}
 	var base *MigratePlan
@@ -446,6 +595,9 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 	}
 	if err != nil {
 		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, migrationTimeout(ctx, "pre-mutation", taskRef, len(base.Items), 0, 0, err)
 	}
 	plan.ProviderRevision = base.ProviderRevision
 
@@ -468,7 +620,28 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			fmt.Fprintf(os.Stderr, "herd deps migrate apply: processed %d/%d cards (current=%s)\n", processed, len(base.Items), planned.Ref)
 		}
 		item := planned
+		if err := ctx.Err(); err != nil {
+			return plan, migrationTimeout(ctx, "pre-mutation", item.Ref, processed-1, 0, len(base.Items)-processed+1, err)
+		}
 		if item.Action != "write_empty" && item.Action != "write_from_board" && item.Action != "repair_stale" {
+			plan.Items = append(plan.Items, item)
+			continue
+		}
+		var t *provider.Task
+		var gerr error
+		if taskRef != "" {
+			t, gerr = resolveMigrationTask(ctx, tp, projectID, taskRef, item.TaskID)
+		} else {
+			t, gerr = tp.GetTask(ctx, item.TaskID)
+		}
+		if gerr != nil || t == nil {
+			item.Action = "error"
+			item.Detail = "get task failed"
+			if gerr != nil {
+				item.Detail += ": " + gerr.Error()
+			}
+			plan.OK = false
+			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
 			plan.Items = append(plan.Items, item)
 			continue
 		}
@@ -477,7 +650,7 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		var snap *GraphSnapshot
 		var serr error
 		if scoped, ok := store.(scopedSnapshotter); ok {
-			snap, serr = snapshotForTaskMigration(ctx, scoped, &provider.Task{ID: item.TaskID, Ref: item.Ref})
+			snap, serr = snapshotForTaskMigration(ctx, scoped, t)
 		} else {
 			snap, serr = snapshotForMigration(ctx, store)
 		}
@@ -491,21 +664,6 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		}
 		if plan.ProviderRevision != "" && snap.ProviderRevision != plan.ProviderRevision {
 			item.Detail = "provider revision moved mid-apply; re-planned from fresh snapshot"
-		}
-		t, gerr := tp.GetTask(ctx, item.TaskID)
-		if taskRef != "" {
-			t, gerr = resolveMigrationTask(ctx, tp, projectID, taskRef, item.TaskID)
-		}
-		if gerr != nil || t == nil {
-			item.Action = "error"
-			item.Detail = "get task failed"
-			if gerr != nil {
-				item.Detail += ": " + gerr.Error()
-			}
-			plan.OK = false
-			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
-			plan.Items = append(plan.Items, item)
-			continue
 		}
 		if taskRef != "" {
 			// The exact-ref apply path re-plans from the fresh snapshot rather
@@ -551,6 +709,14 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			plan.Items = append(plan.Items, item)
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			item.Action = "error"
+			item.Detail = migrationTimeout(ctx, "pre-mutation", item.Ref, processed, 0, len(base.Items)-processed, err).Error()
+			plan.OK = false
+			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+			plan.Items = append(plan.Items, item)
+			continue
+		}
 
 		// Journal before-image before mutation.
 		je := JournalEntry{TaskID: t.ID, Ref: t.Ref, BeforeDesc: before}
@@ -564,23 +730,55 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			continue
 		}
 
-		if err := writer.SetDescription(ctx, t.ID, newDesc); err != nil {
-			item.Action = "error"
-			item.Detail = "set description: " + err.Error()
-			plan.OK = false
-			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
-			plan.Items = append(plan.Items, item)
-			continue
+		if setErr := writer.SetDescription(ctx, t.ID, newDesc); setErr != nil {
+			ambiguous := provider.IsTimeout(setErr) || provider.IsAmbiguous(setErr)
+			recovery, recoveryErr := reconcileMigrationDescriptionWrite(ctx, writer, t.ID, before, newDesc, ambiguous)
+			if ambiguous && recovery.Landed && !recovery.RolledBack && recoveryErr == nil {
+				item.Detail = "set description timeout reconciled by exact readback"
+			} else {
+				item.Action = "error"
+				item.Detail = "set description: " + setErr.Error()
+				item.Applied = recovery.Landed
+				if recoveryErr != nil {
+					item.Detail += "; ambiguous-write rollback failed: " + recoveryErr.Error()
+				} else if recovery.RolledBack {
+					item.RolledBack = true
+					journal.Entries[len(journal.Entries)-1].RolledBack = true
+					if jerr := writeJournal(jPath, journal); jerr != nil && taskRef != "" {
+						item.Detail += "; rollback journal: " + jerr.Error()
+					}
+				}
+				plan.OK = false
+				plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+				plan.Items = append(plan.Items, item)
+				continue
+			}
 		}
 		item.Applied = true
 		journal.Entries[len(journal.Entries)-1].AfterDesc = newDesc
 		journal.Entries[len(journal.Entries)-1].AppliedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		if jerr := writeJournal(jPath, journal); jerr != nil && taskRef != "" {
 			item.Detail = "journal applied image: " + jerr.Error()
-			if rbErr := writer.SetDescription(ctx, t.ID, before); rbErr != nil {
+			if rbErr := rollbackMigrationDescription(ctx, writer, t.ID, before); rbErr != nil {
 				item.Detail += "; rollback failed: " + rbErr.Error()
 			} else {
 				item.RolledBack = true
+			}
+			plan.OK = false
+			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+			plan.Items = append(plan.Items, item)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			item.Detail = "post-mutation cancellation: " + migrationTimeout(ctx, "readback", item.Ref, processed, 0, len(base.Items)-processed, err).Error()
+			if rbErr := rollbackMigrationDescription(ctx, writer, t.ID, before); rbErr != nil {
+				item.Detail += "; rollback failed: " + rbErr.Error()
+			} else {
+				item.RolledBack = true
+				journal.Entries[len(journal.Entries)-1].RolledBack = true
+				if jerr := writeJournal(jPath, journal); jerr != nil {
+					item.Detail += "; rollback journal: " + jerr.Error()
+				}
 			}
 			plan.OK = false
 			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
@@ -637,7 +835,7 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		}
 		if !okRB {
 			// Rollback this card from journal before-image.
-			if rbErr := writer.SetDescription(ctx, t.ID, before); rbErr != nil {
+			if rbErr := rollbackMigrationDescription(ctx, writer, t.ID, before); rbErr != nil {
 				item.Detail += "; rollback failed: " + rbErr.Error()
 			} else {
 				item.RolledBack = true
@@ -652,6 +850,70 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		plan.Items = append(plan.Items, item)
 	}
 	return plan, nil
+}
+
+func rollbackMigrationDescription(ctx context.Context, writer DescriptionWriter, taskID, before string) error {
+	_, err := restoreMigrationDescriptionIfChanged(ctx, writer, taskID, before)
+	return err
+}
+
+type migrationWriteRecovery struct {
+	Landed     bool
+	RolledBack bool
+}
+
+func migrationRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), DefaultMigrationRollbackBudget)
+}
+
+func reconcileMigrationDescriptionWrite(ctx context.Context, writer DescriptionWriter, taskID, before, after string, acceptLanded bool) (migrationWriteRecovery, error) {
+	recoveryCtx, cancel := migrationRecoveryContext(ctx)
+	defer cancel()
+
+	current, readErr := writer.GetDescription(recoveryCtx, taskID)
+	recovery := migrationWriteRecovery{Landed: readErr == nil && current == after}
+	requestActive := ctx == nil || ctx.Err() == nil
+	if recovery.Landed && acceptLanded && requestActive {
+		return recovery, nil
+	}
+	if readErr == nil && current == before {
+		return recovery, nil
+	}
+	if err := writer.SetDescription(recoveryCtx, taskID, before); err != nil {
+		return recovery, fmt.Errorf("restore before image: %w", err)
+	}
+	readback, err := writer.GetDescription(recoveryCtx, taskID)
+	if err != nil {
+		return recovery, fmt.Errorf("exact readback: %w", err)
+	}
+	if readback != before {
+		return recovery, fmt.Errorf("exact readback mismatch after rollback")
+	}
+	recovery.RolledBack = true
+	return recovery, nil
+}
+
+func restoreMigrationDescriptionIfChanged(ctx context.Context, writer DescriptionWriter, taskID, before string) (bool, error) {
+	rollbackCtx, cancel := migrationRecoveryContext(ctx)
+	defer cancel()
+	current, readErr := writer.GetDescription(rollbackCtx, taskID)
+	if readErr == nil && current == before {
+		return false, nil
+	}
+	if err := writer.SetDescription(rollbackCtx, taskID, before); err != nil {
+		return false, err
+	}
+	readback, err := writer.GetDescription(rollbackCtx, taskID)
+	if err != nil {
+		return false, fmt.Errorf("exact readback: %w", err)
+	}
+	if readback != before {
+		return false, fmt.Errorf("exact readback mismatch after rollback")
+	}
+	return true, nil
 }
 
 func writeJournal(path string, j Journal) error {
@@ -708,36 +970,34 @@ type KaneoDescriptionWriter struct {
 	Run       func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
-func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, description string) error {
-	run := w.Run
-	if run == nil {
-		run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			res, err := provider.RunCLI(ctx, name, args...)
-			if res == nil {
-				return nil, err
-			}
-			return res.Stdout, err
-		}
+func (w KaneoDescriptionWriter) runner() func(context.Context, string, ...string) ([]byte, error) {
+	if w.Run != nil {
+		return w.Run
 	}
+	return func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		res, err := provider.RunCLI(ctx, name, args...)
+		if res == nil {
+			return nil, err
+		}
+		return res.Stdout, err
+	}
+}
+
+func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, description string) error {
 	args := []string{"task", "description", taskID, description}
 	if strings.TrimSpace(w.ProjectID) != "" {
 		args = append(args, "--project", w.ProjectID)
 	}
-	_, err := run(ctx, "kaneo", args...)
+	_, err := w.runner()(ctx, "kaneo", args...)
 	return err
 }
 
 func (w KaneoDescriptionWriter) GetDescription(ctx context.Context, taskID string) (string, error) {
-	// Caller should use TaskProvider.GetTask; this is a minimal CLI get.
-	run := w.Run
-	if run == nil {
-		return "", fmt.Errorf("kaneo get description: no runner; use TaskProvider.GetTask")
-	}
 	args := []string{"task", "get", taskID, "--json"}
 	if strings.TrimSpace(w.ProjectID) != "" {
 		args = append(args, "--project", w.ProjectID)
 	}
-	out, err := run(ctx, "kaneo", args...)
+	out, err := w.runner()(ctx, "kaneo", args...)
 	if err != nil {
 		return "", err
 	}

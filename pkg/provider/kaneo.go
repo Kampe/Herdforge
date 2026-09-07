@@ -421,6 +421,16 @@ func (k *KaneoProvider) readRetry() RetryPolicy {
 	return k.Retry.normalize()
 }
 
+func (k *KaneoProvider) RelationTraversalConcurrency() int {
+	if k == nil || k.BulkConcurrency <= 0 {
+		return DefaultBulkRelationConcurrency
+	}
+	if k.BulkConcurrency > MaxKaneoGraphConcurrency {
+		return MaxKaneoGraphConcurrency
+	}
+	return k.BulkConcurrency
+}
+
 func (k *KaneoProvider) httpClient() *http.Client {
 	if k != nil && k.Client != nil {
 		return k.Client

@@ -347,6 +347,13 @@ func (b *BoundClient) relationProvider() (RelationProvider, error) {
 	return nil, fmt.Errorf("%w: inner does not implement RelationProvider", errCapability)
 }
 
+func (b *BoundClient) RelationTraversalConcurrency() int {
+	if b == nil {
+		return 1
+	}
+	return ResolveRelationTraversalConcurrency(b.Inner)
+}
+
 // errCapability is a local sentinel for missing relation capability on BoundClient.
 var errCapability = fmt.Errorf("provider relation capability unsupported")
 

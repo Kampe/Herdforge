@@ -34,6 +34,10 @@ func NewMemoryProvider() *MemoryProvider {
 	}
 }
 
+func (m *MemoryProvider) RelationTraversalConcurrency() int {
+	return DefaultBulkRelationConcurrency
+}
+
 func (m *MemoryProvider) ListTaskLabels(_ context.Context, taskID string) ([]TaskLabel, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
