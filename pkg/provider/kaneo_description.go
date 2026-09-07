@@ -98,7 +98,7 @@ func (k *KaneoProvider) readDescriptionOnce(ctx context.Context, taskID string) 
 	if apiURL == "" {
 		return "", fmt.Errorf("kaneo ReadDescription: APIURL required")
 	}
-	endpoint := fmt.Sprintf("%s/api/task/%s", apiURL, url.PathEscape(taskID))
+	endpoint := kaneoTaskResourceURL(k.APIURL, taskID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", err
