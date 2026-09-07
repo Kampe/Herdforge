@@ -1,6 +1,7 @@
 package reviewledger
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -248,7 +249,7 @@ func (l *Ledger) CompleteLaunchProvenance(opts RecordOpts) error {
 // Ingest ensures the matching exact-SHA admission record before persisting a
 // PASS verdict. Provenance validation happens before either row is written;
 // repeating an accepted handoff is idempotent.
-func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
+func (l *Ledger) Ingest(opts IngestOpts) (enqueued bool, err error) {
 	if opts.Retired != nil {
 		if opts.Verdict.Verdict != "" {
 			return false, fmt.Errorf("retirement must not carry a review verdict")
@@ -261,6 +262,12 @@ func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	release, lockErr := lockVerdictMutation(l.Path)
+	if lockErr != nil {
+		return false, lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
 	if opts.Verdict.Reassesses != "" {
 		prior, found, err := l.VerdictForReviewer(opts.Verdict.SHA, opts.Verdict.Reviewer)
 		if err != nil {
@@ -415,6 +422,12 @@ type VerdictOpts struct {
 func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	release, lockErr := lockVerdictMutation(l.Path)
+	if lockErr != nil {
+		return false, lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
 	return l.verdict(opts)
 }
 
@@ -1286,7 +1299,7 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 // keeps a backfill from being a laundering path: it may add evidence about a
 // verdict, it may never change what the verdict SAID. A backfill that could turn
 // a FAIL into a PASS would be far worse than the gap it closes.
-func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL, vfyDigest, lease string) error {
+func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL, vfyDigest, lease string) (err error) {
 	sha = strings.TrimSpace(sha)
 	reviewer = strings.TrimSpace(reviewer)
 	if sha == "" || reviewer == "" {
@@ -1294,6 +1307,12 @@ func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL,
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	release, lockErr := lockVerdictMutation(l.Path)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
 	rows, err := readRows(l.Path)
 	if err != nil {
 		return err
