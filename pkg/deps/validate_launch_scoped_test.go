@@ -18,6 +18,34 @@ type countingScopedStore struct {
 	snap   *GraphSnapshot
 }
 
+type countingTaskProvider struct {
+	*provider.MemoryProvider
+	listTasks atomic.Int64
+}
+
+func (p *countingTaskProvider) ListTasks(ctx context.Context, projectID, status string) ([]*provider.Task, error) {
+	p.listTasks.Add(1)
+	return p.MemoryProvider.ListTasks(ctx, projectID, status)
+}
+
+func TestProviderStoreScopedLaunchSkipsProjectHydration(t *testing.T) {
+	tp := &countingTaskProvider{MemoryProvider: provider.NewMemoryProvider()}
+	tp.AddTask(&provider.Task{ID: "task-1", Ref: "FAC-1", ProjectID: "project-1", Status: provider.StatusToDo})
+	store := NewProviderStore(tp, "project-1")
+	des := EmptyProvenanceBound("FAC-1", "task-1")
+
+	gr, err := RequireTaskLaunch(WithMigrationScopedContext(context.Background()), store, EntryDispatch, "FAC-1", des, "")
+	if err != nil {
+		t.Fatalf("scoped launch should succeed: %v", err)
+	}
+	if gr == nil || !gr.OK {
+		t.Fatalf("want OK gate result, got %+v", gr)
+	}
+	if got := tp.listTasks.Load(); got != 0 {
+		t.Fatalf("scoped launch hydrated %d project task lists", got)
+	}
+}
+
 func (c *countingScopedStore) SnapshotGraph(ctx context.Context) (*GraphSnapshot, error) {
 	c.bulk.Add(1)
 	return c.MemoryStore.SnapshotGraph(ctx)

@@ -152,7 +152,11 @@ func runDepsCheck() {
 	gr, launchDiag, err := provider.BoundedRead(context.Background(), providerLabel(cfg), budget, "",
 		func(ctx context.Context, ph *provider.Phases) (*deps.GateResult, error) {
 			ph.Enter("RequireTaskLaunch " + ref)
-			return deps.RequireTaskLaunch(ctx, store, ep, deps.Ref(ref), desired, "")
+			// The task was already resolved by the exact GetTask above. Keep the
+			// launch gate on that same scoped authority so it does not hydrate the
+			// entire project before reading the task's component. Identity and live
+			// status checks remain mandatory inside ValidateLaunch.
+			return deps.RequireTaskLaunch(deps.WithMigrationScopedContext(ctx), store, ep, deps.Ref(ref), desired, "")
 		})
 	var semanticBlocker *deps.BlockedError
 	if gr != nil && errors.As(err, &semanticBlocker) && semanticBlocker.Code == "open_blocker" {

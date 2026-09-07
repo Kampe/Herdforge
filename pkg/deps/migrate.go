@@ -224,6 +224,14 @@ func migrationScopedContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, migrationScopedSnapshotKey{}, true)
 }
 
+// WithMigrationScopedContext marks an exact-ref launch check as already
+// resolved by the provider's task-scoped authority. It is intentionally
+// exported for the CLI seam; it does not weaken identity, status, relation,
+// or TOCTOU validation.
+func WithMigrationScopedContext(ctx context.Context) context.Context {
+	return migrationScopedContext(ctx)
+}
+
 func migrationScopedSnapshot(ctx context.Context) bool {
 	if ctx == nil {
 		return false

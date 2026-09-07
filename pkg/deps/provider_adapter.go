@@ -175,15 +175,22 @@ func (s *ProviderStore) ResolveRef(ctx context.Context, ref Ref) (TaskID, error)
 }
 
 func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID, error) {
-	if err := s.hydrateFresh(ctx); err != nil {
-		return "", "", err
-	}
-	s.mu.Lock()
 	id := string(ref)
-	if t, ok := s.refCache[string(ref)]; ok {
-		id = t.ID
+	if !migrationScopedSnapshot(ctx) {
+		s.mu.Lock()
+		if t, ok := s.refCache[string(ref)]; ok {
+			id = t.ID
+		}
+		s.mu.Unlock()
+		if err := s.hydrateFresh(ctx); err != nil {
+			return "", "", err
+		}
+		s.mu.Lock()
+		if t, ok := s.refCache[string(ref)]; ok {
+			id = t.ID
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	// Fresh Get outside lock — live status for Done check (not a full re-list).
 	fresh, err := s.TP.GetTask(ctx, id)
