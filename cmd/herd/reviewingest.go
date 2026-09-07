@@ -1043,6 +1043,8 @@ func runHarvestMerge() {
 	verifyAuthorIdentity := fs.String("author-identity", "", "Builder session identity")
 	verifyProviderRev := fs.String("provider-revision", "", "Board card revision the reviewer bound")
 	verifyPR := fs.Int("pr", 0, "Pull request number for reduced-provenance verify-landed reconciliation")
+	reconstructionBase := fs.String("reconstruction-base", "", "Exact base of attested reconstructed content for receipt reconciliation")
+	reconstructionDigest := fs.String("reconstruction-digest", "", "Digest of the retained reconstruction ledger event")
 
 	// Pull the leading positional out BEFORE flag parsing: Go's flag package
 	// stops at the first non-flag argument, so `harvest-merge <lane> --branch x`
@@ -1068,8 +1070,9 @@ func runHarvestMerge() {
 			BaseSHA: *verifyBaseSHA, Lease: *verifyLease, LeaseGeneration: *verifyLeaseGen,
 			PatchID: *verifyPatchID, AcceptanceDigest: *verifyAcceptance,
 			AuthorFamily: *verifyAuthorFamily, AuthorIdentity: *verifyAuthorIdentity,
-			ProviderRevision: *verifyProviderRev,
-			PullRequest:      *verifyPR,
+			ProviderRevision:  *verifyProviderRev,
+			PullRequest:       *verifyPR,
+			ReconstructionSHA: *reconstructedFrom, ReconstructionBase: *reconstructionBase, ReconstructionDigest: *reconstructionDigest,
 		}
 		if err := runHarvestVerifyLanded(*branch, binding); err != nil {
 			fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", err)
@@ -1704,12 +1707,13 @@ func min(a, b int) int {
 // sealed completion receipt after LandedProof. Prefer a recorded merge-admission
 // for --ref; otherwise every field must be supplied explicitly.
 type verifyLandedBinding struct {
-	Ref, TaskID, Candidate, BaseSHA  string
-	Lease, PatchID, AcceptanceDigest string
-	AuthorFamily, AuthorIdentity     string
-	ProviderRevision                 string
-	PullRequest                      int
-	LeaseGeneration                  int64
+	ReconstructionSHA, ReconstructionBase, ReconstructionDigest string
+	Ref, TaskID, Candidate, BaseSHA                             string
+	Lease, PatchID, AcceptanceDigest                            string
+	AuthorFamily, AuthorIdentity                                string
+	ProviderRevision                                            string
+	PullRequest                                                 int
+	LeaseGeneration                                             int64
 }
 
 // runHarvestVerifyLanded proves the branch content is on origin/main, then
@@ -1796,6 +1800,9 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 	}
 
 	if rec, err := readAdmissionRecord(".", ref); err == nil {
+		if binding.ReconstructionSHA != "" || binding.ReconstructionBase != "" || binding.ReconstructionDigest != "" {
+			return mergeadmit.Request{}, fmt.Errorf("reconstruction cannot replace an existing full merge admission")
+		}
 		req := rec.Request
 		if strings.TrimSpace(req.CandidateSHA) == "" {
 			req.CandidateSHA = candidate
@@ -1812,6 +1819,12 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 		BaseSHA: binding.BaseSHA, Lease: binding.Lease, LeaseGeneration: binding.LeaseGeneration,
 		PatchURL: binding.PatchID, AuthorFamily: binding.AuthorFamily,
 		AuthorIdentity: binding.AuthorIdentity, Mode: mergeadmit.ModeRebase,
+	}
+	if binding.ReconstructionSHA != "" || binding.ReconstructionBase != "" || binding.ReconstructionDigest != "" {
+		req.Reconstruction = &mergeadmit.ReconstructionBinding{SHA: binding.ReconstructionSHA, BaseSHA: binding.ReconstructionBase, AttestationDigest: binding.ReconstructionDigest}
+		if binding.PullRequest <= 0 {
+			return req, fmt.Errorf("reconstruction reconciliation requires --pr and reduced provenance admission")
+		}
 	}
 	if binding.PullRequest > 0 {
 		req.ReducedProvenance = &mergeadmit.ReducedProvenance{PullRequest: binding.PullRequest, VerifyLanded: true}

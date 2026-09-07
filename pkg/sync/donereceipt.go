@@ -52,52 +52,58 @@ const ProvenanceReduced = "reduced"
 // DoneRecord.ProviderReadback, and a write whose readback does not say "done"
 // is a hard failure (see BoardDone).
 type CompletionReceipt struct {
-	Version            int    `json:"version"`
-	RepoID             string `json:"repo_id"`
-	TaskRef            string `json:"task_ref"`
-	TaskID             string `json:"task_id"`
-	ProviderRevision   string `json:"provider_revision"`
-	LeaseGeneration    int64  `json:"lease_generation"`
-	BaseSHA            string `json:"base_sha"`
-	CandidateSHA       string `json:"candidate_sha"`
-	MergeSHA           string `json:"merge_sha"`
-	PatchID            string `json:"patch_id"`
-	AcceptanceDigest   string `json:"acceptance_digest"`
-	AcceptanceEvidence string `json:"acceptance_evidence,omitempty"`
-	VerificationDigest string `json:"verification_digest"`
-	RiskTier           string `json:"risk_tier"`
-	AuthorFamily       string `json:"author_family"`
-	ReviewerFamily     string `json:"reviewer_family"`
-	Verdict            string `json:"verdict"`
-	IntegrationResult  string `json:"integration_result"`
-	ProvenanceMode     string `json:"provenance_mode,omitempty"`
-	PullRequest        int    `json:"pull_request,omitempty"`
-	Digest             string `json:"digest"`
+	Version               int    `json:"version"`
+	RepoID                string `json:"repo_id"`
+	TaskRef               string `json:"task_ref"`
+	TaskID                string `json:"task_id"`
+	ProviderRevision      string `json:"provider_revision"`
+	LeaseGeneration       int64  `json:"lease_generation"`
+	BaseSHA               string `json:"base_sha"`
+	CandidateSHA          string `json:"candidate_sha"`
+	MergeSHA              string `json:"merge_sha"`
+	PatchID               string `json:"patch_id"`
+	AcceptanceDigest      string `json:"acceptance_digest"`
+	AcceptanceEvidence    string `json:"acceptance_evidence,omitempty"`
+	VerificationDigest    string `json:"verification_digest"`
+	RiskTier              string `json:"risk_tier"`
+	AuthorFamily          string `json:"author_family"`
+	ReviewerFamily        string `json:"reviewer_family"`
+	Verdict               string `json:"verdict"`
+	IntegrationResult     string `json:"integration_result"`
+	ProvenanceMode        string `json:"provenance_mode,omitempty"`
+	PullRequest           int    `json:"pull_request,omitempty"`
+	ReconstructedSHA      string `json:"reconstructed_sha,omitempty"`
+	ReconstructionBaseSHA string `json:"reconstruction_base_sha,omitempty"`
+	ReconstructionDigest  string `json:"reconstruction_digest,omitempty"`
+	Digest                string `json:"digest"`
 }
 
 // receiptForDigest is the canonical digest pre-image: every field except
 // Digest itself, in declaration order.
 type receiptForDigest struct {
-	Version            int    `json:"version"`
-	RepoID             string `json:"repo_id"`
-	TaskRef            string `json:"task_ref"`
-	TaskID             string `json:"task_id"`
-	ProviderRevision   string `json:"provider_revision"`
-	LeaseGeneration    int64  `json:"lease_generation"`
-	BaseSHA            string `json:"base_sha"`
-	CandidateSHA       string `json:"candidate_sha"`
-	MergeSHA           string `json:"merge_sha"`
-	PatchID            string `json:"patch_id"`
-	AcceptanceDigest   string `json:"acceptance_digest"`
-	AcceptanceEvidence string `json:"acceptance_evidence,omitempty"`
-	VerificationDigest string `json:"verification_digest"`
-	RiskTier           string `json:"risk_tier"`
-	AuthorFamily       string `json:"author_family"`
-	ReviewerFamily     string `json:"reviewer_family"`
-	Verdict            string `json:"verdict"`
-	IntegrationResult  string `json:"integration_result"`
-	ProvenanceMode     string `json:"provenance_mode,omitempty"`
-	PullRequest        int    `json:"pull_request,omitempty"`
+	Version               int    `json:"version"`
+	RepoID                string `json:"repo_id"`
+	TaskRef               string `json:"task_ref"`
+	TaskID                string `json:"task_id"`
+	ProviderRevision      string `json:"provider_revision"`
+	LeaseGeneration       int64  `json:"lease_generation"`
+	BaseSHA               string `json:"base_sha"`
+	CandidateSHA          string `json:"candidate_sha"`
+	MergeSHA              string `json:"merge_sha"`
+	PatchID               string `json:"patch_id"`
+	AcceptanceDigest      string `json:"acceptance_digest"`
+	AcceptanceEvidence    string `json:"acceptance_evidence,omitempty"`
+	VerificationDigest    string `json:"verification_digest"`
+	RiskTier              string `json:"risk_tier"`
+	AuthorFamily          string `json:"author_family"`
+	ReviewerFamily        string `json:"reviewer_family"`
+	Verdict               string `json:"verdict"`
+	IntegrationResult     string `json:"integration_result"`
+	ProvenanceMode        string `json:"provenance_mode,omitempty"`
+	PullRequest           int    `json:"pull_request,omitempty"`
+	ReconstructedSHA      string `json:"reconstructed_sha,omitempty"`
+	ReconstructionBaseSHA string `json:"reconstruction_base_sha,omitempty"`
+	ReconstructionDigest  string `json:"reconstruction_digest,omitempty"`
 }
 
 // ComputeDigest returns SHA-256 over the canonical JSON form of the receipt
@@ -113,6 +119,7 @@ func (r CompletionReceipt) ComputeDigest() string {
 		AuthorFamily: r.AuthorFamily, ReviewerFamily: r.ReviewerFamily,
 		Verdict: r.Verdict, IntegrationResult: r.IntegrationResult,
 		ProvenanceMode: r.ProvenanceMode, PullRequest: r.PullRequest,
+		ReconstructedSHA: r.ReconstructedSHA, ReconstructionBaseSHA: r.ReconstructionBaseSHA, ReconstructionDigest: r.ReconstructionDigest,
 	})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -148,6 +155,12 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 		return fmt.Errorf("receipt digest does not match its contents (tampered or hand-edited)")
 	}
 
+	if r.ReconstructedSHA != "" || r.ReconstructionBaseSHA != "" || r.ReconstructionDigest != "" {
+		proof, err := hex.DecodeString(r.ReconstructionDigest)
+		if r.ProvenanceMode != ProvenanceReduced || !fullSHA.MatchString(r.ReconstructedSHA) || !fullSHA.MatchString(r.ReconstructionBaseSHA) || err != nil || len(proof) != 32 {
+			return fmt.Errorf("receipt reconstruction binding is incomplete")
+		}
+	}
 	ref = NormalizeRef(ref)
 	if !strings.EqualFold(NormalizeRef(r.TaskRef), ref) {
 		return fmt.Errorf("receipt is bound to %s, not %s", r.TaskRef, ref)

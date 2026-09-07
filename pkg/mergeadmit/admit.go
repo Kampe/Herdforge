@@ -77,6 +77,7 @@ type Request struct {
 	// RemoteCI is the exact candidate, policy, repository, and attempt-bound
 	// settlement that policy requires before a local admission may proceed.
 	RemoteCI          *remoteci.Settlement
+	Reconstruction    *ReconstructionBinding
 	ReducedProvenance *ReducedProvenance
 }
 
@@ -356,4 +357,11 @@ func sameSHA(a, b string) bool {
 		return false
 	}
 	return strings.HasPrefix(b, a)
+}
+
+// ReconstructionBinding explicitly pins content separately from review consent.
+type ReconstructionBinding struct {
+	SHA               string
+	BaseSHA           string
+	AttestationDigest string
 }
