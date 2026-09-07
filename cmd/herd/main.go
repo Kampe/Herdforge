@@ -7887,15 +7887,21 @@ func runLocked(child []string, lockdir string) int {
 //	herd review-ledger drift                — report standing builder-family drift
 //	herd review-ledger evidence-gap         — FAC-578 non-closable tasks + in-review holes
 func runReviewLedger() {
-	ledgerPath := reviewLedgerPath()
-	l, err := reviewledger.NewReviewLedger(".", ledgerPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
-		os.Exit(1)
-	}
 	mode := "list"
 	if len(os.Args) > 2 {
 		mode = os.Args[2]
+	}
+	ledgerPath := reviewLedgerPath()
+	var l *reviewledger.Ledger
+	var err error
+	if mode == "verdict-digest" || mode == "reconstruction-digest" {
+		l, err = reviewledger.NewReadOnlyReviewLedger(".", ledgerPath)
+	} else {
+		l, err = reviewledger.NewReviewLedger(".", ledgerPath)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "review-ledger: %v\n", err)
+		os.Exit(1)
 	}
 	switch mode {
 	case "evidence-gap":
