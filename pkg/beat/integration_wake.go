@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +21,8 @@ type IntegrationAction struct {
 	PullRequest  int    `json:"pull_request"`
 	Task         string `json:"task"`
 	Owner        string `json:"owner"`
+	Target       string `json:"target"`
+	Session      string `json:"session"`
 	Action       string `json:"action"`
 }
 
@@ -30,7 +31,7 @@ func (a IntegrationAction) validate() error {
 	if err != nil || len(raw) != 20 || a.PullRequest <= 0 {
 		return fmt.Errorf("integration wake requires an exact SHA and positive PR")
 	}
-	if strings.TrimSpace(a.Owner) == "" || strings.TrimSpace(a.Task) == "" || strings.TrimSpace(a.Action) == "" {
+	if strings.TrimSpace(a.Target) == "" || strings.TrimSpace(a.Session) == "" || strings.TrimSpace(a.Owner) == "" || strings.TrimSpace(a.Task) == "" || strings.TrimSpace(a.Action) == "" {
 		return fmt.Errorf("integration wake requires task, owner and executable action")
 	}
 	return nil
@@ -176,11 +177,12 @@ func ReconcileIntegrationWakes(ctx context.Context, path string, ready []Integra
 		if err := saveIntegrationState(path, state); err != nil {
 			return err
 		}
-		keys := make([]string, 0, len(state.Wakes))
-		for sha := range state.Wakes {
-			keys = append(keys, sha)
+		// Preserve the caller's canonical priority/ref order; do not replace it
+		// with SHA order or duplicate the provider's priority policy here.
+		keys := make([]string, 0, len(ready))
+		for _, action := range ready {
+			keys = append(keys, action.CandidateSHA)
 		}
-		sort.Strings(keys)
 		var problems []error
 		for _, sha := range keys {
 			w := state.Wakes[sha]

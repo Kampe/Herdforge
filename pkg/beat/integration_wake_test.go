@@ -6,12 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func integrationFixture() IntegrationAction {
-	return IntegrationAction{CandidateSHA: strings.Repeat("a", 40), PullRequest: 123, Task: "FAC-599", Owner: "coordinator", Action: "Run normal integration admission for the exact candidate and PR 123"}
+	return IntegrationAction{CandidateSHA: strings.Repeat("a", 40), PullRequest: 123, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "terminal-1", Action: "Run normal integration admission for the exact candidate and PR 123"}
 }
 
 func TestIntegrationWakeReplacesPerCandidateAndRejectsDelayedAck(t *testing.T) {
@@ -107,11 +108,13 @@ func TestIntegrationWakeInvalidSnapshotPreservesPriorState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, bad := range []IntegrationAction{
-		{CandidateSHA: a.CandidateSHA, PullRequest: 123, Task: a.Task, Owner: a.Owner},
-		{CandidateSHA: a.CandidateSHA, PullRequest: 123, Task: a.Task, Action: a.Action},
-		{CandidateSHA: "abc", PullRequest: 123, Task: a.Task, Owner: a.Owner, Action: a.Action},
-	} {
+	badAction, badOwner, badSHA, badTarget, badSession := a, a, a, a, a
+	badAction.Action = ""
+	badOwner.Owner = ""
+	badSHA.CandidateSHA = "abc"
+	badTarget.Target = ""
+	badSession.Session = ""
+	for _, bad := range []IntegrationAction{badAction, badOwner, badSHA, badTarget, badSession} {
 		if _, err := ReconcileIntegrationWakes(context.Background(), path, []IntegrationAction{bad}, now, time.Minute, send); err == nil {
 			t.Fatalf("accepted invalid action: %+v", bad)
 		}
@@ -145,5 +148,58 @@ func TestIntegrationWakeCorruptStateIsNotAnEmptyQueue(t *testing.T) {
 				t.Fatal("corrupt evidence overwritten", readErr)
 			}
 		})
+	}
+}
+
+func TestIntegrationWakeConcurrentBeatsDeliverOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wakes.json")
+	now := time.Now().UTC()
+	action := integrationFixture()
+	var calls atomic.Int32
+	start := make(chan struct{})
+	results := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() {
+			<-start
+			_, err := ReconcileIntegrationWakes(context.Background(), path, []IntegrationAction{action}, now, time.Minute, func(context.Context, IntegrationWake) error { calls.Add(1); return nil })
+			results <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < 8; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("concurrent beats sent %d times", calls.Load())
+	}
+}
+
+func TestIntegrationWakeCancellationCannotDeliver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wakes.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	_, err := ReconcileIntegrationWakes(ctx, path, []IntegrationAction{integrationFixture()}, time.Now(), time.Minute, func(context.Context, IntegrationWake) error { called = true; return nil })
+	if !errors.Is(err, context.Canceled) || called {
+		t.Fatalf("cancelled beat delivered: %v called=%t", err, called)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("cancelled beat wrote state", err)
+	}
+}
+
+func TestIntegrationWakePreservesCanonicalAdmissionOrder(t *testing.T) {
+	a := integrationFixture()
+	b := a
+	a.CandidateSHA = strings.Repeat("f", 40)
+	a.Task = "FAC-2"
+	b.CandidateSHA = strings.Repeat("a", 40)
+	b.Task = "FAC-10"
+	var sent []string
+	_, err := ReconcileIntegrationWakes(context.Background(), filepath.Join(t.TempDir(), "wakes.json"), []IntegrationAction{a, b}, time.Now(), time.Minute, func(_ context.Context, w IntegrationWake) error { sent = append(sent, w.Task); return nil })
+	if err != nil || len(sent) != 2 || sent[0] != "FAC-2" || sent[1] != "FAC-10" {
+		t.Fatalf("caller priority/ref order changed: %v %v", err, sent)
 	}
 }

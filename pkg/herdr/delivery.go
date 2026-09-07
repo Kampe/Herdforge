@@ -186,6 +186,11 @@ func waitForOperatorConsumptionText(ctx context.Context, key, target, session, b
 		textdelivery.ErrDurableAmbiguous, key, baseline, last, payloadSHA)
 }
 
+// OperatorDeliveryStatePath is the shared durable prompt receipt authority.
+func OperatorDeliveryStatePath(root string) string {
+	return filepath.Join(root, ".herd", "herdr-delivery.db")
+}
+
 // DeliverOperator opens the shared receipt authority, reserves the exact
 // direct-argv intent, invokes herdr with the payload as TEXT, and completes
 // only after ConsumptionProvenSeen holds.
@@ -206,7 +211,7 @@ func deliverOperator(ctx context.Context, d OperatorDelivery, executor textdeliv
 		return DeliveryProof{}, errors.New("herdr delivery: executor is required")
 	}
 	if d.StatePath == "" {
-		d.StatePath = filepath.Join(".herd", "herdr-delivery.db")
+		d.StatePath = OperatorDeliveryStatePath(".")
 	}
 	store, err := outbox.NewStore(d.StatePath)
 	if err != nil {

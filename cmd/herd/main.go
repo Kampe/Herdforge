@@ -354,6 +354,11 @@ func main() {
 	case "send":
 		runSend()
 
+	case "integration-wake":
+		if err := runIntegrationWakeAck(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "herdr-deliver":
 		runHerdrDeliver()
 
@@ -4475,7 +4480,7 @@ func runHerdrDeliver() {
 	session := fs.String("session", "", "optional session provenance")
 	wait := fs.Bool("wait", false, "ask herdr to wait for a working state")
 	file := fs.String("file", "", "read exact prompt bytes from this file")
-	state := fs.String("state", ".herd/herdr-delivery.db", "shared SQLite receipt authority path")
+	state := fs.String("state", herdr.OperatorDeliveryStatePath("."), "shared SQLite receipt authority path")
 	deliveryTimeout := fs.Int("timeout", 30, "seconds to wait for consumption proof")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		os.Exit(2)
@@ -11597,7 +11602,12 @@ func forgeLoopMain() int {
 	// FAC-222: register the coordinator as a named agent so dispatched packets
 	// carry a reply address and agents report completion/BLOCKED to it instead
 	// of relying on the coordinator to notice by polling.
-	coordReg, regErr := coordinator.Register(".", *coordName, forgeWorkspace)
+	forgeControlRoot, rootErr := canonicalHerdRoot()
+	if rootErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control root: %v\n", rootErr)
+		return 1
+	}
+	coordReg, regErr := coordinator.Register(forgeControlRoot, *coordName, forgeWorkspace)
 	if regErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator registration failed: %v\n", regErr)
 		return 1
@@ -11615,7 +11625,7 @@ func forgeLoopMain() int {
 	} else {
 		fmt.Printf("herd forge --loop: coordinator broker serving %s\n", brokerSock)
 	}
-	if _, bindErr := bindCoordinatorControlTab(".", forgeWorkspace); bindErr != nil {
+	if _, bindErr := bindCoordinatorControlTab(forgeControlRoot, forgeWorkspace); bindErr != nil {
 		fmt.Fprintf(os.Stderr, "forge --loop: coordinator control binding failed: %v\n", bindErr)
 		return 1
 	}
@@ -11682,6 +11692,7 @@ func forgeLoopMain() int {
 		// the operator clearly intended when they asked not to loop.
 		MaxTicks:               effectiveMaxTicks(*loopMode, *ticks),
 		StopEmpty:              *stopEmpty,
+		IntegrationWakes:       func(ctx context.Context) error { return runForgeIntegrationWakes(ctx, cfg, tp) },
 		Feedback:               feedbackRunner,
 		FeedbackInterval:       feedbackInterval,
 		ApproveSuppressionPath: ".herd/forge-approve-suppressions.json",

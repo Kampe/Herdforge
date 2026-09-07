@@ -70,6 +70,10 @@ type ForgeLoopOptions struct {
 	MaxTicks  int           // 0 = run until ctx cancelled or board drained
 	StopEmpty bool          // stop once the board is clear and no lane is busy
 
+	// IntegrationWakes dispatches exact ready-candidate prompts each tick. A
+	// failure remains an explicit failed transition until a later tick recovers.
+	IntegrationWakes func(ctx context.Context) error
+
 	// Feedback is the periodic fleet-wide census runner (FAC-222). When set,
 	// the loop calls it every FeedbackInterval ticks so a lane that goes quiet
 	// is REPORTED rather than discovered by polling. A nil Feedback preserves
@@ -216,6 +220,9 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 				d.Log(fmt.Sprintf("forge: control reconciliation failed: %v", err))
 				return fmt.Errorf("forge: control reconciliation failed before lane/board actions: %w", err)
 			}
+		}
+		if opts.IntegrationWakes != nil {
+			act("integration-wake", "", func() error { return opts.IntegrationWakes(ctx) })
 		}
 		// Periodic reconciliation is the safety net for lost callbacks.
 		observe()

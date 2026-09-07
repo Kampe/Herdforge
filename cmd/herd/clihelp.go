@@ -168,6 +168,8 @@ Outcomes:
 
 Use herd mail send for durable mailbox delivery; it is not surfaced in the recipient pane.
 Prefer herdr-deliver for durable digests.`,
+	"integration-wake": `Usage: herd integration-wake --candidate <sha> --generation <n>
+  Acknowledge handling one delivered integration wake. This neither merges nor closes a card.`,
 	"herdr-deliver": `Usage: herd herdr-deliver --key <op> --generation <n> --target <name> [--session <id>] [--file path] [--wait] [--timeout s] [--state path]
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,
