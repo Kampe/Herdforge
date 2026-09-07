@@ -261,6 +261,19 @@ func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if opts.Verdict.Reassesses != "" {
+		prior, found, err := l.VerdictForReviewer(opts.Verdict.SHA, opts.Verdict.Reviewer)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, fmt.Errorf("reassessment prior verdict not found")
+		}
+		replay, err := CheckReassessment(prior, opts.Verdict)
+		if err != nil || replay {
+			return false, err
+		}
+	}
 	if err := l.ensureRecord(opts.Record); err != nil {
 		return false, err
 	}
@@ -378,6 +391,8 @@ type TierReport struct {
 
 // VerdictOpts carries fields for Verdict.
 type VerdictOpts struct {
+	Reassesses     string
+	ArtifactDigest string
 	SHA            string
 	Reviewer       string
 	Verdict        Verdict
@@ -416,10 +431,23 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	for _, r := range rows {
+	found := false
+	for i := len(rows) - 1; i >= 0; i-- {
+		r := rows[i]
 		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer {
-			return false, nil
+			found = true
+			if opts.Reassesses == "" {
+				return false, nil
+			}
+			replay, err := CheckReassessment(r, opts)
+			if err != nil || replay {
+				return false, err
+			}
+			break
 		}
+	}
+	if opts.Reassesses != "" && !found {
+		return false, fmt.Errorf("reassessment prior verdict not found")
 	}
 	if opts.Verdict == VerdictPASS && strings.TrimSpace(opts.RetryOf) != "" {
 		if err := l.appendRow(l.Path, &LedgerRow{
@@ -432,7 +460,8 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	}
 
 	row := &LedgerRow{
-		Event:              string(EventVerdict),
+		Event:      string(EventVerdict),
+		Reassesses: opts.Reassesses, ArtifactDigest: opts.ArtifactDigest,
 		SHA:                opts.SHA,
 		Reviewer:           opts.Reviewer,
 		Verdict:            string(opts.Verdict),
