@@ -149,15 +149,27 @@ func BuilderFamilyForBranch(path, branch string) (string, bool) {
 // receipt with no timestamp, cannot be ordered and so is not provenance --
 // unknown must never read as proven.
 func BuilderFamilyReachingSHA(path, sha string, commitTime time.Time, reaches func(branch string) bool) (string, bool) {
-	if strings.TrimSpace(sha) == "" || reaches == nil || commitTime.IsZero() {
+	r, ok := ReachingBuilderReceipt(path, sha, commitTime, reaches)
+	if !ok {
 		return "", false
+	}
+	return strings.TrimSpace(r.BuilderFamily), true
+}
+
+// ReachingBuilderReceipt returns the latest accepted receipt whose branch
+// reaches sha and whose CreatedAt predates commitTime. The locator JSON is
+// not this proof; only the canonical log is.
+func ReachingBuilderReceipt(path, sha string, commitTime time.Time, reaches func(branch string) bool) (Receipt, bool) {
+	if strings.TrimSpace(sha) == "" || reaches == nil || commitTime.IsZero() {
+		return Receipt{}, false
 	}
 	receipts, err := ReadReceipts(path)
 	if err != nil {
-		return "", false
+		return Receipt{}, false
 	}
-	family := ""
-	var best time.Time
+	var best Receipt
+	var bestTime time.Time
+	found := false
 	for _, r := range receipts {
 		if !r.Accepted {
 			continue
@@ -170,13 +182,13 @@ func BuilderFamilyReachingSHA(path, sha string, commitTime time.Time, reaches fu
 		if r.CreatedAt.After(commitTime) {
 			continue
 		}
-		if !best.IsZero() && r.CreatedAt.Before(best) {
+		if found && r.CreatedAt.Before(bestTime) {
 			continue
 		}
 		if !reaches(branch) {
 			continue
 		}
-		family, best = fam, r.CreatedAt
+		best, bestTime, found = r, r.CreatedAt, true
 	}
-	return family, family != ""
+	return best, found
 }
