@@ -297,6 +297,24 @@ func addCandidatePass(t *testing.T, l *reviewledger.Ledger, sha, branch string) 
 	}
 }
 
+func addHostLabelledPass(t *testing.T, l *reviewledger.Ledger, sha, branch, host, reviewer, reviewerFamily, builderFamily string) {
+	t.Helper()
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Branch: branch, Reviewer: reviewer, Host: host,
+		BuilderFamily: builderFamily, ReviewerFamily: reviewerFamily,
+		Gate: "independent", Tier: "R2", Task: "FAC-765",
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Branch: branch, Reviewer: reviewer, Host: host,
+		Verdict: reviewledger.VerdictPASS, ReviewerFamily: reviewerFamily,
+		BuilderFamily: builderFamily, Task: "FAC-765", CandidateSHA: sha,
+	}); err != nil {
+		t.Fatalf("verdict: %v", err)
+	}
+}
+
 func writeCandidateFile(t *testing.T, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(name, []byte(content), 0o644); err != nil {

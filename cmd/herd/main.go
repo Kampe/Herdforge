@@ -7885,6 +7885,11 @@ func runReviewLedger() {
 			fmt.Fprintf(os.Stderr, "review-ledger: encode tier report: %v\n", err)
 			os.Exit(1)
 		}
+	case "host-ingest":
+		if err := runReviewHostIngest(os.Args[3:]); err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger host-ingest: %v\n", err)
+			os.Exit(1)
+		}
 	case "backfill":
 		if err := runLedgerBackfill(os.Args[3:]); err != nil {
 			fmt.Fprintf(os.Stderr, "review-ledger backfill: %v\n", err)

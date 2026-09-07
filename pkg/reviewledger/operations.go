@@ -17,6 +17,7 @@ type RecordOpts struct {
 	BuilderIdentity string
 	ReviewerFamily  string
 	Reviewer        string
+	Host            string
 	Provider        string
 	Model           string
 	Pane            string
@@ -96,6 +97,7 @@ func (l *Ledger) record(opts RecordOpts) error {
 		BuilderIdentity: opts.BuilderIdentity,
 		ReviewerFamily:  opts.ReviewerFamily,
 		Reviewer:        opts.Reviewer,
+		Host:            opts.Host,
 		Provider:        opts.Provider,
 		Model:           opts.Model,
 		Pane:            opts.Pane,
@@ -164,7 +166,7 @@ func (l *Ledger) ensureRecord(opts RecordOpts) error {
 		return err
 	}
 	for _, row := range rows {
-		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer {
+		if row.Event == string(EventRecord) && row.SHA == opts.SHA && row.Reviewer == opts.Reviewer && strings.TrimSpace(row.Host) == strings.TrimSpace(opts.Host) {
 			return nil
 		}
 	}
@@ -402,6 +404,7 @@ type VerdictOpts struct {
 	ArtifactDigest string
 	SHA            string
 	Reviewer       string
+	Host           string
 	Verdict        Verdict
 	Artifact       string
 	ReviewerFamily string
@@ -447,7 +450,7 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	found := false
 	for i := len(rows) - 1; i >= 0; i-- {
 		r := rows[i]
-		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer {
+		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer && strings.TrimSpace(r.Host) == strings.TrimSpace(opts.Host) {
 			found = true
 			if opts.Reassesses == "" {
 				return false, nil
@@ -477,6 +480,7 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 		Reassesses: opts.Reassesses, ArtifactDigest: opts.ArtifactDigest,
 		SHA:                opts.SHA,
 		Reviewer:           opts.Reviewer,
+		Host:               opts.Host,
 		Verdict:            string(opts.Verdict),
 		Artifact:           opts.Artifact,
 		Task:               opts.Task,
@@ -501,6 +505,7 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 		Event:    string(EventEnqueue),
 		SHA:      opts.SHA,
 		Reviewer: opts.Reviewer,
+		Host:     opts.Host,
 		Branch:   opts.Branch,
 		Lane:     opts.Lane,
 		Status:   "queued",
