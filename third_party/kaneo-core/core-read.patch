@@ -13,7 +13,7 @@ index 01155bb..51232fe 100644
      /// Create a new task
      Create {
 diff --git a/src/cli/task_handler.rs b/src/cli/task_handler.rs
-index 83ba1fc..612d84d 100644
+index 83ba1fc..6c9bab1 100644
 --- a/src/cli/task_handler.rs
 +++ b/src/cli/task_handler.rs
 @@ -128,7 +128,12 @@ pub async fn run(args: TaskArgs, ctx: &ResolvedContext, json: bool) -> anyhow::R
@@ -30,7 +30,7 @@ index 83ba1fc..612d84d 100644
              let known_slug = parse_task_ref(&id).map(|(s, _)| s.to_string());
              let id = resolve_task_id(&id, ctx, &client).await?;
  
-@@ -1464,3 +1469,111 @@ fn print_task_row(t: &serde_json::Value, cyan: &console::Style, dim: &console::S
+@@ -1464,3 +1469,122 @@ fn print_task_row(t: &serde_json::Value, cyan: &console::Style, dim: &console::S
          dim.apply_to(id),
      );
  }
@@ -51,7 +51,7 @@ index 83ba1fc..612d84d 100644
 +                    ("q", requested),
 +                    ("workspaceId", ws),
 +                    ("type", "tasks"),
-+                    ("limit", "100"),
++                    ("limit", "50"),
 +                ],
 +            )
 +            .await?;
@@ -108,8 +108,19 @@ index 83ba1fc..612d84d 100644
 +            .is_none_or(|p| p == task.project_id),
 +        "task project mismatch"
 +    );
-+    let project: crate::api::types::Project =
-+        client.get(&format!("/project/{}", task.project_id)).await?;
++    // Both resources are required, and task identity is already validated.
++    // Overlap their reads without admitting either until all checks pass.
++    // The detail endpoint embeds every task; use scoped project metadata.
++    let workspace = crate::auth::require_workspace(ctx)?;
++    let project_query = [("workspaceId", workspace), ("includeArchived", "true")];
++    let labels_path = format!("/label/task/{id}");
++    let (projects, labels): (Vec<crate::api::types::Project>, Vec<Label>) = tokio::try_join!(
++        client.get_query("/project", &project_query),
++        client.get(&labels_path),
++    )?;
++    let mut matches = projects.into_iter().filter(|p| p.id == task.project_id);
++    let project = matches.next().ok_or_else(|| anyhow::anyhow!("missing project metadata"))?;
++    anyhow::ensure!(matches.next().is_none(), "ambiguous project metadata");
 +    anyhow::ensure!(
 +        project.id == task.project_id && !project.slug.is_empty(),
 +        "project identity mismatch"
@@ -128,7 +139,7 @@ index 83ba1fc..612d84d 100644
 +        expected_ref.is_none() || task_ref == requested,
 +        "task ref mismatch"
 +    );
-+    let labels: Vec<Label> = client.get(&format!("/label/task/{id}")).await?;
++
 +    anyhow::ensure!(
 +        labels
 +            .iter()
@@ -144,14 +155,16 @@ index 83ba1fc..612d84d 100644
 +}
 diff --git a/tests/core_read.py b/tests/core_read.py
 new file mode 100644
-index 0000000..9fd7b5d
+index 0000000..37b6961
 --- /dev/null
 +++ b/tests/core_read.py
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,63 @@
 +import http.server,threading,subprocess,json,os,tempfile
 +from pathlib import Path
++from urllib.parse import urlsplit,parse_qs
 +seen=[]
 +mode='ok'
++project_seen=threading.Event();labels_seen=threading.Event()
 +class H(http.server.BaseHTTPRequestHandler):
 + def log_message(self,*args):pass
 + def do_GET(self):
@@ -167,29 +180,44 @@ index 0000000..9fd7b5d
 +   if mode=='ambiguous':data['results'].append(dict(data['results'][0],id='task2'));data['totalCount']=2
 +   if mode=='cross-project':data['results'][0]['projectId']='other'
 +   if mode=='search-error':data={'error':'unavailable'}
++   limit=int(parse_qs(urlsplit(self.path).query).get('limit',['0'])[0])
++   if not 1 <= limit <= 50:code=400;data={'error':'limit: Limit must not exceed 50'}
 +  elif self.path=='/api/task/task1':
 +   data=task
 +   if mode=='wrong-task':data['id']='other'
-+  elif self.path=='/api/project/project1':
-+   data=project
-+   if mode=='wrong-project':data['slug']='OTHER'
++  elif urlsplit(self.path).path=='/api/project':
++   data=[project]
++   query=parse_qs(urlsplit(self.path).query)
++   if query.get('workspaceId')!=['ws1'] or query.get('includeArchived')!=['true']:code=400;data={'error':'scoped metadata query required'}
++   if mode=='wrong-project':project['slug']='OTHER'
++   if mode=='project-missing':data=[]
++   if mode=='project-duplicate':data.append(dict(project))
++   if mode=='project-workspace':project['workspaceId']='other'
++   if mode=='project-error':data={'error':'unavailable'}
++   if mode=='project-extra':data.append(dict(project,id='unrelated',slug='OTHER'))
++   if mode=='parallel':
++    project_seen.set()
++    if not labels_seen.wait(3):code=503;data={'error':'labels request must overlap project request'}
 +  elif self.path=='/api/label/task/task1':
 +   data=[label]
 +   if mode=='wrong-label-owner':label['taskId']='other'
 +   if mode=='wrong-label-workspace':label['workspaceId']='other'
 +   if mode=='labels-error-200':data={'error':'unavailable'}
 +   if mode=='labels-fail':code=503;data={'error':'unavailable'}
++   if mode=='parallel':
++    labels_seen.set()
++    if not project_seen.wait(3):code=503;data={'error':'project request must overlap labels request'}
 +  else:code=503;data={'error':'optional subresource must not be read'}
 +  body=json.dumps(data).encode();self.send_response(code);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 +s=http.server.ThreadingHTTPServer(('127.0.0.1',0),H);threading.Thread(target=s.serve_forever,daemon=True).start()
 +binary=str(Path(__file__).resolve().parents[1]/'target/debug/kaneo')
 +with tempfile.TemporaryDirectory() as cwd:
 + env=os.environ.copy();env.update(KANEO_API_KEY='fixture-only',KANEO_API_URL='http://127.0.0.1:'+str(s.server_port),KANEO_WORKSPACE='ws1',KANEO_PROJECT='project1')
-+ for mode in ['ok','opaque','labels-fail','wrong-task','wrong-project','truncated','missing-count','ambiguous','cross-project','search-error','wrong-label-owner','wrong-label-workspace','labels-error-200']:
-+  seen.clear();r=subprocess.run([binary,'task','get','task1' if mode=='opaque' else 'FAC-1','--core','--json'],cwd=cwd,env=env,capture_output=True,text=True,timeout=10)
-+  assert (r.returncode==0)==(mode in ['ok','opaque']),(mode,r.returncode,r.stdout,r.stderr)
-+  assert all(x.startswith('/api/search') or x in ['/api/task/task1','/api/project/project1','/api/label/task/task1'] for x in seen),seen
-+  if mode in ['ok','opaque']:
++ for mode in ['ok','opaque','parallel','project-extra','project-missing','project-duplicate','project-workspace','project-error','labels-fail','wrong-task','wrong-project','truncated','missing-count','ambiguous','cross-project','search-error','wrong-label-owner','wrong-label-workspace','labels-error-200']:
++  seen.clear();project_seen.clear();labels_seen.clear();r=subprocess.run([binary,'task','get','task1' if mode=='opaque' else 'FAC-1','--core','--json'],cwd=cwd,env=env,capture_output=True,text=True,timeout=10)
++  assert (r.returncode==0)==(mode in ['ok','opaque','parallel','project-extra']),(mode,r.returncode,r.stdout,r.stderr)
++  assert all(x.startswith('/api/search') or urlsplit(x).path in ['/api/task/task1','/api/project','/api/label/task/task1'] for x in seen),seen
++  if mode in ['ok','opaque','parallel','project-extra']:
 +   assert len(seen)==(3 if mode=='opaque' else 4),seen
 +   assert json.loads(r.stdout)['labels']==['bounded']
 +  print(mode,'PASS',len(seen),'requests')
