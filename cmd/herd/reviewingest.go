@@ -1466,7 +1466,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("read harvest queue: %w", err)
 	}
-	var latest reviewledger.LedgerRow
+	var latest, latestExact reviewledger.LedgerRow
 	var offBranch []string
 	queuedBySHA := make(map[string]reviewledger.LedgerRow)
 	for _, row := range queued {
@@ -1492,8 +1492,13 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		if row.Timestamp >= latest.Timestamp {
 			latest = row
 		}
+		if strings.TrimSpace(row.Branch) == branch && row.Timestamp >= latestExact.Timestamp {
+			latestExact = row
+		}
 	}
-	if latest.SHA != "" {
+	if latestExact.SHA != "" {
+		report.LastPassSHA = latestExact.SHA
+	} else if latest.SHA != "" {
 		report.LastPassSHA = latest.SHA
 	}
 	report.OffBranchQueued = offBranch

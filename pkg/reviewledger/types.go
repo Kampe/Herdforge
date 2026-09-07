@@ -72,6 +72,7 @@ type LedgerRow struct {
 	BuilderIdentity    string `json:"builder_identity,omitempty"`
 	ReviewerFamily     string `json:"reviewer_family,omitempty"`
 	Reviewer           string `json:"reviewer,omitempty"`
+	Host               string `json:"host,omitempty"`
 	Provider           string `json:"provider,omitempty"`
 	Model              string `json:"model,omitempty"`
 	Pane               string `json:"pane,omitempty"`
