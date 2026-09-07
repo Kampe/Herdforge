@@ -195,3 +195,46 @@ func TestLatestWithinBranchStillSupersedes(t *testing.T) {
 		t.Fatalf("last pass = %q, want the later same-branch pass %q", got.LastPassSHA, second)
 	}
 }
+
+func TestHostLabelledHarvestSelectsExactBranchBoundPass(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	gitCandidateTest(t, "init", "-q", "-b", "main")
+	gitCandidateTest(t, "config", "user.email", "test@example.com")
+	gitCandidateTest(t, "config", "user.name", "test")
+	gitCandidateTest(t, "commit", "--allow-empty", "-q", "-m", "base")
+
+	gitCandidateTest(t, "checkout", "-q", "-b", "herd/fac-652")
+	writeCandidateFile(t, "fac652.go", "package fac652\n")
+	gitCandidateTest(t, "add", "fac652.go")
+	gitCandidateTest(t, "commit", "-q", "-m", "fac-652")
+	fac652 := gitCandidateOutput(t, "rev-parse", "HEAD")
+
+	gitCandidateTest(t, "checkout", "-q", "main")
+	gitCandidateTest(t, "checkout", "-q", "-b", "herd/fac-670")
+	writeCandidateFile(t, "fac670.go", "package fac670\n")
+	gitCandidateTest(t, "add", "fac670.go")
+	gitCandidateTest(t, "commit", "-q", "-m", "fac-670")
+	fac670 := gitCandidateOutput(t, "rev-parse", "HEAD")
+	if fac652 == fac670 {
+		t.Fatal("fixture must produce two distinct candidates")
+	}
+
+	l, err := reviewledger.NewReviewLedger(root, filepath.Join(root, ".herd", "review-ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	addHostLabelledPass(t, l, fac670, "herd/fac-670", "local", "review-fac-670", "google", "openai")
+	addHostLabelledPass(t, l, fac652, "herd/fac-652", "w4", "review-fac-652-2a3a20d57ba7", "anthropic", "openai")
+
+	got, err := resolveHarvestCandidateWithReconstructionAt(root, "herd/fac-652", "", "", "")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got.LastPassSHA == fac670 {
+		t.Fatalf("selected FAC-670 %s instead of branch-bound FAC-652", fac670)
+	}
+	if got.LastPassSHA != fac652 {
+		t.Fatalf("last pass = %q, want FAC-652 branch-bound %q", got.LastPassSHA, fac652)
+	}
+}
