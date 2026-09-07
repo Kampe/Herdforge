@@ -686,7 +686,7 @@ func TestVerifyCLI_PostsReceiptBoundFailCallback(t *testing.T) {
 // `herd approve` now requires: a real merged candidate on origin/main, a
 // sealed task-bound receipt over it, and durable lifecycle state at
 // "integrated" for the same lease generation and candidate.
-func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64) {
+func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, configure ...func(*hsync.CompletionReceipt)) {
 	t.Helper()
 	// A candidate commit with actual content, merged into main so the
 	// receipt's merge SHA is an ancestor of origin/main and carries the
@@ -718,6 +718,9 @@ func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64) {
 		VerificationDigest: "verification-digest-1", RiskTier: "R3",
 		AuthorFamily: "anthropic", ReviewerFamily: "openai",
 		Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged,
+	}
+	for _, setup := range configure {
+		setup(r)
 	}
 	r.Seal()
 	if err := hsync.WriteReceipt(dir, r); err != nil {
@@ -777,7 +780,7 @@ func seedDisabledWinddown(t *testing.T, dir string) {
 	}
 }
 
-func approveFixture(t *testing.T) (dir, keyDir string, fk *fakeKaneo) {
+func approveFixture(t *testing.T, configure ...func(*hsync.CompletionReceipt)) (dir, keyDir string, fk *fakeKaneo) {
 	t.Helper()
 	fk, server := newFakeKaneo()
 	t.Cleanup(server.Close)
@@ -814,7 +817,7 @@ func approveFixture(t *testing.T) (dir, keyDir string, fk *fakeKaneo) {
 	// with "no positive lease generation (lifecycle must record the active
 	// lease)". Seed the same generation into the lifecycle so the two agree.
 	seedFixtureLifecycle(t, dir, "FAC-1", leaseGen)
-	seedCompletionReceipt(t, dir, "FAC-1", leaseGen)
+	seedCompletionReceipt(t, dir, "FAC-1", leaseGen, configure...)
 	return dir, keyDir, fk
 }
 
@@ -2020,24 +2023,19 @@ func TestApproveCLI_LandingReceiptClosesWithoutTaskContext(t *testing.T) {
 // task context, lifecycle row, task id, lease, or post-hoc acceptance block.
 func TestApproveCLI_ReducedLandingReceiptClosesWithoutDispatchProvenance(t *testing.T) {
 	binary := buildHerd(t)
-	dir, keyDir, fk := approveFixture(t)
+	// Seed the reduced schema before first publication; this is fixture setup,
+	// not an authorization to replace a receipt for the same landed candidate.
+	dir, keyDir, fk := approveFixture(t, func(r *hsync.CompletionReceipt) {
+		r.TaskID = ""
+		r.ProviderRevision = ""
+		r.LeaseGeneration = 0
+		r.AcceptanceDigest = ""
+		r.AcceptanceEvidence = ""
+		r.ProvenanceMode = hsync.ProvenanceReduced
+		r.PullRequest = 655
+	})
 	provisionFence(t, binary, dir, keyDir)
 
-	path := hsync.ReceiptPath(dir, "FAC-1")
-	r, err := hsync.LoadReceipt(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.TaskID = ""
-	r.ProviderRevision = ""
-	r.LeaseGeneration = 0
-	r.AcceptanceDigest = ""
-	r.AcceptanceEvidence = ""
-	r.ProvenanceMode = hsync.ProvenanceReduced
-	r.PullRequest = 655
-	if err := hsync.WriteReceipt(dir, r); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.RemoveAll(filepath.Join(dir, ".herd", "worktrees", "fac-1")); err != nil {
 		t.Fatal(err)
 	}

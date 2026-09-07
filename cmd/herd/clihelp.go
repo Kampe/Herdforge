@@ -109,6 +109,7 @@ var subcommandUsage = map[string]string{
 		"    --ref <REF>              task ref; records a landed disposition and reconciles\n" +
 		"                             the completion receipt\n" +
 		"    --pr <n>                 pull request that carried the merge\n" +
+		"    --supersedes-receipt <digest>  explicit prior receipt; preserve immutable history\n" +
 		"\n" +
 		"  Receipt binding (only when no merge-admission record exists):\n" +
 		"    --task-id --base-sha --lease --lease-generation --patch-id\n" +

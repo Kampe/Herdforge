@@ -28,6 +28,7 @@ package mergeadmit
 import (
 	"bytes"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"os/exec"
 	"strings"
 )
@@ -150,7 +151,7 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 		// The candidate object survived, so ancestry is the whole question.
 		// This exit status IS the gate — capturing it and reporting success
 		// anyway is the FAC-178 bug.
-		if err := runGit(repoDir, "merge-base", "--is-ancestor", candidate, landed); err != nil {
+		if err := gitroot.RequireAncestor(repoDir, candidate, landed); err != nil {
 			return nil, fmt.Errorf("merge-mode proof failed: candidate %s is not an ancestor of landed %s",
 				short(candidate), short(landed))
 		}

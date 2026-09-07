@@ -326,16 +326,7 @@ func MissingCompletionReceiptError(repoDir, ref string) error {
 // WriteReceipt seals and durably writes a receipt for ref. Producers use this;
 // it is the seam the integration pipeline writes through.
 func WriteReceipt(repoDir string, r *CompletionReceipt) error {
-	r.Seal()
-	path := ReceiptPath(repoDir, r.TaskRef)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("receipt dir: %w", err)
-	}
-	b, err := json.MarshalIndent(r, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode receipt: %w", err)
-	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
+	return persistReceipt(repoDir, r, "", nil)
 }
 
 // LoadReceipt reads a receipt from disk. It does not validate it.

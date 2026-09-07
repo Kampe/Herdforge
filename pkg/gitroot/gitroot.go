@@ -144,3 +144,21 @@ func divergentLane(projectRoot string) string {
 	}
 	return filepath.Clean(abs)
 }
+
+// RequireAncestor refuses both non-containment and an unanswerable Git query.
+// Shared by CLI discovery and receipt delivery-continuity validation.
+func RequireAncestor(root, ancestor, descendant string) error {
+	ancestor, descendant = strings.TrimSpace(ancestor), strings.TrimSpace(descendant)
+	if ancestor == "" || descendant == "" {
+		return fmt.Errorf("ancestry requires two commit identities")
+	}
+	args := []string{}
+	if strings.TrimSpace(root) != "" {
+		args = append(args, "-C", root)
+	}
+	args = append(args, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err := exec.Command("git", args...).Run(); err != nil {
+		return fmt.Errorf("git ancestry refused: %w", err)
+	}
+	return nil
+}
