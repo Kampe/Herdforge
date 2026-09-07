@@ -3036,6 +3036,11 @@ func runApprove() {
 		os.Exit(1)
 	}
 
+	if err := deps.RefusePendingRollback(""); err != nil {
+		fmt.Fprintf(os.Stderr, "herd approve: %v\n", err)
+		os.Exit(1)
+	}
+
 	ctx := context.Background()
 
 	// FAC-145: acquire the CANONICAL transaction lock before scanning, and
