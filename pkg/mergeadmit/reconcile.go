@@ -117,11 +117,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}
 
-	proof, err := ProveEquivalentLanded(g.RepoDir, ProofRequest{
-		BaseSHA:      req.BaseSHA,
-		CandidateSHA: req.CandidateSHA,
-		LandedSHA:    landed,
-	})
+	proof, err := g.ProveLanded(req, landed)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %w", CodeProofFailed, err)
 	}
@@ -234,11 +230,7 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}
-	contentBase, contentSHA, err := g.reconstructionContent(req)
-	if err != nil {
-		return nil, fmt.Errorf("herd-merge-reconcile: reconstruction: %w", err)
-	}
-	proof, err := ProveEquivalentLanded(g.RepoDir, ProofRequest{BaseSHA: contentBase, CandidateSHA: contentSHA, LandedSHA: landed})
+	proof, err := g.ProveLanded(req, landed)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %w", CodeProofFailed, err)
 	}
@@ -250,8 +242,8 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 	if req.Reconstruction != nil {
 		receipt.CandidateSHA = req.CandidateSHA
 		receipt.BaseSHA = req.BaseSHA
-		receipt.ReconstructedSHA = contentSHA
-		receipt.ReconstructionBaseSHA = contentBase
+		receipt.ReconstructedSHA = proof.CandidateSHA
+		receipt.ReconstructionBaseSHA = proof.BaseSHA
 		receipt.ReconstructionDigest = req.Reconstruction.AttestationDigest
 	}
 	receipt.Seal()
@@ -358,6 +350,16 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 		return nil, fmt.Errorf("equivalent-patch proof failed: %w", err)
 	}
 
+	if mergeSHA, found, squashErr := matchSquashRangeReplay(repoDir, base, candidate, landedContent); squashErr != nil {
+		return nil, fmt.Errorf("squash proof failed: %w", squashErr)
+	} else if found {
+		proof, proofErr := equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree")
+		if proof != nil {
+			proof.Mode = ModeSquash
+		}
+		return proof, proofErr
+	}
+
 	mergeSHA, replayErr := matchCombinedRangeReplay(repoDir, base, candidate, candidateContent, landedContent)
 	if replayErr != nil {
 		return nil, fmt.Errorf("equivalent-patch proof failed: ordered proof: %v; combined proof: %w", err, replayErr)
@@ -422,7 +424,7 @@ func matchCombinedRangeReplay(repoDir, base, candidate string, candidateContent,
 		if start > 0 {
 			windowBase = landedCommits[start-1]
 		}
-		replayedTree, mergeErr := gitOut(repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, windowBase, candidate)
+		replayedTree, mergeErr := replayReviewedTree(repoDir, base, windowBase, candidate)
 		if mergeErr != nil {
 			continue
 		}
@@ -468,4 +470,10 @@ func matchOrderedPatchSubsequence(want, got, landedCommits []string) (string, er
 		j++
 	}
 	return lastMatch, nil
+}
+
+// replayReviewedTree applies precisely the reviewed base-to-candidate delta to
+// a landed parent. Both rebased-stack and squash proofs use this predicate.
+func replayReviewedTree(repoDir, base, parent, candidate string) (string, error) {
+	return gitOut(repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
 }
