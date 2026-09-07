@@ -42,7 +42,7 @@ func TestHerdCommandNestedSlotReentryOmitsFleetMetadata(t *testing.T) {
 				t.Fatalf("%s=%q, want 1", slot.EnvHeld, val)
 			}
 			held = true
-		case "HERD_ROOT", "HERD_PROJECT_ROOT", "HERD_WORKSPACE", "HERD_ROLE", "HERD_LANE", "HERD_USE_PI", "HERD_MODE", "HERD_ISOLATION_ATTESTATION":
+		case "HERD_ROOT", "HERD_REPO_ROOT", "HERD_PROJECT_ROOT", "HERD_WORKSPACE", "HERD_ROLE", "HERD_LANE", "HERD_USE_PI", "HERD_MODE", "HERD_ISOLATION_ATTESTATION":
 			t.Fatalf("nested CLI inherited unrelated fleet metadata %s", name)
 		}
 		if strings.HasPrefix(name, "HERDR_") {

@@ -102,9 +102,11 @@ func TestMain(m *testing.M) {
 	// keep that pane marker out of both test contexts while leaving the
 	// production signer-boundary check unchanged.
 	// FAC-610: HERD_ROLE was the first of these to bite, but it is one member
-	// of a class. A lane also inherits HERD_ROOT, HERD_PROJECT_ROOT,
-	// HERD_WORKSPACE and HERDR_* pane vars, which made five cmd/herd tests fail
-	// in a lane's shell and pass in the coordinator's on the same commit.
+	// of a class. A lane also inherits HERD_ROOT, HERD_REPO_ROOT,
+	// HERD_PROJECT_ROOT, HERD_WORKSPACE and HERDR_* pane vars, which made
+	// five cmd/herd tests fail in a lane's shell and pass in the coordinator's
+	// on the same commit. HERD_REPO_ROOT is the legacy alias that wins after
+	// HERD_ROOT is cleared (FAC-756).
 	nestedVerifierSlotHeld = os.Getenv(slot.EnvHeld) == "1"
 	laneenv.Strip()
 	cliTestGit, cliTestGitErr = gitBinaryOnPATH(os.Getenv("PATH"))

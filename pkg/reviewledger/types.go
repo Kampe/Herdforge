@@ -62,6 +62,8 @@ var FamilyAllowlist = map[string]bool{
 
 // LedgerRow matches the jq-emitted JSONL row exactly (JSON tags for jq compat).
 type LedgerRow struct {
+	Reassesses         string `json:"reassesses,omitempty"`
+	ArtifactDigest     string `json:"artifact_digest,omitempty"`
 	Timestamp          string `json:"ts"`
 	Event              string `json:"event"`
 	SHA                string `json:"sha,omitempty"`

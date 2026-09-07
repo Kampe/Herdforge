@@ -152,3 +152,42 @@ func TestStripLeavesUnrelatedEnvironmentAlone(t *testing.T) {
 		}
 	}
 }
+
+// FAC-756: after Strip clears HERD_ROOT, the legacy HERD_REPO_ROOT alias is
+// the remaining root override. A suite that only enumerates Vars-by-range
+// would stay green if the alias were omitted from that slice.
+func TestStripRemovesLegacyRepoRootAlias(t *testing.T) {
+	const alias = "HERD_REPO_ROOT"
+	unrelated := filepath.Join(t.TempDir(), "shared-fleet-root")
+	t.Setenv("HERD_ROOT", unrelated)
+	t.Setenv(alias, unrelated)
+	t.Setenv("HOME_AWAY_FROM_HOME", "keep-me")
+
+	if leaked := Leaked(); !containsName(leaked, alias) {
+		t.Fatal("Leaked omitted HERD_REPO_ROOT before Strip; Vars does not isolate the alias")
+	}
+
+	Strip()
+
+	if _, ok := os.LookupEnv(alias); ok {
+		t.Fatal("legacy HERD_REPO_ROOT alias survived Strip after HERD_ROOT was cleared")
+	}
+	if _, ok := os.LookupEnv("HERD_ROOT"); ok {
+		t.Fatal("HERD_ROOT survived Strip")
+	}
+	if v := os.Getenv("HOME_AWAY_FROM_HOME"); v != "keep-me" {
+		t.Fatalf("Strip cleared unrelated variable: %q", v)
+	}
+	if leaked := Leaked(); len(leaked) != 0 {
+		t.Fatalf("launch metadata survived Strip: %v", leaked)
+	}
+}
+
+func containsName(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}

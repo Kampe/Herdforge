@@ -92,11 +92,9 @@ func (l *Ledger) appendRow(path string, row *LedgerRow) error {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
-	if _, err := f.Write(data); err != nil {
+	// One append keeps a concurrent event writer from splitting this JSON row.
+	if _, err := f.Write(append(data, '\n')); err != nil {
 		return fmt.Errorf("write: %w", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		return fmt.Errorf("write newline: %w", err)
 	}
 	return nil
 }

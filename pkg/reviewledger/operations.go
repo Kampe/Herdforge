@@ -1,6 +1,7 @@
 package reviewledger
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -248,7 +249,7 @@ func (l *Ledger) CompleteLaunchProvenance(opts RecordOpts) error {
 // Ingest ensures the matching exact-SHA admission record before persisting a
 // PASS verdict. Provenance validation happens before either row is written;
 // repeating an accepted handoff is idempotent.
-func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
+func (l *Ledger) Ingest(opts IngestOpts) (enqueued bool, err error) {
 	if opts.Retired != nil {
 		if opts.Verdict.Verdict != "" {
 			return false, fmt.Errorf("retirement must not carry a review verdict")
@@ -261,6 +262,25 @@ func (l *Ledger) Ingest(opts IngestOpts) (bool, error) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	release, lockErr := lockVerdictMutation(l.Path)
+	if lockErr != nil {
+		return false, lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
+	if opts.Verdict.Reassesses != "" {
+		prior, found, err := l.VerdictForReviewer(opts.Verdict.SHA, opts.Verdict.Reviewer)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, fmt.Errorf("reassessment prior verdict not found")
+		}
+		replay, err := CheckReassessment(prior, opts.Verdict)
+		if err != nil || replay {
+			return false, err
+		}
+	}
 	if err := l.ensureRecord(opts.Record); err != nil {
 		return false, err
 	}
@@ -378,6 +398,8 @@ type TierReport struct {
 
 // VerdictOpts carries fields for Verdict.
 type VerdictOpts struct {
+	Reassesses     string
+	ArtifactDigest string
 	SHA            string
 	Reviewer       string
 	Verdict        Verdict
@@ -400,6 +422,12 @@ type VerdictOpts struct {
 func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	release, lockErr := lockVerdictMutation(l.Path)
+	if lockErr != nil {
+		return false, lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
 	return l.verdict(opts)
 }
 
@@ -416,10 +444,23 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	for _, r := range rows {
+	found := false
+	for i := len(rows) - 1; i >= 0; i-- {
+		r := rows[i]
 		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer {
-			return false, nil
+			found = true
+			if opts.Reassesses == "" {
+				return false, nil
+			}
+			replay, err := CheckReassessment(r, opts)
+			if err != nil || replay {
+				return false, err
+			}
+			break
 		}
+	}
+	if opts.Reassesses != "" && !found {
+		return false, fmt.Errorf("reassessment prior verdict not found")
 	}
 	if opts.Verdict == VerdictPASS && strings.TrimSpace(opts.RetryOf) != "" {
 		if err := l.appendRow(l.Path, &LedgerRow{
@@ -432,7 +473,8 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	}
 
 	row := &LedgerRow{
-		Event:              string(EventVerdict),
+		Event:      string(EventVerdict),
+		Reassesses: opts.Reassesses, ArtifactDigest: opts.ArtifactDigest,
 		SHA:                opts.SHA,
 		Reviewer:           opts.Reviewer,
 		Verdict:            string(opts.Verdict),
@@ -1257,7 +1299,7 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 // keeps a backfill from being a laundering path: it may add evidence about a
 // verdict, it may never change what the verdict SAID. A backfill that could turn
 // a FAIL into a PASS would be far worse than the gap it closes.
-func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL, vfyDigest, lease string) error {
+func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL, vfyDigest, lease string) (err error) {
 	sha = strings.TrimSpace(sha)
 	reviewer = strings.TrimSpace(reviewer)
 	if sha == "" || reviewer == "" {
@@ -1265,6 +1307,12 @@ func (l *Ledger) CompleteVerdictProvenance(sha, reviewer string, task, patchURL,
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	release, lockErr := lockVerdictMutation(l.Path)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { err = errors.Join(err, release()) }()
+
 	rows, err := readRows(l.Path)
 	if err != nil {
 		return err

@@ -7998,6 +7998,20 @@ func runReviewLedger() {
 			fmt.Fprintln(os.Stderr, "review-ledger: exact reconstruction attestation not found")
 			os.Exit(1)
 		}
+	case "verdict-digest":
+		if len(os.Args) != 5 {
+			fmt.Fprintln(os.Stderr, "Usage: herd review-ledger verdict-digest <sha> <reviewer>")
+			os.Exit(2)
+		}
+		row, found, err := l.VerdictForReviewer(os.Args[3], os.Args[4])
+		if err != nil || !found {
+			fmt.Fprintln(os.Stderr, "review-ledger: exact reviewer verdict not found", err)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"sha": row.SHA, "reviewer": row.Reviewer, "verdict": row.Verdict, "digest": reviewledger.VerdictEventDigest(row)}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "readiness":
 		// FAC-636: MergeReadiness existed only as a Go API, so the coordinator had
 		// no way to classify candidates except grepping the ledger -- which is

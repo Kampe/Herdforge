@@ -5,6 +5,9 @@
 // `go test`, and tests that assert a DEGRADED or non-canonical resolution get a
 // canonical one instead -- so they fail in a lane's shell and pass in a
 // coordinator's, on the same commit, in the same worktree, on the same machine.
+// FAC-756: HERD_REPO_ROOT is the legacy root alias. After Strip clears
+// HERD_ROOT, firstEnv and claim-dir resolvers still honor it, so an inherited
+// value re-binds fixtures onto shared fleet state.
 //
 // Measured on 8811e89: clean env exit 0; with lane metadata set, six failures
 // across cmd/herd and pkg/reviewroot. TestNonRepoResolutionIsMarkedNonCanonical
@@ -32,6 +35,7 @@ import (
 // already handled individually in cmd/herd; it belongs to the same class.
 var Vars = []string{
 	"HERD_ROOT",
+	"HERD_REPO_ROOT",
 	"HERD_PROJECT_ROOT",
 	"HERD_WORKSPACE",
 	"HERD_ROLE",

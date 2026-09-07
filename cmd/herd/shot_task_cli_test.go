@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
+	"github.com/Kampe/Herdforge/pkg/laneenv"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/shot"
 )
@@ -19,6 +20,28 @@ import (
 // network, no state outside t.TempDir().
 
 const cliCandidate = "3333333333333333333333333333333333333333"
+
+// inheritUnrelatedRootAliases binds HERD_ROOT and the legacy HERD_REPO_ROOT
+// alias to a synthetic external root, then Strip()s them the way TestMain
+// isolates a lane. FAC-756: if the alias survives Strip, the real shot CLI
+// writes callbacks and locks into that unrelated tree instead of dir.
+func inheritUnrelatedRootAliases(t *testing.T) string {
+	t.Helper()
+	unrelated := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(unrelated, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	poison := filepath.Join(unrelated, ".herd", "control-mail.jsonl")
+	t.Setenv("HERD_ROOT", unrelated)
+	t.Setenv("HERD_REPO_ROOT", unrelated)
+	laneenv.Strip()
+	t.Cleanup(func() {
+		if _, err := os.Stat(poison); err == nil {
+			t.Errorf("shot callback escaped into unrelated inherited root %s", poison)
+		}
+	})
+	return unrelated
+}
 
 func shotRepo(t *testing.T) string {
 	t.Helper()
@@ -47,6 +70,12 @@ func runShotCLI(t *testing.T, binary, dir string, args ...string) (string, int) 
 	cmd.Env = append(os.Environ(),
 		"XDG_STATE_HOME="+filepath.Join(dir, "state"),
 		"PATH="+stubHarnessPATH(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, kv := range cmd.Env {
+		name, _, ok := strings.Cut(kv, "=")
+		if ok && (name == "HERD_ROOT" || name == "HERD_REPO_ROOT") {
+			t.Fatalf("shot CLI inherited root alias %s; fixtures would escape the test repo", name)
+		}
+	}
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return string(out), 0
@@ -112,8 +141,12 @@ func TestShotPromptLaneStillRequiresAPrompt(t *testing.T) {
 // The completion callback is the builder half of the loop. This drives it
 // through the real binary and reads the durable mailbox back.
 func TestShotReportPostsDurableCallback(t *testing.T) {
+	unrelated := inheritUnrelatedRootAliases(t)
 	binary := buildHerd(t)
 	repo := shotRepo(t)
+	if repo == unrelated {
+		t.Fatal("shot fixture reused the synthetic inherited root")
+	}
 
 	out, code := runShotCLI(t, binary, repo, "shot", "FAC-89",
 		"--report", "complete", "--sha", cliCandidate, "--lease", "4")
@@ -139,8 +172,12 @@ func TestShotReportPostsDurableCallback(t *testing.T) {
 }
 
 func TestShotReportBlockedCarriesDetail(t *testing.T) {
+	unrelated := inheritUnrelatedRootAliases(t)
 	binary := buildHerd(t)
 	repo := shotRepo(t)
+	if repo == unrelated {
+		t.Fatal("shot fixture reused the synthetic inherited root")
+	}
 
 	if out, code := runShotCLI(t, binary, repo, "shot", "FAC-89",
 		"--report", "blocked", "--detail", "waiting on FAC-172", "--lease", "4"); code != 0 {
@@ -218,8 +255,12 @@ func TestShotEmitsJSONEvidenceOnFailure(t *testing.T) {
 // Duplicate invocations must not double-claim: the second refuses at the lock
 // stage without ever reading the board.
 func TestShotRefusesDuplicateInvocation(t *testing.T) {
+	unrelated := inheritUnrelatedRootAliases(t)
 	binary := buildHerd(t)
 	repo := shotRepo(t)
+	if repo == unrelated {
+		t.Fatal("shot fixture reused the synthetic inherited root")
+	}
 
 	lockDir := filepath.Join(repo, ".herd", "locks", "shot-fac-89.lock.d")
 	if err := os.MkdirAll(lockDir, 0o755); err != nil {
