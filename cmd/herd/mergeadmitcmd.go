@@ -281,10 +281,16 @@ func originMainProbe(dir string) mergeadmit.Probe {
 // where jq and head exit 0 over an empty stream, so a failed gh read as a
 // clean gate. There is no pipeline here for a tail to overwrite the status of.
 type prView struct {
+	Number            int    `json:"number"`
+	State             string `json:"state"`
+	URL               string `json:"url"`
 	HeadRefOid        string `json:"headRefOid"`
 	Mergeable         string `json:"mergeable"`
 	StatusCheckRollup []struct {
 		Name       string `json:"name"`
+		Status     string `json:"status"`
+		DetailsURL string `json:"detailsUrl"`
+		TargetURL  string `json:"targetUrl"`
 		Context    string `json:"context"`
 		Conclusion string `json:"conclusion"`
 		State      string `json:"state"`

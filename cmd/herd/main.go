@@ -7162,47 +7162,20 @@ func runAttention() {
 		os.Exit(1)
 	}
 	result, err := attention.RunWithHoldReaderAndTasks(attentionAuthority, attentionRepository, activeResolver, attentionRegistry)
-	if err != nil {
-		// Fail-closed: herdr unavailable or agent list parse error is a hard
-		// error, not a silent "fleet healthy".
-		if result != nil {
-			if *asJSON {
-				if out, marshalErr := json.MarshalIndent(result, "", "  "); marshalErr == nil {
-					fmt.Println(string(out))
-				}
-			} else {
-				fmt.Println(attention.Summary(*result))
-			}
-		}
-		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
-		os.Exit(1)
+	if err == nil {
+		evidenceCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err = populateAttentionCandidates(evidenceCtx, result, attentionConfig)
+		cancel()
 	}
-
-	if *asJSON {
-		out, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "herd-attention: json encode: %v\n", err)
+	if result != nil {
+		if outputErr := attention.WriteResult(os.Stdout, *result, *asJSON, *quiet); outputErr != nil {
+			fmt.Fprintf(os.Stderr, "herd-attention: output: %v\n", outputErr)
 			os.Exit(1)
 		}
-		fmt.Println(string(out))
-		return
 	}
-
-	fmt.Println(attention.Summary(*result))
-
-	if *quiet {
-		return
-	}
-
-	for _, item := range result.Items {
-		fmt.Println("  " + attention.FormatItem(item))
-	}
-
-	if result.Needing > 0 {
-		fmt.Println()
-		fmt.Println("herd-attention: triage complete. Actions: review/harvest done lanes,")
-		fmt.Println("  unblock blocked lanes, kick idle lanes (herd kick), raise missing")
-		fmt.Println("  lanes (herd standing), reroute provider-death lanes.")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd-attention: %v\n", err)
+		os.Exit(1)
 	}
 }
 
