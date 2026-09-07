@@ -1,9 +1,6 @@
 package main
 
-import (
-	"os/exec"
-	"strings"
-)
+import "github.com/Kampe/Herdforge/pkg/gitroot"
 
 // One definition each for two git questions this tree kept re-asking.
 //
@@ -23,15 +20,5 @@ import (
 // even when it is no longer the tip. An error is NOT containment -- an
 // unanswerable question is never a yes.
 func commitIsAncestor(root, sha, ref string) bool {
-	sha = strings.TrimSpace(sha)
-	ref = strings.TrimSpace(ref)
-	if sha == "" || ref == "" {
-		return false
-	}
-	args := []string{}
-	if strings.TrimSpace(root) != "" {
-		args = append(args, "-C", root)
-	}
-	args = append(args, "merge-base", "--is-ancestor", sha, ref)
-	return exec.Command("git", args...).Run() == nil
+	return gitroot.RequireAncestor(root, sha, ref) == nil
 }

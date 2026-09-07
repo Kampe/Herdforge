@@ -34,6 +34,11 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 	if g.Ledger == nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: no review ledger configured; with no ledger there is no verdict, and no verdict is not a PASS")
 	}
+	if req.PriorReceiptDigest != "" {
+		if err := g.validatePriorReceipt(req); err != nil {
+			return nil, err
+		}
+	}
 	if req.Reconstruction != nil && req.ReducedProvenance == nil {
 		return nil, fmt.Errorf("reconstruction requires explicit reduced-provenance reconciliation")
 	}
@@ -96,6 +101,11 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 					sameSHA(existing.CandidateSHA, req.CandidateSHA) &&
 					existing.LeaseGeneration == req.LeaseGeneration &&
 					strings.EqualFold(existing.TaskID, req.TaskID) {
+					if req.PriorReceiptDigest != "" {
+						if err := g.persistReconciledReceipt(req, existing); err != nil {
+							return nil, err
+						}
+					}
 					return existing, nil
 				}
 			}
@@ -149,7 +159,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 
 	path := hsync.ReceiptPath(g.RepoDir, receipt.TaskRef)
 	if existing, loadErr := hsync.LoadReceipt(path); loadErr == nil {
-		if existing.Digest != receipt.Digest {
+		if existing.Digest != receipt.Digest && req.PriorReceiptDigest == "" {
 			return nil, fmt.Errorf("herd-merge-reconcile: %s already holds a different receipt (%s) than this reconcile produced (%s); refusing to overwrite",
 				path, short(existing.Digest), short(receipt.Digest))
 		}
@@ -159,7 +169,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		}
 	}
 
-	if err := writeReceipt(g.RepoDir, receipt); err != nil {
+	if err := g.persistReconciledReceipt(req, receipt); err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: persist receipt: %w", err)
 	}
 
@@ -193,13 +203,13 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 		return nil, fmt.Errorf("herd-merge-reconcile: autonomous merge refused: %s", strings.Join(rep.Reasons, "; "))
 	}
 	admission := reviewledger.ReducedAdmissionOpts{CandidateSHA: req.CandidateSHA}
-	if req.Reconstruction != nil {
+	if req.Reconstruction != nil || req.PriorReceiptDigest != "" {
 		existing, err := hsync.LoadReceipt(hsync.ReceiptPath(g.RepoDir, hsync.NormalizeRef(req.Ref)))
 		if err == nil && existing.Digest != "" && existing.Digest == existing.ComputeDigest() &&
 			existing.TaskRef == hsync.NormalizeRef(req.Ref) && existing.CandidateSHA == req.CandidateSHA &&
-			existing.BaseSHA == req.BaseSHA && existing.ReconstructedSHA == req.Reconstruction.SHA &&
-			existing.ReconstructionBaseSHA == req.Reconstruction.BaseSHA &&
-			existing.ReconstructionDigest == req.Reconstruction.AttestationDigest && existing.PullRequest == rp.PullRequest {
+			existing.BaseSHA == req.BaseSHA && existing.PullRequest == rp.PullRequest &&
+			((req.Reconstruction == nil && existing.ReconstructedSHA == "") || (req.Reconstruction != nil && existing.ReconstructedSHA == req.Reconstruction.SHA &&
+				existing.ReconstructionBaseSHA == req.Reconstruction.BaseSHA && existing.ReconstructionDigest == req.Reconstruction.AttestationDigest)) {
 			admission.ReconcileConsumedMergeSHA = existing.MergeSHA
 		}
 	}
@@ -213,10 +223,10 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 		}
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %s", CodeLedgerRefused, reason)
 	}
-	if req.Reconstruction != nil {
+	if req.Reconstruction != nil || req.PriorReceiptDigest != "" {
 		verdict, found, err := g.Ledger.VerdictForReviewer(req.CandidateSHA, result.Reviewer)
 		if err != nil || !found || reviewledger.CloseableCardRef(req.Ref) == "" || reviewledger.CloseableCardRef(verdict.Task) != reviewledger.CloseableCardRef(req.Ref) {
-			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction review consent does not name this task")
+			return nil, fmt.Errorf("herd-merge-reconcile: review consent does not name this task")
 		}
 		readiness, err := g.Ledger.MergeReadinessFor(req.CandidateSHA)
 		if err != nil {
@@ -249,14 +259,16 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 	receipt.Seal()
 	path := hsync.ReceiptPath(g.RepoDir, receipt.TaskRef)
 	if existing, loadErr := hsync.LoadReceipt(path); loadErr == nil {
-		if existing.Digest != receipt.Digest {
+		if existing.Digest != receipt.Digest && req.PriorReceiptDigest == "" {
 			return nil, fmt.Errorf("herd-merge-reconcile: %s already holds a different receipt; refusing to overwrite", path)
 		}
-		return existing, nil
+		if req.PriorReceiptDigest == "" {
+			return existing, nil
+		}
 	} else if !os.IsNotExist(rootCause(loadErr)) {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s exists but could not be read: %w", path, loadErr)
 	}
-	if err := writeReceipt(g.RepoDir, receipt); err != nil {
+	if err := g.persistReconciledReceipt(req, receipt); err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: persist receipt: %w", err)
 	}
 	back, err := hsync.LoadReceipt(path)
@@ -476,4 +488,51 @@ func matchOrderedPatchSubsequence(want, got, landedCommits []string) (string, er
 // a landed parent. Both rebased-stack and squash proofs use this predicate.
 func replayReviewedTree(repoDir, base, parent, candidate string) (string, error) {
 	return gitOut(repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
+}
+
+// validatePriorReceipt does not grant review consent: the normal admission
+// path still runs afterward, and persistence performs a second exact CAS.
+func (g *Gate) validatePriorReceipt(req Request) error {
+	if reviewledger.CloseableCardRef(req.Ref) == "" {
+		return fmt.Errorf("follow-up requires an exact closeable task ref")
+	}
+	prior, err := hsync.LoadPriorReceipt(g.RepoDir, req.Ref, req.PriorReceiptDigest)
+	if err != nil {
+		return fmt.Errorf("prior receipt: %w", err)
+	}
+	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	if err != nil {
+		return err
+	}
+	if prior.Version != hsync.CompletionReceiptVersion || prior.RepoID != repoID || (prior.TaskID != "" && req.TaskID != prior.TaskID) || prior.Verdict != "PASS" || prior.IntegrationResult != hsync.IntegrationMerged {
+		return fmt.Errorf("prior receipt repository/task/completion identity mismatch")
+	}
+	if prior.CandidateSHA == req.CandidateSHA {
+		return fmt.Errorf("follow-up must name a new candidate")
+	}
+	if _, err := resolveCommit(g.RepoDir, prior.MergeSHA, "prior merge"); err != nil {
+		return err
+	}
+	if _, err := resolveCommit(g.RepoDir, req.BaseSHA, "follow-up reviewed base"); err != nil {
+		return err
+	}
+	if err := gitroot.RequireAncestor(g.RepoDir, prior.MergeSHA, req.BaseSHA); err != nil {
+		return fmt.Errorf("follow-up reviewed base does not contain prior delivery: %w", err)
+	}
+	// Even idempotent consumed replays must not ignore a later dissent.
+	ready, err := g.Ledger.MergeReadinessFor(req.CandidateSHA)
+	if err != nil {
+		return err
+	}
+	if !ready.Ready {
+		return fmt.Errorf("follow-up review is not ready: %s", ready.Reason)
+	}
+	return nil
+}
+
+func (g *Gate) persistReconciledReceipt(req Request, receipt *hsync.CompletionReceipt) error {
+	if req.PriorReceiptDigest == "" {
+		return writeReceipt(g.RepoDir, receipt)
+	}
+	return hsync.SupersedeReceipt(g.RepoDir, receipt, req.PriorReceiptDigest)
 }

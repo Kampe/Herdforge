@@ -44,6 +44,8 @@ var ErrRestartAdmission = errors.New("admission is stale: live state advanced, r
 // Admission does not default, infer, or look anything up from prose: a field
 // the caller cannot supply is a claim it cannot make.
 type Request struct {
+	// PriorReceiptDigest explicitly authorizes a history-preserving follow-up reconciliation.
+	PriorReceiptDigest string
 	// Ref is the board ticket ref, e.g. "FAC-156".
 	Ref string
 	// TaskID is the provider task id the work is bound to. Refs are re-minted

@@ -1058,6 +1058,7 @@ func runHarvestMerge() {
 	verifyTaskID := fs.String("task-id", "", "Provider task id (required with --verify-landed when no merge-admission is on disk)")
 	// --candidate is shared with the harvest path (registered above); a second
 	// fs.String here panics with "flag redefined" on every invocation.
+	priorReceipt := fs.String("supersedes-receipt", "", "Exact prior completion receipt digest; preserve history for an admitted landed follow-up")
 	verifyBaseSHA := fs.String("base-sha", "", "Base sha the candidate was reviewed against")
 	verifyLease := fs.String("lease", "", "Claim lease token bound into the ledger verdict")
 	verifyLeaseGen := fs.Int64("lease-generation", 0, "Claim lease generation bound into the completion receipt")
@@ -1088,9 +1089,14 @@ func runHarvestMerge() {
 
 	// FAC-213 + FAC-379: --verify-landed is the post-merge "did this merge?"
 	// check, then the sealed completion-receipt reconcile for approve.
+	if *priorReceipt != "" && !*verifyLanded {
+		fmt.Fprintln(os.Stderr, "--supersedes-receipt requires --verify-landed")
+		os.Exit(2)
+	}
 	if *verifyLanded {
 		binding := verifyLandedBinding{
-			Ref: *verifyRef, TaskID: *verifyTaskID, Candidate: *candidate,
+			PriorReceiptDigest: *priorReceipt,
+			Ref:                *verifyRef, TaskID: *verifyTaskID, Candidate: *candidate,
 			BaseSHA: *verifyBaseSHA, Lease: *verifyLease, LeaseGeneration: *verifyLeaseGen,
 			PatchID: *verifyPatchID, AcceptanceDigest: *verifyAcceptance,
 			AuthorFamily: *verifyAuthorFamily, AuthorIdentity: *verifyAuthorIdentity,
@@ -1731,6 +1737,7 @@ func min(a, b int) int {
 // sealed completion receipt after LandedProof. Prefer a recorded merge-admission
 // for --ref; otherwise every field must be supplied explicitly.
 type verifyLandedBinding struct {
+	PriorReceiptDigest                                          string
 	ReconstructionSHA, ReconstructionBase, ReconstructionDigest string
 	Ref, TaskID, Candidate, BaseSHA                             string
 	Lease, PatchID, AcceptanceDigest                            string
@@ -1810,6 +1817,7 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 			return mergeadmit.Request{}, fmt.Errorf("reconstruction cannot replace an existing full merge admission")
 		}
 		req := rec.Request
+		req.PriorReceiptDigest = binding.PriorReceiptDigest
 		if strings.TrimSpace(req.CandidateSHA) == "" {
 			req.CandidateSHA = candidate
 		}
@@ -1820,7 +1828,8 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 	}
 
 	req := mergeadmit.Request{
-		Ref: ref, TaskID: binding.TaskID, ProviderRevision: binding.ProviderRevision,
+		PriorReceiptDigest: binding.PriorReceiptDigest,
+		Ref:                ref, TaskID: binding.TaskID, ProviderRevision: binding.ProviderRevision,
 		AcceptanceDigest: binding.AcceptanceDigest, CandidateSHA: candidate,
 		BaseSHA: binding.BaseSHA, Lease: binding.Lease, LeaseGeneration: binding.LeaseGeneration,
 		PatchURL: binding.PatchID, AuthorFamily: binding.AuthorFamily,
