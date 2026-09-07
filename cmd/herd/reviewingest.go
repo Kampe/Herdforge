@@ -19,7 +19,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
-	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
@@ -49,6 +48,15 @@ func runReviewIngest() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
 		os.Exit(2)
+	}
+
+	if parsed.ackOnly {
+		ackRoots := roots
+		ackRoots.LedgerPath = parsed.ledgerPath
+		if err := ackRoots.requireMutationSafe(); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Resolve the review corpus ONCE, before any branch, and say which one it
@@ -131,7 +139,7 @@ func runReviewIngest() {
 	}
 
 	var ledger reviewIngestLedger
-	if parsed.dryRun {
+	if parsed.dryRun || parsed.ackOnly {
 		ledger, err = reviewledger.NewReadOnlyReviewLedger(projectRoot, parsed.ledgerPath)
 	} else {
 		ledger, err = reviewledger.NewReviewLedger(projectRoot, parsed.ledgerPath)
@@ -148,6 +156,19 @@ func runReviewIngest() {
 		if err != nil {
 			emit.refused(f, err)
 			refused++
+			continue
+		}
+		if parsed.ackOnly {
+			if err := recoverReviewArtifactAck(projectRoot, ledger, body, parsed.dryRun); err != nil {
+				emit.refused(f, err)
+				refused++
+				continue
+			}
+			disposition := "acknowledged"
+			if parsed.dryRun {
+				disposition = "would_acknowledge"
+			}
+			emit.record(reviewIngestOutcome{Artifact: filepath.Base(f), Path: f, Disposition: disposition}, fmt.Sprintf("%s %s\n", disposition, filepath.Base(f)), false)
 			continue
 		}
 		a := reviewingest.Parse(string(body))
@@ -419,11 +440,9 @@ func runReviewIngest() {
 			// FAC-586: durable ack that canonical ingest admitted this artifact.
 			// Remote-ref transport and ledger admission are distinct; review hosts
 			// must not retire residents on transport alone.
-			if ackErr := reviewack.Emit(projectRoot, reviewack.Ack{
-				SHA: a.SHA, Reviewer: a.Reviewer, ArtifactDigest: reviewack.ArtifactDigest(body),
-				LaunchIdentity: a.Reviewer,
-			}); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "review-ingest: ADMITTED %s but ingest ack emit failed: %v\n", a.SHA[:12], ackErr)
+			if ackErr := recoverReviewArtifactAck(projectRoot, ledger, body, false); ackErr != nil {
+				fmt.Fprintf(os.Stderr, "review-ingest: ADMITTED %s but ingest ack emit failed: %v; recover with --ack-only on the exact retained artifact\n", a.SHA[:12], ackErr)
+				refused++
 			}
 			postReviewCompleteCallback(projectRoot, a.SHA, a.Branch, a.Reviewer, a.Verdict)
 			reclaimReviewPoolSlotFor(a.SHA)
@@ -445,7 +464,8 @@ func runReviewIngest() {
 }
 
 type reviewIngestArgs struct {
-	dryRun bool
+	dryRun  bool
+	ackOnly bool
 	// sweep discovers the uningested artifacts itself instead of requiring the
 	// caller to enumerate them (FAC-606).
 	sweep      bool
@@ -479,6 +499,8 @@ func parseReviewIngestArgs(args []string, roots reviewIngestRoots) (reviewIngest
 			continue
 		}
 		switch {
+		case arg == "--ack-only":
+			parsed.ackOnly = true
 		case arg == "--json" || arg == "-json":
 			parsed.asJSON = true
 		case arg == "--dry-run" || arg == "-dry-run":
@@ -506,6 +528,9 @@ func parseReviewIngestArgs(args []string, roots reviewIngestRoots) (reviewIngest
 		default:
 			return reviewIngestArgs{}, fmt.Errorf("unknown flag %q", arg)
 		}
+	}
+	if parsed.ackOnly && (parsed.sweep || parsed.audit || len(parsed.files) != 1) {
+		return reviewIngestArgs{}, fmt.Errorf("--ack-only requires exactly one artifact and cannot sweep or audit")
 	}
 	if parsed.sweep && parsed.audit {
 		return reviewIngestArgs{}, fmt.Errorf("--sweep and --audit are mutually exclusive")
