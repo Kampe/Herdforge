@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
@@ -219,20 +220,35 @@ func TestHostLabelledHarvestSelectsExactBranchBoundPass(t *testing.T) {
 	if fac652 == fac670 {
 		t.Fatal("fixture must produce two distinct candidates")
 	}
+	// Merge the off-branch SHA into the harvest target so BOTH commits are
+	// reachable. Without this, reachableFromBranch already excludes the other
+	// SHA and latestExact is never compared (the f88780fa W4 FAIL).
+	gitCandidateTest(t, "checkout", "-q", "herd/fac-652")
+	gitCandidateTest(t, "merge", "-q", "--no-ff", "-m", "merge fac-670", "herd/fac-670")
+	if !reachableFromBranch(root, fac652, "herd/fac-652") {
+		t.Fatal("target branch must still reach its own candidate")
+	}
+	if !reachableFromBranch(root, fac670, "herd/fac-652") {
+		t.Fatal("off-branch SHA must remain reachable from the target tip, otherwise ancestry alone explains the selection")
+	}
 
 	l, err := reviewledger.NewReviewLedger(root, filepath.Join(root, ".herd", "review-ledger.jsonl"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
-	addHostLabelledPass(t, l, fac670, "herd/fac-670", "local", "review-fac-670", "google", "openai")
+	// Earlier exact-branch PASS, later off-branch PASS. Timestamp-only latest
+	// would pick fac670; latestExact must keep herd/fac-652.
+	l.Now = func() time.Time { return time.Date(2026, 9, 7, 1, 0, 0, 0, time.UTC) }
 	addHostLabelledPass(t, l, fac652, "herd/fac-652", "w4", "review-fac-652-2a3a20d57ba7", "anthropic", "openai")
+	l.Now = func() time.Time { return time.Date(2026, 9, 7, 2, 0, 0, 0, time.UTC) }
+	addHostLabelledPass(t, l, fac670, "herd/fac-670", "local", "review-fac-670", "google", "openai")
 
 	got, err := resolveHarvestCandidateWithReconstructionAt(root, "herd/fac-652", "", "", "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if got.LastPassSHA == fac670 {
-		t.Fatalf("selected FAC-670 %s instead of branch-bound FAC-652", fac670)
+		t.Fatalf("timestamp-only latest selected FAC-670 %s; latestExact must keep branch-bound FAC-652", fac670)
 	}
 	if got.LastPassSHA != fac652 {
 		t.Fatalf("last pass = %q, want FAC-652 branch-bound %q", got.LastPassSHA, fac652)
