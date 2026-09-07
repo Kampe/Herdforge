@@ -34,6 +34,9 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 	if g.Ledger == nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: no review ledger configured; with no ledger there is no verdict, and no verdict is not a PASS")
 	}
+	if req.Reconstruction != nil && req.ReducedProvenance == nil {
+		return nil, fmt.Errorf("reconstruction requires explicit reduced-provenance reconciliation")
+	}
 	if req.ReducedProvenance != nil {
 		return g.reconcileLandedReduced(req)
 	}
@@ -193,7 +196,18 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 	if rep := preflight.CheckMergePolicy(g.Policy); !rep.OK {
 		return nil, fmt.Errorf("herd-merge-reconcile: autonomous merge refused: %s", strings.Join(rep.Reasons, "; "))
 	}
-	result, ledgerErr := g.Ledger.AdmitReduced(reviewledger.ReducedAdmissionOpts{CandidateSHA: req.CandidateSHA})
+	admission := reviewledger.ReducedAdmissionOpts{CandidateSHA: req.CandidateSHA}
+	if req.Reconstruction != nil {
+		existing, err := hsync.LoadReceipt(hsync.ReceiptPath(g.RepoDir, hsync.NormalizeRef(req.Ref)))
+		if err == nil && existing.Digest != "" && existing.Digest == existing.ComputeDigest() &&
+			existing.TaskRef == hsync.NormalizeRef(req.Ref) && existing.CandidateSHA == req.CandidateSHA &&
+			existing.BaseSHA == req.BaseSHA && existing.ReconstructedSHA == req.Reconstruction.SHA &&
+			existing.ReconstructionBaseSHA == req.Reconstruction.BaseSHA &&
+			existing.ReconstructionDigest == req.Reconstruction.AttestationDigest && existing.PullRequest == rp.PullRequest {
+			admission.ReconcileConsumedMergeSHA = existing.MergeSHA
+		}
+	}
+	result, ledgerErr := g.Ledger.AdmitReduced(admission)
 	if result == nil || !result.Admitted {
 		reason := "review ledger refused this candidate"
 		if result != nil && result.Reason != "" {
@@ -203,11 +217,28 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 		}
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %s", CodeLedgerRefused, reason)
 	}
+	if req.Reconstruction != nil {
+		verdict, found, err := g.Ledger.VerdictForReviewer(req.CandidateSHA, result.Reviewer)
+		if err != nil || !found || reviewledger.CloseableCardRef(req.Ref) == "" || reviewledger.CloseableCardRef(verdict.Task) != reviewledger.CloseableCardRef(req.Ref) {
+			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction review consent does not name this task")
+		}
+		readiness, err := g.Ledger.MergeReadinessFor(req.CandidateSHA)
+		if err != nil {
+			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction readiness: %w", err)
+		}
+		if !readiness.Ready {
+			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction current verdict gate refused: %s", readiness.Reason)
+		}
+	}
 	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}
-	proof, err := ProveEquivalentLanded(g.RepoDir, ProofRequest{BaseSHA: req.BaseSHA, CandidateSHA: req.CandidateSHA, LandedSHA: landed})
+	contentBase, contentSHA, err := g.reconstructionContent(req)
+	if err != nil {
+		return nil, fmt.Errorf("herd-merge-reconcile: reconstruction: %w", err)
+	}
+	proof, err := ProveEquivalentLanded(g.RepoDir, ProofRequest{BaseSHA: contentBase, CandidateSHA: contentSHA, LandedSHA: landed})
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %w", CodeProofFailed, err)
 	}
@@ -216,6 +247,13 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 		return nil, fmt.Errorf("herd-merge-reconcile: resolve repository identity: %w", err)
 	}
 	receipt := &hsync.CompletionReceipt{RepoID: repoID, TaskRef: hsync.NormalizeRef(req.Ref), BaseSHA: proof.BaseSHA, CandidateSHA: proof.CandidateSHA, MergeSHA: proof.MergeSHA, PatchID: proof.PatchID, VerificationDigest: result.VerificationDigest, RiskTier: result.Tier, AuthorFamily: result.AuthorFamily, ReviewerFamily: result.ReviewerFamily, Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged, ProvenanceMode: hsync.ProvenanceReduced, PullRequest: rp.PullRequest}
+	if req.Reconstruction != nil {
+		receipt.CandidateSHA = req.CandidateSHA
+		receipt.BaseSHA = req.BaseSHA
+		receipt.ReconstructedSHA = contentSHA
+		receipt.ReconstructionBaseSHA = contentBase
+		receipt.ReconstructionDigest = req.Reconstruction.AttestationDigest
+	}
 	receipt.Seal()
 	path := hsync.ReceiptPath(g.RepoDir, receipt.TaskRef)
 	if existing, loadErr := hsync.LoadReceipt(path); loadErr == nil {

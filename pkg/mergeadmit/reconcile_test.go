@@ -588,3 +588,93 @@ func TestReconcileLandedEmptyMergeTipRefusesWithoutExactPASS(t *testing.T) {
 		})
 	}
 }
+
+func TestReconcileReconstructedConsent(t *testing.T) {
+	dir := gitRepo(t)
+	base := commit(t, dir, "docs.md", "heading\n", "base")
+	run(t, dir, "git", "checkout", "-q", "-b", "reviewed")
+	candidate := commit(t, dir, "docs.md", "heading\nreviewed row\n", "reviewed")
+	run(t, dir, "git", "checkout", "-q", "-b", "reconstructed", base)
+	newBase := commit(t, dir, "docs.md", "heading\nnew context\n", "context")
+	rebuilt := commit(t, dir, "docs.md", "heading\nnew context\nreviewed row\n", "reanchor")
+	l := newLedger(t, dir)
+	launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
+	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
+	if err := l.Reconstruction(reviewledger.ReconstructionOpts{SHA: rebuilt, CandidateSHA: candidate, ContentProof: "same row reanchored"}); err != nil {
+		t.Fatal(err)
+	}
+	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(rebuilt)}}
+	req := Request{Ref: testRef, CandidateSHA: candidate, BaseSHA: base, ReducedProvenance: &ReducedProvenance{PullRequest: 1, VerifyLanded: true}, Reconstruction: &ReconstructionBinding{SHA: rebuilt, BaseSHA: newBase, AttestationDigest: ""}}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Event == string(reviewledger.EventReconstruction) {
+			req.Reconstruction.AttestationDigest = ReconstructionDigest(row)
+		}
+	}
+	for name, mutate := range map[string]func(*Request){
+		"missing proof":            func(q *Request) { q.Reconstruction.AttestationDigest = "" },
+		"tampered proof":           func(q *Request) { q.Reconstruction.AttestationDigest = strings.Repeat("0", 64) },
+		"wrong task":               func(q *Request) { q.Ref = "FAC-999" },
+		"wrong original":           func(q *Request) { q.CandidateSHA = base },
+		"unrelated reconstruction": func(q *Request) { q.Reconstruction.SHA = base },
+		"wrong base":               func(q *Request) { q.Reconstruction.BaseSHA = candidate },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := req
+			binding := *req.Reconstruction
+			bad.Reconstruction = &binding
+			mutate(&bad)
+			if _, err := g.ReconcileLanded(bad); err == nil {
+				t.Fatal("invalid reconstruction admitted")
+			}
+			if _, err := os.Stat(hsync.ReceiptPath(dir, testRef)); !os.IsNotExist(err) {
+				t.Fatal("refusal wrote receipt")
+			}
+		})
+	}
+	receipt, err := g.ReconcileLanded(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.CandidateSHA != candidate || receipt.ReconstructedSHA != rebuilt || receipt.ReconstructionDigest != req.Reconstruction.AttestationDigest {
+		t.Fatalf("identities lost: %+v", receipt)
+	}
+	again, err := g.ReconcileLanded(req)
+	if err != nil || again.Digest != receipt.Digest {
+		t.Fatalf("reconciliation replay: %v", err)
+	}
+	launch(t, l, candidate, "reviewer-b", "anthropic", "builder-session-1")
+	verdict(t, l, candidate, "reviewer-b", reviewledger.VerdictFAIL)
+	if _, err := g.ReconcileLanded(req); err == nil {
+		t.Fatal("existing receipt bypassed current reviewer dissent")
+	}
+}
+
+func TestReconstructionRejectsAlteredBlobs(t *testing.T) {
+	for _, path := range []string{"code.go", "docs.md"} {
+		t.Run(path, func(t *testing.T) {
+			dir := gitRepo(t)
+			base := commit(t, dir, path, "base\n", "base")
+			run(t, dir, "git", "checkout", "-q", "-b", "reviewed")
+			candidate := commit(t, dir, path, "reviewed\n", "reviewed")
+			run(t, dir, "git", "checkout", "-q", "-b", "rebuilt", base)
+			rebuilt := commit(t, dir, path, "unreviewed\n", "tampered")
+			l := newLedger(t, dir)
+			if err := l.Reconstruction(reviewledger.ReconstructionOpts{SHA: rebuilt, CandidateSHA: candidate, ContentProof: "claimed equal"}); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := l.AllRows()
+			if err != nil {
+				t.Fatal(err)
+			}
+			g := &Gate{RepoDir: dir, Ledger: l}
+			req := Request{BaseSHA: base, CandidateSHA: candidate, Reconstruction: &ReconstructionBinding{BaseSHA: base, SHA: rebuilt, AttestationDigest: ReconstructionDigest(rows[len(rows)-1])}}
+			if _, _, err := g.reconstructionContent(req); err == nil {
+				t.Fatal("attestation admitted altered content")
+			}
+		})
+	}
+}

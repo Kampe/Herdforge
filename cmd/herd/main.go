@@ -51,6 +51,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/lost"
 	"github.com/Kampe/Herdforge/pkg/mail"
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/next"
 	"github.com/Kampe/Herdforge/pkg/outbox"
 	"github.com/Kampe/Herdforge/pkg/overlap"
@@ -7978,6 +7979,31 @@ func runReviewLedger() {
 			os.Exit(1)
 		}
 
+	case "reconstruction-digest":
+		if len(os.Args) != 5 {
+			fmt.Fprintln(os.Stderr, "Usage: herd review-ledger reconstruction-digest <reviewed-sha> <reconstructed-sha>")
+			os.Exit(2)
+		}
+		rows, err := l.AllRows()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		found := false
+		for _, row := range rows {
+			if row.Event != string(reviewledger.EventReconstruction) || row.CandidateSHA != os.Args[3] || row.SHA != os.Args[4] {
+				continue
+			}
+			found = true
+			if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"reviewed_sha": row.CandidateSHA, "reconstructed_sha": row.SHA, "digest": mergeadmit.ReconstructionDigest(row), "content_proof": row.ContentProof}); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+		if !found {
+			fmt.Fprintln(os.Stderr, "review-ledger: exact reconstruction attestation not found")
+			os.Exit(1)
+		}
 	case "verdict-digest":
 		if len(os.Args) != 5 {
 			fmt.Fprintln(os.Stderr, "Usage: herd review-ledger verdict-digest <sha> <reviewer>")
