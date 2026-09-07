@@ -63,6 +63,7 @@ type JournalEntry struct {
 type Journal struct {
 	ProviderRevision string         `json:"provider_revision"`
 	StartedAt        string         `json:"started_at"`
+	Status           string         `json:"status,omitempty"`
 	Entries          []JournalEntry `json:"entries"`
 }
 
@@ -585,19 +586,21 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		}
 	}
 	ctx, _ = WithSnapshotFence(ctx)
+	phases := deriveMigrationPhases(ctx)
+	defer phases.cancel()
 	plan := &MigratePlan{ProjectID: projectID, OK: true, Mode: "apply-description"}
 	var base *MigratePlan
 	var err error
 	if taskRef == "" {
-		base, err = PlanMigration(ctx, store, tp, projectID)
+		base, err = PlanMigration(phases.planning, store, tp, projectID)
 	} else {
-		base, err = PlanMigrationForRef(ctx, store, tp, projectID, taskRef)
+		base, err = PlanMigrationForRef(phases.planning, store, tp, projectID, taskRef)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, migrationTimeout(ctx, "pre-mutation", taskRef, len(base.Items), 0, 0, err)
+	if err := phases.planning.Err(); err != nil {
+		return nil, migrationTimeout(phases.planning, "pre-mutation", taskRef, len(base.Items), 0, 0, err)
 	}
 	plan.ProviderRevision = base.ProviderRevision
 
@@ -620,8 +623,8 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			fmt.Fprintf(os.Stderr, "herd deps migrate apply: processed %d/%d cards (current=%s)\n", processed, len(base.Items), planned.Ref)
 		}
 		item := planned
-		if err := ctx.Err(); err != nil {
-			return plan, migrationTimeout(ctx, "pre-mutation", item.Ref, processed-1, 0, len(base.Items)-processed+1, err)
+		if err := phases.mutation.Err(); err != nil {
+			return plan, migrationTimeout(phases.mutation, "pre-mutation", item.Ref, processed-1, 0, len(base.Items)-processed+1, err)
 		}
 		if item.Action != "write_empty" && item.Action != "write_from_board" && item.Action != "repair_stale" {
 			plan.Items = append(plan.Items, item)
@@ -630,9 +633,9 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		var t *provider.Task
 		var gerr error
 		if taskRef != "" {
-			t, gerr = resolveMigrationTask(ctx, tp, projectID, taskRef, item.TaskID)
+			t, gerr = resolveMigrationTask(phases.mutation, tp, projectID, taskRef, item.TaskID)
 		} else {
-			t, gerr = tp.GetTask(ctx, item.TaskID)
+			t, gerr = tp.GetTask(phases.mutation, item.TaskID)
 		}
 		if gerr != nil || t == nil {
 			item.Action = "error"
@@ -650,9 +653,9 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		var snap *GraphSnapshot
 		var serr error
 		if scoped, ok := store.(scopedSnapshotter); ok {
-			snap, serr = snapshotForTaskMigration(ctx, scoped, t)
+			snap, serr = snapshotForTaskMigration(phases.mutation, scoped, t)
 		} else {
-			snap, serr = snapshotForMigration(ctx, store)
+			snap, serr = snapshotForMigration(phases.mutation, store)
 		}
 		if serr != nil {
 			item.Action = "error"
@@ -682,7 +685,7 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			plan.ProviderRevision = snap.ProviderRevision
 			journal.ProviderRevision = snap.ProviderRevision
 		}
-		before, berr := writer.GetDescription(ctx, t.ID)
+		before, berr := writer.GetDescription(phases.mutation, t.ID)
 		if berr != nil {
 			// Fallback to task description field.
 			before = t.Description
@@ -709,9 +712,9 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			plan.Items = append(plan.Items, item)
 			continue
 		}
-		if err := ctx.Err(); err != nil {
+		if err := phases.mutation.Err(); err != nil {
 			item.Action = "error"
-			item.Detail = migrationTimeout(ctx, "pre-mutation", item.Ref, processed, 0, len(base.Items)-processed, err).Error()
+			item.Detail = migrationTimeout(phases.mutation, "pre-mutation", item.Ref, processed, 0, len(base.Items)-processed, err).Error()
 			plan.OK = false
 			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
 			plan.Items = append(plan.Items, item)
@@ -730,9 +733,9 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			continue
 		}
 
-		if setErr := writer.SetDescription(ctx, t.ID, newDesc); setErr != nil {
+		if setErr := writer.SetDescription(phases.mutation, t.ID, newDesc); setErr != nil {
 			ambiguous := provider.IsTimeout(setErr) || provider.IsAmbiguous(setErr)
-			recovery, recoveryErr := reconcileMigrationDescriptionWrite(ctx, writer, t.ID, before, newDesc, ambiguous)
+			recovery, recoveryErr := reconcileMigrationDescriptionWrite(phases.mutation, writer, t.ID, before, newDesc, ambiguous)
 			if ambiguous && recovery.Landed && !recovery.RolledBack && recoveryErr == nil {
 				item.Detail = "set description timeout reconciled by exact readback"
 			} else {
@@ -740,7 +743,15 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 				item.Detail = "set description: " + setErr.Error()
 				item.Applied = recovery.Landed
 				if recoveryErr != nil {
-					item.Detail += "; ambiguous-write rollback failed: " + recoveryErr.Error()
+					item.Detail += "; rollback_pending: " + recoveryErr.Error()
+					journal.Status = JournalStatusRollbackPending
+					if jerr := writeJournal(jPath, journal); jerr != nil {
+						item.Detail += "; rollback journal: " + jerr.Error()
+					}
+					plan.OK = false
+					plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+					plan.Items = append(plan.Items, item)
+					return plan, &RollbackPendingError{Ref: item.Ref, JournalPath: jPath, Cause: recoveryErr}
 				} else if recovery.RolledBack {
 					item.RolledBack = true
 					journal.Entries[len(journal.Entries)-1].RolledBack = true
@@ -759,26 +770,11 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		journal.Entries[len(journal.Entries)-1].AppliedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		if jerr := writeJournal(jPath, journal); jerr != nil && taskRef != "" {
 			item.Detail = "journal applied image: " + jerr.Error()
-			if rbErr := rollbackMigrationDescription(ctx, writer, t.ID, before); rbErr != nil {
-				item.Detail += "; rollback failed: " + rbErr.Error()
-			} else {
-				item.RolledBack = true
-			}
-			plan.OK = false
-			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
-			plan.Items = append(plan.Items, item)
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			item.Detail = "post-mutation cancellation: " + migrationTimeout(ctx, "readback", item.Ref, processed, 0, len(base.Items)-processed, err).Error()
-			if rbErr := rollbackMigrationDescription(ctx, writer, t.ID, before); rbErr != nil {
-				item.Detail += "; rollback failed: " + rbErr.Error()
-			} else {
-				item.RolledBack = true
-				journal.Entries[len(journal.Entries)-1].RolledBack = true
-				if jerr := writeJournal(jPath, journal); jerr != nil {
-					item.Detail += "; rollback journal: " + jerr.Error()
-				}
+			if rbErr := finishMigrationRollback(phases.rollback, writer, t.ID, before, jPath, &journal, &item); rbErr != nil {
+				plan.OK = false
+				plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+				plan.Items = append(plan.Items, item)
+				return plan, rbErr
 			}
 			plan.OK = false
 			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
@@ -786,20 +782,27 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			continue
 		}
 
-		// Semantic readback: Present + bind + exact multiset edges.
-		after, rerr := writer.GetDescription(ctx, t.ID)
-		if rerr != nil {
+		// Semantic readback uses the readback phase, which may expire independently
+		// of rollback. Empty readback is never success.
+		after, rerr := writer.GetDescription(phases.readback, t.ID)
+		unknown := readbackUnknown(rerr)
+		if unknown {
+			item.Detail = "readback UNKNOWN: " + rerr.Error()
+			after = ""
+		} else if rerr != nil {
 			after = ""
 		}
-		if after == "" {
-			// re-get task
-			if fresh, ferr := tp.GetTask(ctx, t.ID); ferr == nil && fresh != nil {
+		if !unknown && after == "" {
+			if fresh, ferr := tp.GetTask(phases.readback, t.ID); ferr == nil && fresh != nil {
 				after = fresh.Description
 			}
 		}
-		got, xerr := ExtractProvenanceFromText(after)
 		okRB := false
-		if xerr != nil {
+		if unknown {
+			okRB = false
+		} else if after == "" {
+			item.Detail = "readback missing fence"
+		} else if got, xerr := ExtractProvenanceFromText(after); xerr != nil {
 			item.Detail = "readback extract: " + xerr.Error()
 		} else if got == nil || !got.Present {
 			item.Detail = "readback missing fence"
@@ -819,10 +822,14 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 				okRB = false
 				item.ReadbackOK = false
 				item.Detail = "provider readback: scoped relation snapshot capability missing"
-			} else if confirm, cerr := snapshotForTaskMigration(ctx, scoped, t); cerr != nil {
+			} else if confirm, cerr := snapshotForTaskMigration(phases.readback, scoped, t); cerr != nil {
 				okRB = false
 				item.ReadbackOK = false
-				item.Detail = "provider readback: " + cerr.Error()
+				if readbackUnknown(cerr) {
+					item.Detail = "readback UNKNOWN: " + cerr.Error()
+				} else {
+					item.Detail = "provider readback: " + cerr.Error()
+				}
 			} else if confirm.ProviderRevision != snap.ProviderRevision {
 				okRB = false
 				item.ReadbackOK = false
@@ -834,22 +841,42 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 			}
 		}
 		if !okRB {
-			// Rollback this card from journal before-image.
-			if rbErr := rollbackMigrationDescription(ctx, writer, t.ID, before); rbErr != nil {
-				item.Detail += "; rollback failed: " + rbErr.Error()
-			} else {
-				item.RolledBack = true
-				journal.Entries[len(journal.Entries)-1].RolledBack = true
-				if jerr := writeJournal(jPath, journal); jerr != nil && taskRef != "" {
-					item.Detail += "; rollback journal: " + jerr.Error()
-				}
+			if rbErr := finishMigrationRollback(phases.rollback, writer, t.ID, before, jPath, &journal, &item); rbErr != nil {
+				plan.OK = false
+				plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+				plan.Items = append(plan.Items, item)
+				return plan, rbErr
 			}
 			plan.OK = false
 			plan.Errors = append(plan.Errors, item.Ref+": "+item.Detail)
+		} else {
+			journal.Status = JournalStatusApplied
+			_ = writeJournal(jPath, journal)
 		}
 		plan.Items = append(plan.Items, item)
 	}
 	return plan, nil
+}
+
+func finishMigrationRollback(rollbackCtx context.Context, writer DescriptionWriter, taskID, before, jPath string, journal *Journal, item *MigrateItem) error {
+	rbErr := rollbackMigrationDescription(rollbackCtx, writer, taskID, before)
+	if rbErr != nil {
+		item.Detail += "; rollback_pending: " + rbErr.Error()
+		journal.Status = JournalStatusRollbackPending
+		if jerr := writeJournal(jPath, *journal); jerr != nil {
+			item.Detail += "; rollback journal: " + jerr.Error()
+		}
+		return &RollbackPendingError{Ref: item.Ref, JournalPath: jPath, Cause: rbErr}
+	}
+	item.RolledBack = true
+	journal.Status = JournalStatusRolledBack
+	if len(journal.Entries) > 0 {
+		journal.Entries[len(journal.Entries)-1].RolledBack = true
+	}
+	if jerr := writeJournal(jPath, *journal); jerr != nil {
+		item.Detail += "; rollback journal: " + jerr.Error()
+	}
+	return nil
 }
 
 func rollbackMigrationDescription(ctx context.Context, writer DescriptionWriter, taskID, before string) error {
@@ -866,7 +893,12 @@ func migrationRecoveryContext(ctx context.Context) (context.Context, context.Can
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithTimeout(context.WithoutCancel(ctx), DefaultMigrationRollbackBudget)
+	if ctx.Err() == nil {
+		if _, ok := ctx.Deadline(); ok {
+			return ctx, func() {}
+		}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), migrationRollbackBudget(ctx))
 }
 
 func reconcileMigrationDescriptionWrite(ctx context.Context, writer DescriptionWriter, taskID, before, after string, acceptLanded bool) (migrationWriteRecovery, error) {

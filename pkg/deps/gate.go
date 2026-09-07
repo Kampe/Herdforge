@@ -47,9 +47,10 @@ type GateResult struct {
 
 // hardSelectionCodes fail the whole SelectEligibleRefs run (never "zero eligible").
 var hardSelectionCodes = map[string]bool{
-	"capability": true,
-	"stale":      true,
-	"unresolved": true, // store-level when task itself unreadable mid-select
+	"capability":       true,
+	"stale":            true,
+	"unresolved":       true, // store-level when task itself unreadable mid-select
+	"rollback_pending": true,
 }
 
 // ValidateLaunch is the PRE-SIDE-EFFECT gate. Call before any worktree create,
@@ -91,6 +92,9 @@ func ValidateLaunch(
 	taskRef = Ref(strings.TrimSpace(string(taskRef)))
 	if !taskRef.Valid() {
 		return nil, &BlockedError{Ref: taskRef, Code: "unresolved", Reason: "empty task ref"}
+	}
+	if err := RefusePendingRollback(""); err != nil {
+		return nil, &BlockedError{Ref: taskRef, Code: "rollback_pending", Reason: err.Error()}
 	}
 
 	// Provenance is mandatory for launch eligibility.
