@@ -1,65 +1,96 @@
-sha: <the 40-hex commit id this verdict is ABOUT>
-
-Routing and persistence are defined in `.herd/prompts/routing.md`; deliver only to the standing review supervisor.
-branch: <the branch the candidate lives on>
-task: <the board card this review is ABOUT, e.g. CHA-2345 — omit only if there is genuinely no card>
-reviewer: <your lane name — never a coordinator>
-reviewer-family: <your model family: anthropic|openai|google|xai|moonshot|...>
-builder-family: <the AUTHOR's family — must differ from yours>
+sha: <the exact 40-hex candidate commit this verdict is about>
+branch: <the candidate branch from the review packet>
+task: <the exact board card ref from the review packet>
+reviewer: <your authenticated reviewer lane name, never a coordinator>
+reviewer-family: <your actual model family, not the harness brand>
+builder-family: <the author family proven by the admitted review packet>
 verdict: PASS | FAIL | BLOCKED
-reviewed-head: <output of `git rev-parse HEAD` in the tree you actually read>
-retry-of: <optional prior reviewer lane for an exact-head retry>
+reviewed-base: <the exact 40-hex diff base you independently reviewed>
+reviewed-head: <git rev-parse HEAD in the tree you actually read; must equal sha>
+retry-of: <optional prior reviewer lane for an exact-head retry; otherwise omit this line>
+reassesses: <optional prior verdict-event digest for authenticated reassessment; otherwise omit this line>
 ---
-Your evidence goes here, below the `---`.
+## Findings and risk
 
-Declare the card in the `task:` header. Without it the ledger row records only
-sha+verdict, so the verdict cannot be tied back to a card and a corrupted board
-cannot be rebuilt from review history. A bare card ref mentioned in this body is
-NOT attribution — reviews routinely cite sibling cards, and harvesting a
-mention credits the wrong work.
+{{review-evidence}}
 
-Read `.herd/prompts/routing.md`; deliver only to its current supervisor target.
+## Tests run
 
-Delivery: send this verdict and its findings to the standing review supervisor. The coordinator receives only the supervisor's merge-ready PASS handoff.
+{{executed-verification}}
 
-Use the named live-pane route `herd send <agent> --file <path>` for a report,
-or the durable fallback `herd mail send --from <self> --to <peer> --file
-<path>` when pane delivery is unavailable. A queued durable copy is a
-successful delivery. Do not send verdicts through repository
-`bin/herd-*` scripts or directly to the coordinator. The supervisor owns the
-exact-SHA ledger row, retry loop, author feedback, and reviewer-tab cleanup.
+## Author instructions
 
-Coordinator retirement artifacts use `verdict: RETIRED` and
-`authority: <coordinator name>`. RETIRED settles a branch for audit/drain
-purposes; it is not an independent review verdict.
+Replace every placeholder with your own evidence; remove unused optional header
+lines. The template itself is not a verdict or verification evidence. Keep all
+headers together before `---`: no title, routing sentence or other prose may
+interrupt the leading metadata block. A single opening `---` is also accepted.
 
-# The accepted keys above (plus `authority` for RETIRED) are the COMPLETE set
+In Findings and risk, record the exact reviewed range, risk floor from
+`herd review-classify`, acceptance criteria, numbered findings and residual
+risks. Do not lower the classifier floor. For R3, explicitly assess the required
+high-risk gates against concrete evidence. Supply at least 200 non-whitespace
+characters of independent reasoning, including for FAIL and BLOCKED.
 
-`herd review-ingest` refuses an artifact carrying any other key. That is
-deliberate: a misspelled `reviewed-head` silently disables the gate that catches
-a reviewer grading the wrong tree, and a key nothing reads surfaces nothing at
-all. If you need to record something else, put it in this body.
+In Tests run, replace the placeholder with commands you actually executed and
+their observed outcomes, failures, limitations and any RED/GREEN mutation proof.
+If you executed no checks, leave that section empty and state the limitation in
+Findings and risk; do not manufacture a digest or count these instructions as
+verification. The parser also recognizes Verification, Verification evidence,
+and Commands run. Headings such as Tests or Tests & Invariants are not aliases.
+Package checks do not establish full-suite coverage. A builder or CI full-suite
+receipt is separate evidence: identify its exact candidate and scope outside
+Tests run, rather than representing its commands as your own execution.
 
-## Rules the gate enforces, and why each exists
+## Identity and optional metadata
 
-- **Front matter is the LEADING block.** No title, no prose above it. A line
-  like `Reviewer: see the assignment below` lowercases to a real key and would
-  otherwise shadow the honest header beneath it.
-- **No key twice with different values.** Neither first-wins nor last-wins is
-  safe — one admits `verdict: FAIL` followed by `verdict: PASS`, the other
-  admits the shadowing above. Ambiguity is refused rather than resolved.
-- **A coordinator may never be the reviewer.** Self-verification does not
-  qualify at any risk tier.
-- **reviewer-family must differ from builder-family.** Same family is not an
-  independent read.
-- **reviewed-head must equal sha.** It is provenance, not proof — you could
-  write anything. But you review from a disposable worktree checked out AT the
-  pin, so a truthful reviewer reports it without effort and a wandering one has
-  to state a mismatch or lie outright. Omitting it is tolerated for older
-  reviewers; a stated mismatch never is.
-- **The body must carry at least 200 characters of non-whitespace evidence.**
-  A verdict with no reasoning is not a review. This applies to FAIL and BLOCKED
-  too: a bare rejection is unactionable.
+Use `task:` for the exact card this review is about. A mention of a sibling card
+in the body is not an explicit task binding. Parser compatibility aliases are
+`task-id`, `card`, and `ticket`; prefer the canonical `task` spelling.
 
-A value may contain a colon (`branch: feat/thing:sub` parses correctly) — only
-the first colon on a line separates key from value.
+Record `reviewed-base` from the diff you actually assessed and `reviewed-head`
+from the pinned worktree. Do not substitute a candidate's parent for a reviewed
+base you did not inspect. A stated head mismatch is refused. Legacy artifacts
+may omit these fields at some gates; new completion-ready reviews need truthful
+exact bindings.
+
+Model family and harness name are different concepts: an AGY session can run an
+Anthropic model. Use authenticated model provenance. Never invent a builder
+family or override the packet's proven family; ask the supervisor to resolve a
+missing or contradictory binding. Different-family review is required for
+R1–R3, and a coordinator cannot review its own work at any tier.
+
+`retry-of` names a prior reviewer lane for an exact-head retry. It is not
+permission to replace a verdict. Use `reassesses` only for a supported,
+authenticated same-reviewer reassessment of the same task and SHA, with new
+artifact and verification evidence, binding the exact prior verdict-event
+digest supplied by the review process. It is not the candidate SHA or the
+artifact file digest. Never rename a reviewer, rewrite historical evidence, or
+invent the prior digest to evade duplicate protection. Supervisor admission
+still validates the reassessment and appends it; the header alone grants no
+merge authority.
+
+For coordinator retirement artifacts only, use `verdict: RETIRED` and
+`authority: <coordinator name>` (`asserting-authority` is a compatibility alias).
+RETIRED is not an independent review verdict or PASS.
+
+The parser accepts the canonical headers above and the documented aliases.
+It also accepts a small advisory set: `merge-recommendation`, `recommendation`,
+`confidence`, `skills-used`, `model-family`, `provider`, and `model`. Those are
+ignored for admission and cannot supply provenance or risk-tier authority.
+Unrecognized headers and misspelled gate keys are refused. Do not duplicate a
+key with conflicting values. Put other observations in the body. A value may
+contain a colon; only the first colon separates its header key from its value.
+
+## Delivery and retention
+
+Read `.herd/prompts/routing.md` before delivery. Write the reviewer-authored
+artifact to the exact inbox path assigned by the supervisor; a pane message or
+provider comment is not an ingested verdict. Send the artifact path and report
+using `herd send <agent> --file <path>`, or the routing contract's durable mail
+fallback when pane delivery is unavailable. Do not send directly to the
+coordinator or use repository `bin/herd-*` scripts.
+
+The supervisor validates and ingests the exact artifact and checks retained
+identity, risk and verification bindings before recommending retirement. Keep
+the author session resumable until required handoff evidence is retained and
+validated. Only the supervisor's merge-ready handoff goes to the coordinator.
