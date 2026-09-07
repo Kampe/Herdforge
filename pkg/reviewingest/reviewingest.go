@@ -28,8 +28,9 @@ var unknownHeaderRe = regexp.MustCompile(`^[a-z][a-z0-9._-]*$`)
 
 // Artifact is a parsed reviewer verdict.
 type Artifact struct {
-	SHA    string
-	Branch string
+	Reassesses string
+	SHA        string
+	Branch     string
 	// TaskRef is the board card this verdict belongs to. Without it a ledger
 	// row carries only sha+verdict, so no verdict can be tied back to a card
 	// and a corrupted board cannot be rebuilt from review history (FAC-578).
@@ -168,6 +169,8 @@ func Parse(text string) Artifact {
 				// anything else makes the wandering-reviewer gate dead code
 				// that fails OPEN with no warning.
 				a.ReadHead = value
+			case "reassesses":
+				a.Reassesses = value
 			case "retry-of":
 				a.RetryOf = value
 			default:
@@ -229,7 +232,7 @@ func (a Artifact) Validate(coordinators map[string]struct{}, commitExists func(s
 	// unwritten contract would make every reviewer's first artifact a guess.
 	if len(a.UnknownHeaders) > 0 {
 		return fmt.Errorf("unrecognised front-matter key(s): %s; accepted keys are "+
-			"sha, branch, task, task-id, card, ticket, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-base, reviewed-head, retry-of "+
+			"sha, branch, task, task-id, card, ticket, reviewer, authority, asserting-authority, reviewer-family, builder-family, verdict, reviewed-base, reviewed-head, retry-of, reassesses "+
 			"(see .herd/prompts/review-verdict.template.md); a misspelled gate key silently "+
 			"disables its gate, so this is refused rather than ignored",
 			strings.Join(a.UnknownHeaders, ", "))
@@ -432,7 +435,7 @@ var advisoryHeaders = map[string]bool{
 var gateHeaders = []string{
 	"sha", "branch", "task", "task-id", "card", "ticket", "reviewer",
 	"authority", "asserting-authority", "reviewer-family", "builder-family",
-	"verdict", "reviewed-head", "retry-of",
+	"verdict", "reviewed-head", "retry-of", "reassesses",
 }
 
 // advisoryHeader reports whether a key may be accepted and ignored.

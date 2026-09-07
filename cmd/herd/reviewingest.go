@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -301,6 +302,9 @@ func runReviewIngest() {
 			VfyDigest:    a.VerificationDigest(),
 			CandidateSHA: a.SHA, RetryOf: a.RetryOf,
 		}
+		verdictOpts.Reassesses = a.Reassesses
+		artifactSum := sha256.Sum256(body)
+		verdictOpts.ArtifactDigest = fmt.Sprintf("%x", artifactSum)
 		opts := reviewledger.IngestOpts{Record: recordOpts, Verdict: verdictOpts}
 		if a.Verdict == "RETIRED" {
 			opts = reviewledger.IngestOpts{Retired: &reviewledger.RetireOpts{
@@ -920,10 +924,21 @@ func reviewIngestAdmissionDecision(ledger reviewIngestLedger, opts reviewledger.
 		return "", err
 	}
 	if opts.Verdict.Reviewer != "" {
-		if _, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
+		if prior, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer); err != nil {
 			return "", fmt.Errorf("read existing ledger verdict: %w", err)
 		} else if found {
-			return reviewIngestSkipDuplicate, nil
+			if opts.Verdict.Reassesses == "" {
+				return reviewIngestSkipDuplicate, nil
+			}
+			replay, err := reviewledger.CheckReassessment(prior, opts.Verdict)
+			if err != nil {
+				return "", err
+			}
+			if replay {
+				return reviewIngestSkipDuplicate, nil
+			}
+		} else if opts.Verdict.Reassesses != "" {
+			return "", fmt.Errorf("reassessment prior verdict not found")
 		}
 	}
 	if err := reviewingest.CheckMoveToIngested(source, destinationName); err != nil {
@@ -970,6 +985,15 @@ func admitVerdictAndMove(ledger reviewIngestLedger, opts reviewledger.IngestOpts
 			_ = os.Rename(destination, source)
 		}
 		return false, fmt.Errorf("read back ledger verdict: sha %s not found", sha)
+	}
+	if opts.Verdict.Reassesses != "" {
+		row, found, err := ledger.VerdictForReviewer(sha, opts.Verdict.Reviewer)
+		if err != nil || !found || row.Reassesses != opts.Verdict.Reassesses || row.ArtifactDigest != opts.Verdict.ArtifactDigest || row.Verdict != string(opts.Verdict.Verdict) {
+			if destination != source {
+				_ = os.Rename(destination, source)
+			}
+			return false, fmt.Errorf("reassessment exact-event readback failed: %v", err)
+		}
 	}
 	return enqueued, nil
 }

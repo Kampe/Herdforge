@@ -180,3 +180,35 @@ func TestReviewIngestCollisionIsRefusedBeforeLedgerMutation(t *testing.T) {
 // FAC-620: the fake satisfies the corroboration lookup an asserted
 // builder-family needs when no launch receipt reaches the commit.
 func (f *fakeReviewIngestLedger) ProvenBuilderFamily(string) (string, error) { return "", nil }
+
+func TestReviewIngestReassessmentAdmission(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "review.md")
+	if err := os.WriteFile(source, []byte("new authenticated evidence"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := reviewledger.NewReviewLedger(root, reviewledger.DefaultPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 40)
+	opts := reviewledger.IngestOpts{
+		Record:  reviewledger.RecordOpts{SHA: sha, Reviewer: "r", Task: "FAC-493", Branch: "fix/reassess", BuilderFamily: "anthropic", ReviewerFamily: "google", Gate: "independent", Artifact: source},
+		Verdict: reviewledger.VerdictOpts{SHA: sha, Reviewer: "r", Task: "FAC-493", ReviewerFamily: "google", BuilderFamily: "anthropic", Verdict: reviewledger.VerdictFAIL, VfyDigest: "old", Artifact: source},
+	}
+	if _, err := l.Ingest(opts); err != nil {
+		t.Fatal(err)
+	}
+	prior, _, err := l.VerdictForReviewer(sha, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.Verdict.Reassesses = reviewledger.VerdictEventDigest(prior)
+	opts.Verdict.Verdict = reviewledger.VerdictPASS
+	opts.Verdict.VfyDigest = "new"
+	opts.Verdict.ArtifactDigest = strings.Repeat("b", 64)
+	decision, err := reviewIngestAdmissionDecision(l, opts, source, "review.md")
+	if err != nil || decision != reviewIngestAdmit {
+		t.Fatalf("reassessment decision=%s err=%v", decision, err)
+	}
+}
