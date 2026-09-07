@@ -2709,31 +2709,42 @@ func TestApproveBroker(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(short) })
 	t.Setenv("TMPDIR", short)
 	binary := buildHerd(t)
-	dir, keyDir, fk := approveFixture(t)
-	provisionFence(t, binary, dir, keyDir)
-	cmd := herdCmd(binary, dir, keyDir, "approve", "FAC-1")
-	env := cmd.Env[:0]
-	for _, entry := range cmd.Env {
-		if strings.HasPrefix(entry, "HERD_FENCE_ATOMIC_SERVER=") || strings.HasPrefix(entry, "HERD_FENCE_COORDINATOR=") {
-			continue
-		}
-		env = append(env, entry)
-	}
-	cmd.Env = append(env, "HERD_FENCE_COORDINATOR=1")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("receipt approval through coordinator broker: %v\n%s", err, out)
-	}
-	if got := atomic.LoadInt32(&fk.patches); got != 1 {
-		t.Fatalf("want one status mutation, got %d: %s", got, out)
-	}
-	// Replaying the sealed receipt must not issue a second provider mutation.
-	replay := herdCmd(binary, dir, keyDir, "approve", "FAC-1")
-	replay.Env = cmd.Env
-	if out, err := replay.CombinedOutput(); err != nil && !strings.Contains(string(out), "no in-review card matches FAC-1") {
-		t.Fatalf("receipt replay: %v\n%s", err, out)
-	}
-	if got := atomic.LoadInt32(&fk.patches); got != 1 {
-		t.Fatalf("receipt replay duplicated provider mutation: %d", got)
+	for _, entrypoint := range []string{"approve", "board-done"} {
+		t.Run(entrypoint, func(t *testing.T) {
+			dir, keyDir, fk := approveFixture(t)
+			if entrypoint == "board-done" {
+				// Receipt reconciliation must also close a landed card whose worker
+				// never projected In Review, as observed for FAC-756.
+				fk.mu.Lock()
+				fk.status = "in-progress"
+				fk.mu.Unlock()
+			}
+			provisionFence(t, binary, dir, keyDir)
+			cmd := herdCmd(binary, dir, keyDir, entrypoint, "FAC-1")
+			env := cmd.Env[:0]
+			for _, entry := range cmd.Env {
+				if strings.HasPrefix(entry, "HERD_FENCE_ATOMIC_SERVER=") || strings.HasPrefix(entry, "HERD_FENCE_COORDINATOR=") {
+					continue
+				}
+				env = append(env, entry)
+			}
+			cmd.Env = append(env, "HERD_FENCE_COORDINATOR=1")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("receipt approval through coordinator broker: %v\n%s", err, out)
+			}
+			if got := atomic.LoadInt32(&fk.patches); got != 1 {
+				t.Fatalf("want one status mutation, got %d: %s", got, out)
+			}
+			replay := herdCmd(binary, dir, keyDir, entrypoint, "FAC-1")
+			replay.Env = cmd.Env
+			out, err = replay.CombinedOutput()
+			if err != nil && !(entrypoint == "approve" && strings.Contains(string(out), "no in-review card matches FAC-1")) {
+				t.Fatalf("receipt replay: %v\n%s", err, out)
+			}
+			if got := atomic.LoadInt32(&fk.patches); got != 1 {
+				t.Fatalf("receipt replay duplicated provider mutation: %d", got)
+			}
+		})
 	}
 }
