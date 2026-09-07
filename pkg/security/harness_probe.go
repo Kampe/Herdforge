@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/provenance"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -241,11 +242,11 @@ func proveParentDeathBrokerSurvival(tmp string) (bool, string, error) {
 	herdBin := durableBrokerBinary
 	if herdBin == "" {
 		candidates := []string{}
-		if p, err := filepath.Abs("bin/herd"); err == nil {
+		if p, err := filepath.Abs(provenance.NativeExecutableRel); err == nil {
 			candidates = append(candidates, p)
 		}
 		if root, err := filepath.Abs("../.."); err == nil {
-			candidates = append(candidates, filepath.Join(root, "bin/herd"))
+			candidates = append(candidates, filepath.Join(root, provenance.NativeExecutableRel))
 		}
 		for _, c := range candidates {
 			if st, err := os.Stat(c); err == nil && !st.IsDir() {

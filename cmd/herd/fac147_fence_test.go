@@ -128,3 +128,45 @@ func TestFencedBoardStatus_RequiresStack(t *testing.T) {
 		t.Fatal("expected error without stack")
 	}
 }
+
+// A native integration call can run from a lane cwd, but it must contend for
+// the same task lease as the explicitly bound completion repository.
+func TestFAC601FencedDoneContendsAtExplicitRequestRoot(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	initGitMainFAC147(t, repo)
+	mp := provider.NewMemoryProvider()
+	task := &provider.Task{ID: "root-601", Ref: "FAC-601", Title: "fixture", Status: provider.StatusInReview, ProjectID: "p", Labels: []string{"worker"}}
+	mp.AddTask(task)
+	stack, err := provider.OpenClaimStack(t.TempDir(), mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	key := provider.LeaseKey(repo, "memory", "p", task.Ref)
+	if _, err := stack.AcquireLease(ctx, key, "another-fixture-owner", "worker", "worker"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.TaskProvider.Type = "memory"
+	cfg.TaskProvider.ProjectID = "p"
+	// The fixture's otherwise-closeable override isolates lease contention;
+	// nativeIntegrationSteps never accepts or constructs an override.
+	req := hsync.DoneRequest{RepoDir: repo, ProjectID: "p", Ref: task.Ref, Override: &hsync.OverrideRequest{Policy: "abandoned-scope", Actor: "fixture", Reason: "unit-test", Evidence: "fixture-only"}}
+	if _, err := fencedBoardDone(ctx, cfg, mp, stack, task, req); err == nil {
+		t.Fatal("completion ignored the lease in its explicit repository")
+	}
+	foreign := provider.LeaseKey(".", "memory", "p", task.Ref)
+	if foreign == key {
+		t.Fatal("fixture did not distinguish cwd from explicit request root")
+	}
+	generation, err := stack.Leases.PeekLatestGeneration(ctx, foreign)
+	if err != nil || generation != 0 {
+		t.Fatalf("completion acquired a lease in the wrong repository: generation=%d error=%v", generation, err)
+	}
+
+	got, err := mp.GetTask(ctx, task.ID)
+	if err != nil || got.Status != provider.StatusInReview {
+		t.Fatalf("contended completion mutated board: %+v %v", got, err)
+	}
+}

@@ -10,12 +10,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/integration"
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
+
+// IntegrationNamespace names serialized replay generations and publication branches.
+const IntegrationNamespace = "integration/"
+
+const SharedIntegrationLockName = "herd-shared-checkout.lock.d"
 
 // Integration implements the README contract: a serialized merge pipeline
 // that consumes a Harvester (exact-SHA), Verifier (test gate),
@@ -156,6 +162,9 @@ func WithDiskAdmission(admission resources.DiskAdmission) IntegrationOption {
 
 // IntegrationResult carries the outcome of the full pipeline for one harvest.
 type IntegrationResult struct {
+	// Progress is one durable step, not a claim that the candidate merged.
+	Progress           *integration.Record `json:"integration_progress,omitempty"`
+	Preview            *integration.Intent `json:"integration_preview,omitempty"`
 	HarvestResult      *HarvestResult      `json:"harvest_result"`
 	ReviewGatedSHAs    []ReviewGateOutcome `json:"review_gated_shas,omitempty"`
 	MergedSHAs         []MergeOutcome      `json:"merged_shas,omitempty"`
@@ -198,7 +207,7 @@ func NewIntegration(h *Harvester, v Verifier, d Dispatcher, l *reviewledger.Ledg
 		Dispatcher:    d,
 		Ledger:        l,
 		RepoRoot:      repoRoot,
-		LockDir:       filepath.Join(repoRoot, ".git", "herd-shared-checkout.lock.d"),
+		LockDir:       filepath.Join(repoRoot, ".git", SharedIntegrationLockName),
 		MaxMergeAge:   5 * time.Minute,
 		DiskAdmission: resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy()),
 	}
@@ -471,7 +480,7 @@ func (in *Integration) runMergeBatch(ctx context.Context, group []ReviewGateOutc
 		}
 		sources[i] = rg.SHA
 	}
-	replayReq := ReplayRequest{RepoRoot: in.RepoRoot, TaskID: task, RepoID: repoID, ExpectedHead: strings.TrimSpace(expected), Generation: "integration/" + task + "/" + group[0].SHA, SourceCommits: sources}
+	replayReq := ReplayRequest{RepoRoot: in.RepoRoot, TaskID: task, RepoID: repoID, ExpectedHead: strings.TrimSpace(expected), Generation: IntegrationNamespace + task + "/" + group[0].SHA, SourceCommits: sources}
 	replay, err := Replay(ctx, replayReq)
 	if err != nil {
 		return nil, err

@@ -121,6 +121,7 @@ type DrainActionEvidence struct {
 	SHA, Branch, Lane, BuilderFamily, Tier string
 	TierRecorded, Pending, Vetoed          bool
 	HarvestReady, RebaseNeeded             bool
+	IntegrationPending                     bool // durable native cycle, not new merge authority
 }
 
 type BoardGitRow struct {

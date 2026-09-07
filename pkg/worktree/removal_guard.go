@@ -29,8 +29,9 @@ func RefuseRemovalWithLiveLease(ctx context.Context, root, target string) error 
 }
 
 // RefuseRemovalWithoutLeaseHistoryCheck is the removal fence for worktrees
-// tracked by a lease mechanism outside pkg/claim's SQLite store -- currently
-// only Pool, whose slots are leased and released via their own
+// tracked by ownership outside pkg/claim's SQLite store: native integration
+// worktrees retain exact creation/proof operations in their transaction; Pool
+// slots are leased and released via their own
 // self-contained slot.LeaseID bookkeeping and are never registered with
 // pkg/claim.Acquire. Using the full RefuseRemovalWithLiveLease here would
 // refuse every pool slot unconditionally, since none of them ever appear in

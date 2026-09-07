@@ -22,6 +22,15 @@ import (
 	"strings"
 )
 
+// MainBranchRef is the full native trunk ref used for exact identity reads.
+const MainBranchRef = "refs/heads/main"
+
+// StatusUntrackedNormal explicitly includes untracked paths regardless of local Git config.
+const StatusUntrackedNormal = "--untracked-files=normal"
+
+// RefLeaseFlagPrefix binds a ref update to an explicit expected old object.
+const RefLeaseFlagPrefix = "--force-with-lease="
+
 // MergeTreeWriteFlag asks git merge-tree to write and return the merged tree
 // object. Keep this repository-wide Git capability rule here so conflict
 // probes and landing proofs cannot drift onto different invocations.
@@ -148,6 +157,11 @@ func divergentLane(projectRoot string) string {
 // RequireAncestor refuses both non-containment and an unanswerable Git query.
 // Shared by CLI discovery and receipt delivery-continuity validation.
 func RequireAncestor(root, ancestor, descendant string) error {
+	return RequireAncestorContext(context.Background(), root, ancestor, descendant)
+}
+
+// RequireAncestorContext retains the caller cancellation boundary for native integration.
+func RequireAncestorContext(ctx context.Context, root, ancestor, descendant string) error {
 	ancestor, descendant = strings.TrimSpace(ancestor), strings.TrimSpace(descendant)
 	if ancestor == "" || descendant == "" {
 		return fmt.Errorf("ancestry requires two commit identities")
@@ -157,7 +171,7 @@ func RequireAncestor(root, ancestor, descendant string) error {
 		args = append(args, "-C", root)
 	}
 	args = append(args, "merge-base", "--is-ancestor", ancestor, descendant)
-	if err := exec.Command("git", args...).Run(); err != nil {
+	if err := exec.CommandContext(ctx, "git", args...).Run(); err != nil {
 		return fmt.Errorf("git ancestry refused: %w", err)
 	}
 	return nil

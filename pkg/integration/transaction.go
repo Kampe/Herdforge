@@ -58,25 +58,72 @@ var Order = []Step{
 // Record is one completed step, appended before the next begins so a crash
 // leaves a diagnosable trail rather than an ambiguous half-state.
 type Record struct {
-	Step       Step   `json:"step"`
-	Candidate  string `json:"candidate"`
-	Evidence   string `json:"evidence"`
-	RecordedAt string `json:"recorded_at"`
+	Step        Step   `json:"step"`
+	Candidate   string `json:"candidate"`
+	Evidence    string `json:"evidence"`
+	RecordedAt  string `json:"recorded_at"`
+	OperationID string `json:"operation_id,omitempty"`
 }
 
 // Transaction is the serialized lifecycle for exactly one candidate.
 type Transaction struct {
-	Candidate string   `json:"candidate"`
-	Done      []Record `json:"done"`
+	Candidate     string   `json:"candidate"`
+	Done          []Record `json:"done"`
+	DriverVersion int      `json:"driver_version,omitempty"`
+	Pending       *Intent  `json:"pending,omitempty"`
 }
 
 // New starts a transaction for an exact candidate SHA.
 func New(candidate string) (*Transaction, error) {
-	if len(strings.TrimSpace(candidate)) < 12 {
+	candidate = strings.TrimSpace(candidate)
+	if len(candidate) < 12 || len(candidate) > 40 || strings.Trim(candidate, "0123456789abcdefABCDEF") != "" {
 		return nil, fmt.Errorf("integration requires an exact candidate sha (>=12 chars), got %q: "+
 			"a transaction keyed on anything less cannot prove which content it landed", candidate)
 	}
 	return &Transaction{Candidate: strings.TrimSpace(candidate)}, nil
+}
+
+// Validate rejects syntactically valid JSON that invents or reorders history.
+// Completion predicates are meaningful only for a contiguous, evidenced prefix.
+func (t *Transaction) Validate() error {
+	if t == nil {
+		return fmt.Errorf("integration: nil transaction")
+	}
+	canonical, err := New(t.Candidate)
+	if err != nil {
+		return err
+	}
+	if canonical.Candidate != t.Candidate {
+		return fmt.Errorf("integration: noncanonical candidate identity")
+	}
+	if t.DriverVersion != 0 && t.DriverVersion != 1 {
+		return fmt.Errorf("integration: unsupported driver version %d", t.DriverVersion)
+	}
+	if len(t.Done) > len(Order) {
+		return fmt.Errorf("integration: history exceeds lifecycle")
+	}
+	for i, r := range t.Done {
+		if r.Step != Order[i] || r.Candidate != t.Candidate || strings.TrimSpace(r.Evidence) == "" {
+			return fmt.Errorf("integration %s: invalid ordered evidence at step %d", short(t.Candidate), i)
+		}
+		if _, err := time.Parse(time.RFC3339, r.RecordedAt); err != nil {
+			return fmt.Errorf("integration %s: invalid recorded timestamp at step %d: %w", short(t.Candidate), i, err)
+		}
+		if t.DriverVersion == 1 && !validOperationID(r.OperationID) {
+			return fmt.Errorf("integration: step %d has no execution identity", i)
+		}
+	}
+	if t.Pending != nil {
+		next, more := t.Next()
+		p := t.Pending
+		if t.DriverVersion != 1 || !more || p.Step != next || p.Candidate != t.Candidate || !validOperationID(p.ID) {
+			return fmt.Errorf("integration: invalid pending execution identity")
+		}
+		if _, err := time.Parse(time.RFC3339, p.StartedAt); err != nil {
+			return fmt.Errorf("integration: invalid intent timestamp: %w", err)
+		}
+	}
+	return nil
 }
 
 // Completed reports whether a step has already been recorded.
@@ -115,6 +162,16 @@ func (t *Transaction) Next() (Step, bool) {
 // own home as removable, and 154 commits sit stranded on a standing branch
 // right now, so the cost of getting this edge wrong is measured, not theoretical.
 func (t *Transaction) Complete(s Step, evidence string) error {
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	if t.DriverVersion != 0 {
+		return fmt.Errorf("integration: executed transactions require observed effect evidence through Advance")
+	}
+	return t.complete(s, evidence, "")
+}
+
+func (t *Transaction) complete(s Step, evidence, operationID string) error {
 	if t.Completed(s) {
 		return fmt.Errorf("integration %s: step %q already recorded", short(t.Candidate), s)
 	}
@@ -142,10 +199,11 @@ func (t *Transaction) Complete(s Step, evidence string) error {
 			short(t.Candidate), s)
 	}
 	t.Done = append(t.Done, Record{
-		Step:       s,
-		Candidate:  t.Candidate,
-		Evidence:   strings.TrimSpace(evidence),
-		RecordedAt: time.Now().UTC().Format(time.RFC3339),
+		Step:        s,
+		Candidate:   t.Candidate,
+		Evidence:    strings.TrimSpace(evidence),
+		RecordedAt:  time.Now().UTC().Format(time.RFC3339),
+		OperationID: operationID,
 	})
 	return nil
 }

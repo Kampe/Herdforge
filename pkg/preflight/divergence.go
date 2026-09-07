@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // MainOriginDivergence describes commits present on one main ref but not the
@@ -31,7 +33,7 @@ func CheckMainOriginDivergence(root string) (MainOriginDivergence, error) {
 	// fails hard below. Absence of the ref cannot mean that -- there is no local
 	// history to have drifted -- so it reports not-applicable instead of
 	// inventing a failure from a comparison that was never possible.
-	if _, err := runCmd(root, "git", "rev-parse", "--verify", "--quiet", "refs/heads/main"); err != nil {
+	if _, err := runCmd(root, "git", "rev-parse", "--verify", "--quiet", gitroot.MainBranchRef); err != nil {
 		return MainOriginDivergence{}, nil
 	}
 	out, err := runCmd(root, "git", "rev-list", "--left-right", "--count", "main...origin/main")
