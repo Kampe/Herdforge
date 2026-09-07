@@ -58,3 +58,12 @@ lease. It works after landing without treating an empty diff as a new review.
 Changed or superseded evidence, an alternate ledger, and corpus-wide recovery
 are refused. The consumer still checks the exact launch identity before retiring
 a resident. A successful acknowledgment is not a completion receipt.
+
+When normal ingestion admits a verdict but cannot publish its acknowledgment,
+the single structured outcome is `admitted_unacked`, with the exact artifact
+identity and a recovery instruction in `reason`. The command exits nonzero and
+counts that artifact once as a failed operation (`refused`), rather than twice
+as both admitted and refused. The verdict is already durable: use `--ack-only`,
+not a replacement verdict. No completion callback or pool release is attempted
+for that unacknowledged outcome. `enqueued: false` on a fresh FAIL or BLOCKED
+verdict does not mean it is a duplicate; exact ledger identity decides replay.

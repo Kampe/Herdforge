@@ -22,7 +22,7 @@ import (
 type reviewIngestOutcome struct {
 	Artifact string `json:"artifact"`
 	Path     string `json:"path,omitempty"`
-	// Disposition is the machine-stable name: admitted, duplicate, refused,
+	// Disposition is the machine-stable name: admitted, admitted_unacked, duplicate, refused,
 	// retired, would_admit, would_skip.
 	Disposition string `json:"disposition"`
 	SHA         string `json:"sha,omitempty"`
