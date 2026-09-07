@@ -617,6 +617,7 @@ func TestReconcileReconstructedConsent(t *testing.T) {
 	for name, mutate := range map[string]func(*Request){
 		"missing proof":            func(q *Request) { q.Reconstruction.AttestationDigest = "" },
 		"tampered proof":           func(q *Request) { q.Reconstruction.AttestationDigest = strings.Repeat("0", 64) },
+		"wrong task":               func(q *Request) { q.Ref = "FAC-999" },
 		"wrong original":           func(q *Request) { q.CandidateSHA = base },
 		"unrelated reconstruction": func(q *Request) { q.Reconstruction.SHA = base },
 		"wrong base":               func(q *Request) { q.Reconstruction.BaseSHA = candidate },
@@ -640,6 +641,15 @@ func TestReconcileReconstructedConsent(t *testing.T) {
 	}
 	if receipt.CandidateSHA != candidate || receipt.ReconstructedSHA != rebuilt || receipt.ReconstructionDigest != req.Reconstruction.AttestationDigest {
 		t.Fatalf("identities lost: %+v", receipt)
+	}
+	again, err := g.ReconcileLanded(req)
+	if err != nil || again.Digest != receipt.Digest {
+		t.Fatalf("reconciliation replay: %v", err)
+	}
+	launch(t, l, candidate, "reviewer-b", "anthropic", "builder-session-1")
+	verdict(t, l, candidate, "reviewer-b", reviewledger.VerdictFAIL)
+	if _, err := g.ReconcileLanded(req); err == nil {
+		t.Fatal("existing receipt bypassed current reviewer dissent")
 	}
 }
 

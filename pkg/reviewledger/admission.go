@@ -39,7 +39,12 @@ type AdmissionResult struct {
 	AuthorFamily       string
 }
 
-type ReducedAdmissionOpts struct{ CandidateSHA string }
+type ReducedAdmissionOpts struct {
+	CandidateSHA string
+	// ReconcileConsumedMergeSHA permits rechecking consent only for an existing
+	// validated completion receipt for this exact consumed landing.
+	ReconcileConsumedMergeSHA string
+}
 
 // AdmitReduced preserves exact-SHA and independent-review evidence for
 // legacy verdicts that predate lease and patch bindings. It never fabricates
@@ -58,7 +63,8 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 		return nil, err
 	}
 	for _, row := range qrows {
-		if row.Event == string(EventConsumed) && row.SHA == sha {
+		if row.Event == string(EventConsumed) && row.SHA == sha &&
+			(opts.ReconcileConsumedMergeSHA == "" || row.MergeSHA != opts.ReconcileConsumedMergeSHA) {
 			return reject(sha, "candidate already consumed (exactly-once admission spent)")
 		}
 	}

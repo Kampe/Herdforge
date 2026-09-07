@@ -196,7 +196,18 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 	if rep := preflight.CheckMergePolicy(g.Policy); !rep.OK {
 		return nil, fmt.Errorf("herd-merge-reconcile: autonomous merge refused: %s", strings.Join(rep.Reasons, "; "))
 	}
-	result, ledgerErr := g.Ledger.AdmitReduced(reviewledger.ReducedAdmissionOpts{CandidateSHA: req.CandidateSHA})
+	admission := reviewledger.ReducedAdmissionOpts{CandidateSHA: req.CandidateSHA}
+	if req.Reconstruction != nil {
+		existing, err := hsync.LoadReceipt(hsync.ReceiptPath(g.RepoDir, hsync.NormalizeRef(req.Ref)))
+		if err == nil && existing.Digest != "" && existing.Digest == existing.ComputeDigest() &&
+			existing.TaskRef == hsync.NormalizeRef(req.Ref) && existing.CandidateSHA == req.CandidateSHA &&
+			existing.BaseSHA == req.BaseSHA && existing.ReconstructedSHA == req.Reconstruction.SHA &&
+			existing.ReconstructionBaseSHA == req.Reconstruction.BaseSHA &&
+			existing.ReconstructionDigest == req.Reconstruction.AttestationDigest && existing.PullRequest == rp.PullRequest {
+			admission.ReconcileConsumedMergeSHA = existing.MergeSHA
+		}
+	}
+	result, ledgerErr := g.Ledger.AdmitReduced(admission)
 	if result == nil || !result.Admitted {
 		reason := "review ledger refused this candidate"
 		if result != nil && result.Reason != "" {
@@ -205,6 +216,19 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 			reason = ledgerErr.Error()
 		}
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %s", CodeLedgerRefused, reason)
+	}
+	if req.Reconstruction != nil {
+		verdict, found, err := g.Ledger.VerdictForReviewer(req.CandidateSHA, result.Reviewer)
+		if err != nil || !found || reviewledger.CloseableCardRef(req.Ref) == "" || reviewledger.CloseableCardRef(verdict.Task) != reviewledger.CloseableCardRef(req.Ref) {
+			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction review consent does not name this task")
+		}
+		readiness, err := g.Ledger.MergeReadinessFor(req.CandidateSHA)
+		if err != nil {
+			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction readiness: %w", err)
+		}
+		if !readiness.Ready {
+			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction current verdict gate refused: %s", readiness.Reason)
+		}
 	}
 	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
 	if err != nil {
