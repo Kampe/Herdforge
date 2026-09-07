@@ -6,10 +6,13 @@ import (
 )
 
 // AcceptedCanonicalMember returns the canonical accepted log copy that the
-// locator identifies. The locator is an identity key, never a source of
-// Host, Session, BuilderFamily, or Accepted: those fields are taken from
-// the log member. A hand-written JSON file that is not in the log is not
-// authentication.
+// locator identifies. Membership is exact sameReceipt identity, including
+// StartToken. StartToken is the post-start process proof recorded at
+// Accept; a reservation has none, and resume (HasStarted) requires the
+// accepted token. A copied DecisionDigest is mismatch diagnosis only, never
+// authentication of a changed launch. Host, Session, BuilderFamily, and
+// Accepted come from the log member. A hand-written JSON file that is not
+// in the log is not authentication.
 func AcceptedCanonicalMember(members []Receipt, locator Receipt) (Receipt, error) {
 	var exact []Receipt
 	var digestBound []Receipt
@@ -45,6 +48,9 @@ func AcceptedCanonicalMember(members []Receipt, locator Receipt) (Receipt, error
 	}
 	if hostFieldMismatch(locator.HerdrSession, canonical.HerdrSession) {
 		return Receipt{}, fmt.Errorf("mismatched session: locator is not the canonical review session")
+	}
+	if strings.TrimSpace(locator.StartToken) != strings.TrimSpace(canonical.StartToken) {
+		return Receipt{}, fmt.Errorf("tampered start token is not the canonical accepted launch")
 	}
 	return Receipt{}, fmt.Errorf("launch receipt is not a canonical accepted member")
 }
