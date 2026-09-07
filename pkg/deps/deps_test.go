@@ -96,6 +96,7 @@ func TestRejectEmptyProviderGraph(t *testing.T) {
 }
 
 func TestMigrate_DryRunAndApply(t *testing.T) {
+	isolateMigrateJournal(t)
 	mp := provider.NewMemoryProvider()
 	mp.AddTask(&provider.Task{ID: "t1", Ref: "FAC-1", Status: "to-do", ProjectID: "p", Title: "a"})
 	mp.AddTask(&provider.Task{ID: "t2", Ref: "FAC-2", Status: "to-do", ProjectID: "p", Title: "b",
@@ -221,6 +222,7 @@ func TestPlanMigrationReturnsPartialPlanOnScopedTimeout(t *testing.T) {
 }
 
 func TestApplyMigrationReportsPeriodicProgress(t *testing.T) {
+	isolateMigrateJournal(t)
 	mp := provider.NewMemoryProvider()
 	for i := 1; i <= 10; i++ {
 		ref := fmt.Sprintf("FAC-%d", i)

@@ -435,6 +435,7 @@ func (w *landingTimeoutDescriptionWriter) SetDescription(ctx context.Context, ta
 }
 
 func TestApplyMigrationForRefReconcilesLandedTimeout(t *testing.T) {
+	isolateMigrateJournal(t)
 	tp := newExactMigrationProvider()
 	tp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-686", Status: provider.StatusInProgress, ProjectID: "p", Description: "before"})
 	store := NewProviderStore(tp, "p")
@@ -535,6 +536,7 @@ func (w *cancelAfterSetWriter) SetDescription(ctx context.Context, taskID, descr
 }
 
 func TestApplyMigrationForRefCancellationGates(t *testing.T) {
+	isolateMigrateJournal(t)
 	tests := []struct {
 		name          string
 		cancelLate    bool

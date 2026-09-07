@@ -56,7 +56,14 @@ func (w *phaseScopedDescriptionWriter) GetDescription(ctx context.Context, taskI
 	return w.recordingDescriptionWriter.GetDescription(ctx, taskID)
 }
 
+func isolateMigrateJournal(t *testing.T) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+	t.Setenv("HERD_MIGRATE_JOURNAL", "")
+}
+
 func TestApplyMigrationReadbackTimeoutUsesIndependentRollbackContext(t *testing.T) {
+	isolateMigrateJournal(t)
 	tp := newExactMigrationProvider()
 	const before = "before readback timeout"
 	tp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-765", Status: provider.StatusInProgress, ProjectID: "p", Description: before})
@@ -90,6 +97,7 @@ func TestApplyMigrationReadbackTimeoutUsesIndependentRollbackContext(t *testing.
 }
 
 func TestApplyMigrationRollbackTimeoutLeavesRollbackPending(t *testing.T) {
+	isolateMigrateJournal(t)
 	tp := newExactMigrationProvider()
 	const before = "before rollback timeout"
 	tp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-765", Status: provider.StatusInProgress, ProjectID: "p", Description: before})
@@ -132,5 +140,50 @@ func TestApplyMigrationRollbackTimeoutLeavesRollbackPending(t *testing.T) {
 	task, getErr := tp.GetTask(context.Background(), "target-id")
 	if getErr != nil || task.Description == before {
 		t.Fatalf("unreconciled description = %q err=%v; fence must not be claimed and before-image is unrestored", task.Description, getErr)
+	}
+}
+
+// TestNonDefaultJournalPendingRollbackBlocksLaunch proves the W4 FAIL on
+// 5a3e0ea3: ApplyMigrationForRef(--journal tmp) can leave rollback_pending
+// where a default-dir-only scan never looks, and production ValidateLaunch /
+// RefusePendingRollback("") must still refuse.
+func TestNonDefaultJournalPendingRollbackBlocksLaunch(t *testing.T) {
+	isolateMigrateJournal(t)
+
+	tp := newExactMigrationProvider()
+	const before = "before non-default journal timeout"
+	tp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-765", Status: provider.StatusInProgress, ProjectID: "p", Description: before})
+	store := NewProviderStore(tp, "p")
+	base := &recordingDescriptionWriter{mp: tp.MemoryProvider}
+	writer := &phaseScopedDescriptionWriter{recordingDescriptionWriter: base, blockReadback: true, blockRollback: true}
+	journalDir := t.TempDir()
+
+	ctx := WithMigrationRollbackBudget(context.Background(), 40*time.Millisecond)
+	ctx, cancel := WithMigrationRequestBudget(ctx, 80*time.Millisecond)
+	defer cancel()
+	plan, err := ApplyMigrationForRef(ctx, store, tp, "p", "FAC-765", writer, journalDir)
+	var pending *RollbackPendingError
+	if !errors.As(err, &pending) {
+		t.Fatalf("err = %v, want rollback_pending", err)
+	}
+	if plan == nil || pending.JournalPath == "" || !strings.HasPrefix(pending.JournalPath, journalDir) {
+		t.Fatalf("pending journal %q is not under --journal tmp %q", pending.JournalPath, journalDir)
+	}
+
+	defaultPending, scanErr := PendingRollbackJournals(DefaultMigrateJournalDir)
+	if scanErr != nil {
+		t.Fatalf("default-dir scan: %v", scanErr)
+	}
+	if len(defaultPending) != 0 {
+		t.Fatalf("default-dir-only scan found %v; that is the fail-open the production gate had", defaultPending)
+	}
+
+	if err := RefusePendingRollback(""); err == nil {
+		t.Fatal("RefusePendingRollback(\"\") must refuse the tmp journal apply actually used")
+	}
+	_, launchErr := ValidateLaunch(context.Background(), NewMemoryStore(), EntryDispatch, "FAC-765", nil, "")
+	var blocked *BlockedError
+	if !errors.As(launchErr, &blocked) || blocked.Code != "rollback_pending" {
+		t.Fatalf("ValidateLaunch err = %v, want rollback_pending", launchErr)
 	}
 }

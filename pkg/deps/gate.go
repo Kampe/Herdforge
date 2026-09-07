@@ -93,6 +93,7 @@ func ValidateLaunch(
 	if !taskRef.Valid() {
 		return nil, &BlockedError{Ref: taskRef, Code: "unresolved", Reason: "empty task ref"}
 	}
+	// Empty dir scans default, HERD_MIGRATE_JOURNAL, and remembered --journal roots.
 	if err := RefusePendingRollback(""); err != nil {
 		return nil, &BlockedError{Ref: taskRef, Code: "rollback_pending", Reason: err.Error()}
 	}
