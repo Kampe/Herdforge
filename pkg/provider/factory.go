@@ -9,10 +9,11 @@ import (
 // TaskConfig is the production config surface for building a board provider.
 // Mirrors config.TaskProvider fields used at activation (FAC-150).
 type TaskConfig struct {
-	Type      string
-	APIURL    string
-	ProjectID string
-	UseCLI    bool
+	Type          string
+	APIURL        string
+	ProjectID     string
+	UseCLI        bool
+	CoreTaskReads bool
 	// APIKey for HTTP bulk graph fan-out (even when UseCLI is true).
 	APIKey string
 	// APIKeyTrustedOrigin is operator-controlled (KANEO_API_URL or selected
@@ -57,10 +58,14 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 	if err := checkEnabled(providerType, tc.Enabled); err != nil {
 		return nil, err
 	}
+	if tc.CoreTaskReads && (providerType != "kaneo" || !tc.UseCLI) {
+		return nil, fmt.Errorf("core_task_reads requires Kaneo CLI transport")
+	}
 	dls := DeadlinesFromParts(tc.Get, tc.List, tc.Mutate, tc.Comment, tc.Readback)
 	switch providerType {
 	case "kaneo":
 		k := NewKaneoProvider(tc.APIURL, tc.ProjectID, tc.UseCLI)
+		k.CoreTaskReads = tc.CoreTaskReads
 		if tc.APIKey != "" {
 			k.APIKey = tc.APIKey
 			// Always assign, including empty, so a direct/custom key cannot inherit

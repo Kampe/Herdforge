@@ -233,12 +233,13 @@ type StandingRolePolicy struct {
 }
 
 type TaskProvider struct {
-	Type        string `yaml:"type"`
-	ProjectID   string `yaml:"project_id"`
-	WorkspaceID string `yaml:"workspace_id,omitempty"`
-	APIURL      string `yaml:"api_url,omitempty"`
-	APIKeyEnv   string `yaml:"api_key_env,omitempty"`
-	UseCLI      bool   `yaml:"use_cli,omitempty"`
+	Type          string `yaml:"type"`
+	ProjectID     string `yaml:"project_id"`
+	WorkspaceID   string `yaml:"workspace_id,omitempty"`
+	APIURL        string `yaml:"api_url,omitempty"`
+	APIKeyEnv     string `yaml:"api_key_env,omitempty"`
+	UseCLI        bool   `yaml:"use_cli,omitempty"`
+	CoreTaskReads bool   `yaml:"core_task_reads,omitempty"`
 	// Enabled is the repository's explicit task-provider activation policy
 	// (FAC-155). When set, Type must be a member or activation fails closed.
 	// Omitted means "exactly Type" — no repository ever inherits, discovers,
