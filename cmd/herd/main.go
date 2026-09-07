@@ -2218,86 +2218,13 @@ func runStanding() {
 
 func runUp() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: herd up <lane-name>\n")
+		fmt.Fprintln(os.Stderr, "Usage: herd up <lane-name>")
 		os.Exit(1)
 	}
-	laneName := os.Args[2]
-	if err := requireFleetAdmission(context.Background()); err != nil {
+	if err := runUpCommand(os.Args[2], liveUpRuntime{}, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "up: %v\n", err)
 		os.Exit(1)
 	}
-
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	var lane *config.LaneDef
-	for i := range cfg.Lanes {
-		if cfg.Lanes[i].Name == laneName {
-			lane = &cfg.Lanes[i]
-			break
-		}
-	}
-	if lane == nil {
-		fmt.Fprintf(os.Stderr, "lane '%s' not found in config\n", laneName)
-		os.Exit(1)
-	}
-
-	if !herdr.IsAvailable() {
-		fmt.Fprintf(os.Stderr, "herdr CLI not found\n")
-		os.Exit(1)
-	}
-	workspace, workspaceErr := resolveBuilderWorkspace(".")
-	if workspaceErr != nil {
-		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: %v\n", workspaceErr)
-		os.Exit(1)
-	}
-	repository := repositoryIdentityForLaunch(cfg)
-	if repository == "" {
-		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: repository identity unavailable\n")
-		os.Exit(1)
-	}
-	if lane.Worktree == "" {
-		fmt.Fprintf(os.Stderr, "launch rejected before tab creation: isolated worktree required\n")
-		os.Exit(1)
-	}
-	var tab *herdr.TabInfo
-	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), nil), func(admitted *router.LaunchDecision) error {
-		var tabErr error
-		cwd := "."
-		if lane.Worktree != "" {
-			cwd = filepath.Join(".", lane.Worktree)
-		}
-		req := launch.Request{Decision: admitted, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}
-		_, tab, tabErr = openWriteCapableTab(admitted, req, lane, workspace, standing.AgentNameForRepository(lane.Name, repository), cwd)
-		return tabErr
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "launch route rejected before tab creation: %v\n", err)
-		os.Exit(1)
-	}
-	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
-		fmt.Fprintf(os.Stderr, "launch decision rejected before tab creation: %v\n", err)
-		os.Exit(1)
-	}
-	tabLabel := standing.AgentNameForRepository(lane.Name, repository)
-	ready, readyErr := waitExactPaneBeforeStart(tab, nativePaneReadyTimeout)
-	if readyErr != nil {
-		closeErr := compensateExactLaunchTab(workspace, tab)
-		fmt.Fprintf(os.Stderr, "LAUNCH_FAILED: %s\n", ready.Reason)
-		if closeErr != nil {
-			fmt.Fprintf(os.Stderr, "  COMPENSATION FAILED: %v\n", closeErr)
-		}
-		os.Exit(1)
-	}
-	if err := herdr.StartPreparedAgent(tab.ID, tabLabel, decision.Harness, tab.Pane.ID, launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start agent: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Lane '%s' started: tab=%s pane=%s agent=%s\n", lane.Name, tab.ID, tab.Pane.ID, tabLabel)
 }
 
 // setDurableGoal replaces the lane-local goal atomically. Direct task launches
