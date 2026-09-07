@@ -61,7 +61,11 @@ func fencedBoardDone(ctx context.Context, cfg *config.Config, tp provider.TaskPr
 	if rerr != nil {
 		return nil, rerr
 	}
-	key := provider.LeaseKey(".", cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, task.Ref)
+	root := req.RepoDir
+	if strings.TrimSpace(root) == "" {
+		root = "."
+	}
+	key := provider.LeaseKey(root, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, task.Ref)
 	lease, err := stack.AcquireLease(ctx, key, owner, taskRole, taskRole)
 	if err != nil {
 		return nil, fmt.Errorf("approve refuses mutation without live lease: %w", err)

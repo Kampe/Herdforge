@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/integration"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/review"
@@ -38,6 +40,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/standing"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/verifier"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // drainLaunchProof is what a process API must return before a review launch is
@@ -101,9 +104,10 @@ func drainLiveAgentName(laneName, repository string) (string, bool) {
 
 func (a *drainAdapters) hooks() drainActionHooks {
 	return drainActionHooks{
-		launchReview: a.launchReview,
-		dryRun:       func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, true) },
-		harvest:      func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, false) },
+		singleIntegrationStep: true,
+		launchReview:          a.launchReview,
+		dryRun:                func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, true) },
+		harvest:               func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, false) },
 	}
 }
 
@@ -238,6 +242,58 @@ func (a *drainAdapters) integrate(ctx context.Context, e drainActionEvidence, dr
 	}
 	if res == nil {
 		return fmt.Errorf("harvest integration returned no result for %s", sha)
+	}
+	if len(res.Errors) > 0 {
+		return fmt.Errorf("harvest integration errors: %s", strings.Join(res.Errors, "; "))
+	}
+	if res.Preview != nil {
+		if !dry || res.Preview.Candidate != sha || res.Progress != nil {
+			return fmt.Errorf("harvest: invalid native preview identity or execution claim")
+		}
+		root, err := worktree.ResolveCanonicalRoot(ctx, a.root, "")
+		if err != nil {
+			return err
+		}
+		tx, err := integration.Load(root, sha)
+		if err != nil {
+			return err
+		}
+		next, more := tx.Next()
+		if !more || next != res.Preview.Step {
+			return fmt.Errorf("harvest: native preview does not match next durable step")
+		}
+		if tx.DriverVersion == 1 && tx.Completed(integration.StepMerge) {
+			// Review was already consumed by this native lifecycle. Its exact
+			// retained history, not a new review of merged source, drives recovery.
+			return nil
+		}
+	}
+	if res.Progress != nil {
+		for _, gate := range res.ReviewGatedSHAs {
+			if gate.SHA == sha && !gate.Eligible {
+				return fmt.Errorf("harvest: step result contradicts exact candidate review refusal")
+			}
+		}
+		if dry {
+			return fmt.Errorf("harvest: dry-run unexpectedly reported an executed step")
+		}
+		root, err := worktree.ResolveCanonicalRoot(ctx, a.root, "")
+		if err != nil {
+			return err
+		}
+		tx, err := integration.Load(root, sha)
+		if err != nil {
+			return err
+		}
+		if tx.DriverVersion != 1 || res.Progress.Candidate != sha {
+			return fmt.Errorf("harvest: step result lacks exact native transaction authority")
+		}
+		for _, recorded := range tx.Done {
+			if recorded == *res.Progress {
+				return nil
+			}
+		}
+		return fmt.Errorf("harvest: reported step has no matching durable completion")
 	}
 	gated := false
 	for _, g := range res.ReviewGatedSHAs {
@@ -614,9 +670,23 @@ func (a *drainAdapters) liveDrainIntegration(ctx context.Context, sha string, ad
 		a.ledger,
 		a.root,
 		harvest.WithDryRun(dry),
-		harvest.WithAdmissionSource(harvest.MapAdmissionSource{sha: adm}),
+		harvest.WithAdmissionSource(drainBatchAdmission{adapters: a}),
 	)
-	return in.Run(ctx)
+	tx, err := integration.Load(a.root, sha)
+	if err != nil {
+		return nil, err
+	}
+	next, more := tx.Next()
+	if !more {
+		return nil, fmt.Errorf("integration: candidate lifecycle is already complete")
+	}
+	return in.RunCandidate(ctx, sha, next, &nativeIntegrationSteps{root: a.root, project: a.project, tasks: a.tasks, ledger: a.ledger})
+}
+
+type drainBatchAdmission struct{ adapters *drainAdapters }
+
+func (s drainBatchAdmission) ForCandidate(ctx context.Context, sha string, _ harvest.UnmergedWork) (harvest.AdmissionContext, error) {
+	return s.adapters.admission(ctx, sha)
 }
 
 // newDrainAdapters wires the live authorities. Any missing piece is reported,
@@ -641,6 +711,14 @@ func newDrainAdapters(root, ledgerPath string, cfg *config.Config, tp provider.T
 	}
 	if strings.TrimSpace(lane.Worktree) == "" {
 		return nil, fmt.Errorf("reviewer lane %q has no isolated worktree", lane.Name)
+	}
+	canonicalRoot, rootErr := worktree.ResolveCanonicalRoot(context.Background(), root, "")
+	if rootErr != nil {
+		return nil, fmt.Errorf("drain project control root: %w", rootErr)
+	}
+	root = canonicalRoot
+	if !filepath.IsAbs(ledgerPath) {
+		ledgerPath = filepath.Join(root, ledgerPath)
 	}
 	ledger, err := reviewledger.NewReviewLedger(root, ledgerPath)
 	if err != nil {

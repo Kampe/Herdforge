@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
@@ -48,25 +49,26 @@ func admissionRecordPath(repoDir, ref string) string {
 // looked up BY NAME, never by argv position — FAC-138 shipped a bug where a
 // flag after a positional silently parsed as its zero value.
 type mergeAdmitFlags struct {
-	ref, taskID, candidate, base     *string
-	lease, patchID, acceptance, mode *string
-	authorFamily, authorIdentity     *string
-	leaseGeneration                  *int64
-	pr                               *int
-	remoteCIAttempt                  *int64
-	remoteCIFile                     *string
-	asJSON                           *bool
+	ref, taskID, candidate, base, providerRevision *string
+	lease, patchID, acceptance, mode               *string
+	authorFamily, authorIdentity                   *string
+	leaseGeneration                                *int64
+	pr                                             *int
+	remoteCIAttempt                                *int64
+	remoteCIFile                                   *string
+	asJSON                                         *bool
 }
 
 func registerMergeAdmitFlags(fs *flag.FlagSet) *mergeAdmitFlags {
 	return &mergeAdmitFlags{
-		ref:             fs.String("ref", "", "Board ticket ref (required)"),
-		taskID:          fs.String("task-id", "", "Provider task id the work is bound to (required)"),
-		candidate:       fs.String("candidate", "", "Exact reviewed candidate sha (required)"),
-		base:            fs.String("base", "", "Base sha the candidate was reviewed against (required)"),
-		lease:           fs.String("lease", "", "Claim lease token (required)"),
-		leaseGeneration: fs.Int64("lease-generation", 0, "Claim lease generation (required, positive)"),
-		patchID:         fs.String("patch-id", "", "Patch identity bound into the reviewer's verdict (required)"),
+		ref:              fs.String("ref", "", "Board ticket ref (required)"),
+		taskID:           fs.String("task-id", "", "Provider task id the work is bound to (required)"),
+		candidate:        fs.String("candidate", "", "Exact reviewed candidate sha (required)"),
+		base:             fs.String("base", "", "Base sha the candidate was reviewed against (required)"),
+		providerRevision: fs.String("provider-revision", "", "Exact provider revision retained at review time (required; never inferred from the current card)"),
+		lease:            fs.String("lease", "", "Claim lease token (required)"),
+		leaseGeneration:  fs.Int64("lease-generation", 0, "Claim lease generation (required, positive)"),
+		patchID:          fs.String("patch-id", "", "Patch identity bound into the reviewer's verdict (required)"),
 		acceptance: fs.String("acceptance-digest", "",
 			"Acceptance digest carried from review time (required). Compute with `herd merge-admit --show-acceptance --ref X`."),
 		authorFamily:    fs.String("author-family", "", "Builder model family (required)"),
@@ -82,7 +84,8 @@ func registerMergeAdmitFlags(fs *flag.FlagSet) *mergeAdmitFlags {
 func (f *mergeAdmitFlags) request() mergeadmit.Request {
 	return mergeadmit.Request{
 		Ref: *f.ref, TaskID: *f.taskID, CandidateSHA: *f.candidate, BaseSHA: *f.base,
-		Lease: *f.lease, LeaseGeneration: *f.leaseGeneration, PatchURL: *f.patchID,
+		ProviderRevision: *f.providerRevision,
+		Lease:            *f.lease, LeaseGeneration: *f.leaseGeneration, PatchURL: *f.patchID,
 		AcceptanceDigest: *f.acceptance, AuthorFamily: *f.authorFamily,
 		AuthorIdentity: *f.authorIdentity, Mode: mergeadmit.Mode(*f.mode),
 	}
@@ -298,8 +301,10 @@ type prView struct {
 }
 
 type prProbes struct {
-	number int
-	cached *prView
+	number           int
+	cached           *prView
+	root, repository string
+	ctx              context.Context
 }
 
 func newPRProbes(number int) *prProbes { return &prProbes{number: number} }
@@ -308,8 +313,18 @@ func (p *prProbes) view() (*prView, error) {
 	if p.cached != nil {
 		return p.cached, nil
 	}
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprint(p.number),
-		"--json", "headRefOid,mergeable,statusCheckRollup")
+	ctx := p.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	args := []string{"pr", "view", fmt.Sprint(p.number), "--json", "headRefOid,mergeable,statusCheckRollup"}
+	if p.repository != "" {
+		args = append(args, "--repo", p.repository)
+	}
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	cmd.Dir = p.root
 	out, err := cmd.Output()
 	// The producer's exit status is checked BEFORE the output is looked at.
 	if err != nil {

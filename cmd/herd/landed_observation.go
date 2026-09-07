@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 )
 
@@ -21,7 +22,7 @@ func observeVerifyLanded(dir string, gate *mergeadmit.Gate, req mergeadmit.Reque
 		}
 		return strings.TrimSpace(string(out)), nil
 	}
-	status, err := git("status", "--porcelain", "--untracked-files=normal")
+	status, err := git("status", "--porcelain", gitroot.StatusUntrackedNormal)
 	if err != nil {
 		return nil, err
 	}

@@ -411,3 +411,19 @@ func TestCompleteRefusesEmptyCandidateEndToEnd(t *testing.T) {
 		t.Fatal("an empty candidate wrote a receipt to disk")
 	}
 }
+
+func TestFAC601CompletionRemainsBoundAfterTrunkAdvance(t *testing.T) {
+	f := newCompleteFixture(t, ModeMerge)
+	d := mustAdmit(t, f.gate, f.req)
+	f.merged()
+	first, err := f.gate.Complete(d, f.req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := commit(t, f.dir, "later.txt", "unrelated later main\n", "later main")
+	f.gate.Live.OriginMain = StaticProbe(later)
+	resumed, err := f.gate.Complete(d, f.req)
+	if err != nil || resumed.Digest != first.Digest || resumed.MergeSHA != f.candidate {
+		t.Fatalf("resume replaced the recorded merge with new main: %+v %v", resumed, err)
+	}
+}

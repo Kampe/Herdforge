@@ -25,6 +25,9 @@ var (
 	errNotGitRoot   = errors.New("not a Git worktree")
 )
 
+// NativeExecutableRel is the project-relative executable selected by native consumers.
+const NativeExecutableRel = "bin/herd"
+
 type Info struct {
 	Path           string
 	SourceRevision string
@@ -48,7 +51,7 @@ func CurrentExecutable() (Info, error) {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
 	}
-	revision, buildTime, module := binaryValuesFrom(path)
+	revision, buildTime, module := binaryValuesFrom("")
 	return Info{Path: path, BinaryRevision: revision, BuildTime: buildTime, BinaryModule: module}, nil
 }
 
@@ -249,7 +252,12 @@ func binaryValues() (string, string) {
 }
 
 func binaryValuesFrom(path string) (string, string, string) {
-	revision, buildTime := strings.TrimSpace(BinaryRevision), strings.TrimSpace(BinaryBuildTime)
+	// Linker variables belong to this running process only. Applying them to
+	// another file can certify a stale installed binary as the caller's SHA.
+	revision, buildTime := "", ""
+	if path == "" {
+		revision, buildTime = strings.TrimSpace(BinaryRevision), strings.TrimSpace(BinaryBuildTime)
+	}
 	module := ""
 	var bi *debug.BuildInfo
 	if path == "" {
@@ -258,6 +266,20 @@ func binaryValuesFrom(path string) (string, string, string) {
 		bi, _ = buildinfo.ReadFile(path)
 	}
 	if bi != nil {
+		if path != "" {
+			// Worktree builds may carry the common checkout's vcs.revision.
+			// The native builder stamps its verified worktree HEAD in -ldflags;
+			// read that stamp from THIS file, never this process's globals.
+			for _, setting := range bi.Settings {
+				if setting.Key == "-ldflags" {
+					var stamped bool
+					revision, buildTime, stamped = selectedLinkerStamp(setting.Value)
+					if stamped {
+						return revision, buildTime, bi.Main.Path
+					}
+				}
+			}
+		}
 		module = bi.Main.Path
 		for _, setting := range bi.Settings {
 			switch setting.Key {
@@ -324,4 +346,50 @@ func ParseUnixTime(value string) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(seconds, 0).UTC()
+}
+
+// selectedLinkerStamp accepts the exact data-only -X form emitted by the native
+// build script. Malformed or duplicate identity stamps are UNKNOWN, not a
+// reason to silently fall back to another revision. No shell is evaluated.
+func selectedLinkerStamp(flags string) (revision, buildTime string, present bool) {
+	const prefix = "github.com/Kampe/Herdforge/pkg/provenance."
+	const revisionKey = prefix + "BinaryRevision="
+	const timeKey = prefix + "BinaryBuildTime="
+	present = strings.Contains(flags, revisionKey)
+	if !present {
+		return "", "", false
+	}
+	if strings.Count(flags, revisionKey) != 1 {
+		return "", "", true
+	}
+	fields := strings.Fields(flags)
+	revisions, times := 0, 0
+	for i := 0; i < len(fields); i++ {
+		arg := fields[i]
+		if arg == "-X" && i+1 < len(fields) {
+			i++
+			arg = fields[i]
+		} else if strings.HasPrefix(arg, "-X=") {
+			arg = strings.TrimPrefix(arg, "-X=")
+		} else {
+			continue
+		}
+		if strings.HasPrefix(arg, revisionKey) {
+			revisions++
+			revision = strings.TrimPrefix(arg, revisionKey)
+		}
+		if strings.HasPrefix(arg, timeKey) {
+			times++
+			buildTime = strings.TrimPrefix(arg, timeKey)
+		}
+	}
+	if revisions != 1 || times > 1 || len(revision) != 40 || strings.Trim(revision, "0123456789abcdef") != "" {
+		return "", "", true
+	}
+	if buildTime != "" {
+		if _, err := time.Parse(time.RFC3339, buildTime); err != nil {
+			return "", "", true
+		}
+	}
+	return revision, buildTime, true
 }

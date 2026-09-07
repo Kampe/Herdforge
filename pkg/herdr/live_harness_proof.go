@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/provenance"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -288,8 +289,8 @@ func proveLiveHarness(kind, realBin, tmp string) (modelOK, toolOK, viaLA, contai
 	if herdBin, berr := exec.LookPath("herd"); berr == nil {
 		restoreBin := security.SetDurableBrokerBinaryForTest(herdBin)
 		defer restoreBin()
-	} else if st, err := os.Stat("bin/herd"); err == nil && !st.IsDir() {
-		abs, _ := filepath.Abs("bin/herd")
+	} else if st, err := os.Stat(provenance.NativeExecutableRel); err == nil && !st.IsDir() {
+		abs, _ := filepath.Abs(provenance.NativeExecutableRel)
 		restoreBin := security.SetDurableBrokerBinaryForTest(abs)
 		defer restoreBin()
 	}

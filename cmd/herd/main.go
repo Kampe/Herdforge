@@ -8499,6 +8499,12 @@ func runDrainCommand(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(out, "herd-drain: REFUSED --act: %v\n", err)
 		} else {
 			hooks = adapters.hooks()
+			evidence, pendingErr := adapters.integrationEvidence(report.ActionEvidence)
+			if pendingErr != nil {
+				fmt.Fprintf(out, "herd-drain: REFUSED pending integration: %v\n", pendingErr)
+				return 1
+			}
+			report.ActionEvidence = evidence
 		}
 		result := executeDrainActions(context.Background(), report, report.ActionEvidence, *maxReview, *maxHarvest, *maxRelaunch, *autoTiers, out, hooks)
 		if unauthorized || result.Failed {
@@ -8629,14 +8635,15 @@ func drainExitCode(r *review.DrainReport) int {
 type drainActionEvidence = review.DrainActionEvidence
 
 type drainActionHooks struct {
-	launchReview func(context.Context, drainActionEvidence) error
-	dryRun       func(context.Context, drainActionEvidence) error
-	harvest      func(context.Context, drainActionEvidence) error
+	singleIntegrationStep bool
+	launchReview          func(context.Context, drainActionEvidence) error
+	dryRun                func(context.Context, drainActionEvidence) error
+	harvest               func(context.Context, drainActionEvidence) error
 }
 
 type drainActionResult struct {
-	Reviews, Harvests, DryRuns, Refusals int
-	Failed                               bool
+	Reviews, Harvests, IntegrationSteps, DryRuns, Refusals int
+	Failed                                                 bool
 }
 
 // defaultDrainActionHooks is the no-authority beat: the compiled adapters
@@ -8701,8 +8708,11 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 		result.Refusals++
 		return result
 	}
+	if hooks.singleIntegrationStep && maxHarvest > 1 {
+		maxHarvest = 1
+	}
 	allowed := drainAllowedTiers(autoTiers)
-	reviewCount, harvestCount, harvestAttempts := 0, 0, 0
+	reviewCount, harvestAttempts := 0, 0
 	// FAC-645: candidates needing rebase mail that no implemented path can reach.
 	var rebaseBlocked []string
 	seenBranches := make(map[string]bool)
@@ -8734,7 +8744,7 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 				rebaseBlocked = append(rebaseBlocked, e.SHA)
 			}
 		}
-		if e.HarvestReady && harvestAttempts < maxHarvest {
+		if (e.HarvestReady || e.IntegrationPending) && harvestAttempts < maxHarvest {
 			harvestAttempts++
 			if hooks.dryRun == nil {
 				fmt.Fprintf(out, "REFUSED harvest %s: missing dry-run seam\n", e.SHA)
@@ -8765,8 +8775,11 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 				result.Failed = true
 				result.Refusals++
 			} else {
-				harvestCount++
-				result.Harvests++
+				if hooks.singleIntegrationStep {
+					result.IntegrationSteps++
+				} else {
+					result.Harvests++
+				}
 			}
 		}
 		if !containsDrainSHA(r.Shas.NeedReview, e.SHA) || reviewCount >= maxReview {
@@ -8823,8 +8836,8 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 			fmt.Fprintf(out, "  note: relaunch bound %d would have truncated this list to %d of %d\n", maxRelaunch, maxRelaunch, len(rebaseBlocked))
 		}
 	}
-	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",
-		result.Reviews, result.Harvests, result.DryRuns, len(rebaseBlocked), result.Refusals)
+	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d act_integration_steps=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",
+		result.Reviews, result.Harvests, result.IntegrationSteps, result.DryRuns, len(rebaseBlocked), result.Refusals)
 	return result
 }
 
