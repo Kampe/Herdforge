@@ -608,11 +608,12 @@ func applyMigration(ctx context.Context, store RelationStore, tp provider.TaskPr
 		ProviderRevision: base.ProviderRevision,
 		StartedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if journalDir == "" {
-		journalDir = filepath.Join(".herd", "migrate-journal")
-	}
+	journalDir = migrateJournalDir(journalDir)
 	if err := os.MkdirAll(journalDir, 0o755); err != nil {
 		return nil, err
+	}
+	if err := rememberMigrateJournalRoot(journalDir); err != nil {
+		return nil, fmt.Errorf("record migrate journal dir: %w", err)
 	}
 	jPath := filepath.Join(journalDir, fmt.Sprintf("apply-%d.json", time.Now().UnixNano()))
 	plan.JournalPath = jPath

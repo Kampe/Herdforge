@@ -214,6 +214,7 @@ func (w *recordingDescriptionWriter) GetDescription(ctx context.Context, taskID 
 }
 
 func TestApplyMigrationForRefWritesOnlyTargetAndJournalsBeforeImage(t *testing.T) {
+	isolateMigrateJournal(t)
 	tp := newExactMigrationProvider()
 	const before = "target before description"
 	tp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-646", Status: provider.StatusInProgress, ProjectID: "p", Description: before})
@@ -252,6 +253,7 @@ func TestApplyMigrationForRefWritesOnlyTargetAndJournalsBeforeImage(t *testing.T
 }
 
 func TestApplyMigrationForRefReadbackFailureRollsBack(t *testing.T) {
+	isolateMigrateJournal(t)
 	tp := newExactMigrationProvider()
 	const before = "before readback failure"
 	tp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-646", Status: provider.StatusInProgress, ProjectID: "p", Description: before})
@@ -295,6 +297,7 @@ func (s *revisionSequenceStore) SnapshotGraphForTask(ctx context.Context, _ Ref,
 }
 
 func TestApplyMigrationForRefMovedProviderRevisionRollsBack(t *testing.T) {
+	isolateMigrateJournal(t)
 	mp := provider.NewMemoryProvider()
 	const before = "before provider moved"
 	mp.AddTask(&provider.Task{ID: "target-id", Ref: "FAC-646", Status: provider.StatusInProgress, ProjectID: "p", Description: before})
