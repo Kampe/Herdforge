@@ -159,3 +159,8 @@ package-inventory:
 clean:
 	@echo "==> Cleaning build artifacts..."
 	rm -rf bin "$(COVER_DIR)"
+
+# Optional explicit dependency build; never upgrades the global Kaneo CLI.
+.PHONY: kaneo-core
+kaneo-core:
+	zsh ./third_party/kaneo-core/build.zsh

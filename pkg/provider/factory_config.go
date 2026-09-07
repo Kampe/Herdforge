@@ -80,6 +80,7 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 		APIURL:              apiURL,
 		ProjectID:           cfg.TaskProvider.ProjectID,
 		UseCLI:              useCLI,
+		CoreTaskReads:       cfg.TaskProvider.CoreTaskReads,
 		APIKey:              apiKey,
 		APIKeyTrustedOrigin: trustedOrigin,
 		Enabled:             cfg.TaskProvider.Enabled,

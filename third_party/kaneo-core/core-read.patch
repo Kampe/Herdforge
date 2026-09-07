@@ -1,0 +1,196 @@
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index 01155bb..51232fe 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -459,6 +459,9 @@ pub enum TaskCommand {
+         /// Show full sub-resource details instead of compact summary
+         #[arg(long)]
+         full: bool,
++        /// Read only task identity and labels; refuse incomplete evidence (JSON only)
++        #[arg(long, conflicts_with = "full")]
++        core: bool,
+     },
+     /// Create a new task
+     Create {
+diff --git a/src/cli/task_handler.rs b/src/cli/task_handler.rs
+index 83ba1fc..612d84d 100644
+--- a/src/cli/task_handler.rs
++++ b/src/cli/task_handler.rs
+@@ -128,7 +128,12 @@ pub async fn run(args: TaskArgs, ctx: &ResolvedContext, json: bool) -> anyhow::R
+             }
+         }
+ 
+-        TaskCommand::Get { id, full } => {
++        TaskCommand::Get { id, full, core } => {
++            if core {
++                anyhow::ensure!(json, "--core requires JSON output");
++                output::json_output(&get_core_task(&id, ctx, &client).await?);
++                return Ok(());
++            }
+             let known_slug = parse_task_ref(&id).map(|(s, _)| s.to_string());
+             let id = resolve_task_id(&id, ctx, &client).await?;
+ 
+@@ -1464,3 +1469,111 @@ fn print_task_row(t: &serde_json::Value, cyan: &console::Style, dim: &console::S
+         dim.apply_to(id),
+     );
+ }
++
++// Machine admission reads must not wait for optional activity/time/link resources.
++async fn get_core_task(
++    requested: &str,
++    ctx: &ResolvedContext,
++    client: &ApiClient,
++) -> anyhow::Result<serde_json::Value> {
++    let expected_ref = parse_task_ref(requested);
++    let id = if let Some((slug, number)) = expected_ref {
++        let ws = crate::auth::require_workspace(ctx)?;
++        let result: serde_json::Value = client
++            .get_query(
++                "/search",
++                &[
++                    ("q", requested),
++                    ("workspaceId", ws),
++                    ("type", "tasks"),
++                    ("limit", "100"),
++                ],
++            )
++            .await?;
++        let rows = result
++            .get("results")
++            .or_else(|| result.get("tasks"))
++            .and_then(|x| x.as_array())
++            .ok_or_else(|| anyhow::anyhow!("invalid task search response"))?;
++        let total = result
++            .get("totalCount")
++            .and_then(|v| v.as_u64())
++            .ok_or_else(|| anyhow::anyhow!("missing search completeness count"))?;
++        anyhow::ensure!(
++            total == rows.len() as u64,
++            "incomplete task search response"
++        );
++        let ids: std::collections::BTreeSet<String> = rows
++            .iter()
++            .filter(|x| {
++                x.get("projectSlug").and_then(|v| v.as_str()) == Some(slug)
++                    && x.get("taskNumber")
++                        .or_else(|| x.get("number"))
++                        .and_then(|v| v.as_i64())
++                        == Some(number)
++                    && ctx
++                        .project_id
++                        .as_deref()
++                        .is_none_or(|p| x.get("projectId").and_then(|v| v.as_str()) == Some(p))
++            })
++            .filter_map(|x| {
++                x.get("id")
++                    .and_then(|v| v.as_str())
++                    .filter(|v| !v.is_empty())
++                    .map(String::from)
++            })
++            .collect();
++        anyhow::ensure!(
++            ids.len() == 1,
++            "core read requires one exact task search match"
++        );
++        ids.into_iter().next().unwrap()
++    } else {
++        requested.to_string()
++    };
++    anyhow::ensure!(
++        !id.is_empty() && !id.contains('/') && !id.contains('?') && !id.contains('#'),
++        "invalid task identity"
++    );
++    let task: Task = client.get(&format!("/task/{id}")).await?;
++    anyhow::ensure!(task.id == id, "task identity mismatch");
++    anyhow::ensure!(
++        ctx.project_id
++            .as_deref()
++            .is_none_or(|p| p == task.project_id),
++        "task project mismatch"
++    );
++    let project: crate::api::types::Project =
++        client.get(&format!("/project/{}", task.project_id)).await?;
++    anyhow::ensure!(
++        project.id == task.project_id && !project.slug.is_empty(),
++        "project identity mismatch"
++    );
++    anyhow::ensure!(
++        ctx.workspace_id
++            .as_deref()
++            .is_none_or(|w| w == project.workspace_id),
++        "workspace mismatch"
++    );
++    let number = task
++        .number
++        .ok_or_else(|| anyhow::anyhow!("missing task number"))?;
++    let task_ref = format!("{}-{number}", project.slug);
++    anyhow::ensure!(
++        expected_ref.is_none() || task_ref == requested,
++        "task ref mismatch"
++    );
++    let labels: Vec<Label> = client.get(&format!("/label/task/{id}")).await?;
++    anyhow::ensure!(
++        labels
++            .iter()
++            .all(|l| l.task_id.as_deref() == Some(id.as_str())
++                && l.workspace_id.as_deref() == Some(project.workspace_id.as_str())
++                && !l.name.is_empty()),
++        "label ownership or name mismatch"
++    );
++    let mut val = serde_json::to_value(task)?;
++    val["ref"] = serde_json::json!(task_ref);
++    val["labels"] = serde_json::json!(labels.iter().map(|l| &l.name).collect::<Vec<_>>());
++    Ok(val)
++}
+diff --git a/tests/core_read.py b/tests/core_read.py
+new file mode 100644
+index 0000000..9fd7b5d
+--- /dev/null
++++ b/tests/core_read.py
+@@ -0,0 +1,46 @@
++import http.server,threading,subprocess,json,os,tempfile
++from pathlib import Path
++seen=[]
++mode='ok'
++class H(http.server.BaseHTTPRequestHandler):
++ def log_message(self,*args):pass
++ def do_GET(self):
++  seen.append(self.path)
++  task={'id':'task1','projectId':'project1','number':1,'title':'fixture','status':'to-do','priority':'high','createdAt':'2026-09-07T00:00:00Z'}
++  project={'id':'project1','workspaceId':'ws1','slug':'FAC','name':'fixture','createdAt':'2026-09-07T00:00:00Z'}
++  label={'id':'label1','name':'bounded','color':'green','createdAt':'2026-09-07T00:00:00Z','taskId':'task1','workspaceId':'ws1'}
++  code=200
++  if self.path.startswith('/api/search'):
++   data={'totalCount':1,'results':[{'id':'task1','projectId':'project1','projectSlug':'FAC','taskNumber':1,'number':1}]}
++   if mode=='truncated':data['totalCount']=2
++   if mode=='missing-count':del data['totalCount']
++   if mode=='ambiguous':data['results'].append(dict(data['results'][0],id='task2'));data['totalCount']=2
++   if mode=='cross-project':data['results'][0]['projectId']='other'
++   if mode=='search-error':data={'error':'unavailable'}
++  elif self.path=='/api/task/task1':
++   data=task
++   if mode=='wrong-task':data['id']='other'
++  elif self.path=='/api/project/project1':
++   data=project
++   if mode=='wrong-project':data['slug']='OTHER'
++  elif self.path=='/api/label/task/task1':
++   data=[label]
++   if mode=='wrong-label-owner':label['taskId']='other'
++   if mode=='wrong-label-workspace':label['workspaceId']='other'
++   if mode=='labels-error-200':data={'error':'unavailable'}
++   if mode=='labels-fail':code=503;data={'error':'unavailable'}
++  else:code=503;data={'error':'optional subresource must not be read'}
++  body=json.dumps(data).encode();self.send_response(code);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
++s=http.server.ThreadingHTTPServer(('127.0.0.1',0),H);threading.Thread(target=s.serve_forever,daemon=True).start()
++binary=str(Path(__file__).resolve().parents[1]/'target/debug/kaneo')
++with tempfile.TemporaryDirectory() as cwd:
++ env=os.environ.copy();env.update(KANEO_API_KEY='fixture-only',KANEO_API_URL='http://127.0.0.1:'+str(s.server_port),KANEO_WORKSPACE='ws1',KANEO_PROJECT='project1')
++ for mode in ['ok','opaque','labels-fail','wrong-task','wrong-project','truncated','missing-count','ambiguous','cross-project','search-error','wrong-label-owner','wrong-label-workspace','labels-error-200']:
++  seen.clear();r=subprocess.run([binary,'task','get','task1' if mode=='opaque' else 'FAC-1','--core','--json'],cwd=cwd,env=env,capture_output=True,text=True,timeout=10)
++  assert (r.returncode==0)==(mode in ['ok','opaque']),(mode,r.returncode,r.stdout,r.stderr)
++  assert all(x.startswith('/api/search') or x in ['/api/task/task1','/api/project/project1','/api/label/task/task1'] for x in seen),seen
++  if mode in ['ok','opaque']:
++   assert len(seen)==(3 if mode=='opaque' else 4),seen
++   assert json.loads(r.stdout)['labels']==['bounded']
++  print(mode,'PASS',len(seen),'requests')
++s.shutdown()

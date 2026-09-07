@@ -22,6 +22,10 @@ type KaneoProvider struct {
 	APIURL    string
 	ProjectID string
 	UseCLI    bool
+	// CoreTaskReads requires an explicitly supported minimal CLI read mode.
+	CoreTaskReads bool
+	coreReadOnce  sync.Once
+	coreReadErr   error
 	// APIKey authenticates HTTP calls (Bearer). Loaded from api_key_env / KANEO_API_KEY.
 	// Bulk project graph snapshots prefer HTTP fan-out even when UseCLI is true
 	// to avoid N CLI subprocesses (FAC-159 live-path stampede).
@@ -641,7 +645,16 @@ var kaneoRunCLI = RunCLI
 
 func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, error) {
 	if k.UseCLI {
-		res, err := kaneoRunCLI(ctx, "kaneo", "task", "get", id, "--json")
+		args := []string{"task", "get", id, "--json"}
+		executable := "kaneo"
+		if k.CoreTaskReads {
+			if err := k.requireCoreRead(ctx); err != nil {
+				return nil, err
+			}
+			args = append(args, "--core", "--project", k.ProjectID)
+			executable = kaneoCoreReadExecutable
+		}
+		res, err := kaneoRunCLI(ctx, executable, args...)
 		if err != nil {
 			return nil, fmt.Errorf("kaneo task get: %w", err)
 		}
@@ -652,6 +665,11 @@ func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, erro
 				pe.Op = "GetTask"
 			}
 			return nil, fmt.Errorf("kaneo task get: %w", err)
+		}
+		if k.CoreTaskReads {
+			if err := validateCoreTaskBody(res.Stdout, dto, k.ProjectID); err != nil {
+				return nil, err
+			}
 		}
 		return dtoToTask(dto), nil
 	}
