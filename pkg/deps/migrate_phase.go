@@ -15,6 +15,7 @@ import (
 
 const (
 	DefaultMigrateJournalDir = ".herd/migrate-journal"
+	migrateJournalRootsFile  = "roots.jsonl"
 
 	JournalStatusApplied         = "applied"
 	JournalStatusRolledBack      = "rolled_back"
@@ -76,6 +77,66 @@ func migrateJournalDir(explicit string) string {
 	return DefaultMigrateJournalDir
 }
 
+func rememberMigrateJournalRoot(journalDir string) error {
+	journalDir = filepath.Clean(strings.TrimSpace(journalDir))
+	if journalDir == "" || journalDir == "." {
+		return nil
+	}
+	canonical := migrateJournalDir("")
+	if err := os.MkdirAll(canonical, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(canonical, migrateJournalRootsFile)
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	want := journalDir + "\n"
+	for _, line := range strings.Split(string(existing), "\n") {
+		if filepath.Clean(strings.TrimSpace(line)) == journalDir {
+			return nil
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(want)
+	return err
+}
+
+func knownMigrateJournalRoots(explicit string) []string {
+	if dir := strings.TrimSpace(explicit); dir != "" {
+		return []string{filepath.Clean(dir)}
+	}
+	seen := map[string]struct{}{}
+	var roots []string
+	add := func(dir string) {
+		dir = filepath.Clean(strings.TrimSpace(dir))
+		if dir == "" || dir == "." {
+			return
+		}
+		if _, ok := seen[dir]; ok {
+			return
+		}
+		seen[dir] = struct{}{}
+		roots = append(roots, dir)
+	}
+	add(migrateJournalDir(""))
+	add(DefaultMigrateJournalDir)
+	for _, base := range []string{migrateJournalDir(""), DefaultMigrateJournalDir} {
+		raw, err := os.ReadFile(filepath.Join(base, migrateJournalRootsFile))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			add(line)
+		}
+	}
+	return roots
+}
+
 type migrationPhases struct {
 	planning context.Context
 	mutation context.Context
@@ -107,7 +168,9 @@ func deriveMigrationPhases(op context.Context) migrationPhases {
 }
 
 // RefusePendingRollback fails closed when a migrate journal is waiting for
-// operator reconciliation. A missing journal directory is not pending work.
+// operator reconciliation. An empty journalDir scans every root apply can
+// write (default, HERD_MIGRATE_JOURNAL, and remembered --journal dirs).
+// A missing journal directory is not pending work.
 func RefusePendingRollback(journalDir string) error {
 	pending, err := PendingRollbackJournals(journalDir)
 	if err != nil {
@@ -120,8 +183,22 @@ func RefusePendingRollback(journalDir string) error {
 }
 
 // PendingRollbackJournals lists apply journals marked rollback_pending.
+// An explicit directory is scanned alone so a default-dir-only check can
+// prove it would miss a non-default --journal. An empty directory scans
+// every remembered apply root.
 func PendingRollbackJournals(journalDir string) ([]string, error) {
-	dir := migrateJournalDir(journalDir)
+	var pending []string
+	for _, dir := range knownMigrateJournalRoots(journalDir) {
+		found, err := pendingRollbackJournalsInDir(dir)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, found...)
+	}
+	return pending, nil
+}
+
+func pendingRollbackJournalsInDir(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {

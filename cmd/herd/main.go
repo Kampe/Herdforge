@@ -3036,6 +3036,7 @@ func runApprove() {
 		os.Exit(1)
 	}
 
+	// Empty dir scans default, HERD_MIGRATE_JOURNAL, and remembered --journal roots.
 	if err := deps.RefusePendingRollback(""); err != nil {
 		fmt.Fprintf(os.Stderr, "herd approve: %v\n", err)
 		os.Exit(1)
