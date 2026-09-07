@@ -17,8 +17,8 @@ func TestAcceptedCanonicalMemberRequiresLogMembership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exact member: %v", err)
 	}
-	if got.PaneID != canonical.PaneID {
-		t.Fatalf("canonical copy PaneID=%q", got.PaneID)
+	if got.PaneID != canonical.PaneID || got.StartToken != canonical.StartToken {
+		t.Fatalf("canonical copy PaneID=%q StartToken=%q", got.PaneID, got.StartToken)
 	}
 
 	forged := canonical
@@ -28,6 +28,27 @@ func TestAcceptedCanonicalMemberRequiresLogMembership(t *testing.T) {
 	forged.DecisionDigest = "forged-digest-never-ran"
 	if _, err := AcceptedCanonicalMember([]Receipt{canonical}, forged); err == nil || !strings.Contains(err.Error(), "canonical accepted member") {
 		t.Fatalf("forged locator err=%v", err)
+	}
+}
+
+func TestAcceptedCanonicalMemberRefusesTamperedStartToken(t *testing.T) {
+	canonical := Receipt{
+		TaskRef: "FAC-765", Role: ReviewerRole, Name: "review-fac-999",
+		DecisionDigest: "review-digest-001", PaneID: "W4-canonical-review-pane",
+		HerdrSession: "w4-review-session", ProcessIdentity: "W4-canonical-review-pane",
+		Accepted: true, StartToken: "review-start",
+	}
+	locator := canonical
+	locator.StartToken = "tampered-start-token"
+	_, err := AcceptedCanonicalMember([]Receipt{canonical}, locator)
+	if err == nil {
+		t.Fatal("copied DecisionDigest with a tampered StartToken must not authenticate")
+	}
+	if !strings.Contains(err.Error(), "start token") {
+		t.Fatalf("tampered StartToken err=%v, want start-token refusal", err)
+	}
+	if strings.Contains(err.Error(), "mismatched host") || strings.Contains(err.Error(), "mismatched session") {
+		t.Fatalf("StartToken replay must not be diagnosed as host/session mismatch: %v", err)
 	}
 }
 
