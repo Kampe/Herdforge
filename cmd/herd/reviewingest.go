@@ -427,26 +427,24 @@ func runReviewIngest() {
 			refused++
 			continue
 		}
-		if ingestDisposition(enqueued, a.Verdict) == dispositionDuplicate {
-			o := base
-			o.Disposition, o.Enqueued = dispositionDuplicate, boolPtr(false)
-			emit.record(o, fmt.Sprintf("DUPLICATE %s verdict=%s reviewer=%s sha=%s enqueued=false\n",
-				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12]), false)
-		} else {
-			o := base
-			o.Disposition, o.Enqueued = dispositionAdmitted, boolPtr(enqueued)
-			emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
-				filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
-			// FAC-586: durable ack that canonical ingest admitted this artifact.
-			// Remote-ref transport and ledger admission are distinct; review hosts
-			// must not retire residents on transport alone.
-			if ackErr := recoverReviewArtifactAck(projectRoot, ledger, body, false); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "review-ingest: ADMITTED %s but ingest ack emit failed: %v; recover with --ack-only on the exact retained artifact\n", a.SHA[:12], ackErr)
-				refused++
-			}
-			postReviewCompleteCallback(projectRoot, a.SHA, a.Branch, a.Reviewer, a.Verdict)
-			reclaimReviewPoolSlotFor(a.SHA)
+		// Duplicate suppression is decided from the exact ledger identity above.
+		// Enqueued is false for a NEW FAIL/BLOCKED as well as a duplicate.
+		// It cannot decide whether this artifact needs an acknowledgment.
+		o := base
+		o.Enqueued = boolPtr(enqueued)
+		if ackErr := recoverReviewArtifactAck(projectRoot, ledger, body, false); ackErr != nil {
+			o.Disposition = "admitted_unacked"
+			o.Reason = fmt.Sprintf("verdict admitted but acknowledgment failed: %v; recover with --ack-only on the exact retained artifact", ackErr)
+			emit.record(o, fmt.Sprintf("ADMITTED_UNACKED %s: %s\n", filepath.Base(f), o.Reason), true)
+			refused++
+			continue
 		}
+		o.Disposition = dispositionAdmitted
+		emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
+			filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
+		postReviewCompleteCallback(projectRoot, a.SHA, a.Branch, a.Reviewer, a.Verdict)
+		reclaimReviewPoolSlotFor(a.SHA)
+
 		admitted++
 	}
 
@@ -747,16 +745,6 @@ const (
 	dispositionAdmitted  = "admitted"
 )
 
-// ingestDisposition reports how an artifact whose ledger write returned
-// enqueued should be dispositioned. enqueued == false means the verdict row
-// already existed, which is a duplicate regardless of verdict polarity.
-//
-// FAC-581: this used to read `!enqueued && verdict == "PASS"`, so a re-ingested
-// FAIL was reported as freshly ADMITTED. A bulk replay of the historical inbox
-// therefore re-applied days-old FAIL transitions and reverted current cards to
-// to-do. Duplicate suppression must not depend on which way the verdict went.
-// verdict is accepted so that every disposition rule lives here, where the
-// polarity-independence test can hold it, rather than back at the call site.
 // honestlyUnrecordedFamily reports whether a builder-family value is a candid
 // "I could not determine this", and normalises it.
 //
@@ -927,14 +915,6 @@ func minInt(a, b int) int {
 func ingestTaskIdentityFor(taskRef, branch string) string {
 	_ = branch
 	return reviewledger.CloseableCardRef(taskRef)
-}
-
-func ingestDisposition(enqueued bool, verdict string) string {
-	_ = verdict
-	if !enqueued {
-		return dispositionDuplicate
-	}
-	return dispositionAdmitted
 }
 
 // reviewIngestAdmissionDecision is the read-only gate shared by dry-run and

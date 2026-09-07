@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
@@ -116,5 +117,107 @@ func TestFAC763AckOnlyRecoversWithoutVerdictOrPoolMutation(t *testing.T) {
 	}
 	if out, err := run("--ack-only", "--sweep"); err == nil {
 		t.Fatalf("corpus recovery allowed: %s", out)
+	}
+}
+
+// This also preserves FAC-581: replay of any verdict polarity must remain a
+// duplicate without rewriting history. Enqueue status is not admission status.
+func TestFAC763LiveAdmissionAckFailureIsStructuredAndRecoverable(t *testing.T) {
+	binary := buildHerd(t)
+	for _, verdict := range []string{"PASS", "FAIL", "BLOCKED"} {
+		t.Run(verdict, func(t *testing.T) {
+			repo, sha := corroborationRepo(t)
+			for _, key := range []string{"HERD_ROOT", "HERD_REPO_ROOT", "HERD_PROJECT_ROOT", "HERD_CANONICAL_ROOT"} {
+				t.Setenv(key, repo)
+			}
+			ledgerPath := filepath.Join(repo, ".herd", "review-ledger.jsonl")
+			t.Setenv("HERD_REVIEW_LEDGER", ledgerPath)
+			t.Setenv("HERD_LAUNCH_RECEIPTS", filepath.Join(repo, ".herd", "launch-receipts.jsonl"))
+			t.Setenv("HERD_REVIEW_ROOT", "")
+			writeVerdict(t, repo, sha, "unknown")
+			source := filepath.Join(repo, ".herd", "review", "inbox", "sha-review-corroboration.md")
+			body, err := os.ReadFile(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = bytes.Replace(body, []byte("verdict: PASS"), []byte("verdict: "+verdict), 1)
+			if err := os.WriteFile(source, body, 0600); err != nil {
+				t.Fatal(err)
+			}
+			blockedAck := filepath.Join(repo, reviewack.DirRel)
+			if err := os.WriteFile(blockedAck, []byte("publication failure fixture"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(binary, "review-ingest", "--json", source)
+			cmd.Dir = repo
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			out, runErr := cmd.Output()
+			if runErr == nil {
+				t.Fatalf("ack failure returned success: %s %s", out, stderr.String())
+			}
+			var result struct {
+				Admitted int                   `json:"admitted"`
+				Refused  int                   `json:"refused"`
+				Outcomes []reviewIngestOutcome `json:"outcomes"`
+			}
+			if err := json.Unmarshal(out, &result); err != nil {
+				t.Fatalf("JSON: %v %s stderr=%s", err, out, stderr.String())
+			}
+			if result.Admitted != 0 || result.Refused != 1 || len(result.Outcomes) != 1 {
+				t.Fatalf("one artifact counted incorrectly: %s stderr=%s", out, stderr.String())
+			}
+			if _, err := os.Stat(mail.CallbackMailPath(repo)); !os.IsNotExist(err) {
+				t.Fatalf("unacknowledged admission posted completion callback: %v", err)
+			}
+			outcome := result.Outcomes[0]
+			if outcome.Disposition != "admitted_unacked" || !strings.Contains(outcome.Reason, "--ack-only") || outcome.SHA != sha {
+				t.Fatalf("ack failure is not actionable: %s stderr=%s", out, stderr.String())
+			}
+			ledger, err := reviewledger.NewReadOnlyReviewLedger(repo, ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, found, err := ledger.VerdictForReviewer(sha, "review-corroboration")
+			if err != nil || !found || row.Verdict != verdict {
+				t.Fatalf("verdict was not actually admitted: %+v %v", row, err)
+			}
+			before, err := os.ReadFile(ledgerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(blockedAck); err != nil {
+				t.Fatal(err)
+			}
+			cmd = exec.Command(binary, "review-ingest", "--ack-only", filepath.Join(repo, row.Artifact))
+			cmd.Dir = repo
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("native recovery failed: %v %s", err, out)
+			}
+			after, err := os.ReadFile(ledgerPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("recovery changed verdict history", err)
+			}
+			if got := reviewack.Consume(repo, sha, row.Reviewer, row.ArtifactDigest, row.Reviewer); !got.OK {
+				t.Fatalf("recovery ack unusable: %+v", got)
+			}
+			cmd = exec.Command(binary, "review-ingest", "--json", filepath.Join(repo, row.Artifact))
+			cmd.Dir = repo
+			replay, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("ordinary replay: %v %s", err, replay)
+			}
+			if err := json.Unmarshal(replay, &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Outcomes) != 1 || result.Outcomes[0].Disposition != "duplicate" || result.Refused != 0 {
+				t.Fatalf("historical verdict reapplied: %s", replay)
+			}
+			after, err = os.ReadFile(ledgerPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("ordinary replay changed verdict history", err)
+			}
+
+		})
 	}
 }
