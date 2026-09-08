@@ -149,7 +149,7 @@ func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (pass
 			latest[rowProjection(r)] = r
 		}
 	}
-	superseded := retrySupersessionFromLatest(latest, sha)
+	superseded := retrySupersessionFromLatest(latest, launch, sha)
 	var veto bool
 	for k, verdict := range latest {
 		reviewer := k.Reviewer

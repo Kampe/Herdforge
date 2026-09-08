@@ -64,7 +64,7 @@ func TestSameHostRetryReachesEveryFinalConsumer(t *testing.T) {
 	if full == nil || !full.Admitted {
 		t.Fatalf("Admit not admitted: %+v", full)
 	}
-	cerr := l.CompleteAdmissionRecord(admitTask, sha, "reviewer-b", func(LedgerRow) (RecordCompletion, error) {
+	cerr := l.CompleteAdmissionRecord(admitTask, sha, "reviewer-b", host, func(LedgerRow) (RecordCompletion, error) {
 		return RecordCompletion{Branch: "main", Tier: "R2"}, nil
 	})
 	if cerr != nil {
@@ -254,4 +254,39 @@ func TestGenericSupersessionDoesNotClearCurrentVeto(t *testing.T) {
 			t.Fatalf("other-host BLOCKED cleared: eligible=%v err=%v", ok, err)
 		}
 	})
+}
+
+func TestFabricatedRetryCannotClearVeto(t *testing.T) {
+	l := newTestLedger(t)
+	const sha = "fabricated-retry-sha"
+	const host = "host-a"
+	mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-a", Host: host, BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+	must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Host: host, Verdict: VerdictFAIL, ReviewerFamily: "openai", BuilderFamily: "anthropic"}))
+	_, err := l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-b", Host: host, Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "anthropic", RetryOf: "reviewer-a"})
+	if err == nil {
+		t.Fatal("native retry PASS without reviewer-b record was accepted")
+	}
+	if e := l.appendRow(l.Path, &LedgerRow{
+		Event: string(EventVerdict), SHA: sha, Reviewer: "reviewer-b", Host: host,
+		Verdict: string(VerdictPASS), RetryOf: "reviewer-a", ReviewerFamily: "openai", BuilderFamily: "anthropic",
+	}); e != nil {
+		t.Fatal(e)
+	}
+	eligible, err := l.Eligible(sha, "anthropic")
+	if err == nil || eligible {
+		t.Fatalf("fabricated RetryOf cleared veto: eligible=%v err=%v", eligible, err)
+	}
+	vetoes, verr := l.VetoSHAs()
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	found := false
+	for _, v := range vetoes {
+		if v == sha {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("fabricated RetryOf removed SHA from VetoSHAs: %v", vetoes)
+	}
 }
