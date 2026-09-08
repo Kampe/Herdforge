@@ -90,6 +90,62 @@ func AcceptedReviewLaunchFor(members []Receipt, reviewer string) (Receipt, error
 	return matches[len(matches)-1], nil
 }
 
+// AcceptedReviewLaunchForCandidate returns the canonical accepted review-role
+// launch bound to reviewer and the requested candidate. A name-only lookup is
+// not authorization for another SHA, task, repository, or lane. Receipts that
+// omit CandidateSHA are not candidate-pinned and cannot authenticate a SHA.
+func AcceptedReviewLaunchForCandidate(members []Receipt, reviewer, sha, task, repo, lane string) (Receipt, error) {
+	reviewer = strings.TrimSpace(reviewer)
+	sha = strings.TrimSpace(sha)
+	if reviewer == "" {
+		return Receipt{}, fmt.Errorf("reviewer identity is required")
+	}
+	if sha == "" {
+		return Receipt{}, fmt.Errorf("candidate SHA is required for review launch proof")
+	}
+	task = strings.TrimSpace(task)
+	repo = strings.TrimSpace(repo)
+	lane = strings.TrimSpace(lane)
+	var matches []Receipt
+	for _, m := range members {
+		if !m.Accepted {
+			continue
+		}
+		if strings.TrimSpace(m.Role) != ReviewerRole {
+			continue
+		}
+		if strings.TrimSpace(m.Name) != reviewer {
+			continue
+		}
+		if strings.TrimSpace(m.CandidateSHA) != sha {
+			continue
+		}
+		if task != "" {
+			if got := strings.TrimSpace(m.TaskRef); got != "" && got != task {
+				continue
+			}
+		}
+		if repo != "" {
+			if got := strings.TrimSpace(m.Repository); got != "" && got != repo {
+				continue
+			}
+		}
+		if lane != "" {
+			if got := strings.TrimSpace(m.Lane); got != "" && got != lane {
+				continue
+			}
+		}
+		matches = append(matches, m)
+	}
+	if len(matches) == 0 {
+		return Receipt{}, fmt.Errorf("no canonical accepted review launch for %q on candidate %s", reviewer, sha)
+	}
+	if reviewHostsConflict(matches) {
+		return Receipt{}, fmt.Errorf("conflicting canonical review launches for %q", reviewer)
+	}
+	return matches[len(matches)-1], nil
+}
+
 func hostFieldMismatch(locator, canonical string) bool {
 	a, b := strings.TrimSpace(locator), strings.TrimSpace(canonical)
 	if a == "" || b == "" {
