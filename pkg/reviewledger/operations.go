@@ -469,6 +469,15 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 		return false, fmt.Errorf("reassessment prior verdict not found")
 	}
 	if opts.Verdict == VerdictPASS && strings.TrimSpace(opts.RetryOf) != "" {
+		records := indexProjectionEvent(rows, string(EventRecord), true)
+		self := ProjectionOf(opts.SHA, opts.Reviewer, opts.Host)
+		named := ProjectionOf(opts.SHA, strings.TrimSpace(opts.RetryOf), opts.Host)
+		if _, ok := records[self]; !ok {
+			return false, fmt.Errorf("retry PASS requires a same-host launch record for reviewer %q", opts.Reviewer)
+		}
+		if _, ok := records[named]; !ok {
+			return false, fmt.Errorf("retry PASS requires a same-host launch record for named reviewer %q", strings.TrimSpace(opts.RetryOf))
+		}
 		if err := l.appendRow(l.Path, &LedgerRow{
 			Event: string(EventSupersession), SHA: opts.SHA, Task: opts.SHA,
 			Reviewer: opts.RetryOf, RetryOf: opts.RetryOf, Host: opts.Host,
@@ -782,7 +791,7 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 
 	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility,
 	// unless a later PASS on the same host explicitly names that reviewer.
-	hostRetry := retrySupersessionFromLatest(latest, sha)
+	hostRetry := retrySupersessionFromLatest(latest, launch, sha)
 	hasVeto := false
 	for k, verdict := range latest {
 		if k.SHA != sha {
@@ -915,7 +924,7 @@ func (l *Ledger) isCoordinator(name string) bool {
 // any PASS and no FAIL/BLOCKED, using the family ladder.
 func (l *Ledger) isPassVerdictLatest(sha string, latest map[ProjectionKey]LedgerRow, launch map[ProjectionKey]LedgerRow, allowUnrecorded bool) bool {
 	var hasPass bool
-	superseded := retrySupersessionFromLatest(latest, sha)
+	superseded := retrySupersessionFromLatest(latest, launch, sha)
 	for k, verdict := range latest {
 		if k.SHA != sha {
 			continue
@@ -1098,7 +1107,7 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 		hasPass := false
 		hasVeto := false
 		hasIndependent := false
-		supersededReviewers := retrySupersessionFromRows(vset, sha)
+		supersededReviewers := retrySupersessionFromRows(vset, launch, sha)
 		for _, verdict := range vset {
 			reviewer := verdict.Reviewer
 			if l.isCoordinator(reviewer) {
@@ -1167,7 +1176,7 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 	var shas []string
 	for sha, vset := range shaVerdicts {
 		hasVeto := false
-		superseded := retrySupersessionFromRows(vset, sha)
+		superseded := retrySupersessionFromRows(vset, launch, sha)
 		for _, verdict := range vset {
 			reviewer := verdict.Reviewer
 			if l.isCoordinator(reviewer) {

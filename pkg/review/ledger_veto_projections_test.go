@@ -108,6 +108,24 @@ func TestVerdictProjectionsShareRetryAuthority(t *testing.T) {
 			want: want{vetoed: true, vetoSHAs: true, passSHAs: false},
 		},
 		{
+			name: "fabricated_retry_cannot_clear_veto",
+			sha:  current,
+			setup: func(t *testing.T, l *reviewledger.Ledger) {
+				if err := l.Record(reviewledger.RecordOpts{
+					SHA: current, Reviewer: "reviewer-a", Host: "host-a",
+					BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				mustVerdict(t, l, current, "reviewer-a", "host-a", reviewledger.VerdictFAIL, "")
+				appendMainRow(t, l, map[string]string{
+					"event": "verdict", "sha": current, "reviewer": "reviewer-b", "host": "host-a",
+					"verdict": "PASS", "retry_of": "reviewer-a", "builder_family": "anthropic", "reviewer_family": "openai",
+				})
+			},
+			want: want{vetoed: true, vetoSHAs: true, passSHAs: false},
+		},
+		{
 			name: "identity_replacement_leaves_previous_fail",
 			sha:  current,
 			setup: func(t *testing.T, l *reviewledger.Ledger) {

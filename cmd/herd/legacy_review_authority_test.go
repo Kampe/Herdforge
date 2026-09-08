@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 func TestSameHostRetryReachesLegacyClosure(t *testing.T) {
@@ -36,6 +38,45 @@ func TestSameHostRetryReachesLegacyClosure(t *testing.T) {
 	}
 	if ev.CandidateSHA != sha || ev.Verdict != "PASS" {
 		t.Fatalf("legacy %+v want current PASS", ev)
+	}
+}
+
+func TestNativeRevocationWithdrawsLegacyClosure(t *testing.T) {
+	sha := "cccccccccccccccccccccccccccccccccccccccc"
+	ref := "FAC-765"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "review-ledger.jsonl")
+	l, err := reviewledger.NewReviewLedger(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Reviewer: "reviewer-b", Host: "host-a", Branch: "task/" + ref,
+		BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Reviewer: "reviewer-a", Host: "host-a", Branch: "task/" + ref,
+		BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Reviewer: "reviewer-b", Host: "host-a", Verdict: reviewledger.VerdictPASS,
+		ReviewerFamily: "openai", BuilderFamily: "anthropic", Branch: "task/" + ref, Artifact: "task/" + ref,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Reviewer: "reviewer-a", Host: "host-a", Verdict: reviewledger.VerdictFAIL,
+		ReviewerFamily: "openai", BuilderFamily: "anthropic", Branch: "task/" + ref,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = newLedgerLegacyReview(path).AdmittedPass(ref)
+	if err == nil || !strings.Contains(err.Error(), "no current admitted PASS") {
+		t.Fatalf("native queue EventRevoked must withdraw PASS, got err=%v", err)
 	}
 }
 
