@@ -80,7 +80,7 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 			withdrawn[row.SHA] = true
 		}
 	}
-	merged := map[string]candidate.Review{}
+	byHost := map[reviewledger.ProjectionKey]candidate.Review{}
 	for _, row := range snap.Rows {
 		if row.SHA == "" || withdrawn[row.SHA] || row.Verdict == "" {
 			continue
@@ -88,10 +88,11 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 		if !rowNamesRef(row, ref) {
 			continue
 		}
-		cur := merged[row.SHA]
+		k := reviewledger.ProjectionOf(row.SHA, row.Reviewer, row.Host)
+		cur := byHost[k]
 		cur.CandidateSHA = row.SHA
-		// Later rows enrich earlier ones; never overwrite a known value with a
-		// blank, or a follow-up row erases the evidence.
+		// Later rows enrich earlier ones inside one host projection; never
+		// overwrite a known value with a blank.
 		cur.Verdict = firstNonEmpty(row.Verdict, cur.Verdict)
 		cur.RecordedBranch = firstNonEmpty(row.Branch, cur.RecordedBranch)
 		cur.Artifact = firstNonEmpty(row.Artifact, cur.Artifact)
@@ -99,13 +100,47 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 		cur.ReviewerFamily = firstNonEmpty(row.ReviewerFamily, cur.ReviewerFamily)
 		cur.BuilderFamily = firstNonEmpty(row.BuilderFamily, cur.BuilderFamily)
 		cur.MergeSHA = firstNonEmpty(row.MergeSHA, cur.MergeSHA)
-		merged[row.SHA] = cur
+		byHost[k] = cur
+	}
+	merged := map[string]candidate.Review{}
+	for _, r := range byHost {
+		cur, ok := merged[r.CandidateSHA]
+		if !ok {
+			merged[r.CandidateSHA] = r
+			continue
+		}
+		if isVetoVerdict(r.Verdict) {
+			cur.Verdict = r.Verdict
+			cur = enrichReview(cur, r)
+		} else if !isVetoVerdict(cur.Verdict) {
+			cur.Verdict = firstNonEmpty(r.Verdict, cur.Verdict)
+			cur = enrichReview(cur, r)
+		}
+		merged[r.CandidateSHA] = cur
 	}
 	out := make([]candidate.Review, 0, len(merged))
 	for _, r := range merged {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+func isVetoVerdict(v string) bool {
+	switch strings.ToUpper(strings.TrimSpace(v)) {
+	case string(reviewledger.VerdictFAIL), string(reviewledger.VerdictBLOCKED):
+		return true
+	}
+	return false
+}
+
+func enrichReview(cur, src candidate.Review) candidate.Review {
+	cur.Artifact = firstNonEmpty(src.Artifact, cur.Artifact)
+	cur.Reviewer = firstNonEmpty(src.Reviewer, cur.Reviewer)
+	cur.ReviewerFamily = firstNonEmpty(src.ReviewerFamily, cur.ReviewerFamily)
+	cur.BuilderFamily = firstNonEmpty(src.BuilderFamily, cur.BuilderFamily)
+	cur.RecordedBranch = firstNonEmpty(src.RecordedBranch, cur.RecordedBranch)
+	cur.MergeSHA = firstNonEmpty(src.MergeSHA, cur.MergeSHA)
+	return cur
 }
 
 func firstNonEmpty(a, b string) string {
