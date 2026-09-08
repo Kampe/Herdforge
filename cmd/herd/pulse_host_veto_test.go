@@ -21,8 +21,8 @@ func TestLoadReapEvidenceCrossHostDissentKeepsAwaitingVerdict(t *testing.T) {
 	t.Run("hostA_FAIL_then_hostB_PASS", func(t *testing.T) {
 		dir, sha := committedLane(t)
 		writeHostVerdictLedger(t, sha, reviewer,
-			hostVerdictRow{"host-a", "FAIL"},
-			hostVerdictRow{"host-b", "PASS"},
+			hostVerdictRow{host: "host-a", verdict: "FAIL"},
+			hostVerdictRow{host: "host-b", verdict: "PASS"},
 		)
 		if !awaitingVerdictForLane(t, dir) {
 			t.Fatal("host-A FAIL then host-B PASS must keep AwaitingVerdict")
@@ -31,8 +31,8 @@ func TestLoadReapEvidenceCrossHostDissentKeepsAwaitingVerdict(t *testing.T) {
 	t.Run("reversed_hostB_PASS_then_hostA_FAIL", func(t *testing.T) {
 		dir, sha := committedLane(t)
 		writeHostVerdictLedger(t, sha, reviewer,
-			hostVerdictRow{"host-b", "PASS"},
-			hostVerdictRow{"host-a", "FAIL"},
+			hostVerdictRow{host: "host-b", verdict: "PASS"},
+			hostVerdictRow{host: "host-a", verdict: "FAIL"},
 		)
 		if !awaitingVerdictForLane(t, dir) {
 			t.Fatal("host-B PASS then host-A FAIL must keep AwaitingVerdict")
@@ -41,8 +41,8 @@ func TestLoadReapEvidenceCrossHostDissentKeepsAwaitingVerdict(t *testing.T) {
 	t.Run("same_host_FAIL_then_PASS_reassessment", func(t *testing.T) {
 		dir, sha := committedLane(t)
 		writeHostVerdictLedger(t, sha, reviewer,
-			hostVerdictRow{"host-a", "FAIL"},
-			hostVerdictRow{"host-a", "PASS"},
+			hostVerdictRow{host: "host-a", verdict: "FAIL"},
+			hostVerdictRow{host: "host-a", verdict: "PASS"},
 		)
 		if awaitingVerdictForLane(t, dir) {
 			t.Fatal("same-host FAIL then PASS must clear AwaitingVerdict")
@@ -51,7 +51,7 @@ func TestLoadReapEvidenceCrossHostDissentKeepsAwaitingVerdict(t *testing.T) {
 }
 
 type hostVerdictRow struct {
-	host, verdict string
+	host, verdict, artifact, family string
 }
 
 func committedLane(t *testing.T) (dir, sha string) {
