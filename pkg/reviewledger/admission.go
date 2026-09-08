@@ -68,19 +68,19 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			return reject(sha, "candidate already consumed (exactly-once admission spent)")
 		}
 	}
-	launch := map[string]LedgerRow{}
+	launch := map[projectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventRecord) && r.SHA == sha {
-			launch[r.SHA+":"+r.Reviewer] = r
+			launch[rowProjection(r)] = r
 		}
 	}
 	if len(launch) == 0 {
 		return reject(sha, "no launch record for exact candidate sha")
 	}
-	latest := map[string]LedgerRow{}
+	latest := map[projectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
-			latest[r.SHA+":"+r.Reviewer] = r
+			latest[rowProjection(r)] = r
 		}
 	}
 	// FAC-630: every `continue` below used to land on one generic refusal, so an
@@ -235,21 +235,21 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 
 	// Exact-SHA gate: only a launch record for this precise candidate SHA
 	// counts. A stale or unknown SHA has nothing to admit against.
-	launch := make(map[string]LedgerRow)
+	launch := make(map[projectionKey]LedgerRow)
 	for _, r := range rows {
 		if r.Event == string(EventRecord) && r.SHA == sha {
-			launch[r.SHA+":"+r.Reviewer] = r
+			launch[rowProjection(r)] = r
 		}
 	}
 	if len(launch) == 0 {
 		return reject(sha, "no launch record for exact candidate sha (stale or unknown sha)")
 	}
 
-	latest := make(map[string]LedgerRow)
-	var order []string
+	latest := make(map[projectionKey]LedgerRow)
+	var order []projectionKey
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
-			k := r.SHA + ":" + r.Reviewer
+			k := rowProjection(r)
 			if _, seen := latest[k]; !seen {
 				order = append(order, k)
 			}
@@ -276,7 +276,12 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 		}
 	}
 
-	sort.Strings(order)
+	sort.Slice(order, func(i, j int) bool {
+		if order[i].Reviewer != order[j].Reviewer {
+			return order[i].Reviewer < order[j].Reviewer
+		}
+		return order[i].Host < order[j].Host
+	})
 	lastReason := "no verdict satisfied merge-admission policy"
 	for _, k := range order {
 		verdict := latest[k]

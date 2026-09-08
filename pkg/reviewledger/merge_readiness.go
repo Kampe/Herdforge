@@ -134,9 +134,12 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		if verdict == "" {
 			continue
 		}
-		// Later verdicts from the SAME reviewer supersede earlier ones; verdicts
-		// from DIFFERENT reviewers never supersede each other.
+		// Later verdicts from the SAME reviewer+host supersede earlier ones;
+		// distinct authenticated hosts never supersede each other.
 		name := strings.TrimSpace(row.Reviewer)
+		if host := hostKey(row.Host); host != "" {
+			name = name + " host=" + host
+		}
 		reviewers[name] = verdict
 		if row.Gate == GateProvenanceUnrecorded || strings.EqualFold(strings.TrimSpace(row.BuilderFamily), FamilyUnrecorded) {
 			unrecorded[name] = true
