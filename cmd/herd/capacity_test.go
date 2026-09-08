@@ -670,7 +670,17 @@ func TestAdmissionLeaseLockIsCrossProcessAndSidecarIsPermanent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "admission.lease")
 	ready, release := filepath.Join(dir, "ready"), filepath.Join(dir, "release")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestAdmissionLeaseLockHelper$")
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Other CLI tests legitimately redirect os.Args[0] while exercising a
+	// compiled herd binary. The child must use the test process identity, not
+	// that mutable display/argv alias.
+	originalArg0 := os.Args[0]
+	os.Args[0] = "herd"
+	t.Cleanup(func() { os.Args[0] = originalArg0 })
+	cmd := exec.Command(testExecutable, "-test.run=^TestAdmissionLeaseLockHelper$")
 	cmd.Env = append(os.Environ(), "HERD_ADMISSION_LOCK_HELPER=1", "HERD_ADMISSION_LOCK_PATH="+path, "HERD_ADMISSION_LOCK_READY="+ready, "HERD_ADMISSION_LOCK_RELEASE="+release)
 	var childOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &childOut, &childOut
