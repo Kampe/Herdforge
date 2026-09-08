@@ -106,6 +106,9 @@ func AcceptedReviewLaunchForCandidate(members []Receipt, reviewer, sha, task, re
 	task = strings.TrimSpace(task)
 	repo = strings.TrimSpace(repo)
 	lane = strings.TrimSpace(lane)
+	if task == "" || repo == "" || lane == "" {
+		return Receipt{}, fmt.Errorf("review launch proof requires task, repository, and lane binding")
+	}
 	var matches []Receipt
 	for _, m := range members {
 		if !m.Accepted {
@@ -120,20 +123,14 @@ func AcceptedReviewLaunchForCandidate(members []Receipt, reviewer, sha, task, re
 		if strings.TrimSpace(m.CandidateSHA) != sha {
 			continue
 		}
-		if task != "" {
-			if got := strings.TrimSpace(m.TaskRef); got != "" && got != task {
-				continue
-			}
+		if strings.TrimSpace(m.TaskRef) != task {
+			continue
 		}
-		if repo != "" {
-			if got := strings.TrimSpace(m.Repository); got != "" && got != repo {
-				continue
-			}
+		if strings.TrimSpace(m.Repository) != repo {
+			continue
 		}
-		if lane != "" {
-			if got := strings.TrimSpace(m.Lane); got != "" && got != lane {
-				continue
-			}
+		if strings.TrimSpace(m.Lane) != lane {
+			continue
 		}
 		matches = append(matches, m)
 	}
