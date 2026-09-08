@@ -63,23 +63,20 @@ func (l *ledgerLegacyReview) AdmittedPass(ref string) (hsync.LegacyReviewEvidenc
 			revoked[prev] = true
 		}
 	}
-	queueState := map[string]string{}
+	queueState := map[reviewledger.ProjectionKey]string{}
 	for _, row := range snap.Queue {
+		k := reviewledger.ProjectionOf(row.SHA, row.Reviewer, row.Host)
 		switch row.Event {
 		case string(reviewledger.EventRevoked):
-			queueState[row.SHA] = "revoked"
+			queueState[k] = "revoked"
 		case string(reviewledger.EventEnqueue):
-			queueState[row.SHA] = "queued"
+			queueState[k] = "queued"
 		case string(reviewledger.EventConsumed):
-			queueState[row.SHA] = "consumed"
-		}
-	}
-	for sha, state := range queueState {
-		if state == "revoked" || state == "consumed" {
-			revoked[sha] = true
+			revoked[row.SHA] = true
 		}
 	}
 
+	latest, records := reviewProjectionMaps(snap.Rows)
 	found := map[string]hsync.LegacyReviewEvidence{}
 	for _, row := range snap.Rows {
 		if row.Verdict != string(reviewledger.VerdictPASS) {
@@ -87,6 +84,13 @@ func (l *ledgerLegacyReview) AdmittedPass(ref string) (hsync.LegacyReviewEvidenc
 		}
 		if row.SHA == "" || revoked[row.SHA] {
 			// A revoked or superseded PASS is not current evidence.
+			continue
+		}
+		k := reviewledger.ProjectionOf(row.SHA, row.Reviewer, row.Host)
+		if queueState[k] == "revoked" {
+			continue
+		}
+		if liveHostVeto(latest, records, row.SHA) {
 			continue
 		}
 		if !l.refMatches(row, ref) {

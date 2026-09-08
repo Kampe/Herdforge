@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/candidate"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 func TestLedgerReviewsAdmittedForRefPreservesCrossHostDissent(t *testing.T) {
@@ -66,21 +68,53 @@ func TestLedgerReviewsAdmittedForRefPreservesCrossHostDissent(t *testing.T) {
 func TestLedgerReviewsSameHostRetryRetainsPass(t *testing.T) {
 	sha := "dddddddddddddddddddddddddddddddddddddddd"
 	ref := "FAC-765"
-	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
-	f, err := os.Create(path)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "review-ledger.jsonl")
+	l, err := reviewledger.NewReviewLedger(dir, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	enc := json.NewEncoder(f)
-	rows := []map[string]string{
-		{"event": "verdict", "sha": sha, "reviewer": "reviewer-a", "host": "host-a", "verdict": "FAIL", "branch": "task/" + ref, "artifact": "a.md", "reviewer_family": "anthropic"},
-		{"event": "verdict", "sha": sha, "reviewer": "reviewer-b", "host": "host-a", "verdict": "PASS", "retry_of": "reviewer-a", "branch": "task/" + ref, "artifact": "b.md", "reviewer_family": "openai"},
-		{"event": "supersession", "sha": sha, "task": sha, "reviewer": "reviewer-a", "host": "host-a", "retry_of": "reviewer-a"},
+	mustCandidateRecord(t, l, sha, "reviewer-a", "host-a", ref)
+	mustCandidateRecord(t, l, sha, "reviewer-b", "host-a", ref)
+	mustCandidateVerdict(t, l, sha, "reviewer-a", "host-a", reviewledger.VerdictFAIL, "", ref, ref+"-a.md")
+	mustCandidateVerdict(t, l, sha, "reviewer-b", "host-a", reviewledger.VerdictPASS, "reviewer-a", ref, ref+"-b.md")
+	got, err := (ledgerReviews{path: path}).AdmittedForRef(ref)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, row := range rows {
-		if err := enc.Encode(row); err != nil {
-			t.Fatal(err)
-		}
+	if len(got) != 1 || got[0].Verdict != "PASS" || got[0].Artifact != ref+"-b.md" {
+		t.Fatalf("same-host retry display %+v want PASS %s-b.md", got, ref)
+	}
+	id, err := candidate.Resolve(context.Background(), ref, ledgerReviews{path: path}, harvestGit{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Disposition != candidate.DispositionHarvest || id.Verdict != "PASS" {
+		t.Fatalf("native same-host retry Resolve %+v want harvest PASS", id)
+	}
+}
+
+func TestCandidateFabricatedRetryDoesNotAuthorizeHarvest(t *testing.T) {
+	sha := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	ref := "FAC-765"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "review-ledger.jsonl")
+	l, err := reviewledger.NewReviewLedger(dir, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustCandidateRecord(t, l, sha, "reviewer-a", "host-a", ref)
+	mustCandidateVerdict(t, l, sha, "reviewer-a", "host-a", reviewledger.VerdictFAIL, "", ref, ref+"-a.md")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(f).Encode(map[string]string{
+		"event": "verdict", "sha": sha, "reviewer": "reviewer-b", "host": "host-a",
+		"verdict": "PASS", "retry_of": "reviewer-a", "branch": "task/" + ref, "artifact": "b.md",
+		"reviewer_family": "openai", "builder_family": "anthropic",
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
@@ -89,8 +123,48 @@ func TestLedgerReviewsSameHostRetryRetainsPass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Verdict != "PASS" || got[0].Artifact != "b.md" {
-		t.Fatalf("same-host retry display %+v want PASS b.md", got)
+	if len(got) != 1 || got[0].Verdict != "FAIL" {
+		t.Fatalf("fabricated RetryOf authorized candidate reviews %+v want FAIL", got)
+	}
+	id, err := candidate.Resolve(context.Background(), ref, ledgerReviews{path: path}, harvestGit{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Disposition == candidate.DispositionHarvest || id.Verdict == "PASS" {
+		t.Fatalf("fabricated RetryOf authorized Harvest: %+v", id)
+	}
+	if id.Disposition != candidate.DispositionRepair {
+		t.Fatalf("disposition=%s want repair", id.Disposition)
+	}
+}
+
+type harvestGit struct{}
+
+func (harvestGit) ObjectExists(context.Context, string) bool { return true }
+func (harvestGit) BranchesContaining(context.Context, string) ([]string, error) {
+	return []string{"task/FAC-765"}, nil
+}
+func (harvestGit) WorktreeForBranch(context.Context, string) (string, error) { return "", nil }
+func (harvestGit) ContainedInMain(context.Context, string) bool              { return false }
+func (harvestGit) PatchLandedOnMain(context.Context, string) bool            { return false }
+
+func mustCandidateRecord(t *testing.T, l *reviewledger.Ledger, sha, reviewer, host, ref string) {
+	t.Helper()
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: sha, Reviewer: reviewer, Host: host, Branch: "task/" + ref,
+		BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustCandidateVerdict(t *testing.T, l *reviewledger.Ledger, sha, reviewer, host string, v reviewledger.Verdict, retry, ref, artifact string) {
+	t.Helper()
+	if _, err := l.Verdict(reviewledger.VerdictOpts{
+		SHA: sha, Reviewer: reviewer, Host: host, Verdict: v, RetryOf: retry,
+		ReviewerFamily: "openai", BuilderFamily: "anthropic", Branch: "task/" + ref, Artifact: artifact,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
