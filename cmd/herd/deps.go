@@ -343,20 +343,9 @@ workers write/test this command; they never apply live (no sidecar authority)`)
 		os.Exit(1)
 	}
 
-	var writer deps.DescriptionWriter
-	switch strings.ToLower(strings.TrimSpace(cfg.TaskProvider.Type)) {
-	case "memory":
-		mp, ok := tp.(*provider.MemoryProvider)
-		if !ok {
-			fmt.Fprintln(os.Stderr, "migrate apply: memory provider type mismatch")
-			os.Exit(1)
-		}
-		writer = deps.MemoryDescriptionWriter{MP: mp}
-	case "kaneo":
-		// Description fences are the only write surface (no unsigned sidecar).
-		writer = deps.KaneoDescriptionWriter{ProjectID: cfg.TaskProvider.ProjectID}
-	default:
-		fmt.Fprintf(os.Stderr, "migrate apply: provider %q has no DescriptionWriter (description fences only)\n", cfg.TaskProvider.Type)
+	writer, werr := deps.DescriptionWriterFor(tp, cfg.TaskProvider.ProjectID)
+	if werr != nil {
+		fmt.Fprintf(os.Stderr, "migrate apply: %v\n", werr)
 		os.Exit(1)
 	}
 

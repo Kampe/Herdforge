@@ -640,6 +640,13 @@ func (k *KaneoProvider) CreateTask(ctx context.Context, task *Task) (*Task, erro
 	return dtoToTask(dto), nil
 }
 
+// kaneoTaskResourceURL is the Kaneo exact-task HTTP resource. GetTask, status
+// mutate, and description readback share this spelling so a path fix cannot
+// land on only one copy (FAC-575 / FAC-768).
+func kaneoTaskResourceURL(apiURL, taskID string) string {
+	return fmt.Sprintf("%s/api/task/%s", strings.TrimRight(strings.TrimSpace(apiURL), "/"), url.PathEscape(taskID))
+}
+
 // kaneoRunCLI is the CLI runner for Kaneo production UseCLI mode. Tests may
 // swap it for a hermetic counter; production uses process-group RunCLI.
 var kaneoRunCLI = RunCLI
@@ -675,7 +682,7 @@ func (k *KaneoProvider) getTaskOnce(ctx context.Context, id string) (*Task, erro
 		return dtoToTask(dto), nil
 	}
 
-	url := fmt.Sprintf("%s/api/task/%s", k.APIURL, url.PathEscape(id))
+	url := kaneoTaskResourceURL(k.APIURL, id)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

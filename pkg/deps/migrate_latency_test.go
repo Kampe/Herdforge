@@ -483,7 +483,7 @@ case "$1:$2" in
     ;;
   task:get)
     value=$(/bin/cat "$FAKE_KANEO_STATE")
-    printf '{"description":"%s"}\n' "$value"
+    printf '{"id":"target-id","ref":"FAC-768","description":"%s","projectId":"p"}\n' "$value"
     ;;
   *)
     exit 2
