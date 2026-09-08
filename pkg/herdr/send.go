@@ -535,9 +535,17 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 		time.Sleep(poll)
 	}
 	if staged || strings.Contains(strings.ToLower(lastPane), "pasted text") {
-		return SendResult{Status: "queued"}, fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", resolvedTarget, last)
+		return SendResult{Status: "queued"}, errQueuedStaged(resolvedTarget, last)
 	}
-	return SendResult{Status: "queued"}, fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", resolvedTarget, last)
+	return SendResult{Status: "queued"}, errQueuedUnobserved(resolvedTarget, last)
+}
+
+func errQueuedStaged(target, last string) error {
+	return fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", target, last)
+}
+
+func errQueuedUnobserved(target, last string) error {
+	return fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", target, last)
 }
 
 func sendStatusInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {

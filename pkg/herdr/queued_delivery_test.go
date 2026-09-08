@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/mail"
 )
 
@@ -425,16 +427,47 @@ func TestFormatSendResultNamesQueuedDurable(t *testing.T) {
 	}
 }
 
-func TestQueueMailboxUsesRepoRelativeDefault(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HERD_ROOT", dir)
+func TestQueueMailboxFailsClosedWithoutProjectRoot(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HERD_ROOT", t.TempDir())
+	t.Setenv("HERD_PROJECT_ROOT", "")
 	t.Setenv("HERD_MAIL_FILE", "")
-	box := resolveQueueMailbox()
-	want := filepath.Join(dir, ".herd", "control-mail.jsonl")
-	if box.MailFile != want {
-		t.Fatalf("default mailbox = %q, want %q", box.MailFile, want)
+	_, err := resolveQueueMailbox()
+	if err == nil {
+		t.Fatal("unavailable project root must fail closed, not guess cwd or HERD_ROOT")
 	}
-	if filepath.IsAbs(os.Getenv("HERD_MAIL_FILE")) {
-		t.Fatal("test must not set an absolute HERD_MAIL_FILE")
+}
+
+func TestQueueMailboxIgnoresLaneHERDROOT(t *testing.T) {
+	repo := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "fac773@test"},
+		{"config", "user.name", "fac773"},
+		{"commit", "--allow-empty", "-q", "-m", "base"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+filepath.Join(t.TempDir(), "gitconfig"), "GIT_CONFIG_NOSYSTEM=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	lane := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("HERD_ROOT", lane)
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Setenv("HERD_MAIL_FILE", "")
+	box, err := resolveQueueMailbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _, err := gitroot.ProjectRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, ".herd", "control-mail.jsonl")
+	if box.MailFile != want {
+		t.Fatalf("mailbox = %q, want project root %q (not HERD_ROOT %q)", box.MailFile, want, lane)
 	}
 }
