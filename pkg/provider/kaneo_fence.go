@@ -318,7 +318,7 @@ func (k *KaneoProvider) mutateStatus(ctx context.Context, taskID, status string)
 		}
 		return k.runCLIMutate(ctx, args...)
 	}
-	url := fmt.Sprintf("%s/api/task/%s", strings.TrimRight(strings.TrimSpace(k.APIURL), "/"), taskID)
+	url := kaneoTaskResourceURL(k.APIURL, taskID)
 	payload := map[string]string{"status": status}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewBuffer(body))
@@ -374,7 +374,7 @@ func (k *KaneoProvider) mutateStatusFullSchemaPUT(ctx context.Context, taskID, s
 		}
 	}
 	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/api/task/%s", strings.TrimRight(apiURL, "/"), url.PathEscape(taskID))
+	url := kaneoTaskResourceURL(apiURL, taskID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewBuffer(body))
 	if err != nil {
 		return err
