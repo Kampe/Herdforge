@@ -186,9 +186,13 @@ func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID
 	s.mu.Unlock()
 
 	// Fresh Get outside lock — live status for Done check (not a full re-list).
-	fresh, err := s.TP.GetTask(ctx, id)
-	if err != nil || fresh == nil {
-		return "", "", fmt.Errorf("%w: %s", ErrDeletedTask, ref)
+	// resolveEndpointTask never infers archive from the GetTask failure alone:
+	// it only accepts a matching row from this project's own archived column as
+	// positive evidence, so a genuinely missing/foreign/unauthorized ref stays
+	// fail-closed with its real error preserved (FAC-777 live correction).
+	fresh, ferr := s.resolveEndpointTask(ctx, id)
+	if ferr != nil {
+		return "", "", fmt.Errorf("deps: task %s: %w", ref, ferr)
 	}
 	st := provider.NormalizeStatus(fresh.Status)
 	if st == provider.StatusUnknown || strings.HasPrefix(st, "unknown:") {
@@ -205,6 +209,52 @@ func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID
 		fence.mu.Unlock()
 	}
 	return st, TaskID(fresh.ID), nil
+}
+
+// resolveEndpointTask resolves one endpoint by immutable id for snapshot
+// hydration and status reads. A direct GetTask is always tried first and, on
+// success, is authoritative regardless of status (an archived task that GetTask
+// can still read needs no special case). Only when GetTask itself fails does
+// this consult this project's own archived column for an exact id match: that
+// is the sole accepted positive evidence for "archived, unreadable via single
+// GetTask" (live Kaneo can 404/400 a single active or archived ref while the
+// project-scoped column listing still resolves it). Archive is never inferred
+// from the GetTask failure alone, a 404/400 body, or a missing list entry —
+// per FAC-777 live correction, that goes on poisoning genuinely missing,
+// foreign-project, or unauthorized endpoints as "deleted", not "archived".
+func (s *ProviderStore) resolveEndpointTask(ctx context.Context, idOrRef string) (*provider.Task, error) {
+	t, gerr := s.TP.GetTask(ctx, idOrRef)
+	if gerr == nil && t != nil {
+		return t, nil
+	}
+	archived, aerr := s.findArchivedEvidence(ctx, idOrRef)
+	if aerr == nil && archived != nil {
+		return archived, nil
+	}
+	if gerr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDeletedTask, gerr)
+	}
+	return nil, ErrDeletedTask
+}
+
+// findArchivedEvidence looks for idOrRef in this project's archived column,
+// scoped to s.ProjectID and matched by exact immutable id or ref on the
+// returned row — never across a different project. A miss (including a
+// foreign-project archived task this store has no authority to confirm)
+// returns (nil, nil): the caller keeps the caller's original GetTask error
+// rather than silently accepting an unconfirmed archive state.
+func (s *ProviderStore) findArchivedEvidence(ctx context.Context, idOrRef string) (*provider.Task, error) {
+	rows, err := s.TP.ListTasks(ctx, s.ProjectID, provider.StatusArchived)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if row != nil && (row.ID == idOrRef || row.Ref == idOrRef) {
+			cp := *row
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) (DependencyEdge, error) {
@@ -229,9 +279,9 @@ func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) 
 	tgtT := s.idCache[r.TargetTaskID]
 	s.mu.Unlock()
 	if srcT == nil {
-		t, gerr := s.TP.GetTask(ctx, r.SourceTaskID)
-		if gerr != nil || t == nil {
-			return DependencyEdge{}, fmt.Errorf("deps: relation %s source %s unreadable: %w", r.ID, r.SourceTaskID, ErrDeletedTask)
+		t, rerr := s.resolveEndpointTask(ctx, r.SourceTaskID)
+		if rerr != nil {
+			return DependencyEdge{}, fmt.Errorf("deps: relation %s source %s unreadable: %w", r.ID, r.SourceTaskID, rerr)
 		}
 		srcT = t
 		s.mu.Lock()
@@ -240,9 +290,9 @@ func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) 
 		s.mu.Unlock()
 	}
 	if tgtT == nil {
-		t, gerr := s.TP.GetTask(ctx, r.TargetTaskID)
-		if gerr != nil || t == nil {
-			return DependencyEdge{}, fmt.Errorf("deps: relation %s target %s unreadable: %w", r.ID, r.TargetTaskID, ErrDeletedTask)
+		t, rerr := s.resolveEndpointTask(ctx, r.TargetTaskID)
+		if rerr != nil {
+			return DependencyEdge{}, fmt.Errorf("deps: relation %s target %s unreadable: %w", r.ID, r.TargetTaskID, rerr)
 		}
 		tgtT = t
 		s.mu.Lock()
@@ -427,7 +477,25 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 			t := s.refCache[string(ref)]
 			s.mu.Unlock()
 			if t == nil {
-				return fmt.Errorf("deps: scoped graph endpoint %s is not in project", ref)
+				// Not in the unfiltered hydrate cache -- try the same
+				// evidence-based resolution mapEdgeStrict/TaskStatus use before
+				// declaring the endpoint out of project (FAC-777 live correction:
+				// an unfiltered listing can omit a row a scoped read still
+				// resolves). A cross-project GetTask hit is still rejected below.
+				resolved, rerr := s.resolveEndpointTask(ctx, string(ref))
+				if rerr != nil {
+					return fmt.Errorf("deps: scoped graph endpoint %s is not in project: %w", ref, rerr)
+				}
+				if resolved.ProjectID != s.ProjectID {
+					return fmt.Errorf("deps: scoped graph endpoint %s resolved outside project", ref)
+				}
+				cp := *resolved
+				t = &cp
+				s.mu.Lock()
+				s.refCache[t.Ref] = t
+				s.idCache[t.ID] = t
+				s.mu.Unlock()
+				projectIDs[t.ID] = struct{}{}
 			}
 			id = TaskID(t.ID)
 		}
