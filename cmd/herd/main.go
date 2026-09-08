@@ -2026,20 +2026,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			return resolveLaneLoopMode(cfg, laneName)
 		},
 		CreateTab: func(workspace, label, cwd string) (standing.Tab, error) {
-			if lastAdmit.decision == nil || lastAdmit.lane == nil {
-				return standing.Tab{}, errors.New("standing tab create requires prior AdmitRoute decision")
-			}
-			req := launch.Request{
-				Decision: lastAdmit.decision,
-				TaskRef:  lastAdmit.lane.Name,
-				Scope:    router.ScopeLane,
-				Lane:     lastAdmit.lane.Name,
-			}
-			_, tab, err := openWriteCapableTab(lastAdmit.decision, req, lastAdmit.lane, workspace, label, cwd)
-			if err != nil {
-				return standing.Tab{}, err
-			}
-			return standing.Tab{ID: tab.ID, Label: tab.Label, PaneID: tab.Pane.ID, Cwd: tab.Cwd}, nil
+			return standingCreateTab(lastAdmit.decision, lastAdmit.lane, workspace, label, cwd)
 		},
 		StartAgent: func(tab standing.Tab, agentName string, route standing.Route, lane *config.LaneDef, repository string) error {
 			return startStandingAgent(tab, agentName, route, lane, repository, herdr.StartPreparedAgent)

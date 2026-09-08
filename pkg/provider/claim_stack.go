@@ -1,13 +1,13 @@
 package provider
 
 import (
-	"sync"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
@@ -182,10 +182,12 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 			}
 		}
 	}
-	// Worker attach: when HERD_FENCE_BROKER_URL is set, wire the live broker
-	// client so fenced status/comment writes reach the sidecar. Without this
-	// production callers fail closed at mutate time with no remedy.
+	// Worker attach: when HERD_FENCE_BROKER_URL is set (process env or the
+	// confidential contain env.list channel), wire the live broker client so
+	// fenced status/comment writes reach the sidecar. Without this production
+	// callers fail closed at mutate time with no remedy.
 	if isRealKaneoProvider(tp) {
+		_ = applyConfidentialWorkerBrokerEnvFromProcess()
 		if url := strings.TrimSpace(os.Getenv(envFenceBrokerURL)); url != "" {
 			client, cerr := NewFenceBrokerClientFromEnv()
 			if cerr != nil {
@@ -447,7 +449,7 @@ var knownImplementationRoles = []string{"forge-smith", "worker", "builder", "cod
 // unknown label is still refused: the point is to teach the check this
 // repository's vocabulary, not to accept any label at all.
 var (
-	projectRolesMu          sync.RWMutex
+	projectRolesMu             sync.RWMutex
 	projectImplementationRoles []string
 )
 
