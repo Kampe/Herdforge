@@ -4311,14 +4311,15 @@ func runBoardSyncFix(syncer *hsync.BoardSyncer, projectID string, asJSON bool) i
 	return 0
 }
 
-// runSend ports bin/herd-send: prompt an agent and verify it consumed the
-// submit (working/done), with one Enter nudge before giving up.
+// runSend ports bin/herd-send: prompt an idle agent, or queue routinely while
+// the recipient works. Authenticated urgent control stays on SendStatus.
 func runSend() {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	noVerify := fs.Bool("no-verify", false, "Submit without waiting for the agent to flip to working")
 	file := fs.String("file", "", "Read the text to send from a file (for long packets)")
 	timeoutSec := fs.Int("timeout", 30, "Seconds to wait for consumption confirmation")
 	workspace := fs.String("workspace", "", "Explicitly authorize delivery to a peer in this Herdr workspace")
+	drain := fs.Bool("drain", false, "Surface pending durable envelopes at an idle/done turn boundary")
 	selftestFlag := fs.Bool("selftest", false, "Run status-extraction assertions and exit")
 
 	// Go's flag package stops parsing at the first positional argument. Move
@@ -4330,7 +4331,7 @@ func runSend() {
 	for i := 2; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		switch arg {
-		case "--no-verify", "--selftest":
+		case "--no-verify", "--selftest", "--drain":
 			flagArgs = append(flagArgs, arg)
 		case "--file", "--timeout", "--workspace":
 			flagArgs = append(flagArgs, arg)
@@ -4377,12 +4378,14 @@ func runSend() {
 			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
 			os.Exit(1)
 		}
-		text = strings.TrimSpace(string(data))
+		text = string(data)
 	case len(pos) > 1:
 		text = strings.Join(pos[1:], " ")
 	default:
-		fmt.Fprintf(os.Stderr, "herd send: no text given (positional or --file)\n")
-		os.Exit(2)
+		if !*drain {
+			fmt.Fprintf(os.Stderr, "herd send: no text given (positional or --file)\n")
+			os.Exit(2)
+		}
 	}
 
 	if !herdr.IsAvailable() {
@@ -4390,32 +4393,63 @@ func runSend() {
 		os.Exit(1)
 	}
 
-	var status string
-	var err error
-	if strings.TrimSpace(*workspace) != "" {
-		status, err = herdr.SendInWorkspace(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second, strings.TrimSpace(*workspace))
+	mailPath, err := controlMailPath("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd send: mailbox: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(filepath.Dir(mailPath), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "herd send: mailbox: %v\n", err)
+		os.Exit(1)
+	}
+	box := mail.NewMailbox(mailPath)
+	restoreMailbox := herdr.SetQueueMailbox(box)
+	defer restoreMailbox()
+
+	ws := strings.TrimSpace(*workspace)
+	if *drain {
+		results, drainErr := herdr.DrainQueuedAtBoundary(target, ws, box)
+		if drainErr != nil {
+			fmt.Fprintf(os.Stderr, "herd send: drain: %v\n", drainErr)
+			if text == "" {
+				os.Exit(1)
+			}
+		} else {
+			for _, result := range results {
+				fmt.Printf("herd send: drained envelope %s delivered=%t acknowledged=%t\n", result.EnvelopeID, result.Delivered, result.Acknowledged)
+			}
+			if len(results) == 0 {
+				fmt.Println("herd send: drain: no pending durable envelopes")
+			}
+		}
+		if text == "" {
+			return
+		}
+	}
+
+	var result herdr.SendResult
+	if ws != "" {
+		result, err = herdr.DeliverRoutineInWorkspace(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second, ws)
 	} else {
-		status, err = herdr.Send(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
+		result, err = herdr.DeliverRoutine(target, text, !*noVerify, time.Duration(*timeoutSec)*time.Second)
 	}
 	if err != nil {
-		if status == "queued" || status == "deferred" {
-			fmt.Fprintf(os.Stderr, "herd send: -> %s: %v\n", status, err)
+		if result.Status == "queued" || result.Status == "deferred" {
+			fmt.Fprintf(os.Stderr, "herd send: -> %s: %v\n", result.Status, err)
 		} else {
 			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
 		}
 		os.Exit(1)
 	}
-	if lane := strings.TrimSpace(os.Getenv("HERD_LANE")); lane != "" {
-		if err := feedback.RecordReply(context.Background(), feedback.DefaultMailDir("."), lane, target, text); err != nil {
-			fmt.Fprintf(os.Stderr, "herd send: record feedback reply: %v\n", err)
-			os.Exit(1)
+	if result.Status != herdr.StatusQueuedDurable {
+		if lane := strings.TrimSpace(os.Getenv("HERD_LANE")); lane != "" {
+			if err := feedback.RecordReply(context.Background(), feedback.DefaultMailDir("."), lane, target, text); err != nil {
+				fmt.Fprintf(os.Stderr, "herd send: record feedback reply: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
-	if strings.TrimSpace(*workspace) != "" {
-		fmt.Println(herdr.FormatSendResultInWorkspace(target, *workspace, status))
-	} else {
-		fmt.Println(herdr.FormatSendResult(target, status))
-	}
+	fmt.Println(herdr.FormatSendResultWithEnvelope(target, ws, result.Status, result.EnvelopeID))
 }
 
 // runHerdrDeliver is the durable operator boundary for free-form prompt bytes.
@@ -7041,7 +7075,8 @@ func runKick() {
 		Generation: func(ctx context.Context, identity lifecycle.HoldIdentity) (int64, error) {
 			return authority.CurrentGeneration(ctx, identity)
 		},
-		ActiveTasks: activeResolver,
+		ActiveTasks:   activeResolver,
+		SurfaceQueued: surfaceQueuedAtKick,
 		AuthorityEnvelope: func(id string) (goalguard.AuthorityEnvelope, error) {
 			laneID := strings.TrimPrefix(id, kick.ForgePrefix)
 			for _, lane := range kickConfig.Lanes {

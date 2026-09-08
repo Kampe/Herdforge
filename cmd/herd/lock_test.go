@@ -23,6 +23,8 @@ func sandbox(t *testing.T) string {
 }
 
 // runHerd runs the freshly-built binary in dir with the given args/env.
+// Inherited lock-scope variables are stripped so a parent HERD_CANONICAL_ROOT
+// cannot redirect the lock out of the sandbox. Explicit env still wins.
 func runHerd(t *testing.T, dir string, env []string, args ...string) ([]byte, error) {
 	t.Helper()
 	binary := buildHerd(t)
@@ -30,7 +32,8 @@ func runHerd(t *testing.T, dir string, env []string, args ...string) ([]byte, er
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	cmd.Env = append(os.Environ(), env...)
+	base := filterEnv(os.Environ(), lock.EnvCanonicalRoot, lock.EnvLockDir, lock.EnvHeld)
+	cmd.Env = append(base, env...)
 	return cmd.CombinedOutput()
 }
 
@@ -274,6 +277,32 @@ func TestLockAcquireHoldsRelease(t *testing.T) {
 	}
 }
 
+func TestLockIgnoresInheritedCanonicalRoot(t *testing.T) {
+	foreign := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(foreign, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(lock.EnvCanonicalRoot, foreign)
+
+	dir := sandbox(t)
+	probe := filepath.Join(dir, "probe.sh")
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nprintf '%s' \"${HERD_SHARED_LOCK_HELD-}\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runHerd(t, dir, nil, "lock", "with", "--", probe)
+	if err != nil {
+		t.Fatalf("with probe under inherited canonical: %v (out=%s)", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	want := lockDirFor(dir)
+	if got != want {
+		t.Fatalf("inherited %s redirected lock out of sandbox: got %s want %s", lock.EnvCanonicalRoot, got, want)
+	}
+	if _, err := os.Stat(filepath.Join(foreign, lock.DefaultRelDir)); err == nil {
+		t.Fatalf("lock dir leaked into inherited foreign root %s", foreign)
+	}
+}
+
 func TestLockEnvOverrides(t *testing.T) {
 	custom := filepath.Join(t.TempDir(), "custom-checkout")
 	// The lockdir lives under <canonical>/.git, so the canonical checkout must
@@ -285,11 +314,7 @@ func TestLockEnvOverrides(t *testing.T) {
 	// is elsewhere. Use `acquire` (leaves the lock held) rather than `with`
 	// (which releases on exit, removing the lockdir before we could stat it).
 	env := []string{"HERD_CANONICAL_ROOT=" + custom}
-	binary := buildHerd(t)
-	cmd := exec.Command(binary, "lock", "acquire", "--wait", "2", "--reason", "override")
-	cmd.Dir = filepath.Dir(custom) // run from outside the canonical root
-	cmd.Env = append(os.Environ(), env...)
-	out, err := cmd.CombinedOutput()
+	out, err := runHerd(t, filepath.Dir(custom), env, "lock", "acquire", "--wait", "2", "--reason", "override")
 	if err != nil {
 		t.Fatalf("acquire outside canonical: %v (out=%s)", err, out)
 	}

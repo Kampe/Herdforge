@@ -76,13 +76,14 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 		return nil, fmt.Errorf("read review ledger: %w", err)
 	}
 	withdrawn := map[string]bool{}
-	superseded := map[reviewledger.ProjectionKey]bool{}
+	latest, records := reviewProjectionMaps(snap.Rows)
+	superseded := reviewledger.RetrySupersessionFromLatest(latest, records, "")
 	for _, row := range snap.Rows {
 		if row.Event == string(reviewledger.EventRevoked) {
 			withdrawn[row.SHA] = true
 		}
-		if row.Event == string(reviewledger.EventVerdict) && row.Verdict == "PASS" && strings.TrimSpace(row.RetryOf) != "" {
-			superseded[reviewledger.ProjectionOf(row.SHA, row.RetryOf, row.Host)] = true
+		if prev := reviewledger.IdentityReplacementSHA(row.Event, row.SHA, row.Task, row.RetryOf); prev != "" {
+			withdrawn[prev] = true
 		}
 	}
 	byHost := map[reviewledger.ProjectionKey]candidate.Review{}
