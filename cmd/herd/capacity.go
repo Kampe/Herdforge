@@ -78,6 +78,18 @@ import (
 // gates decide. A capacity gate that refuses whenever it cannot measure is an
 // outage generator, and this session has already paid for that lesson twice.
 // Only a gate that is actually FALSE refuses.
+// capacityExit carries a specific process exit code through an ordinary
+// return, instead of os.Exit, so a --claim admission lease's deferred
+// release still runs before the process ends.
+//
+// FAC-770: os.Exit inside runCapacity's --claim path terminated the process
+// immediately on both the refusal and the refresh-failure branches, skipping
+// `defer release()` and orphaning the lease for its full TTL even though the
+// launch it guarded never happened.
+type capacityExit int
+
+func (e capacityExit) Error() string { return fmt.Sprintf("herd capacity: exit %d", int(e)) }
+
 func runCapacity(args []string) error {
 	fs := flag.NewFlagSet("capacity", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "emit the structured capacity record")
@@ -112,7 +124,7 @@ func runCapacity(args []string) error {
 			c.Reason = "another launch holds the admission lease on this host; serialize rather than racing it. " +
 				"Retry after it resolves, or pass --claim-ttl if a legitimate launch needs longer."
 			emitCapacity(c, *asJSON)
-			os.Exit(3)
+			return capacityExit(3)
 		}
 		defer release()
 	}
@@ -139,7 +151,7 @@ func runCapacity(args []string) error {
 		l, err := refreshLaunchable()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd capacity: refresh-launchable: %v\n", err)
-			os.Exit(1)
+			return capacityExit(1)
 		}
 		fmt.Printf("provider concurrency refreshed: %s\n", l.Detail)
 		return nil
@@ -155,7 +167,7 @@ func runCapacity(args []string) error {
 	if !c.Admit {
 		// Fail-closed exit status so a shell caller cannot ignore a refusal by
 		// forgetting to parse the JSON it just printed.
-		os.Exit(3)
+		return capacityExit(3)
 	}
 	return nil
 }
