@@ -7069,7 +7069,8 @@ func runKick() {
 		Generation: func(ctx context.Context, identity lifecycle.HoldIdentity) (int64, error) {
 			return authority.CurrentGeneration(ctx, identity)
 		},
-		ActiveTasks: activeResolver,
+		ActiveTasks:   activeResolver,
+		SurfaceQueued: surfaceQueuedAtKick,
 		AuthorityEnvelope: func(id string) (goalguard.AuthorityEnvelope, error) {
 			laneID := strings.TrimPrefix(id, kick.ForgePrefix)
 			for _, lane := range kickConfig.Lanes {
