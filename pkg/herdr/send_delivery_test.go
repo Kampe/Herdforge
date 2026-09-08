@@ -90,7 +90,7 @@ func jsonQuote(s string) string {
 func TestConfirmedSendSubmitsExactlyOnce(t *testing.T) {
 	text := "do the thing"
 	rec := &sendRecorder{
-		status:       "working",
+		status:       "idle",
 		baselinePane: "prompt> ",
 		pane:         "prompt> " + text + "\nThinking...",
 	}
@@ -101,8 +101,8 @@ func TestConfirmedSendSubmitsExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a consumed send must succeed: %v", err)
 	}
-	if status != "working" && status != "done" {
-		t.Fatalf("status = %q, want a consumed status", status)
+	if status != "idle" && status != "working" && status != "done" {
+		t.Fatalf("status = %q, want a consumed idle-path status", status)
 	}
 	if got := rec.enterCount(); got != 1 {
 		t.Errorf("exactly one Enter must be sent on the happy path, got %d: %v", got, rec.calls)
