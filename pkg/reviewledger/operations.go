@@ -284,6 +284,9 @@ func (l *Ledger) Ingest(opts IngestOpts) (enqueued bool, err error) {
 	if err := l.ensureRecord(opts.Record); err != nil {
 		return false, err
 	}
+	if err := l.completeAuthenticatedLaunchRecord(opts.Record); err != nil {
+		return false, err
+	}
 	return l.verdict(opts.Verdict)
 }
 
