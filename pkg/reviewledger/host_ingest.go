@@ -83,6 +83,42 @@ func rowProjection(r LedgerRow) ProjectionKey {
 	return ProjectionOf(r.SHA, r.Reviewer, r.Host)
 }
 
+func retrySupersessionFromLatest(latest map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
+	out := make(map[ProjectionKey]bool)
+	for k, verdict := range latest {
+		if k.SHA != sha || verdict.Verdict != string(VerdictPASS) {
+			continue
+		}
+		if retry := strings.TrimSpace(verdict.RetryOf); retry != "" {
+			out[ProjectionOf(k.SHA, retry, k.Host)] = true
+		}
+	}
+	return out
+}
+
+func retrySupersessionFromRows(rows []LedgerRow, sha string) map[ProjectionKey]bool {
+	out := make(map[ProjectionKey]bool)
+	for _, r := range rows {
+		if r.SHA != sha || r.Verdict != string(VerdictPASS) {
+			continue
+		}
+		if retry := strings.TrimSpace(r.RetryOf); retry != "" {
+			out[ProjectionOf(r.SHA, retry, r.Host)] = true
+		}
+	}
+	return out
+}
+
+func indexHostRetrySupersession(rows []LedgerRow, latest map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
+	out := retrySupersessionFromLatest(latest, sha)
+	for _, r := range rows {
+		if r.Event == string(EventSupersession) && r.SHA == sha && strings.TrimSpace(r.Reviewer) != "" {
+			out[rowProjection(r)] = true
+		}
+	}
+	return out
+}
+
 func indexProjectionEvent(rows []LedgerRow, event string, skipRetired bool) map[ProjectionKey]LedgerRow {
 	out := make(map[ProjectionKey]LedgerRow)
 	for _, r := range rows {
