@@ -122,8 +122,11 @@ func collectAttentionCandidates(ctx context.Context, root string, cfg *config.Co
 			}
 			records[row.SHA] = record
 		}
-		if row.Event == string(reviewledger.EventSupersession) {
-			superseded[row.Task] = true
+		if row.Event == string(reviewledger.EventRevoked) {
+			superseded[row.SHA] = true
+		}
+		if prev := reviewledger.IdentityReplacementSHA(row.Event, row.SHA, row.Task, row.RetryOf); prev != "" {
+			superseded[prev] = true
 		}
 	}
 	policy, err := preflight.LoadMergePolicy(root)

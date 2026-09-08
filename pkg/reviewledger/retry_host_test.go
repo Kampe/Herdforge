@@ -199,3 +199,59 @@ func TestEligibleCrossHostBlockedSurvivesRetry(t *testing.T) {
 		t.Fatalf("host-B retry must not hide host-A BLOCKED: eligible=%v err=%v", eligible, err)
 	}
 }
+
+func TestGenericSupersessionDoesNotClearCurrentVeto(t *testing.T) {
+	l := newTestLedger(t)
+	const current = "generic-supersession-current"
+	const previous = "generic-supersession-previous"
+	mustErr(l.Record(RecordOpts{SHA: current, Reviewer: "reviewer-a", BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+	mustErr(l.Record(RecordOpts{SHA: current, Reviewer: "reviewer-b", BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+	must2(l.Verdict(VerdictOpts{SHA: current, Reviewer: "reviewer-a", Verdict: VerdictFAIL, ReviewerFamily: "openai", BuilderFamily: "anthropic"}))
+	must2(l.Verdict(VerdictOpts{SHA: current, Reviewer: "reviewer-b", Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "anthropic"}))
+	mustErr(l.Supersession(DecisionOpts{
+		SHA: current, PreviousSHA: previous, Reviewer: "reviewer-a",
+		Reason: "candidate identity replacement",
+	}))
+	eligible, err := l.Eligible(current, "anthropic")
+	if err == nil || eligible {
+		t.Fatalf("generic EventSupersession cleared current veto: eligible=%v err=%v", eligible, err)
+	}
+
+	t.Run("bound_same_host_retry_still_eligible", func(t *testing.T) {
+		l := newTestLedger(t)
+		const sha = "bound-retry-still-eligible"
+		const host = "host-a"
+		mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-a", Host: host, BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+		mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-b", Host: host, BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+		must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Host: host, Verdict: VerdictFAIL, ReviewerFamily: "openai", BuilderFamily: "anthropic"}))
+		must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-b", Host: host, Verdict: VerdictPASS, ReviewerFamily: "openai", BuilderFamily: "anthropic", RetryOf: "reviewer-a"}))
+		ok, err := l.Eligible(sha, "anthropic")
+		if err != nil || !ok {
+			t.Fatalf("bound same-host PASS RetryOf: eligible=%v err=%v", ok, err)
+		}
+	})
+	t.Run("other_host_fail_survives", func(t *testing.T) {
+		l := newTestLedger(t)
+		const sha = "generic-other-host-fail"
+		mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-a", BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+		mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-b", BuilderFamily: "anthropic", ReviewerFamily: "xai", Gate: "independent"}))
+		must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-a", Verdict: VerdictFAIL, ReviewerFamily: "openai", BuilderFamily: "anthropic"}))
+		must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-b", Verdict: VerdictPASS, ReviewerFamily: "xai", BuilderFamily: "anthropic", RetryOf: "reviewer-a"}))
+		ok, err := l.Eligible(sha, "anthropic")
+		if err == nil || ok {
+			t.Fatalf("other-host FAIL cleared: eligible=%v err=%v", ok, err)
+		}
+	})
+	t.Run("other_host_blocked_survives", func(t *testing.T) {
+		l := newTestLedger(t)
+		const sha = "generic-other-host-blocked"
+		mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-a", BuilderFamily: "anthropic", ReviewerFamily: "openai", Gate: "independent"}))
+		mustErr(l.Record(RecordOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-b", BuilderFamily: "anthropic", ReviewerFamily: "xai", Gate: "independent"}))
+		must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-a", Verdict: VerdictBLOCKED, ReviewerFamily: "openai", BuilderFamily: "anthropic"}))
+		must2(l.Verdict(VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Host: "host-b", Verdict: VerdictPASS, ReviewerFamily: "xai", BuilderFamily: "anthropic", RetryOf: "reviewer-a"}))
+		ok, err := l.Eligible(sha, "anthropic")
+		if err == nil || ok {
+			t.Fatalf("other-host BLOCKED cleared: eligible=%v err=%v", ok, err)
+		}
+	})
+}

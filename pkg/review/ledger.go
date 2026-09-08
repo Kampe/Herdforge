@@ -81,6 +81,7 @@ type LedgerRow struct {
 	Lane           string `json:"lane,omitempty"`
 	MergeSHA       string `json:"merge_sha,omitempty"`
 	Status         string `json:"status,omitempty"`
+	Task           string `json:"task,omitempty"`
 	RetryOf        string `json:"retry_of,omitempty"`
 }
 
