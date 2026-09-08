@@ -28,12 +28,55 @@ func completionFixture(t *testing.T, mutate func(*LedgerRow, *LedgerRow)) (*Ledg
 	return l, sha, reviewer
 }
 
+func TestCompleteAdmissionRecordReconcilesLegacyBranchTask(t *testing.T) {
+	l, sha, reviewer := completionFixture(t, func(r, _ *LedgerRow) {
+		r.Task = "recovery/fac-655-record-completion"
+	})
+	before, err := os.ReadFile(l.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) {
+		return RecordCompletion{Branch: "recovery/fac-655-record-completion", Tier: "R3"}, nil
+	}); err != nil {
+		t.Fatalf("legacy branch placeholder: %v", err)
+	}
+	after, err := os.ReadFile(l.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(after), string(before)) {
+		t.Fatal("rewrote history")
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := rows[len(rows)-1]
+	if last.Event != string(EventRecord) || last.Task != "FAC-759" || last.BuilderFamily != "openai" || last.ReviewerFamily != "google" || last.Tier != "R3" || last.Branch != "recovery/fac-655-record-completion" || last.Gate != "independent" || last.Lease != "real-lease" || last.PatchURL != "real-patch" {
+		t.Fatalf("incomplete recovered record: %+v", last)
+	}
+	if err := l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) {
+		return RecordCompletion{Branch: "recovery/fac-655-record-completion", Tier: "R3"}, nil
+	}); err != nil {
+		t.Fatalf("repeat: %v", err)
+	}
+	repeat, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repeat) != len(rows) {
+		t.Fatalf("repeat appended %d rows, want %d", len(repeat), len(rows))
+	}
+}
+
 func TestCompleteAdmissionRecordRefusesConflicts(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*LedgerRow, *LedgerRow)
 	}{
 		{"record task", func(r, v *LedgerRow) { r.Task = "FAC-758" }},
+		{"legacy branch mismatch", func(r, v *LedgerRow) { r.Task = "other-branch" }},
 		{"verdict task", func(r, v *LedgerRow) { v.Task = "FAC-758" }},
 		{"candidate", func(r, v *LedgerRow) { v.CandidateSHA = strings.Repeat("c", 40) }},
 		{"FAIL", func(r, v *LedgerRow) { v.Verdict = string(VerdictFAIL) }},
@@ -53,7 +96,9 @@ func TestCompleteAdmissionRecordRefusesConflicts(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			e = l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) { return RecordCompletion{Branch: "work", Tier: "R3"}, nil })
+			e = l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) {
+				return RecordCompletion{Branch: "work", Tier: "R3"}, nil
+			})
 			if e == nil {
 				t.Fatal("conflicting evidence admitted")
 			}
