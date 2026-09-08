@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/candidate"
@@ -102,27 +103,40 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 		cur.MergeSHA = firstNonEmpty(row.MergeSHA, cur.MergeSHA)
 		byHost[k] = cur
 	}
-	merged := map[string]candidate.Review{}
-	for _, r := range byHost {
-		cur, ok := merged[r.CandidateSHA]
-		if !ok {
-			merged[r.CandidateSHA] = r
-			continue
-		}
-		if isVetoVerdict(r.Verdict) {
-			cur.Verdict = r.Verdict
-			cur = enrichReview(cur, r)
-		} else if !isVetoVerdict(cur.Verdict) {
-			cur.Verdict = firstNonEmpty(r.Verdict, cur.Verdict)
-			cur = enrichReview(cur, r)
-		}
-		merged[r.CandidateSHA] = cur
+	return coherentReviews(byHost), nil
+}
+
+// coherentReviews picks one whole projection per SHA. Mixing artifact/family
+// from different hosts via map-order enrich is not a display identity.
+func coherentReviews(byHost map[reviewledger.ProjectionKey]candidate.Review) []candidate.Review {
+	bySHA := map[string][]reviewledger.ProjectionKey{}
+	for k := range byHost {
+		bySHA[k.SHA] = append(bySHA[k.SHA], k)
 	}
-	out := make([]candidate.Review, 0, len(merged))
-	for _, r := range merged {
-		out = append(out, r)
+	shas := make([]string, 0, len(bySHA))
+	for sha := range bySHA {
+		shas = append(shas, sha)
 	}
-	return out, nil
+	sort.Strings(shas)
+	out := make([]candidate.Review, 0, len(shas))
+	for _, sha := range shas {
+		keys := bySHA[sha]
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].Reviewer != keys[j].Reviewer {
+				return keys[i].Reviewer < keys[j].Reviewer
+			}
+			return keys[i].Host < keys[j].Host
+		})
+		chosen := keys[0]
+		for _, k := range keys {
+			if isVetoVerdict(byHost[k].Verdict) {
+				chosen = k
+				break
+			}
+		}
+		out = append(out, byHost[chosen])
+	}
+	return out
 }
 
 func isVetoVerdict(v string) bool {
@@ -131,16 +145,6 @@ func isVetoVerdict(v string) bool {
 		return true
 	}
 	return false
-}
-
-func enrichReview(cur, src candidate.Review) candidate.Review {
-	cur.Artifact = firstNonEmpty(src.Artifact, cur.Artifact)
-	cur.Reviewer = firstNonEmpty(src.Reviewer, cur.Reviewer)
-	cur.ReviewerFamily = firstNonEmpty(src.ReviewerFamily, cur.ReviewerFamily)
-	cur.BuilderFamily = firstNonEmpty(src.BuilderFamily, cur.BuilderFamily)
-	cur.RecordedBranch = firstNonEmpty(src.RecordedBranch, cur.RecordedBranch)
-	cur.MergeSHA = firstNonEmpty(src.MergeSHA, cur.MergeSHA)
-	return cur
 }
 
 func firstNonEmpty(a, b string) string {
