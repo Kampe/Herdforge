@@ -427,6 +427,12 @@ func main() {
 
 	case "capacity":
 		if err := runCapacity(os.Args[2:]); err != nil {
+			// capacityExit already printed everything it needs to; it exists
+			// so runCapacity can `return` instead of os.Exit and let its
+			// deferred --claim lease release run first (FAC-770).
+			if ce, ok := err.(capacityExit); ok {
+				os.Exit(int(ce))
+			}
 			fmt.Fprintf(os.Stderr, "herd capacity: %v\n", err)
 			os.Exit(1)
 		}
