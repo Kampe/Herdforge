@@ -137,26 +137,27 @@ func fullSuiteTestArgv(argv []string) bool {
 }
 
 func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (passes []LedgerRow, contradict bool, err error) {
-	launch := map[string]LedgerRow{}
+	launch := map[projectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventRecord) && r.SHA == sha {
-			launch[r.Reviewer] = r
+			launch[rowProjection(r)] = r
 		}
 	}
-	latest := map[string]LedgerRow{}
+	latest := map[projectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
-			latest[r.Reviewer] = r
+			latest[rowProjection(r)] = r
 		}
 	}
 	var veto bool
-	for reviewer, verdict := range latest {
+	for k, verdict := range latest {
+		reviewer := k.Reviewer
 		if strings.TrimSpace(verdict.Task) != "" && !strings.EqualFold(verdict.Task, task) {
 			continue
 		}
 		if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
 			if !l.isCoordinator(reviewer) {
-				if launchRow, ok := launch[reviewer]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
+				if launchRow, ok := launch[k]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
 					veto = true
 				}
 			}
@@ -168,7 +169,7 @@ func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (pass
 		if l.isCoordinator(reviewer) {
 			continue
 		}
-		launchRow, ok := launch[reviewer]
+		launchRow, ok := launch[k]
 		if !ok {
 			continue
 		}

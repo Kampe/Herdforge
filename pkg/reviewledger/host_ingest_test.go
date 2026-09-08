@@ -46,8 +46,12 @@ func fac652CommitTime() time.Time {
 }
 
 func reachingReceipt(string) LaunchProvenance {
+	return hostReceipt("w4-session-pane")
+}
+
+func hostReceipt(host string) LaunchProvenance {
 	return LaunchProvenance{
-		Host: "w4-session-pane", Session: "w4-session-pane",
+		Host: host, Session: host,
 		BuilderFamily: "openai", Branch: "fix/fac-652-direct",
 		CreatedAt: time.Date(2026, 9, 7, 3, 9, 34, 0, time.UTC),
 		Accepted:  true,
@@ -308,6 +312,98 @@ func TestHostIngestRefusesMismatchUnreachableAndFlagOnlyTrust(t *testing.T) {
 	}
 	if !hasExactVerdict(after, fac652SHA, fac652Rev, "", "google", localDig) {
 		t.Fatal("refusals rewrote the local google PASS")
+	}
+}
+
+func hostIngestArtifact(t *testing.T, l *Ledger, host, digest string, verdict Verdict, reviewerFamily string) {
+	t.Helper()
+	_, err := l.HostIngest(HostIngestOpts{
+		SHA: fac652SHA, Reviewer: fac652Rev, Task: "FAC-652", Branch: "fix/fac-652-direct",
+		Artifact: host + ".md", ArtifactDigest: digest, Verdict: verdict,
+		ReviewerFamily: reviewerFamily, BuilderFamily: FamilyUnrecorded, VfyDigest: host + "-vfy",
+		ReadBase: prodParent, ReadHead: fac652SHA, ProductionBase: prodParent,
+		CommitTime: fac652CommitTime(), Reaches: reachesFixFac652,
+		Receipt: hostReceipt(host),
+	})
+	if err != nil {
+		t.Fatalf("host ingest host=%s verdict=%s: %v", host, verdict, err)
+	}
+}
+
+func TestHostIngestCrossHostDissentBlocksEligibility(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, DefaultPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedLocalGooglePass(t, l, fac652SHA, fac652Rev)
+	hostIngestArtifact(t, l, "host-a", "fa"+w4XAIDig[2:], VerdictFAIL, "anthropic")
+	if eligible, err := l.Eligible(fac652SHA, "openai"); err == nil || eligible {
+		t.Fatalf("host-A FAIL must veto before host-B PASS: eligible=%v err=%v", eligible, err)
+	}
+	hostIngestArtifact(t, l, "host-b", w4XAIDig, VerdictPASS, "xai")
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasExactVerdict(rows, fac652SHA, fac652Rev, "host-a", "anthropic", "fa"+w4XAIDig[2:]) {
+		t.Fatalf("host-A FAIL was not preserved: %+v", rows)
+	}
+	if !hasExactVerdict(rows, fac652SHA, fac652Rev, "host-b", "xai", w4XAIDig) {
+		t.Fatalf("host-B PASS was not appended: %+v", rows)
+	}
+	eligible, err := l.Eligible(fac652SHA, "openai")
+	if err == nil || eligible {
+		t.Fatalf("cross-host dissent must not be eligible=true err=nil: eligible=%v err=%v", eligible, err)
+	}
+	if !strings.Contains(err.Error(), "veto") {
+		t.Fatalf("eligibility error = %v, want SHA-level veto", err)
+	}
+	queued, qerr := l.Queued()
+	if qerr != nil {
+		t.Fatal(qerr)
+	}
+	for _, q := range queued {
+		if q.SHA == fac652SHA {
+			t.Fatalf("queued hid host-A FAIL behind host-B PASS: %+v", queued)
+		}
+	}
+	ready, rerr := l.MergeReadinessFor(fac652SHA)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if ready.Ready {
+		t.Fatalf("readiness hid host-A FAIL behind host-B PASS: %+v", ready)
+	}
+}
+
+func TestHostIngestCrossHostBlockedVetoesPass(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, DefaultPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedLocalGooglePass(t, l, fac652SHA, fac652Rev)
+	hostIngestArtifact(t, l, "host-a", "bb"+w4XAIDig[2:], VerdictBLOCKED, "anthropic")
+	hostIngestArtifact(t, l, "host-b", w4XAIDig, VerdictPASS, "xai")
+	if eligible, err := l.Eligible(fac652SHA, "openai"); err == nil || eligible {
+		t.Fatalf("host-A BLOCKED must veto host-B PASS: eligible=%v err=%v", eligible, err)
+	}
+}
+
+func TestHostIngestIndependentHostPassIsEligible(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, DefaultPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedLocalGooglePass(t, l, fac652SHA, fac652Rev)
+	if _, err := wholeRangeXAI(t, l); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err := l.Eligible(fac652SHA, "openai")
+	if err != nil || !eligible {
+		t.Fatalf("independent host PASS must remain eligible: eligible=%v err=%v", eligible, err)
 	}
 }
 
