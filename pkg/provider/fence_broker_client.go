@@ -46,6 +46,7 @@ type CapabilityIssueRequest struct {
 // NewFenceBrokerClientFromEnv builds a worker client (no mint authority).
 // HERD_FENCE_BROKER_MINT_TOKEN is intentionally ignored if present.
 func NewFenceBrokerClientFromEnv() (*FenceBrokerClient, error) {
+	_ = applyConfidentialWorkerBrokerEnvFromProcess()
 	url := strings.TrimSpace(os.Getenv(envFenceBrokerURL))
 	tok := strings.TrimSpace(os.Getenv(envFenceBrokerToken))
 	if url == "" {
@@ -142,6 +143,43 @@ func (c *FenceBrokerClient) Live(ctx context.Context) error {
 		return fmt.Errorf("fence-broker health HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// FenceBrokerStatus is the authenticated worker view of a live standalone broker.
+type FenceBrokerStatus struct {
+	OK         bool   `json:"ok"`
+	Role       string `json:"role"`
+	ClaimDir   string `json:"claim_dir"`
+	InstanceID string `json:"instance_id"`
+}
+
+// Status proves URL+token pairing against /v1/status (worker token required).
+func (c *FenceBrokerClient) Status(ctx context.Context) (*FenceBrokerStatus, error) {
+	if c == nil {
+		return nil, fmt.Errorf("nil fence broker client")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	resp, err := c.do(ctx, http.MethodGet, "/v1/status", nil)
+	if err != nil {
+		return nil, fmt.Errorf("fence-broker status: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
+		return nil, fmt.Errorf("fence-broker status: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("fence-broker status HTTP %d", resp.StatusCode)
+	}
+	var st FenceBrokerStatus
+	if err := json.Unmarshal(body, &st); err != nil {
+		return nil, fmt.Errorf("fence-broker status: %w", err)
+	}
+	if strings.TrimSpace(st.ClaimDir) == "" {
+		return nil, fmt.Errorf("fence-broker status: missing claim_dir")
+	}
+	return &st, nil
 }
 
 // OpApplied is server-native readback (worker-safe).
