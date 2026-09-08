@@ -103,6 +103,12 @@ type Options struct {
 	// AuthorityEnvelope re-delivers the standing grant on every resume kick.
 	AuthorityEnvelope func(name string) (goalguard.AuthorityEnvelope, error)
 	Freeze            func() (bool, string, error)
+	// SurfaceQueued occupies an idle/done turn with pending durable mail.
+	// Production wires DrainQueuedAtBoundary here. A true result means the
+	// kick message must not also be sent.
+	SurfaceQueued func(name, workspace string) (occupied bool, err error)
+	// Send delivers the kick prompt. Nil uses HerdSend.
+	Send func(paneID, message string) (string, error)
 }
 
 // Result holds counts for one kick run.
@@ -198,6 +204,15 @@ func FetchAgentList() ([]AgentEntry, error) {
 //
 // Exact equality is still tried first: it is the cheap path and it is what a
 // non-standing target uses. Lane matching is the fallback only.
+func agentWorkspace(agents []AgentEntry, name, paneID string) string {
+	for _, a := range agents {
+		if a.Name == name || a.Label == name || a.PaneID == paneID {
+			return a.Workspace
+		}
+	}
+	return ""
+}
+
 func LookupAgent(agents []AgentEntry, name string) (status, paneID string, found bool) {
 	if st, pane, ok := lookupExact(agents, name); ok {
 		return st, pane, true
@@ -549,6 +564,37 @@ func Run(opts Options) (*Result, error) {
 			continue
 		}
 
+		if opts.SurfaceQueued != nil {
+			occupied, surfErr := opts.SurfaceQueued(id, agentWorkspace(agents, id, paneID))
+			if surfErr != nil {
+				fmt.Fprintf(os.Stderr, "herd-kick: FAIL queued surface %s pane=%s: %v\n", id, paneID, surfErr)
+				result.Failed++
+				result.Entries = append(result.Entries, EntryResult{
+					Name:   id,
+					Status: st,
+					PaneID: paneID,
+					Result: "failed",
+					Reason: fmt.Sprintf("queued surface: %v", surfErr),
+				})
+				continue
+			}
+			if occupied {
+				if !opts.Quiet {
+					fmt.Printf("herd-kick: surfaced queued mail for %s pane=%s\n", id, paneID)
+				}
+				result.Kicked++
+				opts.LastKick[id] = now()
+				result.Entries = append(result.Entries, EntryResult{
+					Name:   id,
+					Status: st,
+					PaneID: paneID,
+					Result: "kicked",
+					Reason: "queued-durable surfaced",
+				})
+				continue
+			}
+		}
+
 		// FAC-696: a goal-driven lane that reached a terminal goal state cannot
 		// consume a plain follow-up prompt. Every standing lane on this fleet
 		// was sitting at "Goal paused (/goal resume)", so kick sent a normal
@@ -563,7 +609,11 @@ func Run(opts Options) (*Result, error) {
 		if paneShowsPausedGoal(paneID) {
 			outbound = goalResumeVerb
 		}
-		sendOut, err := HerdSend(paneID, outbound)
+		sendFn := opts.Send
+		if sendFn == nil {
+			sendFn = HerdSend
+		}
+		sendOut, err := sendFn(paneID, outbound)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd-kick: FAIL unconsumed prompt %s pane=%s: %s\n", id, paneID, sendOut)
 			result.Failed++

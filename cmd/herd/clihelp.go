@@ -154,20 +154,23 @@ var subcommandUsage = map[string]string{
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
-	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s] [--workspace id]
-  Deliver a prompt and report whether the agent consumed it.
+	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s] [--workspace id] [--drain]
+  Deliver a prompt when the recipient is idle, or queue it durably while the recipient works.
 
   --workspace id  explicitly authorize a repo-qualified peer coordinator in another Herdr workspace.
                    Ordinary lane delivery remains workspace-fenced when this is omitted.
+  --drain         surface pending durable envelopes at an idle/done turn boundary; no pane writes while busy.
 
 Outcomes:
   -> working  task text observed in the pane after consumption; do not re-send.
   -> done     task text observed in the pane after consumption; do not re-send.
+  -> queued-durable  recipient was busy; durable inbox copy queued with an envelope id; do not re-send and do not treat as consumed.
   -> queued   assignment is visible or staged but not consumed; exits 1 and requires retry or explicit deferral.
   -> submitted  UNVERIFIED (--no-verify); delivery is unknown, so re-send if needed.
   no result line  the pane never flipped; exits 1 and re-send is appropriate.
 
-Use herd mail send for durable mailbox delivery; it is not surfaced in the recipient pane.
+Authenticated urgent control (herd stop) still preempts. The same payload through herd send does not.
+Use herd mail send for durable mailbox delivery without a live pane.
 Prefer herdr-deliver for durable digests.`,
 	"integration-wake": `Usage: herd integration-wake --candidate <sha> --generation <n>
   Acknowledge handling one delivered integration wake. This neither merges nor closes a card.`,

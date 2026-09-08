@@ -3,6 +3,7 @@ package kick
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -782,5 +783,41 @@ func TestHealthyPaneIsNotTreatedAsPaused(t *testing.T) {
 		if ContainsPausedGoalMarker(text) {
 			t.Fatalf("healthy pane text was read as a paused goal: %q", text)
 		}
+	}
+}
+
+func TestRun_OccupiedQueuedSurfaceSkipsKickMessage(t *testing.T) {
+	sent := 0
+	result, err := Run(Options{
+		Names:        []string{"forge-worker"},
+		Quiet:        true,
+		RaiseMissing: false,
+		HoldReader:   allowAllHolds{},
+		Identity:     testIdentity,
+		ActiveTasks:  testActiveTasks,
+		Generation:   testGeneration,
+		Freeze:       func() (bool, string, error) { return false, "", nil },
+		FetchAgents: func() ([]AgentEntry, error) {
+			return []AgentEntry{{Name: "forge-worker", Status: "idle", PaneID: "p-w", Workspace: "wK"}}, nil
+		},
+		SurfaceQueued: func(name, workspace string) (bool, error) {
+			if name != "forge-worker" || workspace != "wK" {
+				t.Fatalf("surface target = %q %q", name, workspace)
+			}
+			return true, nil
+		},
+		Send: func(paneID, message string) (string, error) {
+			sent++
+			return "", fmt.Errorf("kick message must not send when queued mail occupies the turn")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kicked != 1 || result.Failed != 0 || sent != 0 {
+		t.Fatalf("kick=%+v sent=%d", result, sent)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].Reason != "queued-durable surfaced" {
+		t.Fatalf("entries=%+v", result.Entries)
 	}
 }
