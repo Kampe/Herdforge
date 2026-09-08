@@ -146,6 +146,9 @@ type Verifier struct {
 	// DiskAdmission is checked before mutation/test fan-out. It is injectable
 	// so rejected paths can prove zero process and filesystem callbacks.
 	DiskAdmission resources.DiskAdmission
+	// afterMutationApplied runs after mutant bytes are on disk and before the
+	// mutant command is executed. Nil in production.
+	afterMutationApplied func()
 }
 
 func defaultDiskAdmission() resources.DiskAdmission {
@@ -174,10 +177,10 @@ func NewVerifierArgs(argv []string) *Verifier {
 }
 
 func (v *Verifier) Execute(ctx context.Context, dir string) (*Result, error) {
-	return v.execute(ctx, dir, EnvironmentPolicyInherited)
+	return v.execute(ctx, dir, EnvironmentPolicyInherited, 0)
 }
 
-func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPolicy) (*Result, error) {
+func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPolicy, commandTimeout time.Duration) (*Result, error) {
 	if v == nil {
 		return nil, errors.New("nil verifier")
 	}
@@ -208,6 +211,12 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	defer func() { _ = lease.Release() }()
 
 	started := time.Now()
+	commandCtx := ctx
+	if commandTimeout > 0 {
+		var cancel context.CancelFunc
+		commandCtx, cancel = context.WithTimeout(ctx, commandTimeout)
+		defer cancel()
+	}
 	commandPath := v.Argv[0]
 	var commandEnv []string
 	if policy == EnvironmentPolicyHermetic {
@@ -225,7 +234,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// Two-phase ownership supervisor: start/done handshake + residual drain
 	// while the supervisor still owns the process group, then ack to exit.
 	// Marker FD (ExtraFiles FD5) is the unforgeable lineage for escaped writers.
-	cmd, statusR, statusW, ackR, ackW, marker, markerPath, prepErr := prepareOwnedCommand(ctx, commandPath, v.Argv[1:], dir, env)
+	cmd, statusR, statusW, ackR, ackW, marker, markerPath, prepErr := prepareOwnedCommand(commandCtx, commandPath, v.Argv[1:], dir, env)
 	if prepErr != nil {
 		return newOutputResult(OutcomeBLOCKED, []byte(prepErr.Error()), -1, time.Since(started)), nil
 	}
@@ -279,9 +288,9 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		}
 		return newOutputResult(OutcomeBLOCKED, []byte(strings.Join(parts, "\n")), exitCode(cmd, waitErr), time.Since(started)), nil
 	}
-	if ctx.Err() != nil {
+	if commandCtx.Err() != nil {
 		reapErr := owned.Reap()
-		msg := ctx.Err().Error()
+		msg := commandCtx.Err().Error()
 		if reapErr != nil {
 			msg += "\n" + reapErr.Error()
 		}
@@ -314,7 +323,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	if waitErr != nil {
 		result.Passed = false
 		result.Outcome = OutcomeFAIL
-		if ctx.Err() != nil || cmd.ProcessState == nil {
+		if commandCtx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}
 		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", waitErr, string(output))))
@@ -359,7 +368,7 @@ func (v *Verifier) VerifyCandidate(ctx context.Context, dir string, req Verifica
 		return blockedReceipt(req, v.argv(), 0, nil, err), nil
 	}
 
-	result, err := v.execute(ctx, dir, req.EnvironmentPolicy)
+	result, err := v.execute(ctx, dir, req.EnvironmentPolicy, 0)
 	if err != nil {
 		// Never surface cancellation as a bare VerifyCandidate error.
 		if isContextDone(err) || (ctx != nil && ctx.Err() != nil) {
@@ -941,19 +950,17 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 		result.Output = fmt.Sprintf("apply mutant: %v", err)
 		return result, nil
 	}
+	if v.afterMutationApplied != nil {
+		v.afterMutationApplied()
+	}
 
-	mutantCtx, cancel := context.WithTimeout(ctx, req.Timeout)
-	mutant, execErr := v.Execute(mutantCtx, dir)
-	mutantContextErr := mutantCtx.Err()
-	cancel()
+	mutant, execErr := v.execute(ctx, dir, EnvironmentPolicyInherited, req.Timeout)
 	if execErr != nil {
 		// No race window: cancellation/timeout from Execute is always a
 		// BLOCKED MutationResult so the restore defer still records Restored.
-		if isContextDone(execErr) || mutantContextErr != nil || ctx.Err() != nil {
+		if isContextDone(execErr) || ctx.Err() != nil {
 			cause := execErr
-			if mutantContextErr != nil {
-				cause = mutantContextErr
-			} else if ctx.Err() != nil {
+			if ctx.Err() != nil {
 				cause = ctx.Err()
 			}
 			result.Output = cause.Error()
@@ -967,7 +974,7 @@ func (v *Verifier) RunMutationCheckForCandidate(ctx context.Context, dir string,
 	result.Mutant = makeReceipt(mutantReq, v.argv(), mutant, mutant.Outcome)
 	result.Output = mutant.Output
 
-	if mutantContextErr != nil || ctx.Err() != nil {
+	if ctx.Err() != nil {
 		result.Outcome = OutcomeBLOCKED
 		return result, nil
 	}
