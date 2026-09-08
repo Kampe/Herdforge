@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -671,17 +672,27 @@ func TestAdmissionLeaseLockIsCrossProcessAndSidecarIsPermanent(t *testing.T) {
 	ready, release := filepath.Join(dir, "ready"), filepath.Join(dir, "release")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestAdmissionLeaseLockHelper$")
 	cmd.Env = append(os.Environ(), "HERD_ADMISSION_LOCK_HELPER=1", "HERD_ADMISSION_LOCK_PATH="+path, "HERD_ADMISSION_LOCK_READY="+ready, "HERD_ADMISSION_LOCK_RELEASE="+release)
+	var childOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &childOut, &childOut
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = os.WriteFile(release, []byte("release\n"), 0o600); _ = cmd.Wait() }()
-	deadline := time.Now().Add(time.Second)
+	defer func() {
+		_ = os.WriteFile(release, []byte("release\n"), 0o600)
+		_ = cmd.Wait()
+	}()
+	// This is a test-only child-start budget, not an admission deadline. Full
+	// shuffled unit runs can contend for four Go workers while starting the
+	// already-built test binary; one second was shorter than that startup path
+	// on Linux. Ten seconds remains bounded, and a child that cannot publish its
+	// marker still fails with its captured diagnostic.
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(ready); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("lock helper did not acquire lock")
+			t.Fatalf("lock helper did not acquire lock within test startup budget: %s", childOut.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
