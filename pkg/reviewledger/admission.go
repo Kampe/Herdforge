@@ -90,16 +90,14 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 	// problem, and again as the same string when the risk tier was the problem.
 	// Absence of a reason is not a reason: record why each candidate verdict was
 	// skipped and report the most specific one.
+	if veto, ok := l.unsupersededSHAVeto(latest, launch); ok {
+		return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", veto.Verdict, veto.Reviewer))
+	}
 	var skipped []string
 	note := func(reviewer, why string) {
 		skipped = append(skipped, fmt.Sprintf("reviewer=%s: %s", reviewer, why))
 	}
 	for key, verdict := range latest {
-		if (verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED)) && !l.isCoordinator(verdict.Reviewer) {
-			if launchRow, ok := launch[key]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
-				return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", verdict.Verdict, verdict.Reviewer))
-			}
-		}
 		if verdict.Verdict != string(VerdictPASS) {
 			note(verdict.Reviewer, "verdict is "+verdict.Verdict+", not PASS")
 			continue
@@ -170,6 +168,36 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 	}
 	return reject(sha, "no independent PASS verdict with durable verification evidence: "+
 		"no verdict rows exist for this candidate")
+}
+
+// unsupersededSHAVeto inspects every host-aware latest verdict before any
+// PASS may be selected. Checking a veto inside the same unordered loop that
+// returns Admitted lets map iteration visit PASS first and fail open.
+func (l *Ledger) unsupersededSHAVeto(latest, launch map[ProjectionKey]LedgerRow) (LedgerRow, bool) {
+	keys := make([]ProjectionKey, 0, len(latest))
+	for k := range latest {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Reviewer != keys[j].Reviewer {
+			return keys[i].Reviewer < keys[j].Reviewer
+		}
+		return keys[i].Host < keys[j].Host
+	})
+	for _, k := range keys {
+		verdict := latest[k]
+		if verdict.Verdict != string(VerdictFAIL) && verdict.Verdict != string(VerdictBLOCKED) {
+			continue
+		}
+		if l.isCoordinator(verdict.Reviewer) {
+			continue
+		}
+		launchRow, hasLaunch := launch[k]
+		if hasLaunch && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
+			return verdict, true
+		}
+	}
+	return LedgerRow{}, false
 }
 
 // admissionRejected is the sentinel error Admit returns alongside a non-nil,
@@ -263,17 +291,8 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 	// SHA-level veto gate: any unsuperseded FAIL/BLOCKED from a
 	// non-coordinator reviewer with a provable launch family blocks
 	// admission outright, regardless of any PASS elsewhere for this SHA.
-	for k, verdict := range latest {
-		if verdict.Verdict != string(VerdictFAIL) && verdict.Verdict != string(VerdictBLOCKED) {
-			continue
-		}
-		if l.isCoordinator(verdict.Reviewer) {
-			continue
-		}
-		launchRow, hasLaunch := launch[k]
-		if hasLaunch && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
-			return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", verdict.Verdict, verdict.Reviewer))
-		}
+	if veto, ok := l.unsupersededSHAVeto(latest, launch); ok {
+		return reject(sha, fmt.Sprintf("unsuperseded %s veto from reviewer=%s", veto.Verdict, veto.Reviewer))
 	}
 
 	sort.Slice(order, func(i, j int) bool {
