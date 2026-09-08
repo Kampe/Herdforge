@@ -149,6 +149,7 @@ func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (pass
 			latest[rowProjection(r)] = r
 		}
 	}
+	superseded := retrySupersessionFromLatest(latest, sha)
 	var veto bool
 	for k, verdict := range latest {
 		reviewer := k.Reviewer
@@ -156,6 +157,9 @@ func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (pass
 			continue
 		}
 		if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
+			if superseded[k] {
+				continue
+			}
 			if !l.isCoordinator(reviewer) {
 				if launchRow, ok := launch[k]; ok && launchRow.BuilderFamily != "" && FamilyAllowlist[launchRow.BuilderFamily] {
 					veto = true
