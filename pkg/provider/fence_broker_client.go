@@ -160,7 +160,7 @@ func (c *FenceBrokerClient) Status(ctx context.Context) (*FenceBrokerStatus, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	resp, err := c.do(ctx, http.MethodGet, "/v1/status", nil)
+	resp, err := c.do(ctx, http.MethodGet, brokerStatusPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fence-broker status: %w", err)
 	}
