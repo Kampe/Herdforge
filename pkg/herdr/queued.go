@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/mail"
 )
@@ -29,6 +30,20 @@ type SendResult struct {
 }
 
 var queueMailboxHook func() *mail.Mailbox
+
+var queuedProveTimeout = 30 * time.Second
+
+// SetQueuedProveTimeoutForTest shortens drain consumption polling. Restore
+// with the returned func.
+func SetQueuedProveTimeoutForTest(d time.Duration) func() {
+	prev := queuedProveTimeout
+	if d <= 0 {
+		queuedProveTimeout = 30 * time.Second
+	} else {
+		queuedProveTimeout = d
+	}
+	return func() { queuedProveTimeout = prev }
+}
 
 // SetQueueMailbox injects the durable mailbox used by routine busy delivery.
 // Restore with the returned func.
@@ -94,12 +109,13 @@ type DrainResult struct {
 	Acknowledged bool
 }
 
-// DrainQueuedAtBoundary surfaces pending routine envelopes onto an idle or
-// done recipient, then durably acknowledges each successful surface. It does
-// not stop a still-running command: a non-idle recipient is refused with
-// ErrNotIdleBoundary and no pane writes. Acknowledgment is MarkHandled, not
-// the mailbox seen-set; a crash after deliver and before ack can re-surface
-// the same envelope (at-least-once, not exactly-once side effects).
+// DrainQueuedAtBoundary surfaces pending routine envelopes at a live idle or
+// done turn. It re-reads safe-boundary authority before each message, so a
+// recipient that starts working after the first delivery is not prompted again.
+// Acknowledgment follows a task-bound consumption receipt, not AgentPrompt or
+// a working status alone. Prompt/Enter failure, a staged composer, or unknown
+// consumption leave the envelope pending (at-least-once re-delivery, not
+// exactly-once side effects).
 func DrainQueuedAtBoundary(target, workspace string, box *mail.Mailbox) ([]DrainResult, error) {
 	return drainQueuedAtBoundary(target, workspace, box, nil)
 }
@@ -108,32 +124,37 @@ func drainQueuedAtBoundary(target, workspace string, box *mail.Mailbox, afterDel
 	if box == nil {
 		return nil, fmt.Errorf("herdr drain: mailbox is required")
 	}
-	resolved, err := requireAgentWorkspaceIn(target, workspace)
-	if err != nil {
-		return nil, err
-	}
-	resolvedTarget := resolved.Name
-	if resolvedTarget == "" {
-		resolvedTarget = target
-	}
-	if !immediateDeliveryAllowed(resolved.Status) {
-		return nil, fmt.Errorf("%w (status %q)", ErrNotIdleBoundary, resolved.Status)
-	}
-	pending, err := box.PendingQueued(resolvedTarget)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]DrainResult, 0, len(pending))
-	for _, env := range pending {
+	var out []DrainResult
+	for {
+		resolved, err := requireAgentWorkspaceIn(target, workspace)
+		if err != nil {
+			return out, err
+		}
+		resolvedTarget := resolved.Name
+		if resolvedTarget == "" {
+			resolvedTarget = target
+		}
+		if !immediateDeliveryAllowed(resolved.Status) {
+			return out, fmt.Errorf("%w (status %q)", ErrNotIdleBoundary, resolved.Status)
+		}
+		pending, err := box.PendingQueued(resolvedTarget)
+		if err != nil {
+			return out, err
+		}
+		if len(pending) == 0 {
+			return out, nil
+		}
+		env := pending[0]
 		if env == nil {
-			continue
+			return out, fmt.Errorf("herdr drain: nil pending envelope")
 		}
 		result := DrainResult{EnvelopeID: env.ID}
-		if _, err := AgentPrompt(resolvedTarget, env.Body, false); err != nil {
-			return out, fmt.Errorf("drain envelope %s: %w", env.ID, err)
+		delivered, submitErr := submitRoutineAtIdle(resolved, resolvedTarget, env.Body, workspace, queuedProveTimeout)
+		result.Delivered = delivered
+		if submitErr != nil {
+			out = append(out, result)
+			return out, fmt.Errorf("drain envelope %s: %w", env.ID, submitErr)
 		}
-		_ = SendKeys(resolvedTarget, "Enter")
-		result.Delivered = true
 		if afterDeliver != nil {
 			if hookErr := afterDeliver(env); hookErr != nil {
 				out = append(out, result)
@@ -147,5 +168,68 @@ func drainQueuedAtBoundary(target, workspace string, box *mail.Mailbox, afterDel
 		result.Acknowledged = true
 		out = append(out, result)
 	}
-	return out, nil
+}
+
+func submitRoutineAtIdle(resolved AgentEntry, target, text, workspace string, timeout time.Duration) (bool, error) {
+	baselinePane := ""
+	if resolved.PaneID != "" {
+		pane, err := PaneRead(resolved.PaneID, 120)
+		if err != nil {
+			return false, fmt.Errorf("agent '%s' pre-drain pane readback failed: %w", target, err)
+		}
+		baselinePane = pane
+	}
+	if _, err := AgentPrompt(target, text, false); err != nil {
+		return false, err
+	}
+	if err := SendKeys(target, "Enter"); err != nil {
+		return true, err
+	}
+	if err := proveRoutineConsumption(resolved, target, text, workspace, baselinePane, timeout); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func proveRoutineConsumption(resolved AgentEntry, target, text, workspace, baselinePane string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	poll := 2 * time.Second
+	if timeout < poll {
+		poll = timeout
+	}
+	deadline := time.Now().Add(timeout)
+	last := "unknown"
+	lastPane := ""
+	staged := false
+	for {
+		st, err := liveStatusScopedIn(target, workspace)
+		if err == nil {
+			last = st
+			pane, paneErr := PaneRead(resolved.PaneID, 120)
+			if paneErr == nil {
+				lastPane = pane
+				staged = strings.Contains(strings.ToLower(pane), "pasted text") && !taskTextObserved(text, pane)
+				// Presence after this submit is the task-bound receipt. A count
+				// increase is unnecessary: a crash-before-ack retry may already
+				// show the same payload from the earlier prompt. Working status
+				// alone is not a receipt.
+				if taskTextObserved(text, pane) {
+					return nil
+				}
+				if (st == "working" || st == "done") && !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) {
+					return nil
+				}
+			}
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(poll)
+	}
+	if staged || strings.Contains(strings.ToLower(lastPane), "pasted text") {
+		return fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", target, last)
+	}
+	return fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", target, last)
 }

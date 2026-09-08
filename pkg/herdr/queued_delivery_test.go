@@ -15,13 +15,16 @@ import (
 )
 
 type interruptRecorder struct {
-	mu       sync.Mutex
-	calls    []string
-	status   string
-	pane     string
-	signals  int
-	prompted int
-	keys     []string
+	mu              sync.Mutex
+	calls           []string
+	status          string
+	pane            string
+	paneAfterPrompt string
+	enterErr        error
+	afterPrompt     func()
+	signals         int
+	prompted        int
+	keys            []string
 }
 
 func (r *interruptRecorder) run(args ...string) (string, error) {
@@ -36,9 +39,18 @@ func (r *interruptRecorder) run(args ...string) (string, error) {
 		return `{"result":{"text":` + jsonQuote(r.pane) + `}}`, nil
 	case len(args) >= 2 && args[0] == "agent" && args[1] == "prompt":
 		r.prompted++
+		if r.paneAfterPrompt != "" {
+			r.pane = r.paneAfterPrompt
+		}
+		if r.afterPrompt != nil {
+			r.afterPrompt()
+		}
 		return `{"result":{"delivered":true}}`, nil
 	case len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys":
 		r.keys = append(r.keys, strings.Join(args[3:], " "))
+		if r.enterErr != nil && strings.EqualFold(strings.Join(args[3:], " "), "Enter") {
+			return "composer refused", r.enterErr
+		}
 		return `{"result":{"ok":true}}`, nil
 	case strings.Contains(joined, "kill") || strings.Contains(joined, "signal"):
 		r.signals++
@@ -205,6 +217,7 @@ func TestDrainAtIdleSurfacesThenAckPreventsDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec.status = "idle"
+	rec.paneAfterPrompt = body
 	rec.mu.Lock()
 	rec.prompted, rec.keys, rec.calls = 0, nil, nil
 	rec.mu.Unlock()
@@ -219,6 +232,11 @@ func TestDrainAtIdleSurfacesThenAckPreventsDuplicate(t *testing.T) {
 	_, prompted, keys, _ := rec.snapshot()
 	if prompted != 1 || len(keys) == 0 {
 		t.Fatalf("idle drain must surface: prompted=%d keys=%v", prompted, keys)
+	}
+	for _, key := range keys {
+		if strings.EqualFold(key, "Escape") {
+			t.Fatalf("routine drain sent Escape: %v", keys)
+		}
 	}
 
 	rec.mu.Lock()
@@ -237,12 +255,117 @@ func TestDrainAtIdleSurfacesThenAckPreventsDuplicate(t *testing.T) {
 	}
 }
 
+func TestDrainEnterFailurePreservesPending(t *testing.T) {
+	rec, box := installBusyWorker(t, "working")
+	body := "enter-fail packet"
+	if _, err := Send("worker", body, false, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	rec.status = "idle"
+	rec.paneAfterPrompt = body
+	rec.enterErr = errors.New("enter refused")
+	rec.mu.Lock()
+	rec.prompted, rec.keys, rec.calls = 0, nil, nil
+	rec.mu.Unlock()
+
+	results, err := DrainQueuedAtBoundary("worker", "wK", box)
+	if err == nil {
+		t.Fatal("Enter failure must fail closed")
+	}
+	if len(results) != 1 || !results[0].Delivered || results[0].Acknowledged {
+		t.Fatalf("partial Enter failure = %+v", results)
+	}
+	pending, err := box.PendingQueued("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Body != body {
+		t.Fatalf("Enter failure must leave the envelope pending: %+v", pending)
+	}
+}
+
+func TestDrainUnconsumedComposerPreservesPending(t *testing.T) {
+	rec, box := installBusyWorker(t, "working")
+	body := "composer staged packet"
+	if _, err := Send("worker", body, false, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	rec.status = "idle"
+	rec.pane = "[Pasted text #1]"
+	rec.paneAfterPrompt = "[Pasted text #1]"
+	t.Cleanup(SetQueuedProveTimeoutForTest(20 * time.Millisecond))
+	rec.mu.Lock()
+	rec.prompted, rec.keys, rec.calls = 0, nil, nil
+	rec.mu.Unlock()
+
+	results, err := DrainQueuedAtBoundary("worker", "wK", box)
+	if err == nil {
+		t.Fatal("unconsumed composer must not look acknowledged")
+	}
+	if len(results) != 1 && len(results) != 0 {
+		t.Fatalf("unconsumed drain results = %+v", results)
+	}
+	for _, result := range results {
+		if result.Acknowledged {
+			t.Fatalf("unconsumed composer was acked: %+v", results)
+		}
+	}
+	pending, err := box.PendingQueued("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unconsumed composer must stay pending: %+v", pending)
+	}
+}
+
+func TestDrainRefreshesSafeBoundaryBeforeEachEnvelope(t *testing.T) {
+	rec, box := installBusyWorker(t, "working")
+	if _, err := Send("worker", "alpha", false, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Send("worker", "beta", false, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	rec.status = "idle"
+	rec.afterPrompt = func() {
+		if rec.prompted == 1 {
+			rec.status = "working"
+			rec.pane = "alpha"
+		}
+	}
+	rec.mu.Lock()
+	rec.prompted, rec.keys, rec.calls = 0, nil, nil
+	rec.mu.Unlock()
+
+	results, err := DrainQueuedAtBoundary("worker", "wK", box)
+	if err != nil && !errors.Is(err, ErrNotIdleBoundary) {
+		t.Fatalf("stale-boundary drain: %v", err)
+	}
+	if rec.prompted != 1 {
+		t.Fatalf("second envelope used a stale idle snapshot: prompted=%d results=%+v", rec.prompted, results)
+	}
+	for _, key := range rec.keys {
+		if strings.EqualFold(key, "Escape") {
+			t.Fatalf("routine drain sent Escape: %v", rec.keys)
+		}
+	}
+	pending, err := box.PendingQueued("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Body != "beta" {
+		t.Fatalf("second envelope must remain pending: %+v", pending)
+	}
+}
+
 func TestDrainCrashBeforeAckReSurfacesAfterAckDoesNot(t *testing.T) {
 	rec, box := installBusyWorker(t, "working")
 	if _, err := Send("worker", "crash-window", false, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	rec.status = "idle"
+	rec.paneAfterPrompt = "crash-window"
 	crash := errors.New("simulated crash after deliver")
 	first, err := drainQueuedAtBoundary("worker", "wK", box, func(*mail.Envelope) error { return crash })
 	if !errors.Is(err, crash) {

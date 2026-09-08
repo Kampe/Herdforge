@@ -52,9 +52,20 @@ case "$1 $2" in
     st=$(cat "$HERD_FAKE_STATUS")
     printf '{"result":{"agents":[{"name":"worker","pane_id":"p1","workspace_id":"wK","agent_status":"%s"}]}}\n' "$st"
     ;;
-  "agent prompt") printf '{"result":{"delivered":true}}\n' ;;
+  "agent prompt")
+    shift 2
+    printf '%s' "$*" > "$HERD_FAKE_PROMPT"
+    printf '{"result":{"delivered":true}}\n'
+    ;;
   "agent send-keys") printf '{"result":{"ok":true}}\n' ;;
-  "pane read") printf '{"result":{"text":"running sleep"}}\n' ;;
+  "pane read")
+    if [ -s "$HERD_FAKE_PROMPT" ]; then
+      body=$(cat "$HERD_FAKE_PROMPT")
+      printf '{"result":{"text":"%s"}}\n' "$body"
+    else
+      printf '{"result":{"text":"running sleep"}}\n'
+    fi
+    ;;
   "pane process-info")
     printf '{"result":{"process_info":{"foreground_processes":[{"pid":%s,"name":"sleep"}]}}}\n' "$(cat "$HERD_FAKE_PID")"
     ;;
@@ -72,9 +83,14 @@ exit 0
 	}
 	t.Setenv(herdr.BinaryEnv, bin)
 	t.Setenv(herdr.NoLiveEnv, "1")
+	promptPath := filepath.Join(dir, "prompt")
+	if err := os.WriteFile(promptPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("HERD_FAKE_LOG", logPath)
 	t.Setenv("HERD_FAKE_STATUS", statusPath)
 	t.Setenv("HERD_FAKE_PID", pidPath)
+	t.Setenv("HERD_FAKE_PROMPT", promptPath)
 	t.Setenv("HERD_WORKSPACE", "wK")
 	return bin, logPath, statusPath
 }
@@ -103,6 +119,7 @@ func queuedSendEnv(bin, repo string) []string {
 		"HERD_FAKE_LOG=" + os.Getenv("HERD_FAKE_LOG"),
 		"HERD_FAKE_STATUS=" + os.Getenv("HERD_FAKE_STATUS"),
 		"HERD_FAKE_PID=" + os.Getenv("HERD_FAKE_PID"),
+		"HERD_FAKE_PROMPT=" + os.Getenv("HERD_FAKE_PROMPT"),
 	}
 }
 
