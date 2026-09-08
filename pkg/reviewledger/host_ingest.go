@@ -65,20 +65,26 @@ func hostKey(host string) string {
 	return strings.TrimSpace(host)
 }
 
-// projectionKey is the shared identity for host-labelled ingest and every
+// ProjectionKey is the shared identity for host-labelled ingest and every
 // readiness/eligibility/queue consumer. HostIngest appends distinct
 // (SHA, reviewer, authenticated host) rows; collapsing to SHA:reviewer
 // lets a later host-B PASS hide a host-A FAIL/BLOCKED.
-type projectionKey struct {
+type ProjectionKey struct {
 	SHA, Reviewer, Host string
 }
 
-func rowProjection(r LedgerRow) projectionKey {
-	return projectionKey{SHA: r.SHA, Reviewer: r.Reviewer, Host: hostKey(r.Host)}
+// ProjectionOf is the canonical projection identity. Empty host is a
+// distinct legacy projection, not a wildcard across hosts.
+func ProjectionOf(sha, reviewer, host string) ProjectionKey {
+	return ProjectionKey{SHA: sha, Reviewer: reviewer, Host: hostKey(host)}
 }
 
-func indexProjectionEvent(rows []LedgerRow, event string, skipRetired bool) map[projectionKey]LedgerRow {
-	out := make(map[projectionKey]LedgerRow)
+func rowProjection(r LedgerRow) ProjectionKey {
+	return ProjectionOf(r.SHA, r.Reviewer, r.Host)
+}
+
+func indexProjectionEvent(rows []LedgerRow, event string, skipRetired bool) map[ProjectionKey]LedgerRow {
+	out := make(map[ProjectionKey]LedgerRow)
 	for _, r := range rows {
 		if skipRetired && r.Event == string(EventRetired) {
 			continue

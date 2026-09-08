@@ -137,13 +137,13 @@ func fullSuiteTestArgv(argv []string) bool {
 }
 
 func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (passes []LedgerRow, contradict bool, err error) {
-	launch := map[projectionKey]LedgerRow{}
+	launch := map[ProjectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventRecord) && r.SHA == sha {
 			launch[rowProjection(r)] = r
 		}
 	}
-	latest := map[projectionKey]LedgerRow{}
+	latest := map[ProjectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
 			latest[rowProjection(r)] = r
