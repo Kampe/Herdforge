@@ -588,6 +588,44 @@ func TestAdmissionLeaseExpiryUsesRecordedOwnerTTL(t *testing.T) {
 	}
 }
 
+func TestAdmissionLeaseLegacyNoPhaseUsesRecordedOwnerTTL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "legacy", PID: 4321, Taken: time.Now(), TTL: time.Hour})
+	_, held, err := holdAdmissionLeaseWithHooks(time.Nanosecond, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return admissionDead }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatal("fresh legacy lease without a phase was reclaimed early")
+	}
+
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "legacy-expired", PID: 4321, Taken: time.Now().Add(-time.Hour), TTL: 10 * time.Minute})
+	release, held, err := holdAdmissionLeaseWithHooks(600*time.Second, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return admissionUnknown }})
+	if err != nil || !held {
+		t.Fatalf("expired readable legacy lease was not reclaimed: held=%v err=%v", held, err)
+	}
+	release()
+}
+
+func TestAdmissionLeaseReleaseLeavesOnlyPermanentSidecar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	release, held, err := holdAdmissionLease(time.Hour)
+	if err != nil || !held {
+		t.Fatalf("acquire failed: held=%v err=%v", held, err)
+	}
+	release()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "admission.lease.lock" {
+		t.Fatalf("lease directory contains unexpected files: %v", entries)
+	}
+}
+
 func TestAdmissionLeaseStatusRedactsToken(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "admission.lease")
 	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)

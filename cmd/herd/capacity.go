@@ -965,7 +965,11 @@ func readAdmissionLease(path string) (admissionLeaseRecord, os.FileInfo, error) 
 		return admissionLeaseRecord{}, nil, err
 	}
 	r, err := parseAdmissionLease(raw)
-	if err != nil || r.Phase == "" {
+	// Phase is a write-ahead safety hint, not part of the legacy lease's
+	// authenticated identity. Missing or unknown phases remain ineligible for
+	// early reclaim, but a readable token/pid/taken/ttl lease must still follow
+	// its recorded-owner TTL expiry policy.
+	if err != nil {
 		return admissionLeaseRecord{}, nil, fmt.Errorf("unreadable admission lease: %w", err)
 	}
 	fi, err := os.Lstat(path)
