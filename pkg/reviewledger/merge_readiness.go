@@ -120,8 +120,15 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 			fmt.Errorf("review ledger has no rows: refusing to infer review state from an empty ledger")
 	}
 	latest := map[ProjectionKey]LedgerRow{}
+	records := map[ProjectionKey]LedgerRow{}
 	for _, row := range rows {
-		if row.Event != string(EventVerdict) || !shaMatches(row.SHA, sha) {
+		if !shaMatches(row.SHA, sha) {
+			continue
+		}
+		if row.Event == string(EventRecord) {
+			records[rowProjection(row)] = row
+		}
+		if row.Event != string(EventVerdict) {
 			continue
 		}
 		if strings.TrimSpace(row.Verdict) == "" {
@@ -129,7 +136,7 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		}
 		latest[rowProjection(row)] = row
 	}
-	superseded := retrySupersessionFromLatest(latest, "")
+	superseded := retrySupersessionFromLatest(latest, records, "")
 	reviewers := map[string]string{}
 	unrecorded := map[string]bool{}
 	for k, row := range latest {

@@ -9,11 +9,13 @@ import (
 // are inherited from the admitted verdict, never supplied by the operator.
 type RecordCompletion struct{ Branch, Tier string }
 
-// CompleteAdmissionRecord repairs one incomplete launch record. The verifier
-// must validate the retained artifact and its native launch receipt against
-// the current verdict. It runs inside the same inode lock as compare/append,
-// so a concurrent reassessment cannot change the consent being completed.
-func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func(LedgerRow) (RecordCompletion, error)) (err error) {
+// CompleteAdmissionRecord repairs one incomplete launch record for the exact
+// (SHA, reviewer, host) projection. Host is not a wildcard: empty selects only
+// unhosted records. The verifier must validate the retained artifact and its
+// native launch receipt against the current verdict. It runs inside the same
+// inode lock as compare/append, so a concurrent reassessment cannot change the
+// consent being completed.
+func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer, host string, verify func(LedgerRow) (RecordCompletion, error)) (err error) {
 	if verify == nil {
 		return fmt.Errorf("record completion requires retained evidence verification")
 	}
@@ -31,16 +33,21 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func
 	if err != nil {
 		return err
 	}
+	want := ProjectionOf(sha, reviewer, host)
 	var prior *LedgerRow
 	latest := map[ProjectionKey]LedgerRow{}
+	records := map[ProjectionKey]LedgerRow{}
 	for i := range rows {
 		r := rows[i]
 		if r.SHA != sha {
 			continue
 		}
-		if r.Event == string(EventRecord) && r.Reviewer == reviewer {
-			copy := r
-			prior = &copy
+		if r.Event == string(EventRecord) {
+			records[rowProjection(r)] = r
+			if rowProjection(r) == want {
+				copy := r
+				prior = &copy
+			}
 		}
 		if r.Event == string(EventVerdict) {
 			latest[rowProjection(r)] = r
@@ -49,18 +56,11 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func
 			return fmt.Errorf("retired candidate cannot complete admission")
 		}
 	}
-	var v LedgerRow
-	found := false
-	for k, row := range latest {
-		if k.Reviewer == reviewer && row.Verdict == string(VerdictPASS) {
-			v = row
-			found = true
-		}
-	}
-	if !found || prior == nil || l.isCoordinator(reviewer) {
+	v, found := latest[want]
+	if !found || v.Verdict != string(VerdictPASS) || prior == nil || l.isCoordinator(reviewer) {
 		return fmt.Errorf("exact independent PASS and launch record required")
 	}
-	superseded := retrySupersessionFromLatest(latest, sha)
+	superseded := retrySupersessionFromLatest(latest, records, sha)
 	for k, r := range latest {
 		if superseded[k] {
 			continue
