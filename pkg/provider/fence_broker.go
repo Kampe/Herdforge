@@ -34,9 +34,12 @@ const (
 	brokerSockLeaf          = "fence-broker.sock"
 	// unixBaseURL is the HTTP host used for every unix-socket broker endpoint.
 	// Written seven times across this package before FAC-564.
-	unixBaseURL = "http://unix"
-	brokerAuthHeader        = "X-Herd-Broker-Token"
-	leasesDBLeaf            = "leases.db"
+	unixBaseURL      = "http://unix"
+	brokerAuthHeader = "X-Herd-Broker-Token"
+	leasesDBLeaf     = "leases.db"
+	// brokerStatusPath is the authenticated worker status route. Mux and client
+	// share this one spelling so the path cannot drift (FAC-776).
+	brokerStatusPath = "/v1/status"
 )
 
 // FenceBroker is the production-enforcing sidecar for FAC-147.
@@ -192,7 +195,7 @@ func StartFenceBroker(cfg FenceBrokerConfig) (*FenceBroker, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", b.handleHealth)
-	mux.HandleFunc("/v1/status", b.handleStatus)
+	mux.HandleFunc(brokerStatusPath, b.handleStatus)
 	mux.HandleFunc("/v1/capabilities", b.handleCapabilities)
 	mux.HandleFunc("/v1/ops/", b.handleOp)
 	mux.HandleFunc("/v1/tasks/", b.handleTask)
