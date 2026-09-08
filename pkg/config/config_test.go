@@ -132,6 +132,103 @@ merge_policy:
 	}
 }
 
+func TestMergePolicyBranchPublicationAuthority(t *testing.T) {
+	validBody := func(publicationLine string) string {
+		body := `version: "1"
+project:
+  name: "test-project"
+task_provider:
+  type: "kaneo"
+merge_policy:
+  protected: true
+  required_checks: ["Build"]
+  require_different_family_review: true
+  require_pull_request_reviews: true
+`
+		if publicationLine != "" {
+			body += "  " + publicationLine + "\n"
+		}
+		return body
+	}
+
+	type tc struct {
+		name   string
+		line   string
+		want   string
+		wantOK bool
+	}
+	cases := []tc{
+		{name: "omitted default", want: "", wantOK: true},
+		{name: "empty string", line: `branch_publication: ""`, want: "", wantOK: true},
+		{name: "coordinator-harvest", line: `branch_publication: coordinator-harvest`, want: BranchPublicationCoordinatorHarvest, wantOK: true},
+		{name: "lane-push", line: `branch_publication: lane-push`, want: BranchPublicationLanePush, wantOK: true},
+		{name: "invalid worker-push", line: `branch_publication: worker-push`, wantOK: false},
+		{name: "invalid lane_push", line: `branch_publication: lane_push`, wantOK: false},
+		{name: "invalid Lane-Push", line: `branch_publication: Lane-Push`, wantOK: false},
+	}
+
+	passed, refused := 0, 0
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "herd.yaml")
+			if err := os.WriteFile(path, []byte(validBody(c.line)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if c.wantOK {
+				if err != nil {
+					t.Fatalf("valid branch_publication was rejected: %v", err)
+				}
+				if cfg.MergePolicy == nil {
+					t.Fatal("merge_policy was dropped")
+				}
+				if cfg.MergePolicy.BranchPublication != c.want {
+					t.Fatalf("BranchPublication=%q, want %q", cfg.MergePolicy.BranchPublication, c.want)
+				}
+				passed++
+				return
+			}
+			if err == nil {
+				t.Fatal("invalid branch_publication was accepted")
+			}
+			if !strings.Contains(err.Error(), "merge_policy") || !strings.Contains(err.Error(), "branch_publication") {
+				t.Fatalf("error must name merge_policy.branch_publication, got %v", err)
+			}
+			refused++
+		})
+	}
+	if passed == 0 {
+		t.Fatal("reject-all: no valid branch_publication mode was accepted")
+	}
+	if refused == 0 {
+		t.Fatal("accept-all: no invalid branch_publication mode was refused")
+	}
+}
+
+func TestMergePolicyValidateBranchPublication(t *testing.T) {
+	base := MergePolicy{
+		Protected:                    true,
+		RequiredChecks:               []string{"Build"},
+		RequireDifferentFamilyReview: true,
+		RequirePullRequestReviews:    true,
+	}
+	ok := []string{"", " ", BranchPublicationCoordinatorHarvest, BranchPublicationLanePush, "  lane-push  "}
+	for _, mode := range ok {
+		p := base
+		p.BranchPublication = mode
+		if err := p.Validate(); err != nil {
+			t.Fatalf("mode %q refused: %v", mode, err)
+		}
+	}
+	p := base
+	p.BranchPublication = "push-myself"
+	if err := p.Validate(); err == nil {
+		t.Fatal("invalid branch_publication was accepted by MergePolicy.Validate")
+	} else if !strings.Contains(err.Error(), "branch_publication") {
+		t.Fatalf("error must name branch_publication, got %v", err)
+	}
+}
+
 func TestLoadConfig_NoLanes(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "herd.yaml")
