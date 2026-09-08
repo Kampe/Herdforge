@@ -53,7 +53,7 @@ func TestCompleteAdmissionRecordRefusesConflicts(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			e = l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) { return RecordCompletion{Branch: "work", Tier: "R3"}, nil })
+			e = l.CompleteAdmissionRecord("FAC-759", sha, reviewer, "", func(LedgerRow) (RecordCompletion, error) { return RecordCompletion{Branch: "work", Tier: "R3"}, nil })
 			if e == nil {
 				t.Fatal("conflicting evidence admitted")
 			}
@@ -77,7 +77,7 @@ func TestCompleteAdmissionRecordRejectsDissentAndUnverifiedEvidence(t *testing.T
 					t.Fatal(e)
 				}
 			}
-			e := l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) {
+			e := l.CompleteAdmissionRecord("FAC-759", sha, reviewer, "", func(LedgerRow) (RecordCompletion, error) {
 				if !dissent {
 					return RecordCompletion{}, fmt.Errorf("native proof missing")
 				}
@@ -112,7 +112,7 @@ func TestCompleteAdmissionRecordSerializesAliases(t *testing.T) {
 	one := make(chan error, 1)
 	two := make(chan error, 1)
 	go func() {
-		one <- l.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) {
+		one <- l.CompleteAdmissionRecord("FAC-759", sha, reviewer, "", func(LedgerRow) (RecordCompletion, error) {
 			close(entered)
 			<-release
 			return RecordCompletion{Branch: "work", Tier: "R3"}, nil
@@ -120,7 +120,7 @@ func TestCompleteAdmissionRecordSerializesAliases(t *testing.T) {
 	}()
 	<-entered
 	go func() {
-		two <- other.CompleteAdmissionRecord("FAC-759", sha, reviewer, func(LedgerRow) (RecordCompletion, error) { return RecordCompletion{Branch: "work", Tier: "R3"}, nil })
+		two <- other.CompleteAdmissionRecord("FAC-759", sha, reviewer, "", func(LedgerRow) (RecordCompletion, error) { return RecordCompletion{Branch: "work", Tier: "R3"}, nil })
 	}()
 	select {
 	case e := <-two:
@@ -140,5 +140,38 @@ func TestCompleteAdmissionRecordSerializesAliases(t *testing.T) {
 	}
 	if len(rows) != 3 {
 		t.Fatalf("want one appended record, got %d rows", len(rows))
+	}
+}
+
+func TestCompletionRequiresExactHostProjection(t *testing.T) {
+	orders := [][]string{{"host-b", "host-a"}, {"host-a", "host-b"}}
+	for _, order := range orders {
+		t.Run(strings.Join(order, "_then_"), func(t *testing.T) {
+			l := newTestLedger(t)
+			sha := strings.Repeat("a", 40)
+			reviewer := "independent"
+			for _, host := range order {
+				r := LedgerRow{Event: string(EventRecord), SHA: sha, Reviewer: reviewer, Host: host, Task: "FAC-759", BuilderFamily: FamilyUnrecorded, Gate: GateProvenanceUnrecorded, Lease: "real-lease", PatchURL: "real-patch"}
+				if e := l.appendRow(l.Path, &r); e != nil {
+					t.Fatal(e)
+				}
+			}
+			v := LedgerRow{Event: string(EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: reviewer, Host: "host-b", Task: "FAC-759", BuilderFamily: "openai", ReviewerFamily: "google", Verdict: string(VerdictPASS), VerificationDigest: "real-verification", ArtifactDigest: strings.Repeat("b", 64)}
+			if e := l.appendRow(l.Path, &v); e != nil {
+				t.Fatal(e)
+			}
+			verify := func(got LedgerRow) (RecordCompletion, error) {
+				if got.Host != "host-b" {
+					t.Fatalf("completion used host %q", got.Host)
+				}
+				return RecordCompletion{Branch: "work", Tier: "R3"}, nil
+			}
+			if e := l.CompleteAdmissionRecord("FAC-759", sha, reviewer, "host-a", verify); e == nil {
+				t.Fatal("host-B PASS completed host-A record")
+			}
+			if e := l.CompleteAdmissionRecord("FAC-759", sha, reviewer, "host-b", verify); e != nil {
+				t.Fatalf("host-B completion: %v", e)
+			}
+		})
 	}
 }

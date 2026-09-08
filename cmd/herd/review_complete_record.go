@@ -19,12 +19,13 @@ import (
 func runReviewCompleteRecord() error {
 	args := os.Args[2:]
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: herd review-complete-record REF --candidate SHA --reviewer NAME --artifact FILE")
+		return fmt.Errorf("usage: herd review-complete-record REF --candidate SHA --reviewer NAME --host HOST --artifact FILE")
 	}
 	task := args[0]
 	fs := flag.NewFlagSet("review-complete-record", flag.ContinueOnError)
 	sha := fs.String("candidate", "", "exact admitted candidate")
 	reviewer := fs.String("reviewer", "", "original admitted reviewer")
+	host := fs.String("host", "", "exact admitted reviewer host; empty selects only unhosted records")
 	artifact := fs.String("artifact", "", "retained admitted artifact")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -41,7 +42,7 @@ func runReviewCompleteRecord() error {
 	if err != nil {
 		return err
 	}
-	return l.CompleteAdmissionRecord(task, *sha, *reviewer, func(v reviewledger.LedgerRow) (reviewledger.RecordCompletion, error) {
+	return l.CompleteAdmissionRecord(task, *sha, *reviewer, *host, func(v reviewledger.LedgerRow) (reviewledger.RecordCompletion, error) {
 		var out reviewledger.RecordCompletion
 		body, err := os.ReadFile(*artifact)
 		if err != nil {
