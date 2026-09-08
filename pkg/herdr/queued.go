@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -57,15 +58,18 @@ func SetQueueMailbox(box *mail.Mailbox) func() {
 	return func() { queueMailboxHook = prev }
 }
 
-func resolveQueueMailbox() *mail.Mailbox {
+func resolveQueueMailbox() (*mail.Mailbox, error) {
 	if queueMailboxHook != nil {
-		return queueMailboxHook()
+		return queueMailboxHook(), nil
 	}
-	root := strings.TrimSpace(os.Getenv("HERD_ROOT"))
-	if root == "" {
-		root = "."
+	path, err := mail.ResolveControlFile(".")
+	if err != nil {
+		return nil, err
 	}
-	return mail.NewMailbox(mail.CallbackMailPath(root))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	return mail.NewMailbox(path), nil
 }
 
 func queueSender() string {
@@ -91,7 +95,10 @@ func queueRoutineLocked(ctx context.Context, recipient, body string) (SendResult
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	box := resolveQueueMailbox()
+	box, err := resolveQueueMailbox()
+	if err != nil {
+		return SendResult{}, fmt.Errorf("queue routine delivery for %s: %w", recipient, err)
+	}
 	if box == nil {
 		return SendResult{}, fmt.Errorf("agent '%s' is not idle; durable queue mailbox is required", recipient)
 	}
@@ -229,7 +236,7 @@ func proveRoutineConsumption(resolved AgentEntry, target, text, workspace, basel
 		time.Sleep(poll)
 	}
 	if staged || strings.Contains(strings.ToLower(lastPane), "pasted text") {
-		return fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", target, last)
+		return errQueuedStaged(target, last)
 	}
-	return fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", target, last)
+	return errQueuedUnobserved(target, last)
 }

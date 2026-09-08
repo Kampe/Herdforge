@@ -14,7 +14,7 @@ import (
 // routine mail so a busy-queued message is surfaced without another
 // operator send --drain.
 func surfaceQueuedAtKick(name, workspace string) (bool, error) {
-	path, err := controlMailPath("")
+	path, err := mail.ResolveControlFile(".")
 	if err != nil {
 		return false, err
 	}
