@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/freshness"
@@ -99,8 +102,12 @@ func runCapacity(args []string) error {
 	refreshLaunch := fs.Bool("refresh-launchable", false, "probe the router for live provider concurrency and cache it; slow (20-90s) and never run inline")
 	claim := fs.Bool("claim", false, "hold an admission lease across the caller's launch, so concurrent callers cannot all pass the same check")
 	holdFor := fs.Duration("claim-ttl", defaultAdmissionLeaseTTL, "how long a claimed admission stays held before it expires")
+	leaseStatus := fs.Bool("lease-status", false, "show the read-only admission lease status")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *leaseStatus {
+		return emitAdmissionLeaseStatus()
 	}
 
 	// FAC-686: the check alone is a TOCTOU gate. A review supervisor launched
@@ -675,7 +682,155 @@ func admissionLeasePath() string {
 // host that just fell over from concurrent launches.
 const defaultAdmissionLeaseTTL = 600 * time.Second
 
+type admissionLeasePhase string
+
+const (
+	admissionPhaseCapacity  admissionLeasePhase = "capacity"
+	admissionPhaseCandidate admissionLeasePhase = "candidate"
+	admissionPhaseRoute     admissionLeasePhase = "route"
+	admissionPhaseProbe     admissionLeasePhase = "probe"
+	admissionPhasePool      admissionLeasePhase = "pool"
+	admissionPhasePacket    admissionLeasePhase = "packet"
+	admissionPhaseTab       admissionLeasePhase = "tab"
+	admissionPhaseSpawn     admissionLeasePhase = "spawn"
+)
+
+type admissionLeaseLiveness string
+
+const (
+	admissionLive    admissionLeaseLiveness = "live"
+	admissionDead    admissionLeaseLiveness = "dead"
+	admissionUnknown admissionLeaseLiveness = "unknown"
+)
+
+type admissionLeaseRecord struct {
+	Token string
+	PID   int
+	Taken time.Time
+	TTL   time.Duration
+	Phase admissionLeasePhase
+}
+
+type admissionLease struct {
+	path  string
+	token string
+	ttl   time.Duration
+}
+
+func (l *admissionLease) update(phase admissionLeasePhase) error {
+	return updateAdmissionLeasePhase(l.path, l.token, phase)
+}
+
+func (l *admissionLease) release() { releaseAdmissionLease(l.path, l.token) }
+
+func acquirePoolAdmissionLease(ttl time.Duration) (*admissionLease, bool, error) {
+	path := admissionLeasePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, false, err
+	}
+	// Keep the established lease implementation as the sole writer; this
+	// helper obtains the same ownership data for phase-fenced review launches.
+	_, held, err := holdAdmissionLease(ttl)
+	if err != nil || !held {
+		return nil, held, err
+	}
+	r, _, err := readAdmissionLease(path)
+	if err != nil || r.Token == "" || r.PID != os.Getpid() {
+		return nil, false, fmt.Errorf("admission lease owner could not be re-read")
+	}
+	return &admissionLease{path: path, token: r.Token, ttl: r.TTL}, true, nil
+}
+
+func acquirePoolCapacityLeaseOrRefuse() (*admissionLease, error) {
+	perReviewer := envInt64("HERD_REVIEWER_RSS_MIB", 4096)
+	floor := envInt64("HERD_MEM_FLOOR_MIB", 6144)
+	ttl := defaultAdmissionLeaseTTL
+	if v := strings.TrimSpace(os.Getenv("HERD_ADMISSION_LEASE_TTL")); v != "" {
+		if d, parseErr := time.ParseDuration(v); parseErr == nil && d > 0 {
+			ttl = d
+		}
+	}
+	lease, held, err := acquirePoolAdmissionLease(ttl)
+	if err != nil {
+		return nil, fmt.Errorf("review --pool capacity gate: admission lease: %w", err)
+	}
+	if !held {
+		return nil, fmt.Errorf("review --pool REFUSING before candidate preparation: another launch holds the admission lease on this host; serialize rather than racing it")
+	}
+	obs := poolCapacityObserve()
+	limit := derivedReviewLimit(obs.MemTotalMiB, perReviewer)
+	c := decideCapacity(obs, limit, perReviewer, floor)
+	c.LimitDerived = true
+	if !c.Admit {
+		lease.release()
+		return nil, fmt.Errorf("review --pool REFUSING before candidate preparation: %s", c.Reason)
+	}
+	return lease, nil
+}
+
+type admissionLeaseStatus struct {
+	Present     bool                   `json:"present"`
+	PID         int                    `json:"pid,omitempty"`
+	Liveness    admissionLeaseLiveness `json:"liveness,omitempty"`
+	Taken       string                 `json:"taken,omitempty"`
+	RecordedTTL string                 `json:"recorded_ttl,omitempty"`
+	Phase       admissionLeasePhase    `json:"phase,omitempty"`
+	TokenDigest string                 `json:"token_digest,omitempty"`
+}
+
+func emitAdmissionLeaseStatus() error {
+	status := admissionLeaseStatus{}
+	path := admissionLeasePath()
+	if _, err := os.Stat(path); err == nil {
+		status.Present = true
+		if r, _, readErr := readAdmissionLease(path); readErr == nil {
+			status.PID, status.Taken, status.RecordedTTL, status.Phase = r.PID, r.Taken.UTC().Format(time.RFC3339Nano), r.TTL.String(), r.Phase
+			status.Liveness = admissionProcessAlive(r.PID)
+			h := sha256.Sum256([]byte(r.Token))
+			status.TokenDigest = fmt.Sprintf("%x", h[:4])
+		} else {
+			status.Liveness = admissionUnknown
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(status)
+}
+
+const admissionLeaseLockTimeout = 2 * time.Second
+const admissionLeaseLegacyTTL = defaultAdmissionLeaseTTL
+
+// admissionLeaseProcessAlive is intentionally attached to the operation below
+// through admissionLeaseHooks in tests; production always uses the kernel
+// signal probe. A missing or permission-denied probe is never proof of death.
+type admissionLeaseHooks struct {
+	processAlive  func(int) admissionLeaseLiveness
+	beforeReplace func()
+}
+
+func productionAdmissionLeaseHooks() admissionLeaseHooks {
+	return admissionLeaseHooks{processAlive: admissionProcessAlive}
+}
+
+func admissionProcessAlive(pid int) admissionLeaseLiveness {
+	if pid <= 0 {
+		return admissionUnknown
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil || err == syscall.EPERM {
+		return admissionLive
+	}
+	if err == syscall.ESRCH {
+		return admissionDead
+	}
+	return admissionUnknown
+}
+
 func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error) {
+	return holdAdmissionLeaseWithHooks(ttl, productionAdmissionLeaseHooks())
+}
+
+func holdAdmissionLeaseWithHooks(ttl time.Duration, hooks admissionLeaseHooks) (release func(), held bool, err error) {
 	path := admissionLeasePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, false, err
@@ -694,11 +849,17 @@ func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error
 	// it still owns.
 	token := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 
+	lock, err := acquireAdmissionLeaseLock(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer lock.Close()
+
 	write := func() (bool, error) {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			_, werr := fmt.Fprintf(f, "token=%s pid=%d taken=%s ttl=%s\n",
-				token, os.Getpid(), time.Now().UTC().Format(time.RFC3339), ttl)
+			_, werr := fmt.Fprintf(f, "token=%s pid=%d taken=%s ttl=%s phase=%s\n",
+				token, os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano), ttl, admissionPhaseCapacity)
 			if cerr := f.Close(); werr == nil {
 				werr = cerr
 			}
@@ -715,10 +876,28 @@ func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error
 		return nil, false, err
 	}
 	if !ok {
-		// Expired lease: reclaim. Age is read from the file, not remembered, so
-		// a lease outlives the process that took it.
-		if fi, statErr := os.Stat(path); statErr == nil && time.Since(fi.ModTime()) > ttl {
-			_ = os.Remove(path)
+		observed, fi, readErr := readAdmissionLease(path)
+		if readErr != nil {
+			return nil, false, nil
+		}
+		age := time.Since(observed.Taken)
+		ownerTTL := observed.TTL
+		if ownerTTL <= 0 {
+			ownerTTL = admissionLeaseLegacyTTL
+		}
+		live := admissionUnknown
+		if hooks.processAlive != nil {
+			live = hooks.processAlive(observed.PID)
+		}
+		early := (observed.Phase == admissionPhaseCapacity || observed.Phase == admissionPhaseCandidate) && live == admissionDead && age <= ownerTTL
+		expired := age > ownerTTL
+		if early || expired {
+			if hooks.beforeReplace != nil {
+				hooks.beforeReplace()
+			}
+			if !replaceObservedAdmissionLease(path, observed, fi) {
+				return nil, false, nil
+			}
 			if ok, err = write(); err != nil {
 				return nil, false, err
 			}
@@ -731,6 +910,110 @@ func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error
 	return func() { releaseAdmissionLease(path, token) }, true, nil
 }
 
+func admissionLeaseLockPath(path string) string { return path + ".lock" }
+
+func acquireAdmissionLeaseLock(path string) (*os.File, error) {
+	f, err := os.OpenFile(admissionLeaseLockPath(path), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(admissionLeaseLockTimeout)
+	for {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return f, nil
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = f.Close()
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			_ = f.Close()
+			return nil, fmt.Errorf("admission lease lock timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func parseAdmissionLease(raw []byte) (admissionLeaseRecord, error) {
+	var r admissionLeaseRecord
+	fields := map[string]string{}
+	for _, field := range strings.Fields(string(raw)) {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) == 2 {
+			fields[parts[0]] = parts[1]
+		}
+	}
+	var err error
+	if r.Token = fields["token"]; r.Token == "" {
+		return r, fmt.Errorf("missing lease token")
+	}
+	if r.PID, err = strconv.Atoi(fields["pid"]); err != nil || r.PID <= 0 {
+		return r, fmt.Errorf("invalid lease pid")
+	}
+	if r.Taken, err = time.Parse(time.RFC3339Nano, fields["taken"]); err != nil {
+		return r, fmt.Errorf("invalid lease taken time")
+	}
+	if fields["ttl"] != "" {
+		r.TTL, _ = time.ParseDuration(fields["ttl"])
+	}
+	r.Phase = admissionLeasePhase(fields["phase"])
+	return r, nil
+}
+
+func readAdmissionLease(path string) (admissionLeaseRecord, os.FileInfo, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return admissionLeaseRecord{}, nil, err
+	}
+	r, err := parseAdmissionLease(raw)
+	if err != nil || r.Phase == "" {
+		return admissionLeaseRecord{}, nil, fmt.Errorf("unreadable admission lease: %w", err)
+	}
+	fi, err := os.Lstat(path)
+	if err == nil && (fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular()) {
+		return admissionLeaseRecord{}, nil, fmt.Errorf("admission lease is not a regular file")
+	}
+	return r, fi, err
+}
+
+func replaceObservedAdmissionLease(path string, observed admissionLeaseRecord, observedInfo os.FileInfo) bool {
+	current, _, err := readAdmissionLease(path)
+	if err != nil || current.Token != observed.Token {
+		return false
+	}
+	currentInfo, err := os.Stat(path)
+	if err != nil || !os.SameFile(observedInfo, currentInfo) {
+		return false
+	}
+	return os.Remove(path) == nil
+}
+
+func updateAdmissionLeasePhase(path, token string, phase admissionLeasePhase) error {
+	lock, err := acquireAdmissionLeaseLock(path)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	record, info, err := readAdmissionLease(path)
+	if err != nil {
+		return err
+	}
+	if record.Token != token {
+		return fmt.Errorf("admission lease ownership changed")
+	}
+	currentInfo, err := os.Stat(path)
+	if err != nil || !os.SameFile(info, currentInfo) {
+		return fmt.Errorf("admission lease identity changed")
+	}
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("token=%s pid=%d taken=%s ttl=%s phase=%s\n", record.Token, record.PID, record.Taken.UTC().Format(time.RFC3339Nano), record.TTL, phase)), 0o600); err != nil {
+		return err
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil || info == nil || !os.SameFile(info, newInfo) {
+		return fmt.Errorf("admission lease identity changed")
+	}
+	return nil
+}
+
 // releaseAdmissionLease removes the lease ONLY if this holder still owns it.
 //
 // A holder whose lease already expired and was reclaimed by someone else must
@@ -738,12 +1021,17 @@ func holdAdmissionLease(ttl time.Duration) (release func(), held bool, err error
 // losing the lease is a normal outcome of running past TTL, and the launch it
 // guarded has already happened either way.
 func releaseAdmissionLease(path, token string) {
-	raw, err := os.ReadFile(path)
+	lock, err := acquireAdmissionLeaseLock(path)
 	if err != nil {
 		return
 	}
-	if !strings.Contains(string(raw), "token="+token+" ") {
-		// Someone else owns it now. Deleting it would admit a third launcher.
+	defer lock.Close()
+	record, info, err := readAdmissionLease(path)
+	if err != nil || record.Token != token {
+		return
+	}
+	current, err := os.Stat(path)
+	if err != nil || !os.SameFile(info, current) {
 		return
 	}
 	_ = os.Remove(path)

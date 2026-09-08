@@ -19,6 +19,27 @@ func schemaFlagNames(t *testing.T) []string {
 	return names
 }
 
+func TestAdmissionPhaseIsWriteAheadOfCandidateAndRoute(t *testing.T) {
+	src, err := os.ReadFile("review_pool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := funcBody(string(src), "func runPoolReview(")
+	if !ok {
+		t.Fatal("cannot locate runPoolReview")
+	}
+	candidate := strings.Index(body, "capacityLease.update(admissionPhaseCandidate)")
+	resolveCandidate := strings.Index(body, "resolvePoolReviewCandidateAt(")
+	if candidate < 0 || resolveCandidate < 0 || candidate > resolveCandidate {
+		t.Fatal("candidate phase is not write-ahead of candidate preparation")
+	}
+	route := strings.Index(body, "capacityLease.update(admissionPhaseRoute)")
+	resolveRoute := strings.Index(body, "resolvePoolReviewer(")
+	if route < 0 || resolveRoute < 0 || route > resolveRoute {
+		t.Fatal("route phase is not write-ahead of the first provider route/probe")
+	}
+}
+
 // funcBody returns one top-level func's source, declaration through closing brace.
 func funcBody(src, decl string) (string, bool) {
 	start := strings.Index(src, decl)
