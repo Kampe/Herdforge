@@ -87,7 +87,7 @@ func parseReviewHostIngestArgs(args []string) (reviewHostIngestArgs, error) {
 	return out, nil
 }
 
-func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, reviewer, sha string, commitTime time.Time, reaches func(branch, sha string) bool) (reviewledger.LaunchProvenance, error) {
+func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, reviewer, sha, task, repo, lane string, commitTime time.Time, reaches func(branch, sha string) bool) (reviewledger.LaunchProvenance, error) {
 	path := launch.ReceiptPathFor(root)
 	members, err := launch.ReadReceipts(path)
 	if err != nil {
@@ -99,7 +99,7 @@ func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, revie
 	if _, err := launch.AcceptedCanonicalMember(members, locator); err != nil {
 		return reviewledger.LaunchProvenance{}, err
 	}
-	reviewLaunch, err := launch.AcceptedReviewLaunchFor(members, reviewer)
+	reviewLaunch, err := launch.AcceptedReviewLaunchForCandidate(members, reviewer, sha, task, repo, lane)
 	if err != nil {
 		return reviewledger.LaunchProvenance{}, err
 	}
@@ -163,9 +163,24 @@ func runReviewHostIngest(args []string) error {
 	if err != nil {
 		root = "."
 	}
+	var artifact reviewingest.Artifact
+	var artifactBody []byte
+	task := ""
+	if parsed.Artifact != "" {
+		body, err := os.ReadFile(parsed.Artifact)
+		if err != nil {
+			return fmt.Errorf("read artifact: %w", err)
+		}
+		artifact = reviewingest.Parse(string(body))
+		if artifact.SHA != parsed.Candidate || artifact.Reviewer != parsed.Reviewer {
+			return fmt.Errorf("SHA/reviewer mismatch: artifact sha=%s reviewer=%s", artifact.SHA, artifact.Reviewer)
+		}
+		artifactBody = body
+		task = reviewledger.CloseableCardRef(artifact.TaskRef)
+	}
 	commitTime := commitTimeOf(root, parsed.Candidate)
 	reaches := func(branch, sha string) bool { return branchReaches(root, branch, sha) }
-	proof, err := resolveCanonicalLaunchProvenance(root, locator, parsed.Reviewer, parsed.Candidate, commitTime, reaches)
+	proof, err := resolveCanonicalLaunchProvenance(root, locator, parsed.Reviewer, parsed.Candidate, task, "", "", commitTime, reaches)
 	if err != nil {
 		return err
 	}
@@ -176,25 +191,17 @@ func runReviewHostIngest(args []string) error {
 		Reaches:        reaches,
 	}
 	if parsed.Artifact != "" {
-		body, err := os.ReadFile(parsed.Artifact)
-		if err != nil {
-			return fmt.Errorf("read artifact: %w", err)
-		}
-		a := reviewingest.Parse(string(body))
-		if a.SHA != parsed.Candidate || a.Reviewer != parsed.Reviewer {
-			return fmt.Errorf("SHA/reviewer mismatch: artifact sha=%s reviewer=%s", a.SHA, a.Reviewer)
-		}
-		sum := sha256.Sum256(body)
-		opts.Task = reviewledger.CloseableCardRef(a.TaskRef)
-		opts.Branch = a.Branch
+		sum := sha256.Sum256(artifactBody)
+		opts.Task = task
+		opts.Branch = artifact.Branch
 		opts.Artifact = parsed.Artifact
 		opts.ArtifactDigest = fmt.Sprintf("%x", sum)
-		opts.Verdict = reviewledger.Verdict(a.Verdict)
-		opts.ReviewerFamily = a.ReviewerFamily
-		opts.BuilderFamily = a.BuilderFamily
-		opts.VfyDigest = a.VerificationDigest()
-		opts.ReadBase = a.ReadBase
-		opts.ReadHead = a.ReadHead
+		opts.Verdict = reviewledger.Verdict(artifact.Verdict)
+		opts.ReviewerFamily = artifact.ReviewerFamily
+		opts.BuilderFamily = artifact.BuilderFamily
+		opts.VfyDigest = artifact.VerificationDigest()
+		opts.ReadBase = artifact.ReadBase
+		opts.ReadHead = artifact.ReadHead
 	} else {
 		opts.Branch = proof.Branch
 	}

@@ -139,6 +139,86 @@ func TestHostIngestRefusesBuilderPaneAsReviewerHost(t *testing.T) {
 	assertLedgerHostAbsent(t, fx, "builder-proc")
 }
 
+func TestCanonicalReviewProvenanceRejectsDifferentCandidate(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, fx.reviewReceipt)
+	if err := os.WriteFile(filepath.Join(fx.dir, "later"), []byte("other-candidate\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitHostIngest(t, fx.dir, []string{
+		"GIT_AUTHOR_DATE=2026-09-07T13:00:00+00:00",
+		"GIT_COMMITTER_DATE=2026-09-07T13:00:00+00:00",
+	}, "add", "-A")
+	gitHostIngest(t, fx.dir, []string{
+		"GIT_AUTHOR_DATE=2026-09-07T13:00:00+00:00",
+		"GIT_COMMITTER_DATE=2026-09-07T13:00:00+00:00",
+	}, "commit", "-qm", "later candidate")
+	other := gitHostIngest(t, fx.dir, nil, "rev-parse", "HEAD")
+	if other == fx.sha {
+		t.Fatal("fixture did not produce a second candidate SHA")
+	}
+	proof, err := resolveCanonicalLaunchProvenance(fx.dir, fx.builderReceipt, fx.reviewer, other, "", "", "",
+		commitTimeOf(fx.dir, other), func(branch, sha string) bool { return branchReaches(fx.dir, branch, sha) })
+	if err == nil {
+		t.Fatalf("review launch for %s authenticated host=%s for other candidate %s", fx.sha, proof.Host, other)
+	}
+	if !strings.Contains(err.Error(), "review launch") {
+		t.Fatalf("cross-candidate refusal = %v, want review launch binding", err)
+	}
+}
+
+func TestCanonicalReviewProvenanceRejectsDifferentTask(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	foreign := fx.reviewReceipt
+	foreign.TaskRef = "FAC-999"
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, foreign)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, fx.builderReceipt)
+	artifact := filepath.Join(fx.dir, "review.md")
+	if err := os.WriteFile(artifact, []byte(""+
+		"sha: "+fx.sha+"\n"+
+		"reviewer: "+fx.reviewer+"\n"+
+		"task: FAC-765\n"+
+		"verdict: PASS\n"+
+		"reviewer-family: google\n"+
+		"builder-family: openai\n"+
+		"reviewed-base: "+fx.sha+"\n"+
+		"reviewed-head: "+fx.sha+"\n"+
+		"---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+		"--artifact", artifact,
+		"--base", fx.sha,
+	})
+	if err == nil || !(strings.Contains(err.Error(), "task") || strings.Contains(err.Error(), "review launch")) {
+		t.Fatalf("review launch for FAC-999 must not authenticate FAC-765, err=%v", err)
+	}
+	assertLedgerHostAbsent(t, fx, "W4-canonical-review-pane")
+}
+
+func TestCanonicalReviewProvenanceAcceptsPreEditBuilderEmptyCandidateSHA(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	preEdit := fx.builderReceipt
+	preEdit.CandidateSHA = ""
+	writeCanonicalLog(t, fx.receipts, preEdit, fx.reviewReceipt)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, preEdit)
+
+	if err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+	}); err != nil {
+		t.Fatalf("pre-edit builder receipt with empty CandidateSHA must still reach: %v", err)
+	}
+	assertLedgerHostPresent(t, fx, "W4-canonical-review-pane")
+}
+
 func TestHostIngestRefusesMissingCanonicalLog(t *testing.T) {
 	fx := newHostIngestFixture(t)
 	locator := filepath.Join(fx.dir, "locator.json")
