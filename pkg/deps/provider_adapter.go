@@ -180,15 +180,21 @@ func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID
 	}
 	s.mu.Lock()
 	id := string(ref)
+	mode := lookupByRef
 	if t, ok := s.refCache[string(ref)]; ok {
 		id = t.ID
+		mode = lookupByID
 	}
 	s.mu.Unlock()
 
 	// Fresh Get outside lock — live status for Done check (not a full re-list).
-	fresh, err := s.TP.GetTask(ctx, id)
-	if err != nil || fresh == nil {
-		return "", "", fmt.Errorf("%w: %s", ErrDeletedTask, ref)
+	// resolveEndpointTask never infers archive from the GetTask failure alone:
+	// it only accepts a matching row from this project's own archived column as
+	// positive evidence, so a genuinely missing/foreign/unauthorized ref stays
+	// fail-closed with its real error preserved (FAC-777 live correction).
+	fresh, ferr := s.resolveEndpointTask(ctx, mode, id)
+	if ferr != nil {
+		return "", "", fmt.Errorf("deps: task %s: %w", ref, ferr)
 	}
 	st := provider.NormalizeStatus(fresh.Status)
 	if st == provider.StatusUnknown || strings.HasPrefix(st, "unknown:") {
@@ -205,6 +211,102 @@ func (s *ProviderStore) TaskStatus(ctx context.Context, ref Ref) (string, TaskID
 		fence.mu.Unlock()
 	}
 	return st, TaskID(fresh.ID), nil
+}
+
+// endpointLookupMode says whether an endpoint is being resolved by its
+// immutable provider id or by its human ref, so archived-column evidence is
+// matched on the exact same field the caller actually looked up by — never
+// an id-or-ref OR. A row whose Ref happens to equal an id being looked up
+// (or vice versa) must never authenticate that lookup (FAC-777 review R3,
+// HIGH: a ref collision authenticated the wrong immutable identity).
+type endpointLookupMode int
+
+const (
+	lookupByID endpointLookupMode = iota
+	lookupByRef
+)
+
+// resolveEndpointTask resolves one endpoint for snapshot hydration and status
+// reads. A direct GetTask is always tried first and, on success, is
+// authoritative regardless of status (an archived task that GetTask can
+// still read needs no special case). Only when GetTask itself fails does
+// this consult this project's own archived column for exact-identity
+// evidence via findArchivedEvidence: that is the sole accepted positive
+// evidence for "archived, unreadable via single GetTask" (live Kaneo can
+// 404/400 a single active or archived ref while the project-scoped column
+// listing still resolves it). Archive is never inferred from the GetTask
+// failure alone, a 404/400 body, a missing list entry, or an unauthenticated
+// archived-column row — per FAC-777 live correction and review R3, that goes
+// on poisoning genuinely missing, foreign-project, wrong-status, or
+// wrong-identity endpoints as "deleted"/"archived" respectively. Ambiguous
+// (conflicting) evidence is itself fail-closed, not silently ignored.
+func (s *ProviderStore) resolveEndpointTask(ctx context.Context, mode endpointLookupMode, key string) (*provider.Task, error) {
+	t, gerr := s.TP.GetTask(ctx, key)
+	if gerr == nil && t != nil {
+		return t, nil
+	}
+	archived, aerr := s.findArchivedEvidence(ctx, mode, key)
+	if aerr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDeletedTask, aerr)
+	}
+	if archived != nil {
+		return archived, nil
+	}
+	if gerr != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDeletedTask, gerr)
+	}
+	return nil, ErrDeletedTask
+}
+
+// findArchivedEvidence looks for key in this project's archived column and
+// accepts a row only when ALL of the following hold, independently
+// re-verified rather than trusted from the query's own filters:
+//   - the row matches key on the EXACT field named by mode (immutable id, or
+//     ref — never either, which a colliding row could exploit);
+//   - row.ProjectID == s.ProjectID (never trust the ListTasks project
+//     argument alone — a misbehaving or adversarial provider can return a
+//     foreign-project row for a project-scoped query);
+//   - NormalizeStatus(row.Status) == provider.StatusArchived (never trust the
+//     ListTasks status argument alone — the same reasoning);
+//
+// A miss returns (nil, nil): the caller keeps its original GetTask error
+// rather than silently accepting an unconfirmed archive state. More than one
+// DISTINCT row matching key is ambiguous evidence and returns an error —
+// never resolved by picking the first row.
+func (s *ProviderStore) findArchivedEvidence(ctx context.Context, mode endpointLookupMode, key string) (*provider.Task, error) {
+	rows, err := s.TP.ListTasks(ctx, s.ProjectID, provider.StatusArchived)
+	if err != nil {
+		return nil, err
+	}
+	var match *provider.Task
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		var hit bool
+		switch mode {
+		case lookupByID:
+			hit = row.ID == key
+		case lookupByRef:
+			hit = row.Ref == key
+		}
+		if !hit {
+			continue
+		}
+		if row.ProjectID != s.ProjectID {
+			continue
+		}
+		if provider.NormalizeStatus(row.Status) != provider.StatusArchived {
+			continue
+		}
+		if match != nil && (match.ID != row.ID || match.Ref != row.Ref || match.ProjectID != row.ProjectID) {
+			return nil, fmt.Errorf("deps: ambiguous archived evidence for %q: conflicting rows id=%s/%s ref=%s/%s project=%s/%s",
+				key, match.ID, row.ID, match.Ref, row.Ref, match.ProjectID, row.ProjectID)
+		}
+		cp := *row
+		match = &cp
+	}
+	return match, nil
 }
 
 func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) (DependencyEdge, error) {
@@ -229,9 +331,9 @@ func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) 
 	tgtT := s.idCache[r.TargetTaskID]
 	s.mu.Unlock()
 	if srcT == nil {
-		t, gerr := s.TP.GetTask(ctx, r.SourceTaskID)
-		if gerr != nil || t == nil {
-			return DependencyEdge{}, fmt.Errorf("deps: relation %s source %s unreadable: %w", r.ID, r.SourceTaskID, ErrDeletedTask)
+		t, rerr := s.resolveEndpointTask(ctx, lookupByID, r.SourceTaskID)
+		if rerr != nil {
+			return DependencyEdge{}, fmt.Errorf("deps: relation %s source %s unreadable: %w", r.ID, r.SourceTaskID, rerr)
 		}
 		srcT = t
 		s.mu.Lock()
@@ -240,9 +342,9 @@ func (s *ProviderStore) mapEdgeStrict(ctx context.Context, r provider.Relation) 
 		s.mu.Unlock()
 	}
 	if tgtT == nil {
-		t, gerr := s.TP.GetTask(ctx, r.TargetTaskID)
-		if gerr != nil || t == nil {
-			return DependencyEdge{}, fmt.Errorf("deps: relation %s target %s unreadable: %w", r.ID, r.TargetTaskID, ErrDeletedTask)
+		t, rerr := s.resolveEndpointTask(ctx, lookupByID, r.TargetTaskID)
+		if rerr != nil {
+			return DependencyEdge{}, fmt.Errorf("deps: relation %s target %s unreadable: %w", r.ID, r.TargetTaskID, rerr)
 		}
 		tgtT = t
 		s.mu.Lock()
@@ -427,7 +529,25 @@ func (s *ProviderStore) SnapshotGraphForTask(ctx context.Context, taskRef Ref, t
 			t := s.refCache[string(ref)]
 			s.mu.Unlock()
 			if t == nil {
-				return fmt.Errorf("deps: scoped graph endpoint %s is not in project", ref)
+				// Not in the unfiltered hydrate cache -- try the same
+				// evidence-based resolution mapEdgeStrict/TaskStatus use before
+				// declaring the endpoint out of project (FAC-777 live correction:
+				// an unfiltered listing can omit a row a scoped read still
+				// resolves). A cross-project GetTask hit is still rejected below.
+				resolved, rerr := s.resolveEndpointTask(ctx, lookupByRef, string(ref))
+				if rerr != nil {
+					return fmt.Errorf("deps: scoped graph endpoint %s is not in project: %w", ref, rerr)
+				}
+				if resolved.ProjectID != s.ProjectID {
+					return fmt.Errorf("deps: scoped graph endpoint %s resolved outside project", ref)
+				}
+				cp := *resolved
+				t = &cp
+				s.mu.Lock()
+				s.refCache[t.Ref] = t
+				s.idCache[t.ID] = t
+				s.mu.Unlock()
+				projectIDs[t.ID] = struct{}{}
 			}
 			id = TaskID(t.ID)
 		}
