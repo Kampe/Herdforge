@@ -108,8 +108,14 @@ herd fence-provision
 This sets `HERD_FENCE_PROVISION=1`, mints a random 32-byte hex seal, writes
 `fences.db` + `SHARED`, then prints `export HERD_CLAIM_DIR=…` and
 `export HERD_FENCE_VOLUME_ID=…`. Treat that print as secret; do not commit
-it. A pre-set `HERD_FENCE_VOLUME_ID` at first-time provision is refused
-(stolen-seal split-brain protection).
+it. `runFenceProvision` itself unsets `HERD_FENCE_VOLUME_ID` before calling
+`WriteSharedMarker` — the protection isn't `WriteSharedMarker` rejecting a
+caller-supplied seal, it's that the CLI never lets one through in the first
+place. First provision always mints a fresh seal regardless of what was in
+the environment beforehand; no caller-supplied `HERD_FENCE_VOLUME_ID` is ever
+accepted as authority. Keep the explicit `unset` in the recipe anyway — it
+documents the intent and doesn't depend on that CLI-internal behavior
+continuing to exist.
 
 ## 4. Worker/mint credentials
 
@@ -221,10 +227,18 @@ loads that file via `HERD_ROOT`.
 | Mechanism | Starts a broker? | Shareable worker route? | Compatible with a standalone owner on the same volume? |
 |---|---|---|---|
 | `herd pulse --act` | No | No | N/A — heartbeat only |
-| `herd pulse --act --spawn` (`dispatchTicketDecision`) | No | No | Dispatches real work, but still can't mint against a standalone broker (§1) |
+| `herd pulse --act --spawn` (`dispatchTicketDecision`) | Conditionally — if that process also runs with `HERD_FENCE_COORDINATOR=1`, `dispatchTicketDecision`'s own `OpenClaimStack` call starts one, exactly like any other coordinator-mode caller | No — that owner is per-dispatch and in-process, not a standing shareable service | Dispatches real work either way, but a per-dispatch in-process owner still takes the claim-dir flock like any coordinator-mode owner, and still can't coexist with a standalone broker (§1) |
 | `herd daemon` `RunPulse` claim | Only if that process also has `HERD_FENCE_COORDINATOR=1` | No — tokens stay in-process | Incompatible: takes the claim-dir flock |
 | `HERD_FENCE_COORDINATOR=1` + `HERD_FENCE_BROKER_URL` set together | Refused (`standalone broker owns this claim volume`) | No | Explicitly exclusive |
 | Standalone `herd fence-broker` + clients (URL+TOKEN, coordinator unset) | One owner | Yes — this is the FAC-776 standing path | Compatible, as long as coordinator/daemon stay clients |
+
+`dispatchTicketDecision` not calling `StartCoordinatorBroker` directly does
+not mean pulse never opens a broker — under `HERD_FENCE_COORDINATOR=1` its
+`OpenClaimStack` call takes the same in-process-owner path every other
+coordinator-mode caller does. What it never does is start a *persistent,
+shareable* owner the way standalone `herd fence-broker` does: that owner's
+lifetime is scoped to the dispatch call, and nothing else can attach to it
+as a client.
 
 Do not enable `HERD_FENCE_COORDINATOR=1` to "fix" standing — that creates a
 second, incompatible owner. A production fenced Kaneo mutate still needs a
@@ -289,20 +303,34 @@ user's global settings and the current repo's project settings — so a policy
 file has to be scoped to the right host *and* the right repo; a policy tuned
 for one repo can't just be copied onto another with a different hook set.
 
-Rollout for a policy change:
+Rollout for a policy change — run from inside the repo the policy is scoped
+to, with `HERD_HARNESS_HOOKS_FILE` explicitly pointed at that scoped file, not
+left to fall back to `.herd/harness-hooks.json`:
 
 ```zsh
+cd "<repo-root>"                              # the repo whose Claude discovery this scopes
+policy="<host>-claude-<date>.json"            # the repo-scoped policy file, not a shared default
+export HERD_HARNESS_HOOKS_FILE="$policy"
 herd hooks-pin --provider claude --file "$policy" --dry-run
 # explicitly review every ADD/DROP the dry-run reports
 herd hooks-pin --provider claude --file "$policy"
 "$HOME/.local/bin/herd-hook-inventory" --provider claude --validate
 ```
 
+Both `cd` and the `HERD_HARNESS_HOOKS_FILE` export matter: Claude's discovery
+reads the *current* repo's project settings, so pinning or validating from
+the wrong cwd — or with the env var unset and a stale `.herd/harness-hooks.json`
+sitting in that cwd — silently inspects a different repo or the wrong
+default file instead of the policy you meant to check.
+
 The native pin computes its own revision; there's no manual digest math.
-Preserve existing classifications across a rollout — the generator defaults
-newly-added hooks to *optional*, which is a reasonable default but not a
-license to blanket-enable them without reviewing what each one actually
-does.
+First setup for a new host/repo pair must seed `$policy` from an
+already-reviewed policy for that host, carrying its existing classifications
+forward, not generate one from a blank slate — never blindly overwrite an
+existing scoped policy file wholesale. Preserve existing classifications
+across a rollout; the generator defaults newly-added hooks to *optional*,
+which is a reasonable default but not a license to blanket-mark every new
+hook optional without reviewing what each one actually does.
 
 Grok and Codex, absent a provider-specific policy, report no hooks and
 validate cleanly by default — that's expected discovery behavior for those
@@ -312,13 +340,24 @@ they aren't.
 
 ### Chainseer example (concrete, current)
 
-A reviewed policy for Chainseer exists at
+A reviewed policy for Chainseer already exists at
 `$HOME/.local/state/herdforge/hook-policy/chainseer-claude-20260908.json`: 31
 entries, preserving the 29 existing host rows and adding two new project
 rows — `role-inject` (`SessionStart`) and a fail-open `goal-guard` (`Stop`) —
 both individually assessed as optional continuation/context hooks with no
-change to any existing safety classification. Validation for Claude, Grok,
-and Codex passed against this policy from a Chainseer checkout at the
+change to any existing safety classification. Since it's already reviewed
+and in place, re-validating it needs no pin/dry-run step, just cwd + env
+pointed at it and all three native validators:
+
+```zsh
+cd "$CHAINSEER_ROOT"
+export HERD_HARNESS_HOOKS_FILE="$HOME/.local/state/herdforge/hook-policy/chainseer-claude-20260908.json"
+"$HOME/.local/bin/herd-hook-inventory" --provider claude --validate
+"$HOME/.local/bin/herd-hook-inventory" --provider grok --validate
+"$HOME/.local/bin/herd-hook-inventory" --provider codex --validate
+```
+
+All three passed against this policy from a Chainseer checkout at the
 audited source revision. No Chainseer broker has been started as part of
 producing this runbook or that policy.
 
