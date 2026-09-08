@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -220,14 +221,22 @@ func SendKeys(target, keys string) error {
 	return nil
 }
 
-// Send submits text via `herdr agent prompt` and, when verify is set, polls
-// up to timeout for prompt-correlated pane evidence. The agent must report a
-// consumption transition relative to the pre-send baseline, and the exact
-// task text must appear in pane readback. If it never proves consumption, it
-// returns an error so a caller can escalate. It does NOT answer trust/approval
-// dialogs.
+// Send submits text via `herdr agent prompt` when the recipient is idle or
+// done. A working, starting, or unknown recipient is not preempted: the
+// payload is filed on the durable mailbox and the status is queued-durable.
+// Authenticated urgent control uses SendStatus, which still delivers
+// immediately. When verify is set on the idle path, Send polls for
+// prompt-correlated pane evidence. It does NOT answer trust/approval dialogs.
 func Send(target, text string, verify bool, timeout time.Duration) (string, error) {
-	return sendInWorkspace(target, text, verify, timeout, "")
+	result, err := deliverRoutine(target, text, verify, timeout, "")
+	return result.Status, err
+}
+
+// DeliverRoutine is Send with the durable envelope identity when the
+// recipient is busy. Callers that need the queued receipt should use this
+// rather than parsing the status string.
+func DeliverRoutine(target, text string, verify bool, timeout time.Duration) (SendResult, error) {
+	return deliverRoutine(target, text, verify, timeout, "")
 }
 
 // SendStatus is the status-only delivery path for operator control nudges
@@ -242,7 +251,13 @@ func SendStatus(target, text string, verify bool, timeout time.Duration) (string
 // SendInWorkspace submits to a target already selected from an explicit
 // workspace, as used by stop and other workspace-scoped operators.
 func SendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
-	return sendInWorkspace(target, text, verify, timeout, workspace)
+	result, err := deliverRoutine(target, text, verify, timeout, workspace)
+	return result.Status, err
+}
+
+// DeliverRoutineInWorkspace is the workspace-scoped form of DeliverRoutine.
+func DeliverRoutineInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (SendResult, error) {
+	return deliverRoutine(target, text, verify, timeout, workspace)
 }
 
 // SendStatusInWorkspace is the workspace-scoped control-nudge variant of
@@ -253,7 +268,13 @@ func SendStatusInWorkspace(target, text string, verify bool, timeout time.Durati
 
 // FormatSendResult renders the operator-facing delivery result.
 func FormatSendResult(target, status string) string {
-	return formatSendResult(target, "", status)
+	return formatSendResult(target, "", status, "")
+}
+
+// FormatSendResultWithEnvelope renders a send receipt that may include a
+// durable mailbox identity. queued-durable is success, not consumption.
+func FormatSendResultWithEnvelope(target, workspace, status, envelopeID string) string {
+	return formatSendResult(target, workspace, status, envelopeID)
 }
 
 // FormatSendResultInWorkspace renders an explicitly authorized cross-workspace
@@ -261,10 +282,10 @@ func FormatSendResult(target, status string) string {
 // ordinary formatter makes the authorization visible to operators and leaves
 // existing same-workspace output stable.
 func FormatSendResultInWorkspace(target, workspace, status string) string {
-	return formatSendResult(target, workspace, status)
+	return formatSendResult(target, workspace, status, "")
 }
 
-func formatSendResult(target, workspace, status string) string {
+func formatSendResult(target, workspace, status, envelopeID string) string {
 	qualifier := ""
 	switch status {
 	case "working", "done":
@@ -277,6 +298,12 @@ func formatSendResult(target, workspace, status string) string {
 		qualifier = " (UNVERIFIED: --no-verify)"
 	case "queued":
 		qualifier = " (queued but not consumed; explicit retry or defer required)"
+	case StatusQueuedDurable:
+		if strings.TrimSpace(envelopeID) != "" {
+			qualifier = fmt.Sprintf(" (durable inbox copy queued; envelope %s; not consumed)", envelopeID)
+		} else {
+			qualifier = " (durable inbox copy queued; not consumed)"
+		}
 	}
 	route := target
 	if strings.TrimSpace(workspace) != "" {
@@ -400,41 +427,40 @@ func isExecutableTaskLine(line string) bool {
 	return false
 }
 
-func sendInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
+func deliverRoutine(target, text string, verify bool, timeout time.Duration, workspace string) (SendResult, error) {
 	resolved, err := requireAgentWorkspaceIn(target, workspace)
 	if err != nil {
-		return "", err
+		return SendResult{}, err
 	}
 	resolvedTarget := resolved.Name
 	if resolvedTarget == "" {
 		resolvedTarget = target
 	}
+	if !immediateDeliveryAllowed(resolved.Status) {
+		// FAC-773: routine traffic must not preempt. working/starting/unknown
+		// are not permission to send Escape, Enter, AgentPrompt, or signals.
+		queued, qErr := queueRoutineLocked(context.Background(), resolvedTarget, text)
+		if qErr != nil {
+			return SendResult{}, qErr
+		}
+		return queued, nil
+	}
 	baselinePane := ""
 	if verify {
 		baselinePane, err = PaneRead(resolved.PaneID, 120)
 		if err != nil {
-			return "", fmt.Errorf("agent '%s' pre-send pane readback failed: %w", resolvedTarget, err)
-		}
-	}
-	// A working standing lane may be inside its durable /goal turn. An
-	// addressed assignment must own the next turn, not sit behind that goal;
-	// Escape pauses the standing turn before the assignment is written. If the
-	// preemption cannot be delivered, refuse loudly instead of reporting a
-	// successful send for text that can only remain queued.
-	if strings.EqualFold(strings.TrimSpace(resolved.Status), "working") {
-		if err := SendKeys(resolvedTarget, "Escape"); err != nil {
-			return "deferred", fmt.Errorf("agent '%s' assignment explicitly deferred: cannot preempt standing goal: %w", resolvedTarget, err)
+			return SendResult{}, fmt.Errorf("agent '%s' pre-send pane readback failed: %w", resolvedTarget, err)
 		}
 	}
 	if _, err := AgentPrompt(resolvedTarget, text, false); err != nil {
-		return "", err
+		return SendResult{}, err
 	}
 	// Herdr can return after writing TEXT while the pane composer is still
 	// processing it.  Submit once immediately so a following status poll does
 	// not observe text stranded in the composer (FAC-388).
 	_ = SendKeys(resolvedTarget, "Enter")
 	if !verify {
-		return "submitted", nil
+		return SendResult{Status: "submitted"}, nil
 	}
 
 	poll := 2 * time.Second
@@ -476,7 +502,7 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 				if st == "" {
 					st = "working"
 				}
-				return st, nil
+				return SendResult{Status: st}, nil
 			}
 			if (st == "working" || st == "done") && paneErr == nil {
 				// FAC-579: some harnesses NEVER echo the prompt, so requiring
@@ -497,7 +523,7 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 				// ignored the input does not change. That is weaker evidence
 				// than an echo, and it is the strongest this harness exposes.
 				if !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) {
-					return st, nil
+					return SendResult{Status: st}, nil
 				}
 			}
 		}
@@ -509,9 +535,9 @@ func sendInWorkspace(target, text string, verify bool, timeout time.Duration, wo
 		time.Sleep(poll)
 	}
 	if staged || strings.Contains(strings.ToLower(lastPane), "pasted text") {
-		return "queued", fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", resolvedTarget, last)
+		return SendResult{Status: "queued"}, fmt.Errorf("agent '%s' queued-but-not-consumed: task text remained staged/unsubmitted in the pane (last status %q)", resolvedTarget, last)
 	}
-	return "queued", fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", resolvedTarget, last)
+	return SendResult{Status: "queued"}, fmt.Errorf("agent '%s' queued-but-not-consumed: task-specific consumption was not observed in the pane (last status %q)", resolvedTarget, last)
 }
 
 func sendStatusInWorkspace(target, text string, verify bool, timeout time.Duration, workspace string) (string, error) {
