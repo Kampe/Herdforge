@@ -102,6 +102,29 @@ func TestAcceptedReviewLaunchForRefusesConflictingHosts(t *testing.T) {
 	}
 }
 
+func TestAcceptedReviewLaunchForCandidateRefusesOtherSHAAndTask(t *testing.T) {
+	review := Receipt{
+		TaskRef: "FAC-765", Role: ReviewerRole, Name: "review-fac-999",
+		PaneID: "W4-canonical-review-pane", CandidateSHA: "aaa", Accepted: true,
+		Repository: "herdforge", Lane: "review",
+	}
+	if _, err := AcceptedReviewLaunchForCandidate([]Receipt{review}, "review-fac-999", "bbb", "", "", ""); err == nil || !strings.Contains(err.Error(), "review launch") {
+		t.Fatalf("other candidate err=%v", err)
+	}
+	if _, err := AcceptedReviewLaunchForCandidate([]Receipt{review}, "review-fac-999", "aaa", "FAC-999", "", ""); err == nil || !strings.Contains(err.Error(), "review launch") {
+		t.Fatalf("other task err=%v", err)
+	}
+	unpinned := review
+	unpinned.CandidateSHA = ""
+	if _, err := AcceptedReviewLaunchForCandidate([]Receipt{unpinned}, "review-fac-999", "aaa", "", "", ""); err == nil || !strings.Contains(err.Error(), "review launch") {
+		t.Fatalf("empty CandidateSHA must not pin, err=%v", err)
+	}
+	got, err := AcceptedReviewLaunchForCandidate([]Receipt{review}, "review-fac-999", "aaa", "FAC-765", "herdforge", "review")
+	if err != nil || got.PaneID != "W4-canonical-review-pane" {
+		t.Fatalf("pinned review launch: got=%+v err=%v", got, err)
+	}
+}
+
 func TestReachingBuilderReceiptIgnoresLocatorFamily(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/launch-receipts.jsonl"
