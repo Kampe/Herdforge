@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // FAC-108: the agent-callback bus. Instead of the coordinator pane-scraping
@@ -39,6 +41,32 @@ func CallbackMailPath(root string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Join(root, path)
+}
+
+// ResolveControlFile is the one project-control mailbox path. It uses
+// gitroot.ProjectRoot (FAC-573): HERD_PROJECT_ROOT or the git common-dir
+// parent, never HERD_ROOT. Unavailable or escaping configuration fails closed.
+func ResolveControlFile(startDir string) (string, error) {
+	root, _, err := gitroot.ProjectRoot(context.Background(), startDir)
+	if err != nil {
+		return "", fmt.Errorf("mail: project root unavailable: %w", err)
+	}
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("mail: project root unavailable")
+	}
+	configured := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
+	if configured == "" {
+		return filepath.Join(root, DefaultCallbackMailFile), nil
+	}
+	if filepath.IsAbs(configured) {
+		return "", fmt.Errorf("HERD_MAIL_FILE must be relative to the repository root")
+	}
+	path := filepath.Clean(filepath.Join(root, configured))
+	rel, relErr := filepath.Rel(root, path)
+	if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("HERD_MAIL_FILE escapes the repository root")
+	}
+	return path, nil
 }
 
 // CallbackKind is what an agent is reporting.

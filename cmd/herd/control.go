@@ -91,21 +91,9 @@ func controlMailPath(override string) (string, error) {
 	if strings.TrimSpace(override) != "" {
 		return override, nil
 	}
-	root, err := canonicalHerdRoot()
+	path, err := mail.ResolveControlFile(".")
 	if err != nil {
 		return "", fmt.Errorf("resolve shared mail root: %w", err)
-	}
-	configured := strings.TrimSpace(os.Getenv("HERD_MAIL_FILE"))
-	if configured == "" {
-		return mail.CallbackMailPath(root), nil
-	}
-	if filepath.IsAbs(configured) {
-		return "", fmt.Errorf("HERD_MAIL_FILE must be relative to the repository root")
-	}
-	path := filepath.Clean(filepath.Join(root, configured))
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("HERD_MAIL_FILE escapes the repository root")
 	}
 	return path, nil
 }

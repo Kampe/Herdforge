@@ -2,9 +2,12 @@ package herdr
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/mail"
 )
 
 func TestStatusFromList(t *testing.T) {
@@ -40,6 +43,7 @@ func TestFormatSendResultExplainsDeliveryGuarantee(t *testing.T) {
 		{name: "working", status: "working", want: "herd send: worker -> working (consumption confirmed)"},
 		{name: "done", status: "done", want: "herd send: worker -> done (consumption confirmed)"},
 		{name: "queued", status: "queued", want: "herd send: worker -> queued (queued but not consumed; explicit retry or defer required)"},
+		{name: "queued-durable", status: StatusQueuedDurable, want: "herd send: worker -> queued-durable (durable inbox copy queued; not consumed)"},
 		{name: "submitted", status: "submitted", want: "herd send: worker -> submitted (UNVERIFIED: --no-verify)"},
 	}
 	for _, tc := range cases {
@@ -130,7 +134,8 @@ func TestSendAcceptsBusyLaneOnlyWithTaskTextPaneEvidence(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	oldRun := runHerdr
 	t.Cleanup(func() { runHerdr = oldRun })
-	paneReads := 0
+	box := mail.NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
+	t.Cleanup(SetQueueMailbox(box))
 	var transport []string
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "agent" && (args[1] == "send-keys" || args[1] == "prompt") {
@@ -140,23 +145,17 @@ func TestSendAcceptsBusyLaneOnlyWithTaskTextPaneEvidence(t *testing.T) {
 			return `{"result":{"agents":[{"name":"worker","pane_id":"pane-busy","workspace_id":"wK","agent_status":"working"}]}}`, nil
 		}
 		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
-			paneReads++
-			if paneReads == 1 {
-				return `{"result":{"text":"empty pane"}}`, nil
-			}
-			return `{"result":{"text":"❯ assigned command: go test ./pkg/herdr"}}`, nil
+			return `{"result":{"text":"empty pane"}}`, nil
 		}
 		return "{}", nil
 	}
 
 	got, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Second)
-	if err != nil || got != "working" {
-		t.Fatalf("busy delivery = %q, %v; want task-specific pane proof", got, err)
+	if err != nil || got != StatusQueuedDurable {
+		t.Fatalf("busy delivery = %q, %v; want queued-durable with no pane writes", got, err)
 	}
-	if len(transport) < 3 || !strings.HasPrefix(transport[0], "agent send-keys worker Escape") ||
-		!strings.HasPrefix(transport[1], "agent prompt worker assigned command") ||
-		!strings.HasPrefix(transport[2], "agent send-keys worker Enter") {
-		t.Fatalf("busy assignment transport = %#v; want Escape, prompt, Enter", transport)
+	if len(transport) != 0 {
+		t.Fatalf("busy routine transport = %#v; want zero keystrokes", transport)
 	}
 }
 
@@ -164,6 +163,8 @@ func TestSendRefusesAssignmentWhenStandingGoalCannotBePreempted(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	oldRun := runHerdr
 	t.Cleanup(func() { runHerdr = oldRun })
+	box := mail.NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
+	t.Cleanup(SetQueueMailbox(box))
 	runHerdr = func(args ...string) (string, error) {
 		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 			return `{"result":{"agents":[{"name":"worker","pane_id":"pane-busy","workspace_id":"wK","agent_status":"working"}]}}`, nil
@@ -178,8 +179,8 @@ func TestSendRefusesAssignmentWhenStandingGoalCannotBePreempted(t *testing.T) {
 	}
 
 	status, err := Send("worker", "assigned command: go test ./pkg/herdr", true, time.Second)
-	if err == nil || status != "deferred" || !strings.Contains(err.Error(), "explicitly deferred") {
-		t.Fatalf("preemption refusal = status %q err %v; want explicit deferred failure", status, err)
+	if err != nil || status != StatusQueuedDurable {
+		t.Fatalf("busy routine must queue even if send-keys would fail: status %q err %v", status, err)
 	}
 }
 
