@@ -1149,6 +1149,7 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 		shaVerdicts[k.SHA] = append(shaVerdicts[k.SHA], v)
 	}
 
+	superseded := hostRetrySupersession(latest)
 	var shas []string
 	for sha, vset := range shaVerdicts {
 		hasVeto := false
@@ -1167,6 +1168,9 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 			}
 
 			if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
+				if superseded[rowProjection(verdict)] {
+					continue
+				}
 				hasVeto = true
 			}
 		}
