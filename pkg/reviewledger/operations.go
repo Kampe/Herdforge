@@ -915,7 +915,7 @@ func (l *Ledger) isCoordinator(name string) bool {
 
 // isPassVerdictLatest checks whether the latest verdict set for a sha has
 // any PASS and no FAIL/BLOCKED, using the family ladder.
-func (l *Ledger) isPassVerdictLatest(sha string, latest map[projectionKey]LedgerRow, launch map[projectionKey]LedgerRow, allowUnrecorded bool) bool {
+func (l *Ledger) isPassVerdictLatest(sha string, latest map[ProjectionKey]LedgerRow, launch map[ProjectionKey]LedgerRow, allowUnrecorded bool) bool {
 	var hasPass bool
 	superseded := make(map[string]bool)
 	for k, verdict := range latest {
@@ -1047,7 +1047,7 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 	}
 
 	retired := make(map[string]bool)
-	verdictIdx := make(map[projectionKey]int)
+	verdictIdx := make(map[ProjectionKey]int)
 	for i, r := range rows {
 		if r.Event == string(EventRetired) {
 			retired[r.SHA] = true
@@ -1061,7 +1061,7 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 		row   LedgerRow
 		index int
 	}
-	newestRec := make(map[projectionKey]recEntry)
+	newestRec := make(map[ProjectionKey]recEntry)
 	for i, r := range rows {
 		if r.Event == string(EventRecord) {
 			newestRec[rowProjection(r)] = recEntry{row: r, index: i}

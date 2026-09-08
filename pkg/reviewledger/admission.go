@@ -68,7 +68,7 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 			return reject(sha, "candidate already consumed (exactly-once admission spent)")
 		}
 	}
-	launch := map[projectionKey]LedgerRow{}
+	launch := map[ProjectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventRecord) && r.SHA == sha {
 			launch[rowProjection(r)] = r
@@ -77,7 +77,7 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 	if len(launch) == 0 {
 		return reject(sha, "no launch record for exact candidate sha")
 	}
-	latest := map[projectionKey]LedgerRow{}
+	latest := map[ProjectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
 			latest[rowProjection(r)] = r
@@ -235,7 +235,7 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 
 	// Exact-SHA gate: only a launch record for this precise candidate SHA
 	// counts. A stale or unknown SHA has nothing to admit against.
-	launch := make(map[projectionKey]LedgerRow)
+	launch := make(map[ProjectionKey]LedgerRow)
 	for _, r := range rows {
 		if r.Event == string(EventRecord) && r.SHA == sha {
 			launch[rowProjection(r)] = r
@@ -245,8 +245,8 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 		return reject(sha, "no launch record for exact candidate sha (stale or unknown sha)")
 	}
 
-	latest := make(map[projectionKey]LedgerRow)
-	var order []projectionKey
+	latest := make(map[ProjectionKey]LedgerRow)
+	var order []ProjectionKey
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
 			k := rowProjection(r)

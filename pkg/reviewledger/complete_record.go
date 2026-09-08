@@ -32,7 +32,7 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func
 		return err
 	}
 	var prior *LedgerRow
-	latest := map[projectionKey]LedgerRow{}
+	latest := map[ProjectionKey]LedgerRow{}
 	for i := range rows {
 		r := rows[i]
 		if r.SHA != sha {

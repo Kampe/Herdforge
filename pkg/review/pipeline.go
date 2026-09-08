@@ -20,6 +20,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 type ConflictState string
@@ -130,9 +131,9 @@ type BoardGitRow struct {
 }
 
 func (s LedgerSnapshot) Pending() []LedgerRow {
-	recordIndex, verdictIndex := map[string]int{}, map[string]int{}
+	recordIndex, verdictIndex := map[reviewledger.ProjectionKey]int{}, map[reviewledger.ProjectionKey]int{}
 	for i, row := range s.Rows {
-		key := row.SHA + "\x00" + row.Reviewer
+		key := rowProjection(row)
 		if row.Event == string(EventRecord) {
 			recordIndex[key] = i
 		}
@@ -159,15 +160,15 @@ func (s LedgerSnapshot) Pending() []LedgerRow {
 }
 
 func (s LedgerSnapshot) Vetoed() map[string]bool {
-	latest := map[string]LedgerRow{}
+	latest := map[reviewledger.ProjectionKey]LedgerRow{}
 	for _, row := range s.Rows {
 		if row.Event == string(EventVerdict) {
-			latest[row.SHA+"\x00"+row.Reviewer] = row
+			latest[rowProjection(row)] = row
 		}
 	}
 	out := map[string]bool{}
 	for _, row := range latest {
-		if row.Verdict == string(VerdictFAIL) || row.Verdict == string(VerdictBLOCKED) {
+		if isVetoVerdict(row.Verdict) {
 			out[row.SHA] = true
 		}
 	}
