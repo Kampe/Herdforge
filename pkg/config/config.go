@@ -118,6 +118,14 @@ func (b WorktreeBoundary) Validate() error {
 	return nil
 }
 
+// Branch publication modes for merge_policy.branch_publication.
+// Empty (the default) and coordinator-harvest keep today's harvest-only
+// worker contract. lane-push tells the assigned lane to publish its branch.
+const (
+	BranchPublicationCoordinatorHarvest = "coordinator-harvest"
+	BranchPublicationLanePush           = "lane-push"
+)
+
 // MergePolicy is the repository's autonomous-merge admission contract. It is
 // part of the live herd.yaml so provider, lane, and merge settings are read
 // from one operator-selected configuration profile.
@@ -127,6 +135,7 @@ type MergePolicy struct {
 	RequireDifferentFamilyReview bool           `yaml:"require_different_family_review" json:"require_different_family_review"`
 	RequirePullRequestReviews    bool           `yaml:"require_pull_request_reviews" json:"require_pull_request_reviews"`
 	RemoteCI                     RemoteCIPolicy `yaml:"remote_ci" json:"remote_ci"`
+	BranchPublication            string         `yaml:"branch_publication,omitempty" json:"branch_publication,omitempty"`
 }
 
 type RemoteCIPolicy struct {
@@ -154,7 +163,22 @@ func (p MergePolicy) Validate() error {
 	if p.RemoteCI.Required && len(nonBlank(p.RemoteCI.RequiredChecks)) == 0 {
 		return fmt.Errorf("remote_ci.required_checks must contain at least one name when remote_ci.required is true")
 	}
+	if err := ValidateBranchPublication(p.BranchPublication); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ValidateBranchPublication accepts the empty default, coordinator-harvest,
+// and lane-push. Any other value is refused so packet text cannot be selected
+// by an unvalidated config string.
+func ValidateBranchPublication(mode string) error {
+	switch strings.TrimSpace(mode) {
+	case "", BranchPublicationCoordinatorHarvest, BranchPublicationLanePush:
+		return nil
+	default:
+		return fmt.Errorf("branch_publication must be coordinator-harvest or lane-push")
+	}
 }
 
 func nonBlank(values []string) []string {

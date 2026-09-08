@@ -427,7 +427,7 @@ func TestBuildTaskPacket(t *testing.T) {
 		Model: "deepseek-v4-flash", Prompt: ".herd/prompts/worker.md",
 	}
 	verification := config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."}
-	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
+	packet := buildTaskPacket(task, "herd/fac-33", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, "", ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 	if !strings.Contains(packet, "FAC-33") {
 		t.Error("packet should contain ticket ref")
 	}
@@ -499,7 +499,7 @@ func TestBuildTaskPacket_ReplyTargetIsNonVacuous(t *testing.T) {
 	verification := config.Verification{TestCommand: "go test ./..."}
 
 	t.Run("named coordinator and lease are embedded", func(t *testing.T) {
-		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification,
+		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, "",
 			ReplyTarget{Name: "forge-coordinator", ReviewSupervisor: "forge-review-harvest-supervisor", LeaseGeneration: 42})
 		if !strings.Contains(packet, "forge-coordinator") {
 			t.Errorf("packet must carry the named coordinator:\n%s", packet)
@@ -513,7 +513,7 @@ func TestBuildTaskPacket_ReplyTargetIsNonVacuous(t *testing.T) {
 	})
 
 	t.Run("empty name falls back to default", func(t *testing.T) {
-		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification,
+		packet := buildTaskPacket(task, "herd/fac-222", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, verification, "",
 			ReplyTarget{Name: "", LeaseGeneration: 7})
 		if !strings.Contains(packet, "coordinator") {
 			t.Errorf("packet must fall back to default coordinator name:\n%s", packet)
@@ -534,7 +534,7 @@ func TestBuildTaskPacket_ProviderNeutralTaskReference(t *testing.T) {
 
 	for _, providerType := range []string{"kaneo", "github", "linear", "jira", "memory", ""} {
 		t.Run(providerType+" provider uses the broker", func(t *testing.T) {
-			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, "fac-proj", lane, verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
+			packet := buildTaskPacket(task, "herd/fac-2", ".herd/prompts/worker.md", providerType, "fac-proj", lane, verification, "", ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 			if !strings.Contains(packet, "herd task get FAC-2 --full") {
 				t.Errorf("provider %q must reference the receipt-gated broker:\n%s", providerType, packet)
 			}
@@ -585,7 +585,7 @@ func TestBuildTaskPacket_RepositoryAgnosticVerification(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, c.verification, ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
+			packet := buildTaskPacket(task, "herd/fac-1", ".herd/prompts/worker.md", "kaneo", "fac-proj", lane, c.verification, "", ReplyTarget{Name: "coordinator", LeaseGeneration: 1})
 			for _, want := range c.wantContains {
 				if !strings.Contains(packet, want) {
 					t.Errorf("packet missing %q:\n%s", want, packet)

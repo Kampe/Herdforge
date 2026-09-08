@@ -830,6 +830,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if err != nil {
 		return nil, err
 	}
+	publication, err := branchPublicationMode(d.Config)
+	if err != nil {
+		return nil, err
+	}
 
 	defaultBranch := d.Config.Project.DefaultBranch
 	if defaultBranch == "" {
@@ -1123,7 +1127,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			fmt.Errorf("failed to sign task context: %w", err))
 	}
 
-	packet := buildTaskPacket(task, tc0.Branch, rolePath, tc0.ProviderType, tc0.ProjectID, lane, d.Config.Verification, ReplyTarget{
+	packet := buildTaskPacket(task, tc0.Branch, rolePath, tc0.ProviderType, tc0.ProjectID, lane, d.Config.Verification, publication, ReplyTarget{
 		Name:             d.coordinatorName(),
 		ReviewSupervisor: d.reviewSupervisorName(),
 		LeaseGeneration:  tc0.LeaseGeneration,
@@ -2215,6 +2219,43 @@ func extractIntentFromTitle(title string) string {
 	return strings.TrimSpace(strings.ToLower(title))
 }
 
+func branchPublicationMode(cfg *config.Config) (string, error) {
+	mode := ""
+	if cfg != nil && cfg.MergePolicy != nil {
+		mode = cfg.MergePolicy.BranchPublication
+	}
+	if err := config.ValidateBranchPublication(mode); err != nil {
+		return "", fmt.Errorf("merge_policy: %w", err)
+	}
+	return strings.TrimSpace(mode), nil
+}
+
+func gitBranchCommandArg(branch string) string {
+	branch = strings.TrimSpace(branch)
+	if gitBranchSafe(branch) {
+		return branch
+	}
+	return "'" + strings.ReplaceAll(branch, "'", `'\''`) + "'"
+}
+
+func gitBranchSafe(branch string) bool {
+	if branch == "" || strings.Contains(branch, "..") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") || strings.Contains(branch, "//") {
+		return false
+	}
+	for _, seg := range strings.Split(branch, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+		for _, r := range seg {
+			if r == '.' || r == '_' || r == '-' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
 // buildTaskPacket builds a TIGHT, reference-based packet (FAC-115). It does
 // NOT dump the card's (often 150-line) spec inline — that burned the agent's
 // context to 80% before it wrote a line and was a direct cause of the
@@ -2253,7 +2294,7 @@ func extractIntentFromTitle(title string) string {
 // worktree's signed TASK-CONTEXT.json, so the agent's very first board read
 // binds to the exact provider/project/task with no ambient credentials and no
 // provider-native context file.
-func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, taskProviderProject string, lane *config.LaneDef, verification config.Verification, reply ReplyTarget) string {
+func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, taskProviderProject string, lane *config.LaneDef, verification config.Verification, publication string, reply ReplyTarget) string {
 	var b strings.Builder
 
 	verifySummary := verification.TestCommand
@@ -2311,7 +2352,12 @@ func buildTaskPacket(task *provider.Task, branch, rolePath, taskProviderType, ta
 	fmt.Fprintf(&b, "  BLOCKED: herd shot %s --report blocked --detail \"<why>\" --lease %d\n", task.Ref, reply.LeaseGeneration)
 	b.WriteString("Report as soon as the condition is true. Polling is the backstop, not the primary signal.\n\n")
 
-	b.WriteString("Do NOT push, PR, or merge — the coordinator harvests your branch. Do NOT touch the root checkout.\n")
+	switch strings.TrimSpace(publication) {
+	case config.BranchPublicationLanePush:
+		fmt.Fprintf(&b, "Push the assigned branch with `git push -u origin %s`. Confirm the remote head of that branch equals `git rev-parse HEAD` before handoff. Do NOT open a PR or merge — the coordinator alone opens and merges. Do NOT touch the root checkout.\n", gitBranchCommandArg(branch))
+	default:
+		b.WriteString("Do NOT push, PR, or merge — the coordinator harvests your branch. Do NOT touch the root checkout.\n")
+	}
 	if lane != nil && rolePath != "" {
 		fmt.Fprintf(&b, "Role contract: %s\n", rolePath)
 	}
