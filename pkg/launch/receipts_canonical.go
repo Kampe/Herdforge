@@ -5,6 +5,10 @@ import (
 	"strings"
 )
 
+// CanonicalMemberRequired is the fail-closed membership refusal. One spelling
+// is shared with pkg/reviewledger so the copies cannot diverge.
+const CanonicalMemberRequired = "launch receipt is not a canonical accepted member"
+
 // AcceptedCanonicalMember returns the canonical accepted log copy that the
 // locator identifies. Membership is exact sameReceipt identity, including
 // StartToken. StartToken is the post-start process proof recorded at
@@ -37,7 +41,7 @@ func AcceptedCanonicalMember(members []Receipt, locator Receipt) (Receipt, error
 		return exact[len(exact)-1], nil
 	}
 	if len(digestBound) == 0 {
-		return Receipt{}, fmt.Errorf("launch receipt is not a canonical accepted member")
+		return Receipt{}, fmt.Errorf("%s", CanonicalMemberRequired)
 	}
 	if receiptsConflict(digestBound) {
 		return Receipt{}, fmt.Errorf("conflicting canonical launch receipts")
@@ -52,7 +56,7 @@ func AcceptedCanonicalMember(members []Receipt, locator Receipt) (Receipt, error
 	if strings.TrimSpace(locator.StartToken) != strings.TrimSpace(canonical.StartToken) {
 		return Receipt{}, fmt.Errorf("tampered start token is not the canonical accepted launch")
 	}
-	return Receipt{}, fmt.Errorf("launch receipt is not a canonical accepted member")
+	return Receipt{}, fmt.Errorf("%s", CanonicalMemberRequired)
 }
 
 // AcceptedReviewLaunchFor returns the canonical accepted review-role launch

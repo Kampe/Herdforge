@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/committime"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
@@ -29,66 +29,50 @@ func parseReviewHostIngestArgs(args []string) (reviewHostIngestArgs, error) {
 	usage := fmt.Errorf("usage: herd review-ledger host-ingest --candidate SHA --reviewer NAME --receipt FILE [--artifact FILE] [--base SHA]")
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		need := func() (string, error) {
-			if i+1 >= len(args) {
-				return "", usage
-			}
-			i++
-			return strings.TrimSpace(args[i]), nil
-		}
-		switch {
-		case a == "--host" || strings.HasPrefix(a, "--host=") || a == "--family" || strings.HasPrefix(a, "--family="):
+		if a == "--host" || strings.HasPrefix(a, "--host=") || a == "--family" || strings.HasPrefix(a, "--family=") {
 			return out, fmt.Errorf("%s is not authentication; host and family must come from the canonical accepted launch log", strings.SplitN(a, "=", 2)[0])
-		case a == "--candidate" || strings.HasPrefix(a, "--candidate="):
-			if strings.HasPrefix(a, "--candidate=") {
-				out.Candidate = strings.TrimSpace(strings.TrimPrefix(a, "--candidate="))
-				continue
-			}
-			v, err := need()
+		}
+		if v, next, ok, err := takeCLIFlag(args, i, "--candidate"); ok {
 			if err != nil {
-				return out, err
+				return out, usage
 			}
 			out.Candidate = v
-		case a == "--reviewer" || strings.HasPrefix(a, "--reviewer="):
-			if strings.HasPrefix(a, "--reviewer=") {
-				out.Reviewer = strings.TrimSpace(strings.TrimPrefix(a, "--reviewer="))
-				continue
-			}
-			v, err := need()
+			i = next
+			continue
+		}
+		if v, next, ok, err := takeCLIFlag(args, i, "--reviewer"); ok {
 			if err != nil {
-				return out, err
+				return out, usage
 			}
 			out.Reviewer = v
-		case a == "--receipt" || strings.HasPrefix(a, "--receipt="):
-			if strings.HasPrefix(a, "--receipt=") {
-				out.Receipt = strings.TrimSpace(strings.TrimPrefix(a, "--receipt="))
-				continue
-			}
-			v, err := need()
+			i = next
+			continue
+		}
+		if v, next, ok, err := takeCLIFlag(args, i, "--receipt"); ok {
 			if err != nil {
-				return out, err
+				return out, usage
 			}
 			out.Receipt = v
-		case a == "--artifact" || strings.HasPrefix(a, "--artifact="):
-			if strings.HasPrefix(a, "--artifact=") {
-				out.Artifact = strings.TrimSpace(strings.TrimPrefix(a, "--artifact="))
-				continue
-			}
-			v, err := need()
+			i = next
+			continue
+		}
+		if v, next, ok, err := takeCLIFlag(args, i, "--artifact"); ok {
 			if err != nil {
-				return out, err
+				return out, usage
 			}
 			out.Artifact = v
-		case a == "--base" || strings.HasPrefix(a, "--base="):
-			if strings.HasPrefix(a, "--base=") {
-				out.ProductionBase = strings.TrimSpace(strings.TrimPrefix(a, "--base="))
-				continue
-			}
-			v, err := need()
+			i = next
+			continue
+		}
+		if v, next, ok, err := takeCLIFlag(args, i, "--base"); ok {
 			if err != nil {
-				return out, err
+				return out, usage
 			}
 			out.ProductionBase = v
+			i = next
+			continue
+		}
+		switch {
 		case a == "--sweep" || a == "--corpus" || strings.HasPrefix(a, "--sweep=") || strings.HasPrefix(a, "--corpus="):
 			return out, fmt.Errorf("corpus mode is refused; host-ingest is explicit SHA/reviewer/receipt only")
 		case strings.HasPrefix(a, "-"):
@@ -155,21 +139,11 @@ func firstNonEmptyCLI(values ...string) string {
 }
 
 func commitTimeOf(root, sha string) time.Time {
-	cmd := exec.Command("git", "-C", root, "show", "-s", "--format=%cI", sha)
-	out, err := cmd.Output()
-	if err != nil {
-		return time.Time{}
-	}
-	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
-	if err != nil {
-		return time.Time{}
-	}
-	return parsed
+	return committime.Of(root, sha)
 }
 
 func branchReaches(root, branch, sha string) bool {
-	cmd := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", sha, branch)
-	return cmd.Run() == nil
+	return gitroot.RequireAncestor(root, sha, branch) == nil
 }
 
 func runReviewHostIngest(args []string) error {

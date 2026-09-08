@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/launch"
 )
 
 // LaunchProvenance is the authenticated launch-receipt subset host-labelled
@@ -67,6 +69,10 @@ func sameHost(a, b string) bool {
 	return hostKey(a) == hostKey(b)
 }
 
+func unknownBuilderFamilyError(family string) error {
+	return fmt.Errorf("unknown builder family %q (refusing unprovable review provenance)", family)
+}
+
 func candidUnrecordedFamily(raw string) bool {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	if v == "" || v == FamilyUnrecorded {
@@ -82,7 +88,7 @@ func candidUnrecordedFamily(raw string) bool {
 
 func authenticateLaunchProvenance(p LaunchProvenance, sha string, commitTime time.Time, reaches func(branch, sha string) bool) (host, builderFamily string, err error) {
 	if !p.Member {
-		return "", "", fmt.Errorf("launch receipt is not a canonical accepted member")
+		return "", "", fmt.Errorf("%s", launch.CanonicalMemberRequired)
 	}
 	if !p.Accepted {
 		return "", "", fmt.Errorf("launch receipt is not accepted")
@@ -122,7 +128,7 @@ func reconcileBuilderFamily(stated, receiptFamily string) (string, error) {
 		return receiptFamily, nil
 	}
 	if !FamilyAllowlist[strings.TrimSpace(stated)] {
-		return "", fmt.Errorf("unknown builder family %q (refusing unprovable review provenance)", stated)
+		return "", unknownBuilderFamilyError(stated)
 	}
 	if !strings.EqualFold(strings.TrimSpace(stated), receiptFamily) {
 		return "", fmt.Errorf("builder-family %q contradicts launch provenance %q; refusing to launder the disagreement", stated, receiptFamily)
