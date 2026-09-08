@@ -24,23 +24,25 @@ func parseReviewBindEvidenceArgs(args []string) (reviewBindEvidenceArgs, error) 
 	usage := fmt.Errorf("usage: herd review-bind-evidence <REF> --candidate <sha> --receipt <digest>")
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if v, next, ok, err := takeCLIFlag(args, i, "--candidate"); ok {
+			if err != nil {
+				return out, usage
+			}
+			out.Candidate = v
+			i = next
+			continue
+		}
+		if v, next, ok, err := takeCLIFlag(args, i, "--receipt"); ok {
+			if err != nil {
+				return out, usage
+			}
+			out.Receipt = v
+			i = next
+			continue
+		}
 		switch {
 		case a == "--sweep" || a == "--corpus" || strings.HasPrefix(a, "--sweep=") || strings.HasPrefix(a, "--corpus="):
 			return out, fmt.Errorf("corpus mode is refused; review-bind-evidence is explicit-ref only")
-		case a == "--candidate" || a == "--receipt":
-			if i+1 >= len(args) {
-				return out, usage
-			}
-			i++
-			if a == "--candidate" {
-				out.Candidate = strings.TrimSpace(args[i])
-			} else {
-				out.Receipt = strings.TrimSpace(args[i])
-			}
-		case strings.HasPrefix(a, "--candidate="):
-			out.Candidate = strings.TrimSpace(strings.TrimPrefix(a, "--candidate="))
-		case strings.HasPrefix(a, "--receipt="):
-			out.Receipt = strings.TrimSpace(strings.TrimPrefix(a, "--receipt="))
 		case a == "--":
 			positional = append(positional, args[i+1:]...)
 			i = len(args)

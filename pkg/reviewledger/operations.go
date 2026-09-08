@@ -143,7 +143,7 @@ func validateRecord(opts RecordOpts) error {
 			return fmt.Errorf("record needs --builder-family for an independent review")
 		}
 		if !FamilyAllowlist[opts.BuilderFamily] {
-			return fmt.Errorf("unknown builder family %q (refusing unprovable review provenance)", opts.BuilderFamily)
+			return unknownBuilderFamilyError(opts.BuilderFamily)
 		}
 	}
 	return nil
