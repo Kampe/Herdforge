@@ -81,6 +81,7 @@ type LedgerRow struct {
 	Lane           string `json:"lane,omitempty"`
 	MergeSHA       string `json:"merge_sha,omitempty"`
 	Status         string `json:"status,omitempty"`
+	Task           string `json:"task,omitempty"`
 	RetryOf        string `json:"retry_of,omitempty"`
 }
 
@@ -181,13 +182,30 @@ func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
 			latest[rowProjection(row)] = row
 		}
 	}
+	superseded := hostRetrySupersession(latest)
 	result := make(map[string]bool)
-	for _, row := range latest {
+	for k, row := range latest {
+		if superseded[k] {
+			continue
+		}
 		if isVetoVerdict(row.Verdict) {
 			result[row.SHA] = true
 		}
 	}
 	return result, nil
+}
+
+func hostRetrySupersession(latest map[reviewledger.ProjectionKey]LedgerRow) map[reviewledger.ProjectionKey]bool {
+	out := make(map[reviewledger.ProjectionKey]bool)
+	for k, row := range latest {
+		if row.Verdict != string(VerdictPASS) {
+			continue
+		}
+		if retry := strings.TrimSpace(row.RetryOf); retry != "" {
+			out[reviewledger.ProjectionOf(k.SHA, retry, k.Host)] = true
+		}
+	}
+	return out
 }
 
 // TierProp resolves the latest recorded tier for a SHA, or empty when the
@@ -1048,6 +1066,7 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 		shaVerdicts[k.SHA] = append(shaVerdicts[k.SHA], v)
 	}
 
+	superseded := hostRetrySupersession(latest)
 	var shas []string
 	for sha, vset := range shaVerdicts {
 		hasPass := false
@@ -1086,6 +1105,9 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 				hasPass = true
 			}
 			if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
+				if superseded[rowProjection(verdict)] {
+					continue
+				}
 				hasVeto = true
 			}
 		}

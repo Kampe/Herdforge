@@ -76,9 +76,13 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 		return nil, fmt.Errorf("read review ledger: %w", err)
 	}
 	withdrawn := map[string]bool{}
+	superseded := map[reviewledger.ProjectionKey]bool{}
 	for _, row := range snap.Rows {
-		if row.Event == string(reviewledger.EventRevoked) || row.Event == string(reviewledger.EventSupersession) {
+		if row.Event == string(reviewledger.EventRevoked) {
 			withdrawn[row.SHA] = true
+		}
+		if row.Event == string(reviewledger.EventVerdict) && row.Verdict == "PASS" && strings.TrimSpace(row.RetryOf) != "" {
+			superseded[reviewledger.ProjectionOf(row.SHA, row.RetryOf, row.Host)] = true
 		}
 	}
 	byHost := map[reviewledger.ProjectionKey]candidate.Review{}
@@ -86,10 +90,13 @@ func (l ledgerReviews) AdmittedForRef(ref string) ([]candidate.Review, error) {
 		if row.SHA == "" || withdrawn[row.SHA] || row.Verdict == "" {
 			continue
 		}
+		k := reviewledger.ProjectionOf(row.SHA, row.Reviewer, row.Host)
+		if isVetoVerdict(row.Verdict) && superseded[k] {
+			continue
+		}
 		if !rowNamesRef(row, ref) {
 			continue
 		}
-		k := reviewledger.ProjectionOf(row.SHA, row.Reviewer, row.Host)
 		cur := byHost[k]
 		cur.CandidateSHA = row.SHA
 		// Later rows enrich earlier ones inside one host projection; never

@@ -166,8 +166,12 @@ func (s LedgerSnapshot) Vetoed() map[string]bool {
 			latest[rowProjection(row)] = row
 		}
 	}
+	superseded := hostRetrySupersession(latest)
 	out := map[string]bool{}
-	for _, row := range latest {
+	for k, row := range latest {
+		if superseded[k] {
+			continue
+		}
 		if isVetoVerdict(row.Verdict) {
 			out[row.SHA] = true
 		}
