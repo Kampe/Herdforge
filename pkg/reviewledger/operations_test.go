@@ -1,6 +1,7 @@
 package reviewledger
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -215,6 +216,90 @@ func TestCompletingAnUnrecordedRecordPreservesItsGate(t *testing.T) {
 	}
 	if last.BuilderFamily != FamilyUnrecorded {
 		t.Errorf("family = %q; completion must never upgrade unprovable provenance", last.BuilderFamily)
+	}
+}
+
+func TestIngestCompletesLegacyBranchPlaceholderWithoutDroppingLease(t *testing.T) {
+	l := newTestLedger(t)
+	sha := strings.Repeat("f", 40)
+	branch := "recovery/fac-655-record-completion"
+	if err := l.EnsureRecord(RecordOpts{
+		SHA: sha, Reviewer: "independent-reviewer", Task: branch,
+		BuilderFamily: FamilyUnrecorded, Gate: GateProvenanceUnrecorded,
+		Lease: "pool-real", PatchURL: "patch-real",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(l.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := IngestOpts{
+		Record: RecordOpts{
+			SHA: sha, Branch: branch, BuilderFamily: "xai", ReviewerFamily: "anthropic",
+			Reviewer: "independent-reviewer", Artifact: ".herd/review/inbox/retained.md",
+			Gate: "independent", Tier: "R3", Task: "FAC-655",
+		},
+		Verdict: VerdictOpts{
+			SHA: sha, Reviewer: "independent-reviewer", Verdict: VerdictPASS,
+			ReviewerFamily: "anthropic", BuilderFamily: "xai", Branch: branch,
+			Artifact: ".herd/review/inbox/retained.md", Task: "FAC-655",
+			VfyDigest: "vfy", CandidateSHA: sha,
+		},
+	}
+	enqueued, err := l.Ingest(opts)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if !enqueued {
+		t.Fatal("PASS was not queued")
+	}
+	after, err := os.ReadFile(l.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(after), string(before)) {
+		t.Fatal("rewrote history")
+	}
+	rows, err := l.AllRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastRecord *LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(EventRecord) && rows[i].SHA == sha {
+			lastRecord = &rows[i]
+		}
+	}
+	if lastRecord == nil || lastRecord.Task != "FAC-655" || lastRecord.BuilderFamily != "xai" || lastRecord.ReviewerFamily != "anthropic" || lastRecord.Tier != "R3" || lastRecord.Gate != "independent" || lastRecord.Lease != "pool-real" || lastRecord.PatchURL != "patch-real" {
+		t.Fatalf("ingest did not complete placeholder: %+v", lastRecord)
+	}
+	queued, err := l.Queued()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, q := range queued {
+		if q.SHA == sha {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Queued omitted completed candidate: %+v", queued)
+	}
+	enqueued, err = l.Ingest(opts)
+	if err != nil {
+		t.Fatalf("duplicate ingest: %v", err)
+	}
+	if enqueued {
+		t.Fatal("duplicate ingest re-queued")
+	}
+	repeat, err := os.ReadFile(l.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(repeat) != string(after) {
+		t.Fatal("duplicate ingest mutated ledger")
 	}
 }
 
