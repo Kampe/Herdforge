@@ -131,8 +131,8 @@ var subcommandUsage = map[string]string{
 	"verdict-harvest":  "Usage: herd verdict-harvest [--remote origin] [--dry-run]\n  Pull verdict artifacts other hosts pushed into the local inbox. Never overwrites\n  a local artifact, so an already-ingested verdict cannot be resurrected.",
 	"verdict-push":     "Usage: herd verdict-push (--artifact <path> | --sweep) [--workspace <id>] [--dry-run]\n  Transport verdict artifacts to the ledger host over git. Uses plumbing only:\n  never checks out, stashes, or switches a branch in the reviewer's worktree.\n  --sweep also retires an exact idle/done, unfocused resident reviewer after the\n  remote ref, candidate HEAD, tab incarnation, and PID start-token tree are proved.",
 	"review-ingest":    "Usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run] [--json]\n  Validate, admit, and audit reviewer verdict artifacts.\n  --ack-only FILE: recover one exact admitted artifact acknowledgment; no new verdict.\n  --sweep: ingest every inbox verdict the ledger has never recorded. Without it\n  artifacts must be named explicitly, so a verdict nobody enumerates stays inert.",
-	"review-complete-record": "Usage: herd review-complete-record REF --candidate SHA --reviewer NAME --artifact FILE\n" +
-		"  Complete one admitted record from retained evidence; no family/tier assertions or corpus mode.\n",
+	"review-complete-record": "Usage: herd review-complete-record REF --candidate SHA --reviewer NAME [--host HOST] --artifact FILE\n" +
+		"  Complete one admitted record from retained evidence; --host selects the exact projection (empty is unhosted, not a wildcard). No family/tier assertions or corpus mode.\n",
 	"review-bind-evidence": "Usage: herd review-bind-evidence <REF> --candidate <sha> --receipt <digest>\n" +
 		"  Bind an immutable full-suite PASS verification receipt to one existing\n" +
 		"  independent PASS for an exact candidate. Append-only; explicit-ref only.\n" +

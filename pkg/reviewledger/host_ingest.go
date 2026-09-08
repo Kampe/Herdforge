@@ -83,8 +83,14 @@ func rowProjection(r LedgerRow) ProjectionKey {
 	return ProjectionOf(r.SHA, r.Reviewer, r.Host)
 }
 
-func retrySupersessionFromLatest(latest map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
+// RetrySupersessionFromLatest authorizes a same-host retry only when the PASS
+// RetryOf projection itself has an EventRecord and the named prior reviewer
+// has a same-host EventRecord. Fabricated PASS rows do not clear a veto.
+func RetrySupersessionFromLatest(latest, records map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
 	out := make(map[ProjectionKey]bool)
+	if records == nil {
+		return out
+	}
 	for k, verdict := range latest {
 		if sha != "" && k.SHA != sha {
 			continue
@@ -92,24 +98,32 @@ func retrySupersessionFromLatest(latest map[ProjectionKey]LedgerRow, sha string)
 		if verdict.Verdict != string(VerdictPASS) {
 			continue
 		}
-		if retry := strings.TrimSpace(verdict.RetryOf); retry != "" {
-			out[ProjectionOf(k.SHA, retry, k.Host)] = true
+		retry := strings.TrimSpace(verdict.RetryOf)
+		if retry == "" {
+			continue
 		}
+		if _, ok := records[k]; !ok {
+			continue
+		}
+		named := ProjectionOf(k.SHA, retry, k.Host)
+		if _, ok := records[named]; !ok {
+			continue
+		}
+		out[named] = true
 	}
 	return out
 }
 
-func retrySupersessionFromRows(rows []LedgerRow, sha string) map[ProjectionKey]bool {
-	out := make(map[ProjectionKey]bool)
-	for _, r := range rows {
-		if r.SHA != sha || r.Verdict != string(VerdictPASS) {
-			continue
-		}
-		if retry := strings.TrimSpace(r.RetryOf); retry != "" {
-			out[ProjectionOf(r.SHA, retry, r.Host)] = true
-		}
+func retrySupersessionFromLatest(latest, records map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
+	return RetrySupersessionFromLatest(latest, records, sha)
+}
+
+func retrySupersessionFromRows(verdicts []LedgerRow, records map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
+	latest := make(map[ProjectionKey]LedgerRow)
+	for _, r := range verdicts {
+		latest[rowProjection(r)] = r
 	}
-	return out
+	return retrySupersessionFromLatest(latest, records, sha)
 }
 
 // boundRetryAudit is the native PASS RetryOf EventSupersession: SHA is the

@@ -63,6 +63,22 @@ func (l *ledgerLegacyReview) AdmittedPass(ref string) (hsync.LegacyReviewEvidenc
 			revoked[prev] = true
 		}
 	}
+	queueState := map[string]string{}
+	for _, row := range snap.Queue {
+		switch row.Event {
+		case string(reviewledger.EventRevoked):
+			queueState[row.SHA] = "revoked"
+		case string(reviewledger.EventEnqueue):
+			queueState[row.SHA] = "queued"
+		case string(reviewledger.EventConsumed):
+			queueState[row.SHA] = "consumed"
+		}
+	}
+	for sha, state := range queueState {
+		if state == "revoked" || state == "consumed" {
+			revoked[sha] = true
+		}
+	}
 
 	found := map[string]hsync.LegacyReviewEvidence{}
 	for _, row := range snap.Rows {

@@ -184,7 +184,7 @@ func (l *Ledger) unsupersededSHAVeto(latest, launch map[ProjectionKey]LedgerRow)
 		}
 		return keys[i].Host < keys[j].Host
 	})
-	superseded := retrySupersessionFromLatest(latest, "")
+	superseded := retrySupersessionFromLatest(latest, launch, "")
 	for _, k := range keys {
 		verdict := latest[k]
 		if verdict.Verdict != string(VerdictFAIL) && verdict.Verdict != string(VerdictBLOCKED) {

@@ -177,12 +177,16 @@ func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
 		return nil, err
 	}
 	latest := make(map[reviewledger.ProjectionKey]LedgerRow)
+	records := make(map[reviewledger.ProjectionKey]LedgerRow)
 	for _, row := range rows {
+		if row.Event == string(EventRecord) {
+			records[rowProjection(row)] = row
+		}
 		if row.Event == string(EventVerdict) {
 			latest[rowProjection(row)] = row
 		}
 	}
-	superseded := hostRetrySupersession(latest)
+	superseded := hostRetrySupersession(latest, records)
 	result := make(map[string]bool)
 	for k, row := range latest {
 		if superseded[k] {
@@ -195,17 +199,15 @@ func (l *Ledger) Vetoed(ctx context.Context) (map[string]bool, error) {
 	return result, nil
 }
 
-func hostRetrySupersession(latest map[reviewledger.ProjectionKey]LedgerRow) map[reviewledger.ProjectionKey]bool {
-	out := make(map[reviewledger.ProjectionKey]bool)
-	for k, row := range latest {
-		if row.Verdict != string(VerdictPASS) {
-			continue
+func hostRetrySupersession(latest, records map[reviewledger.ProjectionKey]LedgerRow) map[reviewledger.ProjectionKey]bool {
+	toRL := func(src map[reviewledger.ProjectionKey]LedgerRow) map[reviewledger.ProjectionKey]reviewledger.LedgerRow {
+		out := make(map[reviewledger.ProjectionKey]reviewledger.LedgerRow, len(src))
+		for k, r := range src {
+			out[k] = reviewledger.LedgerRow{SHA: r.SHA, Reviewer: r.Reviewer, Host: r.Host, Verdict: r.Verdict, RetryOf: r.RetryOf, Event: r.Event}
 		}
-		if retry := strings.TrimSpace(row.RetryOf); retry != "" {
-			out[reviewledger.ProjectionOf(k.SHA, retry, k.Host)] = true
-		}
+		return out
 	}
-	return out
+	return reviewledger.RetrySupersessionFromLatest(toRL(latest), toRL(records), "")
 }
 
 // TierProp resolves the latest recorded tier for a SHA, or empty when the
@@ -837,12 +839,7 @@ func (l *Ledger) isCoordinator(name string) bool {
 // any PASS and no FAIL/BLOCKED, using the family ladder.
 func (l *Ledger) isPassVerdictLatest(sha string, latest map[reviewledger.ProjectionKey]LedgerRow, launch map[reviewledger.ProjectionKey]LedgerRow) bool {
 	var hasPass bool
-	superseded := map[reviewledger.ProjectionKey]bool{}
-	for k, verdict := range latest {
-		if k.SHA == sha && verdict.Verdict == string(VerdictPASS) && strings.TrimSpace(verdict.RetryOf) != "" {
-			superseded[reviewledger.ProjectionOf(k.SHA, verdict.RetryOf, k.Host)] = true
-		}
-	}
+	superseded := hostRetrySupersession(latest, launch)
 	for k, verdict := range latest {
 		if k.SHA != sha {
 			continue
@@ -1066,7 +1063,7 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 		shaVerdicts[k.SHA] = append(shaVerdicts[k.SHA], v)
 	}
 
-	superseded := hostRetrySupersession(latest)
+	superseded := hostRetrySupersession(latest, launch)
 	var shas []string
 	for sha, vset := range shaVerdicts {
 		hasPass := false
@@ -1149,7 +1146,7 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 		shaVerdicts[k.SHA] = append(shaVerdicts[k.SHA], v)
 	}
 
-	superseded := hostRetrySupersession(latest)
+	superseded := hostRetrySupersession(latest, launch)
 	var shas []string
 	for sha, vset := range shaVerdicts {
 		hasVeto := false
