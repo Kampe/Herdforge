@@ -20,6 +20,11 @@ type endpointFaultProvider struct {
 	*provider.MemoryProvider
 	hideFromUnfiltered map[string]bool
 	failGetTask        map[string]error
+	// archivedOverride, when non-nil, makes ListTasks(proj, "archived") return
+	// exactly this slice -- independently controlled, may not correspond to
+	// any real task -- so review-adversarial rows (wrong status, wrong
+	// project, colliding ref/id, duplicates) can be injected directly.
+	archivedOverride []*provider.Task
 }
 
 func newEndpointFaultProvider() *endpointFaultProvider {
@@ -38,6 +43,9 @@ func (p *endpointFaultProvider) GetTask(ctx context.Context, id string) (*provid
 }
 
 func (p *endpointFaultProvider) ListTasks(ctx context.Context, projectID, status string) ([]*provider.Task, error) {
+	if status == provider.StatusArchived && p.archivedOverride != nil {
+		return p.archivedOverride, nil
+	}
 	tasks, err := p.MemoryProvider.ListTasks(ctx, projectID, status)
 	if err != nil {
 		return nil, err
@@ -69,7 +77,15 @@ func TestArchivedEndpoint_ColumnEvidence_NotSingleGet(t *testing.T) {
 	p.AddTask(tArchived)
 	p.AddTask(bTask)
 	p.hideFromUnfiltered[tArchived.ID] = true
-	p.failGetTask[tArchived.ID] = fmt.Errorf("kaneo: GetTask %s: 404 not found", tArchived.ID)
+	// Fail GetTask by both id and ref: gate.go's prerequisite-closure loop
+	// re-resolves T's status via TaskStatus, which re-hydrates (dropping the
+	// hidden T) and falls back to a ref-mode lookup for an uncached ref. A
+	// plain MemoryProvider.GetTask also matches by ref, which would otherwise
+	// resolve T directly and never actually exercise the archived-column
+	// fallback this test claims to cover.
+	notFoundT := fmt.Errorf("kaneo: GetTask %s: 404 not found", tArchived.ID)
+	p.failGetTask[tArchived.ID] = notFoundT
+	p.failGetTask[tArchived.Ref] = notFoundT
 	if _, err := p.CreateRelation(context.Background(), tArchived.ID, bTask.ID, provider.RelationBlocks); err != nil {
 		t.Fatalf("seed relation: %v", err)
 	}
@@ -183,5 +199,143 @@ func TestUnrelatedTaskIsolatedFromForeignEndpoint(t *testing.T) {
 	}
 	if _, err := RequireTaskLaunch(ctx, store, EntryDispatch, "FAC-B", desiredB, ""); err == nil {
 		t.Fatalf("the task actually depending on the foreign endpoint must still refuse before claim")
+	}
+}
+
+// The following four tests reproduce FAC-777 review R3's HIGH finding: the
+// archived-column fallback is an authority-bearing launch input and must not
+// trust the listing's own filters. Each independently controls the archived
+// query response (archivedOverride) to inject a row that a real Kaneo-shaped
+// provider should never legitimately return for the query it answered.
+
+// TestArchivedEvidence_RejectsNonArchivedStatusRow reproduces: an exact-ID
+// row in the correct project with status=done returned from the archived
+// listing must not authorize the connected dependent task.
+func TestArchivedEvidence_RejectsNonArchivedStatusRow(t *testing.T) {
+	p := newEndpointFaultProvider()
+	proj := "proj"
+	tTask := &provider.Task{ID: "id-t", Ref: "CHA-T", Status: "to-do", ProjectID: proj, Title: "T"}
+	bTask := &provider.Task{ID: "id-b", Ref: "FAC-B", Status: "to-do", ProjectID: proj, Title: "B"}
+	p.AddTask(tTask)
+	p.AddTask(bTask)
+	p.hideFromUnfiltered[tTask.ID] = true
+	// Fail GetTask by both id and ref: gate.go's prerequisite-closure loop
+	// re-resolves T's status via TaskStatus, which re-hydrates the project
+	// cache (dropping the hidden T) and falls back to a ref-mode lookup. A
+	// plain MemoryProvider.GetTask also matches by ref, which would otherwise
+	// bypass this adversarial setup by returning the REAL to-do task.
+	notFoundT := fmt.Errorf("kaneo: GetTask %s: 404 not found", tTask.ID)
+	p.failGetTask[tTask.ID] = notFoundT
+	p.failGetTask[tTask.Ref] = notFoundT
+	// Adversarial: correct id and project, but status=done -- not archived.
+	p.archivedOverride = []*provider.Task{
+		{ID: "id-t", Ref: "CHA-T", Status: "done", ProjectID: proj},
+	}
+	if _, err := p.CreateRelation(context.Background(), tTask.ID, bTask.ID, provider.RelationBlocks); err != nil {
+		t.Fatalf("seed relation: %v", err)
+	}
+	store := NewProviderStore(p, proj)
+	ctx := context.Background()
+	desiredB := &Provenance{
+		Version: SchemaVersion, TaskRef: "FAC-B", TaskID: TaskID(bTask.ID), Present: true,
+		Edges: []DependencyEdge{{SourceRef: "CHA-T", TargetRef: "FAC-B", Type: EdgeBlocks}},
+	}
+	if _, err := RequireTaskLaunch(ctx, store, EntryDispatch, "FAC-B", desiredB, ""); err == nil {
+		t.Fatalf("a status=done row from the archived query must not authorize the connected dependent task")
+	}
+}
+
+// TestArchivedEvidence_RejectsForeignProjectRow reproduces: an exact-ID
+// archived row whose own ProjectID names a different project must not
+// authenticate a project-scoped snapshot.
+func TestArchivedEvidence_RejectsForeignProjectRow(t *testing.T) {
+	p := newEndpointFaultProvider()
+	proj := "proj"
+	tTask := &provider.Task{ID: "id-t", Ref: "CHA-T", Status: "to-do", ProjectID: proj, Title: "T"}
+	bTask := &provider.Task{ID: "id-b", Ref: "FAC-B", Status: "to-do", ProjectID: proj, Title: "B"}
+	p.AddTask(tTask)
+	p.AddTask(bTask)
+	p.hideFromUnfiltered[tTask.ID] = true
+	p.failGetTask[tTask.ID] = fmt.Errorf("kaneo: GetTask %s: 404 not found", tTask.ID)
+	// Adversarial: correct id and archived status, but the row's own
+	// ProjectID names a different project than the query was scoped to.
+	p.archivedOverride = []*provider.Task{
+		{ID: "id-t", Ref: "CHA-T", Status: provider.StatusArchived, ProjectID: "other-project"},
+	}
+	if _, err := p.CreateRelation(context.Background(), tTask.ID, bTask.ID, provider.RelationBlocks); err != nil {
+		t.Fatalf("seed relation: %v", err)
+	}
+	store := NewProviderStore(p, proj)
+	ctx := context.Background()
+	if _, err := store.SnapshotGraph(ctx); err == nil {
+		t.Fatalf("a foreign-project row must not authenticate the full project snapshot")
+	}
+}
+
+// TestArchivedEvidence_RejectsRefCollisionAgainstIDLookup reproduces: a row
+// whose Ref happens to equal the immutable id being looked up, but whose own
+// ID differs, must not authenticate an id-mode lookup (relation endpoints are
+// always resolved by immutable id).
+func TestArchivedEvidence_RejectsRefCollisionAgainstIDLookup(t *testing.T) {
+	p := newEndpointFaultProvider()
+	proj := "proj"
+	xTask := &provider.Task{ID: "id-x", Ref: "CHA-X", Status: "to-do", ProjectID: proj, Title: "X"}
+	bTask := &provider.Task{ID: "id-b", Ref: "FAC-B", Status: "to-do", ProjectID: proj, Title: "B"}
+	p.AddTask(xTask)
+	p.AddTask(bTask)
+	p.hideFromUnfiltered[xTask.ID] = true
+	p.failGetTask[xTask.ID] = fmt.Errorf("kaneo: GetTask %s: 404 not found", xTask.ID)
+	// Adversarial: a DISTINCT row (own id "id-other") whose Ref collides with
+	// the immutable id "id-x" actually being looked up.
+	p.archivedOverride = []*provider.Task{
+		{ID: "id-other", Ref: "id-x", Status: provider.StatusArchived, ProjectID: proj},
+	}
+	if _, err := p.CreateRelation(context.Background(), xTask.ID, bTask.ID, provider.RelationBlocks); err != nil {
+		t.Fatalf("seed relation: %v", err)
+	}
+	store := NewProviderStore(p, proj)
+	ctx := context.Background()
+	if _, err := store.SnapshotGraph(ctx); err == nil {
+		t.Fatalf("a ref collision must not authenticate an immutable-id lookup")
+	}
+}
+
+// TestArchivedEvidence_RejectsAmbiguousDuplicateRows reproduces the "add a
+// duplicate case" requirement: two DISTINCT archived rows both matching the
+// same lookup key (same ref, different immutable ids) is conflicting
+// evidence and must refuse -- never resolved by silently picking the first
+// row.
+func TestArchivedEvidence_RejectsAmbiguousDuplicateRows(t *testing.T) {
+	p := newEndpointFaultProvider()
+	proj := "proj"
+	tTask := &provider.Task{ID: "id-t", Ref: "CHA-T", Status: "to-do", ProjectID: proj, Title: "T"}
+	bTask := &provider.Task{ID: "id-b", Ref: "FAC-B", Status: "to-do", ProjectID: proj, Title: "B"}
+	p.AddTask(tTask)
+	p.AddTask(bTask)
+	p.hideFromUnfiltered[tTask.ID] = true
+	// Fail GetTask by both id and ref -- exercises the ref-mode lookup used
+	// by SnapshotGraphForTask's desired-edge seeding (a plain MemoryProvider
+	// GetTask falls back to matching by ref, which would otherwise bypass
+	// this adversarial setup entirely).
+	notFound := fmt.Errorf("kaneo: GetTask %s: 404 not found", tTask.ID)
+	p.failGetTask[tTask.ID] = notFound
+	p.failGetTask[tTask.Ref] = notFound
+	// Adversarial: two conflicting archived rows for the same ref "CHA-T",
+	// each with a different immutable id.
+	p.archivedOverride = []*provider.Task{
+		{ID: "id-t", Ref: "CHA-T", Status: provider.StatusArchived, ProjectID: proj},
+		{ID: "id-t-dup", Ref: "CHA-T", Status: provider.StatusArchived, ProjectID: proj},
+	}
+	if _, err := p.CreateRelation(context.Background(), tTask.ID, bTask.ID, provider.RelationBlocks); err != nil {
+		t.Fatalf("seed relation: %v", err)
+	}
+	store := NewProviderStore(p, proj)
+	ctx := context.Background()
+	desiredB := &Provenance{
+		Version: SchemaVersion, TaskRef: "FAC-B", TaskID: TaskID(bTask.ID), Present: true,
+		Edges: []DependencyEdge{{SourceRef: "CHA-T", TargetRef: "FAC-B", Type: EdgeBlocks}},
+	}
+	if _, err := RequireTaskLaunch(ctx, store, EntryDispatch, "FAC-B", desiredB, ""); err == nil {
+		t.Fatalf("ambiguous/conflicting archived evidence must refuse, not pick the first row")
 	}
 }
