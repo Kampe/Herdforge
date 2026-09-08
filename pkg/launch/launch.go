@@ -509,7 +509,15 @@ func receiptFrom(req Request, role, shape, provider, model, effort, digest strin
 		Repository: req.Repository, Lane: req.Lane, TabID: req.TabID, HerdrSession: req.HerdrSession,
 		CWD: req.CWD, ProcessIdentity: req.ProcessIdentity, StartToken: req.StartToken,
 		PacketDigest: req.PacketDigest, FleetPolicyDigest: fd, FleetAuthTag: fa, FleetFamily: ff, FleetSurface: fs,
+		CandidateSHA: decisionCandidateSHA(req),
 	}
+}
+
+func decisionCandidateSHA(req Request) string {
+	if req.Decision == nil {
+		return ""
+	}
+	return strings.TrimSpace(req.Decision.CandidateSHA)
 }
 
 // RecordStarted is the single acceptance receipt for a process launch.

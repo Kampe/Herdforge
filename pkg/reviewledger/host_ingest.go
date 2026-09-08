@@ -86,7 +86,10 @@ func rowProjection(r LedgerRow) ProjectionKey {
 func retrySupersessionFromLatest(latest map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
 	out := make(map[ProjectionKey]bool)
 	for k, verdict := range latest {
-		if k.SHA != sha || verdict.Verdict != string(VerdictPASS) {
+		if sha != "" && k.SHA != sha {
+			continue
+		}
+		if verdict.Verdict != string(VerdictPASS) {
 			continue
 		}
 		if retry := strings.TrimSpace(verdict.RetryOf); retry != "" {
@@ -109,14 +112,24 @@ func retrySupersessionFromRows(rows []LedgerRow, sha string) map[ProjectionKey]b
 	return out
 }
 
-func indexHostRetrySupersession(rows []LedgerRow, latest map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
-	out := retrySupersessionFromLatest(latest, sha)
-	for _, r := range rows {
-		if r.Event == string(EventSupersession) && r.SHA == sha && strings.TrimSpace(r.Reviewer) != "" {
-			out[rowProjection(r)] = true
-		}
+// boundRetryAudit is the native PASS RetryOf EventSupersession: SHA is the
+// live candidate, RetryOf names the prior reviewer, Host is the retry host.
+// Candidate-identity replacement leaves RetryOf empty and stores PreviousSHA in Task.
+func boundRetryAudit(event, retryOf string) bool {
+	return event == string(EventSupersession) && strings.TrimSpace(retryOf) != ""
+}
+
+// IdentityReplacementSHA is the previous candidate withdrawn by a replacement
+// EventSupersession. Empty for bound retry audit rows.
+func IdentityReplacementSHA(event, sha, task, retryOf string) string {
+	if event != string(EventSupersession) || boundRetryAudit(event, retryOf) {
+		return ""
 	}
-	return out
+	prev := strings.TrimSpace(task)
+	if prev == "" || prev == strings.TrimSpace(sha) {
+		return ""
+	}
+	return prev
 }
 
 func indexProjectionEvent(rows []LedgerRow, event string, skipRetired bool) map[ProjectionKey]LedgerRow {

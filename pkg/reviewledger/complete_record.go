@@ -60,7 +60,11 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func
 	if !found || prior == nil || l.isCoordinator(reviewer) {
 		return fmt.Errorf("exact independent PASS and launch record required")
 	}
+	superseded := retrySupersessionFromLatest(latest, sha)
 	for k, r := range latest {
+		if superseded[k] {
+			continue
+		}
 		if !l.isCoordinator(k.Reviewer) && (r.Verdict == string(VerdictFAIL) || r.Verdict == string(VerdictBLOCKED)) {
 			return fmt.Errorf("candidate has review dissent")
 		}
