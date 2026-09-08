@@ -15,7 +15,7 @@ func TestBuildTaskPacketProjectsRevisionBoundResidual(t *testing.T) {
 		t.Fatal(err)
 	}
 	task := &provider.Task{ID: "id-237", Ref: "FAC-237", Residuals: []residual.Record{r}}
-	packet := buildTaskPacket(task, "task/fac-237", ".herd/prompts/worker.md", "memory", "p", nil, config.Verification{TestCommand: "go test ./pkg/dispatch"}, ReplyTarget{})
+	packet := buildTaskPacket(task, "task/fac-237", ".herd/prompts/worker.md", "memory", "p", nil, config.Verification{TestCommand: "go test ./pkg/dispatch"}, "", ReplyTarget{})
 	section, err := residual.PacketSection(task.Residuals)
 	if err != nil {
 		t.Fatal(err)

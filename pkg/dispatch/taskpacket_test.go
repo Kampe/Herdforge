@@ -87,7 +87,7 @@ func TestDispatchRecoveredWorktreeReplacesGenerationBoundPacketAndContext(t *tes
 	if err := WriteTaskContext(wtInfo.Path, oldContext); err != nil {
 		t.Fatalf("write generation-2 context: %v", err)
 	}
-	oldPacket := buildTaskPacket(task, wtInfo.Branch, lane.Prompt, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, lane, cfg.Verification, ReplyTarget{
+	oldPacket := buildTaskPacket(task, wtInfo.Branch, lane.Prompt, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, lane, cfg.Verification, "", ReplyTarget{
 		Name:            "coordinator",
 		LeaseGeneration: 2,
 	})
@@ -209,7 +209,7 @@ func artifactPacket(tc TaskContext) string {
 	task := &provider.Task{ID: tc.TaskID, Ref: tc.TaskRef, Title: "Task " + tc.TaskRef}
 	lane := &config.LaneDef{Name: "worker", Role: RoleWorker, Prompt: ".herd/prompts/worker.md"}
 	return buildTaskPacket(task, tc.Branch, lane.Prompt, tc.ProviderType, tc.ProjectID, lane,
-		config.Verification{TestCommand: "go test ./..."}, ReplyTarget{Name: "coordinator", LeaseGeneration: tc.LeaseGeneration})
+		config.Verification{TestCommand: "go test ./..."}, "", ReplyTarget{Name: "coordinator", LeaseGeneration: tc.LeaseGeneration})
 }
 
 func TestTaskArtifactPublisherFailureBoundariesFailClosed(t *testing.T) {
