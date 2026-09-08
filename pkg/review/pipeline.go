@@ -161,12 +161,16 @@ func (s LedgerSnapshot) Pending() []LedgerRow {
 
 func (s LedgerSnapshot) Vetoed() map[string]bool {
 	latest := map[reviewledger.ProjectionKey]LedgerRow{}
+	records := map[reviewledger.ProjectionKey]LedgerRow{}
 	for _, row := range s.Rows {
+		if row.Event == string(EventRecord) {
+			records[rowProjection(row)] = row
+		}
 		if row.Event == string(EventVerdict) {
 			latest[rowProjection(row)] = row
 		}
 	}
-	superseded := hostRetrySupersession(latest)
+	superseded := hostRetrySupersession(latest, records)
 	out := map[string]bool{}
 	for k, row := range latest {
 		if superseded[k] {
