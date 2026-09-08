@@ -14,6 +14,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 type reviewHostIngestArgs struct {
@@ -87,7 +88,7 @@ func parseReviewHostIngestArgs(args []string) (reviewHostIngestArgs, error) {
 	return out, nil
 }
 
-func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, reviewer, sha, task, repo, lane string, commitTime time.Time, reaches func(branch, sha string) bool) (reviewledger.LaunchProvenance, error) {
+func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, reviewer, sha, artifactTask string, commitTime time.Time, reaches func(branch, sha string) bool) (reviewledger.LaunchProvenance, error) {
 	path := launch.ReceiptPathFor(root)
 	members, err := launch.ReadReceipts(path)
 	if err != nil {
@@ -96,7 +97,12 @@ func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, revie
 	if len(members) == 0 {
 		return reviewledger.LaunchProvenance{}, fmt.Errorf("canonical launch log is missing")
 	}
-	if _, err := launch.AcceptedCanonicalMember(members, locator); err != nil {
+	member, err := launch.AcceptedCanonicalMember(members, locator)
+	if err != nil {
+		return reviewledger.LaunchProvenance{}, err
+	}
+	task, repo, lane, err := expectedReviewLaunchBinding(root, reviewer, artifactTask, member)
+	if err != nil {
 		return reviewledger.LaunchProvenance{}, err
 	}
 	reviewLaunch, err := launch.AcceptedReviewLaunchForCandidate(members, reviewer, sha, task, repo, lane)
@@ -127,6 +133,25 @@ func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, revie
 		Accepted:      true,
 		Member:        true,
 	}, nil
+}
+
+func expectedReviewLaunchBinding(root, reviewer, artifactTask string, member launch.Receipt) (task, repo, lane string, err error) {
+	repo, err = toolchild.RepositoryIdentity(root)
+	if err != nil || strings.TrimSpace(repo) == "" {
+		return "", "", "", fmt.Errorf("canonical review launch requires repository identity")
+	}
+	task = strings.TrimSpace(artifactTask)
+	if task == "" {
+		task = strings.TrimSpace(member.TaskRef)
+	}
+	if task == "" {
+		return "", "", "", fmt.Errorf("canonical review launch requires task binding")
+	}
+	lane = strings.TrimSpace(reviewer)
+	if lane == "" {
+		return "", "", "", fmt.Errorf("canonical review launch requires lane binding")
+	}
+	return task, repo, lane, nil
 }
 
 func firstNonEmptyCLI(values ...string) string {
@@ -180,7 +205,7 @@ func runReviewHostIngest(args []string) error {
 	}
 	commitTime := commitTimeOf(root, parsed.Candidate)
 	reaches := func(branch, sha string) bool { return branchReaches(root, branch, sha) }
-	proof, err := resolveCanonicalLaunchProvenance(root, locator, parsed.Reviewer, parsed.Candidate, task, "", "", commitTime, reaches)
+	proof, err := resolveCanonicalLaunchProvenance(root, locator, parsed.Reviewer, parsed.Candidate, task, commitTime, reaches)
 	if err != nil {
 		return err
 	}

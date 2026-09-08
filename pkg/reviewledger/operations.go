@@ -468,7 +468,7 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 	if opts.Verdict == VerdictPASS && strings.TrimSpace(opts.RetryOf) != "" {
 		if err := l.appendRow(l.Path, &LedgerRow{
 			Event: string(EventSupersession), SHA: opts.SHA, Task: opts.SHA,
-			Reviewer: opts.RetryOf, RetryOf: opts.RetryOf,
+			Reviewer: opts.RetryOf, RetryOf: opts.RetryOf, Host: opts.Host,
 			Reason: "explicit retry PASS supersedes prior reviewer verdict", Status: "superseded",
 		}); err != nil {
 			return false, err
@@ -778,13 +778,8 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 	}
 
 	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility,
-	// unless a later PASS explicitly names that reviewer as a retry target.
-	supersededReviewers := make(map[string]bool)
-	for _, r := range rows {
-		if r.Event == string(EventSupersession) && r.SHA == sha && r.Task == sha && r.Reviewer != "" {
-			supersededReviewers[r.Reviewer] = true
-		}
-	}
+	// unless a later PASS on the same host explicitly names that reviewer.
+	hostRetry := indexHostRetrySupersession(rows, latest, sha)
 	hasVeto := false
 	for k, verdict := range latest {
 		if k.SHA != sha {
@@ -802,7 +797,7 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 		if hasLaunch {
 			lbf := launchRow.BuilderFamily
 			if lbf != "" && FamilyAllowlist[lbf] {
-				if supersededReviewers[verdict.Reviewer] {
+				if hostRetry[k] {
 					continue
 				}
 				hasVeto = true
@@ -917,12 +912,7 @@ func (l *Ledger) isCoordinator(name string) bool {
 // any PASS and no FAIL/BLOCKED, using the family ladder.
 func (l *Ledger) isPassVerdictLatest(sha string, latest map[ProjectionKey]LedgerRow, launch map[ProjectionKey]LedgerRow, allowUnrecorded bool) bool {
 	var hasPass bool
-	superseded := make(map[string]bool)
-	for k, verdict := range latest {
-		if k.SHA == sha && verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
-			superseded[verdict.RetryOf] = true
-		}
-	}
+	superseded := retrySupersessionFromLatest(latest, sha)
 	for k, verdict := range latest {
 		if k.SHA != sha {
 			continue
@@ -974,7 +964,7 @@ func (l *Ledger) isPassVerdictLatest(sha string, latest map[ProjectionKey]Ledger
 			hasPass = true
 		}
 		if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
-			if superseded[reviewer] {
+			if superseded[k] {
 				continue
 			}
 			return false
@@ -1105,12 +1095,7 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 		hasPass := false
 		hasVeto := false
 		hasIndependent := false
-		supersededReviewers := make(map[string]bool)
-		for _, verdict := range vset {
-			if verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
-				supersededReviewers[verdict.RetryOf] = true
-			}
-		}
+		supersededReviewers := retrySupersessionFromRows(vset, sha)
 		for _, verdict := range vset {
 			reviewer := verdict.Reviewer
 			if l.isCoordinator(reviewer) {
@@ -1144,7 +1129,7 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 				hasPass = true
 			}
 			if verdict.Verdict == string(VerdictFAIL) || verdict.Verdict == string(VerdictBLOCKED) {
-				if supersededReviewers[verdict.Reviewer] {
+				if supersededReviewers[rowProjection(verdict)] {
 					continue
 				}
 				hasVeto = true
