@@ -3,6 +3,7 @@ package reviewledger
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // RecordCompletion contains only deterministic metadata; family and identity
@@ -69,7 +70,7 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer, host string, verif
 			return fmt.Errorf("candidate has review dissent")
 		}
 	}
-	if v.Task != task || prior.Task != task || v.CandidateSHA != sha {
+	if v.Task != task || v.CandidateSHA != sha {
 		return fmt.Errorf("record completion task/candidate binding differs")
 	}
 	if !FamilyAllowlist[v.BuilderFamily] || !FamilyAllowlist[v.ReviewerFamily] || v.BuilderFamily == v.ReviewerFamily || prior.BuilderIdentity == reviewer {
@@ -90,27 +91,125 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer, host string, verif
 	if evidence.Branch == "" {
 		return fmt.Errorf("retained branch required")
 	}
-	if prior.BuilderFamily != "" && prior.BuilderFamily != FamilyUnrecorded && prior.BuilderFamily != v.BuilderFamily {
-		return fmt.Errorf("conflicting recorded builder family")
+	completion := RecordOpts{
+		SHA: sha, Reviewer: reviewer, Task: task, Branch: evidence.Branch, Tier: evidence.Tier,
+		BuilderFamily: v.BuilderFamily, ReviewerFamily: v.ReviewerFamily, Gate: "independent",
+		Artifact: v.Artifact,
 	}
-	if prior.ReviewerFamily != "" && prior.ReviewerFamily != v.ReviewerFamily {
-		return fmt.Errorf("conflicting recorded reviewer family")
+	completed, err := mergeAuthenticatedLaunchRecord(*prior, completion)
+	if err != nil {
+		return err
 	}
-	if prior.Branch != "" && prior.Branch != evidence.Branch {
-		return fmt.Errorf("conflicting recorded branch")
-	}
-	if prior.Tier != "" && prior.Tier != evidence.Tier {
-		return fmt.Errorf("conflicting recorded risk tier")
-	}
-	if prior.BuilderFamily == v.BuilderFamily && prior.ReviewerFamily == v.ReviewerFamily && prior.Tier == evidence.Tier && prior.Branch == evidence.Branch && prior.Gate == "independent" {
+	if launchRecordComplete(*prior, completed) {
 		return nil
 	}
-	completed := *prior
-	completed.BuilderFamily = v.BuilderFamily
-	completed.ReviewerFamily = v.ReviewerFamily
-	completed.Tier = evidence.Tier
-	completed.Branch = evidence.Branch
+	completed.Reason = "completed from retained admitted artifact and native launch evidence"
+	return l.appendRow(l.Path, &completed)
+}
+
+// bindCloseableRecordTask binds a prior launch Task to the authenticated
+// closeable card. A wrong closeable identity is always refused. A legacy
+// non-closeable Task is accepted only when it equals the verified artifact
+// branch. Shared by ingest and review-complete-record.
+func bindCloseableRecordTask(priorTask, closeableTask, verifiedBranch string) (string, error) {
+	if err := RequireCloseableCardRef(closeableTask, "record completion task"); err != nil {
+		return "", err
+	}
+	want := CloseableCardRef(closeableTask)
+	if prior := CloseableCardRef(priorTask); prior != "" {
+		if prior != want {
+			return "", fmt.Errorf("record completion task/candidate binding differs")
+		}
+		return want, nil
+	}
+	if strings.TrimSpace(priorTask) == "" || strings.TrimSpace(verifiedBranch) == "" || priorTask != verifiedBranch {
+		return "", fmt.Errorf("record completion task/candidate binding differs")
+	}
+	return want, nil
+}
+
+func mergeAuthenticatedLaunchRecord(prior LedgerRow, want RecordOpts) (LedgerRow, error) {
+	boundTask, err := bindCloseableRecordTask(prior.Task, want.Task, want.Branch)
+	if err != nil {
+		return LedgerRow{}, err
+	}
+	if strings.TrimSpace(want.Branch) == "" {
+		return LedgerRow{}, fmt.Errorf("retained branch required")
+	}
+	switch want.Tier {
+	case "R0", "R1", "R2", "R3":
+	default:
+		return LedgerRow{}, fmt.Errorf("deterministic risk tier required")
+	}
+	if want.BuilderFamily == "" || want.BuilderFamily == FamilyUnrecorded || !FamilyAllowlist[want.BuilderFamily] {
+		return LedgerRow{}, fmt.Errorf("record completion requires independent admitted families")
+	}
+	if want.ReviewerFamily == "" || !FamilyAllowlist[want.ReviewerFamily] || want.BuilderFamily == want.ReviewerFamily {
+		return LedgerRow{}, fmt.Errorf("record completion requires independent admitted families")
+	}
+	if prior.BuilderFamily != "" && prior.BuilderFamily != FamilyUnrecorded && prior.BuilderFamily != want.BuilderFamily {
+		return LedgerRow{}, fmt.Errorf("conflicting recorded builder family")
+	}
+	if prior.ReviewerFamily != "" && prior.ReviewerFamily != want.ReviewerFamily {
+		return LedgerRow{}, fmt.Errorf("conflicting recorded reviewer family")
+	}
+	if prior.Branch != "" && prior.Branch != want.Branch {
+		return LedgerRow{}, fmt.Errorf("conflicting recorded branch")
+	}
+	if prior.Tier != "" && prior.Tier != want.Tier {
+		return LedgerRow{}, fmt.Errorf("conflicting recorded risk tier")
+	}
+	completed := prior
+	completed.Task = boundTask
+	completed.Branch = want.Branch
+	completed.Tier = want.Tier
+	completed.BuilderFamily = want.BuilderFamily
+	completed.ReviewerFamily = want.ReviewerFamily
 	completed.Gate = "independent"
+	if strings.TrimSpace(want.Artifact) != "" {
+		completed.Artifact = want.Artifact
+	}
+	return completed, nil
+}
+
+func launchRecordComplete(prior, want LedgerRow) bool {
+	return prior.Task == want.Task &&
+		prior.BuilderFamily == want.BuilderFamily &&
+		prior.ReviewerFamily == want.ReviewerFamily &&
+		prior.Tier == want.Tier &&
+		prior.Branch == want.Branch &&
+		prior.Gate == "independent"
+}
+
+func (l *Ledger) completeAuthenticatedLaunchRecord(want RecordOpts) error {
+	if want.Gate != "independent" {
+		return nil
+	}
+	if strings.TrimSpace(want.Tier) == "" {
+		return nil
+	}
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	wantProj := ProjectionOf(want.SHA, want.Reviewer, want.Host)
+	var prior *LedgerRow
+	for i := range rows {
+		if rows[i].Event == string(EventRecord) && rowProjection(rows[i]) == wantProj {
+			copy := rows[i]
+			prior = &copy
+		}
+	}
+	if prior == nil {
+		return nil
+	}
+	completed, err := mergeAuthenticatedLaunchRecord(*prior, want)
+	if err != nil {
+		return err
+	}
+	if launchRecordComplete(*prior, completed) {
+		return nil
+	}
 	completed.Reason = "completed from retained admitted artifact and native launch evidence"
 	return l.appendRow(l.Path, &completed)
 }
