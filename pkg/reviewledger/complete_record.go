@@ -33,7 +33,7 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func
 		return err
 	}
 	var prior *LedgerRow
-	latest := map[string]LedgerRow{}
+	latest := map[projectionKey]LedgerRow{}
 	for i := range rows {
 		r := rows[i]
 		if r.SHA != sha {
@@ -44,18 +44,25 @@ func (l *Ledger) CompleteAdmissionRecord(task, sha, reviewer string, verify func
 			prior = &copy
 		}
 		if r.Event == string(EventVerdict) {
-			latest[r.Reviewer] = r
+			latest[rowProjection(r)] = r
 		}
 		if r.Event == string(EventRetired) {
 			return fmt.Errorf("retired candidate cannot complete admission")
 		}
 	}
-	v, found := latest[reviewer]
-	if !found || prior == nil || v.Verdict != string(VerdictPASS) || l.isCoordinator(reviewer) {
+	var v LedgerRow
+	found := false
+	for k, row := range latest {
+		if k.Reviewer == reviewer && row.Verdict == string(VerdictPASS) {
+			v = row
+			found = true
+		}
+	}
+	if !found || prior == nil || l.isCoordinator(reviewer) {
 		return fmt.Errorf("exact independent PASS and launch record required")
 	}
-	for name, r := range latest {
-		if !l.isCoordinator(name) && (r.Verdict == string(VerdictFAIL) || r.Verdict == string(VerdictBLOCKED)) {
+	for k, r := range latest {
+		if !l.isCoordinator(k.Reviewer) && (r.Verdict == string(VerdictFAIL) || r.Verdict == string(VerdictBLOCKED)) {
 			return fmt.Errorf("candidate has review dissent")
 		}
 	}

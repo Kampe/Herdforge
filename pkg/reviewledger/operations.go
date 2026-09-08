@@ -766,27 +766,8 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 		return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=no record", sha)
 	}
 
-	launch := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventRetired) {
-			continue
-		}
-		if r.Event == string(EventRecord) {
-			k := r.SHA + ":" + r.Reviewer
-			launch[k] = r
-		}
-	}
-
-	latest := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventRetired) {
-			continue
-		}
-		if r.Event == string(EventVerdict) {
-			k := r.SHA + ":" + r.Reviewer
-			latest[k] = r
-		}
-	}
+	launch := indexProjectionEvent(rows, string(EventRecord), true)
+	latest := indexProjectionEvent(rows, string(EventVerdict), true)
 
 	done := make(map[string]bool)
 	for _, r := range qrows {
@@ -809,11 +790,10 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 	}
 	hasVeto := false
 	for k, verdict := range latest {
-		sparts := strings.SplitN(k, ":", 2)
-		if len(sparts) != 2 || sparts[0] != sha {
+		if k.SHA != sha {
 			continue
 		}
-		reviewer := sparts[1]
+		reviewer := k.Reviewer
 		if l.isCoordinator(reviewer) {
 			continue
 		}
@@ -840,11 +820,10 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 	hasPass := false
 	familyMismatch := false
 	for k, verdict := range latest {
-		sparts := strings.SplitN(k, ":", 2)
-		if len(sparts) != 2 || sparts[0] != sha {
+		if k.SHA != sha {
 			continue
 		}
-		reviewer := sparts[1]
+		reviewer := k.Reviewer
 		if l.isCoordinator(reviewer) {
 			continue
 		}
@@ -906,16 +885,14 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 
 	if !hasPass {
 		for k, verdict := range latest {
-			sparts := strings.SplitN(k, ":", 2)
-			if len(sparts) != 2 || sparts[0] != sha {
+			if k.SHA != sha {
 				continue
 			}
-			reviewer := sparts[1]
+			reviewer := k.Reviewer
 			if l.isCoordinator(reviewer) {
 				onlyCoord := true
 				for k2 := range latest {
-					sp := strings.SplitN(k2, ":", 2)
-					if len(sp) == 2 && sp[0] == sha && !l.isCoordinator(sp[1]) {
+					if k2.SHA == sha && !l.isCoordinator(k2.Reviewer) {
 						onlyCoord = false
 						break
 					}
@@ -941,20 +918,19 @@ func (l *Ledger) isCoordinator(name string) bool {
 
 // isPassVerdictLatest checks whether the latest verdict set for a sha has
 // any PASS and no FAIL/BLOCKED, using the family ladder.
-func (l *Ledger) isPassVerdictLatest(sha string, latest map[string]LedgerRow, launch map[string]LedgerRow, allowUnrecorded bool) bool {
+func (l *Ledger) isPassVerdictLatest(sha string, latest map[projectionKey]LedgerRow, launch map[projectionKey]LedgerRow, allowUnrecorded bool) bool {
 	var hasPass bool
 	superseded := make(map[string]bool)
 	for k, verdict := range latest {
-		if strings.HasPrefix(k, sha+":") && verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
+		if k.SHA == sha && verdict.Verdict == string(VerdictPASS) && verdict.RetryOf != "" {
 			superseded[verdict.RetryOf] = true
 		}
 	}
 	for k, verdict := range latest {
-		sparts := strings.SplitN(k, ":", 2)
-		if len(sparts) != 2 || sparts[0] != sha {
+		if k.SHA != sha {
 			continue
 		}
-		reviewer := sparts[1]
+		reviewer := k.Reviewer
 		if l.isCoordinator(reviewer) {
 			continue
 		}
@@ -1036,27 +1012,8 @@ func (l *Ledger) queued(allowUnrecorded bool) ([]LedgerRow, error) {
 		}
 	}
 
-	launch := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventRetired) {
-			continue
-		}
-		if r.Event == string(EventRecord) {
-			k := r.SHA + ":" + r.Reviewer
-			launch[k] = r
-		}
-	}
-
-	latest := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventRetired) {
-			continue
-		}
-		if r.Event == string(EventVerdict) {
-			k := r.SHA + ":" + r.Reviewer
-			latest[k] = r
-		}
-	}
+	launch := indexProjectionEvent(rows, string(EventRecord), true)
+	latest := indexProjectionEvent(rows, string(EventVerdict), true)
 
 	type qentry struct {
 		row   LedgerRow
@@ -1093,14 +1050,13 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 	}
 
 	retired := make(map[string]bool)
-	verdictIdx := make(map[string]int)
+	verdictIdx := make(map[projectionKey]int)
 	for i, r := range rows {
 		if r.Event == string(EventRetired) {
 			retired[r.SHA] = true
 		}
 		if r.Event == string(EventVerdict) {
-			k := r.SHA + ":" + r.Reviewer
-			verdictIdx[k] = i
+			verdictIdx[rowProjection(r)] = i
 		}
 	}
 
@@ -1108,11 +1064,10 @@ func (l *Ledger) Pending() ([]LedgerRow, error) {
 		row   LedgerRow
 		index int
 	}
-	newestRec := make(map[string]recEntry)
+	newestRec := make(map[projectionKey]recEntry)
 	for i, r := range rows {
 		if r.Event == string(EventRecord) {
-			k := r.SHA + ":" + r.Reviewer
-			newestRec[k] = recEntry{row: r, index: i}
+			newestRec[rowProjection(r)] = recEntry{row: r, index: i}
 		}
 	}
 
@@ -1140,28 +1095,12 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 		return nil, err
 	}
 
-	launch := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventRecord) {
-			k := r.SHA + ":" + r.Reviewer
-			launch[k] = r
-		}
-	}
-
-	latest := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventVerdict) {
-			k := r.SHA + ":" + r.Reviewer
-			latest[k] = r
-		}
-	}
+	launch := indexProjectionEvent(rows, string(EventRecord), false)
+	latest := indexProjectionEvent(rows, string(EventVerdict), false)
 
 	shaVerdicts := make(map[string][]LedgerRow)
 	for k, v := range latest {
-		sparts := strings.SplitN(k, ":", 2)
-		if len(sparts) == 2 {
-			shaVerdicts[sparts[0]] = append(shaVerdicts[sparts[0]], v)
-		}
+		shaVerdicts[k.SHA] = append(shaVerdicts[k.SHA], v)
 	}
 
 	var shas []string
@@ -1180,8 +1119,7 @@ func (l *Ledger) PassSHAs() ([]string, error) {
 			if l.isCoordinator(reviewer) {
 				continue
 			}
-			lk := sha + ":" + reviewer
-			lr, hasLaunch := launch[lk]
+			lr, hasLaunch := launch[rowProjection(verdict)]
 			if !hasLaunch {
 				continue
 			}
@@ -1233,28 +1171,12 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 		return nil, err
 	}
 
-	launch := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventRecord) {
-			k := r.SHA + ":" + r.Reviewer
-			launch[k] = r
-		}
-	}
-
-	latest := make(map[string]LedgerRow)
-	for _, r := range rows {
-		if r.Event == string(EventVerdict) {
-			k := r.SHA + ":" + r.Reviewer
-			latest[k] = r
-		}
-	}
+	launch := indexProjectionEvent(rows, string(EventRecord), false)
+	latest := indexProjectionEvent(rows, string(EventVerdict), false)
 
 	shaVerdicts := make(map[string][]LedgerRow)
 	for k, v := range latest {
-		sparts := strings.SplitN(k, ":", 2)
-		if len(sparts) == 2 {
-			shaVerdicts[sparts[0]] = append(shaVerdicts[sparts[0]], v)
-		}
+		shaVerdicts[k.SHA] = append(shaVerdicts[k.SHA], v)
 	}
 
 	var shas []string
@@ -1265,8 +1187,7 @@ func (l *Ledger) VetoSHAs() ([]string, error) {
 			if l.isCoordinator(reviewer) {
 				continue
 			}
-			lk := sha + ":" + reviewer
-			lr, hasLaunch := launch[lk]
+			lr, hasLaunch := launch[rowProjection(verdict)]
 			if !hasLaunch {
 				continue
 			}
