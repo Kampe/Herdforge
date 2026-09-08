@@ -997,9 +997,39 @@ func (w MemoryDescriptionWriter) GetDescription(ctx context.Context, taskID stri
 	return t.Description, nil
 }
 
-// KaneoDescriptionWriter updates description via kaneo CLI (coordinator only).
+// DescriptionWriterFor selects the coordinator description writer for a live
+// provider. Kaneo uses the scoped HTTP description PUT/GET, never CLI
+// presentation enrichment. BoundClient wrappers are unwrapped.
+func DescriptionWriterFor(tp provider.TaskProvider, projectID string) (DescriptionWriter, error) {
+	inner := tp
+	if bound, ok := tp.(*provider.BoundClient); ok && bound != nil && bound.Inner != nil {
+		inner = bound.Inner
+	}
+	switch p := inner.(type) {
+	case *provider.MemoryProvider:
+		return MemoryDescriptionWriter{MP: p}, nil
+	case *provider.KaneoProvider:
+		if strings.TrimSpace(p.APIURL) == "" {
+			return nil, fmt.Errorf("kaneo description writer requires HTTP API URL")
+		}
+		if strings.TrimSpace(projectID) == "" {
+			projectID = p.ProjectID
+		}
+		if strings.TrimSpace(projectID) == "" {
+			return nil, fmt.Errorf("kaneo description writer requires project identity")
+		}
+		return KaneoDescriptionWriter{ProjectID: projectID, Provider: p}, nil
+	default:
+		return nil, fmt.Errorf("provider %T has no DescriptionWriter (description fences only)", inner)
+	}
+}
+
+// KaneoDescriptionWriter updates description via Kaneo HTTP (coordinator only).
+// Provider, when set, is the supported acknowledgement path. Run remains an
+// explicit CLI fallback for hermetic tests that do not construct HTTP.
 type KaneoDescriptionWriter struct {
 	ProjectID string
+	Provider  *provider.KaneoProvider
 	Run       func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
@@ -1017,6 +1047,9 @@ func (w KaneoDescriptionWriter) runner() func(context.Context, string, ...string
 }
 
 func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, description string) error {
+	if w.Provider != nil {
+		return w.Provider.UpdateDescription(ctx, taskID, description)
+	}
 	args := []string{"task", "description", taskID, description}
 	if strings.TrimSpace(w.ProjectID) != "" {
 		args = append(args, "--project", w.ProjectID)
@@ -1026,6 +1059,9 @@ func (w KaneoDescriptionWriter) SetDescription(ctx context.Context, taskID, desc
 }
 
 func (w KaneoDescriptionWriter) GetDescription(ctx context.Context, taskID string) (string, error) {
+	if w.Provider != nil {
+		return w.Provider.ReadDescription(ctx, taskID)
+	}
 	args := []string{"task", "get", taskID, "--json"}
 	if strings.TrimSpace(w.ProjectID) != "" {
 		args = append(args, "--project", w.ProjectID)
@@ -1034,11 +1070,9 @@ func (w KaneoDescriptionWriter) GetDescription(ctx context.Context, taskID strin
 	if err != nil {
 		return "", err
 	}
-	var dto struct {
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(out, &dto); err != nil {
+	desc, err := provider.DecodeKaneoDescription(200, out, taskID, w.ProjectID)
+	if err != nil {
 		return "", err
 	}
-	return dto.Description, nil
+	return desc, nil
 }
