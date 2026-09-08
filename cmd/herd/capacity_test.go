@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +11,103 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/freshness"
 )
+
+// noHerdPATH is /usr/bin:/bin only -- deterministically WITHOUT `herdr` or
+// `herdr-route`, wherever they happen to be installed on the host running
+// this test. It exists so these subprocess tests exercise the real refusal
+// and refresh-failure branches without depending on whether this machine's
+// own fleet daemon happens to be up.
+func noHerdPATH() string {
+	return "/usr/bin:/bin"
+}
+
+// runCapacitySubprocess runs the real, compiled herd binary rather than
+// calling runCapacity in-process. Before FAC-770, the refusal and
+// refresh-failure branches called os.Exit directly -- calling them in the
+// test's own process would have killed the test binary, not just failed one
+// case. The subprocess is what makes the exit code and the post-exit lease
+// file state both observable.
+func runCapacitySubprocess(t *testing.T, leasePath string, args ...string) (out []byte, exitCode int) {
+	t.Helper()
+	binary := buildHerd(t)
+	cmd := exec.Command(binary, append([]string{"capacity"}, args...)...)
+	cmd.Env = append(os.Environ(), "PATH="+noHerdPATH(), "HERD_ADMISSION_LEASE_PATH="+leasePath)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return out, 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return out, exitErr.ExitCode()
+	}
+	t.Fatalf("herd capacity did not run: %v, output: %s", err, out)
+	return nil, -1
+}
+
+// FAC-770: the caller's own lease attempt was refused before it held
+// anything, so it must not touch the file at all -- least of all a lease
+// some other, still-live launcher owns.
+func TestCapacityClaimRefusalLeavesForeignLeaseUntouched(t *testing.T) {
+	lease := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", lease)
+	releaseForeign, held, err := holdAdmissionLease(time.Hour)
+	if err != nil || !held {
+		t.Fatalf("foreign holder failed to take the lease: held=%v err=%v", held, err)
+	}
+	t.Cleanup(releaseForeign)
+	before, err := os.ReadFile(lease)
+	if err != nil {
+		t.Fatalf("foreign lease vanished before the subprocess ran: %v", err)
+	}
+
+	_, code := runCapacitySubprocess(t, lease, "--claim", "--json")
+	if code != 3 {
+		t.Fatalf("claim refusal exit code = %d, want 3", code)
+	}
+	after, err := os.ReadFile(lease)
+	if err != nil {
+		t.Fatalf("foreign lease was removed by the refused caller: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("foreign lease token changed after a refused claim:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// FAC-770 core regression: before the fix, this os.Exit(3) ran before the
+// deferred release(), so a claimed lease outlived its own refused launch for
+// the full TTL. The subprocess must both exit 3 AND have released the lease
+// it took, so the very next caller can proceed instead of serializing behind
+// a launch that already gave up.
+func TestCapacityClaimNotAdmittedStillReleasesItsOwnLease(t *testing.T) {
+	lease := filepath.Join(t.TempDir(), "admission.lease")
+
+	// No herdr on PATH (see noHerdPATH) makes decideCapacity refuse
+	// deterministically, on any host, without depending on real memory.
+	_, code := runCapacitySubprocess(t, lease, "--claim", "--json")
+	if code != 3 {
+		t.Fatalf("not-admitted exit code = %d, want 3", code)
+	}
+	if _, err := os.Stat(lease); !os.IsNotExist(err) {
+		t.Fatalf("lease file still present after a refused claim released it: err=%v", err)
+	}
+}
+
+// Same defect, the other os.Exit site: a refresh-launchable failure inside a
+// held claim used to skip the deferred release exactly like the refusal
+// above.
+func TestCapacityClaimRefreshFailureStillReleasesItsOwnLease(t *testing.T) {
+	lease := filepath.Join(t.TempDir(), "admission.lease")
+
+	// No herdr-route on PATH (see noHerdPATH) makes refreshLaunchable fail
+	// deterministically, on any host, without a live router.
+	_, code := runCapacitySubprocess(t, lease, "--claim", "--refresh-launchable")
+	if code != 1 {
+		t.Fatalf("refresh-launchable failure exit code = %d, want 1", code)
+	}
+	if _, err := os.Stat(lease); !os.IsNotExist(err) {
+		t.Fatalf("lease file still present after a refresh-launchable failure released it: err=%v", err)
+	}
+}
 
 func healthy() CapacityObservation {
 	return CapacityObservation{HerdrRunning: true, AgentsListed: true, MemAvailMiB: 36000, SwapUsedMiB: 0, SwapTotalMiB: 8192, PressurePct: 0.2}
