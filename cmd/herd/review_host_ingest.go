@@ -105,11 +105,10 @@ func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, revie
 	if err != nil {
 		return reviewledger.LaunchProvenance{}, err
 	}
-	reviewLaunch, err := launch.AcceptedReviewLaunchForCandidate(members, reviewer, sha, task, repo, lane)
-	if err != nil {
+	if err := exactReviewLocator(member, reviewer, sha, task, repo, lane); err != nil {
 		return reviewledger.LaunchProvenance{}, err
 	}
-	host := reviewledger.HostFromLaunchProof(reviewLaunch.ProcessIdentity, reviewLaunch.HerdrSession, reviewLaunch.PaneID, reviewLaunch.CWD, reviewLaunch.Worktree)
+	host := reviewledger.HostFromLaunchProof(member.ProcessIdentity, member.HerdrSession, member.PaneID, member.CWD, member.Worktree)
 	if host == "" {
 		return reviewledger.LaunchProvenance{}, fmt.Errorf("canonical review launch does not authenticate a host or session")
 	}
@@ -126,13 +125,35 @@ func resolveCanonicalLaunchProvenance(root string, locator launch.Receipt, revie
 	return reviewledger.LaunchProvenance{
 		CandidateSHA:  strings.TrimSpace(sha),
 		Host:          host,
-		Session:       firstNonEmptyCLI(reviewLaunch.ProcessIdentity, reviewLaunch.HerdrSession, reviewLaunch.PaneID),
+		Session:       firstNonEmptyCLI(member.ProcessIdentity, member.HerdrSession, member.PaneID),
 		BuilderFamily: family,
 		Branch:        strings.TrimSpace(builder.Branch),
 		CreatedAt:     builder.CreatedAt,
 		Accepted:      true,
 		Member:        true,
 	}, nil
+}
+
+func exactReviewLocator(member launch.Receipt, reviewer, sha, task, repo, lane string) error {
+	if strings.TrimSpace(member.Role) != launch.ReviewerRole {
+		return fmt.Errorf("locator is not the canonical accepted review launch")
+	}
+	if strings.TrimSpace(member.Name) != strings.TrimSpace(reviewer) {
+		return fmt.Errorf("locator is not the canonical accepted review launch")
+	}
+	if strings.TrimSpace(member.CandidateSHA) != strings.TrimSpace(sha) {
+		return fmt.Errorf("locator is not the canonical accepted review launch for this candidate")
+	}
+	if strings.TrimSpace(member.TaskRef) != strings.TrimSpace(task) {
+		return fmt.Errorf("locator task does not match the requested review")
+	}
+	if strings.TrimSpace(member.Repository) != strings.TrimSpace(repo) {
+		return fmt.Errorf("locator repository does not match the requested review")
+	}
+	if strings.TrimSpace(member.Lane) != strings.TrimSpace(lane) {
+		return fmt.Errorf("locator lane does not match the requested review")
+	}
+	return nil
 }
 
 func expectedReviewLaunchBinding(root, reviewer, artifactTask string, member launch.Receipt) (task, repo, lane string, err error) {

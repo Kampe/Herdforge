@@ -63,6 +63,37 @@ func TestLedgerReviewsAdmittedForRefPreservesCrossHostDissent(t *testing.T) {
 	})
 }
 
+func TestLedgerReviewsSameHostRetryRetainsPass(t *testing.T) {
+	sha := "dddddddddddddddddddddddddddddddddddddddd"
+	ref := "FAC-765"
+	path := filepath.Join(t.TempDir(), "review-ledger.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+	rows := []map[string]string{
+		{"event": "verdict", "sha": sha, "reviewer": "reviewer-a", "host": "host-a", "verdict": "FAIL", "branch": "task/" + ref, "artifact": "a.md", "reviewer_family": "anthropic"},
+		{"event": "verdict", "sha": sha, "reviewer": "reviewer-b", "host": "host-a", "verdict": "PASS", "retry_of": "reviewer-a", "branch": "task/" + ref, "artifact": "b.md", "reviewer_family": "openai"},
+		{"event": "supersession", "sha": sha, "task": sha, "reviewer": "reviewer-a", "host": "host-a", "retry_of": "reviewer-a"},
+	}
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (ledgerReviews{path: path}).AdmittedForRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Verdict != "PASS" || got[0].Artifact != "b.md" {
+		t.Fatalf("same-host retry display %+v want PASS b.md", got)
+	}
+}
+
 func TestLedgerReviewsConflictingHostVetoesAreStable(t *testing.T) {
 	sha := "cccccccccccccccccccccccccccccccccccccccc"
 	reviewer := "review-fac-765-a336abd2fd66"

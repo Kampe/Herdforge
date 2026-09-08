@@ -62,6 +62,43 @@ func installTestExecutable(t *testing.T, dir, name string) {
 	}
 }
 
+func TestRecordStartedCopiesReviewerDecisionCandidateSHA(t *testing.T) {
+	sha := strings.Repeat("ab", 20)
+	d := &router.LaunchDecision{
+		Role: router.RoleReviewer, Shape: "qa", Provider: "claude", Model: "claude-opus",
+		CandidateSHA: sha, Argv: []string{"claude"}, Family: "anthropic",
+	}
+	req := Request{
+		Decision: d, HookDiscovery: harness.NoHooksDiscovery(),
+		TaskRef: "FAC-765", Name: "review-fac-999", Lane: "review-fac-999",
+		Repository: "example.test/herdforge", PaneID: "W4-canonical-review-pane",
+		ProcessIdentity: "W4-canonical-review-pane", StartToken: "review-start",
+	}
+	s := &MemorySink{}
+	if err := RecordStarted(req, s); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Receipts) != 1 || !s.Receipts[0].Accepted {
+		t.Fatalf("started receipts=%+v", s.Receipts)
+	}
+	if s.Receipts[0].CandidateSHA != sha {
+		t.Fatalf("native reviewer CandidateSHA=%q want %s", s.Receipts[0].CandidateSHA, sha)
+	}
+	if s.Receipts[0].Role != ReviewerRole {
+		t.Fatalf("role=%q", s.Receipts[0].Role)
+	}
+}
+
+func TestRecordStartedDoesNotInventBuilderCandidateSHA(t *testing.T) {
+	s := &MemorySink{}
+	if err := RecordStarted(good(t), s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Receipts[0].CandidateSHA != "" {
+		t.Fatalf("pre-edit builder receipt must not invent CandidateSHA, got %q", s.Receipts[0].CandidateSHA)
+	}
+}
+
 func TestValidateWorkerDecisionDoesNotPreAccept(t *testing.T) {
 	s := &MemorySink{}
 	if err := Validate(good(t), s); err != nil {

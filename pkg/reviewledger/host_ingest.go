@@ -86,7 +86,10 @@ func rowProjection(r LedgerRow) ProjectionKey {
 func retrySupersessionFromLatest(latest map[ProjectionKey]LedgerRow, sha string) map[ProjectionKey]bool {
 	out := make(map[ProjectionKey]bool)
 	for k, verdict := range latest {
-		if k.SHA != sha || verdict.Verdict != string(VerdictPASS) {
+		if sha != "" && k.SHA != sha {
+			continue
+		}
+		if verdict.Verdict != string(VerdictPASS) {
 			continue
 		}
 		if retry := strings.TrimSpace(verdict.RetryOf); retry != "" {
