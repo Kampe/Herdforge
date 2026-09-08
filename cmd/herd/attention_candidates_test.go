@@ -195,3 +195,42 @@ func TestCollectAttentionCandidatesUsesCanonicalEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestSameHostRetryReachesAttentionPipeline(t *testing.T) {
+	const sha = "cccccccccccccccccccccccccccccccccccccccc"
+	root := t.TempDir()
+	ledgerPath := filepath.Join(root, ".herd", "review-ledger.jsonl")
+	t.Setenv("HERD_REVIEW_LEDGER", ledgerPath)
+	t.Setenv("HERD_MAIL_FILE", filepath.Join(root, ".herd", "mail.jsonl"))
+	ledger, err := reviewledger.NewReviewLedger(root, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"event":"record","sha":"` + sha + `","task":"FAC-598","branch":"herd/fac-598","reviewer":"reviewer-a","host":"host-a","builder_family":"openai","reviewer_family":"anthropic","gate":"independent"}` + "\n" +
+		`{"event":"record","sha":"` + sha + `","task":"FAC-598","branch":"herd/fac-598","reviewer":"reviewer-b","host":"host-a","builder_family":"openai","reviewer_family":"anthropic","gate":"independent"}` + "\n" +
+		`{"event":"verdict","sha":"` + sha + `","reviewer":"reviewer-a","host":"host-a","builder_family":"openai","reviewer_family":"anthropic","verdict":"FAIL"}` + "\n" +
+		`{"event":"verdict","sha":"` + sha + `","reviewer":"reviewer-b","host":"host-a","builder_family":"openai","reviewer_family":"anthropic","verdict":"PASS","retry_of":"reviewer-a"}` + "\n" +
+		`{"event":"supersession","sha":"` + sha + `","task":"` + sha + `","reviewer":"reviewer-a","host":"host-a","retry_of":"reviewer-a","status":"superseded"}` + "\n"
+	if err := os.WriteFile(ledgerPath, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ledger.QueuePath, []byte(`{"event":"enqueue","sha":"`+sha+`","branch":"herd/fac-598"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.TaskProvider.ProjectID = "project"
+	tp := &attentionTaskReader{task: &provider.Task{Ref: "FAC-598", ProjectID: "project", Status: "in-review"}}
+	run := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "git" {
+			return []byte(sha), nil
+		}
+		if name != "gh" {
+			t.Fatalf("unexpected command %s", name)
+		}
+		return []byte(`[{"number":42,"headRefOid":"` + sha + `","state":"OPEN","url":"https://example.test/pr/42","mergeable":"MERGEABLE","statusCheckRollup":[{"name":"Build, Preflight & Test Suite","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://example.test/check/1"}]}]`), nil
+	}
+	got, err := collectAttentionCandidates(context.Background(), root, cfg, tp, run)
+	if err != nil || len(got) != 1 || got[0].SHA != sha {
+		t.Fatalf("same-host retry attention empty: findings=%+v err=%v", got, err)
+	}
+}

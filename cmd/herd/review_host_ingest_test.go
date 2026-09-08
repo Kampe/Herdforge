@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/harness"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 func TestParseReviewHostIngestRefusesFlagOnlyTrust(t *testing.T) {
@@ -68,14 +70,14 @@ func TestCanonicalReviewLaunchAuthenticatesHostIngest(t *testing.T) {
 	fx := newHostIngestFixture(t)
 	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, fx.reviewReceipt)
 	locator := filepath.Join(fx.dir, "locator.json")
-	writeJSON(t, locator, fx.builderReceipt)
+	writeJSON(t, locator, fx.reviewReceipt)
 
 	if err := runReviewHostIngest([]string{
 		"--candidate", fx.sha,
 		"--reviewer", fx.reviewer,
 		"--receipt", locator,
 	}); err != nil {
-		t.Fatalf("canonical member + review launch must authenticate: %v", err)
+		t.Fatalf("exact accepted review locator must authenticate: %v", err)
 	}
 	assertLedgerHostPresent(t, fx, "W4-canonical-review-pane")
 	assertLedgerHostAbsent(t, fx, "builder-pane-not-reviewer")
@@ -139,6 +141,183 @@ func TestHostIngestRefusesBuilderPaneAsReviewerHost(t *testing.T) {
 	assertLedgerHostAbsent(t, fx, "builder-proc")
 }
 
+func TestCanonicalReviewProvenanceRejectsDifferentCandidate(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, fx.reviewReceipt)
+	if err := os.WriteFile(filepath.Join(fx.dir, "later"), []byte("other-candidate\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitHostIngest(t, fx.dir, []string{
+		"GIT_AUTHOR_DATE=2026-09-07T13:00:00+00:00",
+		"GIT_COMMITTER_DATE=2026-09-07T13:00:00+00:00",
+	}, "add", "-A")
+	gitHostIngest(t, fx.dir, []string{
+		"GIT_AUTHOR_DATE=2026-09-07T13:00:00+00:00",
+		"GIT_COMMITTER_DATE=2026-09-07T13:00:00+00:00",
+	}, "commit", "-qm", "later candidate")
+	other := gitHostIngest(t, fx.dir, nil, "rev-parse", "HEAD")
+	if other == fx.sha {
+		t.Fatal("fixture did not produce a second candidate SHA")
+	}
+	proof, err := resolveCanonicalLaunchProvenance(fx.dir, fx.builderReceipt, fx.reviewer, other, "",
+		commitTimeOf(fx.dir, other), func(branch, sha string) bool { return branchReaches(fx.dir, branch, sha) })
+	if err == nil {
+		t.Fatalf("review launch for %s authenticated host=%s for other candidate %s", fx.sha, proof.Host, other)
+	}
+	if !strings.Contains(err.Error(), "review launch") {
+		t.Fatalf("cross-candidate refusal = %v, want review launch binding", err)
+	}
+}
+
+func TestCanonicalReviewProvenanceRejectsDifferentTask(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	foreign := fx.reviewReceipt
+	foreign.TaskRef = "FAC-999"
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, foreign)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, foreign)
+	artifact := filepath.Join(fx.dir, "review.md")
+	if err := os.WriteFile(artifact, []byte(""+
+		"sha: "+fx.sha+"\n"+
+		"reviewer: "+fx.reviewer+"\n"+
+		"task: FAC-765\n"+
+		"verdict: PASS\n"+
+		"reviewer-family: google\n"+
+		"builder-family: openai\n"+
+		"reviewed-base: "+fx.sha+"\n"+
+		"reviewed-head: "+fx.sha+"\n"+
+		"---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+		"--artifact", artifact,
+		"--base", fx.sha,
+	})
+	if err == nil || !(strings.Contains(err.Error(), "task") || strings.Contains(err.Error(), "review launch")) {
+		t.Fatalf("review launch for FAC-999 must not authenticate FAC-765, err=%v", err)
+	}
+	assertLedgerHostAbsent(t, fx, "W4-canonical-review-pane")
+}
+
+func TestCanonicalReviewProvenanceRefusesOmittedTaskRepoLane(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	blank := fx.reviewReceipt
+	blank.TaskRef = ""
+	blank.Repository = ""
+	blank.Lane = ""
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, blank)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, blank)
+	err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+	})
+	if err == nil {
+		t.Fatal("omitted task/repository/lane must not authenticate HostIngest")
+	}
+	assertLedgerHostAbsent(t, fx, "W4-canonical-review-pane")
+}
+
+func TestCanonicalReviewProvenanceRefusesContradictoryRepoAndLane(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	wrong := fx.reviewReceipt
+	wrong.Repository = "other.example/not-this-repo"
+	wrong.Lane = "other-lane"
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, wrong)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, wrong)
+	err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+	})
+	if err == nil {
+		t.Fatal("contradictory repository/lane must not authenticate HostIngest")
+	}
+	assertLedgerHostAbsent(t, fx, "W4-canonical-review-pane")
+}
+
+func TestNativeStartedReviewReceiptAuthenticatesHostIngest(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt)
+	d := &router.LaunchDecision{
+		Role: router.RoleReviewer, Shape: "qa", Provider: "claude", Model: "claude-opus",
+		CandidateSHA: fx.sha, Argv: []string{"claude"}, Family: "anthropic",
+	}
+	req := launch.Request{
+		Decision: d, HookDiscovery: harness.NoHooksDiscovery(),
+		TaskRef: "FAC-765", Name: fx.reviewer, Lane: fx.reviewer,
+		Repository: "example.test/herdforge",
+		PaneID:     "W4-canonical-review-pane", HerdrSession: "w4-review-session",
+		ProcessIdentity: "W4-canonical-review-pane", StartToken: "native-review-start",
+	}
+	if err := launch.RecordStarted(req, &launch.JSONLSink{Path: fx.receipts}); err != nil {
+		t.Fatalf("RecordStarted: %v", err)
+	}
+	members, err := launch.ReadReceipts(fx.receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var native launch.Receipt
+	for _, m := range members {
+		if m.Role == launch.ReviewerRole && m.Accepted {
+			native = m
+		}
+	}
+	if native.CandidateSHA != fx.sha {
+		t.Fatalf("native receipt CandidateSHA=%q want %s", native.CandidateSHA, fx.sha)
+	}
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, native)
+	if err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+	}); err != nil {
+		t.Fatalf("native reviewer receipt must authenticate: %v", err)
+	}
+	assertLedgerHostPresent(t, fx, "W4-canonical-review-pane")
+}
+
+func TestCanonicalReviewProvenanceRejectsBuilderLocator(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	writeCanonicalLog(t, fx.receipts, fx.builderReceipt, fx.reviewReceipt)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, fx.builderReceipt)
+	err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+	})
+	if err == nil || !strings.Contains(err.Error(), "review launch") {
+		t.Fatalf("builder locator must not authenticate this review, err=%v", err)
+	}
+	assertLedgerHostAbsent(t, fx, "W4-canonical-review-pane")
+}
+
+func TestCanonicalReviewProvenanceAcceptsPreEditBuilderEmptyCandidateSHA(t *testing.T) {
+	fx := newHostIngestFixture(t)
+	preEdit := fx.builderReceipt
+	preEdit.CandidateSHA = ""
+	writeCanonicalLog(t, fx.receipts, preEdit, fx.reviewReceipt)
+	locator := filepath.Join(fx.dir, "locator.json")
+	writeJSON(t, locator, fx.reviewReceipt)
+
+	if err := runReviewHostIngest([]string{
+		"--candidate", fx.sha,
+		"--reviewer", fx.reviewer,
+		"--receipt", locator,
+	}); err != nil {
+		t.Fatalf("pre-edit builder receipt with empty CandidateSHA must still reach: %v", err)
+	}
+	assertLedgerHostPresent(t, fx, "W4-canonical-review-pane")
+}
+
 func TestHostIngestRefusesMissingCanonicalLog(t *testing.T) {
 	fx := newHostIngestFixture(t)
 	locator := filepath.Join(fx.dir, "locator.json")
@@ -171,6 +350,7 @@ func newHostIngestFixture(t *testing.T) hostIngestFixture {
 	t.Chdir(dir)
 
 	gitHostIngest(t, dir, nil, "init", "-q", "-b", branch)
+	gitHostIngest(t, dir, nil, "remote", "add", "origin", "https://example.test/herdforge.git")
 	if err := os.WriteFile(filepath.Join(dir, "work"), []byte("fac-999\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +398,7 @@ func newHostIngestFixture(t *testing.T) hostIngestFixture {
 		Accepted:        true,
 		Name:            "fac-765-builder",
 		PaneID:          "builder-pane-not-reviewer",
-		Repository:      "herdforge",
+		Repository:      "example.test/herdforge",
 		Lane:            "builder",
 		BuilderFamily:   "openai",
 		Branch:          branch,
@@ -242,8 +422,8 @@ func newHostIngestFixture(t *testing.T) hostIngestFixture {
 		Accepted:        true,
 		Name:            reviewer,
 		PaneID:          "W4-canonical-review-pane",
-		Repository:      "herdforge",
-		Lane:            "review",
+		Repository:      "example.test/herdforge",
+		Lane:            reviewer,
 		Branch:          branch,
 		CandidateSHA:    sha,
 		HerdrSession:    "w4-review-session",

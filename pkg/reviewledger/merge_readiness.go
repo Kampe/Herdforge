@@ -119,23 +119,24 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		return MergeReadiness{SHA: sha, Reason: "review ledger is EMPTY; refusing to report no-verdict from a ledger with zero rows (wrong repo root?)"},
 			fmt.Errorf("review ledger has no rows: refusing to infer review state from an empty ledger")
 	}
-	reviewers := map[string]string{}
-	unrecorded := map[string]bool{}
+	latest := map[ProjectionKey]LedgerRow{}
 	for _, row := range rows {
-		// Match by PREFIX. The ledger stores 40-char SHAs while callers routinely
-		// hold a 12-char short form (PR head refs, packet names, pane names).
-		// Exact matching returned "no verdict recorded" for candidates that had
-		// several -- an absence that reads as safe and is wrong for the wrong
-		// reason, which is the failure mode this whole type exists to prevent.
 		if row.Event != string(EventVerdict) || !shaMatches(row.SHA, sha) {
 			continue
 		}
-		verdict := strings.ToUpper(strings.TrimSpace(row.Verdict))
-		if verdict == "" {
+		if strings.TrimSpace(row.Verdict) == "" {
 			continue
 		}
-		// Later verdicts from the SAME reviewer+host supersede earlier ones;
-		// distinct authenticated hosts never supersede each other.
+		latest[rowProjection(row)] = row
+	}
+	superseded := retrySupersessionFromLatest(latest, "")
+	reviewers := map[string]string{}
+	unrecorded := map[string]bool{}
+	for k, row := range latest {
+		if superseded[k] {
+			continue
+		}
+		verdict := strings.ToUpper(strings.TrimSpace(row.Verdict))
 		name := strings.TrimSpace(row.Reviewer)
 		if host := hostKey(row.Host); host != "" {
 			name = name + " host=" + host
