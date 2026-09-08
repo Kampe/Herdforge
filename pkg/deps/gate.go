@@ -113,6 +113,14 @@ func ValidateLaunch(
 			Reason: "task unreadable: " + err.Error(),
 		}
 	}
+	// A task that has itself already reached a terminal outcome -- done or
+	// archived -- is never dispatchable, same closure family in NormalizeStatus.
+	if status == provider.StatusDone || status == provider.StatusArchived {
+		return nil, &BlockedError{
+			Ref: taskRef, Code: "terminal",
+			Reason: fmt.Sprintf("task status=%s is terminal; not eligible for launch", status),
+		}
+	}
 
 	// Bind fence to this exact task (reject replay; require immutable task_id).
 	if err := desired.BindAndValidate(taskRef, taskID); err != nil {
@@ -247,7 +255,10 @@ func ValidateLaunch(
 		}
 		st = provider.NormalizeStatus(st)
 		statusBy[string(b.ref)] = st
-		if st != provider.StatusDone {
+		// Archived is terminal, same as done: it can never become "done", so
+		// treating it as an open blocker would poison every downstream launch
+		// permanently (FAC-777).
+		if st != provider.StatusDone && st != provider.StatusArchived {
 			open = append(open, string(b.ref))
 			details = append(details, fmt.Sprintf("prerequisite %s status=%s id=%s (need done)", b.ref, st, bid))
 		}
@@ -257,7 +268,6 @@ func ValidateLaunch(
 	// Status is excluded so the revision does not churn when a dispatch flips
 	// its own target to in-progress or when a prerequisite changes status.
 	// TOCTOU detection still fires on edge/relation changes.
-	_ = status
 	_ = taskID
 	rev := GraphRevision(snap.Edges, nil, snap.ProviderRevision)
 	rep.GraphRevision = rev
