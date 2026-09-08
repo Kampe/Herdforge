@@ -56,8 +56,11 @@ func (l *ledgerLegacyReview) AdmittedPass(ref string) (hsync.LegacyReviewEvidenc
 
 	revoked := map[string]bool{}
 	for _, row := range snap.Rows {
-		if row.Event == string(reviewledger.EventRevoked) || row.Event == string(reviewledger.EventSupersession) {
+		if row.Event == string(reviewledger.EventRevoked) {
 			revoked[row.SHA] = true
+		}
+		if prev := reviewledger.IdentityReplacementSHA(row.Event, row.SHA, row.Task, row.RetryOf); prev != "" {
+			revoked[prev] = true
 		}
 	}
 

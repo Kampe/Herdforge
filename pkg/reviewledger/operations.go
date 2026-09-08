@@ -752,7 +752,7 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 		if r.Event == string(EventRetired) && r.SHA == sha {
 			return false, fmt.Errorf("herd-review-ledger: refuse sha=%s reason=retired", sha)
 		}
-		if r.Event == string(EventSupersession) && r.Task == sha && r.SHA != sha {
+		if IdentityReplacementSHA(r.Event, r.SHA, r.Task, r.RetryOf) == sha {
 			superseded = true
 		}
 	}
@@ -779,7 +779,7 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 
 	// SHA-level veto: any FAIL/BLOCKED from a valid reviewer blocks eligibility,
 	// unless a later PASS on the same host explicitly names that reviewer.
-	hostRetry := indexHostRetrySupersession(rows, latest, sha)
+	hostRetry := retrySupersessionFromLatest(latest, sha)
 	hasVeto := false
 	for k, verdict := range latest {
 		if k.SHA != sha {
