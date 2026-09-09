@@ -304,6 +304,11 @@ func mergeSnapshotFile(snap *UsageSnapshot, backoff *cachedProviderRecord) error
 			records[name] = *backoff
 		}
 	}
+	return writeCachedRecords(records)
+}
+
+func writeCachedRecords(records map[string]cachedProviderRecord) error {
+	path := snapshotCachePath()
 	body, err := json.Marshal(cachedSnapshot{Providers: records})
 	if err != nil {
 		return err
@@ -428,12 +433,14 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
 		return nil, pollErrf("rate-limited", "%s", persisted.Error)
 	}
-	if !force && ttl > 0 && quotaCache.snap != nil {
+	if !force && ttl > 0 {
 		quotaCache.Lock()
-		if bound, _, ok := freshBoundSnapshot(quotaCache.snap, ttl, quotaCache.fetchedAt); ok {
-			if snap := providerOnlySnapshot(bound, name); snap != nil {
-				quotaCache.Unlock()
-				return snap, nil
+		if quotaCache.snap != nil {
+			if bound, _, ok := freshBoundSnapshot(quotaCache.snap, ttl, quotaCache.fetchedAt); ok {
+				if snap := providerOnlySnapshot(bound, name); snap != nil {
+					quotaCache.Unlock()
+					return snap, nil
+				}
 			}
 		}
 		quotaCache.Unlock()
@@ -460,6 +467,9 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 			return nil
 		}); err != nil {
 			return err
+		}
+		if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == currentProviderAccountKey(name) {
+			return nil
 		}
 		if snap != nil {
 			return nil
@@ -568,11 +578,44 @@ func providerOnlySnapshot(snap *UsageSnapshot, provider string) *UsageSnapshot {
 // changes quota materially, so the next decision refetches rather than acting on
 // a number it just invalidated.
 func InvalidateSnapshotCache() {
+	_ = InvalidateSnapshotCacheWithError()
+}
+
+// InvalidateSnapshotCacheWithError removes successful observations while
+// retaining account-bound upstream retry deadlines. It is the error-returning
+// form for production callers that need to surface storage failures.
+func InvalidateSnapshotCacheWithError() error {
 	quotaCache.Lock()
-	defer quotaCache.Unlock()
 	quotaCache.snap = nil
 	quotaCache.fetchedAt = time.Time{}
-	if p := snapshotCachePath(); p != "" {
-		_ = os.Remove(p)
-	}
+	quotaCache.Unlock()
+	return withSnapshotFileLock(func() error {
+		path := snapshotCachePath()
+		records := map[string]cachedProviderRecord{}
+		if raw, err := os.ReadFile(path); err == nil {
+			var prior cachedSnapshot
+			if json.Unmarshal(raw, &prior) == nil {
+				records = prior.Providers
+				if records == nil {
+					records = make(map[string]cachedProviderRecord)
+				}
+				if len(records) == 0 && prior.Snapshot != nil {
+					for name, provider := range prior.Snapshot.Providers {
+						record := cachedProviderRecord{ObservedAt: prior.FetchedAt, Provider: provider}
+						if provider.Account != nil {
+							record.AccountKey = provider.Account.Key
+						}
+						records[name] = record
+					}
+				}
+			}
+		}
+		retained := make(map[string]cachedProviderRecord)
+		for name, record := range records {
+			if record.BackoffUntil.After(time.Now()) {
+				retained[name] = record
+			}
+		}
+		return writeCachedRecords(retained)
+	})
 }

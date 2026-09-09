@@ -18,6 +18,15 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 	if os.Getenv("HERD_CACHE_SUBPROCESS_HELPER") != "1" {
 		return
 	}
+	if held := os.Getenv("HERD_CACHE_HOLD_PROVIDER"); held != "" {
+		if err := withProviderFileLock(held, currentProviderAccountKey(held), func() error {
+			time.Sleep(time.Second)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	url := os.Getenv("HERD_CACHE_FIXTURE_URL")
 	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
 		resp, err := http.Get(url)
@@ -25,13 +34,144 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 			return ProviderUsage{}, err
 		}
 		_ = resp.Body.Close()
+		if os.Getenv("HERD_CACHE_429_HELPER") == "1" {
+			return ProviderUsage{}, pollErrf("rate-limited", "HTTP 429 retry-after=15")
+		}
 		return ProviderUsage{DisplayName: "Codex", Account: codexAccountIdentity(), Resources: map[string]ResourceUsage{
 			"primary": {Kind: "consumption", Unit: "percent", Limit: 100, Remaining: 80, WindowSeconds: 18000},
 		}}, nil
 	}})
 	defer restore()
-	if _, err := FetchProviderForce("codex", false); err != nil {
+	_, err := FetchProviderForce("codex", false)
+	if os.Getenv("HERD_CACHE_429_HELPER") == "1" {
+		if err == nil || pollErrorCode(err) != "rate-limited" {
+			t.Fatalf("expected persisted rate-limit result, got %v", err)
+		}
+	} else if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProviderCacheAcrossProcessesShares429Backoff(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	cachePath := filepath.Join(dir, "quota.json")
+	t.Setenv("HERD_QUOTA_CACHE_PATH", cachePath)
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"429-subprocess"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	env := append(os.Environ(), "HERD_CACHE_SUBPROCESS_HELPER=1", "HERD_CACHE_429_HELPER=1", "HERD_CACHE_FIXTURE_URL="+server.URL, "HERD_QUOTA_CACHE_PATH="+cachePath, "HOME="+home, "CODEX_HOME="+home)
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
+		cmd.Env = env
+		go func() {
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				results <- fmt.Errorf("429 helper failed: %w: %s", err, strings.TrimSpace(string(output)))
+				return
+			}
+			results <- nil
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("concurrent 429 callers made %d upstream requests, want 1", requests.Load())
+	}
+	var cached cachedSnapshot
+	body, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &cached); err != nil {
+		t.Fatal(err)
+	}
+	if !cached.Providers["codex"].BackoffUntil.After(time.Now()) {
+		t.Fatal("concurrent 429 did not persist a future cooldown")
+	}
+	if cached.Providers["codex"].BackoffUntil.After(time.Now().Add(15 * time.Second)) {
+		t.Fatal("cooldown deadline was extended by the waiting caller")
+	}
+}
+
+func TestProviderLocksAreScopedAndBoundedAcrossProcesses(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	cachePath := filepath.Join(dir, "quota.json")
+	t.Setenv("HERD_QUOTA_CACHE_PATH", cachePath)
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"lock-scope"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(), "HERD_CACHE_SUBPROCESS_HELPER=1", "HERD_CACHE_HOLD_PROVIDER=codex", "HERD_QUOTA_CACHE_PATH="+cachePath, "HOME="+home, "CODEX_HOME="+home)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	calls := 0
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"gemini": func() (ProviderUsage, error) {
+		calls++
+		return ProviderUsage{DisplayName: "Gemini", Resources: map[string]ResourceUsage{"weekly": {Remaining: 50}}}, nil
+	}})
+	started := time.Now()
+	_, err := FetchProviderForce("gemini", false)
+	elapsed := time.Since(started)
+	restore()
+	if err != nil || calls != 1 {
+		t.Fatalf("unrelated provider was blocked by Codex holder: err=%v calls=%d", err, calls)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("unrelated provider waited on global holder: %v", elapsed)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("holder helper failed: %v", err)
+	}
+}
+
+func TestInvalidatePreservesBackoffAndDoesNotTouchFixtureSentinel(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	sentinel := filepath.Join(home, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	account := &AccountIdentity{Key: "sentinel-account", Provenance: "fixture"}
+	if err := mergeSnapshotFile(&UsageSnapshot{Errors: map[string]string{"codex": "rate-limited: HTTP 429; retry-after=60"}}, &cachedProviderRecord{AccountKey: account.Key, BackoffUntil: time.Now().Add(time.Minute), Error: "rate-limited: HTTP 429; retry-after=60"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InvalidateSnapshotCacheWithError(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("fixture invalidation touched HOME sentinel: %v", err)
+	}
+	var cached cachedSnapshot
+	body, err := os.ReadFile(filepath.Join(dir, "quota.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &cached); err != nil {
+		t.Fatal(err)
+	}
+	if !cached.Providers["codex"].BackoffUntil.After(time.Now()) {
+		t.Fatal("invalidation erased persisted rate-limit cooldown")
 	}
 }
 
@@ -116,8 +256,9 @@ func TestSnapshotTTLIsShortAndOverridable(t *testing.T) {
 // A held reading is reused only while it is young, and its AGE is returned so a
 // caller can report what it acted on instead of implying the number was live.
 func TestCachedSnapshotReportsItsAge(t *testing.T) {
-	InvalidateSnapshotCache()
 	home := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+	InvalidateSnapshotCache()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", home)
 	if err := os.MkdirAll(home, 0o700); err != nil {
@@ -145,8 +286,9 @@ func TestCachedSnapshotReportsItsAge(t *testing.T) {
 }
 
 func TestProviderCachedReusesFreshNativeObservation(t *testing.T) {
-	InvalidateSnapshotCache()
 	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "45")
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+	InvalidateSnapshotCache()
 	calls := 0
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -174,11 +316,11 @@ func TestProviderCachedReusesFreshNativeObservation(t *testing.T) {
 }
 
 func TestProviderCacheRetainsProviderAgeAndSeparatesAccounts(t *testing.T) {
-	InvalidateSnapshotCache()
 	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "45")
 	dir := t.TempDir()
 	home := t.TempDir()
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	InvalidateSnapshotCache()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", home)
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"account-one"}}`), 0o600); err != nil {
@@ -246,10 +388,10 @@ func TestProviderCacheRetainsProviderAgeAndSeparatesAccounts(t *testing.T) {
 }
 
 func TestProviderCacheRejectsClockSkewAndPersists429Backoff(t *testing.T) {
-	InvalidateSnapshotCache()
 	dir := t.TempDir()
 	home := t.TempDir()
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	InvalidateSnapshotCache()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", home)
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"backoff-account"}}`), 0o600); err != nil {
@@ -387,11 +529,11 @@ func TestMergeSnapshotMigratesEmptyAndLegacyCache(t *testing.T) {
 }
 
 func TestScopedThenAllUsesFreshProviderWithoutRepolling(t *testing.T) {
-	InvalidateSnapshotCache()
 	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "45")
 	dir := t.TempDir()
 	home := t.TempDir()
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	InvalidateSnapshotCache()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", home)
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"scoped-all"}}`), 0o600); err != nil {
@@ -424,6 +566,7 @@ func TestScopedThenAllUsesFreshProviderWithoutRepolling(t *testing.T) {
 // changes quota is not followed by a decision acting on the number it just
 // invalidated.
 func TestInvalidateForcesARefetch(t *testing.T) {
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
 	quotaCache.Lock()
 	quotaCache.snap = &UsageSnapshot{}
 	quotaCache.fetchedAt = time.Now()
