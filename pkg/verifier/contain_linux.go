@@ -34,7 +34,7 @@ func ownershipCommand(ctx context.Context, dir string, argv []string) (*exec.Cmd
 		// command paths, worktree, caches, and temporary files remain visible.
 		"--bind", "/", "/", "--bind", absDir, absDir,
 		"--proc", "/proc", "--dev", "/dev", "--chdir", absDir,
-		"--new-session", "--info-fd", "6", "--",
+		"--info-fd", "6", "--",
 		"sh",
 	}
 	if len(argv) >= 3 && argv[2] == "owned-wrap" {

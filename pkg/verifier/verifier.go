@@ -301,7 +301,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		_ = infoR.Close()
 	}
 
-	owned, adoptErr := adoptOwnedCmd(cmd, leaderPID, statusR, ackW, dir, markerPath, marker)
+	owned, adoptErr := adoptOwnedCmd(cmd, leaderPID, cmd.Process.Pid, statusR, ackW, dir, markerPath, marker)
 	if adoptErr != nil {
 		var parts []string
 		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())

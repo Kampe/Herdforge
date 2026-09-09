@@ -61,6 +61,14 @@ func killProcessGroupMembers(pgid int) error {
 // killProcessGroupMembersExcept identity-kills live members of pgid except
 // exceptPID (the supervisor leader must not kill itself mid-drain).
 func killProcessGroupMembersExcept(pgid, exceptPID int) error {
+	except := map[int]struct{}{}
+	if exceptPID > 0 {
+		except[exceptPID] = struct{}{}
+	}
+	return killProcessGroupMembersExceptSet(pgid, except)
+}
+
+func killProcessGroupMembersExceptSet(pgid int, except map[int]struct{}) error {
 	if pgid <= 1 {
 		return fmt.Errorf("kill process group members: invalid pgid %d", pgid)
 	}
@@ -70,7 +78,7 @@ func killProcessGroupMembersExcept(pgid, exceptPID int) error {
 	}
 	var errs []error
 	for _, tok := range snap.membersOfGroup(pgid) {
-		if exceptPID > 0 && tok.pid == exceptPID {
+		if _, skip := except[tok.pid]; skip {
 			continue
 		}
 		h, herr := openHandle(tok)
@@ -121,8 +129,9 @@ type ownedSubprocess struct {
 	cmd          *exec.Cmd
 	leader       int
 	pgid         int
-	candidateDir string // verification root (corroboration / diagnostics only)
-	markerPath   string // private ownership marker path (lineage authority)
+	protected    map[int]struct{} // bwrap and protocol shell remain live until ack
+	candidateDir string           // verification root (corroboration / diagnostics only)
+	markerPath   string           // private ownership marker path (lineage authority)
 	markerFile   *os.File
 
 	mu       sync.Mutex
@@ -252,12 +261,15 @@ func prepareOwnedCommand(ctx context.Context, path string, args []string, dir st
 // handshake pipes: statusR reads start/done; ackW writes go.
 // marker/markerPath are the inherited lineage marker (kill authority for
 // escaped descendants). candidateDir is corroboration-only.
-func adoptOwnedCmd(cmd *exec.Cmd, leader int, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
+func adoptOwnedCmd(cmd *exec.Cmd, leader, pgid int, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, errors.New("adopt owned cmd: nil process")
 	}
 	if leader <= 1 {
 		return nil, fmt.Errorf("adopt owned cmd: invalid supervisor pid %d", leader)
+	}
+	if pgid <= 1 {
+		return nil, fmt.Errorf("adopt owned cmd: invalid process group %d", pgid)
 	}
 	tok, err := tokenOf(leader)
 	if err != nil {
@@ -270,7 +282,8 @@ func adoptOwnedCmd(cmd *exec.Cmd, leader int, statusR, ackW *os.File, candidateD
 	o := &ownedSubprocess{
 		cmd:          cmd,
 		leader:       leader,
-		pgid:         leader,
+		pgid:         pgid,
+		protected:    map[int]struct{}{leader: {}, pgid: {}},
 		candidateDir: candidateDir,
 		markerPath:   markerPath,
 		markerFile:   marker,
@@ -479,7 +492,7 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	// we release the supervisor (same-group residual writers). The waiter
 	// identity-kills members from a fresh snapshot whenever it finds any, so a
 	// separate unconditional enumeration immediately beforehand is redundant.
-	if err := waitProcessGroupEmptyExcept(pgid, o.leader, processGroupGoneBound); err != nil {
+	if err := waitProcessGroupEmptyExceptSet(pgid, o.protected, processGroupGoneBound); err != nil {
 		return fmt.Errorf("drain residuals group empty: %w", err)
 	}
 	// Marker lineage residual: processes that still hold the inherited
@@ -572,6 +585,10 @@ func (o *ownedSubprocess) finishMarkerResidualError(cause error) error {
 // waitProcessGroupEmptyExcept repeatedly membership-kills and probes until
 // pgid has no live members other than exceptPID, or the bound elapses.
 func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error {
+	return waitProcessGroupEmptyExceptSet(pgid, map[int]struct{}{exceptPID: {}}, bound)
+}
+
+func waitProcessGroupEmptyExceptSet(pgid int, except map[int]struct{}, bound time.Duration) error {
 	if pgid <= 1 {
 		return fmt.Errorf("wait process group empty: invalid pgid %d", pgid)
 	}
@@ -583,7 +600,7 @@ func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error
 		}
 		live := 0
 		for _, tok := range snap.membersOfGroup(pgid) {
-			if exceptPID > 0 && tok.pid == exceptPID {
+			if _, skip := except[tok.pid]; skip {
 				continue
 			}
 			if tok.isLiveTarget() {
@@ -593,7 +610,7 @@ func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error
 		if live == 0 {
 			return nil
 		}
-		if err := killProcessGroupMembersExcept(pgid, exceptPID); err != nil {
+		if err := killProcessGroupMembersExceptSet(pgid, except); err != nil {
 			return err
 		}
 		if time.Now().After(deadline) {
@@ -760,8 +777,10 @@ func (o *ownedSubprocess) killTracked(includeLeader bool) error {
 	o.mu.Lock()
 	handles := make([]ownedHandle, 0, len(o.handles))
 	for pid, h := range o.handles {
-		if !includeLeader && pid == o.leader {
-			continue
+		if !includeLeader {
+			if _, protected := o.protected[pid]; protected {
+				continue
+			}
 		}
 		handles = append(handles, h)
 	}
@@ -950,7 +969,7 @@ func ReapOwnedCmd(cmd *exec.Cmd) error {
 	if cmd != nil && cmd.Process != nil {
 		leader = cmd.Process.Pid
 	}
-	owned, err := adoptOwnedCmd(cmd, leader, nil, nil, dir, "", nil)
+	owned, err := adoptOwnedCmd(cmd, leader, leader, nil, nil, dir, "", nil)
 	if err != nil {
 		return err
 	}
