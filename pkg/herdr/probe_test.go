@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -94,6 +95,35 @@ func TestResolveHealthyModel_AllExhausted(t *testing.T) {
 	}
 }
 
+func TestResolveHealthyProviderModel_UsesConfiguredProviderForFallbacks(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "grok.args")
+	writeProbeCLI(t, dir, "grok", `printf '%s\n' "$@" > "`+argsPath+`"
+for a in "$@"; do
+  case "$a" in
+    primary-model) echo "primary failed" >&2; exit 2 ;;
+  esac
+done
+echo PROBE_OK`)
+	writeProbeCLI(t, dir, "opencode", `echo opencode-must-not-run >&2; exit 91`)
+	t.Setenv("PATH", dir)
+
+	got, trail := ResolveHealthyProviderModel(context.Background(), "grok", "primary-model", "medium", []string{"fallback-model"})
+	if got != "fallback-model" {
+		t.Fatalf("provider-aware resolver selected %q, want fallback-model (trail=%+v)", got, trail)
+	}
+	if len(trail) != 2 || trail[0].Available || !strings.Contains(trail[0].Reason, "primary failed") || !trail[1].Available {
+		t.Fatalf("provider-aware trail lost primary/fallback results: %+v", trail)
+	}
+	raw, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "fallback-model") {
+		t.Fatalf("fallback was not probed through grok argv: %q", raw)
+	}
+}
+
 func writeProbeCLI(t *testing.T, dir, name, script string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
@@ -146,6 +176,43 @@ exit 91`)
 	}
 }
 
+func TestProbeProviderModel_UsesEachNativeHeadlessAdapter(t *testing.T) {
+	tests := []struct {
+		provider string
+		model    string
+		effort   string
+		command  string
+	}{
+		{provider: "codex", model: "gpt-5.6-luna", effort: "medium", command: "pi"},
+		{provider: "grok", model: "grok-4.6", effort: "medium", command: "grok"},
+		{provider: "agy", model: "gemini-2.5-pro", effort: "medium", command: "agy"},
+		{provider: "opencode", model: "litellm/lazer/deepseek-v4-flash", command: "opencode"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.provider, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, tc.command+".called")
+			for _, command := range []string{"agy", "grok", "opencode", "pi"} {
+				name := command
+				if command == tc.command {
+					writeProbeCLI(t, dir, name, `: > "`+marker+`"; printf '%s\n' PROBE_OK`)
+					continue
+				}
+				writeProbeCLI(t, dir, name, `echo unexpected-`+name+` >&2; exit 91`)
+			}
+			t.Setenv("PATH", dir)
+
+			result := ProbeProviderModel(context.Background(), tc.provider, tc.model, tc.effort)
+			if !result.Available {
+				t.Fatalf("native %s adapter failed: %+v", tc.provider, result)
+			}
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("native %s adapter was not invoked: %v", tc.provider, err)
+			}
+		})
+	}
+}
+
 func TestProbeProviderModel_OpenCodeBackedUsesOpenCode(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "opencode.args")
@@ -194,15 +261,45 @@ func TestProbeProviderModel_OSCWithoutTokenFails(t *testing.T) {
 
 func TestProbeProviderModel_SanitizesFailureDetail(t *testing.T) {
 	dir := t.TempDir()
-	writeProbeCLI(t, dir, "pi", `printf '\033]0;Herdforge: ready\007command failed\033]0;Herdforge: done\033\\'; exit 2`)
+	writeProbeCLI(t, dir, "pi", `printf '\033]0;Herdforge: ready\007{"error":"first line
+substantive multiline message"}\033]0;Herdforge: done\033\\' >&2; exit 2`)
 	t.Setenv("PATH", dir)
 
 	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
-	if result.Available || result.Reason != "probe failed: command failed" {
+	if result.Available || !strings.Contains(result.Reason, `"error":"first line`) || !strings.Contains(result.Reason, "substantive multiline message") || !strings.Contains(result.Reason, "exit status 2") {
 		t.Fatalf("failure detail = %+v", result)
 	}
 	if strings.ContainsAny(result.Reason, "\x1b\a") {
 		t.Fatalf("failure detail contains a raw control byte: %q", result.Reason)
+	}
+}
+
+func TestProbeProviderModel_BoundsMultilineFailureDetail(t *testing.T) {
+	dir := t.TempDir()
+	writeProbeCLI(t, dir, "pi", `i=0; while [ "$i" -lt 5000 ]; do printf x >&2; i=$((i + 1)); done; exit 2`)
+	t.Setenv("PATH", dir)
+
+	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
+	if result.Available || !strings.Contains(result.Reason, probeDetailTruncation) {
+		t.Fatalf("long failure was not explicitly bounded: %+v", result)
+	}
+	if len(result.Reason) > len("probe failed: ")+maxProbeFailureDetail {
+		t.Fatalf("failure detail exceeded bound: %d", len(result.Reason))
+	}
+}
+
+func TestBoundProbeFailureDetail_StatusWindowIsBounded(t *testing.T) {
+	for _, statusLen := range []int{4066, 4067, 4070, 4071, 4072} {
+		t.Run(fmt.Sprintf("status-%d", statusLen), func(t *testing.T) {
+			status := strings.Repeat("s", statusLen)
+			got := boundProbeFailureDetail(strings.Repeat("d", 5000), status)
+			if len(got) > maxProbeFailureDetail {
+				t.Fatalf("failure detail length = %d, want <= %d", len(got), maxProbeFailureDetail)
+			}
+			if !strings.Contains(got, strings.Repeat("s", 32)) {
+				t.Fatalf("bounded failure detail lost status evidence: len=%d", len(got))
+			}
+		})
 	}
 }
 

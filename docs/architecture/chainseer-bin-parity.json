@@ -2,8 +2,8 @@
   "version": 1,
   "task": "FAC-309",
   "source_root": "chainseer/bin",
-  "source_revision": "010c6b9590b6959868720254b230c2a84026d847",
-  "source_executable_count": 52,
+  "source_revision": "8d8029377ed4ab584caf06d9498e6ecf5b95d131",
+  "source_executable_count": 53,
   "entries": [
     {
       "path": "bin/apply-migrations",
@@ -64,6 +64,11 @@
       "path": "bin/check-morpho-blue-decimals",
       "disposition": "chainseer_product_exemption",
       "rationale": "Chainseer product, deployment, data, release, or repository-specific wrapper; it is not a Herdforge control-plane surface."
+    },
+    {
+      "path": "bin/check-pending-board-claims.py",
+      "disposition": "chainseer_product_exemption",
+      "rationale": "Chainseer product-specific board-claim verification gate: queries Kaneo for live cards matching pending-board claims and fails closed when board evidence is unreadable; it is not a Herdforge control-plane surface."
     },
     {
       "path": "bin/check-pending-table",

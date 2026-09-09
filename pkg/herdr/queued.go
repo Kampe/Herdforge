@@ -119,6 +119,8 @@ type DrainResult struct {
 // DrainQueuedAtBoundary surfaces pending routine envelopes at a live idle or
 // done turn. It re-reads safe-boundary authority before each message, so a
 // recipient that starts working after the first delivery is not prompted again.
+// Ordinary report mail is eligible alongside queued-durable mail; authenticated
+// control and callback envelopes remain on their native consumers.
 // Acknowledgment follows a task-bound consumption receipt, not AgentPrompt or
 // a working status alone. Prompt/Enter failure, a staged composer, or unknown
 // consumption leave the envelope pending (at-least-once re-delivery, not
@@ -144,7 +146,7 @@ func drainQueuedAtBoundary(target, workspace string, box *mail.Mailbox, afterDel
 		if !immediateDeliveryAllowed(resolved.Status) {
 			return out, fmt.Errorf("%w (status %q)", ErrNotIdleBoundary, resolved.Status)
 		}
-		pending, err := box.PendingQueued(resolvedTarget)
+		pending, err := box.PendingRoutine(resolvedTarget)
 		if err != nil {
 			return out, err
 		}

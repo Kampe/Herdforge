@@ -61,6 +61,61 @@ func (m *Mailbox) QueueRoutine(ctx context.Context, sender, recipient, body stri
 // mailbox order. Handled ids are skipped; the append seen-set is not consulted
 // as a processing ack.
 func (m *Mailbox) PendingQueued(recipient string) ([]*Envelope, error) {
+	return m.pendingRoutine(recipient, func(env *Envelope) bool {
+		return env.Subject == QueuedDeliverySubject
+	})
+}
+
+// PendingRoutine returns unacknowledged ordinary report mail for recipient.
+// Authenticated control and callback envelopes stay on their own consumers;
+// everything else is eligible for the safe-boundary routine surface. The
+// handled sidecar is the consumption acknowledgement, not the mailbox read.
+func (m *Mailbox) PendingRoutine(recipient string) ([]*Envelope, error) {
+	return m.pendingRoutine(recipient, func(env *Envelope) bool {
+		if env.Subject == QueuedDeliverySubject {
+			return true
+		}
+		if env.Read {
+			return false
+		}
+		if IsControlSubject(env.Subject) {
+			return false
+		}
+		return !strings.HasPrefix(env.Subject, "complete:") &&
+			!strings.HasPrefix(env.Subject, "blocked:")
+	})
+}
+
+// AcknowledgeOrdinary marks one exact ordinary report handled after its
+// recipient has consumed it. Reads remain read-only; this is the explicit
+// durable disposition operation. Queued routine, control, and callback
+// envelopes stay on their native consumers.
+func (m *Mailbox) AcknowledgeOrdinary(recipient, id string) error {
+	if m == nil {
+		return fmt.Errorf("mail: nil mailbox")
+	}
+	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
+	if recipient == "" || id == "" {
+		return ErrRecipientAndEnvelopeIDRequired
+	}
+	envs, err := m.ReadInbox(recipient)
+	if err != nil {
+		return err
+	}
+	for _, env := range envs {
+		if env == nil || env.ID != id {
+			continue
+		}
+		if env.Subject == QueuedDeliverySubject || IsControlSubject(env.Subject) ||
+			strings.HasPrefix(env.Subject, "complete:") || strings.HasPrefix(env.Subject, "blocked:") {
+			return ordinaryEnvelopeClassError(id)
+		}
+		return m.MarkHandled(recipient, id)
+	}
+	return ordinaryEnvelopeNotFound(id, recipient)
+}
+
+func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool) ([]*Envelope, error) {
 	if m == nil {
 		return nil, fmt.Errorf("mail: nil mailbox")
 	}
@@ -74,7 +129,7 @@ func (m *Mailbox) PendingQueued(recipient string) ([]*Envelope, error) {
 	}
 	out := make([]*Envelope, 0, len(envs))
 	for _, env := range envs {
-		if env == nil || env.Subject != QueuedDeliverySubject {
+		if env == nil || !eligible(env) {
 			continue
 		}
 		handled, hErr := m.Handled(recipient, env.ID)
