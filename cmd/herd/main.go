@@ -1687,7 +1687,7 @@ func runQuotaLimits(oneProvider string, force bool) {
 	var age time.Duration
 	var err error
 	if p := strings.TrimSpace(oneProvider); p != "" {
-		snap, err = usage.FetchProvider(p)
+		snap, err = usage.FetchProviderForce(p, force)
 	} else {
 		snap, age, err = usage.FetchSnapshotCachedForce(force)
 	}

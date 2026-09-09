@@ -38,14 +38,14 @@ type ResourceUsage struct {
 	State         string  `json:"state,omitempty"` // active, not-started, or untracked
 	Model         string  `json:"model,omitempty"`
 	Pool          string  `json:"pool,omitempty"`
-	Limit         float64 `json:"limit,omitempty"`
-	Remaining     float64 `json:"remaining,omitempty"`
+	Limit         float64 `json:"limit"`
+	Remaining     float64 `json:"remaining"`
 	Available     float64 `json:"available,omitempty"`
 	Unit          string  `json:"unit"`
-	Used          float64 `json:"used,omitempty"`
-	Utilization   float64 `json:"utilization,omitempty"`
+	Used          float64 `json:"used"`
+	Utilization   float64 `json:"utilization"`
 	ResetsAt      string  `json:"resetsAt,omitempty"`
-	WindowSeconds int     `json:"windowSeconds,omitempty"`
+	WindowSeconds int     `json:"windowSeconds"`
 }
 
 type grokAuthEntry struct {
@@ -58,6 +58,14 @@ func FetchSnapshot() (*UsageSnapshot, error) {
 }
 
 func FetchProvider(provider string) (*UsageSnapshot, error) {
+	return fetchDirectProvider(provider)
+}
+
+// FetchProviderForce is explicit for callers exposing --force. Single-provider
+// polling has no cache layer, so force is intentionally a no-op after being
+// wired through the public seam.
+func FetchProviderForce(provider string, force bool) (*UsageSnapshot, error) {
+	_ = force
 	return fetchDirectProvider(provider)
 }
 
