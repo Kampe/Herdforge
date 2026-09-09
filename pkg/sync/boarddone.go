@@ -415,9 +415,11 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	}
 
 	// The durable record is appended AFTER the readback, so a crash between
-	// the two leaves a done card with no record — which replays safely (the
-	// status write is idempotent) — rather than a record for a write that
-	// never landed.
+	// the two leaves a done card with no record rather than a record for a
+	// write that never landed. Such a card carries no receipt-bound durable
+	// evidence, so a replay of the same receipt refuses (FAC-783): the done
+	// log is the only receipt-bound closure evidence, and its digest record
+	// cannot be reconstructed from generic done status.
 	rec := DoneRecord{
 		Timestamp: nowStamp(), Ref: ref, TaskID: task.ID,
 		ProviderReadback: back.Status, Override: override,
@@ -427,7 +429,7 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 		rec.MergeSHA = req.Receipt.MergeSHA
 	}
 	if err := appendDoneRecord(repoDir, rec); err != nil {
-		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded (re-run to record): %w", ref, err)
+		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded; a replay refuses on the missing receipt-bound record, so reconcile the done log deliberately: %w", ref, err)
 	}
 
 	// FAC-145 callbacks bind to the exact proof commit; under FAC-132 that is
@@ -526,22 +528,41 @@ func ResolveDoneTask(ctx context.Context, tp provider.TaskProvider, req DoneRequ
 	// Non-empty is not enough — it must equal the revision the exact task read
 	// encodes, so a card whose board acceptance state changed since the
 	// receipt was minted refuses instead of closing on stale evidence.
-	// The binding guards the transition INTO done: a card that already reads
-	// done is closed (closure is monotonic), and refusing here would strand
-	// the crash-recovery replay — a write that landed but whose done-log
-	// record did not — which must converge (FAC-132). Idempotent replays are
-	// still governed by the done-log digest short-circuit and, on the fenced
-	// path, the live-lease gate.
+	// The binding holds for terminal tasks too: generic done status is never
+	// sufficient receipt-bound evidence (FAC-783 reviewer c7102a76 — a
+	// validly sealed stale receipt must not pass solely because the exact
+	// read is already done, and BoardDoneFenced must not return already-done
+	// success on it after only a lease check). A done card is re-driven only
+	// when the append-only done log records THIS receipt's digest — the
+	// durable mark of a closure this receipt actually landed, and the sole
+	// recovery path for the approveOne publication-only reconcile window.
+	// The BoardDone and BoardDoneFenced flows check that same digest before
+	// resolution, so a stale receipt with no matching record can never reach
+	// their closure effects.
 	if strings.TrimSpace(receipt.ProviderRevision) == "" {
 		return nil, fmt.Errorf("%w for %s: receipt is missing provider_revision", ErrNoEvidence, ref)
 	}
+	liveRev := string(provider.EncodeRevision(task))
+	if receipt.ProviderRevision == liveRev {
+		return task, nil
+	}
 	if provider.NormalizeStatus(task.Status) != provider.StatusDone {
-		liveRev := string(provider.EncodeRevision(task))
-		if receipt.ProviderRevision != liveRev {
-			return nil, fmt.Errorf("%w for %s: receipt provider revision %q does not match live task revision %q (board acceptance state changed since the receipt was minted)", ErrNoEvidence, ref, receipt.ProviderRevision, liveRev)
+		return nil, fmt.Errorf("%w for %s: receipt provider revision %q does not match live task revision %q (board acceptance state changed since the receipt was minted)", ErrNoEvidence, ref, receipt.ProviderRevision, liveRev)
+	}
+	repoDir := req.RepoDir
+	if strings.TrimSpace(repoDir) == "" {
+		repoDir = "."
+	}
+	log, err := ReadDoneLog(repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("%w for %s: receipt does not match the live done task and the done log could not be read to bind the terminal closure: %w", ErrNoEvidence, ref, err)
+	}
+	for _, rec := range log {
+		if rec.ReceiptDigest != "" && rec.ReceiptDigest == receipt.Digest {
+			return task, nil
 		}
 	}
-	return task, nil
+	return nil, fmt.Errorf("%w for %s: receipt provider revision %q does not match live task revision %q and the done log holds no record of receipt digest %s — a done card cannot be accepted on stale evidence", ErrNoEvidence, ref, receipt.ProviderRevision, liveRev, shortDigest(receipt.Digest))
 }
 
 // resolveTaskByRef finds the board card for ref through the task provider.
@@ -759,7 +780,7 @@ func BoardDoneFenced(
 		rec.MergeSHA = req.Receipt.MergeSHA
 	}
 	if err := appendDoneRecord(repoDir, rec); err != nil {
-		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded (re-run to record): %w", ref, err)
+		return nil, fmt.Errorf("%s reads back as done but its closure could not be recorded; a replay refuses on the missing receipt-bound record, so reconcile the done log deliberately: %w", ref, err)
 	}
 
 	res := &DoneResult{Ref: ref, TaskID: task.ID, Proof: proof, Overridden: override != nil, ReceiptDigest: rec.ReceiptDigest}

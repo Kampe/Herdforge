@@ -151,3 +151,87 @@ func TestBoardDoneFenced_RequiresLiveLease(t *testing.T) {
 		t.Fatal("expected fail-closed without stack")
 	}
 }
+
+// TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog is the FAC-783
+// reviewer-c7102a76 regression at the real fenced entrypoint: an already-done
+// card must never return success after only a lease check on a validly sealed
+// stale receipt — the done log's record of THIS receipt's digest is the
+// receipt-bound durable evidence, and the refusal must not mutate.
+func TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
+	ctx := context.Background()
+	rdir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
+
+	cp := newReceiptBoard(t, "FAC-783b", testTaskID)
+	stack, err := provider.OpenClaimStack(t.TempDir(), cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	key := provider.LeaseKey(".", "kaneo", "p1", "FAC-783b")
+	lease, err := stack.AcquireLease(ctx, key, "owner-1", "worker", "worker")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	r := validReceipt(t, rdir, "FAC-783b", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
+	// The card reached done through another authority after the receipt was
+	// minted: done status, no done-log record anywhere in rdir.
+	if err := cp.UpdateStatus(ctx, testTaskID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	baseline := cp.updates
+	req := DoneRequest{
+		RepoDir: rdir, ProjectID: "p1", Ref: "FAC-783b", Receipt: r,
+		Lifecycle: fakeLifecycle{st: integratedState("FAC-783b")},
+	}
+	if _, err := BoardDoneFenced(ctx, cp, stack, key, "owner-1", lease.Generation, req); err == nil ||
+		!strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+		t.Fatalf("fenced already-done short-circuit must not accept a sealed stale receipt without a matching done-log digest, got %v", err)
+	}
+	if got := statusOf(t, cp, testTaskID); got != "done" {
+		t.Fatalf("status = %q, want unchanged done", got)
+	}
+	if cp.updates != baseline || cp.comments != 0 {
+		t.Fatalf("zero mutation on refusal: updates=%d baseline=%d comments=%d", cp.updates, baseline, cp.comments)
+	}
+
+	// A different validly sealed digest is likewise not the card's evidence.
+	rB := validReceipt(t, rdir, "FAC-783b", mergeSHA, baseSHA)
+	rB.VerificationDigest = "verification-digest-2"
+	rB.Seal()
+	if rB.Digest == r.Digest {
+		t.Fatal("receipt B must hash differently from receipt A")
+	}
+	reqB := req
+	reqB.Receipt = rB
+	if _, err := BoardDoneFenced(ctx, cp, stack, key, "owner-1", lease.Generation, reqB); err == nil ||
+		!strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+		t.Fatalf("a different sealed digest must refuse on the terminal card, got %v", err)
+	}
+	if cp.updates != baseline {
+		t.Fatalf("zero mutation from the second refusal: updates=%d baseline=%d", cp.updates, baseline)
+	}
+
+	// Receipt-bound recovery: once the done log carries THIS receipt's digest
+	// — the durable mark of a closure this receipt landed — the same live
+	// lease replays it as the idempotent no-op, without re-resolving the
+	// advanced revision and without appending a second record.
+	if err := appendDoneRecord(rdir, DoneRecord{
+		Timestamp: nowStamp(), Ref: "FAC-783b", TaskID: testTaskID,
+		ProviderReadback: "done", ReceiptDigest: r.Digest, MergeSHA: r.MergeSHA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := BoardDoneFenced(ctx, cp, stack, key, "owner-1", lease.Generation, req)
+	if err != nil || !res.Idempotent {
+		t.Fatalf("the recorded-digest replay must be the idempotent no-op, got %+v err %v", res, err)
+	}
+	if cp.updates != baseline {
+		t.Fatalf("the idempotent replay must not write, updates=%d baseline=%d", cp.updates, baseline)
+	}
+	log, err := ReadDoneLog(rdir)
+	if err != nil || len(log) != 1 {
+		t.Fatalf("exactly the recovery record must stand, got %+v err %v", log, err)
+	}
+}

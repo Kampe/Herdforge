@@ -1102,6 +1102,10 @@ func TestApproveCLI_DoneWithoutPublishReconcilesByPublicationOnly(t *testing.T) 
 	fk.mu.Lock()
 	fk.status = "done"
 	fk.mu.Unlock()
+	// A real state=done journal implies the crashed run already appended the
+	// receipt-bound done-log record (the board write and record both landed).
+	// Seed that durable evidence; without it the reconcile refuses (FAC-783).
+	seedDoneLogRecord(t, dir, "FAC-1", "t1")
 
 	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
 	if err != nil {
@@ -2778,5 +2782,69 @@ func TestApproveBroker(t *testing.T) {
 				t.Fatalf("receipt replay duplicated provider mutation: %d", got)
 			}
 		})
+	}
+}
+
+// seedDoneLogRecord appends the receipt-bound done-log record the real
+// board-done flow writes for ref, so fixtures simulating a crash AFTER the
+// record landed carry the receipt-bound durable evidence (FAC-783).
+func seedDoneLogRecord(t *testing.T, dir, ref, taskID string) {
+	t.Helper()
+	r, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, ref))
+	if err != nil {
+		t.Fatalf("load receipt for done log: %v", err)
+	}
+	rec := hsync.DoneRecord{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Ref: ref,
+		TaskID: taskID, ProviderReadback: "done",
+		ReceiptDigest: r.Digest, MergeSHA: r.MergeSHA,
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(hsync.DoneLogPath(dir)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hsync.DoneLogPath(dir), append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestApproveCLI_DoneCardRefusesSealedStaleReceiptWithoutLogRecord is the
+// FAC-783 reviewer-c7102a76 regression at the approveOne entrypoint, reached
+// through the real reconcile sweep: a journaled intent re-driven against an
+// already-done card with no matching done-log record refuses — generic done
+// status is never evidence — and the refusal neither touches the board nor
+// publishes a callback.
+func TestApproveCLI_DoneCardRefusesSealedStaleReceiptWithoutLogRecord(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+	// The crash left a journaled intent and the card reached done through
+	// another authority after the receipt was minted: done status, no
+	// done-log record anywhere.
+	sha := fixtureEvidenceSHA(t, dir)
+	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
+	fk.mu.Lock()
+	fk.status = "done"
+	fk.mu.Unlock()
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "cannot be accepted on stale evidence") {
+		t.Fatalf("stale sealed evidence on a done card must refuse through the reconcile sweep, got err %v:\n%s", err, out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 0 {
+		t.Fatalf("zero mutation on refusal: saw %d board write(s)", got)
+	}
+	if data, rErr := os.ReadFile(mail.CallbackMailPath(dir)); rErr == nil {
+		if strings.Contains(string(data), `"complete: FAC-1"`) {
+			t.Fatalf("the refusal must publish no callback:\n%s", data)
+		}
+	}
+	if data, rErr := os.ReadFile(filepath.Join(dir, ".herd", "approve-intents.jsonl")); rErr == nil {
+		if strings.Contains(string(data), `"state":"published"`) {
+			t.Fatalf("the refusal must not journal a publication:\n%s", data)
+		}
 	}
 }

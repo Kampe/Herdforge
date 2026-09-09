@@ -573,3 +573,89 @@ func TestResolveDoneTask_ExactReadRequiresCompleteProviderIdentity(t *testing.T)
 		}
 	})
 }
+
+// TestBoardDone_TerminalCardRequiresReceiptBoundDoneLog is the FAC-783
+// reviewer-c7102a76 regression: a done card accepts a full receipt only from
+// receipt-bound durable evidence — the done log's record of THIS receipt's
+// digest — never from generic done status.
+func TestBoardDone_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("sealed stale full receipt on a done card with no matching log record refuses with zero mutation", func(t *testing.T) {
+		dir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
+		cp := newReceiptBoard(t, "FAC-132", testTaskID)
+		r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+		bindLiveRevision(t, r, cp, testTaskID)
+		// The card reached done through some other authority after the
+		// receipt was minted: done status, no done-log record anywhere.
+		if err := cp.UpdateStatus(ctx, testTaskID, "done"); err != nil {
+			t.Fatal(err)
+		}
+		baseline := cp.updates
+		req := DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
+			Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
+		}
+		if _, err := BoardDone(ctx, cp, req); err == nil || !strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+			t.Fatalf("a validly sealed stale receipt with no matching done-log digest must refuse on a done card, got %v", err)
+		}
+		if got := statusOf(t, cp, testTaskID); got != "done" {
+			t.Fatalf("status = %q, want unchanged done", got)
+		}
+		if cp.updates != baseline || cp.comments != 0 {
+			t.Fatalf("zero mutation on refusal: updates=%d baseline=%d comments=%d", cp.updates, baseline, cp.comments)
+		}
+		log, err := ReadDoneLog(dir)
+		if err != nil || len(log) != 0 {
+			t.Fatalf("the refusal must append no done-log record, got %+v err %v", log, err)
+		}
+	})
+
+	t.Run("a different validly sealed receipt digest never passes as the terminal card's evidence", func(t *testing.T) {
+		dir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
+		cp := newReceiptBoard(t, "FAC-132", testTaskID)
+		rA := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+		bindLiveRevision(t, rA, cp, testTaskID)
+		if _, err := BoardDone(ctx, cp, DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: rA,
+			Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
+		}); err != nil {
+			t.Fatalf("receipt A close: %v", err)
+		}
+		if rA.Digest == "" {
+			t.Fatal("receipt A must carry a digest")
+		}
+		// Receipt B is validly sealed for the same candidate, merge, and card,
+		// but carries a different verification proof — hence a different
+		// digest — and this card's done log never recorded it.
+		rB := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+		rB.VerificationDigest = "verification-digest-2"
+		rB.Seal()
+		if rB.Digest == rA.Digest {
+			t.Fatal("receipt B must hash differently from receipt A")
+		}
+		req := DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: rB,
+			Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
+		}
+		// First delivery: recorded-digest idempotence short-circuits only for
+		// A's digest, so B refuses as stale evidence on a terminal card.
+		if _, err := BoardDone(ctx, cp, req); err == nil || !strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+			t.Fatalf("a different sealed digest must refuse on a done card, got %v", err)
+		}
+		if cp.updates != 1 {
+			t.Fatalf("zero mutation from the refusal: exactly receipt A's write should stand, updates=%d", cp.updates)
+		}
+		// A itself remains idempotent via the digest short-circuit.
+		res, err := BoardDone(ctx, cp, DoneRequest{
+			RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: rA,
+			Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
+		})
+		if err != nil || !res.Idempotent {
+			t.Fatalf("receipt A replay must stay idempotent, got %+v err %v", res, err)
+		}
+		if cp.updates != 1 {
+			t.Fatalf("idempotent replay must not write again, updates=%d", cp.updates)
+		}
+	})
+}
