@@ -659,20 +659,53 @@ func kaneoListTasksURL(apiURL, projectID, status string, page, limit int) string
 	return fmt.Sprintf("%s?%s", base, v.Encode())
 }
 
+type kaneoBoardPaginationDTO struct {
+	Page       int `json:"page"`
+	PageSize   int `json:"pageSize"`
+	Total      int `json:"total"`
+	TotalPages int `json:"totalPages"`
+}
+
 type kaneoBoardResponseDTO struct {
 	Data struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
 		Columns []struct {
 			ID    string         `json:"id"`
 			Name  string         `json:"name"`
 			Tasks []kaneoTaskDTO `json:"tasks"`
 		} `json:"columns"`
 	} `json:"data"`
-	Pagination struct {
-		Page       int `json:"page"`
-		PageSize   int `json:"pageSize"`
-		Total      int `json:"total"`
-		TotalPages int `json:"totalPages"`
-	} `json:"pagination"`
+	Pagination kaneoBoardPaginationDTO `json:"pagination"`
+}
+
+func validateBoardPagination(p kaneoBoardPaginationDTO, requestedPage int) error {
+	if p.Page != requestedPage {
+		return fmt.Errorf("kaneo ListTasks: pagination page mismatch: requested %d got %d", requestedPage, p.Page)
+	}
+	if p.PageSize <= 0 {
+		return fmt.Errorf("kaneo ListTasks: invalid pagination pageSize %d", p.PageSize)
+	}
+	if p.Total < 0 {
+		return fmt.Errorf("kaneo ListTasks: invalid pagination total %d", p.Total)
+	}
+	if p.TotalPages < 0 {
+		return fmt.Errorf("kaneo ListTasks: invalid pagination totalPages %d", p.TotalPages)
+	}
+	if p.Total == 0 {
+		if p.TotalPages > 1 {
+			return fmt.Errorf("kaneo ListTasks: contradictory pagination totalPages %d for total 0", p.TotalPages)
+		}
+	} else {
+		expectedTotalPages := (p.Total + p.PageSize - 1) / p.PageSize
+		if p.TotalPages != expectedTotalPages {
+			return fmt.Errorf("kaneo ListTasks: contradictory pagination totalPages %d: total=%d pageSize=%d expected %d", p.TotalPages, p.Total, p.PageSize, expectedTotalPages)
+		}
+	}
+	if p.TotalPages > 0 && requestedPage > p.TotalPages {
+		return fmt.Errorf("kaneo ListTasks: requested page %d exceeds totalPages %d", requestedPage, p.TotalPages)
+	}
+	return nil
 }
 
 // kaneoRunCLI is the CLI runner for Kaneo production UseCLI mode. Tests may
@@ -847,6 +880,14 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 			return nil, err
 		}
 
+		if strings.TrimSpace(env.Data.ID) == "" || env.Data.ID != projectID {
+			return nil, fmt.Errorf("kaneo ListTasks: board project identity mismatch: requested %q got %q", projectID, env.Data.ID)
+		}
+
+		if err := validateBoardPagination(env.Pagination, page); err != nil {
+			return nil, err
+		}
+
 		var pageTasks []kaneoTaskDTO
 		for _, col := range env.Data.Columns {
 			for _, dto := range col.Tasks {
@@ -854,7 +895,10 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 					return nil, fmt.Errorf("kaneo ListTasks: response task missing identity")
 				}
 				if dto.ProjectId != "" && dto.ProjectId != projectID {
-					return nil, fmt.Errorf("kaneo ListTasks: project identity mismatch: requested %q got %q", projectID, dto.ProjectId)
+					return nil, fmt.Errorf("kaneo ListTasks: task project identity mismatch: requested %q got %q", projectID, dto.ProjectId)
+				}
+				if dto.ProjectId == "" {
+					dto.ProjectId = projectID
 				}
 				pageTasks = append(pageTasks, dto)
 			}
@@ -869,13 +913,14 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 		}
 
 		dec := DecidePagination(len(pageTasks), freshCount)
-		if dec == PageStopEmpty {
-			return filterTasks(all, status), nil
-		}
 		if dec == PageStopDuplicate {
 			return nil, fmt.Errorf("kaneo task list (page %d): %w", page, ErrDuplicatePage)
 		}
-		if env.Pagination.TotalPages > 0 && page >= env.Pagination.TotalPages {
+
+		if env.Pagination.TotalPages == 0 || page >= env.Pagination.TotalPages || dec == PageStopEmpty {
+			if acc.Len() != env.Pagination.Total {
+				return nil, fmt.Errorf("kaneo ListTasks: accumulated tasks count (%d) does not match pagination total (%d)", acc.Len(), env.Pagination.Total)
+			}
 			return filterTasks(all, status), nil
 		}
 	}

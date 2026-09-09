@@ -149,6 +149,7 @@ func TestKaneoProvider_ListTasks(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{
 			"data": {
+				"id": "proj-1",
 				"columns": [
 					{
 						"id": "c-todo",
@@ -213,6 +214,7 @@ func TestKaneoProvider_ListTasks_PaginatesAndValidates(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
 				"data": {
+					"id": "proj-1",
 					"columns": [
 						{
 							"id": "c1",
@@ -223,13 +225,14 @@ func TestKaneoProvider_ListTasks_PaginatesAndValidates(t *testing.T) {
 						}
 					]
 				},
-				"pagination": {"page": 1, "pageSize": 100, "total": 2, "totalPages": 2}
+				"pagination": {"page": 1, "pageSize": 1, "total": 2, "totalPages": 2}
 			}`))
 		case "2":
 			page2Requested = true
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
 				"data": {
+					"id": "proj-1",
 					"columns": [
 						{
 							"id": "c1",
@@ -240,7 +243,7 @@ func TestKaneoProvider_ListTasks_PaginatesAndValidates(t *testing.T) {
 						}
 					]
 				},
-				"pagination": {"page": 2, "pageSize": 100, "total": 2, "totalPages": 2}
+				"pagination": {"page": 2, "pageSize": 1, "total": 2, "totalPages": 2}
 			}`))
 		default:
 			t.Errorf("unexpected page: %s", page)
@@ -289,7 +292,7 @@ func TestKaneoProvider_ListTasks_FailureControls(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
-				"data":{"columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"wrong-proj"}]}]},
+				"data":{"id":"p1","columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"wrong-proj"}]}]},
 				"pagination":{"page":1,"pageSize":100,"total":1,"totalPages":1}
 			}`))
 		}))
@@ -310,7 +313,7 @@ func TestKaneoProvider_ListTasks_FailureControls(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
-				"data":{"columns":[{"id":"c1","tasks":[{"id":"","ref":"FAC-1","projectId":"p1"}]}]},
+				"data":{"id":"p1","columns":[{"id":"c1","tasks":[{"id":"","ref":"FAC-1","projectId":"p1"}]}]},
 				"pagination":{"page":1,"pageSize":100,"total":1,"totalPages":1}
 			}`))
 		}))
@@ -332,7 +335,7 @@ func TestKaneoProvider_ListTasks_FailureControls(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			// Return page 1 and page 2 with identical task-1 and totalPages=5 so it doesn't stop by totalPages
 			_, _ = w.Write([]byte(`{
-				"data":{"columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"p1"}]}]},
+				"data":{"id":"p1","columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"p1"}]}]},
 				"pagination":{"page":1,"pageSize":100,"total":5,"totalPages":5}
 			}`))
 		}))
@@ -355,7 +358,7 @@ func TestKaneoProvider_ListTasks_FailureControls(t *testing.T) {
 			if page == "1" {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{
-					"data":{"columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"p1"}]}]},
+					"data":{"id":"p1","columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"p1"}]}]},
 					"pagination":{"page":1,"pageSize":100,"total":2,"totalPages":2}
 				}`))
 				return
@@ -373,6 +376,135 @@ func TestKaneoProvider_ListTasks_FailureControls(t *testing.T) {
 			t.Fatalf("expected nil tasks (no partial snapshot) when later page fails, got %v", tasks)
 		}
 	})
+}
+
+func TestKaneoProvider_ListTasks_TopLevelBoardProjectIdentity(t *testing.T) {
+	t.Run("MismatchedTopLevelBoardID", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {
+					"id": "wrong-board-id",
+					"columns": [{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1"}]}]
+				},
+				"pagination": {"page": 1, "pageSize": 100, "total": 1, "totalPages": 1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on mismatched top-level board id")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on error, got %v", tasks)
+		}
+	})
+
+	t.Run("MissingTopLevelBoardID", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {
+					"columns": [{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1"}]}]
+				},
+				"pagination": {"page": 1, "pageSize": 100, "total": 1, "totalPages": 1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on missing top-level board id")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on error, got %v", tasks)
+		}
+	})
+}
+
+func TestKaneoProvider_ListTasks_PaginationMetadataValidation(t *testing.T) {
+	t.Run("PageMismatch", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {"id":"p1","columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1"}]}]},
+				"pagination": {"page": 2, "pageSize": 100, "total": 1, "totalPages": 1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		_, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on page mismatch in pagination metadata")
+		}
+	})
+
+	t.Run("ContradictoryTotalPages", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {"id":"p1","columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1"}]}]},
+				"pagination": {"page": 1, "pageSize": 10, "total": 100, "totalPages": 1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		_, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on contradictory totalPages")
+		}
+	})
+
+	t.Run("IncompleteSnapshotTotalMismatch", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {"id":"p1","columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1"}]}]},
+				"pagination": {"page": 1, "pageSize": 100, "total": 100, "totalPages": 1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error when accumulated tasks count (1) != total (100)")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on total mismatch, got %v", tasks)
+		}
+	})
+}
+
+func TestKaneoProvider_ListTasks_LegitimateEmptyBoard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"data": {"id":"p-empty", "columns":[]},
+			"pagination": {"page": 1, "pageSize": 100, "total": 0, "totalPages": 0}
+		}`))
+	}))
+	defer srv.Close()
+
+	kp := NewKaneoProvider(srv.URL, "p-empty", false)
+	tasks, err := kp.ListTasks(context.Background(), "p-empty", "")
+	if err != nil {
+		t.Fatalf("unexpected error on legitimate empty board: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected 0 tasks, got %d", len(tasks))
+	}
 }
 
 func TestKaneoProvider_ListTasks_BadJSON(t *testing.T) {
@@ -411,7 +543,7 @@ func TestKaneoProvider_ListTasks_DefaultProjectID(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{
-			"data": {"columns": []},
+			"data": {"id": "proj-default", "columns": []},
 			"pagination": {"page": 1, "pageSize": 100, "total": 0, "totalPages": 0}
 		}`))
 	}))

@@ -138,8 +138,10 @@ func (b *authoritativeBoard) serve() *httptest.Server {
 			}
 			b.mu.Unlock()
 			if strings.HasPrefix(r.URL.Path, "/api/task/tasks/") {
+				projID := strings.TrimPrefix(r.URL.Path, "/api/task/tasks/")
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"data": map[string]any{
+						"id": projID,
 						"columns": []map[string]any{
 							{"id": "col-1", "name": "Column 1", "tasks": list},
 						},

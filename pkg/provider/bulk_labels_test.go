@@ -16,6 +16,7 @@ func TestKaneoProvider_ListTaskLabelsBulkReportsCompleteInventory(t *testing.T) 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"data": {
+				"id": "project-1",
 				"columns": [
 					{
 						"id": "c1",
@@ -52,6 +53,7 @@ func TestKaneoProvider_ListTaskLabelsBulkMarksMissingTasksTruncated(t *testing.T
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"data": {
+				"id": "project-1",
 				"columns": [
 					{
 						"id": "c1",
