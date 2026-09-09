@@ -21,6 +21,11 @@ type SQLiteLeaseStore struct {
 	db *sql.DB
 }
 
+// aliasAcquireBeforeInsertHook is test-only interleaving control. It is nil
+// in production and lets claim tests pause a transaction after alias/history
+// inspection while a competing ordinary Acquire attempts its insert.
+var aliasAcquireBeforeInsertHook func()
+
 // NewSQLiteLeaseStore opens (creating if needed) a lease database at path.
 // Use a real file path, not ":memory:", when leases must be visible across
 // processes. Safe to call concurrently from multiple OS processes racing
@@ -132,6 +137,34 @@ func (s *SQLiteLeaseStore) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_leases_pending_capacity
 			ON leases(capacity_release_state, capacity_release_claimed_at)
 			WHERE capacity_released_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS lease_aliases (
+			repo TEXT NOT NULL,
+			provider TEXT NOT NULL,
+			project TEXT NOT NULL,
+			task_ref TEXT NOT NULL,
+			group_id TEXT NOT NULL,
+			PRIMARY KEY (repo, provider, project, task_ref)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_lease_aliases_group
+			ON lease_aliases(group_id, provider, project, task_ref)`,
+		`CREATE TRIGGER IF NOT EXISTS lease_alias_active_conflict
+			BEFORE INSERT ON leases
+			WHEN EXISTS (
+				SELECT 1 FROM lease_aliases a
+				JOIN lease_aliases b ON b.group_id = a.group_id
+				JOIN leases l ON l.repo = b.repo
+					AND l.provider = b.provider
+					AND l.project = b.project
+					AND l.task_ref = b.task_ref
+					AND l.status = 'active'
+				WHERE a.repo = NEW.repo
+					AND a.provider = NEW.provider
+					AND a.project = NEW.project
+					AND a.task_ref = NEW.task_ref
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'claim: recognized alias has an active owner');
+			END`,
 	}
 	for _, m := range migrations {
 		if _, err := execWithRetry(context.Background(), s.db, m); err != nil {
@@ -368,6 +401,111 @@ func (s *SQLiteLeaseStore) Acquire(ctx context.Context, key LeaseKey, ownerID, r
 
 func (s *SQLiteLeaseStore) AcquireWithIdentity(ctx context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
 	return s.acquire(ctx, key, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane, now, ttl)
+}
+
+// AcquireFromAliases selects history, excludes live owners under every
+// authenticated alias, registers the alias set, and inserts the next lease
+// while one SQLite BEGIN IMMEDIATE transaction is held. The insert trigger
+// also makes later ordinary Acquire calls honor the same alias exclusion.
+func (s *SQLiteLeaseStore) AcquireFromAliases(ctx context.Context, aliases []LeaseKey, preferred LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {
+	if len(aliases) == 0 {
+		return nil, fmt.Errorf("claim: alias set is empty")
+	}
+	seen := make(map[LeaseKey]struct{}, len(aliases))
+	unique := make([]LeaseKey, 0, len(aliases))
+	for _, key := range aliases {
+		if key.Provider != preferred.Provider || key.Project != preferred.Project || key.TaskRef != preferred.TaskRef || key.Repo == "" {
+			return nil, fmt.Errorf("claim: alias set crosses provider, project, task, or empty repository identity")
+		}
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			unique = append(unique, key)
+		}
+	}
+	if _, ok := seen[preferred]; !ok {
+		return nil, fmt.Errorf("claim: preferred lease key is outside authenticated alias set")
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("alias acquire: connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("alias acquire: begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	groupID := fmt.Sprintf("%s\x00%s\x00%s\x00%s", preferred.Repo, preferred.Provider, preferred.Project, preferred.TaskRef)
+	for _, key := range unique {
+		if _, err := conn.ExecContext(ctx, `INSERT OR IGNORE INTO lease_aliases(repo, provider, project, task_ref, group_id) VALUES (?, ?, ?, ?, ?)`, key.Repo, key.Provider, key.Project, key.TaskRef, groupID); err != nil {
+			return nil, fmt.Errorf("alias acquire: register %q: %w", key.Repo, err)
+		}
+	}
+
+	best := preferred
+	bestGeneration := int64(0)
+	for _, key := range unique {
+		var gen sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT MAX(generation) FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=?`, key.Repo, key.Provider, key.Project, key.TaskRef).Scan(&gen); err != nil {
+			return nil, fmt.Errorf("alias acquire: history %q: %w", key.Repo, err)
+		}
+		var status string
+		var held int
+		var expires time.Time
+		var providerLockOwner, providerLockKind string
+		if err := conn.QueryRowContext(ctx, `SELECT status, held, expires_at, provider_lock_owner, provider_lock_kind FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? ORDER BY id DESC LIMIT 1`, key.Repo, key.Provider, key.Project, key.TaskRef).Scan(&status, &held, &expires, &providerLockOwner, &providerLockKind); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("alias acquire: owner %q: %w", key.Repo, err)
+		} else if err == nil && status == string(StatusActive) {
+			if held != 0 || expires.After(now) {
+				return nil, fmt.Errorf("claim: recognized alias %q has an active owner", key.Repo)
+			}
+			if providerLockOwner != "" || providerLockKind != "" {
+				return nil, fmt.Errorf("alias acquire: expired recognized alias %q has an active provider transition", key.Repo)
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE leases SET status='expired', released_at=? WHERE repo=? AND provider=? AND project=? AND task_ref=? AND status='active' AND held=0 AND expires_at <= ? AND provider_lock_owner='' AND provider_lock_kind=''`, now, key.Repo, key.Provider, key.Project, key.TaskRef, now); err != nil {
+				return nil, fmt.Errorf("alias acquire: expire %q: %w", key.Repo, err)
+			}
+		}
+		generation := gen.Int64
+		if generation > bestGeneration {
+			best = key
+			bestGeneration = generation
+		}
+	}
+	for _, key := range unique {
+		var gen sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT MAX(generation) FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=?`, key.Repo, key.Provider, key.Project, key.TaskRef).Scan(&gen); err != nil {
+			return nil, fmt.Errorf("alias acquire: history recheck %q: %w", key.Repo, err)
+		}
+		if key != best && gen.Valid && gen.Int64 == bestGeneration && bestGeneration > 0 {
+			return nil, fmt.Errorf("claim: ambiguous recognized alias history at generation %d", bestGeneration)
+		}
+	}
+	if aliasAcquireBeforeInsertHook != nil {
+		aliasAcquireBeforeInsertHook()
+	}
+
+	claimedAt := normalizeProviderLockTime(now)
+	expiresAt := now.Add(ttl)
+	res, err := conn.ExecContext(ctx, `INSERT INTO leases(repo, provider, project, task_ref, owner_id, role, hold_repository, hold_owner, hold_lane, worktree_path, generation, status, held, claimed_at, renewed_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)`, best.Repo, best.Provider, best.Project, best.TaskRef, ownerID, role, holdRepository, holdOwner, holdLane, worktreePath, bestGeneration+1, claimedAt, claimedAt, expiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("alias acquire: insert: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("alias acquire: lease id: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return nil, fmt.Errorf("alias acquire: commit: %w", err)
+	}
+	committed = true
+	return &Lease{ID: id, LeaseKey: best, OwnerID: ownerID, Role: role, HoldRepository: holdRepository, HoldOwner: holdOwner, HoldLane: holdLane, WorktreePath: worktreePath, Generation: bestGeneration + 1, Status: StatusActive, ClaimedAt: claimedAt, RenewedAt: claimedAt, ExpiresAt: expiresAt}, nil
 }
 
 func (s *SQLiteLeaseStore) acquire(ctx context.Context, key LeaseKey, ownerID, role, worktreePath, holdRepository, holdOwner, holdLane string, now time.Time, ttl time.Duration) (*Lease, error) {

@@ -204,6 +204,14 @@ type AtomicLeaseStore interface {
 	AcquireWithIdentity(context.Context, LeaseKey, string, string, string, string, string, string, time.Time, time.Duration) (*Lease, error)
 }
 
+// AliasAtomicLeaseStore acquires one lease while registering a bounded set of
+// repository aliases in the same durable transaction. Implementations must
+// reject live leases under any registered alias before inserting the selected
+// generation, and must make ordinary Acquire honor the registered exclusion.
+type AliasAtomicLeaseStore interface {
+	AcquireFromAliases(context.Context, []LeaseKey, LeaseKey, string, string, string, string, string, string, time.Time, time.Duration) (*Lease, error)
+}
+
 type RecoveryStore interface {
 	SnapshotExpiredLeases(context.Context, time.Time) ([]*Lease, error)
 	ExpireLeaseCAS(context.Context, int64, int64, time.Time) (*Lease, bool, error)

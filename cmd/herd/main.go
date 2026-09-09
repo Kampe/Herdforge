@@ -3956,15 +3956,20 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if oerr != nil {
 			return nil, fmt.Errorf("approve: process owner identity: %w", oerr)
 		}
-		key := provider.LeaseKey(repository, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, reviewLeaseTaskRef(ref))
+		aliases, kerr := approvalLeaseAliases(ctx, root, repository, cfg.Project.Name, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, reviewLeaseTaskRef(ref))
+		if kerr != nil {
+			return nil, fmt.Errorf("approve refuses unauthenticated repository lease identity: %w", kerr)
+		}
+		preferred := provider.LeaseKey(root, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, reviewLeaseTaskRef(ref))
 		taskRole, rerr := provider.TaskOwnershipRole(nil, "worker")
 		if rerr != nil {
 			return nil, rerr
 		}
-		lease, lerr := stack.AcquireLease(ctx, key, owner, taskRole, taskRole)
+		lease, lerr := stack.AcquireLeaseFromAliases(ctx, aliases, preferred, owner, taskRole, taskRole)
 		if lerr != nil {
 			return nil, fmt.Errorf("approve refuses mutation without live lease: %w", lerr)
 		}
+		key := lease.LeaseKey
 		defer func() {
 			_ = stack.Manager.Release(context.Background(), key, owner, lease.Generation)
 		}()
@@ -4023,6 +4028,48 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		return nil, err
 	}
 	return res, nil
+}
+
+// approvalLeaseAliases keeps the receipt's opaque repository authority
+// separate from provider.LeaseKey's filesystem-root input. Selection and
+// durable acquisition happen later inside ClaimManager's alias transaction.
+func approvalLeaseAliases(ctx context.Context, root, repository, configuredName, providerType, projectID, taskRef string) ([]claim.LeaseKey, error) {
+	expected := dispatch.RepositoryIdentityOrName(root, configuredName)
+	if strings.TrimSpace(repository) == "" || repository != expected {
+		return nil, fmt.Errorf("approval lease repository identity %q does not match authenticated repository %q", repository, expected)
+	}
+	canonical := provider.LeaseKey(root, providerType, projectID, taskRef)
+	candidates := []claim.LeaseKey{canonical}
+	registered, err := worktree.NewWorktreeManager(root).ListWorktrees(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("approval lease registered-worktree inventory failed: %w", err)
+	}
+	for _, wt := range registered {
+		if wt == nil || strings.TrimSpace(wt.Path) == "" {
+			continue
+		}
+		// This is the exact pre-FAC-782 compatibility spelling: the opaque
+		// identity was handed to a path-normalizing LeaseKey while cwd was a
+		// registered worktree. Construct that persisted absolute path directly;
+		// passing it through the corrected LeaseKey would canonicalize it and
+		// lose the legacy row. Only Git-registered paths are candidates.
+		legacyRepo, err := filepath.Abs(filepath.Join(wt.Path, repository))
+		if err != nil {
+			return nil, fmt.Errorf("approval lease legacy alias path: %w", err)
+		}
+		legacy := claim.LeaseKey{Repo: filepath.Clean(legacyRepo), Provider: providerType, Project: projectID, TaskRef: taskRef}
+		seen := false
+		for _, candidate := range candidates {
+			if candidate == legacy {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			candidates = append(candidates, legacy)
+		}
+	}
+	return candidates, nil
 }
 
 // runBoardDone is the strict single-card gate: exit 0 only when the card
