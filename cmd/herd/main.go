@@ -5175,11 +5175,9 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	if wm != nil && strings.TrimSpace(wm.RepoRoot) != "" {
 		governorRoot = wm.RepoRoot
 	}
-	resourceGovernor, governorErr := newResourceGovernor(cfg, governorRoot)
-	if governorErr != nil {
+	if governorErr := attachResourceGovernor(d, cfg, governorRoot); governorErr != nil {
 		return nil, nil, fmt.Errorf("resource governor: %w", governorErr)
 	}
-	d.Resources = resourceGovernor
 	// A fresh checkout may not have a previously published scopefence row.
 	// Dispatch's dependency gate can still establish the authoritative graph,
 	// so bind run-state admission to that same provider-backed snapshot instead

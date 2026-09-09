@@ -3,6 +3,7 @@ package resources
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type ProcessUsage struct {
@@ -24,9 +27,94 @@ type ProcessInspector interface {
 	InUse(context.Context, string) (ProcessUsage, error)
 }
 
+// LifecycleEvidence is read from canonical claim/review records. It is not
+// inferred from a worktree filename or an unsigned TASK-CONTEXT file.
+type LifecycleEvidence struct {
+	ActiveLease           bool
+	FailedCandidate       bool
+	ReviewHandoffAdmitted bool
+}
+
+type LifecycleEvidenceReader interface {
+	Read(context.Context, string, string, RegisteredWorktree) (LifecycleEvidence, error)
+}
+
+// SQLiteLifecycleEvidence reads the existing claim database read-only and the
+// append-only review ledger. Missing or malformed authority is an error: an
+// absent record does not prove that a lane is disposable.
+type SQLiteLifecycleEvidence struct {
+	ClaimsPath string
+	LedgerPath string
+	RepoID     string
+	HostID     string
+}
+
+func (r SQLiteLifecycleEvidence) Read(ctx context.Context, repoRoot, hostID string, lane RegisteredWorktree) (LifecycleEvidence, error) {
+	if strings.TrimSpace(r.ClaimsPath) == "" || strings.TrimSpace(r.LedgerPath) == "" || strings.TrimSpace(r.RepoID) == "" || strings.TrimSpace(hostID) == "" {
+		return LifecycleEvidence{}, errors.New("canonical lifecycle evidence identity is incomplete")
+	}
+	if r.HostID != "" && r.HostID != hostID {
+		return LifecycleEvidence{}, errors.New("canonical lifecycle evidence host mismatch")
+	}
+	dsn := "file:" + r.ClaimsPath + "?mode=ro&_pragma=busy_timeout(1000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return LifecycleEvidence{}, fmt.Errorf("open canonical claim evidence: %w", err)
+	}
+	defer db.Close()
+	var repo, owner, status string
+	var held, generation int64
+	var expires time.Time
+	err = db.QueryRowContext(ctx, `SELECT repo, owner_id, status, held, generation, expires_at FROM leases WHERE worktree_path = ? ORDER BY generation DESC LIMIT 1`, lane.Path).Scan(&repo, &owner, &status, &held, &generation, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return LifecycleEvidence{}, errors.New("canonical claim record unavailable for registered worktree")
+	}
+	if err != nil {
+		return LifecycleEvidence{}, fmt.Errorf("read canonical claim evidence: %w", err)
+	}
+	if repo != r.RepoID || generation < 1 || strings.TrimSpace(owner) == "" || !strings.Contains(owner, hostID) {
+		return LifecycleEvidence{}, errors.New("canonical claim record identity mismatch")
+	}
+	evidence := LifecycleEvidence{ActiveLease: status == "active" && (held != 0 || expires.After(time.Now()))}
+	if err := readReviewLifecycle(r.LedgerPath, lane.Head, &evidence); err != nil {
+		return LifecycleEvidence{}, err
+	}
+	_ = repoRoot
+	return evidence, nil
+}
+
+func readReviewLifecycle(path, head string, evidence *LifecycleEvidence) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read canonical review ledger: %w", err)
+	}
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var row struct{ Event, SHA, Verdict string }
+		if err := json.Unmarshal(line, &row); err != nil {
+			return fmt.Errorf("canonical review ledger evidence: %w", err)
+		}
+		if row.SHA != head {
+			continue
+		}
+		if row.Event == "verdict" && (row.Verdict == "FAIL" || row.Verdict == "BLOCKED") {
+			evidence.FailedCandidate = true
+		}
+		if row.Event == "enqueue" {
+			evidence.ReviewHandoffAdmitted = true
+		}
+	}
+	return nil
+}
+
 type GitWorktreeEnumerator struct {
 	Processes ProcessInspector
 	Now       func() time.Time
+	Evidence  LifecycleEvidenceReader
+	HostID    string
 }
 
 type GitTrackedSourceInspector struct{}
@@ -100,6 +188,16 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 			continue
 		}
 		lanes[i].ActiveCWD, lanes[i].OpenFile = usage.CWD, usage.OpenFile
+		if e.Evidence != nil {
+			evidence, evidenceErr := e.Evidence.Read(ctx, root, e.HostID, lanes[i])
+			if evidenceErr != nil {
+				lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "canonical_lifecycle_evidence_unavailable"
+				continue
+			}
+			lanes[i].ActiveLease = evidence.ActiveLease
+			lanes[i].FailedCandidate = evidence.FailedCandidate
+			lanes[i].ReviewHandoffAdmitted = evidence.ReviewHandoffAdmitted
+		}
 		lanes[i].Held = lanes[i].Held || lanes[i].State == LaneHeld
 		switch {
 		case lanes[i].Category == LaneCurrent:

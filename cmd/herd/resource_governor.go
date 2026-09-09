@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -31,6 +33,10 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 	host, err := os.Hostname()
 	if err != nil || strings.TrimSpace(host) == "" {
 		return nil, fmt.Errorf("resource governor host identity unavailable: %w", err)
+	}
+	repoID, err := dispatch.AuthenticatedRepositoryIdentity(resolved)
+	if err != nil || strings.TrimSpace(repoID) == "" {
+		return nil, fmt.Errorf("resource governor repository identity unavailable: %w", err)
 	}
 	capacity, err := (resources.OSBackend{}).StatFS(resolved)
 	if err != nil || strings.TrimSpace(capacity.FilesystemID) == "" {
@@ -61,9 +67,28 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 		Worktrees: resources.GitWorktreeEnumerator{
 			Processes: resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20},
 			Now:       time.Now,
+			HostID:    host,
+			Evidence: resources.SQLiteLifecycleEvidence{
+				ClaimsPath: filepath.Join(resolved, ".herd", "launch-claims.db"),
+				LedgerPath: reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
+			},
 		},
 		Locks: resources.FileLockProvider{}, Now: time.Now,
 	}, nil
+}
+
+func attachResourceGovernor(d *dispatch.Dispatcher, cfg *config.Config, root string) error {
+	if d == nil {
+		return fmt.Errorf("dispatcher is required")
+	}
+	governor, err := newResourceGovernor(cfg, root)
+	if err != nil {
+		return err
+	}
+	if governor != nil {
+		d.Resources = governor
+	}
+	return nil
 }
 
 func parseForeignTargets(values []string, alertBytes uint64) ([]resources.ForeignTarget, error) {

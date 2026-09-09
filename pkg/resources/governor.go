@@ -233,6 +233,30 @@ type RunOptions struct {
 	ForeignTargets []ForeignTarget
 }
 
+type SweepTrigger string
+
+const (
+	SweepStartup             SweepTrigger = "startup"
+	SweepPeriodic            SweepTrigger = "periodic"
+	SweepPostVerdict         SweepTrigger = "post_verdict"
+	SweepPostHarvest         SweepTrigger = "post_harvest"
+	SweepReviewBeforeRefusal SweepTrigger = "review_before_refusal"
+)
+
+// Sweep is the coordinator-facing lifecycle seam. Callers invoke it at
+// startup, periodically, after verdict/harvest, and before review refusal;
+// trigger is retained in the report mode so those observations are auditable.
+func (g *Governor) Sweep(ctx context.Context, trigger SweepTrigger, apply bool) (GovernorReport, error) {
+	if trigger == "" {
+		return GovernorReport{}, errors.New("resource governor sweep trigger is required")
+	}
+	report, err := g.Run(ctx, RunOptions{Apply: apply})
+	if report.Mode != "" {
+		report.Mode = string(trigger) + ":" + report.Mode
+	}
+	return report, err
+}
+
 func (g *Governor) defaults() {
 	if g.Capacity == nil {
 		g.Capacity = OSBackend{}
@@ -429,39 +453,52 @@ func (g *Governor) inspectTarget(ctx context.Context, lane RegisteredWorktree, r
 		target.Decision, target.Reason = TargetBlocked, "target_allocation_truncated"
 		return target
 	}
+	if containsCanonicalState(target.Path) {
+		target.Decision, target.Reason = TargetBlocked, "nested_canonical_state"
+		return target
+	}
 	target.Decision = TargetWouldReap
 	return target
 }
 
 func laneBlockReason(lane RegisteredWorktree) string {
-	switch {
-	case lane.PreserveReason != "":
+	if lane.PreserveReason != "" {
 		return lane.PreserveReason
-	case lane.Category == LaneCurrent:
+	}
+	if lane.Category == LaneCurrent {
 		return "canonical_checkout"
-	case lane.Category == LaneReviewPool || lane.Category == LaneReviewSurface:
-		if !lane.ReviewHandoffAdmitted {
-			return "review_candidate_immutable"
-		}
-	case lane.FailedCandidate:
+	}
+	if (lane.Category == LaneReviewPool || lane.Category == LaneReviewSurface) && !lane.ReviewHandoffAdmitted {
+		return "review_candidate_immutable"
+	}
+	if lane.FailedCandidate {
 		return "failed_candidate_immutable"
-	case lane.Unmerged && !((lane.Category == LaneReviewPool || lane.Category == LaneReviewSurface) && lane.ReviewHandoffAdmitted):
+	}
+	if lane.Unmerged {
 		return "unmerged_candidate"
-	case lane.Dirty:
+	}
+	if lane.Dirty {
 		return "dirty_source"
-	case lane.Untracked:
+	}
+	if lane.Untracked {
 		return "untracked_source"
-	case lane.ActiveLease:
+	}
+	if lane.ActiveLease {
 		return "active_lease"
-	case lane.Held || lane.State == LaneHeld:
+	}
+	if lane.Held || lane.State == LaneHeld {
 		return "held_lane"
-	case lane.ActiveCWD:
+	}
+	if lane.ActiveCWD {
 		return "active_process_cwd"
-	case lane.OpenFile:
+	}
+	if lane.OpenFile {
 		return "active_process_open_file"
-	case lane.State == LaneActive:
+	}
+	if lane.State == LaneActive {
 		return "active_lane"
-	case lane.State == LaneUnknown:
+	}
+	if lane.State == LaneUnknown {
 		return "lane_state_unknown"
 	}
 	return ""
@@ -494,7 +531,7 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 			report.Targets[i] = again
 			continue
 		}
-		if err := g.RemoveTree(again.Path); err != nil {
+		if err := safeRemoveGeneratedTree(g.Policy.RepositoryRoot, again.Path, g.RemoveTree); err != nil {
 			report.Targets[i].Decision, report.Targets[i].Reason = TargetBlocked, "remove_failed"
 			return fmt.Errorf("remove exact generated target %q: %w", again.Path, err)
 		}
@@ -513,6 +550,54 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 		if again.BeforeBytes >= after.Bytes {
 			report.ReclaimedBytes += again.BeforeBytes - after.Bytes
 		}
+	}
+	return nil
+}
+
+func containsCanonicalState(root string) bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != root && (entry.Name() == ".git" || entry.Name() == ".herd") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// safeRemoveGeneratedTree turns the exact target into an unlinked quarantine
+// entry before deleting it. The parent and target are realpath-checked again,
+// so a symlink retarget cannot redirect RemoveTree into foreign state.
+func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) error {
+	root, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil || !containedPath(root, target) {
+		return errors.New("generated target containment changed before removal")
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil || !containedPath(root, resolved) || filepath.Clean(resolved) != filepath.Clean(target) {
+		return errors.New("generated target realpath changed before removal")
+	}
+	parent := filepath.Dir(resolved)
+	parentResolved, err := filepath.EvalSymlinks(parent)
+	if err != nil || !containedPath(root, parentResolved) || filepath.Clean(parentResolved) != filepath.Clean(parent) {
+		return errors.New("generated target parent realpath changed before removal")
+	}
+	quarantine, err := os.MkdirTemp(parent, ".herd-resource-reap-")
+	if err != nil {
+		return fmt.Errorf("create removal quarantine: %w", err)
+	}
+	defer os.RemoveAll(quarantine)
+	quarantined := filepath.Join(quarantine, filepath.Base(resolved))
+	if err := os.Rename(resolved, quarantined); err != nil {
+		return fmt.Errorf("quarantine generated target: %w", err)
+	}
+	if err := remove(quarantine); err != nil {
+		_ = os.Rename(quarantined, resolved)
+		return fmt.Errorf("remove quarantined generated target: %w", err)
 	}
 	return nil
 }

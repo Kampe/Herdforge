@@ -752,7 +752,7 @@ func (d *Dispatcher) compensate(ctx context.Context, ticketRef, reason string) e
 // without a generation lease or double-fire with outer failOwned
 // (audit h5d6pay5vamxvv277qtt5qmk).
 
-func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*DispatchResult, error) {
+func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (result *DispatchResult, err error) {
 	// Fail closed before any side effect when durable hooks are missing.
 	if err := d.requireCompensator(); err != nil {
 		return nil, err
@@ -792,7 +792,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	// READ-ONLY — no worktree/status/comment/tab yet (FAC-159).
 	var (
 		task *provider.Task
-		err  error
 	)
 	if strings.TrimSpace(opts.TaskID) != "" {
 		task, err = d.getTaskBound(ctx, opts.TaskID)
@@ -1063,9 +1062,19 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if d.Worktree == nil {
 		return nil, failOwned("worktree_service_missing", fmt.Errorf("dispatch worktree service is required"))
 	}
-	wtInfo, err := d.withResourcePermit(ctx, func() (*worktree.WorktreeInfo, error) {
-		return d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
-	})
+	var resourcePermit io.Closer
+	if d.Resources != nil {
+		var report resources.GovernorReport
+		resourcePermit, report, err = d.Resources.AcquireDispatch(ctx)
+		if err != nil {
+			return nil, failOwned("resource_governor_refused", fmt.Errorf("host-local resource governor refused dispatch: %w; report=%s", err, report.JSON()))
+		}
+		if resourcePermit == nil {
+			return nil, failOwned("resource_governor_missing_permit", errors.New("host-local resource governor admitted dispatch without a permit"))
+		}
+		defer func() { err = errors.Join(err, resourcePermit.Close()) }()
+	}
+	wtInfo, err := d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
 	if err != nil {
 		return nil, failOwned("worktree_create_failed", fmt.Errorf("failed to create worktree: %w", err))
 	}
@@ -1201,7 +1210,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 			fmt.Errorf("failed to store canonical receipt: %w", err))
 	}
 
-	result := &DispatchResult{
+	result = &DispatchResult{
 		TicketRef:       task.Ref,
 		TicketTitle:     task.Title,
 		Worktree:        wtInfo.Path,

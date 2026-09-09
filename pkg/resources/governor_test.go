@@ -190,6 +190,26 @@ func TestGovernorRejectsCanonicalPolicyAndSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestGovernorPreservesNestedCanonicalState(t *testing.T) {
+	g, target, _ := governorFor(t, "host", 900000, 900000)
+	if err := os.Mkdir(filepath.Join(target, ".herd"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".herd", "receipt.json"), []byte("evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Targets[0].Decision != TargetBlocked || report.Targets[0].Reason != "nested_canonical_state" {
+		t.Fatalf("nested canonical state target=%+v", report.Targets[0])
+	}
+	if _, err := os.Stat(filepath.Join(target, ".herd", "receipt.json")); err != nil {
+		t.Fatalf("canonical evidence changed: %v", err)
+	}
+}
+
 func TestGovernorRejectsOverlappingTargetsWithoutMutation(t *testing.T) {
 	g, target, _ := governorFor(t, "host", 900000)
 	g.Policy.GeneratedDirectories = []string{"node_modules", "node_modules/cache"}
@@ -217,8 +237,44 @@ func TestReviewHydrationRequiresAdmittedHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if admitted.Targets[0].Decision != TargetWouldReap {
+	if admitted.Targets[0].Decision != TargetBlocked || admitted.Targets[0].Reason != "unmerged_candidate" {
 		t.Fatalf("admitted review hydration=%+v", admitted.Targets[0])
+	}
+}
+
+func TestAdmittedReviewStillHonorsEverySafetyGuard(t *testing.T) {
+	guards := []struct {
+		name string
+		edit func(*RegisteredWorktree)
+		want string
+	}{
+		{"failed", func(l *RegisteredWorktree) { l.FailedCandidate = true }, "failed_candidate_immutable"},
+		{"unmerged", func(l *RegisteredWorktree) { l.Unmerged = true }, "unmerged_candidate"},
+		{"dirty", func(l *RegisteredWorktree) { l.Dirty = true }, "dirty_source"},
+		{"untracked", func(l *RegisteredWorktree) { l.Untracked = true }, "untracked_source"},
+		{"lease", func(l *RegisteredWorktree) { l.ActiveLease = true }, "active_lease"},
+		{"cwd", func(l *RegisteredWorktree) { l.ActiveCWD = true }, "active_process_cwd"},
+		{"open file", func(l *RegisteredWorktree) { l.OpenFile = true }, "active_process_open_file"},
+		{"held", func(l *RegisteredWorktree) { l.Held = true }, "held_lane"},
+		{"unknown", func(l *RegisteredWorktree) { l.State = LaneUnknown }, "lane_state_unknown"},
+	}
+	for _, guard := range guards {
+		t.Run(guard.name, func(t *testing.T) {
+			g, target, lanes := governorFor(t, "host", 900000, 900000)
+			lanes.lanes[0].Category = LaneReviewSurface
+			lanes.lanes[0].ReviewHandoffAdmitted = true
+			guard.edit(&lanes.lanes[0])
+			report, err := g.Run(context.Background(), RunOptions{Apply: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Targets[0].Decision != TargetBlocked || report.Targets[0].Reason != guard.want {
+				t.Fatalf("target=%+v want=%s", report.Targets[0], guard.want)
+			}
+			if _, err := os.Stat(target); err != nil {
+				t.Fatalf("guard allowed mutation: %v", err)
+			}
+		})
 	}
 }
 
