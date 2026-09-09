@@ -290,7 +290,7 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	if repoDir == "" {
 		repoDir = "."
 	}
-	task, err := resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+	task, err := ResolveDoneTask(ctx, tp, req)
 	if err != nil {
 		return nil, err
 	}
@@ -440,6 +440,43 @@ func shortDigest(s string) string {
 	return s
 }
 
+// ResolveDoneTask resolves the target board task for a DoneRequest.
+// When an authenticated completion receipt is present, it MUST use the exact
+// receipt task identity (TaskID) to perform a direct GetTask read on the provider,
+// without calling ListTasks, and validate the task identity, canonical ref,
+// project ID, and acceptance revision. If no receipt is present (e.g. manual override
+// without authenticated task identity), it falls back to resolveTaskByRef.
+func ResolveDoneTask(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (*provider.Task, error) {
+	ref := NormalizeRef(req.Ref)
+	if req.Receipt != nil && strings.TrimSpace(req.Receipt.TaskID) != "" {
+		receipt := req.Receipt
+		task, err := tp.GetTask(ctx, receipt.TaskID)
+		if err != nil {
+			return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but board lookup failed: %w", ErrNoEvidence, ref, receipt.TaskID, err)
+		}
+		if task == nil || strings.TrimSpace(task.ID) == "" {
+			return nil, fmt.Errorf("%w for %s: exact task read returned invalid or error-shaped response for task id %s", ErrNoEvidence, ref, receipt.TaskID)
+		}
+		if task.ID != receipt.TaskID {
+			return nil, fmt.Errorf("%w for %s: receipt task id %s does not match board task id %s", ErrNoEvidence, ref, receipt.TaskID, task.ID)
+		}
+		if receipt.TaskRef != "" && NormalizeRef(receipt.TaskRef) != ref {
+			return nil, fmt.Errorf("%w for %s: receipt task ref %s does not match requested ref %s", ErrNoEvidence, ref, receipt.TaskRef, ref)
+		}
+		if task.Ref != "" && NormalizeRef(task.Ref) != ref {
+			return nil, fmt.Errorf("%w for %s: board task ref %s does not match requested ref %s", ErrNoEvidence, ref, task.Ref, ref)
+		}
+		if req.ProjectID != "" && task.ProjectID != "" && task.ProjectID != req.ProjectID {
+			return nil, fmt.Errorf("%w for %s: board task project %s does not match requested project %s", ErrNoEvidence, ref, task.ProjectID, req.ProjectID)
+		}
+		if receipt.ProvenanceMode != ProvenanceReduced && strings.TrimSpace(receipt.ProviderRevision) == "" {
+			return nil, fmt.Errorf("%w for %s: receipt is missing provider_revision", ErrNoEvidence, ref)
+		}
+		return task, nil
+	}
+	return resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+}
+
 // resolveTaskByRef finds the board card for ref through the task provider.
 // It tries ListTasks + Ref field match first, then falls back to GetTask(ref)
 // so a card the provider knows about but whose Ref field is empty (a
@@ -525,7 +562,7 @@ func BoardDoneFenced(
 	if repoDir == "" {
 		repoDir = "."
 	}
-	task, err := resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+	task, err := ResolveDoneTask(ctx, tp, req)
 	if err != nil {
 		return nil, err
 	}

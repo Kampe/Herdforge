@@ -3865,7 +3865,7 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	}
 	receipt := req.Receipt
 	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
-	approvalTask, err := resolveTaskByRef(ctx, tp, cfg.TaskProvider.ProjectID, ref)
+	approvalTask, err := hsync.ResolveDoneTask(ctx, tp, req)
 	if err != nil {
 		return nil, err
 	}
