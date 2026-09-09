@@ -42,17 +42,47 @@ type HoldIdentity struct {
 }
 
 func (i HoldIdentity) valid() bool {
-	if !canonicalIdentityField(i.Repository) || !canonicalIdentityField(i.Owner) || !canonicalIdentityField(i.Lane) {
-		return false
-	}
-	if i.Scope == "lane" {
-		return i.Task == ""
-	}
-	return i.Scope == "task" && canonicalIdentityField(i.Task)
+	return i.invalidField() == ""
 }
 
-func canonicalIdentityField(value string) bool {
-	return value != "" && value == strings.TrimSpace(value)
+// invalidField names the first non-canonical field, or "" when the identity is
+// complete. Reasons are empty, untrimmed, or a scope/task pairing that does
+// not match the fence. The value is never repaired here: callers name the
+// fault they were given.
+func (i HoldIdentity) invalidField() string {
+	if reason := nonCanonicalIdentityField("repository", i.Repository); reason != "" {
+		return reason
+	}
+	if reason := nonCanonicalIdentityField("owner", i.Owner); reason != "" {
+		return reason
+	}
+	if reason := nonCanonicalIdentityField("lane", i.Lane); reason != "" {
+		return reason
+	}
+	switch i.Scope {
+	case "lane":
+		if i.Task != "" {
+			return "task is set (lane identities require an empty task)"
+		}
+		return ""
+	case "task":
+		return nonCanonicalIdentityField("task", i.Task)
+	default:
+		if i.Scope == "" {
+			return "scope is empty, want lane or task"
+		}
+		return fmt.Sprintf("scope=%s, want lane or task", i.Scope)
+	}
+}
+
+func nonCanonicalIdentityField(name, value string) string {
+	if value == "" {
+		return name + " is empty"
+	}
+	if value != strings.TrimSpace(value) {
+		return name + " is untrimmed"
+	}
+	return ""
 }
 
 // HoldDecision is the single read decision shared by all action callers.
@@ -172,10 +202,8 @@ func taskBindingMismatch(task HoldIdentity, repository, owner, lane string) stri
 		return fmt.Sprintf("lane=%s, want %s", task.Lane, lane)
 	case task.Scope != "task":
 		return fmt.Sprintf("scope=%s, want task", task.Scope)
-	case strings.TrimSpace(task.Task) == "":
-		return "task ref is empty"
 	}
-	return ""
+	return task.invalidField()
 }
 
 // HoldAuthority persists holds and explicit release events in the canonical
@@ -278,8 +306,8 @@ func (a *HoldAuthority) WithUnheldTransition(ctx context.Context, identities []H
 	}
 	return a.withImmediate(ctx, "unheld transition", func(ctx context.Context, q holdSQL) error {
 		for _, identity := range identities {
-			if !identity.valid() {
-				return fmt.Errorf("%w: ambiguous transition identity", ErrActiveTaskUnknown)
+			if reason := identity.invalidField(); reason != "" {
+				return fmt.Errorf("%w: %s", ErrActiveTaskUnknown, reason)
 			}
 			row, exists, err := readHoldTx(ctx, q, identity)
 			if err != nil {
@@ -560,8 +588,8 @@ func cloneTime(t *time.Time) *time.Time {
 // Check is the one admission decision. Missing/corrupt storage denies; a
 // valid identity with no active row is explicitly unheld.
 func (a *HoldAuthority) Check(ctx context.Context, identity HoldIdentity, generation int64) (HoldDecision, error) {
-	if !identity.valid() {
-		return HoldDecision{}, fmt.Errorf("%w: ambiguous identity", ErrActiveTaskUnknown)
+	if reason := identity.invalidField(); reason != "" {
+		return HoldDecision{}, fmt.Errorf("%w: %s", ErrActiveTaskUnknown, reason)
 	}
 	if generation <= 0 {
 		return HoldDecision{}, fmt.Errorf("%w: positive generation is required", ErrHoldAuthorityUnavailable)
@@ -600,8 +628,8 @@ func (a *HoldAuthority) Check(ctx context.Context, identity HoldIdentity, genera
 // CurrentGeneration returns the current durable fence. A never-seen identity
 // starts at generation one; callers still pass that positive value to Check.
 func (a *HoldAuthority) CurrentGeneration(ctx context.Context, identity HoldIdentity) (int64, error) {
-	if !identity.valid() {
-		return 0, fmt.Errorf("%w: ambiguous identity", ErrActiveTaskUnknown)
+	if reason := identity.invalidField(); reason != "" {
+		return 0, fmt.Errorf("%w: %s", ErrActiveTaskUnknown, reason)
 	}
 	var generation int64
 	err := a.db.QueryRowContext(ctx, `SELECT generation FROM lifecycle_hold_state WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=?`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope).Scan(&generation)
@@ -621,8 +649,8 @@ func (a *HoldAuthority) CurrentGeneration(ctx context.Context, identity HoldIden
 // separate from CurrentGeneration because an unseen identity starts at one,
 // while a released generation-one identity must advance to generation two.
 func (a *HoldAuthority) HasCurrent(ctx context.Context, identity HoldIdentity) (bool, error) {
-	if !identity.valid() {
-		return false, fmt.Errorf("%w: ambiguous identity", ErrHoldDenied)
+	if reason := identity.invalidField(); reason != "" {
+		return false, fmt.Errorf("%w: %s", ErrHoldDenied, reason)
 	}
 	var generation int64
 	err := a.db.QueryRowContext(ctx, `SELECT generation FROM lifecycle_hold_state WHERE repository=? AND owner=? AND lane=? AND task=? AND scope=?`, identity.Repository, identity.Owner, identity.Lane, identity.Task, identity.Scope).Scan(&generation)

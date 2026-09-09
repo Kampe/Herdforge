@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 var (
@@ -31,6 +33,14 @@ var (
 const (
 	maxEvidenceLength = 128
 	maxStateBytes     = 16 * 1024
+
+	// envStatePath overrides the resolved path outright.
+	envStatePath = "HERD_WINDDOWN_STATE"
+	// relativeStatePath is the state file's location WITHIN a project root. It
+	// is never the answer on its own: resolved against a lane's cwd it names a
+	// file that cannot exist, because .gitignore keeps this state local and it
+	// therefore lives exactly once, at the project root.
+	relativeStatePath = ".herd/winddown.json"
 )
 
 // Clock allows callers and tests to control timestamps without sleeping.
@@ -227,14 +237,29 @@ func (a *Authority) Gate(ctx context.Context) error {
 	return ErrWinddownActive
 }
 
-// DefaultStatePath is the durable wind-down state file every production
-// caller in this repo uses unless HERD_WINDDOWN_STATE overrides it
-// (mirrors cmd/herd's own winddownStatePath).
+// DefaultStatePath is the ONE definition of where durable wind-down state
+// lives. cmd/herd's winddownStatePath delegates here rather than keeping its
+// own copy.
+//
+// FAC-745: the previous body returned the relative path, so it resolved against
+// the CALLER's cwd. That is wrong for every lane, which runs from a linked
+// worktree: the state is gitignored and exists exactly once, at the project
+// root, so the feedback census's admission gate fail-closed from every lane
+// against state the coordinator had in fact provisioned. Two copies of this
+// rule existed and only cmd/herd's resolved a root — the divergence WAS the
+// defect, which is why there is now one copy.
+//
+// HERD_WINDDOWN_STATE still wins outright. Outside a repository, where there is
+// no project root to resolve, the relative path stands.
 func DefaultStatePath() string {
-	if path := strings.TrimSpace(os.Getenv("HERD_WINDDOWN_STATE")); path != "" {
+	if path := strings.TrimSpace(os.Getenv(envStatePath)); path != "" {
 		return path
 	}
-	return ".herd/winddown.json"
+	root, _, err := gitroot.ProjectRoot(context.Background(), ".")
+	if err != nil {
+		return relativeStatePath
+	}
+	return filepath.Join(root, relativeStatePath)
 }
 
 // ExplainError adds the operator context needed to recover from a wind-down

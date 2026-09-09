@@ -16,15 +16,11 @@ import (
 
 const defaultWinddownStatePath = ".herd/winddown.json"
 
-func winddownStatePath() string {
-	if path := strings.TrimSpace(os.Getenv("HERD_WINDDOWN_STATE")); path != "" {
-		return path
-	}
-	if root, err := canonicalHerdRoot(); err == nil {
-		return filepath.Join(root, defaultWinddownStatePath)
-	}
-	return defaultWinddownStatePath
-}
+// winddownStatePath delegates to the owning package. FAC-745: this used to be a
+// second implementation of the same rule, and the two disagreed — this one
+// resolved a root, pkg/winddown's did not — which fail-closed the feedback
+// census from every lane.
+func winddownStatePath() string { return winddown.DefaultStatePath() }
 
 func newWinddownAuthority() (*winddown.Authority, error) {
 	path := winddownStatePath()
