@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/modelprefix"
 )
 
 type UsageSnapshot struct {
@@ -81,7 +83,7 @@ func FetchProviderModelForce(provider, model string, force bool) (*UsageSnapshot
 	m := strings.ToLower(strings.TrimSpace(model))
 	if strings.Contains(m, "ollama-cloud/") {
 		target = "ollama-cloud"
-	} else if strings.Contains(m, "litellm/") || strings.Contains(m, "lazer/") || strings.Contains(m, "litellm/ollama/") {
+	} else if strings.Contains(m, "litellm/") || strings.Contains(m, "lazer/") || strings.Contains(m, modelprefix.LiteLLMOllama) {
 		target = "litellm"
 	}
 	snap, err := fetchProviderCached(target, force)

@@ -136,7 +136,7 @@ func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Ti
 		if len(resources) == 0 {
 			return ProviderUsage{}, pollErrf("no-windows", "ollama quota: no usable session or weekly window")
 		}
-		return ProviderUsage{DisplayName: "Ollama Cloud", Plan: body.Plan, Account: identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signed:/api/usage"), Resources: resources}, nil
+		return ProviderUsage{DisplayName: "Ollama Cloud", Plan: body.Plan, Account: identity("ollama", base64.StdEncoding.EncodeToString(key.public), ollamaSignedProvenance), Resources: resources}, nil
 	}
 	return ProviderUsage{}, pollErrf("decode-failed", "ollama quota URL is invalid")
 }

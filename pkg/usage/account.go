@@ -27,6 +27,8 @@ type AccountIdentity struct {
 	Provenance string `json:"provenance"`
 }
 
+const ollamaSignedProvenance = "ollama-signed:/api/usage"
+
 // accountKeyDomain namespaces the digest so the same claim under a different
 // provider, or a different scheme version, cannot collide.
 const accountKeyDomain = "herd-account-v1"
@@ -80,7 +82,7 @@ func providerAccountIdentity(name string) *AccountIdentity {
 			return nil
 		}
 		defer zeroOllamaKey(&key)
-		return identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signed:/api/usage")
+		return identity("ollama", base64.StdEncoding.EncodeToString(key.public), ollamaSignedProvenance)
 	case "ollama-cloud":
 		return ollamaCloudCredentialIdentity()
 	}

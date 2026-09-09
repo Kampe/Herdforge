@@ -14,6 +14,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 	"github.com/Kampe/Herdforge/pkg/credits"
+	"github.com/Kampe/Herdforge/pkg/modelprefix"
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 	"github.com/Kampe/Herdforge/pkg/usage"
@@ -105,9 +106,9 @@ func waterfallForShape(shape string) ([]string, error) {
 // kimi-k3 is extra-usage-only; HERD_OLLAMA_USE_KIMI=1 restores Kimi.
 func OllamaHeavyModel() string {
 	if os.Getenv("HERD_OLLAMA_USE_KIMI") == "1" {
-		return "litellm/ollama/kimi-k3:cloud"
+		return modelprefix.LiteLLMOllama + "kimi-k3:cloud"
 	}
-	return "litellm/ollama/glm-5.2:cloud"
+	return modelprefix.LiteLLMOllama + "glm-5.2:cloud"
 }
 
 // ModelFor maps provider:shape to the exact model, "" meaning either
@@ -172,9 +173,9 @@ func ModelFor(provider, shape string) string {
 		case "architecture", "qa", "adversarial", "implementation":
 			return OllamaHeavyModel()
 		case "qa-light", "bounded":
-			return "litellm/ollama/qwen3.5:cloud"
+			return modelprefix.LiteLLMOllama + "qwen3.5:cloud"
 		}
-		return "litellm/ollama/glm-5.2:cloud"
+		return modelprefix.LiteLLMOllama + "glm-5.2:cloud"
 	case "grok":
 		return "grok-4.6"
 	case "lazer":
@@ -466,7 +467,7 @@ func PiModelFor(provider, model string) (string, error) {
 		}
 		return model, nil
 	case "ollama":
-		const prefix = "litellm/ollama/"
+		const prefix = modelprefix.LiteLLMOllama
 		if !strings.HasPrefix(model, prefix) {
 			return "", fmt.Errorf("unsupported Pi ollama model %q", model)
 		}
