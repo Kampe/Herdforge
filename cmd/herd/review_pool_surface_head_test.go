@@ -56,6 +56,33 @@ func staleSurfaceFixture(t *testing.T) (surface, wantSHA, actualHead, target str
 	return surface, wantSHA, actualHead, target
 }
 
+func TestReviewContractRequiresBothFilesOnCandidateSurface(t *testing.T) {
+	surface := t.TempDir()
+	for _, path := range []string{".herd/prompts/reviewer.md", ".herd/prompts/review-verdict.template.md"} {
+		full := filepath.Join(surface, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("candidate contract\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := verifyReviewContract(surface); err != nil {
+		t.Fatalf("candidate-owned contract should pass: %v", err)
+	}
+	for _, missing := range []string{".herd/prompts/reviewer.md", ".herd/prompts/review-verdict.template.md"} {
+		if err := os.Remove(filepath.Join(surface, missing)); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyReviewContract(surface); err == nil || !strings.Contains(err.Error(), missing) {
+			t.Fatalf("missing candidate contract/template must fail with exact path %q, got %v", missing, err)
+		}
+		if err := os.WriteFile(filepath.Join(surface, missing), []byte("candidate contract\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // This is the PRODUCTION function runPoolReview calls at both checkpoints
 // (before the --no-launch "ready" print and before herdr.Send). Driving it
 // directly against a manufactured stale alias is what proves the check
@@ -150,6 +177,25 @@ func TestVerifySurfaceCandidateGuardsBothReadyAndLaunch(t *testing.T) {
 	if readyIdx+secondVerify > sendIdx {
 		t.Fatal("the launch-path verifySurfaceCandidate call runs AFTER herdr.Send; a reviewer would already have " +
 			"been handed the packet before the surface was checked")
+	}
+}
+
+func TestReviewContractGuardPrecedesPacketAndKeepsPoolCleanup(t *testing.T) {
+	src, err := os.ReadFile("review_pool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := funcBody(string(src), "func runPoolReview(")
+	if !ok {
+		t.Fatal("cannot locate runPoolReview")
+	}
+	contractIdx := strings.Index(body, "verifyReviewContract(surface)")
+	packetIdx := strings.Index(body, "os.WriteFile(packet")
+	if contractIdx < 0 || packetIdx < 0 || contractIdx > packetIdx {
+		t.Fatal("candidate contract gate must run before packet creation")
+	}
+	if !strings.Contains(body, "defer func()") || !strings.Contains(body, "p.Release(context.Background(), lease.LeaseID)") {
+		t.Fatal("contract refusal must retain provisional pool-lease cleanup")
 	}
 }
 

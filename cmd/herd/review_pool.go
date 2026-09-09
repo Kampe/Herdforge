@@ -106,6 +106,19 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
+	// FAC-668 correction finding 1: validate the candidate's review contract
+	// against the EXACT candidate tree BEFORE any provenance or pool state
+	// changes. Below this point the launch may record an operator-asserted
+	// builder family (a ledger write), resolve the reviewer route, lease a
+	// slot, EVICT stale occupants, reset the slot --hard and create the
+	// surface symlink. Neither the lease-release defer nor any later cleanup
+	// can un-write a provenance row or undo an eviction. A candidate whose
+	// tree cannot prove the reviewer contract must be refused while every one
+	// of those mutations is still ahead of us.
+	if err := verifyCandidateTreeContract(root, sha); err != nil {
+		return err
+	}
+
 	// FAC-608: prove the candidate's builder family BEFORE spending anything.
 	// Admission refuses a verdict whose builder-family is not provable, and it
 	// refused 25 of 41 artifacts in one inbox for exactly that -- each one after a
@@ -336,6 +349,29 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("create review surface symlink: %w", err)
 	}
 
+	// FAC-668 correction finding 1: from here until a successful handoff the
+	// surface is PROVISIONAL. Any failure on the way out must remove the
+	// symlink THIS launch created — ownership-fenced: never the surface root,
+	// never a surface some other run or reviewer owns. The lease-release defer
+	// above cannot do this: the lease is pool state, the symlink is ours.
+	surfaceProvisional := true
+	defer func() {
+		if surfaceProvisional {
+			_ = os.Remove(surface)
+		}
+	}()
+
+	// Validate the exact pinned candidate and its repository-owned review
+	// contract before creating any packet or provenance artifact. Failure is
+	// handled by the pool-lease cleanup defer above and removes the
+	// provisional surface symlink above.
+	if err := verifySurfaceCandidate(surface, sha); err != nil {
+		return err
+	}
+	if err := verifyReviewContract(surface); err != nil {
+		return err
+	}
+
 	packet := filepath.Join(*packetRoot, surfaceName+".md")
 	if err := capacityLease.update(admissionPhasePacket); err != nil {
 		return fmt.Errorf("advance admission phase to packet: %w", err)
@@ -397,17 +433,6 @@ func runPoolReview(ref string) error {
 			"this candidate will be refused at harvest admission until a record row carries its lease and patch id\n", err)
 	}
 
-	// FAC-626: verify the surface's actual content agrees with the candidate
-	// BEFORE reporting anything ready or launching anything into it. The
-	// reset above pins THIS process's own leased slot, which is sound on its
-	// own -- this re-reads through the exact symlink a reviewer (or an
-	// operator reading the "ready" line) would follow, so a defect anywhere
-	// in that chain (a reused lease, a symlink pointing somewhere unexpected)
-	// is caught here rather than trusted because a path merely exists.
-	if err := verifySurfaceCandidate(surface, sha); err != nil {
-		return err
-	}
-
 	if *noLaunch {
 		// FAC-626: --no-launch hands the surface to a LATER, manual reviewer
 		// dispatch (see the top-of-file doc comment: "the lease remains held
@@ -417,6 +442,7 @@ func runPoolReview(ref string) error {
 		// reset this SAME slot before anyone had dispatched into it -- the
 		// live incident. The lease stays held.
 		releaseOnFailure = false
+		surfaceProvisional = false
 		fmt.Printf("review surface ready ref=%s sha=%s lease=%s path=%s packet=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, packet)
 		return nil
 	}
@@ -520,6 +546,7 @@ func runPoolReview(ref string) error {
 	}
 	cleanupTab = false
 	releaseOnFailure = false
+	surfaceProvisional = false
 	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s pool=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Pool, reviewer.Family)
 	return nil
@@ -705,6 +732,79 @@ func verifySurfaceCandidate(surface, wantSHA string) error {
 			"a reviewer dispatched here would review a different commit and its verdict would be misattributed to the "+
 			"requested candidate (FAC-626 refuses rather than serve it)",
 		surface, wantSHA, resolvedTarget, target, gotHead)
+}
+
+const (
+	reviewerContractPath = ".herd/prompts/reviewer.md"
+	verdictTemplatePath  = ".herd/prompts/review-verdict.template.md"
+)
+
+// verifyReviewContract checks the pinned candidate surface, not the checkout
+// that launched the review. A reviewer must receive the same instructions and
+// artifact template that exist in the commit being reviewed; consulting a
+// shared-root copy would make a stale candidate appear reviewable.
+func verifyReviewContract(surface string) error {
+	for _, rel := range []string{reviewerContractPath, verdictTemplatePath} {
+		path := filepath.Join(surface, rel)
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("review candidate is missing required contract/template %s: %w", rel, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("review candidate required contract/template %s is not a regular file", rel)
+		}
+	}
+	return nil
+}
+
+// verifyCandidateTreeContract validates the repository-owned review contract
+// paths against the EXACT candidate git tree, not the working tree of
+// whatever worktree currently holds the candidate.
+//
+// FAC-668 correction finding 2: an os.Stat on the surface cannot prove
+// candidate provenance. `git reset --hard` never removes untracked files, so
+// a stale .herd/prompts/reviewer.md left by a prior slot occupant satisfied a
+// Stat-based gate even when the reviewed commit never contained the path; and
+// Stat follows symlinks, so a tracked symlink hands the reviewer contract
+// content owned by whatever the link targets. Either way a reviewer follows
+// instructions the reviewed commit does not own.
+//
+// The candidate tree is the authority instead: each required path must be a
+// TRACKED REGULAR BLOB (mode 100644/100755) of the exact commit. Missing and
+// untracked are the same fact to a tree; mode 120000 (symlink) and non-blob
+// entries refuse. Runs BEFORE the pool lease, so a refusal cannot cost a slot.
+func verifyCandidateTreeContract(root, sha string) error {
+	for _, rel := range []string{reviewerContractPath, verdictTemplatePath} {
+		out, err := exec.Command("git", "-C", root, "ls-tree", sha, "--", rel).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("candidate contract %s: inspect tree %s: %v: %s",
+				rel, shortSHA(sha), err, strings.TrimSpace(string(out)))
+		}
+		entry := strings.TrimSpace(string(out))
+		if entry == "" {
+			return fmt.Errorf("candidate %s does not track %s in its git tree: "+
+				"the reviewer contract must be a tracked regular blob of the exact reviewed commit; "+
+				"untracked leftovers and symlinks are not the candidate's own contract",
+				shortSHA(sha), rel)
+		}
+		fields := strings.Fields(entry)
+		if len(fields) < 2 {
+			return fmt.Errorf("candidate contract %s: cannot parse git ls-tree output %q for %s",
+				rel, entry, shortSHA(sha))
+		}
+		mode, kind := fields[0], fields[1]
+		if kind != "blob" {
+			return fmt.Errorf("candidate %s tracks %s as a %s, not a regular file blob; "+
+				"the reviewer contract must be a tracked regular blob of the exact reviewed commit",
+				shortSHA(sha), rel, kind)
+		}
+		if mode != "100644" && mode != "100755" {
+			return fmt.Errorf("candidate %s tracks %s with mode %s: symlinked or special contract entries are refused; "+
+				"the reviewer contract must be a tracked regular blob of the exact reviewed commit",
+				shortSHA(sha), rel, mode)
+		}
+	}
+	return nil
 }
 
 // headMatchesSHA reports whether dir's HEAD is exactly sha. A resolution error
@@ -1559,7 +1659,9 @@ shared checkout, that is a finding to report, not a step to take.
 Candidate: %s
 Surface: %s
 
-Read docs/prompts/review-contract.md and inspect only this candidate.
+Read .herd/prompts/reviewer.md and .herd/prompts/review-verdict.template.md from
+the candidate surface and inspect only this candidate. These paths are
+candidate-owned; never fall back to files from the shared checkout.
 
 WRITE YOUR VERDICT ARTIFACT TO EXACTLY THIS PATH:
 

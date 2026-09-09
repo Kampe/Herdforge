@@ -88,6 +88,19 @@ func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
 	}
 }
 
+func TestReviewPacketNamesRepositoryOwnedContractPaths(t *testing.T) {
+	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-668")
+	for _, path := range []string{".herd/prompts/reviewer.md", ".herd/prompts/review-verdict.template.md"} {
+		if !strings.Contains(body, path) {
+			t.Errorf("packet must name candidate-owned contract path %q", path)
+		}
+	}
+	obsolete := strings.Join([]string{"docs/prompts", "review-contract.md"}, "/")
+	if strings.Contains(body, obsolete) {
+		t.Error("packet must not name the obsolete shared/nonexistent contract")
+	}
+}
+
 // The contract the packet advertises must be the contract the parser accepts.
 // If these two drift, reviewers follow instructions and still get refused.
 func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
