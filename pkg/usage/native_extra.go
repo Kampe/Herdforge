@@ -182,11 +182,47 @@ type litellmKeyInfo struct {
 
 func litellmPoll() (ProviderUsage, error) {
 	key := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
+	if key == "" {
+		key = litellmConfiguredKey()
+	}
 	base := litellmBaseURL()
 	if key == "" || base == "" {
 		return ProviderUsage{}, pollErrf("auth-missing", "litellm self-key or configured base URL is unavailable")
 	}
 	return litellmPollWithURL(base+"/key/info", key)
+}
+
+func litellmConfiguredKey() string {
+	for _, path := range opencodeAuthFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var auth map[string]struct {
+			Key   string `json:"key"`
+			Token string `json:"token"`
+		}
+		if json.Unmarshal(raw, &auth) != nil {
+			continue
+		}
+		keys := make([]string, 0, len(auth))
+		for name := range auth {
+			if name != "opencode-go" {
+				keys = append(keys, name)
+			}
+		}
+		sort.Strings(keys)
+		for _, name := range keys {
+			entry := auth[name]
+			if key := strings.TrimSpace(entry.Key); key != "" {
+				return key
+			}
+			if token := strings.TrimSpace(entry.Token); token != "" {
+				return token
+			}
+		}
+	}
+	return ""
 }
 
 // litellmBaseURL follows the existing OpenCode provider configuration before

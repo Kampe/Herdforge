@@ -202,3 +202,26 @@ func TestGrokPollInvalidAuthFile(t *testing.T) {
 		t.Fatal("expected error for invalid auth.json")
 	}
 }
+
+func TestFetchProviderModelUsesBillingAuthority(t *testing.T) {
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+	var opencodeCalls, litellmCalls int
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){
+		"opencode": func() (ProviderUsage, error) {
+			opencodeCalls++
+			return ProviderUsage{}, pollErrf("auth-missing", "opencode-go is absent")
+		},
+		"litellm": func() (ProviderUsage, error) {
+			litellmCalls++
+			return ProviderUsage{Resources: map[string]ResourceUsage{"budget": {Unit: "usd", Used: 1, Limit: 10, Remaining: 9, WindowSeconds: WindowWeekly}}}, nil
+		},
+	})
+	defer restore()
+	snap, err := FetchProviderModelForce("opencode", "litellm/ollama/deepseek-v4-flash:cloud", false)
+	if err != nil || snap == nil || litellmCalls != 1 || opencodeCalls != 0 {
+		t.Fatalf("model authority was not selected: snap=%+v err=%v litellm=%d opencode=%d", snap, err, litellmCalls, opencodeCalls)
+	}
+	if _, ok := snap.Providers["opencode"]; !ok {
+		t.Fatalf("billing result was not re-keyed to requested route: %+v", snap.Providers)
+	}
+}

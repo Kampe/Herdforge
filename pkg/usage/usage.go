@@ -70,6 +70,36 @@ func FetchProviderForce(provider string, force bool) (*UsageSnapshot, error) {
 	return fetchProviderCached(provider, force)
 }
 
+// FetchProviderModelForce acquires the quota authority for the requested model,
+// rather than confusing the harness that launches it with its billing pool.
+// OpenCode is a launcher for several gateways: litellm/ and ollama/ models use
+// the LiteLLM authority, while opencode/ models use the OpenCode authority.
+func FetchProviderModelForce(provider, model string, force bool) (*UsageSnapshot, error) {
+	target := strings.ToLower(strings.TrimSpace(provider))
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.Contains(m, "litellm/") || strings.Contains(m, "lazer/") || strings.Contains(m, "ollama/") || strings.Contains(m, "ollama-cloud") {
+		target = "litellm"
+	}
+	snap, err := fetchProviderCached(target, force)
+	if err != nil || snap == nil || target == strings.ToLower(strings.TrimSpace(provider)) {
+		return snap, err
+	}
+	canonical := strings.ToLower(strings.TrimSpace(provider))
+	if canonical == "agy" {
+		canonical = "antigravity"
+	}
+	if canonical == "lazer" {
+		canonical = "litellm"
+	}
+	if usage, ok := snap.Providers[target]; ok {
+		snap.Providers = map[string]ProviderUsage{canonical: usage}
+	}
+	if detail, ok := snap.Errors[target]; ok {
+		snap.Errors = map[string]string{canonical: detail}
+	}
+	return snap, nil
+}
+
 // nativePollers is the full set of providers pkg/usage polls directly. Every
 // harness the fleet routes for has a native poller; there is no helper-binary
 // path anywhere.

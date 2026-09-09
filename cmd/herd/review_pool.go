@@ -1430,7 +1430,7 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 		// An explicit provider is already a routing decision. Acquire only that
 		// native authority so a Claude review cannot trigger unrelated AGY/Grok
 		// requests or fail because an unused account is unavailable.
-		snap, err = usage.FetchProviderForce(provider, false)
+		snap, err = usage.FetchProviderModelForce(provider, model, false)
 	} else {
 		snap, age, err = usage.FetchSnapshotCached()
 	}
