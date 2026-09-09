@@ -310,6 +310,39 @@ func TestKimiQuotaIsTruthfullyUnsupported(t *testing.T) {
 	}
 }
 
+func TestKimiCodePollMapsUsageAndLimitsWithoutIdentity(t *testing.T) {
+	s := serve(t, 200, `{"usage":{"used":25,"limit":100,"remaining":75,"reset_at":"2099-01-01T00:00:00Z"},"limits":[{"detail":{"used":4,"limit":10,"remaining":6},"window":{"duration":5,"timeUnit":"HOUR"}}]}`)
+	p, err := kimiPollWithURL(s.URL, "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account != nil {
+		t.Fatal("missing Kimi account claim must remain direct-only")
+	}
+	if p.Resources["weekly"].Unit != "requests" || p.Resources["limit1"].WindowSeconds != Window5h {
+		t.Fatalf("Kimi Code usage mapping lost semantics: %+v", p.Resources)
+	}
+}
+
+func TestKimiCodeConfiguredProductionPathUsesLocalCredentials(t *testing.T) {
+	s := serve(t, 200, `{"usage":{"used":1,"limit":10,"remaining":9,"reset_at":"2099-01-01T00:00:00Z"}}`)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".kimi", "credentials"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".kimi", "config.toml"), []byte("provider = \"kimi-code\"\nbase_url = \""+s.URL+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".kimi", "credentials", "kimi-code.json"), []byte(`{"access_token":"tok"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := kimiPoll()
+	if err != nil || p.Resources["weekly"].Remaining != 9 {
+		t.Fatalf("configured Kimi Code path failed: err=%v usage=%+v", err, p.Resources)
+	}
+}
+
 func TestNative429PreservesRetryAfter(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "17")
@@ -376,7 +409,7 @@ func TestPollersErrorRatherThanReportZeroQuota(t *testing.T) {
 // The whole point of FAC-229: these providers are pollable WITHOUT the
 // OpenUsage macOS helper.
 func TestNativePollersCoverEveryHarness(t *testing.T) {
-	for _, want := range []string{"grok", "claude", "codex", "gemini"} {
+	for _, want := range []string{"grok", "claude", "codex", "gemini", "antigravity", "litellm", "opencode", "kimi"} {
 		if _, ok := nativePollers[want]; !ok {
 			t.Errorf("%s has no native poller; it would still need the OpenUsage binary", want)
 		}

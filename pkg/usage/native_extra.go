@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -352,11 +353,110 @@ func opencodePollWithURL(url, token string) (ProviderUsage, error) {
 	if len(resources) == 0 {
 		return ProviderUsage{}, pollErrf("no-windows", "opencode usage: no Go-plan windows")
 	}
-	return ProviderUsage{DisplayName: "OpenCode Go", Resources: resources}, nil
+	account := identity("opencode", body.Account, "opencode-usage:account_id")
+	return ProviderUsage{DisplayName: "OpenCode Go", Account: account, Resources: resources}, nil
 }
 
 func kimiPoll() (ProviderUsage, error) {
-	return ProviderUsage{}, pollErrf("unsupported", "kimi has no supported native quota endpoint")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ProviderUsage{}, pollErrf("auth-missing", "kimi home is unavailable")
+	}
+	config, err := os.ReadFile(filepath.Join(home, ".kimi", "config.toml"))
+	if err != nil {
+		return ProviderUsage{}, pollErrf("unsupported", "Kimi platform is not configured")
+	}
+	text := string(config)
+	if !strings.Contains(strings.ToLower(text), "kimi-code") && !strings.Contains(text, "api.kimi.com/coding") {
+		return ProviderUsage{}, pollErrf("unsupported", "configured Kimi platform is not Kimi Code")
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".kimi", "credentials", "kimi-code.json"))
+	if err != nil {
+		return ProviderUsage{}, pollErrf("auth-missing", "Kimi Code credentials are unavailable; run kimi /login")
+	}
+	var credentials struct {
+		AccessToken string `json:"access_token"`
+		AccountID   string `json:"account_id"`
+	}
+	if json.Unmarshal(raw, &credentials) != nil || strings.TrimSpace(credentials.AccessToken) == "" {
+		return ProviderUsage{}, pollErrf("auth-missing", "Kimi Code credentials are unusable; run kimi /login")
+	}
+	base := "https://api.kimi.com/coding/v1"
+	if i := strings.Index(text, "base_url"); i >= 0 {
+		line := text[i:]
+		if q := strings.IndexAny(line, "\"'"); q >= 0 {
+			line = line[q+1:]
+			if end := strings.IndexAny(line, "\"'"); end > 0 {
+				base = line[:end]
+			}
+		}
+	}
+	return kimiPollWithURL(strings.TrimRight(base, "/")+"/usages", credentials.AccessToken, credentials.AccountID)
+}
+
+type kimiUsageValue struct {
+	Used      float64 `json:"used"`
+	Remaining float64 `json:"remaining"`
+	Limit     float64 `json:"limit"`
+	ResetAt   string  `json:"reset_at"`
+}
+type kimiUsageResponse struct {
+	Usage  *kimiUsageValue `json:"usage"`
+	Limits []struct {
+		Detail *kimiUsageValue `json:"detail"`
+		Window struct {
+			Duration int    `json:"duration"`
+			TimeUnit string `json:"timeUnit"`
+		} `json:"window"`
+	} `json:"limits"`
+}
+
+func kimiPollWithURL(url, token, accountClaim string) (ProviderUsage, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := pollClient().Do(req)
+	if err != nil {
+		return ProviderUsage{}, netPollError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("kimi usage", resp)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ProviderUsage{}, httpStatusPollError("kimi usage", resp.StatusCode)
+	}
+	var body kimiUsageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "kimi usage decode: %v", err)
+	}
+	resources := map[string]ResourceUsage{}
+	add := func(name string, value *kimiUsageValue, seconds int) {
+		if value == nil || value.Limit <= 0 || value.Used < 0 || value.Remaining < 0 {
+			return
+		}
+		if value.Used == 0 && value.Remaining == 0 {
+			value.Used = value.Limit
+		}
+		resources[name] = ResourceUsage{Kind: "consumption", State: "active", Pool: "default", Unit: "requests", Limit: value.Limit, Used: value.Used, Remaining: value.Remaining, ResetsAt: value.ResetAt, WindowSeconds: seconds}
+	}
+	add("weekly", body.Usage, WindowWeekly)
+	for i, limit := range body.Limits {
+		seconds := WindowWeekly
+		if limit.Window.Duration > 0 {
+			seconds = limit.Window.Duration * 60
+			if strings.Contains(strings.ToUpper(limit.Window.TimeUnit), "HOUR") {
+				seconds = limit.Window.Duration * 3600
+			}
+		}
+		add(fmt.Sprintf("limit%d", i+1), limit.Detail, seconds)
+	}
+	if len(resources) == 0 {
+		return ProviderUsage{}, pollErrf("no-windows", "kimi usage: no quota windows")
+	}
+	return ProviderUsage{DisplayName: "Kimi Code", Account: identity("kimi", accountClaim, "kimi-code-config:account_id"), Resources: resources}, nil
 }
 
 func litellmPollWithURL(url, token string) (ProviderUsage, error) {

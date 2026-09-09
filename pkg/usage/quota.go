@@ -43,6 +43,9 @@ type BurnState struct {
 	RunwayResource      string               `json:"runwayResource,omitempty"`
 	Available           bool                 `json:"available"`
 	Reason              string               `json:"reason"`
+	Unit                string               `json:"unit,omitempty"`
+	Pool                string               `json:"pool,omitempty"`
+	Account             *AccountIdentity     `json:"account,omitempty"`
 	Stale               bool                 `json:"stale"`
 	Plan                string               `json:"plan,omitempty"`
 	Windows             []BurnState          `json:"windows,omitempty"`
@@ -173,7 +176,8 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		// 0%-used resource with no reset timestamp stays skipped: that is
 		// indistinguishable from absent data, which is the case the original
 		// guard was protecting against.
-		if r.Unit != "percent" {
+		originalUnit := r.Unit
+		if !normalizeResourcePercent(&r) {
 			continue
 		}
 		rin := resetsIn(r.ResetsAt, now)
@@ -222,6 +226,9 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 			Pressure:            pressure,
 			RunwayMinutes:       runwayMinutes,
 			ExhaustsBeforeReset: exhaustsBeforeReset,
+			Unit:                originalUnit,
+			Pool:                r.Pool,
+			Account:             prov.Account,
 		})
 	}
 	if len(windows) == 0 {
@@ -285,6 +292,26 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		result.RunwayResource = runwayState.Resource
 	}
 	return &result
+}
+
+func normalizeResourcePercent(r *ResourceUsage) bool {
+	if r == nil || math.IsNaN(r.Used) || math.IsInf(r.Used, 0) || math.IsNaN(r.Limit) || math.IsInf(r.Limit, 0) {
+		return false
+	}
+	if r.Unit == "percent" {
+		return r.Limit >= 0 && r.Used >= 0 && r.Used <= 100
+	}
+	if r.Limit <= 0 || r.Used < 0 || r.Used > r.Limit {
+		return false
+	}
+	if r.Unit != "usd" && r.Unit != "requests" {
+		return false
+	}
+	r.Used = r.Used / r.Limit * 100
+	r.Remaining = math.Max(100-r.Used, 0)
+	r.Limit = 100
+	r.Unit = "percent"
+	return true
 }
 
 func poolResources(name string, prov ProviderUsage) map[string]map[string]bool {

@@ -64,6 +64,36 @@ func providerAccountIdentity(name string) *AccountIdentity {
 		return grokAccountIdentity()
 	case "gemini":
 		return geminiAccountIdentity()
+	case "opencode":
+		return opencodeAccountIdentity()
+	}
+	return nil
+}
+
+func opencodeAccountIdentity() *AccountIdentity {
+	for _, path := range opencodeAuthFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var auth map[string]struct {
+			AccountID string `json:"account_id"`
+			AccountId string `json:"accountId"`
+		}
+		if json.Unmarshal(raw, &auth) != nil {
+			continue
+		}
+		entry, ok := auth["opencode-go"]
+		if !ok {
+			continue
+		}
+		claim := strings.TrimSpace(entry.AccountID)
+		if claim == "" {
+			claim = strings.TrimSpace(entry.AccountId)
+		}
+		if id := identity("opencode", claim, "opencode-auth:auth.json:account_id"); id != nil {
+			return id
+		}
 	}
 	return nil
 }
