@@ -188,6 +188,21 @@ func TestProviderProbeSentinelMatching(t *testing.T) {
 	}
 }
 
+func TestProviderProbeSentinelMatchingIgnoresTerminalTitles(t *testing.T) {
+	raw := "\x1b]0;orchestrator: ready\a\x1b]0;orchestrator: working\aHERD_PROVIDER_PROBE_OK\n\x1b]0;orchestrator: done\a"
+	if ok, reason := classifyProviderProbeOutput(raw, raw+"\n\x1b[0m\n> build · lazer/glm-5.3-flash\n", nil, false); !ok || reason != "" {
+		t.Fatalf("OSC-decorated exact sentinel classified as ok=%t reason=%q", ok, reason)
+	}
+	if ok, reason := classifyProviderProbeOutput("\x1b]0;ready\x1b\\HERD_PROVIDER_PROBE_OK\x1b]0;done\x1b\\", "", nil, false); !ok || reason != "" {
+		t.Fatalf("ST-decorated exact sentinel classified as ok=%t reason=%q", ok, reason)
+	}
+	for _, raw := range []string{"\x1b]0;ready\aHERD_PROVIDER_PROBE_OK\x1b]0;done\a prompt echo"} {
+		if ok, _ := classifyProviderProbeOutput(raw, raw, nil, false); ok {
+			t.Fatalf("non-exact normalized probe output %q was accepted", raw)
+		}
+	}
+}
+
 func containsProbeArg(args []string, want string) bool {
 	for _, arg := range args {
 		if arg == want {
