@@ -23,6 +23,19 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
+// ReviewRefPrefix and ReviewRetirementManifestFile are the canonical names
+// shared by review admission, retirement discovery, and manifest validation.
+// Keeping these in the policy package prevents callers from drifting into a
+// second review namespace or registry file.
+const (
+	ReviewRefPrefix              = "refs/herd/reviews/"
+	ReviewRetirementManifestFile = ".herd/review/retirement-manifests.jsonl"
+)
+
+func ReviewRetirementRegistryPath(root string) string {
+	return filepath.Join(root, ReviewRetirementManifestFile)
+}
+
 type ReviewRetirementManifest struct {
 	Repository        string `json:"repository"`
 	TaskRef           string `json:"task_ref"`
@@ -236,7 +249,7 @@ func ValidateReviewRetirementManifest(m ReviewRetirementManifest) error {
 	if m.ManifestArtifact != "" && (filepath.IsAbs(m.ManifestArtifact) || filepath.Clean(m.ManifestArtifact) == "." || strings.HasPrefix(filepath.Clean(m.ManifestArtifact), ".."+string(filepath.Separator))) {
 		return errors.New("review retirement manifest artifact must be repository-relative")
 	}
-	if m.ReviewRef != "" && (!strings.HasPrefix(m.ReviewRef, "refs/herd/reviews/") || strings.Contains(m.ReviewRef, "..")) {
+	if m.ReviewRef != "" && (!strings.HasPrefix(m.ReviewRef, ReviewRefPrefix) || strings.Contains(m.ReviewRef, "..")) {
 		return errors.New("review retirement manifest review_ref is outside the owned review namespace")
 	}
 	return nil

@@ -120,7 +120,7 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 	if a == nil || strings.TrimSpace(a.root) == "" {
 		return fmt.Errorf("review retirement authority is unavailable")
 	}
-	registry := herdr.ReviewRetirementRegistry{Path: filepath.Join(a.root, ".herd", "review", "retirement-manifests.jsonl")}
+	registry := herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(a.root)}
 	all, err := registry.Latest()
 	if err != nil {
 		return err

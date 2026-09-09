@@ -14,7 +14,7 @@ import (
 // runReviewRetirementCleanup is shared by `herd cleanup` and the acting drain
 // edge. Its default is observe-only; callers must explicitly request acting.
 func runReviewRetirementCleanup(ctx context.Context, root string, dryRun bool) (herdr.ReviewRetirementReport, error) {
-	registry := herdr.ReviewRetirementRegistry{Path: filepath.Join(root, ".herd", "review", "retirement-manifests.jsonl")}
+	registry := herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(root)}
 	rows, err := registry.Latest()
 	if err != nil {
 		return herdr.ReviewRetirementReport{}, err

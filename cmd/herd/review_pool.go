@@ -627,7 +627,7 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 	if cfg == nil {
 		return errors.New("review retirement manifest requires launch configuration")
 	}
-	reviewRef := "refs/herd/reviews/" + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	reviewRef := herdr.ReviewRefPrefix + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
 	if _, err := exec.Command("git", "-C", rootAbs, "update-ref", reviewRef, sha, "").CombinedOutput(); err != nil {
 		return fmt.Errorf("create exact owned review ref: %w", err)
 	}
@@ -654,7 +654,7 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 		ReviewerFamily: reviewer.Family, ReviewerModel: reviewer.Model, PromptArtifact: filepath.ToSlash(packetRel), PromptDigest: reviewack.ArtifactDigest(packetBody), Surface: filepath.ToSlash(surfaceRel), ReviewRef: reviewRef,
 		Generation: generation, Nonce: lease.LeaseID,
 	})
-	registry := herdr.ReviewRetirementRegistry{Path: filepath.Join(rootAbs, ".herd", "review", "retirement-manifests.jsonl")}
+	registry := herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(rootAbs)}
 	manifestRel := filepath.ToSlash(filepath.Join(".herd", "review", "manifests", generation+".json"))
 	m.ManifestArtifact = manifestRel
 	m.BindingDigest = herdr.ReviewRetirementBindingDigest(m)
