@@ -65,14 +65,21 @@ Run one relay/watch owner per exact recipient, with the configured host and
 canonical mailbox paths supplied explicitly:
 
 ```zsh
+: "${HERD_WSL_HERD_ROOT:?set the absolute canonical WSL Herdforge root}"
+: "${HERD_CANONICAL_ROOT:?set the absolute canonical coordinator Herdforge root}"
+
 ./scripts/fac773-mail-relay.zsh \
   --host wsl-box \
-  --remote-binary /home/kampe/Projects/Herdforge/bin/herd \
-  --remote-mail /home/kampe/Projects/Herdforge/.herd/control-mail.jsonl \
-  --local-binary /Users/kampe/Projects/Herdforge/bin/herd \
-  --local-mail /Users/kampe/Projects/Herdforge/.herd/control-mail.jsonl \
+  --remote-binary "$HERD_WSL_HERD_ROOT/bin/herd" \
+  --remote-mail "$HERD_WSL_HERD_ROOT/.herd/control-mail.jsonl" \
+  --local-binary "$HERD_CANONICAL_ROOT/bin/herd" \
+  --local-mail "$HERD_CANONICAL_ROOT/.herd/control-mail.jsonl" \
   --recipient <exact-herdr-name> --workspace <exact-workspace-id>
 ```
+
+Both root variables must expand to absolute canonical roots before invocation;
+the relay still rejects relative paths. `wsl-box` is the configured source
+host, not a guessed SSH alias, and the recipient/workspace remain exact.
 
 The relay uses `ssh` with `BatchMode`, bounded connection/command deadlines,
 and the literal supported host `wsl-box`; it rejects unsafe or relative path
