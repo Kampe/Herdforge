@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -257,6 +258,11 @@ func TestWatchWakeReconcilesPreexistingOrdinaryReportAndRestartDoesNotRedeliver(
 	env := queuedSendEnv(bin, repo)
 	body := "exact report bytes\nsecond line"
 	box := mail.NewMailbox(filepath.Join(repo, ".herd", "control-mail.jsonl"))
+	if err := box.AppendEnvelopeContext(context.Background(), &mail.Envelope{
+		ID: "historical-read-report", Sender: "worker", Recipient: "worker", Subject: "old report", Body: "already read", Read: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	report, err := box.SendMessage("worker", "worker", "FAC-773 report", body)
 	if err != nil {
 		t.Fatal(err)
@@ -298,7 +304,7 @@ func TestMailCLIFromWorktreeWritesCanonicalProjectMailbox(t *testing.T) {
 	}
 	bin, _, _ := installQueuedSendFake(t, "working", "0")
 	env := queuedSendEnv(bin, repo)
-	env = append(env, "HERD_ROOT="+lane, "HERD_PROJECT_ROOT=")
+	env = append(env, "HERD_ROOT="+lane, "HERD_PROJECT_ROOT="+repo, "HERD_CANONICAL_ROOT=", "HERD_MAIL_FILE=")
 	body := "worktree producer report"
 	out, err := runHerd(t, lane, env, "mail", "send", "--from", "worker", "--to", "coordinator", "--subject", "FAC-773 report", "--body", body)
 	if err != nil {

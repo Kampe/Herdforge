@@ -75,6 +75,9 @@ func (m *Mailbox) PendingRoutine(recipient string) ([]*Envelope, error) {
 		if env.Subject == QueuedDeliverySubject {
 			return true
 		}
+		if env.Read {
+			return false
+		}
 		if IsControlSubject(env.Subject) {
 			return false
 		}
