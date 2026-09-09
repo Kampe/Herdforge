@@ -287,6 +287,7 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 			UpstreamURL:     upstreamURL,
 			UpstreamProject: upstreamProject,
 			UpstreamCLI:     upstreamCLI,
+			CoreTaskReads:   k != nil && k.CoreTaskReads,
 		})
 		if cerr != nil {
 			_ = stack.Close()

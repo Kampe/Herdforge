@@ -352,26 +352,35 @@ func (k *KaneoProvider) mutateStatusFullSchemaPUT(ctx context.Context, taskID, s
 		return fmt.Errorf("kaneo: APIURL required for AtomicFenceServer mutate")
 	}
 	payload := map[string]any{"status": status}
-	if cur, err := k.GetTask(ctx, taskID); err == nil && cur != nil {
-		title := cur.Title
-		if title == "" {
-			title = taskID
-		}
-		priority := string(cur.Priority)
-		if priority == "" {
-			priority = "medium"
-		}
-		projectID := cur.ProjectID
-		if projectID == "" {
-			projectID = k.ProjectID
-		}
-		payload = map[string]any{
-			"title": title, "description": cur.Description, "status": status,
-			"priority": priority, "projectId": projectID,
-		}
-		if cur.HasPosition {
-			payload["position"] = cur.Position
-		}
+	cur, err := k.GetTask(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("kaneo: status prerequisite read: %w", err)
+	}
+	if cur == nil {
+		return fmt.Errorf("kaneo: status prerequisite read returned no task")
+	}
+	if expectedProject := strings.TrimSpace(k.ProjectID); expectedProject != "" &&
+		strings.TrimSpace(cur.ProjectID) != expectedProject {
+		return fmt.Errorf("kaneo: status prerequisite project mismatch: requested %q got %q", expectedProject, cur.ProjectID)
+	}
+	title := cur.Title
+	if title == "" {
+		title = taskID
+	}
+	priority := string(cur.Priority)
+	if priority == "" {
+		priority = "medium"
+	}
+	projectID := cur.ProjectID
+	if projectID == "" {
+		projectID = k.ProjectID
+	}
+	payload = map[string]any{
+		"title": title, "description": cur.Description, "status": status,
+		"priority": priority, "projectId": projectID,
+	}
+	if cur.HasPosition {
+		payload["position"] = cur.Position
 	}
 	body, _ := json.Marshal(payload)
 	url := kaneoTaskResourceURL(apiURL, taskID)

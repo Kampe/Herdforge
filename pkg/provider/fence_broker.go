@@ -77,6 +77,7 @@ type FenceBrokerConfig struct {
 	UpstreamURL     string
 	UpstreamProject string
 	UpstreamCLI     bool
+	CoreTaskReads   bool
 }
 
 // StartFenceBroker acquires exclusive claim-dir lock and serves.
@@ -171,6 +172,7 @@ func StartFenceBroker(cfg FenceBrokerConfig) (*FenceBroker, error) {
 	}
 
 	up := NewKaneoProvider(cfg.UpstreamURL, cfg.UpstreamProject, cfg.UpstreamCLI)
+	up.CoreTaskReads = cfg.CoreTaskReads
 	up.RequireCASMeta = false
 	up.AtomicFenceServer = false
 	up.Receiver = nil
