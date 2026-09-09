@@ -45,6 +45,13 @@ lanes:
 	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	poisonedConfig := filepath.Join(t.TempDir(), "herd.yaml")
+	poisoned := strings.Replace(config, "doctor-fixture", "poisoned-parent-config", 1)
+	poisoned = strings.Replace(poisoned, "codex-lane", "poisoned-lane", 1)
+	if err := os.WriteFile(poisonedConfig, []byte(poisoned), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONFIG_PATH", poisonedConfig)
 
 	binDir := t.TempDir()
 	for _, command := range []string{"agy", "codex", "grok", "opencode"} {
@@ -56,7 +63,7 @@ lanes:
 
 	cmd := exec.Command(buildHerd(t), "doctor-models")
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "PATH="+binDir)
+	cmd.Env = append(filterEnv(os.Environ(), "HERD_CONFIG_PATH"), "PATH="+binDir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("doctor-models failed: %v\n%s", err, out)

@@ -154,7 +154,7 @@ func boundProbeFailureDetail(detail, status string) string {
 	}
 	limit := maxProbeFailureDetail - len(suffix)
 	if limit <= len(probeDetailTruncation) {
-		return status[:maxProbeFailureDetail]
+		return boundProbeDetail(status)
 	}
 	return detail[:limit-len(probeDetailTruncation)] + probeDetailTruncation + suffix
 }

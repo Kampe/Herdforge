@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -284,6 +285,21 @@ func TestProbeProviderModel_BoundsMultilineFailureDetail(t *testing.T) {
 	}
 	if len(result.Reason) > len("probe failed: ")+maxProbeFailureDetail {
 		t.Fatalf("failure detail exceeded bound: %d", len(result.Reason))
+	}
+}
+
+func TestBoundProbeFailureDetail_StatusWindowIsBounded(t *testing.T) {
+	for _, statusLen := range []int{4066, 4067, 4070, 4071, 4072} {
+		t.Run(fmt.Sprintf("status-%d", statusLen), func(t *testing.T) {
+			status := strings.Repeat("s", statusLen)
+			got := boundProbeFailureDetail(strings.Repeat("d", 5000), status)
+			if len(got) > maxProbeFailureDetail {
+				t.Fatalf("failure detail length = %d, want <= %d", len(got), maxProbeFailureDetail)
+			}
+			if !strings.Contains(got, strings.Repeat("s", 32)) {
+				t.Fatalf("bounded failure detail lost status evidence: len=%d", len(got))
+			}
+		})
 	}
 }
 
