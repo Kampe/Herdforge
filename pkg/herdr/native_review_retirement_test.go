@@ -3,6 +3,7 @@ package herdr
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,5 +140,79 @@ func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *tes
 	}
 	if agent.TabGeneration != 0 || tab.Generation != "" || tab.TabGeneration != "" {
 		t.Fatalf("fixture unexpectedly supplied generation: agent=%+v tab=%+v", agent, tab)
+	}
+}
+
+func TestNativeRetirementClosesLiveSettledReviewerAndProvesAbsence(t *testing.T) {
+	// This is a disposable process owned by this test, not a fleet process.
+	child := exec.Command("sleep", "60")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+
+	closed := false
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			if closed {
+				return `{"result":{"agents":[]}}`, nil
+			}
+			return `{"result":{"agents":[{"name":"forge-mender-fac708-nat-d4b3b8dc","agent_status":"idle","pane_id":"wK:p15T","tab_id":"wK:t15T","workspace_id":"wK","terminal_id":"term_fixture","focused":false,"agent_session":{"value":"session-fixture"}}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			if closed {
+				return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("exit status 1")
+			}
+			return fmt.Sprintf(`{"result":{"process_info":{"pane_id":"wK:p15T","shell_pid":0,"foreground_processes":[{"pid":%d,"name":"sleep","argv":["sleep","60"]}]}}}`, child.Process.Pid), nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
+			if closed {
+				return `{"result":{"tabs":[]}}`, nil
+			}
+			return `{"result":{"tabs":[{"tab_id":"wK:t15T","workspace_id":"wK","number":15,"pane_count":1,"focused":false}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "compare-close" {
+			return `unknown command: compare-close`, errors.New("exit status 1")
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "close" {
+			closed = true
+			return `{"result":{}}`, nil
+		}
+		return "", fmt.Errorf("unexpected fake Herdr command %v", args)
+	}
+
+	oldStartToken := readPIDStartToken
+	readPIDStartToken = func(pid int) (string, error) {
+		if pid != child.Process.Pid {
+			return "", fmt.Errorf("unexpected pid %d", pid)
+		}
+		return "fixture-start-token", nil
+	}
+	t.Cleanup(func() { readPIDStartToken = oldStartToken })
+
+	root := t.TempDir()
+	op := &NativeReviewRetirementOp{Root: root, RepositoryIdentity: "fixture-repo"}
+	m := ReviewRetirementManifest{
+		Repository: "fixture-repo", TaskRef: "FAC-708", TaskID: "task-708",
+		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Branch: "refs/herd/reviews/fac-708",
+		Worktree: ".herd/pool-fac708/pool-01", Pool: ".herd/pool-fac708", Slot: "pool-01", LeaseGeneration: 7,
+		Workspace: "wK", TabID: "wK:t15T", PaneID: "wK:p15T", TerminalID: "term_fixture", SessionID: "session-fixture",
+		Reviewer: "forge-mender-fac708-nat-d4b3b8dc", ReviewerFamily: "openai", ReviewerModel: "gpt-5.6-luna",
+		PromptArtifact: ".herd/review/prompts/fac-708.md", Generation: "live-close-1", Nonce: "lease-live-1",
+		RecordedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := op.Close(m); err != nil {
+		t.Fatalf("live settled close: %v", err)
+	}
+	if !closed {
+		t.Fatal("fake Herdr close transition was not invoked")
+	}
+	if _, err := AgentList(); err != nil {
+		t.Fatalf("agent absence readback: %v", err)
 	}
 }

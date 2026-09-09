@@ -163,6 +163,34 @@ func TestRetireReviewLanesStopsAfterEarlierFailure(t *testing.T) {
 	}
 }
 
+func TestRetireReviewLanesFaultMatrixStopsBeforeLaterDestructiveBoundary(t *testing.T) {
+	m := retirementManifest(t, "fault-matrix")
+	boundaries := []string{
+		"close", "lease-release", "journal-worktree-intent", "worktree",
+		"journal-worktree-done", "journal-ref-intent", "branch", "journal-ref-done",
+		"journal-artifacts-intent", "artifact", "journal-artifacts-done", "receipt",
+	}
+	for _, boundary := range boundaries {
+		t.Run(boundary, func(t *testing.T) {
+			f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"fault-matrix": retirementEvidence(m)}, fail: boundary}
+			r, err := RetireReviewLanes(f, []ReviewRetirementManifest{m}, false)
+			if err == nil || r.Failed != 1 {
+				t.Fatalf("boundary %s was not surfaced: report=%+v err=%v events=%v", boundary, r, err, f.events)
+			}
+			seen := false
+			for _, event := range f.events {
+				if event == boundary {
+					seen = true
+					continue
+				}
+				if seen && (event == "worktree" || event == "branch" || event == "artifact" || event == "receipt") {
+					t.Fatalf("later destructive boundary %q ran after injected %q: %v", event, boundary, f.events)
+				}
+			}
+		})
+	}
+}
+
 func TestRetireReviewLanesDryRunNeverMutates(t *testing.T) {
 	m := retirementManifest(t, "g1")
 	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"g1": retirementEvidence(m)}}
