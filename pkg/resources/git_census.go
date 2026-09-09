@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 type ProcessUsage struct {
@@ -209,7 +210,7 @@ func readReviewLifecycle(path, head string, evidence *LifecycleEvidence) error {
 	if err != nil {
 		return fmt.Errorf("read canonical review ledger: %w", err)
 	}
-	queue, err := read(filepath.Join(filepath.Dir(path), "harvest-queue.jsonl"))
+	queue, err := read(filepath.Join(filepath.Dir(path), gitroot.ReviewQueueLeaf))
 	if err != nil {
 		return fmt.Errorf("read canonical review queue: %w", err)
 	}

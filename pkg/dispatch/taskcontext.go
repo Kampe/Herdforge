@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -24,7 +25,7 @@ import (
 // worktree; no provider-native context file is seeded (a .kaneo.json
 // convenience file was an unguarded ambient-mutation affordance and a
 // crash-consistency hazard).
-const TaskContextFile = "TASK-CONTEXT.json"
+const TaskContextFile = gitroot.TaskContextFile
 
 // AuthorityScopeCandidateSupersession distinguishes the explicit coordinator
 // recovery packet that may replace a Recovering lifecycle candidate from the

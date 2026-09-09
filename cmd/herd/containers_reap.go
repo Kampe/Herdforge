@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // FAC-598: agents create containers and abandon them, and this machine OOMs.
@@ -172,7 +174,7 @@ func reapReason(c dockerContainer, project string) string {
 // verification run, so it cannot outlive that run legitimately.
 func ephemeralWorkDir(dir string) bool {
 	d := strings.ToLower(dir)
-	for _, frag := range []string{"/.herd/pool/", managedWorktreeFrag, "/tmp/", "/private/tmp/", "/.worktrees/"} {
+	for _, frag := range []string{gitroot.ReviewPoolPathFragment, managedWorktreeFrag, "/tmp/", "/private/tmp/", gitroot.LegacyWorktreePathFragment} {
 		if strings.Contains(d, frag) {
 			return true
 		}

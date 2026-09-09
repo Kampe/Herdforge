@@ -422,13 +422,12 @@ func (n *nativeIntegrationSteps) runtimeNeedsFetch(ctx context.Context, landed s
 		}
 		return false, err
 	}
-	raw, err = nativeIntegrationCommand(ctx, n.root, 15*time.Second, "git", "merge-base", "--is-ancestor", landed, "origin/main")
-	if err == nil {
-		return false, nil
+	ancestor, ancestorErr := gitroot.GitCommitIsAncestor(ctx, n.root, landed, "origin/main")
+	if ancestorErr != nil {
+		return false, ancestorErr
 	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == 1 && len(bytes.TrimSpace(raw)) == 0 {
+	if !ancestor {
 		return true, nil
 	}
-	return false, err
+	return false, nil
 }

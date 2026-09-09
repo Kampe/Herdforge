@@ -15,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -77,7 +78,7 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 			Evidence: resources.SQLiteLifecycleEvidence{
 				ClaimsPath:         deps.ResolveLaunchLeasePath(resolved),
 				LaunchClaimsPath:   deps.ResolveLaunchLeasePath(resolved),
-				RecoveryClaimsPath: filepath.Join(resolved, ".herd", "herdforge.db"),
+				RecoveryClaimsPath: lifecycle.CanonicalStatePath(resolved),
 				TaskClaimsPath:     filepath.Join(claimDir, "leases.db"),
 				LedgerPath:         reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
 				SignedTarget: func(_ context.Context, worktreePath string, _ resources.RegisteredWorktree) (resources.SignedTarget, error) {
