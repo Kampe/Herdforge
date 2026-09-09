@@ -3956,7 +3956,10 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		if oerr != nil {
 			return nil, fmt.Errorf("approve: process owner identity: %w", oerr)
 		}
-		key := provider.LeaseKey(repository, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, reviewLeaseTaskRef(ref))
+		key, kerr := approvalLeaseKey(root, repository, cfg.Project.Name, cfg.TaskProvider.Type, cfg.TaskProvider.ProjectID, reviewLeaseTaskRef(ref))
+		if kerr != nil {
+			return nil, fmt.Errorf("approve refuses unauthenticated repository lease identity: %w", kerr)
+		}
 		taskRole, rerr := provider.TaskOwnershipRole(nil, "worker")
 		if rerr != nil {
 			return nil, rerr
@@ -4023,6 +4026,18 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 		return nil, err
 	}
 	return res, nil
+}
+
+// approvalLeaseKey keeps the receipt's opaque repository authority separate
+// from provider.LeaseKey's filesystem-root input. The authority remains in
+// the receipt and callback; the durable lease key is rooted in the canonical
+// repository so linked worktrees share one generation sequence.
+func approvalLeaseKey(root, repository, configuredName, providerType, projectID, taskRef string) (claim.LeaseKey, error) {
+	expected := dispatch.RepositoryIdentityOrName(root, configuredName)
+	if strings.TrimSpace(repository) == "" || repository != expected {
+		return claim.LeaseKey{}, fmt.Errorf("approval lease repository identity %q does not match authenticated repository %q", repository, expected)
+	}
+	return provider.LeaseKey(root, providerType, projectID, taskRef), nil
 }
 
 // runBoardDone is the strict single-card gate: exit 0 only when the card

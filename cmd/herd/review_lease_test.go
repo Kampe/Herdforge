@@ -14,8 +14,71 @@ import (
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/verifier"
 )
+
+func TestApprovalLeaseKey_UsesOneIdentityAcrossRegisteredWorktrees(t *testing.T) {
+	root := t.TempDir()
+	gitIn(t, root, "init", "-b", "main")
+	gitIn(t, root, "config", "user.email", "test@example.invalid")
+	gitIn(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "seed"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", "seed")
+	gitIn(t, root, "commit", "-m", "chore: seed")
+	wtA := filepath.Join(t.TempDir(), "registered-a")
+	wtB := filepath.Join(t.TempDir(), "registered-b")
+	gitIn(t, root, "worktree", "add", "-b", "approval-a", wtA, "main")
+	gitIn(t, root, "worktree", "add", "-b", "approval-b", wtB, "main")
+
+	repository := dispatch.RepositoryIdentityOrName(root, "herdforge-test")
+	keyA, err := approvalLeaseKey(wtA, repository, "herdforge-test", "memory", "proj", "FAC-782:review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := approvalLeaseKey(wtB, repository, "herdforge-test", "memory", "proj", "FAC-782:review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyA != keyB {
+		t.Fatalf("approval lease identity split across registered worktrees: A=%+v B=%+v", keyA, keyB)
+	}
+	canonical := provider.LeaseKey(root, "memory", "proj", "FAC-782:review")
+	if keyA != canonical {
+		t.Fatalf("approval key=%+v, want canonical filesystem-root key=%+v", keyA, canonical)
+	}
+
+	stack := provider.NewTestStack(t, provider.NewMemoryProvider())
+	owner, err := stack.AcquireLease(context.Background(), keyA, "live-owner", "worker", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stack.AcquireLease(context.Background(), keyB, "foreign-owner", "worker", "worker"); err == nil {
+		t.Fatal("live owner on the recognized worktree alias must block a second approval lease")
+	}
+	if _, _, err := stack.Leases.Release(context.Background(), keyA, owner.OwnerID, owner.Generation, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	next, err := stack.AcquireLease(context.Background(), keyB, "next-owner", "worker", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Generation != 2 {
+		t.Fatalf("released generation did not continue across worktree cwd: got %d want 2", next.Generation)
+	}
+	foreignProject := provider.LeaseKey(root, "memory", "foreign-project", "FAC-782:review")
+	if _, err := stack.AcquireLease(context.Background(), foreignProject, "foreign-project-owner", "worker", "worker"); err != nil {
+		t.Fatalf("foreign project row should remain isolated, not join the approval key: %v", err)
+	}
+	if _, err := approvalLeaseKey(root, "foreign-repository", "herdforge-test", "memory", "proj", "FAC-782:review"); err == nil {
+		t.Fatal("foreign repository identity must be refused")
+	}
+	if owner.Generation != 1 {
+		t.Fatalf("first approval generation=%d, want 1", owner.Generation)
+	}
+}
 
 func TestRequireLiveLeaseReacquiresReviewLeaseAfterWorkerRelease(t *testing.T) {
 	root := t.TempDir()
