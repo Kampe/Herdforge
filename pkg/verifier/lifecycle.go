@@ -778,6 +778,9 @@ func (o *ownedSubprocess) killTracked(includeLeader bool) error {
 	handles := make([]ownedHandle, 0, len(o.handles))
 	for pid, h := range o.handles {
 		if !includeLeader {
+			if pid == o.leader {
+				continue
+			}
 			if _, protected := o.protected[pid]; protected {
 				continue
 			}
