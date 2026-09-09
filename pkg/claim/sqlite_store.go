@@ -51,18 +51,26 @@ func NewSQLiteLeaseStore(path string) (*SQLiteLeaseStore, error) {
 }
 
 // OpenSQLiteLeaseStoreReadOnly opens canonical lease evidence without creating
-// the database or running migrations. Census and reaping callers must never
-// turn missing authority into a write or a disposable lane.
+// the database or running migrations. It rejects non-regular paths and pings
+// the read-only connection so unavailable authority remains a hard error.
 func OpenSQLiteLeaseStoreReadOnly(path string) (*SQLiteLeaseStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("read-only lease store path is required")
 	}
-	if _, err := os.Stat(path); err != nil {
-		return nil, err
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat lease store: %w", err)
 	}
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(1000)", path))
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("lease store is not a regular file")
+	}
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(10000)", path))
 	if err != nil {
 		return nil, fmt.Errorf("open read-only lease store: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping read-only lease store: %w", err)
 	}
 	return &SQLiteLeaseStore{db: db}, nil
 }

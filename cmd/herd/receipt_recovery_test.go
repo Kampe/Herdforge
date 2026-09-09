@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,17 +11,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 type recoveryReceiptFixture struct {
-	root, worktree, base, candidate, advancedMain string
-	cfg                                           *config.Config
-	task                                          *provider.Task
-	prior                                         dispatch.TaskContext
-	signer                                        *dispatch.Signer
+	root, worktree, base, candidate, advancedMain, keyDir string
+	cfg                                                   *config.Config
+	task                                                  *provider.Task
+	prior                                                 dispatch.TaskContext
+	signer                                                *dispatch.Signer
 }
 
 func recoveryGit(t *testing.T, dir string, args ...string) string {
@@ -118,7 +120,7 @@ func newRecoveryReceiptFixture(t *testing.T) recoveryReceiptFixture {
 	if err := dispatch.StoreCanonicalReceipt(root, prior); err != nil {
 		t.Fatal(err)
 	}
-	return recoveryReceiptFixture{root: root, worktree: worktree, base: base, candidate: candidate, advancedMain: advancedMain, cfg: cfg, task: task, prior: prior, signer: signer}
+	return recoveryReceiptFixture{root: root, worktree: worktree, base: base, candidate: candidate, advancedMain: advancedMain, keyDir: keyDir, cfg: cfg, task: task, prior: prior, signer: signer}
 }
 
 func TestRecoveryReceiptIdentityPreservesAuthenticatedBaseWhenOriginMainAdvances(t *testing.T) {
@@ -218,5 +220,151 @@ func TestAuthenticatedRecoveryIdentityRejectsGenericRecoverySentinelAsSupersessi
 	}
 	if _, err := authenticatedRecoveryIdentity(context.Background(), f.root, f.worktree, f.task.Ref, f.prior.Branch, f.candidate, f.cfg, f.task); err == nil {
 		t.Fatal("generic recovery-sentinel receipt was promoted into candidate-supersession provenance")
+	}
+}
+
+func TestSelectCanonicalRecoveryReceiptIgnoresStaleHigherGenerationOtherLease(t *testing.T) {
+	f := newRecoveryReceiptFixture(t)
+	stale := f.prior
+	stale.LeaseID = "claim:227"
+	stale.LeaseGeneration = 3
+	stale.SessionID = "stale-worker-session"
+	stale.ExpiresAt = time.Now().Add(-time.Hour)
+	if err := dispatch.WriteTaskContext(f.worktree, stale); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := f.signer.Issue(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery := f.prior
+	recovery.Role = dispatch.RoleRecovery
+	recovery.AuthorityScope = dispatch.AuthorityScopeCandidateSupersession
+	recovery.LeaseID = "claim:318"
+	recovery.LeaseGeneration = 1
+	recovery.LeaseTaskRef = f.task.Ref + ":recovery"
+	recovery.SessionID = "current-recovery-session"
+	recovery.AllowedOps = dispatch.OpsForRole(dispatch.RoleRecovery)
+	recovery.ExpiresAt = time.Now().Add(time.Hour)
+	recovery, err = f.signer.Issue(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, recovery); err != nil {
+		t.Fatal(err)
+	}
+
+	selected, err := dispatch.SelectCanonicalRecoveryReceipt(f.root, dispatch.RecoveryReceiptSelector{
+		ProviderType: recovery.ProviderType, ProjectID: recovery.ProjectID,
+		Repository: recovery.Repository, Role: dispatch.RoleRecovery,
+		TaskRef: recovery.TaskRef, TaskID: recovery.TaskID, Branch: recovery.Branch,
+		BaseSHA: recovery.BaseSHA, CandidateSHA: recovery.CandidateSHA, LeaseID: recovery.LeaseID,
+		LeaseGeneration: recovery.LeaseGeneration, LeaseTaskRef: recovery.LeaseTaskRef,
+		SessionID: recovery.SessionID,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selected.EqualsIssued(recovery) {
+		t.Fatalf("selected stale or altered receipt: got session %s lease %s generation %d", selected.SessionID, selected.LeaseID, selected.LeaseGeneration)
+	}
+	generic, err := dispatch.LoadCanonicalReceipt(f.root, f.task.Ref)
+	if err != nil || generic.LeaseGeneration != stale.LeaseGeneration {
+		t.Fatalf("fixture did not reproduce old newest-generation selection: %v, got generation %d", err, generic.LeaseGeneration)
+	}
+}
+
+func recoveryCLIArgs(tc dispatch.TaskContext, target string) []string {
+	return []string{"receipt", "recover", "--provider-type", tc.ProviderType, "--project-id", tc.ProjectID,
+		"--repository", tc.Repository, "--role", tc.Role, "--task-id", tc.TaskID, "--branch", tc.Branch,
+		"--base-sha", tc.BaseSHA, "--candidate-sha", tc.CandidateSHA, "--lease-id", tc.LeaseID,
+		"--lease-generation", fmt.Sprintf("%d", tc.LeaseGeneration), "--lease-task-ref", tc.LeaseTaskRef,
+		"--session-id", tc.SessionID, tc.TaskRef, target}
+}
+
+func TestReceiptRecoverCLIRequiresExactTargetAndReadOnlyLeaseObservation(t *testing.T) {
+	f := newRecoveryReceiptFixture(t)
+	recovery := f.prior
+	recovery.Role = dispatch.RoleRecovery
+	recovery.AuthorityScope = dispatch.AuthorityScopeCandidateSupersession
+	recovery.LeaseTaskRef = f.task.Ref + ":recovery"
+	recovery.SessionID = "public-cli-recovery"
+	recovery.AllowedOps = dispatch.OpsForRole(dispatch.RoleRecovery)
+	recovery.ExpiresAt = time.Now().Add(time.Hour)
+	storePath := filepath.Join(f.root, ".herd", "herdforge.db")
+	leaseStore, err := claim.NewSQLiteLeaseStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: recovery.Repository, Provider: recovery.ProviderType, Project: recovery.ProjectID, TaskRef: recovery.LeaseTaskRef}, "coordinator-recovery", dispatch.RoleRecovery, f.worktree, time.Now(), time.Hour)
+	if err != nil {
+		leaseStore.Close()
+		t.Fatal(err)
+	}
+	if err := leaseStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovery.LeaseID = fmt.Sprintf("claim:%d", lease.ID)
+	recovery.LeaseGeneration = lease.Generation
+	recovery, err = f.signer.Issue(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, recovery); err != nil {
+		t.Fatal(err)
+	}
+	binary := buildHerd(t)
+	before, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(storePath); err != nil {
+		t.Fatal(err)
+	}
+	out, err := herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(recovery, f.worktree)...).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "read-only") && !strings.Contains(string(out), "lease store") {
+		t.Fatalf("missing lease DB must fail closed: err=%v output=%s", err, out)
+	}
+	if _, statErr := os.Stat(storePath); !os.IsNotExist(statErr) {
+		t.Fatalf("missing DB refusal recreated lease store: %v", statErr)
+	}
+	after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile))
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("missing DB refusal changed target receipt: %v", err)
+	}
+
+	leaseStore, err = claim.NewSQLiteLeaseStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err = leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: recovery.Repository, Provider: recovery.ProviderType, Project: recovery.ProjectID, TaskRef: recovery.LeaseTaskRef}, "coordinator-recovery", dispatch.RoleRecovery, f.worktree, time.Now(), time.Hour)
+	if err != nil {
+		leaseStore.Close()
+		t.Fatal(err)
+	}
+	if err := leaseStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovery.LeaseID = fmt.Sprintf("claim:%d", lease.ID)
+	recovery.LeaseGeneration = lease.Generation
+	recovery.SessionID = "public-cli-recovery-success"
+	recovery, err = f.signer.Issue(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, recovery); err != nil {
+		t.Fatal(err)
+	}
+	out, err = herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(recovery, f.worktree)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("exact registered recovery target should succeed: %v output=%s", err, out)
+	}
+	got, err := dispatch.ReadTaskContext(f.worktree)
+	if err != nil || !got.EqualsIssued(recovery) || got.BaseSHA != f.base {
+		t.Fatalf("successful recovery changed signed authority/base: %v got=%+v", err, got)
 	}
 }

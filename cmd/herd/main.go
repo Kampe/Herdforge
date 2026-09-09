@@ -596,6 +596,18 @@ func main() {
 // generation-fenced.
 func runReceiptRecover() {
 	fs := flag.NewFlagSet("receipt recover", flag.ExitOnError)
+	providerType := fs.String("provider-type", "", "exact provider type")
+	projectID := fs.String("project-id", "", "exact provider project ID")
+	repository := fs.String("repository", "", "exact repository identity")
+	role := fs.String("role", dispatch.RoleRecovery, "exact receipt role (must be recovery)")
+	taskID := fs.String("task-id", "", "exact provider task ID")
+	branch := fs.String("branch", "", "exact target branch")
+	baseSHA := fs.String("base-sha", "", "exact authenticated base SHA")
+	candidateSHA := fs.String("candidate-sha", "", "exact target HEAD/candidate SHA")
+	leaseID := fs.String("lease-id", "", "exact durable lease ID")
+	leaseGeneration := fs.Int64("lease-generation", 0, "exact durable lease generation")
+	leaseTaskRef := fs.String("lease-task-ref", "", "exact durable lease task ref")
+	sessionID := fs.String("session-id", "", "exact canonical receipt session")
 	args := os.Args[2:]
 	if len(args) > 0 && args[0] == "recover" {
 		args = args[1:]
@@ -611,22 +623,33 @@ func runReceiptRecover() {
 		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
 		os.Exit(1)
 	}
-	tc, err := dispatch.LoadCanonicalReceipt(root, ref)
+	tc, err := dispatch.SelectCanonicalRecoveryReceipt(root, dispatch.RecoveryReceiptSelector{
+		ProviderType: *providerType, ProjectID: *projectID, Repository: *repository,
+		Role: *role, TaskRef: ref, TaskID: *taskID, Branch: *branch, BaseSHA: *baseSHA, CandidateSHA: *candidateSHA,
+		LeaseID: *leaseID, LeaseGeneration: *leaseGeneration, LeaseTaskRef: *leaseTaskRef,
+		SessionID: *sessionID,
+	}, time.Now())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
 		os.Exit(1)
 	}
-	verifier, err := dispatch.LoadVerifier(root)
-	if err != nil {
+	if err := validateRecoveryTarget(context.Background(), root, target, tc); err != nil {
 		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
 		os.Exit(1)
 	}
-	if err := verifier.Verify(tc); err != nil {
-		fmt.Fprintf(os.Stderr, "herd receipt recover: canonical receipt authentication failed: %v\n", err)
+	if err := requireExactRecoveryLease(context.Background(), root, tc, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
 		os.Exit(1)
 	}
-	if !strings.EqualFold(hsync.NormalizeRef(tc.TaskRef), ref) {
-		fmt.Fprintf(os.Stderr, "herd receipt recover: receipt task %s does not match %s\n", tc.TaskRef, ref)
+	// Re-observe both sides immediately before publication. This closes the
+	// ordinary release/reissue and target-drift window between initial
+	// admission and the write; any observed change leaves the old bytes intact.
+	if err := validateRecoveryTarget(context.Background(), root, target, tc); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: target changed before publication: %v\n", err)
+		os.Exit(1)
+	}
+	if err := requireExactRecoveryLease(context.Background(), root, tc, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt recover: lease changed before publication: %v\n", err)
 		os.Exit(1)
 	}
 	if err := dispatch.WriteTaskContext(target, tc); err != nil {
@@ -3502,6 +3525,98 @@ func requireLiveLease(ctx context.Context, root string, tc dispatch.TaskContext)
 	}
 	if !strings.HasPrefix(live.OwnerID, "coordinator-") {
 		return fmt.Errorf("live lease for %s is owned by %q, not a coordinator session (FAC-145)", tc.TaskRef, live.OwnerID)
+	}
+	return nil
+}
+
+// requireExactRecoveryLease observes the durable claim store without any
+// lifecycle operation. Recovery is permitted only while the exact recovery
+// lease row is active, unexpired, and still owned by its recorded recovery
+// session; unlike ordinary review authorization, it must never acquire a
+// replacement lease as a side effect of a read.
+func requireExactRecoveryLease(ctx context.Context, root string, tc dispatch.TaskContext, now time.Time) error {
+	if tc.Role != dispatch.RoleRecovery {
+		return fmt.Errorf("recovery receipt role %q is not recovery", tc.Role)
+	}
+	const leasePrefix = "claim:"
+	if !strings.HasPrefix(tc.LeaseID, leasePrefix) {
+		return fmt.Errorf("recovery receipt lease id %q is not a durable claim identity", tc.LeaseID)
+	}
+	leaseID, err := strconv.ParseInt(strings.TrimPrefix(tc.LeaseID, leasePrefix), 10, 64)
+	if err != nil || leaseID < 1 {
+		return fmt.Errorf("recovery receipt lease id %q is invalid", tc.LeaseID)
+	}
+	st, err := claim.OpenSQLiteLeaseStoreReadOnly(filepath.Join(root, ".herd", "herdforge.db"))
+	if err != nil {
+		return fmt.Errorf("recovery lease store unavailable — refusing recovery authority: %w", err)
+	}
+	defer st.Close()
+	leases, err := st.ActiveClaims(ctx, now)
+	if err != nil {
+		return fmt.Errorf("recovery lease read failed — refusing recovery authority: %w", err)
+	}
+	wantKey := claim.LeaseKey{Repo: tc.Repository, Provider: tc.ProviderType, Project: tc.ProjectID, TaskRef: tc.LeaseTaskRef}
+	var found *claim.Lease
+	for _, lease := range leases {
+		if lease.LeaseKey == wantKey && lease.ID == leaseID {
+			if found != nil {
+				return fmt.Errorf("ambiguous active recovery lease for %s", tc.TaskRef)
+			}
+			found = lease
+		}
+	}
+	if found == nil {
+		return fmt.Errorf("no active, unexpired recovery lease matches %s/%s generation %d", tc.LeaseTaskRef, tc.LeaseID, tc.LeaseGeneration)
+	}
+	if found.Status != claim.StatusActive || found.Expired(now) {
+		return fmt.Errorf("recovery lease %s is not active and unexpired", tc.LeaseID)
+	}
+	if found.Generation != tc.LeaseGeneration || found.Role != dispatch.RoleRecovery {
+		return fmt.Errorf("recovery lease %s role/generation mismatch (row role %q generation %d)", tc.LeaseID, found.Role, found.Generation)
+	}
+	if found.OwnerID != "coordinator-"+dispatch.RoleRecovery {
+		return fmt.Errorf("recovery lease %s owner %q does not match the issued recovery owner contract", tc.LeaseID, found.OwnerID)
+	}
+	return nil
+}
+
+func validateRecoveryTarget(ctx context.Context, root, target string, tc dispatch.TaskContext) error {
+	if tc.Role != dispatch.RoleRecovery || tc.CandidateSHA == "" {
+		return fmt.Errorf("recovery target requires recovery role and exact candidate SHA")
+	}
+	canonicalRoot, err := repoRootFromWorktree(root)
+	if err != nil {
+		return fmt.Errorf("resolve canonical repository: %w", err)
+	}
+	targetRoot, err := repoRootFromWorktree(target)
+	if err != nil {
+		return fmt.Errorf("resolve target repository: %w", err)
+	}
+	canonicalRoot, err = filepath.EvalSymlinks(canonicalRoot)
+	if err != nil {
+		return fmt.Errorf("resolve canonical repository realpath: %w", err)
+	}
+	targetRoot, err = filepath.EvalSymlinks(targetRoot)
+	if err != nil {
+		return fmt.Errorf("resolve target repository realpath: %w", err)
+	}
+	if canonicalRoot != targetRoot {
+		return fmt.Errorf("recovery target belongs to a different repository")
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return fmt.Errorf("resolve recovery target realpath: %w", err)
+	}
+	manager := worktree.NewWorktreeManager(canonicalRoot)
+	if _, err := manager.ObserveExactWorktree(ctx, tc.Branch, resolved, tc.CandidateSHA); err != nil {
+		return fmt.Errorf("recovery target is not the exact registered worktree: %w", err)
+	}
+	base, err := shotGit(ctx, resolved, "rev-parse", tc.BaseSHA+"^{commit}")
+	if err != nil || base != tc.BaseSHA {
+		return fmt.Errorf("recovery target cannot resolve the signed base")
+	}
+	if _, err := shotGit(ctx, resolved, "merge-base", "--is-ancestor", tc.BaseSHA, tc.CandidateSHA); err != nil {
+		return fmt.Errorf("recovery candidate is not descended from the signed base")
 	}
 	return nil
 }

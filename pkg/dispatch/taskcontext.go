@@ -448,6 +448,107 @@ func LoadCanonicalReceiptSession(root, providerType, projectID, ref, sessionID s
 		canonicalReceiptName(providerType, projectID, ref, sessionID)), ref)
 }
 
+// RecoveryReceiptSelector is the complete immutable binding required when a
+// canonical receipt is restored into a worktree. Recovery must never infer
+// authority from a task ref or rank generations belonging to different lease
+// keys.
+type RecoveryReceiptSelector struct {
+	ProviderType    string
+	ProjectID       string
+	Repository      string
+	Role            string
+	TaskRef         string
+	TaskID          string
+	Branch          string
+	BaseSHA         string
+	CandidateSHA    string
+	LeaseID         string
+	LeaseGeneration int64
+	LeaseTaskRef    string
+	SessionID       string
+}
+
+func (s RecoveryReceiptSelector) validate() error {
+	for name, value := range map[string]string{
+		"provider_type": s.ProviderType, "project_id": s.ProjectID,
+		"repository": s.Repository, "role": s.Role, "task_ref": s.TaskRef,
+		"task_id": s.TaskID, "branch": s.Branch, "base_sha": s.BaseSHA,
+		"candidate_sha": s.CandidateSHA,
+		"lease_id":      s.LeaseID, "lease_task_ref": s.LeaseTaskRef,
+		"session_id": s.SessionID,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("recovery receipt selector %s is required", name)
+		}
+	}
+	if s.Role != RoleRecovery {
+		return fmt.Errorf("recovery receipt selector role %q is not recovery", s.Role)
+	}
+	if s.LeaseGeneration < 1 {
+		return fmt.Errorf("recovery receipt selector lease_generation %d is invalid", s.LeaseGeneration)
+	}
+	return nil
+}
+
+// SelectCanonicalRecoveryReceipt finds exactly one authenticated, unexpired
+// receipt matching the complete recovery binding. It intentionally does not
+// use LoadCanonicalReceipt: that generic API retains its historical newest
+// generation semantics for non-recovery consumers.
+func SelectCanonicalRecoveryReceipt(root string, selector RecoveryReceiptSelector, now time.Time) (TaskContext, error) {
+	var zero TaskContext
+	if err := selector.validate(); err != nil {
+		return zero, err
+	}
+	if err := safeRefComponent(selector.TaskRef); err != nil {
+		return zero, err
+	}
+	verifier, err := LoadVerifier(root)
+	if err != nil {
+		return zero, fmt.Errorf("load recovery receipt verifier: %w", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, CanonicalTaskContextDir))
+	if err != nil {
+		return zero, fmt.Errorf("list canonical recovery receipts: %w", err)
+	}
+	prefix := strings.ToLower(selector.TaskRef) + "-"
+	var matches []TaskContext
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		candidate, err := readCanonicalFile(filepath.Join(root, CanonicalTaskContextDir, entry.Name()), selector.TaskRef)
+		if err != nil {
+			return zero, err
+		}
+		if !recoveryReceiptMatches(candidate, selector) {
+			continue
+		}
+		if err := verifier.Verify(candidate); err != nil {
+			return zero, fmt.Errorf("authenticate matching recovery receipt session %s: %w", candidate.SessionID, err)
+		}
+		if err := candidate.Authorize(now, provider.OpGet); err != nil {
+			return zero, fmt.Errorf("matching recovery receipt session %s is not currently authorized: %w", candidate.SessionID, err)
+		}
+		matches = append(matches, candidate)
+	}
+	if len(matches) == 0 {
+		return zero, fmt.Errorf("no authenticated, active recovery receipt matches the exact selector for %s", selector.TaskRef)
+	}
+	if len(matches) != 1 {
+		return zero, fmt.Errorf("ambiguous recovery receipt selector for %s: %d authenticated matches", selector.TaskRef, len(matches))
+	}
+	return matches[0], nil
+}
+
+func recoveryReceiptMatches(tc TaskContext, s RecoveryReceiptSelector) bool {
+	return strings.EqualFold(tc.ProviderType, s.ProviderType) &&
+		tc.ProjectID == s.ProjectID && strings.EqualFold(tc.Repository, s.Repository) &&
+		tc.Role == s.Role && strings.EqualFold(tc.TaskRef, s.TaskRef) &&
+		tc.TaskID == s.TaskID && tc.Branch == s.Branch && tc.BaseSHA == s.BaseSHA && tc.CandidateSHA == s.CandidateSHA &&
+		tc.LeaseID == s.LeaseID && tc.LeaseGeneration == s.LeaseGeneration &&
+		tc.LeaseTaskRef == s.LeaseTaskRef && tc.SessionID == s.SessionID
+}
+
 // RemoveCanonicalReceiptSessionIfExact compensates a failed multi-file
 // issuance. It removes only the exact signed session supplied by the caller;
 // a missing session is already compensated, while any different contents are
