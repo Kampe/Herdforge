@@ -727,13 +727,20 @@ func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("HERD_MODE", "local")
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	// Keep this launch-policy regression hermetic and bounded: pinHealthyQuota
+	// injects a fake OpenUsage-compatible binary and temporary cache path, while
+	// the long TTL prevents an unrelated refresh from reaching real pollers.
+	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "3600")
 	pinHealthyQuota(t, dir, "codex")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
 	lane := &config.LaneDef{
 		Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
 	}
-	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+	decision, err := laneLaunchDecisionWithProbe(ctx, lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
 		return herdr.ProbeResult{Model: model, Available: true}
 	})
 	if err != nil {

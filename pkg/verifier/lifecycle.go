@@ -177,7 +177,9 @@ shift
 # namespace-relative proc view local to the owned supervisor and its children.
 # The fixed hermetic Docker profile already supplies the proc authority and
 # intentionally disables nested namespace setup.
-if [ "$proc_ready" -ne 1 ] && [ "${HERD_HERMETIC_CONTAINER:-}" != "1" ]; then
+if [ "$proc_ready" -ne 1 ] && [ "${HERD_HERMETIC_CONTAINER:-}" != "1" ] && [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+  # Namespace mount setup is Linux-only. Non-Linux ownershipCommand paths
+  # retain the same handshake and residual protocol without mount syscalls.
   mount --make-rprivate / || exit 1
   mount -t proc proc /proc || exit 1
 fi
