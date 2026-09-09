@@ -1,10 +1,14 @@
 package usage
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Antigravity quota is a same-host language-server authority. The collector
@@ -27,7 +31,96 @@ var antigravityBuckets = map[string]string{
 }
 
 func antigravityPoll() (ProviderUsage, error) {
-	return ProviderUsage{}, pollErrf("unsupported", "antigravity language-server discovery unavailable; AGY must already expose a same-host quota service")
+	d, err := discoverAntigravity()
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	for _, port := range d.Ports {
+		for _, scheme := range []string{"https", "http"} {
+			url := scheme + "://127.0.0.1:" + strconv.Itoa(port) + "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+			p, pollErr := antigravityPollWithURL(url, d.CSRF)
+			if pollErr == nil {
+				return p, nil
+			}
+		}
+	}
+	if d.ExtensionPort > 0 {
+		url := "http://127.0.0.1:" + strconv.Itoa(d.ExtensionPort) + "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+		return antigravityPollWithURL(url, d.CSRF)
+	}
+	return ProviderUsage{}, pollErrf("unsupported", "antigravity language server has no usable listening port")
+}
+
+type antigravityDiscovery struct {
+	CSRF          string
+	Ports         []int
+	ExtensionPort int
+}
+
+var discoverAntigravity = discoverAntigravityProcess
+
+func discoverAntigravityProcess() (antigravityDiscovery, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-ax", "-o", "pid=,command=").Output()
+	if err != nil {
+		return antigravityDiscovery{}, pollErrf("unreachable", "antigravity process discovery failed")
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		command := strings.Join(fields[1:], " ")
+		lower := strings.ToLower(command)
+		if !strings.Contains(lower, "language_server") && !strings.Contains(lower, "agy") {
+			continue
+		}
+		if strings.Contains(lower, "--app_data_dir") && !strings.Contains(lower, "antigravity") && !strings.Contains(lower, "antigravity-ide") {
+			continue
+		}
+		csrf := flagValue(fields, "--csrf_token")
+		ext := 0
+		if v := flagValue(fields, "--extension_server_port"); v != "" {
+			ext, _ = strconv.Atoi(v)
+		}
+		ports := listeningPorts(ctx, fields[0])
+		if len(ports) == 0 && ext == 0 {
+			continue
+		}
+		return antigravityDiscovery{CSRF: csrf, Ports: ports, ExtensionPort: ext}, nil
+	}
+	return antigravityDiscovery{}, pollErrf("unsupported", "antigravity language server is not running")
+}
+
+func flagValue(fields []string, flag string) string {
+	for i, field := range fields {
+		if field == flag && i+1 < len(fields) {
+			return fields[i+1]
+		}
+		if strings.HasPrefix(field, flag+"=") {
+			return strings.TrimPrefix(field, flag+"=")
+		}
+	}
+	return ""
+}
+
+func listeningPorts(ctx context.Context, pid string) []int {
+	out, err := exec.CommandContext(ctx, "lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid).Output()
+	if err != nil {
+		return nil
+	}
+	seen := map[int]bool{}
+	var ports []int
+	for _, field := range strings.Fields(string(out)) {
+		if i := strings.LastIndex(field, ":"); i >= 0 {
+			if p, err := strconv.Atoi(strings.TrimSuffix(field[i+1:], "(LISTEN)")); err == nil && p > 0 && !seen[p] {
+				seen[p] = true
+				ports = append(ports, p)
+			}
+		}
+	}
+	return ports
 }
 
 func antigravityPollWithURL(url, csrf string) (ProviderUsage, error) {

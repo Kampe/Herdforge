@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -179,6 +180,33 @@ func TestAntigravityMapsOnlyExactFractionBuckets(t *testing.T) {
 	}
 	if len(p.Resources) != 2 || p.Resources["geminiWeekly"].Remaining != 25 || p.Resources["nonGeminiSession"].Used != 50 {
 		t.Fatalf("exact buckets/fractions not preserved: %+v", p.Resources)
+	}
+}
+
+func TestRegisteredAntigravityPollUsesInjectedDiscovery(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" {
+			t.Fatalf("path=%q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.75}]}]}`))
+	}))
+	defer s.Close()
+	port, err := strconv.Atoi(strings.TrimPrefix(s.URL, "http://127.0.0.1:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := discoverAntigravity
+	discoverAntigravity = func() (antigravityDiscovery, error) {
+		return antigravityDiscovery{Ports: []int{port}, CSRF: "fixture-csrf"}, nil
+	}
+	t.Cleanup(func() { discoverAntigravity = old })
+	poll := nativePollers["antigravity"]
+	p, err := poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["geminiSession"].Remaining != 75 {
+		t.Fatalf("registered poller did not use discovered service: %+v", p.Resources)
 	}
 }
 
