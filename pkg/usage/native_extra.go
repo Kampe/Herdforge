@@ -163,12 +163,15 @@ func antigravityPollWithURL(url, csrf string) (ProviderUsage, error) {
 // enforceable budget. An authenticated key without one is explicitly
 // untracked, never unlimited or healthy quota.
 type litellmKeyInfo struct {
-	BudgetMax   *float64 `json:"budget_max"`
-	BudgetSpent *float64 `json:"budget_spent"`
-	MaxBudget   *float64 `json:"max_budget"`
-	Spend       *float64 `json:"spend"`
-	RPMLimit    *float64 `json:"rpm_limit"`
-	MaxParallel *float64 `json:"max_parallel_requests"`
+	KeyName     string          `json:"key_name"`
+	BudgetMax   *float64        `json:"budget_max"`
+	BudgetSpent *float64        `json:"budget_spent"`
+	MaxBudget   *float64        `json:"max_budget"`
+	Spend       *float64        `json:"spend"`
+	RPMLimit    *float64        `json:"rpm_limit"`
+	MaxParallel *float64        `json:"max_parallel_requests"`
+	Error       string          `json:"error"`
+	Info        *litellmKeyInfo `json:"info"`
 }
 
 func litellmPoll() (ProviderUsage, error) {
@@ -198,6 +201,20 @@ func litellmPollWithURL(url, token string) (ProviderUsage, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		return ProviderUsage{}, pollErrf("decode-failed", "litellm key info decode: %v", err)
 	}
+	if strings.TrimSpace(info.Error) != "" {
+		return ProviderUsage{}, pollErrf("provider-error", "litellm key info: %s", strings.TrimSpace(info.Error))
+	}
+	if info.Info != nil {
+		if strings.TrimSpace(info.Info.Error) != "" {
+			return ProviderUsage{}, pollErrf("provider-error", "litellm key info: %s", strings.TrimSpace(info.Info.Error))
+		}
+		info = *info.Info
+	}
+	account := strings.TrimSpace(info.KeyName)
+	accountIdentity := identity("litellm", account, "litellm:key-info:key_name")
+	if accountIdentity == nil {
+		return ProviderUsage{DisplayName: "LiteLLM", Status: "untracked"}, nil
+	}
 	max, spent := info.BudgetMax, info.BudgetSpent
 	if max == nil {
 		max = info.MaxBudget
@@ -205,8 +222,21 @@ func litellmPollWithURL(url, token string) (ProviderUsage, error) {
 	if spent == nil {
 		spent = info.Spend
 	}
-	if max == nil || *max <= 0 || spent == nil || *spent < 0 || *spent > *max {
-		return ProviderUsage{DisplayName: "LiteLLM", Status: "untracked"}, nil
+	if max == nil || *max <= 0 || spent == nil || *spent < 0 {
+		return ProviderUsage{DisplayName: "LiteLLM", Account: accountIdentity, Status: "untracked"}, nil
 	}
-	return ProviderUsage{DisplayName: "LiteLLM", Resources: map[string]ResourceUsage{"budget": {Kind: "consumption", State: "active", Pool: "default", Unit: "percent", Limit: *max, Used: *spent, Remaining: *max - *spent, Utilization: *spent / *max}}}, nil
+	state := "active"
+	remaining := *max - *spent
+	if remaining < 0 {
+		state = "exhausted"
+		remaining = 0
+	}
+	return ProviderUsage{
+		DisplayName: "LiteLLM",
+		Account:     accountIdentity,
+		Resources: map[string]ResourceUsage{"budget": {
+			Kind: "consumption", State: state, Pool: "default", Unit: "usd",
+			Limit: *max, Used: *spent, Remaining: remaining, Utilization: *spent / *max,
+		}},
+	}, nil
 }

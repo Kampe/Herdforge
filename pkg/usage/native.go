@@ -52,7 +52,9 @@ const (
 	keychainTimeout = 5 * time.Second
 )
 
-func pollClient() *http.Client { return &http.Client{Timeout: pollTimeout} }
+var pollClientFactory = func() *http.Client { return &http.Client{Timeout: pollTimeout} }
+
+func pollClient() *http.Client { return pollClientFactory() }
 
 // ---------- claude ----------
 
@@ -403,15 +405,44 @@ func codexPoll() (ProviderUsage, error) {
 	if err != nil {
 		return ProviderUsage{}, err
 	}
-	return codexPollWithURL(codexUsageURL, tok)
+	account := codexAccountClaim()
+	if account == "" {
+		return ProviderUsage{}, pollErrf("auth-ambiguous", "codex OAuth account identity is unavailable")
+	}
+	return codexPollWithURLAndAccount(codexUsageURL, tok, account)
+}
+
+func codexAccountClaim() string {
+	for _, path := range codexCredentialFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var auth struct {
+			Tokens struct {
+				AccountID string `json:"account_id"`
+			} `json:"tokens"`
+		}
+		if json.Unmarshal(raw, &auth) == nil && strings.TrimSpace(auth.Tokens.AccountID) != "" {
+			return strings.TrimSpace(auth.Tokens.AccountID)
+		}
+	}
+	return ""
 }
 
 func codexPollWithURL(url, token string) (ProviderUsage, error) {
+	return codexPollWithURLAndAccount(url, token, "")
+}
+
+func codexPollWithURLAndAccount(url, token, account string) (ProviderUsage, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return ProviderUsage{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	if account != "" {
+		req.Header.Set("ChatGPT-Account-Id", account)
+	}
 	req.Header.Set("User-Agent", pollUserAgent)
 
 	resp, err := pollClient().Do(req)
@@ -469,11 +500,11 @@ func codexPollWithURL(url, token string) (ProviderUsage, error) {
 
 type geminiQuota struct {
 	Quotas []struct {
-		Name           string  `json:"name"`
-		Limit          float64 `json:"limit"`
-		Usage          float64 `json:"usage"`
-		RemainingCount float64 `json:"remainingCount"`
-		ResetTime      string  `json:"resetTime"`
+		Name           string   `json:"name"`
+		Limit          *float64 `json:"limit"`
+		Usage          *float64 `json:"usage"`
+		RemainingCount *float64 `json:"remainingCount"`
+		ResetTime      string   `json:"resetTime"`
 	} `json:"quotas"`
 }
 
@@ -565,17 +596,17 @@ func geminiPollWithURL(url, token string) (ProviderUsage, error) {
 
 	res := map[string]ResourceUsage{}
 	for _, item := range q.Quotas {
-		if item.Name == "" {
+		if item.Name == "" || item.Limit == nil || item.Usage == nil || item.RemainingCount == nil || *item.Limit < 0 || *item.Usage < 0 || *item.RemainingCount < 0 {
 			continue
 		}
 		util := 0.0
-		if item.Limit > 0 {
-			util = item.Usage / item.Limit
+		if *item.Limit > 0 {
+			util = *item.Usage / *item.Limit
 		}
 		res[item.Name] = ResourceUsage{
 			Kind: "consumption", Unit: "requests",
-			Limit: item.Limit, Used: item.Usage,
-			Remaining: item.RemainingCount, Utilization: util,
+			Limit: *item.Limit, Used: *item.Usage,
+			Remaining: *item.RemainingCount, Utilization: util,
 			ResetsAt: item.ResetTime,
 		}
 	}

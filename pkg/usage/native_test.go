@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Fixtures are the SHAPE of real responses, captured from live calls to each
@@ -149,6 +150,19 @@ func TestCodexPollMapsPrimaryWindowToWeekly(t *testing.T) {
 	}
 }
 
+func TestCodexPollBindsAuthenticatedAccountHeader(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("ChatGPT-Account-Id"); got != "acct-1" {
+			t.Errorf("account header = %q, want acct-1", got)
+		}
+		_, _ = w.Write([]byte(codexFixture))
+	}))
+	defer s.Close()
+	if _, err := codexPollWithURLAndAccount(s.URL, "tok", "acct-1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGeminiPollKeepsEveryNamedQuota(t *testing.T) {
 	s := serve(t, 200, geminiFixture)
 	p, err := geminiPollWithURL(s.URL, "tok")
@@ -163,6 +177,15 @@ func TestGeminiPollKeepsEveryNamedQuota(t *testing.T) {
 	}
 	if got := p.Resources["geminiSession"].Remaining; got != 60 {
 		t.Errorf("geminiSession remaining = %v, want 60", got)
+	}
+}
+
+func TestGeminiPollRejectsOmittedNumericFields(t *testing.T) {
+	s := serve(t, 200, `{"quotas":[{"name":"geminiSession","limit":100,"usage":40}]}`)
+	if _, err := geminiPollWithURL(s.URL, "tok"); err == nil {
+		t.Fatal("missing remainingCount must not become a zero quota")
+	} else if code := pollErrorCode(err); code != "no-windows" {
+		t.Fatalf("error code = %q, want no-windows", code)
 	}
 }
 
@@ -222,13 +245,65 @@ func TestLiteLLMWithoutEnforceableBudgetIsUntracked(t *testing.T) {
 }
 
 func TestLiteLLMMapsEnforcedBudget(t *testing.T) {
-	s := serve(t, 200, `{"budget_max":100,"budget_spent":40}`)
+	s := serve(t, 200, `{"key_name":"lazer","budget_max":100,"budget_spent":40}`)
 	p, err := litellmPollWithURL(s.URL, "tok")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Resources["budget"].Remaining != 60 || p.Resources["budget"].Utilization != 0.4 {
+	if p.Account == nil || p.Account.Key != opaqueAccountKey("litellm", "lazer") {
+		t.Fatalf("provider account claim was not preserved: %+v", p.Account)
+	}
+	if p.Resources["budget"].Remaining != 60 || p.Resources["budget"].Utilization != 0.4 || p.Resources["budget"].Unit != "usd" {
 		t.Fatalf("budget mapping wrong: %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMRejectsJSONErrorAtHTTP200(t *testing.T) {
+	s := serve(t, 200, `{"error":"upstream unavailable"}`)
+	if _, err := litellmPollWithURL(s.URL, "tok"); err == nil || pollErrorCode(err) != "provider-error" {
+		t.Fatalf("HTTP 200 JSON error must be provider-error, got %v", err)
+	}
+}
+
+func TestLiteLLMMapsNestedIdentityAndBudget(t *testing.T) {
+	s := serve(t, 200, `{"info":{"key_name":"lazer-account","max_budget":10,"spend":12}}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := p.Resources["budget"]
+	if p.Account == nil || p.Account.Key != opaqueAccountKey("litellm", "lazer-account") {
+		t.Fatalf("nested account claim was not preserved: %+v", p.Account)
+	}
+	if w.State != "exhausted" || w.Unit != "usd" || w.Remaining != 0 || w.Used != 12 || w.Limit != 10 {
+		t.Fatalf("over-budget semantics wrong: %+v", w)
+	}
+}
+
+func TestGrokPollHonoursBoundedClientTimeout(t *testing.T) {
+	started := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	old := pollClientFactory
+	pollClientFactory = func() *http.Client { return &http.Client{Timeout: 25 * time.Millisecond} }
+	t.Cleanup(func() { pollClientFactory = old })
+	done := make(chan error, 1)
+	go func() { _, err := grokPollWithURL(s.URL, "tok"); done <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach fixture")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("hung Grok fixture must return a timeout error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Grok poll exceeded injected bounded timeout")
 	}
 }
 

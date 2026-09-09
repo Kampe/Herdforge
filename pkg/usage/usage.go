@@ -237,11 +237,14 @@ type grokBilling struct {
 }
 
 func grokPollWithURL(url, token string) (ProviderUsage, error) {
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "opencode/1.0")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := pollClient().Do(req)
 	if err != nil {
 		return ProviderUsage{}, netPollError(err)
 	}
