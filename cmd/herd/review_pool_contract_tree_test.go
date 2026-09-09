@@ -9,6 +9,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -189,6 +190,37 @@ func assertZeroPoolMutation(t *testing.T, out []byte, poolRoot, surfaceRoot, pac
 				t.Errorf("refusal touched the fleet: fake herdr saw %q. Output:\n%s", c, out)
 			}
 		}
+	}
+}
+
+// A candidate whose tree does not own the reviewer contract must be refused
+// BEFORE the operator-asserted builder provenance write too: --builder-family
+// records an operator-attributed launch row through the review ledger, and a
+// row left behind by a REFUSED candidate makes the failure look
+// provenance-admitted on a retry. Same public entry, ledger absence as the
+// observable.
+func TestPoolReviewRefusesMalformedContractBeforeAssertedProvenance(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, shas, calls := poolContractFixture(t, binary)
+	ledgerPath := reviewledger.DefaultPath(dir)
+
+	for name, sha := range map[string]string{"missing": shas["missing"], "symlink": shas["symlink"]} {
+		t.Run(name, func(t *testing.T) {
+			poolRoot := filepath.Join(t.TempDir(), "pool")
+			surfaceRoot := filepath.Join(t.TempDir(), "review-surfaces")
+			packetRoot := filepath.Join(t.TempDir(), "review-packets")
+
+			out, err := poolReviewCmd(t, binary, dir, keyDir, "review", "FAC-1", "--pool", "--no-launch",
+				"--builder-family", "anthropic",
+				"--sha", sha, "--pool-root", poolRoot, "--surface-root", surfaceRoot, "--packet-root", packetRoot)
+			if err == nil {
+				t.Fatalf("a candidate whose tree does not own the reviewer contract must refuse even with asserted provenance; output:\n%s", out)
+			}
+			if _, statErr := os.Stat(ledgerPath); !os.IsNotExist(statErr) {
+				t.Errorf("a refused candidate must leave NO operator-asserted provenance row behind (%s must not exist); output:\n%s", ledgerPath, out)
+			}
+			assertZeroPoolMutation(t, out, poolRoot, surfaceRoot, packetRoot, calls)
+		})
 	}
 }
 

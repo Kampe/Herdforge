@@ -106,6 +106,19 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
+	// FAC-668 correction finding 1: validate the candidate's review contract
+	// against the EXACT candidate tree BEFORE any provenance or pool state
+	// changes. Below this point the launch may record an operator-asserted
+	// builder family (a ledger write), resolve the reviewer route, lease a
+	// slot, EVICT stale occupants, reset the slot --hard and create the
+	// surface symlink. Neither the lease-release defer nor any later cleanup
+	// can un-write a provenance row or undo an eviction. A candidate whose
+	// tree cannot prove the reviewer contract must be refused while every one
+	// of those mutations is still ahead of us.
+	if err := verifyCandidateTreeContract(root, sha); err != nil {
+		return err
+	}
+
 	// FAC-608: prove the candidate's builder family BEFORE spending anything.
 	// Admission refuses a verdict whose builder-family is not provable, and it
 	// refused 25 of 41 artifacts in one inbox for exactly that -- each one after a
@@ -215,17 +228,6 @@ func runPoolReview(ref string) error {
 				"  HERD_ALLOW_DIRTY_SHARED_CHECKOUT=1 if these changes are intentional.\n",
 			root, strings.Join(dirty, "\n  "), root, root)
 		return fmt.Errorf("canonical shared checkout is dirty; refusing to launch a reviewer into an unclean repository")
-	}
-
-	// FAC-668 correction finding 1: validate the candidate's review contract
-	// against the EXACT candidate tree BEFORE any pool state changes. Below
-	// this point the launch leases a slot, EVICTS stale occupants, resets the
-	// slot --hard and creates the surface symlink; the lease-release defer
-	// cannot undo an eviction or a reset. A candidate whose tree cannot prove
-	// the reviewer contract must be refused while every one of those
-	// mutations is still ahead of us.
-	if err := verifyCandidateTreeContract(root, sha); err != nil {
-		return err
 	}
 
 	// FAC-653: refuse a DUPLICATE launch before touching the pool.
