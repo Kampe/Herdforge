@@ -75,6 +75,56 @@ func OpenSQLiteLeaseStoreReadOnly(path string) (*SQLiteLeaseStore, error) {
 	return &SQLiteLeaseStore{db: db}, nil
 }
 
+// WithSQLiteLeaseObservation serializes a read-only recovery observation with
+// lease writers. BEGIN IMMEDIATE acquires SQLite's existing authority lock;
+// the callback is run while that lock is held and no lease row is changed.
+// The transaction is rolled back after the callback, so publication can be
+// coupled to the exact lease snapshot without allowing release/reissue in
+// between. Missing stores are rejected without creation or migration.
+func WithSQLiteLeaseObservation(ctx context.Context, path string, key LeaseKey, leaseID int64, fn func(*Lease) error) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat lease store: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("lease store is not a regular file")
+	}
+	dsn := fmt.Sprintf("file:%s?mode=rw&_pragma=busy_timeout(10000)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open lease observation: %w", err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("connect lease observation: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("lock lease authority for observation: %w", err)
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	lease, err := scanLease(conn.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? AND id=?`, key.Repo, key.Provider, key.Project, key.TaskRef, leaseID))
+	if err == sql.ErrNoRows {
+		lease = nil
+	} else if err != nil {
+		return fmt.Errorf("read exact lease observation: %w", err)
+	}
+	if err := fn(lease); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return fmt.Errorf("release lease observation lock: %w", err)
+	}
+	rollback = false
+	return nil
+}
+
 func (s *SQLiteLeaseStore) Close() error { return s.db.Close() }
 
 // isBusyErr matches SQLite's lock-contention errors. busy_timeout already

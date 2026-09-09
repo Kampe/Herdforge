@@ -637,22 +637,7 @@ func runReceiptRecover() {
 		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
 		os.Exit(1)
 	}
-	if err := requireExactRecoveryLease(context.Background(), root, tc, time.Now()); err != nil {
-		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
-		os.Exit(1)
-	}
-	// Re-observe both sides immediately before publication. This closes the
-	// ordinary release/reissue and target-drift window between initial
-	// admission and the write; any observed change leaves the old bytes intact.
-	if err := validateRecoveryTarget(context.Background(), root, target, tc); err != nil {
-		fmt.Fprintf(os.Stderr, "herd receipt recover: target changed before publication: %v\n", err)
-		os.Exit(1)
-	}
-	if err := requireExactRecoveryLease(context.Background(), root, tc, time.Now()); err != nil {
-		fmt.Fprintf(os.Stderr, "herd receipt recover: lease changed before publication: %v\n", err)
-		os.Exit(1)
-	}
-	if err := dispatch.WriteTaskContext(target, tc); err != nil {
+	if err := publishRecoveryUnderLeaseLock(context.Background(), root, target, tc); err != nil {
 		fmt.Fprintf(os.Stderr, "herd receipt recover: %v\n", err)
 		os.Exit(1)
 	}
@@ -3578,6 +3563,29 @@ func requireExactRecoveryLease(ctx context.Context, root string, tc dispatch.Tas
 		return fmt.Errorf("recovery lease %s owner %q does not match the issued recovery owner contract", tc.LeaseID, found.OwnerID)
 	}
 	return nil
+}
+
+func publishRecoveryUnderLeaseLock(ctx context.Context, root, target string, tc dispatch.TaskContext) error {
+	const leasePrefix = "claim:"
+	leaseID, err := strconv.ParseInt(strings.TrimPrefix(tc.LeaseID, leasePrefix), 10, 64)
+	if err != nil || leaseID < 1 || !strings.HasPrefix(tc.LeaseID, leasePrefix) {
+		return fmt.Errorf("recovery receipt lease id %q is invalid", tc.LeaseID)
+	}
+	return claim.WithSQLiteLeaseObservation(ctx, filepath.Join(root, ".herd", "herdforge.db"), claim.LeaseKey{
+		Repo: tc.Repository, Provider: tc.ProviderType, Project: tc.ProjectID, TaskRef: tc.LeaseTaskRef,
+	}, leaseID, func(lease *claim.Lease) error {
+		now := time.Now()
+		if lease == nil {
+			return fmt.Errorf("no exact recovery lease exists for %s", tc.LeaseTaskRef)
+		}
+		if lease.Status != claim.StatusActive || lease.Expired(now) || lease.Generation != tc.LeaseGeneration || lease.Role != dispatch.RoleRecovery || lease.OwnerID != "coordinator-"+dispatch.RoleRecovery {
+			return fmt.Errorf("exact recovery lease is not active, unexpired, and bound to the issued recovery identity")
+		}
+		if err := validateRecoveryTarget(ctx, root, target, tc); err != nil {
+			return fmt.Errorf("target changed before publication: %w", err)
+		}
+		return dispatch.WriteTaskContext(target, tc)
+	})
 }
 
 func validateRecoveryTarget(ctx context.Context, root, target string, tc dispatch.TaskContext) error {
