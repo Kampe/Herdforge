@@ -14,6 +14,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -52,7 +53,7 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 		base = "main"
 	}
 	policy := resources.GovernorPolicy{
-		HostID: host, RepositoryRoot: resolved, BaseRef: "origin/" + base,
+		HostID: host, RepositoryID: repoID, RepositoryRoot: resolved, BaseRef: "origin/" + base,
 		LockPath:             filepath.Join(stateDir(), "resource-governor", fmt.Sprintf("%x.lock", lockIdentity[:12])),
 		GeneratedDirectories: append([]string(nil), cfg.ResourceGovernor.GeneratedDirectories...),
 		PressureBytes:        cfg.ResourceGovernor.PressureBytes, RecoveryBytes: cfg.ResourceGovernor.RecoveryBytes,
@@ -62,6 +63,10 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 		LockTimeout: timeout, LockRetry: retry, AllowApply: cfg.ResourceGovernor.AllowApply,
 		ApplyBeforeDispatch: cfg.ResourceGovernor.ApplyBeforeDispatch,
 	}
+	claimDir, err := provider.CanonicalClaimDir(".", resolved)
+	if err != nil {
+		return nil, fmt.Errorf("resource governor canonical claim directory: %w", err)
+	}
 	return &resources.Governor{
 		Policy: policy, Capacity: resources.OSBackend{}, Measure: resources.OSPhysicalMeasurer{},
 		Worktrees: resources.GitWorktreeEnumerator{
@@ -69,7 +74,7 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 			Now:       time.Now,
 			HostID:    host,
 			Evidence: resources.SQLiteLifecycleEvidence{
-				ClaimsPath: filepath.Join(resolved, ".herd", "launch-claims.db"),
+				ClaimsPath: filepath.Join(claimDir, "leases.db"),
 				LedgerPath: reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
 			},
 		},
@@ -89,6 +94,18 @@ func attachResourceGovernor(d *dispatch.Dispatcher, cfg *config.Config, root str
 		d.Resources = governor
 	}
 	return nil
+}
+
+func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string, trigger resources.SweepTrigger) error {
+	governor, err := newResourceGovernor(cfg, root)
+	if err != nil {
+		return err
+	}
+	if governor == nil {
+		return nil
+	}
+	_, err = governor.Sweep(ctx, trigger, false)
+	return err
 }
 
 func parseForeignTargets(values []string, alertBytes uint64) ([]resources.ForeignTarget, error) {

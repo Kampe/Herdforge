@@ -16,6 +16,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -56,6 +57,16 @@ func runPoolReview(ref string) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
+	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		return fmt.Errorf("review task identity: load config: %w", err)
+	}
+	// Native capacity is observed before the warm-pool refusal boundary and
+	// before candidate resolution can prepare any detached worktree.
+	if err := sweepResourceGovernor(context.Background(), cfg, root, resources.SweepReviewBeforeRefusal); err != nil {
+		return fmt.Errorf("review --pool: capacity pre-refusal sweep: %w", err)
+	}
 	// FAC-584: capacity BEFORE candidate resolution. resolvePoolReviewCandidateAt
 	// can prepare a detached worktree when none holds the SHA; that is already
 	// repository mutation. The W4 incident prepared a worktree and then died
@@ -67,11 +78,6 @@ func runPoolReview(ref string) error {
 	defer capacityLease.release()
 	if err := capacityLease.update(admissionPhaseCandidate); err != nil {
 		return fmt.Errorf("advance admission phase to candidate: %w", err)
-	}
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
-	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
-	if err != nil {
-		return fmt.Errorf("review task identity: load config: %w", err)
 	}
 	tasks, err := loadTaskProvider(cfg)
 	if err != nil {

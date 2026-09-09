@@ -3,7 +3,6 @@ package resources
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/Kampe/Herdforge/pkg/claim"
 )
 
 type ProcessUsage struct {
@@ -56,55 +55,126 @@ func (r SQLiteLifecycleEvidence) Read(ctx context.Context, repoRoot, hostID stri
 	if r.HostID != "" && r.HostID != hostID {
 		return LifecycleEvidence{}, errors.New("canonical lifecycle evidence host mismatch")
 	}
-	dsn := "file:" + r.ClaimsPath + "?mode=ro&_pragma=busy_timeout(1000)"
-	db, err := sql.Open("sqlite", dsn)
+	root, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return LifecycleEvidence{}, fmt.Errorf("resolve canonical evidence root: %w", err)
+	}
+	worktree, err := filepath.EvalSymlinks(lane.Path)
+	if err != nil || !containedPath(root, worktree) {
+		return LifecycleEvidence{}, errors.New("canonical claim worktree identity unavailable")
+	}
+	claims, err := claim.OpenSQLiteLeaseStoreReadOnly(r.ClaimsPath)
 	if err != nil {
 		return LifecycleEvidence{}, fmt.Errorf("open canonical claim evidence: %w", err)
 	}
-	defer db.Close()
-	var repo, owner, status string
-	var held, generation int64
-	var expires time.Time
-	err = db.QueryRowContext(ctx, `SELECT repo, owner_id, status, held, generation, expires_at FROM leases WHERE worktree_path = ? ORDER BY generation DESC LIMIT 1`, lane.Path).Scan(&repo, &owner, &status, &held, &generation, &expires)
-	if errors.Is(err, sql.ErrNoRows) {
-		return LifecycleEvidence{}, errors.New("canonical claim record unavailable for registered worktree")
-	}
+	defer claims.Close()
+	active, err := claims.ActiveClaims(ctx, time.Now())
 	if err != nil {
-		return LifecycleEvidence{}, fmt.Errorf("read canonical claim evidence: %w", err)
+		return LifecycleEvidence{}, fmt.Errorf("read canonical active claims: %w", err)
 	}
-	if repo != r.RepoID || generation < 1 || strings.TrimSpace(owner) == "" || !strings.Contains(owner, hostID) {
-		return LifecycleEvidence{}, errors.New("canonical claim record identity mismatch")
+	paths, err := claims.DistinctWorktreePaths(ctx)
+	if err != nil {
+		return LifecycleEvidence{}, fmt.Errorf("read canonical claim history: %w", err)
 	}
-	evidence := LifecycleEvidence{ActiveLease: status == "active" && (held != 0 || expires.After(time.Now()))}
+	knownPath := false
+	for _, path := range paths {
+		resolved, resolveErr := filepath.EvalSymlinks(path)
+		if resolveErr == nil && filepath.Clean(resolved) == filepath.Clean(worktree) {
+			knownPath = true
+			break
+		}
+	}
+	if !knownPath {
+		return LifecycleEvidence{}, errors.New("canonical claim history has no exact worktree identity")
+	}
+	evidence := LifecycleEvidence{}
+	for _, lease := range active {
+		if lease == nil {
+			continue
+		}
+		leasePath, resolveErr := filepath.EvalSymlinks(lease.WorktreePath)
+		if resolveErr != nil || filepath.Clean(leasePath) != filepath.Clean(worktree) {
+			continue
+		}
+		if lease.Repo != r.RepoID || lease.HoldRepository != r.RepoID || lease.Generation <= 0 || lease.OwnerID == "" || lease.TaskRef == "" || lease.Project == "" || lease.Provider == "" {
+			return LifecycleEvidence{}, errors.New("canonical claim record identity mismatch")
+		}
+		// Host is a scope identity of the local canonical root and claim DB;
+		// owner IDs are lane identities and must never be substring-matched.
+		evidence.ActiveLease = true
+	}
 	if err := readReviewLifecycle(r.LedgerPath, lane.Head, &evidence); err != nil {
 		return LifecycleEvidence{}, err
 	}
-	_ = repoRoot
 	return evidence, nil
 }
 
+type lifecycleRow struct {
+	Event        string `json:"event"`
+	SHA          string `json:"sha"`
+	CandidateSHA string `json:"candidate_sha"`
+	Reviewer     string `json:"reviewer"`
+	Host         string `json:"host"`
+	Task         string `json:"task"`
+	Lease        string `json:"lease"`
+	Pane         string `json:"pane"`
+	Lane         string `json:"lane"`
+	Status       string `json:"status"`
+	Verdict      string `json:"verdict"`
+}
+
 func readReviewLifecycle(path, head string, evidence *LifecycleEvidence) error {
-	data, err := os.ReadFile(path)
+	read := func(name string) ([]lifecycleRow, error) {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		var out []lifecycleRow
+		for _, line := range bytes.Split(data, []byte{'\n'}) {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 {
+				continue
+			}
+			var row lifecycleRow
+			if err := json.Unmarshal(line, &row); err != nil {
+				return nil, err
+			}
+			out = append(out, row)
+		}
+		return out, nil
+	}
+	rows, err := read(path)
 	if err != nil {
 		return fmt.Errorf("read canonical review ledger: %w", err)
 	}
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
+	queue, err := read(filepath.Join(filepath.Dir(path), "harvest-queue.jsonl"))
+	if err != nil {
+		return fmt.Errorf("read canonical review queue: %w", err)
+	}
+	records := make(map[string]lifecycleRow)
+	for _, row := range rows {
+		if row.Event == "record" && row.SHA == head && row.Reviewer != "" && row.Host != "" && row.Task != "" && row.Lease != "" && row.Pane != "" {
+			records[row.Reviewer+"\x00"+row.Host+"\x00"+row.Task] = row
+		}
+	}
+	for _, row := range rows {
+		if row.SHA != head || row.Event != "verdict" || row.Reviewer == "" || row.Host == "" || row.Task == "" || row.CandidateSHA != head {
 			continue
 		}
-		var row struct{ Event, SHA, Verdict string }
-		if err := json.Unmarshal(line, &row); err != nil {
-			return fmt.Errorf("canonical review ledger evidence: %w", err)
-		}
-		if row.SHA != head {
+		key := row.Reviewer + "\x00" + row.Host + "\x00" + row.Task
+		if _, ok := records[key]; !ok {
 			continue
 		}
-		if row.Event == "verdict" && (row.Verdict == "FAIL" || row.Verdict == "BLOCKED") {
+		if row.Verdict == "FAIL" || row.Verdict == "BLOCKED" {
 			evidence.FailedCandidate = true
 		}
-		if row.Event == "enqueue" {
-			evidence.ReviewHandoffAdmitted = true
+		if row.Verdict != "PASS" {
+			continue
+		}
+		for _, q := range queue {
+			if q.Event == "enqueue" && q.SHA == head && q.Reviewer == row.Reviewer && q.Host == row.Host && q.Task == row.Task && q.Lane != "" && q.Status == "queued" {
+				evidence.ReviewHandoffAdmitted = true
+			}
 		}
 	}
 	return nil
@@ -142,10 +212,6 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 	if len(lanes) == 0 {
 		return nil, errors.New("registered worktree allowlist is empty")
 	}
-	now := time.Now
-	if e.Now != nil {
-		now = e.Now
-	}
 	processes := e.Processes
 	if processes == nil {
 		processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
@@ -176,28 +242,24 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 			continue
 		}
 		lanes[i].Unmerged = !merged
-		lease, leaseErr := activeTaskReceipt(lanes[i].Path, now())
-		if leaseErr != nil {
+		if e.Evidence == nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "lease_evidence_unavailable"
 			continue
 		}
-		lanes[i].ActiveLease = lease
 		usage, processErr := processes.InUse(ctx, lanes[i].Path)
 		if processErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "process_evidence_unavailable"
 			continue
 		}
 		lanes[i].ActiveCWD, lanes[i].OpenFile = usage.CWD, usage.OpenFile
-		if e.Evidence != nil {
-			evidence, evidenceErr := e.Evidence.Read(ctx, root, e.HostID, lanes[i])
-			if evidenceErr != nil {
-				lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "canonical_lifecycle_evidence_unavailable"
-				continue
-			}
-			lanes[i].ActiveLease = evidence.ActiveLease
-			lanes[i].FailedCandidate = evidence.FailedCandidate
-			lanes[i].ReviewHandoffAdmitted = evidence.ReviewHandoffAdmitted
+		evidence, evidenceErr := e.Evidence.Read(ctx, root, e.HostID, lanes[i])
+		if evidenceErr != nil {
+			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "canonical_lifecycle_evidence_unavailable"
+			continue
 		}
+		lanes[i].ActiveLease = evidence.ActiveLease
+		lanes[i].FailedCandidate = evidence.FailedCandidate
+		lanes[i].ReviewHandoffAdmitted = evidence.ReviewHandoffAdmitted
 		lanes[i].Held = lanes[i].Held || lanes[i].State == LaneHeld
 		switch {
 		case lanes[i].Category == LaneCurrent:
@@ -354,9 +416,11 @@ func gitMerged(ctx context.Context, path, baseRef string) (bool, error) {
 	return GitCommitIsAncestor(ctx, path, "HEAD", baseRef)
 }
 
+// activeTaskReceipt remains a parser for diagnostics and legacy tests only.
+// GitWorktreeEnumerator never uses it as retirement authority; canonical
+// lifecycle evidence is mandatory in the production census path.
 func activeTaskReceipt(worktree string, now time.Time) (bool, error) {
-	path := filepath.Join(worktree, TaskContextFile)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Join(worktree, TaskContextFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -372,7 +436,7 @@ func activeTaskReceipt(worktree string, now time.Time) (bool, error) {
 	if err := json.Unmarshal(data, &receipt); err != nil {
 		return false, err
 	}
-	if strings.TrimSpace(receipt.LeaseID) == "" || receipt.LeaseGeneration <= 0 || strings.TrimSpace(receipt.SessionID) == "" || receipt.ExpiresAt.IsZero() {
+	if receipt.LeaseID == "" || receipt.LeaseGeneration <= 0 || receipt.SessionID == "" || receipt.ExpiresAt.IsZero() {
 		return false, errors.New("task receipt is incomplete")
 	}
 	return receipt.ExpiresAt.After(now), nil

@@ -14,15 +14,20 @@ import (
 
 func TestSQLiteLifecycleEvidenceReadsCanonicalClaimAndReviewRecords(t *testing.T) {
 	root := t.TempDir()
-	claims, err := claim.NewSQLiteLeaseStore(filepath.Join(root, ".herd", "launch-claims.db"))
+	claimsPath := filepath.Join(root, ".herd", "claim", "leases.db")
+	claims, err := claim.NewSQLiteLeaseStore(claimsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer claims.Close()
 	host := "host-a"
 	worktree := filepath.Join(root, ".herd", "worktrees", "FAC-613")
+	if err := os.MkdirAll(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	sha := strings.Repeat("a", 40)
-	if _, err := claims.Acquire(context.Background(), claim.LeaseKey{Repo: "repo-a", Provider: "kaneo", Project: "project-a", TaskRef: "FAC-613"}, host+"-owner", "worker", worktree, time.Now(), time.Hour); err != nil {
+	_, err = claims.AcquireWithIdentity(context.Background(), claim.LeaseKey{Repo: "repo-a", Provider: "kaneo", Project: "project-a", TaskRef: "FAC-613"}, "coordinator-recovery", "worker", worktree, "repo-a", "worker", "smith", time.Now(), time.Hour)
+	if err != nil {
 		t.Fatal(err)
 	}
 	ledger := filepath.Join(root, ".herd", "review-ledger.jsonl")
@@ -31,8 +36,9 @@ func TestSQLiteLifecycleEvidenceReadsCanonicalClaimAndReviewRecords(t *testing.T
 		t.Fatal(err)
 	}
 	for _, row := range []map[string]string{
-		{"event": "verdict", "sha": sha, "verdict": "FAIL"},
-		{"event": "enqueue", "sha": sha},
+		{"event": "record", "sha": sha, "reviewer": "reviewer-1", "host": "review-host", "task": "FAC-613", "lease": "lease-1", "pane": "w4:t1", "builder_family": "openai"},
+		{"event": "verdict", "sha": sha, "candidate_sha": sha, "reviewer": "reviewer-1", "host": "review-host", "task": "FAC-613", "verdict": "FAIL"},
+		{"event": "verdict", "sha": sha, "candidate_sha": sha, "reviewer": "reviewer-1", "host": "review-host", "task": "FAC-613", "verdict": "PASS"},
 	} {
 		if err := json.NewEncoder(file).Encode(row); err != nil {
 			t.Fatal(err)
@@ -41,7 +47,17 @@ func TestSQLiteLifecycleEvidenceReadsCanonicalClaimAndReviewRecords(t *testing.T
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reader := SQLiteLifecycleEvidence{ClaimsPath: filepath.Join(root, ".herd", "launch-claims.db"), LedgerPath: ledger, RepoID: "repo-a", HostID: host}
+	queue, err := os.Create(filepath.Join(filepath.Dir(ledger), "harvest-queue.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(queue).Encode(map[string]string{"event": "enqueue", "sha": sha, "reviewer": "reviewer-1", "host": "review-host", "task": "FAC-613", "lane": "reviewer", "status": "queued"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader := SQLiteLifecycleEvidence{ClaimsPath: claimsPath, LedgerPath: ledger, RepoID: "repo-a", HostID: host}
 	evidence, err := reader.Read(context.Background(), root, host, RegisteredWorktree{Path: worktree, Head: sha})
 	if err != nil {
 		t.Fatal(err)

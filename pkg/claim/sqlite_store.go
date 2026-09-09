@@ -50,6 +50,23 @@ func NewSQLiteLeaseStore(path string) (*SQLiteLeaseStore, error) {
 	return s, nil
 }
 
+// OpenSQLiteLeaseStoreReadOnly opens canonical lease evidence without creating
+// the database or running migrations. Census and reaping callers must never
+// turn missing authority into a write or a disposable lane.
+func OpenSQLiteLeaseStoreReadOnly(path string) (*SQLiteLeaseStore, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("read-only lease store path is required")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(1000)", path))
+	if err != nil {
+		return nil, fmt.Errorf("open read-only lease store: %w", err)
+	}
+	return &SQLiteLeaseStore{db: db}, nil
+}
+
 func (s *SQLiteLeaseStore) Close() error { return s.db.Close() }
 
 // isBusyErr matches SQLite's lock-contention errors. busy_timeout already

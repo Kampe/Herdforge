@@ -2,6 +2,7 @@ package resources
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,7 +41,8 @@ const (
 // to decide whether its derived data is immutable. An unresolved bit always
 // becomes PreserveReason; zero values never mean safe.
 type RegisteredWorktree struct {
-	Path                  string       `json:"path"`
+	Path                  string       `json:"-"`
+	ReportPath            string       `json:"path"`
 	Branch                string       `json:"branch,omitempty"`
 	Head                  string       `json:"head"`
 	Category              LaneCategory `json:"category"`
@@ -62,6 +64,7 @@ type RegisteredWorktree struct {
 
 type GovernorPolicy struct {
 	HostID                 string
+	RepositoryID           string
 	RepositoryRoot         string
 	BaseRef                string
 	LockPath               string
@@ -181,18 +184,21 @@ const (
 )
 
 type TargetReport struct {
-	Path         string         `json:"path"`
-	WorktreePath string         `json:"worktree_path"`
-	RelativePath string         `json:"relative_path"`
-	Decision     TargetDecision `json:"decision"`
-	Reason       string         `json:"reason,omitempty"`
-	BeforeBytes  uint64         `json:"before_bytes"`
-	AfterBytes   uint64         `json:"after_bytes"`
-	LastUse      time.Time      `json:"last_use"`
+	Path               string         `json:"-"`
+	ReportPath         string         `json:"path"`
+	WorktreePath       string         `json:"-"`
+	ReportWorktreePath string         `json:"worktree_path"`
+	RelativePath       string         `json:"relative_path"`
+	Decision           TargetDecision `json:"decision"`
+	Reason             string         `json:"reason,omitempty"`
+	BeforeBytes        uint64         `json:"before_bytes"`
+	AfterBytes         uint64         `json:"after_bytes"`
+	LastUse            time.Time      `json:"last_use"`
 }
 
 type ForeignTarget struct {
-	Path       string `json:"path"`
+	Path       string `json:"-"`
+	ReportPath string `json:"path"`
 	Owner      string `json:"owner"`
 	Kind       string `json:"kind"`
 	AlertBytes uint64 `json:"alert_bytes"`
@@ -210,6 +216,7 @@ type ForeignTelemetry struct {
 
 type GovernorReport struct {
 	HostID                       string               `json:"host_id"`
+	RepositoryID                 string               `json:"repository_id"`
 	Mode                         string               `json:"mode"`
 	ObservedAt                   time.Time            `json:"observed_at"`
 	PressureBytes                uint64               `json:"pressure_bytes"`
@@ -380,13 +387,19 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	}
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].Path < lanes[j].Path })
 	report := GovernorReport{
-		HostID: g.Policy.HostID, ObservedAt: g.Now().UTC(), PressureBytes: g.Policy.PressureBytes,
+		HostID: g.Policy.HostID, RepositoryID: g.Policy.RepositoryID, ObservedAt: g.Now().UTC(), PressureBytes: g.Policy.PressureBytes,
 		RecoveryBytes: g.Policy.RecoveryBytes, TaskReserveBytes: g.Policy.TaskReserveBytes,
 		CapacityBefore: before, CapacityAfter: before, Worktrees: lanes,
 	}
+	for i := range report.Worktrees {
+		report.Worktrees[i].ReportPath = reportPath(g.Policy.RepositoryRoot, report.Worktrees[i].Path)
+	}
 	for _, lane := range lanes {
 		for _, rel := range g.Policy.GeneratedDirectories {
-			report.Targets = append(report.Targets, g.inspectTarget(ctx, lane, rel))
+			target := g.inspectTarget(ctx, lane, rel)
+			target.ReportPath = reportPath(g.Policy.RepositoryRoot, target.Path)
+			target.ReportWorktreePath = reportPath(g.Policy.RepositoryRoot, target.WorktreePath)
+			report.Targets = append(report.Targets, target)
 		}
 	}
 	report.EstimatedTaskReserveBytes = report.TaskReserveBytes
@@ -403,6 +416,15 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	})
 	g.setConcurrency(&report)
 	return report, nil
+}
+
+func reportPath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "./" + filepath.ToSlash(rel)
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(path)))
+	return fmt.Sprintf("./external/%x", sum[:8])
 }
 
 func (g *Governor) inspectTarget(ctx context.Context, lane RegisteredWorktree, rel string) TargetReport {
@@ -453,7 +475,12 @@ func (g *Governor) inspectTarget(ctx context.Context, lane RegisteredWorktree, r
 		target.Decision, target.Reason = TargetBlocked, "target_allocation_truncated"
 		return target
 	}
-	if containsCanonicalState(target.Path) {
+	canonical, scanErr := containsCanonicalState(target.Path, g.Policy.MaxScanEntries)
+	if scanErr != nil {
+		target.Decision, target.Reason = TargetBlocked, "canonical_state_scan_unavailable"
+		return target
+	}
+	if canonical {
 		target.Decision, target.Reason = TargetBlocked, "nested_canonical_state"
 		return target
 	}
@@ -554,11 +581,16 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 	return nil
 }
 
-func containsCanonicalState(root string) bool {
+func containsCanonicalState(root string, maxEntries int) (bool, error) {
 	found := false
-	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	entries := 0
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		entries++
+		if maxEntries > 0 && entries > maxEntries {
+			return errors.New("canonical state scan exceeded configured bound")
 		}
 		if path != root && (entry.Name() == ".git" || entry.Name() == ".herd") {
 			found = true
@@ -566,7 +598,7 @@ func containsCanonicalState(root string) bool {
 		}
 		return nil
 	})
-	return found
+	return found, err
 }
 
 // safeRemoveGeneratedTree turns the exact target into an unlinked quarantine
@@ -586,18 +618,45 @@ func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) err
 	if err != nil || !containedPath(root, parentResolved) || filepath.Clean(parentResolved) != filepath.Clean(parent) {
 		return errors.New("generated target parent realpath changed before removal")
 	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("stat generated target parent before removal: %w", err)
+	}
 	quarantine, err := os.MkdirTemp(parent, ".herd-resource-reap-")
 	if err != nil {
 		return fmt.Errorf("create removal quarantine: %w", err)
 	}
-	defer os.RemoveAll(quarantine)
 	quarantined := filepath.Join(quarantine, filepath.Base(resolved))
 	if err := os.Rename(resolved, quarantined); err != nil {
 		return fmt.Errorf("quarantine generated target: %w", err)
 	}
+	currentParent, statErr := os.Stat(parent)
+	if statErr != nil || !os.SameFile(parentInfo, currentParent) {
+		if rollbackErr := os.Rename(quarantined, resolved); rollbackErr != nil {
+			return fmt.Errorf("generated target parent changed and rollback failed: %v; quarantine retained at %s", statErr, quarantine)
+		}
+		_ = os.Remove(quarantine)
+		return errors.New("generated target parent changed during removal")
+	}
 	if err := remove(quarantine); err != nil {
-		_ = os.Rename(quarantined, resolved)
+		if rollbackErr := os.Rename(quarantined, resolved); rollbackErr != nil {
+			recovery := filepath.Join(root, ".herd", "resource-reap-recovery.jsonl")
+			_ = os.MkdirAll(filepath.Dir(recovery), 0o700)
+			record, recordErr := os.OpenFile(recovery, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+			if recordErr == nil {
+				_, recordErr = fmt.Fprintf(record, "{\"target\":%q,\"quarantine\":%q,\"reason\":%q}\n", reportPath(root, resolved), reportPath(root, quarantine), err.Error())
+				_ = record.Close()
+			}
+			if recordErr != nil {
+				return fmt.Errorf("remove quarantined generated target: %v; rollback failed: %v; recovery record failed: %v; quarantine retained at %s", err, rollbackErr, recordErr, quarantine)
+			}
+			return fmt.Errorf("remove quarantined generated target: %v; rollback failed: %v; recovery record=%s; quarantine retained at %s", err, rollbackErr, reportPath(root, recovery), quarantine)
+		}
+		_ = os.Remove(quarantine)
 		return fmt.Errorf("remove quarantined generated target: %w", err)
+	}
+	if err := os.Remove(quarantine); err != nil {
+		return fmt.Errorf("remove empty quarantine: %w", err)
 	}
 	return nil
 }
@@ -649,6 +708,7 @@ func (g *Governor) inspectForeign(targets []ForeignTarget) []ForeignTelemetry {
 	out := make([]ForeignTelemetry, 0, len(targets))
 	for _, target := range targets {
 		row := ForeignTelemetry{ForeignTarget: target, Action: "observe_only_contact_owner"}
+		row.ReportPath = reportPath(g.Policy.RepositoryRoot, target.Path)
 		if strings.TrimSpace(target.Path) == "" || strings.TrimSpace(target.Owner) == "" || strings.TrimSpace(target.Kind) == "" {
 			row.Error, row.Escalate = "foreign telemetry requires exact path, owner, and kind", true
 			out = append(out, row)
