@@ -41,8 +41,12 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	if err := ValidateReviewRetirementManifest(m); err != nil {
 		return ReviewRetirementEvidence{}, err
 	}
-	if _, err := n.exactPoolSlot(m, true); err != nil && !errors.Is(err, errRetirementPoolAlreadyRemoved) {
-		return ReviewRetirementEvidence{}, err
+	poolGone := false
+	if _, err := n.exactPoolSlot(m, true); err != nil {
+		if !errors.Is(err, errRetirementPoolAlreadyRemoved) {
+			return ReviewRetirementEvidence{}, err
+		}
+		poolGone = true
 	}
 	rows, err := n.Ledger.AllRows()
 	if err != nil {
@@ -117,7 +121,19 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	}
 	wt, wtErr := n.observeWorktree(m)
 	if wtErr != nil {
-		return ReviewRetirementEvidence{}, wtErr
+		if poolGone {
+			ok, phaseErr := n.hasPhase(m, "worktree-intent", "worktree-done", "ref-intent", "ref-done", "artifacts-intent", "artifacts-done", "complete")
+			if phaseErr != nil {
+				return ReviewRetirementEvidence{}, phaseErr
+			}
+			if ok {
+				wt = ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch}
+				wtErr = nil
+			}
+		}
+		if wtErr != nil {
+			return ReviewRetirementEvidence{}, wtErr
+		}
 	}
 	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: live, Worktree: wt, WorktreeRoot: m.Pool, PromptRoot: filepath.Dir(m.PromptArtifact), Repository: n.RepositoryIdentity}, nil
 }
