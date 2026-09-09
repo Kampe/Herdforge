@@ -34,8 +34,8 @@ var fac151NativeManifest = map[string]string{
 	"pkg/verifier/verifier_test.go::TestExecuteDetachedSessionAndBackgroundWriters":                         "dcd4f66902d96e4999d10126e25a70323112176831d07c15321da3cff0574d96",
 	"pkg/verifier/verifier_test.go::TestProcTokenIdentityBoundRefusesStalePID":                              "5713e3d52a3081e63604e23dbfb9aee9b169ddf4079810f8bc692f7a04aea819",
 	"pkg/verifier/verifier_test.go::TestKillProcessGroupMembersNeverUsesNegativePGID":                       "d8c82016102baccf1375aeef39e48f272b594865ae3e6b1681790a31ad5faada",
-	"pkg/verifier/verifier_test.go::TestOwnedNeverReplacesTokenOnPIDReuse":                                  "fc71daa3b253389cc153f0ce679f9a7ba7b6820616f210ebbc62d12230d81d0a",
-	"pkg/verifier/verifier_test.go::TestOwnedFreezeRejectsPostLeaderGroupAdoption":                          "8947f0c202679b580049368791b2bd37aebde87f75c0a8be00390fb9b3fb463d",
+	"pkg/verifier/verifier_test.go::TestOwnedNeverReplacesTokenOnPIDReuse":                                  "64a371162419a2c41148cb8974744ac0969c7074bb98bf6c60c85adb2f09c9f8",
+	"pkg/verifier/verifier_test.go::TestOwnedFreezeRejectsPostLeaderGroupAdoption":                          "37304c4e038af02ca1fb36966edfa851bcca68df4830beb91c2575ea3b2e459d",
 	"pkg/verifier/verifier_test.go::TestIsExpectedKillWaitUsesTypedWaitStatus":                              "a9c9aeea54fdf0a55d2875a1e313be700d64e6574c35cc6d3a98ba496218afd4",
 	"pkg/verifier/lifecycle_test.go::activeLateWriterScript":                                                "aa675afccfdd6d68fecc5386ae4184a7c0234baf5f05c0c4ffbe5b60b73257ac",
 	"pkg/verifier/lifecycle_test.go::lateWriterFixture":                                                     "2e8e12957fdaf36023350f33d3dff0b69d409cb66f5c3a50c7ba03e2d369b92c",
@@ -57,5 +57,5 @@ var fac151NativeManifest = map[string]string{
 	"pkg/verifier/lifecycle_test.go::startGrandchildGroup":                                                  "38c732372d0e3289ea451cfb93a19ef302e83342c4b802d9408fbe26e9d850c2",
 	"pkg/verifier/lifecycle_test.go::TestReapOwnedCmdKillsGrandchildren":                                    "cfbf7fe2e6b9b0f3bff86e267381c47e1576257100e3c42b3505ee343ed9c4a6",
 	"pkg/verifier/lifecycle_test.go::TestReapOwnedCmdTreeCloseKillsGrandchildrenDespiteLeaderOnlyGroupKill": "d39284053a92b5e929adeaf945a9d4b1efa5399c9fc5bc5672fafaff29e9f14c",
-	"pkg/verifier/lifecycle_test.go::TestFinalizeOwnedTreeMutationLeavesGrandchildAlive":                    "0092878fdee06ada2af9e575ecd3419c7a3381bc18da0edccbc5367bd937d501",
+	"pkg/verifier/lifecycle_test.go::TestFinalizeOwnedTreeMutationLeavesGrandchildAlive":                    "77a13e4d13a2842db3b4681300183fadc42bd879351893c8836961028ed3536f",
 }

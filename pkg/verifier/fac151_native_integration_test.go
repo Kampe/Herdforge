@@ -1171,7 +1171,7 @@ func TestOwnedNeverReplacesTokenOnPIDReuse(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
-	owned, err := adoptOwnedCmd(cmd, nil, nil, "", "", nil)
+	owned, err := adoptOwnedCmd(cmd, cmd.Process.Pid, cmd.Process.Pid, nil, nil, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1205,7 +1205,7 @@ func TestOwnedFreezeRejectsPostLeaderGroupAdoption(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	owned, err := adoptOwnedCmd(cmd, nil, nil, "", "", nil)
+	owned, err := adoptOwnedCmd(cmd, cmd.Process.Pid, cmd.Process.Pid, nil, nil, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1784,7 +1784,7 @@ func TestFinalizeOwnedTreeMutationLeavesGrandchildAlive(t *testing.T) {
 		}
 	})
 
-	owned, err := adoptOwnedCmd(cmd, nil, nil, "", "", nil)
+	owned, err := adoptOwnedCmd(cmd, cmd.Process.Pid, cmd.Process.Pid, nil, nil, "", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
