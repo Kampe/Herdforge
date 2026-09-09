@@ -400,8 +400,8 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 
 // RetireExact removes one already-released owned slot and preserves every
 // other slot in the pool. It is intentionally narrower than GC.
-func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath string) error {
-	if strings.TrimSpace(slotName) == "" || strings.TrimSpace(wantPath) == "" {
+func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeaseID string, expectedGeneration int64) error {
+	if strings.TrimSpace(slotName) == "" || strings.TrimSpace(wantPath) == "" || strings.TrimSpace(expectedLeaseID) == "" || expectedGeneration <= 0 {
 		return errors.New("worktree pool: exact retirement requires slot and path")
 	}
 	err := p.withLock(func() error {
@@ -419,6 +419,9 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath string) error
 			}
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: slot %s is still leased", slotName)
+			}
+			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || filepath.Clean(slot.LastReleasePath) != filepath.Clean(slot.Path) {
+				return fmt.Errorf("worktree pool: slot %s release incarnation changed", slotName)
 			}
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {

@@ -421,6 +421,32 @@ func (n *NativeReviewRetirementOp) Revalidate(m ReviewRetirementManifest, phase 
 			}
 		}
 	}
+	if phase == "worktree" {
+		slot, slotErr := n.exactPoolSlot(m, true)
+		if slotErr != nil && !errors.Is(slotErr, errRetirementPoolAlreadyRemoved) {
+			return fmt.Errorf("worktree pool readback: %w", slotErr)
+		}
+		wt, wtErr := n.observeWorktree(m)
+		if wtErr != nil {
+			if _, statErr := os.Stat(filepath.Join(n.Root, filepath.Clean(m.Worktree))); os.IsNotExist(statErr) {
+				ok, phaseErr := n.hasPhase(m, "worktree-intent", "worktree-done")
+				if phaseErr != nil {
+					return phaseErr
+				}
+				if ok {
+					return nil
+				}
+			}
+			return fmt.Errorf("worktree mutation readback: %w", wtErr)
+		}
+		expectedHead := m.CandidateSHA
+		if slotErr == nil && slot.LeaseID == "" {
+			expectedHead = m.BaseSHA
+		}
+		if !wt.Known || wt.Dirty || wt.Head != expectedHead || wt.Branch != m.Branch {
+			return fmt.Errorf("worktree changed before destructive removal: head=%s want=%s dirty=%t branch=%s want-branch=%s", wt.Head, expectedHead, wt.Dirty, wt.Branch, m.Branch)
+		}
+	}
 	return nil
 }
 
@@ -533,7 +559,7 @@ func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) er
 	if err != nil {
 		return err
 	}
-	return worktree.NewPool(n.Root, poolPath, 0).RetireExact(context.Background(), m.Slot, slot.Path)
+	return worktree.NewPool(n.Root, poolPath, 0).RetireExact(context.Background(), m.Slot, slot.Path, m.Nonce, m.LeaseGeneration)
 }
 func (n *NativeReviewRetirementOp) RemoveBranch(m ReviewRetirementManifest) error {
 	if m.ReviewRef == "" {
