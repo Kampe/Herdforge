@@ -448,6 +448,20 @@ func (n *NativeReviewRetirementOp) RemoveBranch(m ReviewRetirementManifest) erro
 	return err
 }
 func (n *NativeReviewRetirementOp) RemoveArtifact(m ReviewRetirementManifest) error {
+	if m.ManifestArtifact != "" {
+		mp, err := n.boundPath(m.ManifestArtifact)
+		if err != nil {
+			return err
+		}
+		if body, readErr := os.ReadFile(mp); readErr == nil {
+			var recorded ReviewRetirementManifest
+			if json.Unmarshal(body, &recorded) != nil || recorded.BindingDigest != m.BindingDigest || recorded.Generation != m.Generation || recorded.CandidateSHA != m.CandidateSHA {
+				return errors.New("review manifest artifact content changed; refusing removal")
+			}
+		} else if !os.IsNotExist(readErr) {
+			return readErr
+		}
+	}
 	p, err := n.boundPath(m.PromptArtifact)
 	if err != nil {
 		return err
@@ -469,6 +483,14 @@ func (n *NativeReviewRetirementOp) RemoveArtifact(m ReviewRetirementManifest) er
 		mp, err := n.boundPath(m.ManifestArtifact)
 		if err != nil {
 			return err
+		}
+		if body, readErr := os.ReadFile(mp); readErr == nil {
+			var recorded ReviewRetirementManifest
+			if json.Unmarshal(body, &recorded) != nil || recorded.BindingDigest != m.BindingDigest || recorded.Generation != m.Generation || recorded.CandidateSHA != m.CandidateSHA {
+				return errors.New("review manifest artifact content changed; refusing removal")
+			}
+		} else if !os.IsNotExist(readErr) {
+			return readErr
 		}
 		if err := os.Remove(mp); err != nil && !os.IsNotExist(err) {
 			return err

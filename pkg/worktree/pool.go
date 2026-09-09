@@ -427,6 +427,7 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath string) error
 			}
 			if len(state.Slots) == 0 {
 				_ = os.Remove(p.statePath())
+				_ = os.Remove(p.Root)
 			}
 			return nil
 		}
