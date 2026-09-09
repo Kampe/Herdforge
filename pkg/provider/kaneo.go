@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -647,6 +648,33 @@ func kaneoTaskResourceURL(apiURL, taskID string) string {
 	return fmt.Sprintf("%s/api/task/%s", strings.TrimRight(strings.TrimSpace(apiURL), "/"), url.PathEscape(taskID))
 }
 
+func kaneoListTasksURL(apiURL, projectID, status string, page, limit int) string {
+	base := fmt.Sprintf("%s/api/task/tasks/%s", strings.TrimRight(strings.TrimSpace(apiURL), "/"), url.PathEscape(projectID))
+	v := url.Values{}
+	if strings.TrimSpace(status) != "" {
+		v.Set("status", strings.TrimSpace(status))
+	}
+	v.Set("limit", strconv.Itoa(limit))
+	v.Set("page", strconv.Itoa(page))
+	return fmt.Sprintf("%s?%s", base, v.Encode())
+}
+
+type kaneoBoardResponseDTO struct {
+	Data struct {
+		Columns []struct {
+			ID    string         `json:"id"`
+			Name  string         `json:"name"`
+			Tasks []kaneoTaskDTO `json:"tasks"`
+		} `json:"columns"`
+	} `json:"data"`
+	Pagination struct {
+		Page       int `json:"page"`
+		PageSize   int `json:"pageSize"`
+		Total      int `json:"total"`
+		TotalPages int `json:"totalPages"`
+	} `json:"pagination"`
+}
+
 // kaneoRunCLI is the CLI runner for Kaneo production UseCLI mode. Tests may
 // swap it for a hermetic counter; production uses process-group RunCLI.
 var kaneoRunCLI = RunCLI
@@ -791,25 +819,67 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 		return filterTasks(all, status), nil
 	}
 
-	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	k.authorizeKaneo(req)
-	resp, err := k.httpClient().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	var dtos []kaneoTaskDTO
-	if err := DecodeJSONResponse(resp, &dtos); err != nil {
-		if pe, ok := err.(*ProviderError); ok {
-			pe.Provider = "kaneo"
-			pe.Op = "ListTasks"
+	const limit = 100
+	var all []kaneoTaskDTO
+	acc := NewPageAccumulator()
+
+	for page := 1; page <= DefaultMaxListPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
 		}
-		return nil, err
+		endpoint := kaneoListTasksURL(k.APIURL, projectID, status, page, limit)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		k.authorizeKaneo(req)
+		resp, err := k.httpClient().Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		var env kaneoBoardResponseDTO
+		if err := DecodeJSONResponse(resp, &env); err != nil {
+			if pe, ok := err.(*ProviderError); ok {
+				pe.Provider = "kaneo"
+				pe.Op = "ListTasks"
+			}
+			return nil, err
+		}
+
+		var pageTasks []kaneoTaskDTO
+		for _, col := range env.Data.Columns {
+			for _, dto := range col.Tasks {
+				if strings.TrimSpace(dto.ID) == "" || strings.TrimSpace(dto.Ref) == "" {
+					return nil, fmt.Errorf("kaneo ListTasks: response task missing identity")
+				}
+				if dto.ProjectId != "" && dto.ProjectId != projectID {
+					return nil, fmt.Errorf("kaneo ListTasks: project identity mismatch: requested %q got %q", projectID, dto.ProjectId)
+				}
+				pageTasks = append(pageTasks, dto)
+			}
+		}
+
+		freshCount := 0
+		for _, dto := range pageTasks {
+			if acc.Add(dto.ID) {
+				freshCount++
+				all = append(all, dto)
+			}
+		}
+
+		dec := DecidePagination(len(pageTasks), freshCount)
+		if dec == PageStopEmpty {
+			return filterTasks(all, status), nil
+		}
+		if dec == PageStopDuplicate {
+			return nil, fmt.Errorf("kaneo task list (page %d): %w", page, ErrDuplicatePage)
+		}
+		if env.Pagination.TotalPages > 0 && page >= env.Pagination.TotalPages {
+			return filterTasks(all, status), nil
+		}
 	}
-	return filterTasks(dtos, status), nil
+	return nil, fmt.Errorf("kaneo task list: %w (maxPages=%d)", ErrPaginationCap, DefaultMaxListPages)
 }
 
 // walkStatusPages paginates one Kaneo column to exhaustion. Callers run these

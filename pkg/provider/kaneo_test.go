@@ -140,17 +140,34 @@ func TestKaneoProvider_UpdateStatus_Non200(t *testing.T) {
 
 func TestKaneoProvider_ListTasks(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/task" || r.URL.Query().Get("projectId") != "proj-1" {
-			t.Errorf("unexpected path or query: %s?%s", r.URL.Path, r.URL.RawQuery)
+		if r.URL.Path != "/api/task/tasks/proj-1" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[
-			{"id":"t-1","ref":"FAC-1","title":"Task 1","status":"to-do","priority":"high","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]},
-			{"id":"t-2","ref":"FAC-2","title":"Task 2","status":"done","priority":"low","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]}
-		]`))
+		w.Write([]byte(`{
+			"data": {
+				"columns": [
+					{
+						"id": "c-todo",
+						"name": "To Do",
+						"tasks": [
+							{"id":"t-1","ref":"FAC-1","title":"Task 1","status":"to-do","priority":"high","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]}
+						]
+					},
+					{
+						"id": "c-done",
+						"name": "Done",
+						"tasks": [
+							{"id":"t-2","ref":"FAC-2","title":"Task 2","status":"done","priority":"low","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]}
+						]
+					}
+				]
+			},
+			"pagination": {"page": 1, "pageSize": 100, "total": 2, "totalPages": 1}
+		}`))
 	}))
 	defer server.Close()
 
@@ -170,6 +187,192 @@ func TestKaneoProvider_ListTasks(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].ID != "t-2" {
 		t.Fatalf("expected 1 done task, got %d", len(tasks))
 	}
+}
+
+func TestKaneoProvider_ListTasks_PaginatesAndValidates(t *testing.T) {
+	page1Requested := false
+	page2Requested := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/task/tasks/proj-1" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		q := r.URL.Query()
+		if q.Get("status") != "in-progress" || q.Get("limit") != "100" {
+			t.Errorf("unexpected query params: %s", r.URL.RawQuery)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		page := q.Get("page")
+		switch page {
+		case "1":
+			page1Requested = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {
+					"columns": [
+						{
+							"id": "c1",
+							"name": "In Progress",
+							"tasks": [
+								{"id":"t-1","ref":"FAC-1","title":"Task 1","status":"in-progress","priority":"high","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]}
+							]
+						}
+					]
+				},
+				"pagination": {"page": 1, "pageSize": 100, "total": 2, "totalPages": 2}
+			}`))
+		case "2":
+			page2Requested = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data": {
+					"columns": [
+						{
+							"id": "c1",
+							"name": "In Progress",
+							"tasks": [
+								{"id":"t-2","ref":"FAC-2","title":"Task 2","status":"in-progress","priority":"low","projectId":"proj-1","createdAt":"2026-08-01T20:00:00Z","labels":[]}
+							]
+						}
+					]
+				},
+				"pagination": {"page": 2, "pageSize": 100, "total": 2, "totalPages": 2}
+			}`))
+		default:
+			t.Errorf("unexpected page: %s", page)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	kp := NewKaneoProvider(server.URL, "proj-1", false)
+	tasks, err := kp.ListTasks(context.Background(), "proj-1", "in-progress")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !page1Requested || !page2Requested {
+		t.Fatalf("expected both pages requested, page1=%v page2=%v", page1Requested, page2Requested)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+	if tasks[0].ID != "t-1" || tasks[1].ID != "t-2" {
+		t.Fatalf("unexpected task order or IDs: %+v, %+v", tasks[0], tasks[1])
+	}
+}
+
+func TestKaneoProvider_ListTasks_FailureControls(t *testing.T) {
+	t.Run("HTTP200ErrorBody", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"error":"unauthorized board access"}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on HTTP 200 error body")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on error, got %v", tasks)
+		}
+	})
+
+	t.Run("WrongProjectIdentity", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data":{"columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"wrong-proj"}]}]},
+				"pagination":{"page":1,"pageSize":100,"total":1,"totalPages":1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on wrong project identity")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on error, got %v", tasks)
+		}
+	})
+
+	t.Run("WrongTaskIdentity", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"data":{"columns":[{"id":"c1","tasks":[{"id":"","ref":"FAC-1","projectId":"p1"}]}]},
+				"pagination":{"page":1,"pageSize":100,"total":1,"totalPages":1}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on missing task id")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on error, got %v", tasks)
+		}
+	})
+
+	t.Run("DuplicateLoopingPage", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			// Return page 1 and page 2 with identical task-1 and totalPages=5 so it doesn't stop by totalPages
+			_, _ = w.Write([]byte(`{
+				"data":{"columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"p1"}]}]},
+				"pagination":{"page":1,"pageSize":100,"total":5,"totalPages":5}
+			}`))
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error on duplicate page without empty termination")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks on error, got %v", tasks)
+		}
+	})
+
+	t.Run("FailedLaterPageRefusesPartialSuccess", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			page := r.URL.Query().Get("page")
+			if page == "1" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{
+					"data":{"columns":[{"id":"c1","tasks":[{"id":"t-1","ref":"FAC-1","projectId":"p1"}]}]},
+					"pagination":{"page":1,"pageSize":100,"total":2,"totalPages":2}
+				}`))
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		kp := NewKaneoProvider(srv.URL, "p1", false)
+		tasks, err := kp.ListTasks(context.Background(), "p1", "")
+		if err == nil {
+			t.Fatal("expected error when page 2 fails")
+		}
+		if tasks != nil {
+			t.Fatalf("expected nil tasks (no partial snapshot) when later page fails, got %v", tasks)
+		}
+	})
 }
 
 func TestKaneoProvider_ListTasks_BadJSON(t *testing.T) {
@@ -202,12 +405,15 @@ func TestKaneoProvider_ListTasks_Non200(t *testing.T) {
 
 func TestKaneoProvider_ListTasks_DefaultProjectID(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("projectId") != "proj-default" {
-			t.Errorf("expected projectId=proj-default, got %s", r.URL.Query().Get("projectId"))
+		if r.URL.Path != "/api/task/tasks/proj-default" {
+			t.Errorf("expected path /api/task/tasks/proj-default, got %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[]`))
+		w.Write([]byte(`{
+			"data": {"columns": []},
+			"pagination": {"page": 1, "pageSize": 100, "total": 0, "totalPages": 0}
+		}`))
 	}))
 	defer server.Close()
 
