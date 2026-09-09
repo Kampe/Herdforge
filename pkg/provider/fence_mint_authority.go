@@ -2,11 +2,11 @@ package provider
 
 import (
 	cryptorand "crypto/rand"
-	"path/filepath"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -179,6 +179,7 @@ type CoordinatorBrokerOptions struct {
 	UpstreamURL     string
 	UpstreamProject string
 	UpstreamCLI     bool
+	CoreTaskReads   bool
 }
 
 // CoordinatorBroker is a broker owned by this process plus the authority to mint
@@ -245,6 +246,7 @@ func StartCoordinatorBroker(opts CoordinatorBrokerOptions) (*CoordinatorBroker, 
 		UpstreamURL:     opts.UpstreamURL,
 		UpstreamProject: opts.UpstreamProject,
 		UpstreamCLI:     opts.UpstreamCLI,
+		CoreTaskReads:   opts.CoreTaskReads,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("provider: start coordinator-owned broker: %w", err)

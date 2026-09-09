@@ -182,7 +182,6 @@ func TestProductionWritesNoMintCredentialFile(t *testing.T) {
 	}
 }
 
-
 // TestCoordinatorBrokerGrantsMintAuthority covers the wired production path:
 // the coordinator hosts the broker and gets authority over it.
 func TestCoordinatorBrokerGrantsMintAuthority(t *testing.T) {
@@ -214,6 +213,21 @@ func TestCoordinatorBrokerGrantsMintAuthority(t *testing.T) {
 		if cb.Minter.mintSecret == "" {
 			t.Error("authority must not depend on the credential file")
 		}
+	}
+}
+
+func TestCoordinatorBrokerPropagatesCoreTaskReadConfiguration(t *testing.T) {
+	cb, err := StartCoordinatorBroker(CoordinatorBrokerOptions{
+		ClaimDir: t.TempDir(), ListenAddr: "127.0.0.1:0",
+		UpstreamURL: "https://board.example", UpstreamProject: "project-1",
+		UpstreamCLI: true, CoreTaskReads: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cb.Close() }()
+	if cb.Broker.upstream == nil || !cb.Broker.upstream.CoreTaskReads {
+		t.Fatal("coordinator broker must pass CoreTaskReads to its real upstream client")
 	}
 }
 
