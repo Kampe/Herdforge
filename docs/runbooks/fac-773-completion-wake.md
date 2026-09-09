@@ -15,6 +15,12 @@ the recipient is `idle` or `done`; `working`, `starting`, and unknown status
 make zero prompt/key/signal calls. Authenticated control and callback
 envelopes remain on their native consumers.
 
+Producers may run from a linked worktree: leave `HERD_PROJECT_ROOT` unset and
+allow the existing Git common-directory authority to resolve the project. A
+lane-specific `HERD_ROOT` is not a project-mail anchor. If a launcher supplies
+`HERD_PROJECT_ROOT`, it must name the exact canonical project root; do not
+replace it with a guessed worktree basename or fall back to a foreign repo.
+
 Delivery states are distinct: mailbox append is `queued`, prompt submission is
 `submitted`, pane/task evidence is `consumed`, and the handled sidecar is
 `handled`. Pending state is retained until consumption proof and handled-state

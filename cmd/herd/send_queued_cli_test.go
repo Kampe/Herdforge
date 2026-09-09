@@ -290,6 +290,35 @@ func TestWatchWakeReconcilesPreexistingOrdinaryReportAndRestartDoesNotRedeliver(
 	}
 }
 
+func TestMailCLIFromWorktreeWritesCanonicalProjectMailbox(t *testing.T) {
+	repo := queuedSendRepo(t)
+	lane := filepath.Join(repo, ".worktrees", "mender-fac773-route")
+	if out, err := testgit.Command(repo, "worktree", "add", "-q", "-b", "fac773-route", lane).CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %v (%s)", err, out)
+	}
+	bin, _, _ := installQueuedSendFake(t, "working", "0")
+	env := queuedSendEnv(bin, repo)
+	env = append(env, "HERD_ROOT="+lane, "HERD_PROJECT_ROOT=")
+	body := "worktree producer report"
+	out, err := runHerd(t, lane, env, "mail", "send", "--from", "worker", "--to", "coordinator", "--subject", "FAC-773 report", "--body", body)
+	if err != nil {
+		t.Fatalf("mail send from worktree: %v\n%s", err, out)
+	}
+
+	canonical := filepath.Join(repo, ".herd", "control-mail.jsonl")
+	canonicalBox := mail.NewMailbox(canonical)
+	inbox, err := canonicalBox.ReadInbox("coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || inbox[0].Body != body {
+		t.Fatalf("canonical inbox = %+v, want exact report body", inbox)
+	}
+	if _, err := os.Stat(filepath.Join(lane, ".herd", "control-mail.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("worktree-local mailbox was written, stat err=%v", err)
+	}
+}
+
 func TestSendCLIRefusesForeignWorkspace(t *testing.T) {
 	proc := startFakeCommand(t)
 	repo := queuedSendRepo(t)
