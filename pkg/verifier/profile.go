@@ -102,11 +102,34 @@ type ResolvedProfile struct {
 // authorized full-suite test commands (the configured form or the executed
 // form with the test timeout applied).
 func (p ResolvedProfile) CommandAdmitted(command []string) bool {
-	joined := strings.Join(command, " ")
-	if joined == "" {
+	_, ok := p.admittedCommandDigest(command)
+	return ok
+}
+
+// admittedCommandDigest returns the profile digest bound to an exact argv
+// form. Comparing parsed vectors prevents receipt fields from collapsing
+// distinct executions into the same whitespace-joined command string.
+func (p ResolvedProfile) admittedCommandDigest(command []string) (string, bool) {
+	for _, candidate := range []CommandProfile{p.Base, p.Execution} {
+		argv, err := parseArgv(candidate.TestCommand)
+		if err != nil || !sameArgv(argv, command) {
+			continue
+		}
+		return candidate.Digest(), true
+	}
+	return "", false
+}
+
+func sameArgv(left, right []string) bool {
+	if len(left) != len(right) {
 		return false
 	}
-	return joined == strings.TrimSpace(p.Base.TestCommand) || joined == strings.TrimSpace(p.Execution.TestCommand)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ReceiptAdmitted reports whether the profile identity a receipt carries
@@ -116,8 +139,11 @@ func (p ResolvedProfile) ReceiptAdmitted(receipt Receipt) bool {
 	if receipt.VerificationProfile != "" && receipt.VerificationProfile != p.Name {
 		return false
 	}
-	if receipt.ProfileDigest != "" && receipt.ProfileDigest != p.Base.Digest() && receipt.ProfileDigest != p.Execution.Digest() {
-		return false
+	if receipt.ProfileDigest != "" {
+		digest, ok := p.admittedCommandDigest(receipt.Command)
+		if !ok || receipt.ProfileDigest != digest {
+			return false
+		}
 	}
 	if receipt.ConfigRevision != "" && receipt.ConfigRevision != p.Revision {
 		return false

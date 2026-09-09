@@ -821,6 +821,10 @@ func TestCandidateIndex_ReceiptAdmissionRequiresExactFullSuiteCommand(t *testing
 			command:      []string{"go", "test", "./..."},
 			wantAdmitted: true,
 		},
+		{
+			name:    "one argv element is not equivalent to the configured command",
+			command: []string{"go test", "./..."},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -973,9 +977,12 @@ func TestCandidateIndex_ConfiguredProfileExecutionReceiptIsAdmitted(t *testing.T
 		name    string
 		command []string
 		digest  string
+		want    bool
 	}{
-		{name: "executed full-suite command with execution profile digest", command: strings.Fields(execution.TestCommand), digest: execution.Digest()},
-		{name: "configured base command with base profile digest", command: strings.Fields(base.TestCommand), digest: base.Digest()},
+		{name: "executed full-suite command with execution profile digest", command: strings.Fields(execution.TestCommand), digest: execution.Digest(), want: true},
+		{name: "configured base command with base profile digest", command: strings.Fields(base.TestCommand), digest: base.Digest(), want: true},
+		{name: "configured command with execution profile digest is a cross-pair", command: strings.Fields(base.TestCommand), digest: execution.Digest()},
+		{name: "executed command with base profile digest is a cross-pair", command: strings.Fields(execution.TestCommand), digest: base.Digest()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1003,10 +1010,10 @@ func TestCandidateIndex_ConfiguredProfileExecutionReceiptIsAdmitted(t *testing.T
 				t.Fatalf("expected one candidate, got %d", len(cands))
 			}
 			c := cands[0]
-			if !c.CompletionValid {
-				t.Fatalf("managed execution receipt was not admitted: command=%v digest=%s", tt.command, tt.digest)
+			if c.CompletionValid != tt.want {
+				t.Fatalf("receipt admission = %v, want %v: command=%v digest=%s", c.CompletionValid, tt.want, tt.command, tt.digest)
 			}
-			if c.State == StateBlocked || len(c.BlockedReasons) != 0 {
+			if tt.want && (c.State == StateBlocked || len(c.BlockedReasons) != 0) {
 				t.Fatalf("admitted managed receipt left candidate blocked: %+v", c)
 			}
 		})
