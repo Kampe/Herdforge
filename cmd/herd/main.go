@@ -949,7 +949,7 @@ You are an **Autonomous Builder Agent** operating in a dedicated git worktree.
 
 Known pre-existing failures that must not self-block a builder without confirming the diff did not cause them: TestFactoryE2E_CoordinatorFenceBlocksSecondLoop, TestApproveCLI_ReleasedNewerGenerationStillFences, TestBroker_SessionAuthorityDiesWithPaneIncarnation, TestLaneLaunchDecisionReportsConfiguredProbeFailure, and TestNewDrainAdaptersFailsClosedOnMissingAuthority/no_reviewer_lane.
 `)
-	writePrompt(".herd/prompts/reviewer.md", `# Herdforge Reviewer Agent Contract
+	writePrompt(reviewerContractPath, `# Herdforge Reviewer Agent Contract
 
 You are an **Adversarial Code Reviewer** in the Herdforge network.
 
