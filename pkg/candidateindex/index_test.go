@@ -16,6 +16,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/verifier"
 )
 
 type mockProvider struct {
@@ -604,6 +605,88 @@ func TestCandidateIndex_DefaultCallbackMailboxClearsBlockedEvidence(t *testing.T
 	}
 	if c.State == StateBlocked || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
 		t.Fatalf("complete callback did not clear same-lease block on canonical mailbox: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
+	}
+}
+
+func TestCandidateIndex_LaterGenerationClearsEarlierSameSHABlockedCallback(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	sha := "46be267dd2cc0a42acb70141838d0e3f5645605b"
+	base := "b42b69763598436c29d49e7922b27f011ae168a5"
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	writeCallback := func(sequence, generation int64, kind mail.CallbackKind, detail string) {
+		t.Helper()
+		body, marshalErr := json.Marshal(mail.Callback{
+			Ref: "FAC-618", Kind: kind, SHA: sha, Detail: detail,
+			LeaseGeneration: generation,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal callback: %v", marshalErr)
+		}
+		if encodeErr := json.NewEncoder(mailFile).Encode(mail.Envelope{
+			ID: fmt.Sprintf("fac-618-callback-%d", sequence), Sequence: sequence,
+			Sender: "worker", Recipient: mail.CoordinatorInbox,
+			Subject: string(kind) + ": FAC-618", Body: string(body),
+			Timestamp: time.Unix(sequence, 0).UTC(),
+		}); encodeErr != nil {
+			t.Fatalf("write callback: %v", encodeErr)
+		}
+	}
+	writeCallback(620, 1, mail.CallbackBlocked, "generation 1 failed")
+	writeCallback(621, 2, mail.CallbackComplete, "generation 2 complete")
+	if err := mailFile.Close(); err != nil {
+		t.Fatalf("close mail: %v", err)
+	}
+
+	receipt := verifier.Receipt{
+		Version: 1, TaskRef: "FAC-618", LeaseGeneration: "2",
+		CandidateSHA: sha, BaseSHA: base, Command: []string{"go", "test", "-count=1", "./..."},
+		ExitCode: 0, Outcome: verifier.OutcomePASS,
+	}
+	receipt.Digest = receipt.ComputeDigest()
+	receiptDir := filepath.Join(dir, ".herd", "verification-receipts")
+	if err := os.MkdirAll(receiptDir, 0700); err != nil {
+		t.Fatalf("create receipt dir: %v", err)
+	}
+	receiptData, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal receipt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(receiptDir, receipt.Digest[len("sha256:"):]+".json"), receiptData, 0600); err != nil {
+		t.Fatalf("write receipt: %v", err)
+	}
+
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	ledgerFile, err := os.Create(ledgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	if err := json.NewEncoder(ledgerFile).Encode(reviewledger.LedgerRow{
+		Timestamp: "2026-09-02T00:00:00Z", Event: string(reviewledger.EventVerdict),
+		SHA: sha, Task: "FAC-618", Verdict: string(reviewledger.VerdictPASS),
+	}); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+	if err := ledgerFile.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+
+	cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.CandidateSHA != sha || c.LeaseGeneration != 2 || !c.CompletionValid {
+		t.Fatalf("generation 2 evidence was not selected: %+v", c)
+	}
+	if c.State != StateEligible || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
+		t.Fatalf("generation 1 block contaminated completed generation 2: %+v", c)
 	}
 }
 

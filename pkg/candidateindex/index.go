@@ -293,7 +293,13 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 						} else if cb.Kind == mail.CallbackComplete {
 							completionCallbacks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
 							c.CompletionCallback = true
-							if block, ok := callbackBlocks[key]; ok && env.Sequence > block.sequence && cb.LeaseGeneration == block.lease {
+							// A completion from the same or a later lease generation
+							// supersedes the block it causally follows. A later
+							// generation may reuse the identical candidate SHA, so
+							// fencing this comparison to equality would preserve a
+							// stale block forever. An older completion must never
+							// clear a newer generation's block.
+							if block, ok := callbackBlocks[key]; ok && env.Sequence > block.sequence && cb.LeaseGeneration >= block.lease {
 								c.State = StatePending
 								c.BlockedReasons = removeBlockedReason(c.BlockedReasons, BlockedVetoVerdict)
 								c.BlockedEvidence = removeCallbackBlockedEvidence(c.BlockedEvidence)
