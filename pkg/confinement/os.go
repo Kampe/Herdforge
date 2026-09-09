@@ -23,6 +23,10 @@ var ErrOSUnavailable = errors.New("confinement: OS write confinement backend una
 // outside inode — the sandbox is not effective.
 var ErrOSProbeFailed = errors.New("confinement: OS write confinement probe failed")
 
+// ClaudeTopLevelConfigFile is the shared contract for Claude Code's account
+// selector. Both discovery and the macOS write policy must name the same file.
+const ClaudeTopLevelConfigFile = ".claude.json"
+
 // OSBackend isolates helper children that exercise write paths and installs
 // the durable agent wrapper that production launches must place first on PATH.
 //
@@ -777,7 +781,7 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath strin
 			fmt.Fprintf(&b, "(allow file-write* (subpath %q))\n", filepath.Join(home, filepath.FromSlash(rel)))
 		}
 		// Claude Code top-level config is a file, not under .claude/.
-		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(home, ".claude.json"))
+		fmt.Fprintf(&b, "(allow file-write* (literal %q))\n", filepath.Join(home, ClaudeTopLevelConfigFile))
 	}
 	// Worktree-local git bookkeeping only (paths under gitDir already granted).
 	// Do NOT grant common packed-refs or common HEAD — those rewrite shared repo state.

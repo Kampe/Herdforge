@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/confinement"
 )
 
 // AccountIdentity binds a quota reading to the authenticated account it was
@@ -88,7 +90,7 @@ func claudeConfigAccountIdentity() *AccountIdentity {
 		if json.Unmarshal(raw, &cfg) != nil {
 			continue
 		}
-		if id := identity("claude", cfg.OauthAccount.AccountUUID, "claude-config:.claude.json:oauthAccount.accountUuid"); id != nil {
+		if id := identity("claude", cfg.OauthAccount.AccountUUID, "claude-config:"+confinement.ClaudeTopLevelConfigFile+":oauthAccount.accountUuid"); id != nil {
 			return id
 		}
 	}
@@ -128,7 +130,7 @@ func claudeConfigFiles() []string {
 	var out []string
 	add := func(dir string) {
 		if strings.TrimSpace(dir) != "" {
-			out = append(out, filepath.Join(dir, ".claude.json"))
+			out = append(out, filepath.Join(dir, confinement.ClaudeTopLevelConfigFile))
 		}
 	}
 	add(os.Getenv("CLAUDE_CONFIG_DIR"))
