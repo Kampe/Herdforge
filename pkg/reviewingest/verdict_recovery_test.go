@@ -1,12 +1,15 @@
 package reviewingest
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -64,10 +67,32 @@ func (f *recoveryFixture) opts() VerdictRecoveryOptions {
 			}
 			return nil
 		},
+		VerifyRecord: func(data []byte, sigHex string) error {
+			sig, err := hex.DecodeString(sigHex)
+			if err != nil {
+				return err
+			}
+			if !ed25519.Verify(pub, data, sig) {
+				return os.ErrInvalid
+			}
+			return nil
+		},
 		BranchReaches: func(branch, sha string) bool { return branch == fxBranch && sha == fxCand },
 		LatestDeliveredVerdict: func(repo, ref, candidate string) (string, int64, bool, error) {
 			return f.effect.EffectID, 587, true, nil
 		},
+	}
+}
+
+// signRecord signs the record in its CURRENT state — call after any
+// legitimate mutation and before recovery, exactly as the coordinator CLI
+// would. Fixture records are well-formed by construction, so a signing
+// failure here is a fixture bug, not a test outcome.
+func (f *recoveryFixture) signRecord() {
+	if _, err := SignRecoveryRecord(&f.record, func(data []byte) (string, error) {
+		return hex.EncodeToString(ed25519.Sign(f.key, data)), nil
+	}); err != nil {
+		panic("fixture signing failed: " + err.Error())
 	}
 }
 
@@ -206,11 +231,13 @@ func TestRetainVerdictArtifact_VerificationDigestIsNeverSynthesized(t *testing.T
 func TestRecoverVerdictArtifact_Gates(t *testing.T) {
 	t.Run("requires capability", func(t *testing.T) {
 		f := newRecoveryFixture(t, "APPROVED")
+		f.signRecord()
 		opts := f.opts()
 		opts.BranchReaches = nil
 		if _, err := RecoverVerdictArtifact(f.root, f.record, opts); err == nil {
 			t.Fatal("recovery without branch-reach capability must refuse")
 		}
+		f.signRecord()
 		opts = f.opts()
 		opts.LatestDeliveredVerdict = nil
 		if _, err := RecoverVerdictArtifact(f.root, f.record, opts); err == nil {
@@ -220,17 +247,20 @@ func TestRecoverVerdictArtifact_Gates(t *testing.T) {
 	t.Run("requires reviewer family and refuses coordinator identity", func(t *testing.T) {
 		f := newRecoveryFixture(t, "APPROVED")
 		f.record.ReviewerFamily = ""
+		f.signRecord()
 		if _, err := RecoverVerdictArtifact(f.root, f.record, f.opts()); err == nil {
 			t.Fatal("recovery without reviewer family must refuse")
 		}
 		f = newRecoveryFixture(t, "APPROVED")
 		f.record.Reviewer = "coordinator"
+		f.signRecord()
 		if _, err := RecoverVerdictArtifact(f.root, f.record, f.opts()); err == nil {
 			t.Fatal("a coordinator identity must never be recovered as reviewer")
 		}
 	})
 	t.Run("refuses branch that does not reach the candidate", func(t *testing.T) {
 		f := newRecoveryFixture(t, "APPROVED")
+		f.signRecord()
 		opts := f.opts()
 		opts.BranchReaches = func(branch, sha string) bool { return false }
 		if _, err := RecoverVerdictArtifact(f.root, f.record, opts); err == nil {
@@ -239,6 +269,7 @@ func TestRecoverVerdictArtifact_Gates(t *testing.T) {
 	})
 	t.Run("refuses superseded effect", func(t *testing.T) {
 		f := newRecoveryFixture(t, "APPROVED")
+		f.signRecord()
 		opts := f.opts()
 		opts.LatestDeliveredVerdict = func(repo, ref, candidate string) (string, int64, bool, error) {
 			return "verdict-delivered:herdforge:" + fxTask + ":" + fxCand + ":gen1:" + fxLease + ":REJECTED", 590, true, nil
@@ -250,6 +281,7 @@ func TestRecoverVerdictArtifact_Gates(t *testing.T) {
 	t.Run("refuses stale bus binding and duplicate-conflicting sequence", func(t *testing.T) {
 		f := newRecoveryFixture(t, "APPROVED")
 		f.record.BusSequence = 587
+		f.signRecord()
 		opts := f.opts()
 		opts.LatestDeliveredVerdict = func(repo, ref, candidate string) (string, int64, bool, error) {
 			return "", 0, false, nil
@@ -266,6 +298,7 @@ func TestRecoverVerdictArtifact_Gates(t *testing.T) {
 	})
 	t.Run("recovers the effective effect exactly once", func(t *testing.T) {
 		f := newRecoveryFixture(t, "REJECTED")
+		f.signRecord()
 		rel, err := RecoverVerdictArtifact(f.root, f.record, f.opts())
 		if err != nil {
 			t.Fatalf("recover REJECTED: %v", err)
@@ -281,6 +314,128 @@ func TestRecoverVerdictArtifact_Gates(t *testing.T) {
 			t.Fatalf("recovery must be idempotent: %s %v", rel2, err)
 		}
 	})
+}
+
+// TestRecoverVerdictArtifact_RefusesUnboundMetadata is the FAC-740 review
+// finding 2 control: the signed provider effect covers NO reviewer, family,
+// or verification field, so recovery must refuse any record whose metadata is
+// not bound by a valid coordinator record signature. Against the shipped
+// candidate (which checked only that a supplied digest matched a recomputed
+// digest of supplied text) the tampered variants RECOVER — these assertions
+// fail there.
+func TestRecoverVerdictArtifact_RefusesUnboundMetadata(t *testing.T) {
+	t.Run("refuses an unsigned record", func(t *testing.T) {
+		f := newRecoveryFixture(t, "APPROVED")
+		if _, err := RecoverVerdictArtifact(f.root, f.record, f.opts()); err == nil {
+			t.Fatal("an unsigned recovery record must be refused — metadata without signed authority is not independent-review evidence")
+		}
+	})
+	t.Run("refuses a tampered reviewer or family", func(t *testing.T) {
+		f := newRecoveryFixture(t, "APPROVED")
+		f.signRecord()
+		f.record.Reviewer = "review-impersonated-999999999999"
+		if _, err := RecoverVerdictArtifact(f.root, f.record, f.opts()); err == nil {
+			t.Fatal("a record whose reviewer was changed after signing must be refused")
+		}
+		f2 := newRecoveryFixture(t, "APPROVED")
+		f2.signRecord()
+		f2.record.ReviewerFamily = "openai"
+		if _, err := RecoverVerdictArtifact(f2.root, f2.record, f2.opts()); err == nil {
+			t.Fatal("a record whose reviewer family was changed after signing must be refused")
+		}
+	})
+	t.Run("refuses tampered verification evidence", func(t *testing.T) {
+		f := newRecoveryFixture(t, "APPROVED")
+		f.record.Verification = "go test ./... \nexit 0"
+		f.record.VerificationDigest = verificationDigestOf(f.record.Verification)
+		f.signRecord()
+		f.record.Verification = "go test ./... \nexit 0 (self-authored rewrite)"
+		// The record signature covers the stated digest, so rewritten
+		// verification text cannot be smuggled in with a valid signature
+		// over a different digest.
+		if _, err := RecoverVerdictArtifact(f.root, f.record, f.opts()); err == nil {
+			t.Fatal("verification evidence rewritten after signing must be refused")
+		}
+	})
+	t.Run("recovers a signed record whose metadata is bound", func(t *testing.T) {
+		f := newRecoveryFixture(t, "APPROVED")
+		f.signRecord()
+		if _, err := RecoverVerdictArtifact(f.root, f.record, f.opts()); err != nil {
+			t.Fatalf("a coordinator-signed record must recover: %v", err)
+		}
+	})
+}
+
+// TestPublishRetainedArtifact_NeverReplacesExistingEvidence is the FAC-740
+// review finding 3 control. os.Rename silently REPLACES the destination on
+// POSIX, so the shipped candidate's check-then-rename publish let two
+// concurrent recoveries of the same artifact name each report success while
+// the last rename replaced the first evidence. With the atomic no-replace
+// link the second publisher must observe the existing bytes and refuse.
+func TestPublishRetainedArtifact_NeverReplacesExistingEvidence(t *testing.T) {
+	f := newRecoveryFixture(t, "APPROVED")
+	dst := filepath.Join(f.root, ".herd", "review", "inbox", "collision-target.md")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := []byte("coordinator-reviewed evidence v1\n")
+	if err := publishRetainedArtifact(dst, first); err != nil {
+		t.Fatalf("first publish must succeed: %v", err)
+	}
+	if err := publishRetainedArtifact(dst, []byte("conflicting rewrite v2\n")); !errors.Is(err, ErrRetainedCollision) {
+		t.Fatalf("a conflicting publish must collide, got %v", err)
+	}
+	onDisk, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(onDisk, first) {
+		t.Fatalf("existing evidence must survive a colliding publish byte for byte, got %q", onDisk)
+	}
+	// Same content is an idempotent success.
+	if err := publishRetainedArtifact(dst, first); err != nil {
+		t.Fatalf("same-content publish must converge: %v", err)
+	}
+}
+
+// TestPublishRetainedArtifact_ConcurrentSameContentConverges exercises the
+// race itself: N writers of the SAME artifact name with the SAME content must
+// all succeed and leave exactly one file; N writers with DIFFERENT content
+// must leave exactly the first publisher's bytes and no torn mix.
+func TestPublishRetainedArtifact_ConcurrentSameContentConverges(t *testing.T) {
+	f := newRecoveryFixture(t, "APPROVED")
+	dir := filepath.Join(f.root, ".herd", "review", "inbox")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "concurrent-target.md")
+	content := []byte("the effect body, identical for every writer\n")
+	var wg sync.WaitGroup
+	errs := make([]error, 16)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); errs[i] = publishRetainedArtifact(dst, content) }(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("same-content writer %d must converge: %v", i, err)
+		}
+	}
+	onDisk, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(onDisk, content) {
+		t.Fatalf("converged content must be byte-identical, got %q", onDisk)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("convergence must leave exactly one artifact, got %d", len(entries))
+	}
 }
 
 func TestLedgerVerdict_TokenMapping(t *testing.T) {

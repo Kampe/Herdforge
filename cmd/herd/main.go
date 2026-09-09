@@ -10288,7 +10288,55 @@ func serveBrokerConn(conn net.Conn, root string, cfg *config.Config, authority d
 			return
 		} else if !owned {
 			// Another coordinator owns delivery for this exact effect.
-			// Converge on ITS result rather than duplicating the effect.
+			// Converge on ITS RESULT — but a result is EVIDENCE, not intent:
+			// the owner may have stalled between its claim marker and
+			// delivery, and a silent OK here would strand the verdict with
+			// the provider claim in place and no canonical authority (the
+			// exact FAC-737/738 shape). Give an in-flight owner a bounded
+			// window to land the effect, then refuse with a retryable error
+			// unless the effect is actually present on the provider.
+			delivered := false
+			for attempt := 0; ; attempt++ {
+				var dErr error
+				delivered, dErr = effectDelivered()
+				if dErr != nil {
+					respond(brokerResponse{Error: fmt.Sprintf("provider effect readback failed while converging on the owning coordinator — refusing verdict (FAC-145 fail-closed): %v", dErr)})
+					return
+				}
+				if delivered || attempt >= verdictConvergencePolls {
+					break
+				}
+				time.Sleep(verdictConvergencePollInterval)
+			}
+			if !delivered {
+				respond(brokerResponse{Error: "verdict effect claimed by another coordinator but not delivered — refusing to report success without evidence; retry to converge (FAC-145/FAC-351)"})
+				return
+			}
+			// The provider effect is real: converge the canonical artifact
+			// (idempotent; a conflicting artifact refuses with its own exact
+			// error) and the delivered record if it is still missing. This
+			// closes the owner-stalled-after-retention-failure window: the
+			// retry reconciles instead of reporting a success that never
+			// happened.
+			if _, rErr := retainVerdictInboxArtifact(root, tc, verdict, canonicalBody, verifier); rErr != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("verdict delivered by another coordinator but canonical retention failed — retry reconciles (FAC-351): %v", rErr)})
+				return
+			}
+			if _, foundNow, fErr := mb.HasDeliveredVerdict(effectID); fErr != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("verdict state unreadable (FAC-145 fail-closed): %v", fErr)})
+				return
+			} else if !foundNow {
+				convergedRec := mail.Callback{
+					Ref: tc.TaskRef, Kind: kind, SHA: tc.CandidateSHA,
+					Detail: canonicalBody, Repo: tc.Repository,
+					LeaseGeneration: tc.LeaseGeneration, SenderRole: tc.Role,
+					DedupeID: effectID,
+				}
+				if _, err := mb.PostCallback(tc.Role, convergedRec); err != nil {
+					respond(brokerResponse{Error: fmt.Sprintf("verdict delivered to provider but authority record failed (retry reconciles): %v", err)})
+					return
+				}
+			}
 			respond(brokerResponse{OK: true})
 			return
 		}
@@ -10695,6 +10743,15 @@ func releaseCoordinationAndLaunchLeaseBounded(root string, key claim.LeaseKey, o
 
 // verdictClaimPrefix marks provider-side ownership claims.
 const verdictClaimPrefix = "[verdict-claim "
+
+// Convergence polling for the claimed-but-undelivered window (FAC-351/FAC-740):
+// an in-flight owner lands its effect within milliseconds, so a short bounded
+// poll lets a racing loser converge on evidence instead of erroring; a stalled
+// owner still produces a retryable error, never a silent stranded OK.
+const (
+	verdictConvergencePolls        = 8
+	verdictConvergencePollInterval = 250 * time.Millisecond
+)
 
 // retainVerdictInboxArtifact composes and retains the canonical review-inbox
 // artifact for one delivered verdict effect (FAC-351, restored by FAC-740).

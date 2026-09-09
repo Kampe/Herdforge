@@ -21,6 +21,7 @@ package reviewingest
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -209,15 +210,64 @@ type VerdictRecoveryRecord struct {
 	BusSequence int64 `json:"bus_sequence,omitempty"`
 	// CanonicalBody is the EXACT delivered provider comment body.
 	CanonicalBody string `json:"canonical_body"`
+	// RecordSig is the coordinator signature over RecoveryRecordSigPayload —
+	// the authorized authority binding reviewer identity, reviewer family,
+	// and the verification digest to this effect. The signed provider effect
+	// covers none of these fields, so recovery without a valid record
+	// signature could manufacture independent-review metadata around a
+	// publicly readable effect; unsigned records are refused (FAC-351).
+	RecordSig string `json:"record_sig,omitempty"`
+}
+
+// recoveryRecordSigSeparator is a unit-separator join so no delimiter
+// ambiguity can move a value across fields in the signed payload.
+const recoveryRecordSigSeparator = "\x1f"
+
+// RecoveryRecordSigPayload is the canonical preimage a recovery record's
+// record_sig authenticates: the effect identity plus every metadata field
+// recovery would otherwise take on trust. Tampering with any covered field —
+// reviewer, family, or the verification digest — invalidates the signature.
+func RecoveryRecordSigPayload(rec VerdictRecoveryRecord, effectID string) []byte {
+	fields := []string{
+		rec.Repo, rec.Ref, rec.CandidateSHA, rec.BaseSHA, rec.Branch,
+		rec.LeaseID, strconv.FormatInt(rec.LeaseGeneration, 10), rec.Verdict,
+		strings.TrimSpace(rec.Reviewer), strings.TrimSpace(rec.ReviewerFamily),
+		strings.TrimSpace(rec.VerificationDigest), strconv.FormatInt(rec.BusSequence, 10),
+	}
+	return []byte("herd-verdict-recovery-record:" + effectID + "\n" + strings.Join(fields, recoveryRecordSigSeparator))
+}
+
+// SignRecoveryRecord fills rec.RecordSig with a coordinator signature over
+// the canonical record payload (the effect id is derived from the record's
+// own canonical body). This is the only sanctioned way to mint a recovery
+// record; a record without a verifiable signature is refused by recovery.
+func SignRecoveryRecord(rec *VerdictRecoveryRecord, sign func(data []byte) (string, error)) (string, error) {
+	if rec == nil {
+		return "", fmt.Errorf("recovery record is required")
+	}
+	effect, err := ParseVerdictEffect(rec.CanonicalBody)
+	if err != nil {
+		return "", err
+	}
+	sig, err := sign(RecoveryRecordSigPayload(*rec, effect.EffectID))
+	if err != nil {
+		return "", fmt.Errorf("sign recovery record: %w", err)
+	}
+	rec.RecordSig = sig
+	return effect.EffectID, nil
 }
 
 // VerdictRecoveryOptions wires the verification capabilities recovery needs.
-// A nil VerifyEffect or BranchReaches refuses — recovery without verification
-// capability writes nothing (fail closed).
+// A nil VerifyEffect, VerifyRecord, or BranchReaches refuses — recovery
+// without verification capability writes nothing (fail closed).
 type VerdictRecoveryOptions struct {
 	// VerifyEffect authenticates the coordinator signature over
 	// "herd-verdict-effect:" + effectID + "\n" + line.
 	VerifyEffect func(line, effectID, sigHex string) error
+	// VerifyRecord authenticates the coordinator signature over a recovery
+	// record payload (RecoveryRecordSigPayload) — the authority binding the
+	// record's reviewer/verification metadata to the effect.
+	VerifyRecord func(data []byte, sigHex string) error
 	// BranchReaches reports whether branch contains sha (git ancestry).
 	BranchReaches func(branch, sha string) bool
 	// LatestDeliveredVerdict returns the LATEST delivered verdict effect for
@@ -305,15 +355,32 @@ func RetainVerdictArtifact(projectRoot string, rec VerdictRecoveryRecord, opts V
 	return retainVerdictBytes(projectRoot, rec, effect)
 }
 
-// RecoverVerdictArtifact runs the recovery-only gates (reviewer identity,
-// branch reach, supersession order) and then retains the canonical artifact.
+// RecoverVerdictArtifact runs the recovery-only gates (record signature,
+// reviewer identity, branch reach, supersession order) and then retains the
+// canonical artifact.
 func RecoverVerdictArtifact(projectRoot string, rec VerdictRecoveryRecord, opts VerdictRecoveryOptions) (string, error) {
-	if opts.BranchReaches == nil || opts.LatestDeliveredVerdict == nil {
-		return "", fmt.Errorf("recovery requires branch-reach and bus-order verification capability (FAC-351 fail-closed)")
+	if opts.VerifyRecord == nil || opts.BranchReaches == nil || opts.LatestDeliveredVerdict == nil {
+		return "", fmt.Errorf("recovery requires record-signature, branch-reach, and bus-order verification capability (FAC-351 fail-closed)")
 	}
 	coordinators := opts.Coordinators
 	if coordinators == nil {
 		coordinators = reviewledger.DefaultCoordinators
+	}
+	effect, parseErr := ParseVerdictEffect(rec.CanonicalBody)
+	if parseErr != nil {
+		return "", parseErr
+	}
+	// AUTHORITY before AUTHORIZATION: the record signature is the only
+	// sanctioned binding of reviewer identity/family and the verification
+	// digest to this effect. The signed provider effect covers neither, so
+	// an unsigned or mismatched record would let any holder of a publicly
+	// readable effect manufacture independent-review metadata around it.
+	// Unsigned and tampered records are refused before anything else runs.
+	if strings.TrimSpace(rec.RecordSig) == "" {
+		return "", fmt.Errorf("recovery record carries no record signature — reviewer and verification metadata cannot be bound to the signed effect without signed authority (FAC-351 fail-closed)")
+	}
+	if err := opts.VerifyRecord(RecoveryRecordSigPayload(rec, effect.EffectID), rec.RecordSig); err != nil {
+		return "", fmt.Errorf("recovery record signature failed verification — refusing metadata that is not bound to authorized signed authority (FAC-351 fail-closed): %w", err)
 	}
 	if strings.TrimSpace(rec.ReviewerFamily) == "" {
 		return "", fmt.Errorf("recovery requires a reviewer family — a recovered verdict with no reviewer provenance is not independent review evidence (FAC-351)")
@@ -330,10 +397,6 @@ func RecoverVerdictArtifact(projectRoot string, rec VerdictRecoveryRecord, opts 
 	latestID, latestSeq, found, err := opts.LatestDeliveredVerdict(rec.Repo, rec.Ref, rec.CandidateSHA)
 	if err != nil {
 		return "", fmt.Errorf("bus verdict state unreadable — refusing recovery (FAC-351 fail-closed): %w", err)
-	}
-	effect, parseErr := ParseVerdictEffect(rec.CanonicalBody)
-	if parseErr != nil {
-		return "", parseErr
 	}
 	switch {
 	case !found:
@@ -384,7 +447,10 @@ func retainVerdictBytes(projectRoot string, rec VerdictRecoveryRecord, effect Ve
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("stat retained artifact: %w", err)
 	}
-	if err := publishRetainedArtifact(dst, strings.NewReader(text)); err != nil {
+	if err := publishRetainedArtifact(dst, []byte(text)); err != nil {
+		if errors.Is(err, ErrRetainedCollision) {
+			return "", fmt.Errorf("retained artifact %s exists with different content — duplicate-conflicting evidence refused (FAC-351)", rel)
+		}
 		return "", err
 	}
 	return rel, nil

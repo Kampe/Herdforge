@@ -69,6 +69,36 @@ func runRecover(t *testing.T, binary, repo, record string) (string, error) {
 	return string(out), err
 }
 
+// signRecoveryRecord drives the REAL --sign-recovery-record surface: the
+// coordinator key signs the record's reviewer/verification binding to the
+// effect, and the signed record comes back on stdout (FAC-351). Recovery
+// refuses unsigned records, so this is the only way a record becomes
+// recoverable end to end. keyDir is the fixture's key directory — the SAME
+// coordinator key the effect signatures and the published receipt.pub use.
+func signRecoveryRecord(t *testing.T, binary, repo, keyDir string, rec map[string]any) string {
+	t.Helper()
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned := filepath.Join(t.TempDir(), "unsigned-record.json")
+	if err := os.WriteFile(unsigned, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "review-ingest", "--sign-recovery-record", unsigned)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "HERD_ROOT="+repo, "HERD_REPO_ROOT="+repo, "HERD_KEY_DIR="+keyDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("sign recovery record: %v\n%s", err, out)
+	}
+	signed := filepath.Join(t.TempDir(), "signed-record.json")
+	if err := os.WriteFile(signed, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
 func TestRecoverVerdictMaterializesDeliveredEffectsForAdmission(t *testing.T) {
 	binary := buildHerd(t)
 	repo, candidate := corroborationRepo(t)
@@ -82,8 +112,23 @@ func TestRecoverVerdictMaterializesDeliveredEffectsForAdmission(t *testing.T) {
 	if err := dispatch.WriteIsolationAttestation(keyDir, "test-sandbox"); err != nil {
 		t.Fatal(err)
 	}
-	signer, err := dispatch.LoadOrCreateSigner(keyDir, "herdforge", repo)
+	// The signing surface resolves the key by the SAME repository identity
+	// the CLI derives from the config, so the fixture key must be stored
+	// under that identity for the CLI to load (never rotate) it.
+	identity, idErr := dispatch.RepositoryIdentity(repo, "herdforge")
+	if idErr != nil {
+		t.Fatal(idErr)
+	}
+	signer, err := dispatch.LoadOrCreateSigner(keyDir, identity, repo)
 	if err != nil {
+		t.Fatal(err)
+	}
+	// The signing surface resolves the coordinator key through the project
+	// config, exactly as every other signing command does.
+	if err := os.MkdirAll(filepath.Join(repo, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".herd", "herd.yaml"), []byte("version: \"1\"\nproject:\n  name: herdforge\ntask_provider:\n  type: memory\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,11 +147,7 @@ func TestRecoverVerdictMaterializesDeliveredEffectsForAdmission(t *testing.T) {
 		"lease_generation": 1, "verdict": "APPROVED", "reviewer": "reviewer-fac737",
 		"reviewer_family": "anthropic", "bus_sequence": seq, "canonical_body": body,
 	}
-	raw, _ := json.Marshal(rec)
-	recPath := filepath.Join(t.TempDir(), "fac737-verdict.json")
-	if err := os.WriteFile(recPath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	recPath := signRecoveryRecord(t, binary, repo, keyDir, rec)
 
 	out, recoverErr := runRecover(t, binary, repo, recPath)
 	if recoverErr != nil {
@@ -177,8 +218,21 @@ func TestRecoverVerdictRefusesIntentOnlyAndSupersededEvidence(t *testing.T) {
 	if err := dispatch.WriteIsolationAttestation(keyDir, "test-sandbox"); err != nil {
 		t.Fatal(err)
 	}
-	signer, err := dispatch.LoadOrCreateSigner(keyDir, "herdforge", repo)
+	// The signing surface resolves the key by the SAME repository identity
+	// the CLI derives from the config, so the fixture key must be stored
+	// under that identity for the CLI to load (never rotate) it.
+	identity, idErr := dispatch.RepositoryIdentity(repo, "herdforge")
+	if idErr != nil {
+		t.Fatal(idErr)
+	}
+	signer, err := dispatch.LoadOrCreateSigner(keyDir, identity, repo)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".herd", "herd.yaml"), []byte("version: \"1\"\nproject:\n  name: herdforge\ntask_provider:\n  type: memory\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,31 +267,23 @@ func TestRecoverVerdictRefusesIntentOnlyAndSupersededEvidence(t *testing.T) {
 	}
 
 	// (b) A record superseded by the later delivered effect is refused...
-	staleRec, _ := json.Marshal(map[string]any{
+	stalePath := signRecoveryRecord(t, binary, repo, keyDir, map[string]any{
 		"repo": "herdforge", "ref": "FAC-738", "candidate_sha": candidate,
 		"base_sha": base, "branch": "main", "lease_id": "claim:584",
 		"lease_generation": 1, "verdict": "APPROVED", "reviewer": "reviewer-fac738",
 		"reviewer_family": "anthropic", "bus_sequence": 0, "canonical_body": signDeliveredEffect(t, signer, "FAC-738", candidate, base, "claim:584", 1, "APPROVED", ""),
 	})
-	stalePath := filepath.Join(t.TempDir(), "fac738-stale.json")
-	if err := os.WriteFile(stalePath, staleRec, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	out, staleErr := runRecover(t, binary, repo, stalePath)
 	if staleErr == nil {
 		t.Fatalf("a superseded effect must be refused:\n%s", out)
 	}
 	// (c) ...while the effective effect recovers exactly once.
-	effectRec, _ := json.Marshal(map[string]any{
+	effectPath := signRecoveryRecord(t, binary, repo, keyDir, map[string]any{
 		"repo": "herdforge", "ref": "FAC-738", "candidate_sha": candidate,
 		"base_sha": base, "branch": "main", "lease_id": "claim:584",
 		"lease_generation": 2, "verdict": "REJECTED", "reviewer": "reviewer-fac738",
 		"reviewer_family": "anthropic", "bus_sequence": 0, "canonical_body": deliveredBody,
 	})
-	effectPath := filepath.Join(t.TempDir(), "fac738-effect.json")
-	if err := os.WriteFile(effectPath, effectRec, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	out, effErr := runRecover(t, binary, repo, effectPath)
 	if effErr != nil {
 		t.Fatalf("the effective delivered effect must recover: %v\n%s", effErr, out)
