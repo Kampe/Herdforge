@@ -475,7 +475,6 @@ func (s RecoveryReceiptSelector) validate() error {
 		"task_id": s.TaskID, "branch": s.Branch, "base_sha": s.BaseSHA,
 		"candidate_sha": s.CandidateSHA,
 		"lease_id":      s.LeaseID, "lease_task_ref": s.LeaseTaskRef,
-		"session_id": s.SessionID,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("recovery receipt selector %s is required", name)
@@ -546,7 +545,7 @@ func recoveryReceiptMatches(tc TaskContext, s RecoveryReceiptSelector) bool {
 		tc.Role == s.Role && strings.EqualFold(tc.TaskRef, s.TaskRef) &&
 		tc.TaskID == s.TaskID && tc.Branch == s.Branch && tc.BaseSHA == s.BaseSHA && tc.CandidateSHA == s.CandidateSHA &&
 		tc.LeaseID == s.LeaseID && tc.LeaseGeneration == s.LeaseGeneration &&
-		tc.LeaseTaskRef == s.LeaseTaskRef && tc.SessionID == s.SessionID
+		tc.LeaseTaskRef == s.LeaseTaskRef && (s.SessionID == "" || tc.SessionID == s.SessionID)
 }
 
 // RemoveCanonicalReceiptSessionIfExact compensates a failed multi-file

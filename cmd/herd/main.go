@@ -607,7 +607,7 @@ func runReceiptRecover() {
 	leaseID := fs.String("lease-id", "", "exact durable lease ID")
 	leaseGeneration := fs.Int64("lease-generation", 0, "exact durable lease generation")
 	leaseTaskRef := fs.String("lease-task-ref", "", "exact durable lease task ref")
-	sessionID := fs.String("session-id", "", "exact canonical receipt session")
+	sessionID := fs.String("session-id", "", "optional exact canonical receipt session; omitted rejects ambiguity")
 	args := os.Args[2:]
 	if len(args) > 0 && args[0] == "recover" {
 		args = args[1:]

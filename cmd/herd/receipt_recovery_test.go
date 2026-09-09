@@ -272,6 +272,25 @@ func TestSelectCanonicalRecoveryReceiptIgnoresStaleHigherGenerationOtherLease(t 
 	if !selected.EqualsIssued(recovery) {
 		t.Fatalf("selected stale or altered receipt: got session %s lease %s generation %d", selected.SessionID, selected.LeaseID, selected.LeaseGeneration)
 	}
+	ambiguous := recovery
+	ambiguous.SessionID = "second-current-recovery-session"
+	ambiguous, err = f.signer.Issue(ambiguous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, ambiguous); err != nil {
+		t.Fatal(err)
+	}
+	selector := dispatch.RecoveryReceiptSelector{
+		ProviderType: recovery.ProviderType, ProjectID: recovery.ProjectID,
+		Repository: recovery.Repository, Role: dispatch.RoleRecovery,
+		TaskRef: recovery.TaskRef, TaskID: recovery.TaskID, Branch: recovery.Branch,
+		BaseSHA: recovery.BaseSHA, CandidateSHA: recovery.CandidateSHA, LeaseID: recovery.LeaseID,
+		LeaseGeneration: recovery.LeaseGeneration, LeaseTaskRef: recovery.LeaseTaskRef,
+	}
+	if _, err := dispatch.SelectCanonicalRecoveryReceipt(f.root, selector, time.Now()); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("omitted session must reject conflicting exact candidates: %v", err)
+	}
 	generic, err := dispatch.LoadCanonicalReceipt(f.root, f.task.Ref)
 	if err != nil || generic.LeaseGeneration != stale.LeaseGeneration {
 		t.Fatalf("fixture did not reproduce old newest-generation selection: %v, got generation %d", err, generic.LeaseGeneration)
@@ -340,6 +359,93 @@ func TestReceiptRecoverCLIRequiresExactTargetAndReadOnlyLeaseObservation(t *test
 	}
 	if after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile)); err != nil || string(after) != string(before) {
 		t.Fatalf("foreign target refusal changed source target: %v", err)
+	}
+	canonicalPaths, err := filepath.Glob(filepath.Join(f.root, dispatch.CanonicalTaskContextDir, "fac-631-*.json"))
+	if err != nil || len(canonicalPaths) == 0 {
+		t.Fatalf("locate canonical receipts: %v", err)
+	}
+	var recoveryPath string
+	canonicalPaths, err = filepath.Glob(filepath.Join(f.root, dispatch.CanonicalTaskContextDir, "fac-631-*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range canonicalPaths {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && strings.Contains(string(data), recovery.SessionID) {
+			recoveryPath = path
+			break
+		}
+	}
+	if recoveryPath == "" {
+		t.Fatal("locate current recovery canonical receipt")
+	}
+	originalCanonical, err := os.ReadFile(recoveryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badCanonical := strings.Replace(string(originalCanonical), recovery.Signature, strings.Repeat("0", len(recovery.Signature)), 1)
+	if err := os.WriteFile(recoveryPath, []byte(badCanonical), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(recovery, f.worktree)...).CombinedOutput(); err == nil || !strings.Contains(string(out), "authenticate") {
+		t.Fatalf("invalid signature must fail closed: err=%v output=%s", err, out)
+	}
+	if err := os.WriteFile(recoveryPath, originalCanonical, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile)); err != nil || string(after) != string(before) {
+		t.Fatalf("invalid signature refusal changed target: %v", err)
+	}
+	expired := recovery
+	expired.SessionID = "public-cli-expired-session"
+	expired.ExpiresAt = time.Now().Add(-time.Hour)
+	expired, err = f.signer.Issue(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, expired); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(expired, f.worktree)...).CombinedOutput(); err == nil || !strings.Contains(string(out), "authorized") {
+		t.Fatalf("expired receipt must fail closed: err=%v output=%s", err, out)
+	}
+	if after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile)); err != nil || string(after) != string(before) {
+		t.Fatalf("expired receipt refusal changed target: %v", err)
+	}
+	canonicalPaths, err = filepath.Glob(filepath.Join(f.root, dispatch.CanonicalTaskContextDir, "fac-631-*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range canonicalPaths {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && strings.Contains(string(data), expired.SessionID) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	ambiguous := recovery
+	ambiguous.SessionID = "public-cli-conflicting-session"
+	ambiguous, err = f.signer.Issue(ambiguous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, ambiguous); err != nil {
+		t.Fatal(err)
+	}
+	noSession := recoveryCLIArgs(recovery, f.worktree)
+	for i := 0; i < len(noSession); i++ {
+		if noSession[i] == "--session-id" && i+1 < len(noSession) {
+			noSession = append(noSession[:i], noSession[i+2:]...)
+			break
+		}
+	}
+	if out, err := herdCmd(binary, f.root, f.keyDir, noSession...).CombinedOutput(); err == nil || !strings.Contains(string(out), "ambiguous") {
+		t.Fatalf("ambiguous public recovery must fail closed: err=%v output=%s", err, out)
+	}
+	if after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile)); err != nil || string(after) != string(before) {
+		t.Fatalf("ambiguity refusal changed target: %v", err)
 	}
 	if err := os.Remove(storePath); err != nil {
 		t.Fatal(err)
