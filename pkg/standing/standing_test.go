@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/goalguard"
 )
 
 func writePrompt(t *testing.T, dir, rel, body string) string {
@@ -211,6 +212,80 @@ func TestAuthorityEnvelopeContainsAllSixVerifiableFields(t *testing.T) {
 		if !strings.Contains(rendered, marker) {
 			t.Fatalf("launch transcript missing %q: %s", marker, rendered)
 		}
+	}
+}
+
+func TestLanePushStandingGrantMatchesRenderedAndDurableAuthority(t *testing.T) {
+	repo, cfg := standingFixture(t)
+	cfg.MergePolicy = &config.MergePolicy{
+		Protected: true, RequiredChecks: []string{"build"},
+		RequireDifferentFamilyReview: true, RequirePullRequestReviews: true,
+		BranchPublication: config.BranchPublicationLanePush,
+	}
+	t.Chdir(repo)
+	var durable goalguard.AuthorityEnvelope
+	var rendered string
+	opts := baseOpts(t, repo)
+	opts.Mode, opts.Only = ModeRaise, []string{"harvest"}
+	opts.WorktreeHead = func(cwd string) (string, string, error) { return "recovery/fac-778-standing", "abc123", nil }
+	opts.SetGoalWithAuthority = func(_ string, _ string, _ string, _ string, envelope goalguard.AuthorityEnvelope) error {
+		durable = envelope
+		return nil
+	}
+	opts.CreateTab = func(_, _, cwd string) (Tab, error) { return Tab{ID: "tab", PaneID: "pane", Cwd: cwd}, nil }
+	opts.StartAgent = func(Tab, string, Route, *config.LaneDef, string) error { return nil }
+	opts.PromptAgent = func(_ string, prompt string) error { rendered = prompt; return nil }
+	result, err := Run(cfg, opts)
+	if err != nil || result.Raised != 1 {
+		t.Fatalf("raise result=%+v err=%v", result, err)
+	}
+	if durable.AllowedBranch != "recovery/fac-778-standing" || strings.Contains(strings.Join(durable.ForbiddenActions, ";"), "push") {
+		t.Fatalf("durable grant did not authorize only the assigned branch: %+v", durable)
+	}
+	for _, forbidden := range []string{"open or update a PR", "merge", "self-review"} {
+		if !strings.Contains(strings.Join(durable.ForbiddenActions, ";"), forbidden) {
+			t.Fatalf("durable grant lost prohibition %q: %+v", forbidden, durable)
+		}
+	}
+	if !strings.Contains(rendered, "Publish only the assigned branch recovery/fac-778-standing") || strings.Contains(rendered, "forbidden actions: push") {
+		t.Fatalf("rendered grant is contradictory: %s", rendered)
+	}
+	if !strings.Contains(rendered, durable.MutationLimits) {
+		t.Fatalf("rendered grant does not carry durable mutation limits: durable=%q rendered=%q", durable.MutationLimits, rendered)
+	}
+}
+
+func TestLanePushStandingGrantFailsClosedForNonWritersAndProtectedBranches(t *testing.T) {
+	policy := &config.MergePolicy{BranchPublication: config.BranchPublicationLanePush}
+	for _, test := range []struct {
+		name   string
+		lane   config.LaneDef
+		branch string
+		want   string
+	}{
+		{name: "read-only", lane: config.LaneDef{Role: "harvest", Authority: config.AuthorityRead, Capabilities: []config.Capability{config.CapabilityGitWrite}}, branch: "feature/x", want: "push"},
+		{name: "reviewer", lane: config.LaneDef{Role: "reviewer", Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite}}, branch: "feature/x", want: "push"},
+		{name: "no-git-write", lane: config.LaneDef{Role: "harvest", Authority: config.AuthorityWrite}, branch: "feature/x", want: "push"},
+		{name: "main", lane: config.LaneDef{Role: "harvest", Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite}}, branch: "main", want: "push"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := AuthorityEnvelopeForLaneWithPolicy(test.lane, policy, "main", test.branch)
+			if got.AllowedBranch != "" || !strings.Contains(strings.Join(got.ForbiddenActions, ";"), test.want) {
+				t.Fatalf("grant=%+v; lane-push refusal was not fail-closed", got)
+			}
+		})
+	}
+	coordinatorHarvest := AuthorityEnvelopeForLaneWithPolicy(
+		config.LaneDef{Role: "harvest", Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite}},
+		&config.MergePolicy{BranchPublication: config.BranchPublicationCoordinatorHarvest}, "main", "feature/x")
+	if coordinatorHarvest.AllowedBranch != "" || !strings.Contains(strings.Join(coordinatorHarvest.ForbiddenActions, ";"), "push") {
+		t.Fatalf("explicit coordinator-harvest must remain no-push: %+v", coordinatorHarvest)
+	}
+	defaultPolicy := AuthorityEnvelopeForLaneWithPolicy(
+		config.LaneDef{Role: "harvest", Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite}},
+		nil, "main", "feature/x")
+	if defaultPolicy.AllowedBranch != "" || !strings.Contains(strings.Join(defaultPolicy.ForbiddenActions, ";"), "push") {
+		t.Fatalf("omitted policy must remain no-push: %+v", defaultPolicy)
 	}
 }
 
