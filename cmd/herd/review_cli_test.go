@@ -2720,6 +2720,12 @@ func pinSubprocessQuota(t *testing.T, cmd *exec.Cmd) {
 
 // FAC-652: exercise the stock coordinator broker, not atomic-server bypass.
 func TestApproveBroker(t *testing.T) {
+	short, err := os.MkdirTemp("/tmp", "hf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(short) })
+	t.Setenv("TMPDIR", short)
 	binary := buildHerd(t)
 	for _, entrypoint := range []string{"approve", "board-done"} {
 		t.Run(entrypoint, func(t *testing.T) {
@@ -2740,13 +2746,7 @@ func TestApproveBroker(t *testing.T) {
 				}
 				env = append(env, entry)
 			}
-			cmd.Env = append(env, "HERD_FENCE_COORDINATOR=1",
-				// FAC-652 Darwin portability: the coordinator broker's default
-				// claim-dir unix socket has a hard 104-byte path limit, which a
-				// t.TempDir claim dir can exceed. Pin the in-process broker to a
-				// supported loopback listen instead of hijacking TMPDIR — the
-				// subprocess override is test-local, never ambient.
-				"HERD_FENCE_BROKER_LISTEN=127.0.0.1:0")
+			cmd.Env = append(env, "HERD_FENCE_COORDINATOR=1")
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("receipt approval through coordinator broker: %v\n%s", err, out)

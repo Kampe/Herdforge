@@ -282,15 +282,8 @@ func OpenClaimStack(dir string, tp TaskProvider) (*ClaimStack, error) {
 		if k != nil {
 			upstreamURL, upstreamProject, upstreamCLI = k.APIURL, k.ProjectID, k.UseCLI
 		}
-		// HERD_FENCE_BROKER_LISTEN overrides the transport only (default stays
-		// the claim-dir unix socket). The claim-dir socket path has a hard
-		// platform limit (104 bytes on Darwin), so a deep temp claim dir cannot
-		// host the default listener; a loopback TCP listen is the supported
-		// alternative the standalone broker already accepts. Auth is token-
-		// based, never transport-based, so this is not a boundary change.
 		cb, cerr := StartCoordinatorBroker(CoordinatorBrokerOptions{
 			ClaimDir:        dir,
-			ListenAddr:      os.Getenv(envFenceBrokerListen),
 			UpstreamURL:     upstreamURL,
 			UpstreamProject: upstreamProject,
 			UpstreamCLI:     upstreamCLI,
