@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-func withCacheFileLock(path string, fn func() error) error {
+func withCacheFileLock(path string, wait time.Duration, fn func() error) error {
 	lock := path + ".lock"
-	for deadline := time.Now().Add(5 * time.Second); ; {
+	for deadline := time.Now().Add(wait); ; {
 		f, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			_ = f.Close()

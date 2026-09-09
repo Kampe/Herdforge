@@ -1,7 +1,11 @@
 package usage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -245,7 +249,17 @@ func withSnapshotFileLock(fn func() error) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return withCacheFileLock(path+".lock", fn)
+	return withCacheFileLock(path+".lock", 2*time.Second, fn)
+}
+
+func withProviderFileLock(name, accountKey string, fn func() error) error {
+	path := snapshotCachePath()
+	if path == "" {
+		return os.ErrInvalid
+	}
+	key := sha256.Sum256([]byte(name + ":" + accountKey))
+	lockPath := filepath.Join(filepath.Dir(path), filepath.Base(path)+"."+hex.EncodeToString(key[:])[:16])
+	return withCacheFileLock(lockPath, 300*time.Millisecond, fn)
 }
 
 func mergeSnapshotFile(snap *UsageSnapshot, backoff *cachedProviderRecord) error {
@@ -261,6 +275,9 @@ func mergeSnapshotFile(snap *UsageSnapshot, backoff *cachedProviderRecord) error
 		var prior cachedSnapshot
 		if json.Unmarshal(raw, &prior) == nil {
 			records = prior.Providers
+			if records == nil {
+				records = make(map[string]cachedProviderRecord)
+			}
 			if len(records) == 0 && prior.Snapshot != nil {
 				for name, provider := range prior.Snapshot.Providers {
 					record := cachedProviderRecord{ObservedAt: prior.FetchedAt, Provider: provider}
@@ -333,95 +350,55 @@ func FetchSnapshotCached() (*UsageSnapshot, time.Duration, error) {
 // true. Persisted rate-limit backoff is still honored: force cannot turn a
 // provider's explicit 429 cooldown into another upstream request.
 func FetchSnapshotCachedForce(force bool) (*UsageSnapshot, time.Duration, error) {
-	ttl := snapshotTTL()
-	quotaCache.Lock()
-	defer quotaCache.Unlock()
-
-	if !force && ttl > 0 && quotaCache.snap != nil {
-		if bound, age, ok := freshBoundSnapshot(quotaCache.snap, ttl, quotaCache.fetchedAt); ok {
-			return bound, age, nil
-		}
-	}
-	// FAC-679 (second pass): the in-process cache alone did nothing for the case
-	// that reported the problem. Every `herd review` is its OWN process, so a
-	// memory cache collapses repeated fetches within one launch and helps not at
-	// all across launches -- which is where the 29-272 seconds were being spent.
-	//
-	// Caught by measuring two consecutive launches and seeing no improvement
-	// that the cache could account for. The reading is therefore persisted, with
-	// the same rules: short TTL, age reported, identity-bound, and a failed
-	// refresh never served from disk.
-	var snap *UsageSnapshot
-	var err error
-	var ageUsed time.Duration
-	lockErr := withSnapshotFileLock(func() error {
-		if !force && ttl > 0 {
-			if cached, age, ok := readSnapshotFile(ttl); ok {
-				quotaCache.snap, quotaCache.fetchedAt = cached, time.Now().Add(-age)
-				snap = cached
-				ageUsed = age
-				return nil
-			}
-		}
-		pollers := activeNativePollers()
-		available := make(map[string]func() (ProviderUsage, error), len(pollers))
-		suppressed := make(map[string]string)
-		for name, poll := range pollers {
-			if record, ok := readProviderRecord(name); ok && record.BackoffUntil.After(time.Now()) && record.AccountKey == currentProviderAccountKey(name) {
-				suppressed[name] = record.Error
-				continue
-			}
-			available[name] = poll
-		}
-		snap, err = fetchDirectAllWithPollers(available)
-		if len(suppressed) > 0 {
-			if snap.Errors == nil {
-				snap.Errors = make(map[string]string)
-			}
-			for name, detail := range suppressed {
-				if detail == "" {
-					detail = "rate-limited: provider is in persisted backoff"
+	pollers := activeNativePollers()
+	snap := &UsageSnapshot{GeneratedAt: time.Now().UTC(), Providers: make(map[string]ProviderUsage)}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for name := range pollers {
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			one, err := fetchProviderCached(name, force)
+			mu.Lock()
+			defer mu.Unlock()
+			if one != nil {
+				for provider, usage := range one.Providers {
+					snap.Providers[provider] = usage
 				}
-				snap.Errors[name] = detail
+				for provider, detail := range one.Errors {
+					if snap.Errors == nil {
+						snap.Errors = make(map[string]string)
+					}
+					snap.Errors[provider] = detail
+				}
 			}
-		}
-		if len(snap.Providers) > 0 {
-			quotaCache.snap = snap
-			quotaCache.fetchedAt = time.Now()
-			if writeErr := mergeSnapshotFile(snap, nil); writeErr != nil {
-				return writeErr
+			if err != nil {
+				if snap.Errors == nil {
+					snap.Errors = make(map[string]string)
+				}
+				canonical := strings.ToLower(name)
+				if canonical == "agy" {
+					canonical = "antigravity"
+				}
+				if canonical == "lazer" {
+					canonical = "litellm"
+				}
+				snap.Errors[canonical] = classifyPollError(err)
 			}
-		}
-		if writeErr := persistRateLimitErrors(snap); writeErr != nil {
-			return writeErr
-		}
-		return nil
-	})
-	if lockErr != nil {
-		return nil, 0, lockErr
+		}()
 	}
-	if err != nil {
-		// Deliberately do NOT fall back to the cached value. A provider that has
-		// stopped answering is precisely when routing on remembered numbers can
-		// spend a request against a surface that has gone to zero.
-		return snap, 0, err
+	wg.Wait()
+	if len(snap.Providers) == 0 {
+		return snap, 0, fmt.Errorf("no provider could be polled natively")
 	}
-	return snap, ageUsed, nil
-}
-
-func persistRateLimitErrors(snap *UsageSnapshot) error {
-	if snap == nil {
-		return nil
-	}
-	for name, detail := range snap.Errors {
-		if strings.HasPrefix(detail, "rate-limited: ") {
-			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: currentProviderAccountKey(name), BackoffUntil: time.Now().Add(rateLimitBackoff(pollErrf("rate-limited", "%s", detail))), Error: detail}
-			if err := mergeSnapshotFile(&UsageSnapshot{Errors: map[string]string{name: detail}}, &record); err != nil {
-				return err
-			}
+	var oldest time.Duration
+	for _, provider := range snap.Providers {
+		if age := time.Since(provider.ObservedAt); age > oldest {
+			oldest = age
 		}
 	}
-	return nil
+	return snap, oldest, nil
 }
 
 // fetchProviderCached is the provider-scoped companion to
@@ -439,50 +416,82 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 	case "lazer":
 		name = "litellm"
 	}
-	quotaCache.Lock()
-	defer quotaCache.Unlock()
+	accountKey := currentProviderAccountKey(name)
+	var persisted cachedProviderRecord
+	var persistedOK bool
+	if err := withSnapshotFileLock(func() error {
+		persisted, persistedOK = readProviderRecord(name)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
+		return nil, pollErrf("rate-limited", "%s", persisted.Error)
+	}
 	if !force && ttl > 0 && quotaCache.snap != nil {
+		quotaCache.Lock()
 		if bound, _, ok := freshBoundSnapshot(quotaCache.snap, ttl, quotaCache.fetchedAt); ok {
 			if snap := providerOnlySnapshot(bound, name); snap != nil {
+				quotaCache.Unlock()
 				return snap, nil
 			}
 		}
+		quotaCache.Unlock()
 	}
 	var snap *UsageSnapshot
 	var err error
-	lockErr := withSnapshotFileLock(func() error {
-		if record, ok := readProviderRecord(name); ok && record.BackoffUntil.After(time.Now()) && record.AccountKey == currentProviderAccountKey(name) {
-			return nil
-		}
-		if !force && ttl > 0 {
-			if cached, age, ok := readSnapshotFile(ttl); ok {
-				if selected := providerOnlySnapshot(cached, name); selected != nil {
-					quotaCache.snap = cached
-					quotaCache.fetchedAt = time.Now().Add(-age)
-					snap = selected
-					return nil
+	lockErr := withProviderFileLock(name, accountKey, func() error {
+		if err := withSnapshotFileLock(func() error {
+			if record, ok := readProviderRecord(name); ok && record.BackoffUntil.After(time.Now()) && record.AccountKey == currentProviderAccountKey(name) {
+				persisted, persistedOK = record, true
+				return nil
+			}
+			if !force && ttl > 0 {
+				if cached, age, ok := readSnapshotFile(ttl); ok {
+					if selected := providerOnlySnapshot(cached, name); selected != nil {
+						quotaCache.Lock()
+						quotaCache.snap, quotaCache.fetchedAt = cached, time.Now().Add(-age)
+						quotaCache.Unlock()
+						snap = selected
+						return nil
+					}
 				}
 			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if snap != nil {
+			return nil
 		}
 		snap, err = fetchDirectProvider(provider)
 		if err == nil {
-			if quotaCache.snap == nil {
-				quotaCache.snap = &UsageSnapshot{Providers: map[string]ProviderUsage{}}
-			}
-			for k, v := range snap.Providers {
-				quotaCache.snap.Providers[k] = v
-			}
-			quotaCache.fetchedAt = time.Now()
-			return mergeSnapshotFile(snap, nil)
+			return withSnapshotFileLock(func() error { return mergeSnapshotFile(snap, nil) })
 		}
 		if pollErrorCode(err) == "rate-limited" {
-			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: currentProviderAccountKey(name), BackoffUntil: time.Now().Add(rateLimitBackoff(err)), Error: classifyPollError(err)}
-			return mergeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{}, Errors: map[string]string{name: classifyPollError(err)}}, &record)
+			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: accountKey, BackoffUntil: time.Now().Add(rateLimitBackoff(err)), Error: classifyPollError(err)}
+			return withSnapshotFileLock(func() error {
+				return mergeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{}, Errors: map[string]string{name: classifyPollError(err)}}, &record)
+			})
 		}
 		return nil
 	})
 	if lockErr != nil {
 		return nil, lockErr
+	}
+	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
+		return nil, pollErrf("rate-limited", "%s", persisted.Error)
+	}
+	if err == nil && snap != nil {
+		quotaCache.Lock()
+		if quotaCache.snap == nil {
+			quotaCache.snap = &UsageSnapshot{Providers: map[string]ProviderUsage{}}
+		}
+		for k, v := range snap.Providers {
+			quotaCache.snap.Providers[k] = v
+		}
+		quotaCache.fetchedAt = time.Now()
+		quotaCache.Unlock()
 	}
 	if snap == nil && err == nil {
 		if record, ok := readProviderRecord(name); ok && record.Error != "" {
@@ -521,16 +530,20 @@ func readProviderRecord(name string) (cachedProviderRecord, bool) {
 
 func rateLimitBackoff(err error) time.Duration {
 	const defaultBackoff = 15 * time.Second
-	const maxBackoff = 5 * time.Minute
 	text := classifyPollError(err)
 	marker := "retry-after="
 	if i := strings.Index(text, marker); i >= 0 {
-		value := strings.TrimSpace(strings.TrimPrefix(text[i+len(marker):], ""))
-		if seconds, parseErr := strconv.Atoi(value); parseErr == nil && seconds > 0 {
-			if d := time.Duration(seconds) * time.Second; d <= maxBackoff {
-				return d
+		value := strings.TrimSpace(text[i+len(marker):])
+		if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil && seconds > 0 {
+			if seconds > int64((1<<63-1)/int64(time.Second)) {
+				return time.Duration(1<<63 - 1)
 			}
-			return maxBackoff
+			return time.Duration(seconds) * time.Second
+		}
+		if retryAt, parseErr := http.ParseTime(value); parseErr == nil {
+			if delay := time.Until(retryAt); delay > 0 {
+				return delay
+			}
 		}
 	}
 	return defaultBackoff

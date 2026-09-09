@@ -279,6 +279,41 @@ func TestProviderCacheRejectsClockSkewAndPersists429Backoff(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("persisted 429 backoff allowed %d upstream polls, want 1", calls)
 	}
+	raw, err := os.ReadFile(filepath.Join(dir, "quota.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cached cachedSnapshot
+	if err := json.Unmarshal(raw, &cached); err != nil {
+		t.Fatal(err)
+	}
+	record := cached.Providers["codex"]
+	if !record.BackoffUntil.After(time.Now()) {
+		t.Fatal("429 backoff was not persisted")
+	}
+	record.BackoffUntil = time.Now().Add(20 * time.Millisecond)
+	cached.Providers["codex"] = record
+	raw, _ = json.Marshal(cached)
+	if err := os.WriteFile(filepath.Join(dir, "quota.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, err := FetchProviderForce("codex", false); err == nil || pollErrorCode(err) != "rate-limited" {
+		t.Fatalf("expired 429 backoff did not surface the new provider response: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expired backoff did not permit exactly one new poll: calls=%d", calls)
+	}
+}
+
+func TestRateLimitBackoffHonorsLongAndHTTPDateRetryAfter(t *testing.T) {
+	if got := rateLimitBackoff(pollErrf("rate-limited", "HTTP 429 retry-after=601")); got != 601*time.Second {
+		t.Fatalf("long Retry-After was truncated: got %v", got)
+	}
+	date := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
+	if got := rateLimitBackoff(pollErrf("rate-limited", "%s", "HTTP 429 retry-after="+date)); got < time.Second {
+		t.Fatalf("HTTP-date Retry-After was not honored: got %v", got)
+	}
 }
 
 func TestCacheConcurrentAtomicWritesRetainBothProviders(t *testing.T) {
@@ -309,6 +344,79 @@ func TestCacheConcurrentAtomicWritesRetainBothProviders(t *testing.T) {
 	}
 	if len(cached.Providers) != 2 {
 		t.Fatalf("concurrent writes lost a provider: got %d records", len(cached.Providers))
+	}
+}
+
+func TestMergeSnapshotMigratesEmptyAndLegacyCache(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	for _, raw := range []string{"{}", `{"providers":null}`} {
+		if err := os.WriteFile(filepath.Join(dir, "quota.json"), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := mergeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{
+			"codex": {Account: &AccountIdentity{Key: "fixture", Provenance: "fixture"}, ObservedAt: time.Now().UTC()},
+		}}, nil); err != nil {
+			t.Fatalf("empty cache migration failed for %s: %v", raw, err)
+		}
+		var got cachedSnapshot
+		body, _ := os.ReadFile(filepath.Join(dir, "quota.json"))
+		if err := json.Unmarshal(body, &got); err != nil || got.Providers == nil {
+			t.Fatalf("migration did not write a nonnil provider map for %s", raw)
+		}
+	}
+	observed := time.Now().Add(-2 * time.Second).UTC()
+	legacy := &UsageSnapshot{Providers: map[string]ProviderUsage{
+		"codex": {Account: &AccountIdentity{Key: "legacy", Provenance: "fixture"}, ObservedAt: observed},
+	}}
+	body, _ := json.Marshal(cachedSnapshot{FetchedAt: observed, Snapshot: legacy})
+	if err := os.WriteFile(filepath.Join(dir, "quota.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mergeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{"claude": {ObservedAt: time.Now().UTC()}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var migrated cachedSnapshot
+	body, _ = os.ReadFile(filepath.Join(dir, "quota.json"))
+	if err := json.Unmarshal(body, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if !migrated.Providers["codex"].ObservedAt.Equal(observed) || migrated.Providers["codex"].AccountKey != "legacy" {
+		t.Fatal("legacy provider age or account binding was not preserved")
+	}
+}
+
+func TestScopedThenAllUsesFreshProviderWithoutRepolling(t *testing.T) {
+	InvalidateSnapshotCache()
+	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "45")
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"scoped-all"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var codexCalls, claudeCalls int
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){
+		"codex": func() (ProviderUsage, error) {
+			codexCalls++
+			return ProviderUsage{Account: codexAccountIdentity(), Resources: map[string]ResourceUsage{"weekly": {Remaining: 50}}}, nil
+		},
+		"claude": func() (ProviderUsage, error) {
+			claudeCalls++
+			return ProviderUsage{Account: identity("claude", "scoped-claude", "claude-profile:fixture"), Resources: map[string]ResourceUsage{"weekly": {Remaining: 50}}}, nil
+		},
+	})
+	defer restore()
+	if _, err := FetchProviderForce("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := FetchSnapshotCachedForce(false); err != nil {
+		t.Fatal(err)
+	}
+	if codexCalls != 1 || claudeCalls != 1 {
+		t.Fatalf("scoped-then-all repolled or skipped providers: codex=%d claude=%d", codexCalls, claudeCalls)
 	}
 }
 
