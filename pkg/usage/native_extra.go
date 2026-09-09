@@ -37,16 +37,61 @@ func ollamaPoll() (ProviderUsage, error) {
 }
 
 // The OpenCode ollama-cloud bearer credential is a distinct authority from
-// both the signed ~/.ollama account and LiteLLM. No supported native quota GET
-// for that bearer credential has been established yet, so this contract reads
-// only the exact local credential and remains explicitly untracked. It is
-// intentionally network-free until a reviewed endpoint/client is available.
+// both the signed ~/.ollama account and LiteLLM. The verified native endpoint
+// is bounded to this exact GET; credentials are never refreshed or copied.
 func ollamaCloudBearerPoll() (ProviderUsage, error) {
-	account := ollamaCloudCredentialIdentity()
-	if account == nil {
+	credential := ollamaCloudCredential()
+	if credential == "" {
 		return ProviderUsage{}, pollErrf("auth-missing", "ollama-cloud bearer credential is unavailable")
 	}
-	return ProviderUsage{DisplayName: "Ollama Cloud (bearer)", Account: account, Status: "untracked"}, nil
+	return ollamaCloudBearerPollWithURL("https://ollama.com/api/usage", credential, time.Now)
+}
+
+func ollamaCloudBearerPollWithURL(endpoint, credential string, now func() time.Time) (ProviderUsage, error) {
+	requestURL := strings.TrimRight(endpoint, "/") + "/api/usage?ts=" + strconv.FormatInt(now().Unix(), 10)
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "ollama-cloud quota URL is invalid")
+	}
+	req.Header.Set("Authorization", "Bearer "+credential)
+	client := *pollClient()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return ProviderUsage{}, netPollError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("ollama-cloud quota", resp)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ProviderUsage{}, httpStatusPollError("ollama-cloud quota", resp.StatusCode)
+	}
+	var body ollamaUsageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "ollama-cloud quota decode: %v", err)
+	}
+	if strings.TrimSpace(body.Error) != "" {
+		return ProviderUsage{}, pollErrf("provider-error", "ollama-cloud quota: %s", strings.TrimSpace(body.Error))
+	}
+	resources := map[string]ResourceUsage{}
+	add := func(name string, usage *float64, seconds int) {
+		if usage == nil || *usage < 0 || *usage > 1 {
+			return
+		}
+		used := *usage * 100
+		resources[name] = ResourceUsage{Kind: "consumption", State: "active", Pool: "default", Unit: "percent", Limit: 100, Used: used, Remaining: 100 - used, Utilization: *usage, WindowSeconds: seconds}
+	}
+	if body.Limits.Session != nil {
+		add("session", body.Limits.Session.Usage, Window5h)
+	}
+	if body.Limits.Weekly != nil {
+		add("weekly", body.Limits.Weekly.Usage, WindowWeekly)
+	}
+	if len(resources) == 0 {
+		return ProviderUsage{}, pollErrf("no-windows", "ollama-cloud quota: no usable session or weekly window")
+	}
+	return ProviderUsage{DisplayName: "Ollama Cloud", Plan: body.Plan, Account: ollamaCloudCredentialIdentityFor(credential), Resources: resources}, nil
 }
 
 func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Time) (ProviderUsage, error) {

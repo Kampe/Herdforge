@@ -163,7 +163,7 @@ var providerSource = map[string]string{
 	"litellm":      "native:authenticated-key-info",
 	"opencode":     "native:opencode.ai/zen/go/v1/usage",
 	"ollama":       "native:ollama.com/api/usage:signed-ed25519",
-	"ollama-cloud": "native:ollama-cloud/bearer-quota:unverified",
+	"ollama-cloud": "native:ollama.com/api/usage:bearer",
 	"kimi":         "native:unsupported-no-quota-endpoint",
 }
 

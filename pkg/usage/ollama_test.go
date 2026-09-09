@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/pem"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -129,17 +130,35 @@ func TestOllamaAccountIdentityReadsOnlySameHostSigner(t *testing.T) {
 	}
 }
 
-func TestOllamaCloudBearerContractIsCredentialBoundAndNetworkFree(t *testing.T) {
-	data := t.TempDir()
-	t.Setenv("OPENCODE_DATA_DIR", data)
-	if err := os.WriteFile(filepath.Join(data, "auth.json"), []byte(`{"ollama-cloud":{"key":"bearer-fixture"}}`), 0o600); err != nil {
-		t.Fatal(err)
+func TestOllamaCloudBearerPollMapsVerifiedNativeEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/usage" || r.URL.Query().Get("ts") != "1786309987" || r.Header.Get("Authorization") != "Bearer bearer-fixture" {
+			t.Fatalf("unexpected direct bearer request: %s auth=%q", r.URL.String(), r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write([]byte(`{"limits":{"session":{"usage":0.427},"weekly":{"usage":0.212}}}`))
+	}))
+	defer server.Close()
+	got, err := ollamaCloudBearerPollWithURL(server.URL, "bearer-fixture", func() time.Time { return time.Unix(1786309987, 0) })
+	if err != nil || got.Account == nil || math.Abs(got.Resources["session"].Used-42.7) > 1e-9 || math.Abs(got.Resources["weekly"].Used-21.2) > 1e-9 {
+		t.Fatalf("direct bearer quota was not mapped: got=%+v err=%v", got, err)
 	}
-	got, err := ollamaCloudBearerPoll()
-	if err != nil || got.Status != "untracked" || got.Account == nil {
-		t.Fatalf("direct bearer contract should be typed unknown without an endpoint: got=%+v err=%v", got, err)
+	if got.Account.Provenance != "ollama-cloud:credential-fingerprint" || strings.Contains(got.Account.Key, "bearer-fixture") || got.Resources["session"].ResetsAt != "" {
+		t.Fatalf("direct bearer binding/reset handling invalid: %+v", got)
 	}
-	if got.Account.Provenance != "ollama-cloud:credential-fingerprint" || strings.Contains(got.Account.Key, "bearer-fixture") {
-		t.Fatalf("bearer credential was not opaquely bound: %+v", got.Account)
+}
+
+func TestOllamaCloudBearerPollRejectsUnsafeResponses(t *testing.T) {
+	for _, body := range []string{`{"error":"unauthorized"}`, `{}`, `{"limits":{"session":{"usage":1.1}}}`, `{"limits":{"session":{"usage":"bad"}}}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		_, err := ollamaCloudBearerPollWithURL(server.URL, "bearer-fixture", time.Now)
+		server.Close()
+		if err == nil {
+			t.Fatalf("unsafe direct bearer response was accepted: %s", body)
+		}
+	}
+	redirect := httptest.NewServer(http.RedirectHandler("/final", http.StatusTemporaryRedirect))
+	defer redirect.Close()
+	if _, err := ollamaCloudBearerPollWithURL(redirect.URL, "bearer-fixture", time.Now); err == nil {
+		t.Fatal("redirect response must be rejected")
 	}
 }

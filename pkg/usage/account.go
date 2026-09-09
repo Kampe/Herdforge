@@ -88,6 +88,23 @@ func providerAccountIdentity(name string) *AccountIdentity {
 }
 
 func ollamaCloudCredentialIdentity() *AccountIdentity {
+	credential := ollamaCloudCredential()
+	if credential == "" {
+		return nil
+	}
+	return ollamaCloudCredentialIdentityFor(credential)
+}
+
+func ollamaCloudCredentialIdentityFor(credential string) *AccountIdentity {
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(credential))
+	return identity("ollama-cloud", hex.EncodeToString(sum[:]), "ollama-cloud:credential-fingerprint")
+}
+
+func ollamaCloudCredential() string {
 	for _, path := range opencodeAuthFiles() {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -111,10 +128,9 @@ func ollamaCloudCredentialIdentity() *AccountIdentity {
 		if credential == "" {
 			continue
 		}
-		sum := sha256.Sum256([]byte(credential))
-		return identity("ollama-cloud", hex.EncodeToString(sum[:]), "ollama-cloud:credential-fingerprint")
+		return credential
 	}
-	return nil
+	return ""
 }
 
 func opencodeAccountIdentity() *AccountIdentity {
