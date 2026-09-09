@@ -1,10 +1,14 @@
 package herdr
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/reviewack"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
 func retirementManifest(t *testing.T, generation string) ReviewRetirementManifest {
@@ -24,19 +28,23 @@ func retirementManifest(t *testing.T, generation string) ReviewRetirementManifes
 }
 
 func retirementEvidence(m ReviewRetirementManifest) ReviewRetirementEvidence {
-	return ReviewRetirementEvidence{Manifest: m, Verdict: ReviewRetirementVerdict{CandidateSHA: m.CandidateSHA, Durable: true, Terminal: true, ReviewerACK: true}, Head: m.CandidateSHA, Branch: m.Branch, WorktreeRoot: ".herd/reviews", PromptRoot: ".herd/review/prompts", Repository: m.Repository}
+	launch := reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Branch: m.TaskRef}
+	verdict := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: m.CandidateSHA, CandidateSHA: m.CandidateSHA, Reviewer: m.Reviewer, Verdict: string(reviewledger.VerdictPASS), ArtifactDigest: "artifact"}
+	ack := reviewack.Ack{SHA: m.CandidateSHA, Reviewer: m.Reviewer, LaunchIdentity: m.Reviewer, ArtifactDigest: verdict.ArtifactDigest}
+	focused := false
+	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: ReviewRetirementLive{Status: "idle", Focused: &focused}, Worktree: ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch}, WorktreeRoot: ".herd/reviews", PromptRoot: ".herd/review/prompts", Repository: m.Repository}
 }
 
 func TestEvaluateReviewRetirementRequiresExactTerminalVerdict(t *testing.T) {
 	for name, mutate := range map[string]func(*ReviewRetirementEvidence){
-		"missing durable": func(e *ReviewRetirementEvidence) { e.Verdict.Durable = false },
-		"missing ack":     func(e *ReviewRetirementEvidence) { e.Verdict.ReviewerACK = false },
-		"wrong sha":       func(e *ReviewRetirementEvidence) { e.Verdict.CandidateSHA = strings.Repeat("c", 40) },
-		"active":          func(e *ReviewRetirementEvidence) { e.Active = true },
-		"focused":         func(e *ReviewRetirementEvidence) { e.Focused = true },
-		"dirty":           func(e *ReviewRetirementEvidence) { e.Dirty = true },
-		"drift":           func(e *ReviewRetirementEvidence) { e.Head = strings.Repeat("c", 40) },
-		"unique":          func(e *ReviewRetirementEvidence) { e.UniqueCommits = true },
+		"missing durable": func(e *ReviewRetirementEvidence) { e.Verdict.Row.Event = "" },
+		"missing ack":     func(e *ReviewRetirementEvidence) { e.Verdict.Ack = reviewack.Ack{} },
+		"wrong sha":       func(e *ReviewRetirementEvidence) { e.Verdict.Row.SHA = strings.Repeat("c", 40) },
+		"active":          func(e *ReviewRetirementEvidence) { e.Live.Status = "working" },
+		"focused":         func(e *ReviewRetirementEvidence) { *e.Live.Focused = true },
+		"dirty":           func(e *ReviewRetirementEvidence) { e.Worktree.Dirty = true },
+		"drift":           func(e *ReviewRetirementEvidence) { e.Worktree.Head = strings.Repeat("c", 40) },
+		"unique":          func(e *ReviewRetirementEvidence) { e.Worktree.UniqueRefs = true },
 		"namespace":       func(e *ReviewRetirementEvidence) { e.Manifest.Worktree = ".herd/worktrees/fac-708" },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -87,6 +95,10 @@ type retirementFake struct {
 func (f *retirementFake) Observe(m ReviewRetirementManifest) (ReviewRetirementEvidence, error) {
 	return f.evidence[m.Generation], nil
 }
+func (f *retirementFake) Revalidate(m ReviewRetirementManifest, phase string) error { return nil }
+func (f *retirementFake) Journal(m ReviewRetirementManifest, phase string) error {
+	return f.step("journal-"+phase, m)
+}
 func (f *retirementFake) step(name string, m ReviewRetirementManifest) error {
 	f.events = append(f.events, name)
 	if f.fail == name {
@@ -99,7 +111,7 @@ func (f *retirementFake) LeaseReleased(m ReviewRetirementManifest) (bool, error)
 	f.events = append(f.events, "lease-read")
 	return false, nil
 }
-func (f *retirementFake) ReleaseLease(m ReviewRetirementManifest) error {
+func (f *retirementFake) ReleaseLease(_ context.Context, m ReviewRetirementManifest) error {
 	return f.step("lease-release", m)
 }
 func (f *retirementFake) RemoveWorktree(m ReviewRetirementManifest) error {
@@ -116,8 +128,9 @@ func (f *retirementFake) Receipt(m ReviewRetirementManifest, d ReviewRetirementD
 func TestRetireReviewLanesPreflightsAllBeforeMutationAndOrdersOperations(t *testing.T) {
 	m1, m2 := retirementManifest(t, "g1"), retirementManifest(t, "g2")
 	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"g1": retirementEvidence(m1), "g2": retirementEvidence(m2)}}
-	f.evidence["g2"] = retirementEvidence(m2)
-	f.evidence["g2"] = ReviewRetirementEvidence{Manifest: m2, Verdict: ReviewRetirementVerdict{CandidateSHA: m2.CandidateSHA, Durable: true, Terminal: true, ReviewerACK: true}, Head: m2.CandidateSHA, Branch: m2.Branch, WorktreeRoot: ".herd/other", PromptRoot: ".herd/review/prompts", Repository: m2.Repository}
+	e2 := retirementEvidence(m2)
+	e2.WorktreeRoot = ".herd/other"
+	f.evidence["g2"] = e2
 	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{m1, m2}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +143,7 @@ func TestRetireReviewLanesPreflightsAllBeforeMutationAndOrdersOperations(t *test
 	if err != nil || r.Retired != 2 {
 		t.Fatalf("report=%+v err=%v", r, err)
 	}
-	want := []string{"close", "lease-read", "lease-release", "worktree", "branch", "artifact", "receipt", "close", "lease-read", "lease-release", "worktree", "branch", "artifact", "receipt"}
+	want := []string{"close", "lease-read", "lease-release", "worktree", "branch", "journal-artifacts-ready", "artifact", "receipt", "close", "lease-read", "lease-release", "worktree", "branch", "journal-artifacts-ready", "artifact", "receipt"}
 	for i := range want {
 		if f.events[i] != want[i] {
 			t.Fatalf("events=%v want=%v", f.events, want)

@@ -443,7 +443,9 @@ func runReviewIngest() {
 		emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
 			filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
 		postReviewCompleteCallback(projectRoot, a.SHA, a.Branch, a.Reviewer, a.Verdict)
-		reclaimReviewPoolSlotFor(a.SHA)
+		// FAC-708: admission only wakes the bounded coordinator retirement edge.
+		// Lease release must occur after exact tab/process absence and the
+		// manifest phase journal, never as a side effect of ingest.
 
 		admitted++
 	}
@@ -843,6 +845,7 @@ func honestlyUnrecordedFamily(raw string) (string, bool) {
 // Best-effort by construction: the verdict is already admitted and that is the
 // durable outcome. A failed reclaim costs one slot until the reaper notices,
 // which is strictly better than failing an admitted verdict over housekeeping.
+/*
 func reclaimReviewPoolSlotFor(sha string) {
 	sha = strings.TrimSpace(sha)
 	if sha == "" {
@@ -876,6 +879,7 @@ func reclaimReviewPoolSlotFor(sha string) {
 			"the slot stays held until the pool reclaims it\n", sha[:minInt(12, len(sha))], lease, err)
 	}
 }
+*/
 
 func postReviewCompleteCallback(root, sha, branch, reviewer, verdict string) {
 	sha = strings.TrimSpace(sha)

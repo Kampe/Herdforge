@@ -4562,10 +4562,14 @@ func runHerdrDeliver() {
 // deterministic receipts/counts. Dry-run is report-only.
 func runCleanup() {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
-	dryRun := fs.Bool("dry-run", false, "List what would be closed without closing")
+	dryRun := fs.Bool("dry-run", true, "List what would be closed without closing (default)")
+	act := fs.Bool("act", false, "Apply bounded exact cleanup mutations")
 	asJSON := fs.Bool("json", false, "Output JSON")
 	applyVerifyStacks := fs.Bool("reap-verify-stacks", false, "Actually reap eligible verify-harness Compose stacks (default is report-only)")
 	fs.Parse(os.Args[2:])
+	if *act {
+		*dryRun = false
+	}
 
 	if !herdr.IsAvailable() {
 		fmt.Fprintf(os.Stderr, "herd cleanup: herdr CLI not found\n")
@@ -4589,22 +4593,27 @@ func runCleanup() {
 	}
 	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
 	res.Repository = repository
+	reviewReport, reviewErr := runReviewRetirementCleanup(context.Background(), repository, *dryRun)
+	if err == nil {
+		err = reviewErr
+	}
 	stackReport, stackErr := runRepoVerifyReaper(context.Background(), repository, *applyVerifyStacks && !*dryRun)
 	if err == nil {
 		err = stackErr
 	}
 	if *asJSON {
 		out := map[string]interface{}{
-			"dry_run":       res.DryRun,
-			"workspace":     res.Workspace,
-			"repository":    res.Repository,
-			"candidates":    res.Candidates,
-			"attempts":      res.Attempts,
-			"closed":        res.Closed,
-			"blocked":       res.Blocked,
-			"errored":       res.Errored,
-			"error_count":   len(res.Attempts) - res.Closed - res.Blocked,
-			"verify_reaper": stackReport,
+			"dry_run":           res.DryRun,
+			"workspace":         res.Workspace,
+			"repository":        res.Repository,
+			"candidates":        res.Candidates,
+			"attempts":          res.Attempts,
+			"closed":            res.Closed,
+			"blocked":           res.Blocked,
+			"errored":           res.Errored,
+			"error_count":       len(res.Attempts) - res.Closed - res.Blocked,
+			"verify_reaper":     stackReport,
+			"review_retirement": reviewReport,
 		}
 		if err != nil {
 			out["error"] = err.Error()
@@ -4621,6 +4630,9 @@ func runCleanup() {
 			for _, c := range res.Candidates {
 				fmt.Printf("herd cleanup: would close %s (tab %s) — %s\n", c.Name, c.TabID, c.Reason)
 			}
+			for _, c := range reviewReport.Candidates {
+				fmt.Printf("herd cleanup: would retire review generation=%s tab=%s worktree=%s ref=%s prompt=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.ReviewRef, c.Manifest.PromptArtifact, c.Decision.Reason)
+			}
 		} else {
 			for _, att := range res.Attempts {
 				switch att.Outcome {
@@ -4636,6 +4648,9 @@ func runCleanup() {
 				fmt.Printf("herd cleanup: closed=%d blocked=%d errored=%d candidates=%d\n",
 					res.Closed, res.Blocked, res.Errored, len(res.Candidates))
 			}
+		}
+		if !res.DryRun && len(reviewReport.Candidates) > 0 {
+			fmt.Printf("herd cleanup: review-retirement retired=%d blocked=%d failed=%d candidates=%d\n", reviewReport.Retired, reviewReport.Blocked, reviewReport.Failed, len(reviewReport.Candidates))
 		}
 		if stackReport.Output != "" {
 			fmt.Printf("herd cleanup: verify reaper: %s\n", stackReport.Output)
@@ -8726,6 +8741,7 @@ type drainActionHooks struct {
 	launchReview          func(context.Context, drainActionEvidence) error
 	dryRun                func(context.Context, drainActionEvidence) error
 	harvest               func(context.Context, drainActionEvidence) error
+	retireReviews         func(context.Context) error
 }
 
 type drainActionResult struct {
@@ -8921,6 +8937,13 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 			len(rebaseBlocked), len(rebaseBlocked), rebaseBlocked[0][:minDrain(12, len(rebaseBlocked[0]))])
 		if maxRelaunch > 0 && len(rebaseBlocked) > maxRelaunch {
 			fmt.Fprintf(out, "  note: relaunch bound %d would have truncated this list to %d of %d\n", maxRelaunch, maxRelaunch, len(rebaseBlocked))
+		}
+	}
+	if hooks.retireReviews != nil {
+		if err := hooks.retireReviews(ctx); err != nil {
+			fmt.Fprintf(out, "REFUSED review-retirement: %v\n", err)
+			result.Failed = true
+			result.Refusals++
 		}
 	}
 	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d act_integration_steps=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",

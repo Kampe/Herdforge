@@ -66,6 +66,28 @@ func Path(root, sha, reviewer string) string {
 	return filepath.Join(root, DirRel, FileName(sha, reviewer))
 }
 
+// Read returns the durable acknowledgment without consuming it. Cleanup uses
+// this read-only form during dry-run and preflight; only canonical ingest may
+// create the consumed receipt.
+func Read(root, sha, reviewer string) (Ack, error) {
+	root, sha, reviewer = strings.TrimSpace(root), strings.TrimSpace(sha), strings.TrimSpace(reviewer)
+	if root == "" || len(sha) != 40 || reviewer == "" {
+		return Ack{}, fmt.Errorf("reviewack: read requires root, 40-char sha, and reviewer")
+	}
+	body, err := os.ReadFile(Path(root, sha, reviewer))
+	if err != nil {
+		return Ack{}, err
+	}
+	var ack Ack
+	if err := json.Unmarshal(body, &ack); err != nil {
+		return Ack{}, fmt.Errorf("reviewack: decode: %w", err)
+	}
+	if ack.SHA != sha || ack.Reviewer != reviewer || ack.LaunchIdentity != reviewer || ack.ArtifactDigest == "" {
+		return Ack{}, ErrMismatch
+	}
+	return ack, nil
+}
+
 // Emit writes a durable ack for a successful canonical admission. Identical
 // re-emits for the same digest are idempotent (no error). A different digest
 // for the same (sha, reviewer) fails closed as ambiguous.

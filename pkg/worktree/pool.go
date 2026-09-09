@@ -345,16 +345,22 @@ func (p *Pool) GC(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// FAC-708: validate the complete selected set before removing the first
+		// slot. A later leased/unsafe slot must not be discovered after earlier
+		// pool worktrees were already deleted; filesystem removal is not
+		// transactionally rollbackable.
 		for _, slot := range state.Slots {
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: gc refused while slot %s is leased", slot.Name)
 			}
-			// Pool slots are tracked by their own slot.LeaseID above, never
-			// by pkg/claim -- the full RefuseRemovalWithLiveLease would
-			// refuse every slot unconditionally. See its doc comment.
 			if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, slot.Path); err != nil {
 				return fmt.Errorf("worktree pool: gc lease fence for %s: %w", slot.Name, err)
 			}
+		}
+		for _, slot := range state.Slots {
+			// Pool slots are tracked by their own slot.LeaseID above, never
+			// by pkg/claim -- the full RefuseRemovalWithLiveLease would
+			// refuse every slot unconditionally. See its doc comment.
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
