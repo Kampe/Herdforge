@@ -360,7 +360,7 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 		tc := dispatch.TaskContext{
 			ProviderType: providerType, ProjectID: "proj-x", Repository: "herdforge",
 			Role: role, TaskRef: "FAC-145", TaskID: "task-id-1", Branch: "herd/fac-145",
-			BaseSHA: "base123", CandidateSHA: candidate,
+			BaseSHA: "ba5e1234cafe1234beefcafe1234beefcafe1234", CandidateSHA: candidate,
 			LeaseID: leaseID, LeaseGeneration: leaseGen, LeaseTaskRef: "FAC-145", SessionID: NewSessionIDFor(role), AllowedOps: ops,
 			ExpiresAt: time.Now().Add(time.Hour),
 		}
@@ -381,7 +381,7 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 	for _, name := range []string{"kaneo", "memory", "github", "linear", "jira", "azure"} {
 		receipts[name] = receiptPair{
 			worker:   issueReceipt(name, dispatch.RoleWorker, dispatch.WorkerOps, ""),
-			reviewer: issueReceipt(name, dispatch.RoleReviewer, dispatch.ReviewerOps, "cafe1234beef"),
+			reviewer: issueReceipt(name, dispatch.RoleReviewer, dispatch.ReviewerOps, "cafe1234beefcafe1234beefcafe1234beefcafe"),
 		}
 	}
 	closeLeaseStore()
@@ -426,13 +426,13 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 			// without it must FAIL CLOSED rather than publish an
 			// unverifiable verdict (FAC-145).
 			resp = brokerRoundTrip(t, root, auth, verifier, signer, a.tp, brokerRequest{
-				Op: "verdict", Ref: "FAC-145", Body: "REJECTED", CandidateSHA: "cafe1234beef", WorktreeHEAD: "cafe1234beef", Receipt: reviewer,
+				Op: "verdict", Ref: "FAC-145", Body: "REJECTED", CandidateSHA: "cafe1234beefcafe1234beefcafe1234beefcafe", WorktreeHEAD: "cafe1234beefcafe1234beefcafe1234beefcafe", Receipt: reviewer,
 			})
 			if a.readback {
 				if !resp.OK {
 					t.Fatalf("reviewer verdict must pass on a readback-capable adapter: %s", resp.Error)
 				}
-				if a.tw != nil && !a.tw.sawBody("REVIEW VERDICT FAC-145: REJECTED candidate=cafe1234beef") {
+				if a.tw != nil && !a.tw.sawBody("REVIEW VERDICT FAC-145: REJECTED candidate=cafe1234beefcafe1234beefcafe1234beefcafe") {
 					_, bodies := a.tw.snapshot()
 					t.Fatalf("adapter must receive the exact broker-composed verdict, saw: %v", bodies)
 				}
@@ -452,7 +452,7 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 					beforeReq = verdictCount()
 				}
 				if resp := brokerRoundTrip(t, root, auth, verifier, signer, a.tp, brokerRequest{
-					Op: "verdict", Ref: "FAC-145", Body: "REJECTED", CandidateSHA: "cafe1234beef", WorktreeHEAD: "cafe1234beef", Receipt: reviewer,
+					Op: "verdict", Ref: "FAC-145", Body: "REJECTED", CandidateSHA: "cafe1234beefcafe1234beefcafe1234beefcafe", WorktreeHEAD: "cafe1234beefcafe1234beefcafe1234beefcafe", Receipt: reviewer,
 				}); !resp.OK {
 					t.Fatalf("verdict retry must be inert: %s", resp.Error)
 				}
@@ -486,7 +486,7 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 			if resp := brokerRoundTrip(t, root, auth, verifier, signer, a.tp, brokerRequest{Op: "get", Ref: "FAC-999", Receipt: worker}); resp.OK {
 				t.Fatal("foreign ref must be refused")
 			}
-			if resp := brokerRoundTrip(t, root, auth, verifier, signer, a.tp, brokerRequest{Op: "verdict", Ref: "FAC-145", Body: "APPROVED", CandidateSHA: "other", WorktreeHEAD: "cafe1234beef", Receipt: reviewer}); resp.OK {
+			if resp := brokerRoundTrip(t, root, auth, verifier, signer, a.tp, brokerRequest{Op: "verdict", Ref: "FAC-145", Body: "APPROVED", CandidateSHA: "other", WorktreeHEAD: "cafe1234beefcafe1234beefcafe1234beefcafe", Receipt: reviewer}); resp.OK {
 				t.Fatal("wrong-candidate verdict must be refused")
 			}
 			if a.tw != nil {
@@ -505,7 +505,7 @@ func TestBrokerConformance_AllProviders(t *testing.T) {
 	// Supersession on the durable bus: REJECTED (posted after any earlier
 	// APPROVED for the same candidate) is the effective verdict.
 	mb := mail.NewMailbox(mail.CallbackMailPath(root))
-	eff, found, err := mb.EffectiveVerdict("herdforge", "FAC-145", "cafe1234beef")
+	eff, found, err := mb.EffectiveVerdict("herdforge", "FAC-145", "cafe1234beefcafe1234beefcafe1234beefcafe")
 	if err != nil || !found {
 		t.Fatalf("verdict record must exist for readback-capable adapters: found=%v err=%v", found, err)
 	}

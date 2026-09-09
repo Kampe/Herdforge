@@ -253,12 +253,15 @@ func (m *Mailbox) DrainCallbacksContext(ctx context.Context) ([]Callback, error)
 // a DELIVERED record — written after confirmed provider delivery and
 // readback — participates in EffectiveVerdict.
 const (
-	verdictDeliveredPrefix = "verdict-delivered:"
+	// VerdictDeliveredPrefix is the dedupe-id prefix of every DELIVERED
+	// verdict record; consumers scan the bus for it to decide supersession
+	// order and recovery eligibility (FAC-351).
+	VerdictDeliveredPrefix = "verdict-delivered:"
 	verdictIntentPrefix    = "verdict-intent:"
 )
 
 // VerdictEffectID is the consumable delivered-verdict identity.
-func VerdictEffectID(effect string) string { return verdictDeliveredPrefix + effect }
+func VerdictEffectID(effect string) string { return VerdictDeliveredPrefix + effect }
 
 // VerdictIntentID is the non-consumable pre-delivery intent identity.
 func VerdictIntentID(effect string) string { return verdictIntentPrefix + effect }
@@ -315,7 +318,7 @@ func (m *Mailbox) EffectiveVerdict(repo, ref, candidate string) (Callback, bool,
 		}
 		// ONLY delivered records are consumable: an intent (or any other
 		// callback) can never be read as a verdict.
-		if !strings.HasPrefix(cb.DedupeID, verdictDeliveredPrefix) {
+		if !strings.HasPrefix(cb.DedupeID, VerdictDeliveredPrefix) {
 			continue
 		}
 		if cb.Repo != repo || cb.Ref != ref || cb.SHA != candidate {

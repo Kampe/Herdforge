@@ -139,6 +139,60 @@ func CheckMoveToIngested(source, name string) error {
 // review authority after pane cleanup (FAC-373).
 const InboxRel = ".herd/review/inbox"
 
+// retainedTempPattern is the shared temp-file pattern for atomic publication
+// of review evidence — one definition for every retention path.
+const retainedTempPattern = ".verdict-*.tmp"
+
+// confirmRetainedHit re-stats existing evidence after a digest hit so a file
+// that vanished mid-check is never reported as retained. One definition for
+// every retention path.
+func confirmRetainedHit(dst string) error {
+	if _, err := os.Stat(dst); err != nil {
+		return fmt.Errorf("retained artifact vanished after read: %w", err)
+	}
+	return nil
+}
+
+// publishRetainedArtifact atomically publishes review evidence at dst with
+// the durability contract shared by every retention path (the FAC-373 copy
+// and the FAC-740 composed artifact): a 0700 inbox, a 0600 fsynced temp
+// file, an atomic rename, and a post-publish re-stat so an artifact that
+// vanished can never become coordinator-facing PASS evidence.
+func publishRetainedArtifact(dst string, r io.Reader) error {
+	tmp, err := os.CreateTemp(filepath.Dir(dst), retainedTempPattern)
+	if err != nil {
+		return fmt.Errorf("create retained artifact: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := io.Copy(tmp, r); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copy retained artifact: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secure retained artifact: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync retained artifact: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close retained artifact: %w", err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("publish retained artifact: %w", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		return fmt.Errorf("retained artifact vanished after publish: %w", err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("retained artifact is empty after publish")
+	}
+	return nil
+}
+
 // RetainArtifact copies a validated verdict into the repo-local review inbox
 // using a content-addressed filename. The returned path is relative to root
 // (slash-separated) so the ledger remains portable across worktrees.
@@ -177,8 +231,8 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 	if existing, err := os.ReadFile(dst); err == nil {
 		sum := sha256.Sum256(existing)
 		if fmt.Sprintf("%x", sum)[:16] == contentDigest {
-			if _, err := os.Stat(dst); err != nil {
-				return "", fmt.Errorf("retained artifact vanished after read: %w", err)
+			if err := confirmRetainedHit(dst); err != nil {
+				return "", err
 			}
 			return rel, nil
 		}
@@ -186,38 +240,11 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("stat retained artifact: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".verdict-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("create retained artifact: %w", err)
+	if _, err := in.Seek(0, 0); err != nil {
+		return "", fmt.Errorf("rewind verdict artifact: %w", err)
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := io.Copy(tmp, in); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("copy verdict artifact: %w", err)
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("secure retained artifact: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("sync retained artifact: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close retained artifact: %w", err)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return "", fmt.Errorf("publish retained artifact: %w", err)
-	}
-	// Re-stat after publish: a concurrent cleanup of the destination (or a
-	// flaky FS) must never become coordinator-facing PASS evidence.
-	info, err := os.Stat(dst)
-	if err != nil {
-		return "", fmt.Errorf("retained artifact vanished after publish: %w", err)
-	}
-	if info.Size() == 0 {
-		return "", fmt.Errorf("retained artifact is empty after publish")
+	if err := publishRetainedArtifact(dst, in); err != nil {
+		return "", err
 	}
 	return rel, nil
 }

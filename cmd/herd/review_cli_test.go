@@ -102,6 +102,21 @@ func mailPost(dir, sender, subject, body string) (*mail.Envelope, error) {
 // private key lives in keyDir (OUTSIDE repoDir — the worker-readable tree),
 // and the public key is published at repoDir/.herd/receipt.pub, mirroring
 // production issuance exactly.
+// baseFixtureSHA returns a real 40-hex base commit for receipts: the parent
+// of the evidence tip when one exists, else the evidence tip's own grandparent
+// seed. Verdict retention (FAC-740) binds base/candidate as exact commits.
+func baseFixtureSHA(repoDir string) string {
+	out, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD~1").Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	out, err = exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func writeSignedReceipt(t *testing.T, keyDir, repoDir, wt string, mutate func(*dispatch.TaskContext)) {
 	t.Helper()
 	// Receipts are backed by a REAL live lease in the durable claim store —
@@ -835,6 +850,7 @@ func approveFixtureWithStatus(t *testing.T, status string, configure ...func(*hs
 	writeReviewConfig(t, dir, server.URL, "proj-x")
 
 	gitIn(t, dir, "init", "-b", "main")
+	gitIn(t, dir, "commit", "--allow-empty", "-m", "chore: seed base")
 	gitIn(t, dir, "commit", "--allow-empty", "-m", "feat: FAC-1 landed")
 	bare := t.TempDir()
 	gitIn(t, dir, "clone", "--bare", ".", filepath.Join(bare, "origin.git"))
@@ -1524,6 +1540,9 @@ func TestVerdict_TwoBrokersDeliverExactlyOnce(t *testing.T) {
 	startBroker(t, binary, dir, keyDir, sockB)
 
 	candidate := fixtureEvidenceSHA(t, dir)
+	// Retention (FAC-740) binds the base commit too — it must be a real
+	// 40-hex commit, not fixture shorthand.
+	base := runGitOut(t, dir, "rev-parse", candidate+"^")
 	reviewDir := filepath.Join(dir, ".herd", "reviews", "fac-1-race")
 	gitIn(t, dir, "worktree", "add", "--detach", reviewDir, candidate)
 	signer := fixtureSigner(t, keyDir, dir)
@@ -1532,7 +1551,7 @@ func TestVerdict_TwoBrokersDeliverExactlyOnce(t *testing.T) {
 		ProviderType: "kaneo", ProjectID: "proj-x",
 		Repository: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
 		Role:       dispatch.RoleReviewer, TaskRef: "FAC-1", TaskID: "t1",
-		Branch: "herd/fac-1", BaseSHA: "abc", CandidateSHA: candidate,
+		Branch: "herd/fac-1", BaseSHA: base, CandidateSHA: candidate,
 		LeaseID: leaseID, LeaseGeneration: leaseGen, LeaseTaskRef: "FAC-1",
 		SessionID: "reviewer-race", AllowedOps: dispatch.ReviewerOps,
 		ExpiresAt: time.Now().Add(time.Hour),
@@ -1909,10 +1928,11 @@ func TestTaskBrokerCLI_ScopedReviewLeaseWorks(t *testing.T) {
 
 	signer := fixtureSigner(t, keyDir, dir)
 	candidate := fixtureEvidenceSHA(t, dir)
+	base := runGitOut(t, dir, "rev-parse", candidate+"^")
 	receipt, err := signer.Issue(dispatch.TaskContext{
 		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
 		Role: dispatch.RoleReviewer, TaskRef: "FAC-1", TaskID: "t1",
-		Branch: "herd/fac-1", BaseSHA: "abc", CandidateSHA: candidate,
+		Branch: "herd/fac-1", BaseSHA: base, CandidateSHA: candidate,
 		LeaseID: fmt.Sprintf("claim:%d", lease.ID), LeaseGeneration: lease.Generation,
 		LeaseTaskRef: "FAC-1:review", SessionID: "reviewer-scoped", AllowedOps: dispatch.ReviewerOps,
 		ExpiresAt: time.Now().Add(time.Hour),
@@ -2812,11 +2832,12 @@ func TestBroker_SessionAuthorityDiesWithPaneIncarnation(t *testing.T) {
 
 	signer := fixtureSigner(t, keyDir, dir)
 	leaseID, leaseGen := acquireFixtureLease(t, dir, "FAC-1")
+	base := runGitOut(t, dir, "rev-parse", candidate+"^")
 	receipt, err := signer.Issue(dispatch.TaskContext{
 		ProviderType: "kaneo", ProjectID: "proj-x",
 		Repository: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
 		Role:       dispatch.RoleReviewer, TaskRef: "FAC-1", TaskID: "t1",
-		Branch: "herd/fac-1", BaseSHA: "abc", CandidateSHA: candidate,
+		Branch: "herd/fac-1", BaseSHA: base, CandidateSHA: candidate,
 		LeaseID: leaseID, LeaseGeneration: leaseGen, LeaseTaskRef: "FAC-1",
 		SessionID: "reviewer-session", AllowedOps: dispatch.ReviewerOps,
 		AgentSessionID: fmt.Sprintf("%s/%s/%s", fakeTabID, fakePaneID, fakeTerminalID),
