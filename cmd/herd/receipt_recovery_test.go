@@ -322,6 +322,25 @@ func TestReceiptRecoverCLIRequiresExactTargetAndReadOnlyLeaseObservation(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	badBranch := recoveryCLIArgs(recovery, f.worktree)
+	for i := range badBranch {
+		if badBranch[i] == "--branch" && i+1 < len(badBranch) {
+			badBranch[i+1] = "wrong/branch"
+		}
+	}
+	if out, err := herdCmd(binary, f.root, f.keyDir, badBranch...).CombinedOutput(); err == nil {
+		t.Fatalf("wrong branch selector must fail closed: %s", out)
+	}
+	if after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile)); err != nil || string(after) != string(before) {
+		t.Fatalf("wrong branch refusal changed target: %v", err)
+	}
+	foreign := filepath.Join(filepath.Dir(f.root), "foreign-recovery-target")
+	if out, err := herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(recovery, foreign)...).CombinedOutput(); err == nil {
+		t.Fatalf("foreign target must fail closed: %s", out)
+	}
+	if after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile)); err != nil || string(after) != string(before) {
+		t.Fatalf("foreign target refusal changed source target: %v", err)
+	}
 	if err := os.Remove(storePath); err != nil {
 		t.Fatal(err)
 	}
