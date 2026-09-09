@@ -272,7 +272,7 @@ func TestFetchDirectAllPollsProvidersInParallel(t *testing.T) {
 		nativePollers = saved
 	})
 
-	const n = 4
+	n := len(nativePollers)
 	arrived := make(chan string, n)
 	release := make(chan struct{})
 	fake := func(name string) func() (ProviderUsage, error) {
