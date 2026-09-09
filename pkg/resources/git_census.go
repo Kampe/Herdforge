@@ -42,14 +42,30 @@ type LifecycleEvidenceReader interface {
 // append-only review ledger. Missing or malformed authority is an error: an
 // absent record does not prove that a lane is disposable.
 type SQLiteLifecycleEvidence struct {
-	ClaimsPath string
-	LedgerPath string
-	RepoID     string
-	HostID     string
+	ClaimsPath         string
+	LaunchClaimsPath   string
+	RecoveryClaimsPath string
+	TaskClaimsPath     string
+	LedgerPath         string
+	RepoID             string
+	HostID             string
+	SignedTarget       func(context.Context, string, RegisteredWorktree) (SignedTarget, error)
+}
+
+// SignedTarget is the authenticated receipt identity for a lane. It is kept
+// deliberately small so resources does not import dispatch (which would
+// create a package cycle through review/worktree).
+type SignedTarget struct {
+	LeaseID         string
+	LeaseGeneration int64
+	LeaseTaskRef    string
+	Repository      string
+	CandidateSHA    string
+	Authenticated   bool
 }
 
 func (r SQLiteLifecycleEvidence) Read(ctx context.Context, repoRoot, hostID string, lane RegisteredWorktree) (LifecycleEvidence, error) {
-	if strings.TrimSpace(r.ClaimsPath) == "" || strings.TrimSpace(r.LedgerPath) == "" || strings.TrimSpace(r.RepoID) == "" || strings.TrimSpace(hostID) == "" {
+	if strings.TrimSpace(r.LedgerPath) == "" || strings.TrimSpace(r.RepoID) == "" || strings.TrimSpace(hostID) == "" {
 		return LifecycleEvidence{}, errors.New("canonical lifecycle evidence identity is incomplete")
 	}
 	if r.HostID != "" && r.HostID != hostID {
@@ -63,50 +79,96 @@ func (r SQLiteLifecycleEvidence) Read(ctx context.Context, repoRoot, hostID stri
 	if err != nil || !containedPath(root, worktree) {
 		return LifecycleEvidence{}, errors.New("canonical claim worktree identity unavailable")
 	}
-	claims, err := claim.OpenSQLiteLeaseStoreReadOnly(r.ClaimsPath)
-	if err != nil {
-		return LifecycleEvidence{}, fmt.Errorf("open canonical claim evidence: %w", err)
-	}
-	defer claims.Close()
-	active, err := claims.ActiveClaims(ctx, time.Now())
-	if err != nil {
-		return LifecycleEvidence{}, fmt.Errorf("read canonical active claims: %w", err)
-	}
-	paths, err := claims.DistinctWorktreePaths(ctx)
-	if err != nil {
-		return LifecycleEvidence{}, fmt.Errorf("read canonical claim history: %w", err)
-	}
-	knownPath := false
-	for _, path := range paths {
-		resolved, resolveErr := filepath.EvalSymlinks(path)
-		if resolveErr == nil && filepath.Clean(resolved) == filepath.Clean(worktree) {
-			knownPath = true
-			break
-		}
-	}
-	if !knownPath {
-		return LifecycleEvidence{}, errors.New("canonical claim history has no exact worktree identity")
-	}
 	evidence := LifecycleEvidence{}
-	for _, lease := range active {
-		if lease == nil {
+	paths := []string{r.ClaimsPath, r.LaunchClaimsPath, r.RecoveryClaimsPath, r.TaskClaimsPath}
+	seenStores := make(map[string]struct{})
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
 			continue
 		}
-		leasePath, resolveErr := filepath.EvalSymlinks(lease.WorktreePath)
-		if resolveErr != nil || filepath.Clean(leasePath) != filepath.Clean(worktree) {
+		if _, seen := seenStores[path]; seen {
 			continue
 		}
-		if lease.Repo != r.RepoID || lease.HoldRepository != r.RepoID || lease.Generation <= 0 || lease.OwnerID == "" || lease.TaskRef == "" || lease.Project == "" || lease.Provider == "" {
-			return LifecycleEvidence{}, errors.New("canonical claim record identity mismatch")
+		seenStores[path] = struct{}{}
+		store, openErr := claim.OpenSQLiteLeaseStoreReadOnly(path)
+		if openErr != nil {
+			return LifecycleEvidence{}, fmt.Errorf("open canonical claim evidence %q: %w", reportPath(root, path), openErr)
 		}
-		// Host is a scope identity of the local canonical root and claim DB;
-		// owner IDs are lane identities and must never be substring-matched.
-		evidence.ActiveLease = true
+		active, activeErr := store.ActiveClaims(ctx, time.Now())
+		if activeErr != nil {
+			_ = store.Close()
+			return LifecycleEvidence{}, fmt.Errorf("read canonical active claims: %w", activeErr)
+		}
+		knownPath, historyErr := exactClaimPath(ctx, store, root, worktree)
+		if historyErr != nil {
+			_ = store.Close()
+			return LifecycleEvidence{}, historyErr
+		}
+		isRecoveryStore := filepath.Clean(path) == filepath.Clean(r.RecoveryClaimsPath)
+		if knownPath {
+			for _, lease := range active {
+				if lease == nil {
+					continue
+				}
+				leasePath, resolveErr := filepath.EvalSymlinks(lease.WorktreePath)
+				if resolveErr != nil || filepath.Clean(leasePath) != filepath.Clean(worktree) {
+					continue
+				}
+				if lease.Repo != r.RepoID || lease.HoldRepository != r.RepoID || lease.Generation <= 0 || lease.OwnerID == "" || lease.TaskRef == "" || lease.Project == "" || lease.Provider == "" {
+					_ = store.Close()
+					return LifecycleEvidence{}, errors.New("canonical claim record identity mismatch")
+				}
+				if r.SignedTarget != nil {
+					target, targetErr := r.SignedTarget(ctx, worktree, lane)
+					if targetErr != nil || !target.Authenticated || target.LeaseID != fmt.Sprintf("claim:%d", lease.ID) || target.LeaseGeneration != lease.Generation || target.LeaseTaskRef != lease.TaskRef || target.Repository != r.RepoID || (target.CandidateSHA != "" && target.CandidateSHA != lane.Head) {
+						_ = store.Close()
+						return LifecycleEvidence{}, errors.New("canonical claim receipt identity mismatch")
+					}
+				}
+				evidence.ActiveLease = true
+			}
+		}
+		// A live recovery claim with no target path cannot be joined to this
+		// worktree; preserve every target until the signed target binding is
+		// available instead of guessing from generation or owner naming.
+		for _, lease := range active {
+			if lease != nil && lease.WorktreePath == "" && lease.HoldRepository == r.RepoID {
+				if !isRecoveryStore || r.SignedTarget == nil {
+					_ = store.Close()
+					return LifecycleEvidence{}, errors.New("canonical recovery claim has no signed target binding")
+				}
+				target, targetErr := r.SignedTarget(ctx, worktree, lane)
+				if targetErr != nil || !target.Authenticated || target.LeaseID != fmt.Sprintf("claim:%d", lease.ID) || target.LeaseGeneration != lease.Generation || target.LeaseTaskRef != lease.TaskRef || target.Repository != r.RepoID || (target.CandidateSHA != "" && target.CandidateSHA != lane.Head) {
+					_ = store.Close()
+					return LifecycleEvidence{}, errors.New("canonical recovery claim signed target mismatch")
+				}
+				evidence.ActiveLease = true
+			}
+		}
+		if err := store.Close(); err != nil {
+			return LifecycleEvidence{}, fmt.Errorf("close canonical claim evidence: %w", err)
+		}
 	}
 	if err := readReviewLifecycle(r.LedgerPath, lane.Head, &evidence); err != nil {
 		return LifecycleEvidence{}, err
 	}
 	return evidence, nil
+}
+
+func exactClaimPath(ctx context.Context, store *claim.SQLiteLeaseStore, root, worktree string) (bool, error) {
+	paths, err := store.DistinctWorktreePaths(ctx)
+	if err != nil {
+		return false, fmt.Errorf("read canonical claim history: %w", err)
+	}
+	for _, path := range paths {
+		resolved, resolveErr := filepath.EvalSymlinks(path)
+		if resolveErr == nil && filepath.Clean(resolved) == filepath.Clean(worktree) {
+			return true, nil
+		}
+	}
+	_ = root
+	return false, nil
 }
 
 type lifecycleRow struct {

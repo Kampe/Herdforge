@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resources"
@@ -74,8 +75,25 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 			Now:       time.Now,
 			HostID:    host,
 			Evidence: resources.SQLiteLifecycleEvidence{
-				ClaimsPath: filepath.Join(claimDir, "leases.db"),
-				LedgerPath: reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
+				ClaimsPath:         deps.ResolveLaunchLeasePath(resolved),
+				LaunchClaimsPath:   deps.ResolveLaunchLeasePath(resolved),
+				RecoveryClaimsPath: filepath.Join(resolved, ".herd", "herdforge.db"),
+				TaskClaimsPath:     filepath.Join(claimDir, "leases.db"),
+				LedgerPath:         reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
+				SignedTarget: func(_ context.Context, worktreePath string, _ resources.RegisteredWorktree) (resources.SignedTarget, error) {
+					tc, readErr := dispatch.ReadTaskContext(worktreePath)
+					if readErr != nil {
+						return resources.SignedTarget{}, readErr
+					}
+					verifier, verifyErr := dispatch.LoadVerifier(resolved)
+					if verifyErr != nil {
+						return resources.SignedTarget{}, verifyErr
+					}
+					if verifyErr = verifier.Verify(tc); verifyErr != nil {
+						return resources.SignedTarget{}, verifyErr
+					}
+					return resources.SignedTarget{LeaseID: tc.LeaseID, LeaseGeneration: tc.LeaseGeneration, LeaseTaskRef: tc.LeaseTaskRef, Repository: tc.Repository, CandidateSHA: tc.CandidateSHA, Authenticated: true}, nil
+				},
 			},
 		},
 		Locks: resources.FileLockProvider{}, Now: time.Now,
