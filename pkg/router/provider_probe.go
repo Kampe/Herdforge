@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/spin"
 )
 
 const providerProbeSentinel = "HERD_PROVIDER_PROBE_OK"
@@ -46,7 +48,9 @@ func defaultProviderProbe(provider, model string) (bool, string) {
 }
 
 func classifyProviderProbeOutput(output, combined string, runErr error, timedOut bool) (bool, string) {
-	lower := strings.ToLower(combined)
+	cleanOutput := spin.StripTerminalControlSequences(output)
+	cleanCombined := spin.StripTerminalControlSequences(combined)
+	lower := strings.ToLower(cleanCombined)
 	for _, signal := range providerProbeFailures {
 		if strings.Contains(lower, signal) {
 			return false, signal
@@ -60,7 +64,7 @@ func classifyProviderProbeOutput(output, combined string, runErr error, timedOut
 	if runErr != nil {
 		return false, "provider probe failed: " + firstProbeLine(combined, runErr.Error())
 	}
-	if strings.TrimSpace(output) != providerProbeSentinel {
+	if strings.TrimSpace(cleanOutput) != providerProbeSentinel {
 		return false, "provider probe returned no exact readiness token"
 	}
 	return true, ""

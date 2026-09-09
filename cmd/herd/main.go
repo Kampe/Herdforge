@@ -6651,20 +6651,12 @@ func validateLaneLaunchConfig(lane *config.LaneDef) error {
 		return fmt.Errorf("%w: lane %q agent kind %q harness %q must match one supported vendor harness (codex, claude, grok, agy, opencode)", ErrHarnessConfigPolicy, lane.Name, lane.AgentKind, lane.Harness)
 	}
 	if nativeRole == launch.WorkerRole || nativeRole == launch.ForgeSmithRole || nativeRole == launch.RecoveryRole {
-		if lane.Provider == launch.WorkerProvider {
-			if lane.Model != launch.WorkerModel || lane.Effort != launch.WorkerEffort {
-				return fmt.Errorf("%w: lane %q codex workers must use codex/gpt-5.6-luna/medium", ErrWorkerConfigPolicy, lane.Name)
-			}
-		} else if lane.Provider == "grok" {
-			if strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" {
-				return fmt.Errorf("%w: lane %q grok workers require an explicit model and effort", ErrWorkerConfigPolicy, lane.Name)
-			}
-		} else if lane.Provider == "claude" {
-			if strings.TrimSpace(lane.Model) == "" || strings.TrimSpace(lane.Effort) == "" {
-				return fmt.Errorf("%w: lane %q claude workers require an explicit model and effort", ErrWorkerConfigPolicy, lane.Name)
-			}
-		} else {
-			return fmt.Errorf("%w: lane %q must use codex/gpt-5.6-luna/medium or an explicit Grok or Claude model", ErrWorkerConfigPolicy, lane.Name)
+		surface, ok := router.SurfaceFor(strings.ToLower(strings.TrimSpace(lane.Provider)))
+		if !ok || !router.IsLaneLaunchable(lane.Provider) {
+			return fmt.Errorf("%w: lane %q provider %q is not a launchable worker surface", ErrWorkerConfigPolicy, lane.Name, lane.Provider)
+		}
+		if !strings.EqualFold(strings.TrimSpace(surface.Harness), harness) {
+			return fmt.Errorf("%w: lane %q provider %q requires harness %q, got %q", ErrHarnessConfigPolicy, lane.Name, lane.Provider, surface.Harness, lane.Harness)
 		}
 	}
 	return nil
