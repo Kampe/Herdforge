@@ -13,6 +13,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -467,10 +468,24 @@ func (p ClaimPreview) Decision(lane string) (broker.Decision, error) {
 	}
 
 	if len(p.ClaimableRefs) > 0 {
-		d := broker.Decision{
-			Outcome: broker.OutcomeWork,
-			Task:    &broker.Task{Ref: p.ClaimableRefs[0], Kind: broker.KindBuild},
+		queue := make([]broker.Task, 0, len(p.ClaimableRefs))
+		for i, ref := range p.ClaimableRefs {
+			queue = append(queue, broker.Task{
+				Ref:      ref,
+				Kind:     broker.KindBuild,
+				Priority: len(p.ClaimableRefs) - i,
+			})
 		}
+		d := broker.Decide(broker.Inputs{
+			Lane:    lane,
+			Accepts: []broker.Kind{broker.KindBuild},
+			Queue:   queue,
+			Progress: progress.Record{
+				Lane:    lane,
+				TaskRef: p.ClaimableRefs[0],
+				Action:  progress.ClassBuild,
+			},
+		})
 		if err := d.Validate(); err != nil {
 			return broker.Decision{}, err
 		}

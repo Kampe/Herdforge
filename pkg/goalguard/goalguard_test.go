@@ -40,6 +40,21 @@ func TestEvaluateContinuesUntilBoundThenStops(t *testing.T) {
 	}
 }
 
+func TestEvaluateEventWaitDoesNotSpendContinuation(t *testing.T) {
+	s, _, e := testGoal(t)
+	e.ProgressClass = "probe"
+	e.LastArtifact = "sha-a"
+	e.Artifact = "sha-a"
+	got, err := s.Evaluate(e)
+	if err != nil || got.Continue || got.Reason != "event_wait" || got.Continuations != 0 {
+		t.Fatalf("unchanged probe spent continuation: %+v err=%v", got, err)
+	}
+	again, err := s.Evaluate(e)
+	if err != nil || again.Continuations != 0 {
+		t.Fatalf("event wait must not consume budget on retry: %+v err=%v", again, err)
+	}
+}
+
 func TestEvaluateStopsForEveryTerminalCondition(t *testing.T) {
 	cases := []struct {
 		name   string

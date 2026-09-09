@@ -17,6 +17,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/posture"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
 
 const SchemaVersion = 1
@@ -91,15 +92,18 @@ type Goal struct {
 
 // Evidence is the live authority snapshot supplied for one guard decision.
 type Evidence struct {
-	Lane       string    `json:"lane"`
-	Task       string    `json:"task"`
-	Owner      string    `json:"owner"`
-	Generation int64     `json:"generation"`
-	Completed  bool      `json:"completed"`
-	LeaseHeld  bool      `json:"lease_held"`
-	Held       bool      `json:"held"`
-	WindDown   bool      `json:"wind_down"`
-	Now        time.Time `json:"now"`
+	Lane          string         `json:"lane"`
+	Task          string         `json:"task"`
+	Owner         string         `json:"owner"`
+	Generation    int64          `json:"generation"`
+	Completed     bool           `json:"completed"`
+	LeaseHeld     bool           `json:"lease_held"`
+	Held          bool           `json:"held"`
+	WindDown      bool           `json:"wind_down"`
+	Now           time.Time      `json:"now"`
+	ProgressClass progress.Class `json:"progress_class,omitempty"`
+	LastArtifact  string         `json:"last_artifact,omitempty"`
+	Artifact      string         `json:"artifact,omitempty"`
 }
 
 type Decision struct {
@@ -249,6 +253,23 @@ func (s *Store) Evaluate(e Evidence) (Decision, error) {
 	}
 	if g.Stop.WindDown || e.WindDown {
 		return Decision{Reason: "wind_down", Continuations: g.Continuations}, nil
+	}
+	if e.ProgressClass == progress.ClassProbe || e.ProgressClass == progress.ClassWait ||
+		(strings.TrimSpace(e.LastArtifact) != "" && strings.TrimSpace(e.Artifact) != "") {
+		action := e.ProgressClass
+		if action == "" {
+			action = progress.ClassBuild
+		}
+		artifact := strings.TrimSpace(e.Artifact)
+		if artifact == "" {
+			artifact = strings.TrimSpace(e.LastArtifact)
+		}
+		rec := progress.Record{Lane: e.Lane, TaskRef: e.Task, LastArtifact: e.LastArtifact, Action: action}
+		rec, advanced := rec.Observe(now, action, artifact)
+		if !advanced {
+			return Decision{Reason: "event_wait", Continuations: g.Continuations}, nil
+		}
+		_ = rec
 	}
 	if g.MaxContinuations > 0 && g.Continuations >= g.MaxContinuations {
 		return Decision{Reason: "max_continuations", Continuations: g.Continuations}, nil

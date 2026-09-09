@@ -31,6 +31,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
 
 // AttentionLevel ranks how urgently a lane needs coordinator eyes.
@@ -96,6 +97,22 @@ func urgencyRank(l AttentionLevel) int {
 // LevelNone (working/starting) is the only level that does not.
 func NeedsEyes(l AttentionLevel) bool {
 	return l != LevelNone
+}
+
+// ClassifyProgress maps pkg/progress onto attention. Event waits are visible
+// without being mistaken for useful work that needs escalation.
+func ClassifyProgress(rec progress.Record) (AttentionLevel, string) {
+	if rec.Action == progress.ClassWait || rec.Action == progress.ClassProbe || rec.Plateaued(progress.PlateauAfter) {
+		reason := strings.TrimSpace(rec.WaitReason)
+		if reason == "" {
+			reason = "event wait: " + string(rec.Action) + " is not useful work"
+		}
+		return LevelLow, reason
+	}
+	if ok, why := rec.Actionable(); !ok {
+		return LevelLow, why
+	}
+	return LevelNone, "useful work"
 }
 
 // classifyStatus maps a raw agent status string to an attention level

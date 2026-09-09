@@ -6,7 +6,29 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
+
+func TestClassifyProgressEventWaitIsNotUsefulWork(t *testing.T) {
+	lvl, reason := ClassifyProgress(progress.Record{
+		Lane:       "forge-worker",
+		TaskRef:    "FAC-581",
+		Action:     progress.ClassWait,
+		WaitReason: "identical_probe",
+	})
+	if lvl != LevelLow || !strings.Contains(reason, "identical_probe") {
+		t.Fatalf("event wait must be visible without escalating as useful work: level=%s reason=%q", lvl, reason)
+	}
+	useful, usefulReason := ClassifyProgress(progress.Record{
+		Lane:         "forge-worker",
+		TaskRef:      "FAC-581",
+		Action:       progress.ClassBuild,
+		LastArtifact: "sha-builder",
+	})
+	if useful != LevelNone || usefulReason != "useful work" {
+		t.Fatalf("real work must not look like an event wait: level=%s reason=%q", useful, usefulReason)
+	}
+}
 
 func TestNeedsEyes(t *testing.T) {
 	tests := []struct {

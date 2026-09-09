@@ -11,10 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/review"
@@ -54,6 +56,128 @@ func TestSelectPulseDispatchTaskSortsByPriorityThenRef(t *testing.T) {
 	}
 	if got = selectPulseDispatchTask([]*provider.Task{{Status: provider.StatusInProgress, Ref: "FAC-1"}}); got != nil {
 		t.Fatalf("in-progress-only board selected %+v", got)
+	}
+}
+
+func herdDepsFence(ref, id, edges string) string {
+	if edges == "" {
+		edges = "[]"
+	}
+	return "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"" + ref + "\",\"task_id\":\"" + id + "\",\"edges\":" + edges + "}\n```\n"
+}
+
+// FAC-581: the production pulse selector must route through pkg/broker.Decide,
+// which skips an urgent card whose blocking edge is still open.
+func TestSelectPulseDispatchTaskSkipsDependencyBlockedHigherPriority(t *testing.T) {
+	got := selectPulseDispatchTask([]*provider.Task{
+		{
+			Ref: "FAC-75", ID: "t1", Status: provider.StatusToDo, Priority: provider.PriorityUrgent,
+			Description: herdDepsFence("FAC-75", "t1", `[{"source_ref":"FAC-136","target_ref":"FAC-75","type":"blocks"}]`),
+		},
+		{
+			Ref: "FAC-3", ID: "t3", Status: provider.StatusToDo, Priority: provider.PriorityHigh,
+			Description: herdDepsFence("FAC-3", "t3", "[]"),
+		},
+	})
+	if got == nil || got.Ref != "FAC-3" || got.ID != "t3" {
+		t.Fatalf("dependency-ready builder must win over blocked urgent, got %+v", got)
+	}
+}
+
+func TestSelectPulseDispatchTaskRejectsSelectorWithoutIdentity(t *testing.T) {
+	got := selectPulseDispatchTask([]*provider.Task{
+		{ID: "no-ref", Status: provider.StatusToDo, Priority: provider.PriorityUrgent},
+		{Ref: "   ", ID: "blank", Status: provider.StatusToDo, Priority: provider.PriorityHigh},
+	})
+	if got != nil {
+		t.Fatalf("selector output without a task identity must be a failure, got %+v", got)
+	}
+	d := pulseDispatchDecision([]*provider.Task{
+		{ID: "no-ref", Status: provider.StatusToDo, Priority: provider.PriorityUrgent},
+	}, broker.Inputs{})
+	if err := d.Validate(); err != nil {
+		t.Fatalf("empty-identity wait must still be actionable: %v", err)
+	}
+	if d.Outcome != broker.OutcomeWait || strings.TrimSpace(d.WaitReason) == "" {
+		t.Fatalf("selector without identity must wait with a named reason, got %+v", d)
+	}
+}
+
+func TestPulseDispatchDecisionReviewSaturationDoesNotSuppressBuilder(t *testing.T) {
+	d := pulseDispatchDecision(nil, broker.Inputs{
+		Lane:    "pulse",
+		Accepts: []broker.Kind{broker.KindBuild},
+		Queue: []broker.Task{
+			{Ref: "FAC-581", Kind: broker.KindBuild, Priority: 3},
+			{Ref: "FAC-9", Kind: broker.KindReview, Priority: 4},
+		},
+		ReviewSaturated:  true,
+		ReviewWaitReason: "8 reviews in flight >= cap 3",
+		Progress: progress.Record{
+			Lane:         "pulse",
+			TaskRef:      "FAC-581",
+			Action:       progress.ClassBuild,
+			LastArtifact: "sha-builder",
+		},
+	})
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if d.Outcome != broker.OutcomeWork || d.Task == nil || d.Task.Ref != "FAC-581" {
+		t.Fatalf("full review slot suppressed an independent builder: %+v", d)
+	}
+	if d.Progress.LastArtifact != "sha-builder" {
+		t.Fatalf("decision must carry progress classification, got %+v", d.Progress)
+	}
+}
+
+func TestPulseDispatchDecisionEventWaitOnUnchangedProbe(t *testing.T) {
+	d := pulseDispatchDecision([]*provider.Task{
+		{Ref: "FAC-581", ID: "builder", Status: provider.StatusToDo, Priority: provider.PriorityUrgent},
+	}, broker.Inputs{
+		Progress: progress.Record{
+			Lane:         "pulse",
+			TaskRef:      "FAC-581",
+			Action:       progress.ClassProbe,
+			LastArtifact: "sha-a",
+			WaitReason:   "identical_probe",
+		},
+	})
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if d.Outcome != broker.OutcomeWait || d.WaitReason != "identical_probe" {
+		t.Fatalf("unchanged probe scored as work: %+v", d)
+	}
+	if d.Progress.UnchangedBeats < 1 {
+		t.Fatalf("probe must not advance useful progress: %+v", d.Progress)
+	}
+}
+
+func TestCollectPulseProviderObservationSelectsReadyBuilderOverBlockedUrgent(t *testing.T) {
+	tp := provider.NewMemoryProvider()
+	for _, task := range []*provider.Task{
+		{
+			ID: "t1", Ref: "FAC-75", Title: "blocked", ProjectID: "proj-581",
+			Status: provider.StatusToDo, Priority: provider.PriorityUrgent,
+			Description: herdDepsFence("FAC-75", "t1", `[{"source_ref":"FAC-136","target_ref":"FAC-75","type":"blocks"}]`),
+		},
+		{
+			ID: "t3", Ref: "FAC-3", Title: "ready", ProjectID: "proj-581",
+			Status: provider.StatusToDo, Priority: provider.PriorityHigh,
+			Description: herdDepsFence("FAC-3", "t3", "[]"),
+		},
+	} {
+		if _, err := tp.CreateTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obs, _ := collectPulseProviderObservation(context.Background(), tp, "proj-581")
+	if !obs.Known {
+		t.Fatalf("provider observation unknown: %+v", obs)
+	}
+	if obs.NextTaskRef != "FAC-3" || obs.NextTaskID != "t3" {
+		t.Fatalf("production pulse caller must dispatch the ready builder, got ref=%q id=%q", obs.NextTaskRef, obs.NextTaskID)
 	}
 }
 

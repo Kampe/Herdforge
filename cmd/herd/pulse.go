@@ -19,12 +19,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
+	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/mail"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/pulse"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
@@ -290,35 +293,107 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 	return obs, doneRefs
 }
 
-// selectPulseDispatchTask keeps pulse's one-dispatch bound deterministic and
-// aligned with the fleet task-selection contract: priority descending, then
-// ticket reference ascending. Nil and ref-less tasks cannot be dispatched.
+// selectPulseDispatchTask keeps pulse's one-dispatch bound on pkg/broker.Decide:
+// exact task identity, dependency readiness, priority descending, then ref
+// ascending. Review saturation is a review-adapter bound and never vetoes a
+// builder. Nil and ref-less tasks cannot be dispatched.
 func selectPulseDispatchTask(tasks []*provider.Task) *provider.Task {
-	priority := func(p provider.Priority) int {
-		switch p {
-		case provider.PriorityUrgent:
-			return 4
-		case provider.PriorityHigh:
-			return 3
-		case provider.PriorityMedium:
-			return 2
-		case provider.PriorityLow:
-			return 1
-		default:
-			return 0
+	d := pulseDispatchDecision(tasks, broker.Inputs{
+		Lane:    "pulse",
+		Accepts: []broker.Kind{broker.KindBuild},
+		Progress: progress.Record{
+			Lane:   "pulse",
+			Action: progress.ClassBuild,
+		},
+	})
+	if err := d.Validate(); err != nil || d.Outcome != broker.OutcomeWork || d.Task == nil {
+		return nil
+	}
+	want := strings.TrimSpace(d.Task.Ref)
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		if strings.TrimSpace(task.Ref) == want {
+			return task
 		}
 	}
-	var best *provider.Task
+	return nil
+}
+
+// pulseDispatchDecision is the production pulse selector seam. Callers must
+// consume a Decision that either names an exact builder or names the wait.
+func pulseDispatchDecision(tasks []*provider.Task, in broker.Inputs) broker.Decision {
+	if strings.TrimSpace(in.Lane) == "" {
+		in.Lane = "pulse"
+	}
+	if len(in.Accepts) == 0 {
+		in.Accepts = []broker.Kind{broker.KindBuild}
+	}
+	if len(in.Queue) == 0 {
+		in.Queue = pulseBrokerQueue(tasks)
+	}
+	prog := in.Progress
+	if strings.TrimSpace(prog.Lane) == "" {
+		prog.Lane = in.Lane
+	}
+	switch prog.Action {
+	case progress.ClassProbe, progress.ClassWait:
+		artifact := strings.TrimSpace(prog.LastArtifact)
+		prog, advanced := prog.Observe(time.Now().UTC(), prog.Action, artifact)
+		if !advanced {
+			reason := strings.TrimSpace(prog.WaitReason)
+			if reason == "" {
+				if prog.Action == progress.ClassProbe {
+					reason = "identical_probe"
+				} else {
+					reason = "event_wait"
+				}
+			}
+			return broker.Decision{
+				Outcome:    broker.OutcomeWait,
+				WaitReason: reason,
+				Progress:   prog,
+			}
+		}
+	}
+	in.Progress = prog
+	return broker.Decide(in)
+}
+
+func pulseBrokerQueue(tasks []*provider.Task) []broker.Task {
+	queue := make([]broker.Task, 0, len(tasks))
 	for _, task := range tasks {
 		if task == nil || (task.Status != "" && task.Status != provider.StatusToDo) || strings.TrimSpace(task.Ref) == "" {
 			continue
 		}
-		if best == nil || priority(task.Priority) > priority(best.Priority) ||
-			(priority(task.Priority) == priority(best.Priority) && strings.TrimSpace(task.Ref) < strings.TrimSpace(best.Ref)) {
-			best = task
+		ref := strings.TrimSpace(task.Ref)
+		item := broker.Task{
+			Ref:      ref,
+			Kind:     broker.KindBuild,
+			Priority: candidateindex.PriorityRank(task.Priority),
 		}
+		if prov, err := deps.ExtractProvenanceFromText(task.Description); err == nil && prov != nil && prov.Present {
+			seen := map[string]struct{}{}
+			for _, edge := range prov.Edges {
+				if edge.Type != deps.EdgeBlocks {
+					continue
+				}
+				tgt := strings.TrimSpace(string(edge.TargetRef))
+				src := strings.TrimSpace(string(edge.SourceRef))
+				if src == "" || !strings.EqualFold(tgt, ref) {
+					continue
+				}
+				if _, dup := seen[src]; dup {
+					continue
+				}
+				seen[src] = struct{}{}
+				item.DependsOn = append(item.DependsOn, src)
+			}
+		}
+		queue = append(queue, item)
 	}
-	return best
+	return queue
 }
 
 // readPulseHerdr reads the live fleet and enriches each agent with reap
