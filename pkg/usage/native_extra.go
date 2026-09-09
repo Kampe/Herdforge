@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +137,9 @@ func antigravityPollWithURL(url, csrf string) (ProviderUsage, error) {
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("antigravity quota", resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("antigravity quota", resp.StatusCode)
 	}
@@ -176,11 +181,182 @@ type litellmKeyInfo struct {
 
 func litellmPoll() (ProviderUsage, error) {
 	key := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
-	base := strings.TrimRight(strings.TrimSpace(os.Getenv("LITELLM_BASE_URL")), "/")
+	base := litellmBaseURL()
 	if key == "" || base == "" {
 		return ProviderUsage{}, pollErrf("auth-missing", "litellm self-key or configured base URL is unavailable")
 	}
 	return litellmPollWithURL(base+"/key/info", key)
+}
+
+// litellmBaseURL follows the existing OpenCode provider configuration before
+// considering the explicit compatibility override. This keeps the native
+// collector aligned with the CLI actually selected by the fleet.
+func litellmBaseURL() string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("LITELLM_BASE_URL")), "/"); base != "" {
+		return base
+	}
+	for _, path := range opencodeConfigFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var document any
+		if json.Unmarshal(raw, &document) != nil {
+			continue
+		}
+		if base := findProviderBaseURL(document); base != "" {
+			return strings.TrimRight(base, "/")
+		}
+	}
+	return ""
+}
+
+func findProviderBaseURL(value any) string {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	keys := make([]string, 0, len(obj))
+	for key := range obj {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		child := obj[key]
+		if strings.EqualFold(key, "baseURL") || strings.EqualFold(key, "base_url") || strings.EqualFold(key, "api_base") {
+			if base, ok := child.(string); ok && strings.TrimSpace(base) != "" {
+				return base
+			}
+		}
+		if base := findProviderBaseURL(child); base != "" {
+			return base
+		}
+	}
+	return ""
+}
+
+func opencodeConfigFiles() []string {
+	var paths []string
+	if dir := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG_DIR")); dir != "" {
+		paths = append(paths, filepath.Join(dir, "opencode.json"), filepath.Join(dir, "config.json"))
+	}
+	if dir := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); dir != "" {
+		paths = append(paths, filepath.Join(dir, "opencode", "opencode.json"), filepath.Join(dir, "opencode", "config.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".config", "opencode", "opencode.json"), filepath.Join(home, ".config", "opencode", "config.json"))
+	}
+	return paths
+}
+
+type opencodeUsageWindow struct {
+	Percent  float64 `json:"percent"`
+	ResetsAt string  `json:"resetsAt"`
+}
+
+type opencodeUsageResponse struct {
+	Rolling *opencodeUsageWindow `json:"rolling"`
+	Weekly  *opencodeUsageWindow `json:"weekly"`
+	Monthly *opencodeUsageWindow `json:"monthly"`
+	Error   string               `json:"error"`
+	Account string               `json:"account_id"`
+}
+
+func opencodePoll() (ProviderUsage, error) {
+	key, err := opencodeGoKey()
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	return opencodePollWithURL("https://opencode.ai/zen/go/v1/usage", key)
+}
+
+func opencodeGoKey() (string, error) {
+	for _, path := range opencodeAuthFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var auth map[string]struct {
+			Key   string `json:"key"`
+			Token string `json:"token"`
+		}
+		if json.Unmarshal(raw, &auth) != nil {
+			return "", pollErrf("decode-failed", "opencode auth decode failed")
+		}
+		entry, ok := auth["opencode-go"]
+		if !ok {
+			continue
+		}
+		if key := strings.TrimSpace(entry.Key); key != "" {
+			return key, nil
+		}
+		if token := strings.TrimSpace(entry.Token); token != "" {
+			return token, nil
+		}
+		return "", pollErrf("auth-missing", "opencode-go credential has no usable key; run opencode login")
+	}
+	return "", pollErrf("auth-missing", "opencode-go credential is unavailable; run opencode login")
+}
+
+func opencodeAuthFiles() []string {
+	var paths []string
+	if dir := strings.TrimSpace(os.Getenv("OPENCODE_DATA_DIR")); dir != "" {
+		paths = append(paths, filepath.Join(dir, "auth.json"))
+	}
+	if dir := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); dir != "" {
+		paths = append(paths, filepath.Join(dir, "opencode", "auth.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".local", "share", "opencode", "auth.json"))
+	}
+	return paths
+}
+
+func opencodePollWithURL(url, token string) (ProviderUsage, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := pollClient().Do(req)
+	if err != nil {
+		return ProviderUsage{}, netPollError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("opencode usage", resp)
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("litellm key info", resp)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ProviderUsage{}, httpStatusPollError("opencode usage", resp.StatusCode)
+	}
+	var body opencodeUsageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "opencode usage decode: %v", err)
+	}
+	if strings.TrimSpace(body.Error) != "" {
+		return ProviderUsage{}, pollErrf("provider-error", "opencode usage: %s", strings.TrimSpace(body.Error))
+	}
+	resources := map[string]ResourceUsage{}
+	add := func(name string, window *opencodeUsageWindow, seconds int) {
+		if window == nil || window.Percent < 0 || window.Percent > 100 {
+			return
+		}
+		resources[name] = ResourceUsage{Kind: "consumption", State: "active", Pool: "default", Unit: "percent", Limit: 100, Used: window.Percent, Remaining: 100 - window.Percent, Utilization: window.Percent / 100, ResetsAt: window.ResetsAt, WindowSeconds: seconds}
+	}
+	add("rolling", body.Rolling, 30*24*3600)
+	add("weekly", body.Weekly, 7*24*3600)
+	add("monthly", body.Monthly, 30*24*3600)
+	if len(resources) == 0 {
+		return ProviderUsage{}, pollErrf("no-windows", "opencode usage: no Go-plan windows")
+	}
+	return ProviderUsage{DisplayName: "OpenCode Go", Resources: resources}, nil
+}
+
+func kimiPoll() (ProviderUsage, error) {
+	return ProviderUsage{}, pollErrf("unsupported", "kimi has no supported native quota endpoint")
 }
 
 func litellmPollWithURL(url, token string) (ProviderUsage, error) {

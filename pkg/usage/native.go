@@ -220,6 +220,9 @@ func claudePollAuthenticated(usageURL, token string) (ProviderUsage, error) {
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("claude profile", resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("claude profile", resp.StatusCode)
 	}
@@ -262,6 +265,9 @@ func claudePollWithURL(url, token string) (ProviderUsage, error) {
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("claude usage", resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("claude usage", resp.StatusCode)
 	}
@@ -450,6 +456,9 @@ func codexPollWithURLAndAccount(url, token, account string) (ProviderUsage, erro
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("codex usage", resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("codex usage", resp.StatusCode)
 	}
@@ -586,6 +595,9 @@ func geminiPollWithURL(url, token string) (ProviderUsage, error) {
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("gemini quota", resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("gemini quota", resp.StatusCode)
 	}

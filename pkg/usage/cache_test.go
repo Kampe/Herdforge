@@ -53,6 +53,29 @@ func TestCachedSnapshotReportsItsAge(t *testing.T) {
 	}
 }
 
+func TestProviderCachedReusesFreshNativeObservation(t *testing.T) {
+	InvalidateSnapshotCache()
+	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "45")
+	calls := 0
+	old := nativePollers["opencode"]
+	nativePollers["opencode"] = func() (ProviderUsage, error) {
+		calls++
+		return ProviderUsage{DisplayName: "OpenCode Go", Resources: map[string]ResourceUsage{
+			"weekly": {Kind: "consumption", Unit: "percent", Limit: 100, Remaining: 80, WindowSeconds: 604800},
+		}}, nil
+	}
+	t.Cleanup(func() { nativePollers["opencode"] = old; InvalidateSnapshotCache() })
+	if _, err := FetchProviderForce("opencode", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FetchProviderForce("opencode", false); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("fresh provider observation was polled %d times, want singleflight/cache reuse", calls)
+	}
+}
+
 // Invalidation forces the next decision to refetch, so anything that materially
 // changes quota is not followed by a decision acting on the number it just
 // invalidated.
@@ -96,7 +119,7 @@ func TestPersistedReadingSurvivesAcrossProcesses(t *testing.T) {
 	}
 	acc := &AccountIdentity{
 		Key:        opaqueAccountKey("claude", accountUUID),
-		Provenance: "claude-config:.claude.json:oauthAccount.accountUuid",
+		Provenance: "claude-profile:api.anthropic.com/api/oauth/profile:account.uuid",
 	}
 	writeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{
 		"claude": {DisplayName: "Claude", Account: acc, Stale: false,
@@ -105,8 +128,8 @@ func TestPersistedReadingSurvivesAcrossProcesses(t *testing.T) {
 			}},
 	}})
 	snap, age, ok := readSnapshotFile(45 * time.Second)
-	if ok || snap != nil {
-		t.Fatal("a Claude config hint must not make an unverified cached reading reusable")
+	if !ok || snap == nil {
+		t.Fatal("a profile-bound Claude reading must be reusable for the matching current account")
 	}
 	_ = age
 	_ = acc

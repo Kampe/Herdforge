@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
+	"strings"
 )
 
 // pollError carries a stable machine-readable code alongside the human detail.
@@ -35,6 +37,14 @@ func httpStatusPollError(surface string, status int) error {
 		code: "http-" + strconv.Itoa(status),
 		msg:  surface + ": HTTP " + strconv.Itoa(status),
 	}
+}
+
+func httpRateLimitPollError(surface string, resp *http.Response) error {
+	retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if retryAfter == "" {
+		retryAfter = "unspecified"
+	}
+	return &pollError{code: "rate-limited", msg: surface + ": HTTP 429; retry-after=" + retryAfter}
 }
 
 // netPollError classifies a transport failure so a hung provider is

@@ -177,7 +177,7 @@ func cachedAccountSnapshot(t *testing.T, accountUUID string) (*UsageSnapshot, *A
 	t.Helper()
 	acc := &AccountIdentity{
 		Key:        opaqueAccountKey("claude", accountUUID),
-		Provenance: "claude-config:.claude.json:oauthAccount.accountUuid",
+		Provenance: "claude-profile:api.anthropic.com/api/oauth/profile:account.uuid",
 	}
 	return &UsageSnapshot{
 		GeneratedAt: time.Now().UTC(),
@@ -198,6 +198,7 @@ func TestCacheRejectsUnverifiedClaudeIdentity(t *testing.T) {
 	const uuid = "11111111-2222-3333-4444-555555555555"
 	writeJSONFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"`+uuid+`"}}`)
 	snap, acc := cachedAccountSnapshot(t, uuid)
+	acc.Provenance = "claude-config:.claude.json:oauthAccount.accountUuid"
 	body, _ := json.Marshal(cachedSnapshot{FetchedAt: time.Now(), Snapshot: snap})
 	if err := os.WriteFile(filepath.Join(dir, "q.json"), body, 0o600); err != nil {
 		t.Fatal(err)
@@ -234,7 +235,7 @@ func TestCacheDropsUnprovableProviders(t *testing.T) {
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "q.json"))
 	const uuid = "11111111-2222-3333-4444-555555555555"
 	writeJSONFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"`+uuid+`"}}`)
-	acc := &AccountIdentity{Key: opaqueAccountKey("claude", uuid), Provenance: "claude-config:.claude.json:oauthAccount.accountUuid"}
+	acc := &AccountIdentity{Key: opaqueAccountKey("claude", uuid), Provenance: "claude-profile:api.anthropic.com/api/oauth/profile:account.uuid"}
 	snap := &UsageSnapshot{
 		GeneratedAt: time.Now().UTC(),
 		Providers: map[string]ProviderUsage{
@@ -251,8 +252,8 @@ func TestCacheDropsUnprovableProviders(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, ok := readSnapshotFile(time.Minute)
-	if ok {
-		t.Fatal("a Claude reading remains unusable until its credential is profile-bound")
+	if !ok {
+		t.Fatal("a profile-bound Claude reading should remain reusable while the unprovable Gemini entry is dropped")
 	}
 }
 

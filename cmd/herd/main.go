@@ -6565,6 +6565,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		}
 	}
 	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
+	hardPin := pinnedBuilder && !lane.Standing
 	request := router.LaunchRequest{LaneName: strings.TrimSpace(lane.Name), Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	request.Standing = lane.Standing
 	if pinnedBuilder {
@@ -6606,9 +6607,18 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	// made codex unreachable from every lane whose configured model was not
 	// itself the probe-gated one.
 	if productionMode() {
-		candidates, wfErr := router.Waterfall(shape)
-		if wfErr != nil {
-			return nil, wfErr
+		var candidates []string
+		if hardPin {
+			// A hard provider pin is an acquisition boundary as well as a
+			// routing constraint: do not poll or probe unrelated providers while
+			// preparing this launch.
+			candidates = []string{provider}
+		} else {
+			var wfErr error
+			candidates, wfErr = router.Waterfall(shape)
+			if wfErr != nil {
+				return nil, wfErr
+			}
 		}
 		probes := map[string]bool{}
 		for _, cp := range candidates {
@@ -6623,14 +6633,18 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 			probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
 		}
 		if router.ModelRequiresProbe(model) {
-			probe := probeModel(ctx, provider, model, lane.Effort)
-			probes[router.ProbeKey(provider, model)] = probe.Available
-			if pinnedBuilder && !probe.Available {
-				reason := strings.TrimSpace(probe.Reason)
-				if reason == "" {
-					reason = "unknown probe failure"
+			if alreadyProbed, ok := probes[router.ProbeKey(provider, model)]; !ok {
+				probe := probeModel(ctx, provider, model, lane.Effort)
+				probes[router.ProbeKey(provider, model)] = probe.Available
+				if pinnedBuilder && !probe.Available {
+					reason := strings.TrimSpace(probe.Reason)
+					if reason == "" {
+						reason = "unknown probe failure"
+					}
+					return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
 				}
-				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			} else if pinnedBuilder && !alreadyProbed {
+				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: no exact probe output", lane.Name, provider, model)
 			}
 		}
 		if len(probes) > 0 {
@@ -6655,7 +6669,13 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	// refusing every launch because the quota snapshot is unavailable.
 	engine := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
-	if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
+	if hardPin {
+		if snap, err := usage.FetchProviderForce(provider, false); err == nil && snap != nil {
+			computed = engine.ComputeAll(snap)
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "herd: WARN lane %q native quota unavailable for pinned provider %s (%v); routing on availability only\n", lane.Name, provider, err)
+		}
+	} else if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
 		computed = engine.ComputeAll(snap)
 	} else if err != nil {
 		fmt.Fprintf(os.Stderr, "herd: WARN lane %q live quota unavailable (%v); routing on availability only\n", lane.Name, err)
@@ -6717,7 +6737,6 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	//
 	// observed live after provider, model and bind fallthrough were all working.
 	// A non-standing pinned builder keeps every one of these checks.
-	hardPin := pinnedBuilder && !lane.Standing
 	if hardPin && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
 		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}

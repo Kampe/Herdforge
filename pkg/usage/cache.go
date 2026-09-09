@@ -127,6 +127,9 @@ func bindSnapshotToAccounts(snap *UsageSnapshot) (*UsageSnapshot, bool) {
 	}
 	kept := make(map[string]ProviderUsage, len(snap.Providers))
 	for name, pu := range snap.Providers {
+		if name == "claude" && (pu.Account == nil || !strings.HasPrefix(strings.TrimSpace(pu.Account.Provenance), "claude-profile:")) {
+			continue
+		}
 		current := providerAccountIdentity(name)
 		if pu.Account == nil || current == nil {
 			continue
@@ -215,6 +218,64 @@ func FetchSnapshotCachedForce(force bool) (*UsageSnapshot, time.Duration, error)
 	quotaCache.fetchedAt = time.Now()
 	writeSnapshotFile(snap)
 	return snap, 0, nil
+}
+
+// fetchProviderCached is the provider-scoped companion to
+// FetchSnapshotCachedForce. Explicit review/provider requests must share the
+// same fresh native observation as the limits command; otherwise every review
+// would immediately re-poll and a provider 429 would turn a recent success
+// into an UNKNOWN route. The cache mutex is held through a miss, providing
+// singleflight semantics for this process without starting a second poll.
+func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
+	ttl := snapshotTTL()
+	name := strings.ToLower(strings.TrimSpace(provider))
+	switch name {
+	case "agy":
+		name = "antigravity"
+	case "lazer":
+		name = "litellm"
+	}
+	quotaCache.Lock()
+	defer quotaCache.Unlock()
+	if !force && ttl > 0 && quotaCache.snap != nil {
+		if age := time.Since(quotaCache.fetchedAt); age >= 0 && age < ttl {
+			if snap := providerOnlySnapshot(quotaCache.snap, name); snap != nil {
+				return snap, nil
+			}
+		}
+	}
+	if !force && ttl > 0 {
+		if snap, _, ok := readSnapshotFile(ttl); ok {
+			if selected := providerOnlySnapshot(snap, name); selected != nil {
+				quotaCache.snap = snap
+				quotaCache.fetchedAt = time.Now()
+				return selected, nil
+			}
+		}
+	}
+	snap, err := fetchDirectProvider(provider)
+	if err != nil {
+		return snap, err
+	}
+	quotaCache.snap = snap
+	quotaCache.fetchedAt = time.Now()
+	writeSnapshotFile(snap)
+	return snap, nil
+}
+
+func providerOnlySnapshot(snap *UsageSnapshot, provider string) *UsageSnapshot {
+	if snap == nil {
+		return nil
+	}
+	p, ok := snap.Providers[provider]
+	if !ok {
+		return nil
+	}
+	return &UsageSnapshot{
+		GeneratedAt: snap.GeneratedAt,
+		Providers:   map[string]ProviderUsage{provider: p},
+		Errors:      snap.Errors,
+	}
 }
 
 // InvalidateSnapshotCache drops the held reading. Used after anything that

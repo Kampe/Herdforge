@@ -280,6 +280,48 @@ func TestLiteLLMMapsNestedIdentityAndBudget(t *testing.T) {
 	}
 }
 
+func TestLiteLLMBaseURLReadsOpenCodeConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LITELLM_BASE_URL", "")
+	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"http://lazer.test/v1"}}}}`)
+	if got := litellmBaseURL(); got != "http://lazer.test/v1" {
+		t.Fatalf("LiteLLM base URL = %q, want configured provider URL", got)
+	}
+}
+
+func TestOpenCodeGoPollMapsAvailableWindows(t *testing.T) {
+	s := serve(t, 200, `{"rolling":{"percent":12,"resetsAt":"2099-01-01T00:00:00Z"},"weekly":{"percent":34,"resetsAt":"2099-01-02T00:00:00Z"},"monthly":{"percent":56,"resetsAt":"2099-02-01T00:00:00Z"}}`)
+	p, err := opencodePollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["weekly"].Utilization != 0.34 || p.Resources["monthly"].WindowSeconds != 30*24*3600 {
+		t.Fatalf("OpenCode windows were not preserved: %+v", p.Resources)
+	}
+}
+
+func TestKimiQuotaIsTruthfullyUnsupported(t *testing.T) {
+	if _, err := kimiPoll(); err == nil || pollErrorCode(err) != "unsupported" {
+		t.Fatalf("Kimi without a supported endpoint must remain unsupported, got %v", err)
+	}
+}
+
+func TestNative429PreservesRetryAfter(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer s.Close()
+	_, err := opencodePollWithURL(s.URL, "tok")
+	if err == nil || pollErrorCode(err) != "rate-limited" || !strings.Contains(err.Error(), "retry-after=17") {
+		t.Fatalf("429 provenance missing: %v", err)
+	}
+}
+
 func TestGrokPollHonoursBoundedClientTimeout(t *testing.T) {
 	started := make(chan struct{})
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

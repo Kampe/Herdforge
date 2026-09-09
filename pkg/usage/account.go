@@ -52,10 +52,10 @@ func identity(provider, claim, provenance string) *AccountIdentity {
 func providerAccountIdentity(name string) *AccountIdentity {
 	switch name {
 	case "claude":
-		// The local .claude.json value is only an expected hint. Until the
-		// authenticated /oauth/profile response binds the credential, it must
-		// not authorize persisted-cache reuse.
-		return nil
+		// A cached Claude reading carries the authenticated /oauth/profile
+		// claim. The CLI-maintained account UUID selects the current account and
+		// rejects reuse after an account switch.
+		return claudeConfigAccountIdentity()
 	case "codex":
 		return codexAccountIdentity()
 	case "grok":

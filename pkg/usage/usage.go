@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -66,8 +67,7 @@ func FetchProvider(provider string) (*UsageSnapshot, error) {
 // polling has no cache layer, so force is intentionally a no-op after being
 // wired through the public seam.
 func FetchProviderForce(provider string, force bool) (*UsageSnapshot, error) {
-	_ = force
-	return fetchDirectProvider(provider)
+	return fetchProviderCached(provider, force)
 }
 
 // nativePollers is the full set of providers pkg/usage polls directly. Every
@@ -80,6 +80,41 @@ var nativePollers = map[string]func() (ProviderUsage, error){
 	"gemini":      geminiPoll,
 	"antigravity": antigravityPoll,
 	"litellm":     litellmPoll,
+	"opencode":    opencodePoll,
+	"kimi":        kimiPoll,
+}
+
+var nativePollerOverride struct {
+	sync.RWMutex
+	pollers map[string]func() (ProviderUsage, error)
+}
+
+// SetNativePollersForTest injects hermetic native acquisition fixtures and
+// returns a restore function. It exists for cross-package production-path
+// tests; callers must never use it to override live acquisition.
+func SetNativePollersForTest(pollers map[string]func() (ProviderUsage, error)) func() {
+	copyPollers := make(map[string]func() (ProviderUsage, error), len(pollers))
+	for name, poll := range pollers {
+		copyPollers[name] = poll
+	}
+	nativePollerOverride.Lock()
+	old := nativePollerOverride.pollers
+	nativePollerOverride.pollers = copyPollers
+	nativePollerOverride.Unlock()
+	return func() {
+		nativePollerOverride.Lock()
+		nativePollerOverride.pollers = old
+		nativePollerOverride.Unlock()
+	}
+}
+
+func activeNativePollers() map[string]func() (ProviderUsage, error) {
+	nativePollerOverride.RLock()
+	defer nativePollerOverride.RUnlock()
+	if nativePollerOverride.pollers != nil {
+		return nativePollerOverride.pollers
+	}
+	return nativePollers
 }
 
 // providerSource names the native authority per provider.
@@ -90,6 +125,8 @@ var providerSource = map[string]string{
 	"grok":        "native:cli-chat-proxy.grok.com/v1/billing?format=credits",
 	"antigravity": "native:same-host-language-server/RetrieveUserQuotaSummary",
 	"litellm":     "native:authenticated-key-info",
+	"opencode":    "native:opencode.ai/zen/go/v1/usage",
+	"kimi":        "native:unsupported-no-quota-endpoint",
 }
 
 // decorateProvider attaches the reading's provenance: which native endpoint
@@ -107,7 +144,7 @@ func decorateProvider(name string, p ProviderUsage) ProviderUsage {
 }
 
 func fetchDirectAll() (*UsageSnapshot, error) {
-	return fetchDirectAllWithPollers(nativePollers)
+	return fetchDirectAllWithPollers(activeNativePollers())
 }
 
 func fetchDirectAllWithPollers(pollers map[string]func() (ProviderUsage, error)) (*UsageSnapshot, error) {
@@ -153,7 +190,7 @@ func fetchDirectAllWithPollers(pollers map[string]func() (ProviderUsage, error))
 }
 
 func fetchDirectProvider(provider string) (*UsageSnapshot, error) {
-	return fetchDirectProviderWithPollers(provider, nativePollers)
+	return fetchDirectProviderWithPollers(provider, activeNativePollers())
 }
 
 func fetchDirectProviderWithPollers(provider string, pollers map[string]func() (ProviderUsage, error)) (*UsageSnapshot, error) {
@@ -249,6 +286,9 @@ func grokPollWithURL(url, token string) (ProviderUsage, error) {
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ProviderUsage{}, httpRateLimitPollError("grok billing", resp)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("grok billing", resp.StatusCode)
 	}
