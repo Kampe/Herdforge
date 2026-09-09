@@ -16,6 +16,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -544,12 +545,83 @@ func runPoolReview(ref string) error {
 	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packetAbs+" in full.", true, 30*time.Second); err != nil {
 		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
+	// FAC-708: the reviewer is now a registered exact retirement target. Record
+	// this only after packet delivery succeeds, while every launch identity is
+	// still available. The record is append-only and repository-relative; the
+	// coordinator later reads it together with the admitted exact-SHA verdict.
+	if err := recordReviewRetirementManifest(root, cfg, providerTask, ref, sha, lease, ws, *tab, agentName, reviewer, packet); err != nil {
+		return errors.Join(fmt.Errorf("record review retirement manifest: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+	}
 	cleanupTab = false
 	releaseOnFailure = false
 	surfaceProvisional = false
 	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s pool=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Pool, reviewer.Family)
 	return nil
+}
+
+func recordReviewRetirementManifest(root string, cfg *config.Config, task *provider.Task, ref, sha string, lease *worktree.PoolSlot, workspace string, tab herdr.TabInfo, agentName string, reviewer poolReviewer, packet string) error {
+	if lease == nil || task == nil {
+		return errors.New("review retirement manifest requires task and pool lease")
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	worktreeAbs, err := filepath.Abs(lease.Path)
+	if err != nil {
+		return err
+	}
+	packetAbs, err := filepath.Abs(packet)
+	if err != nil {
+		return err
+	}
+	worktreeRel, err := filepath.Rel(rootAbs, worktreeAbs)
+	if err != nil || filepath.IsAbs(worktreeRel) || strings.HasPrefix(worktreeRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement worktree escaped repository root")
+	}
+	packetRel, err := filepath.Rel(rootAbs, packetAbs)
+	if err != nil || filepath.IsAbs(packetRel) || strings.HasPrefix(packetRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement prompt escaped repository root")
+	}
+	poolAbs, err := filepath.Abs(filepath.Dir(lease.Path))
+	if err != nil {
+		return err
+	}
+	poolRel, err := filepath.Rel(rootAbs, poolAbs)
+	if err != nil || filepath.IsAbs(poolRel) || strings.HasPrefix(poolRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement pool escaped repository root")
+	}
+	base, err := exec.Command("git", "-C", rootAbs, "merge-base", sha, "origin/main").Output()
+	if err != nil {
+		return fmt.Errorf("resolve review base: %w", err)
+	}
+	baseSHA := strings.TrimSpace(string(base))
+	if len(baseSHA) != 40 || strings.Trim(baseSHA, "0123456789abcdefABCDEF") != "" {
+		return fmt.Errorf("resolve review base returned invalid sha %q", baseSHA)
+	}
+	if strings.TrimSpace(tab.ID) == "" || strings.TrimSpace(tab.Pane.ID) == "" || strings.TrimSpace(tab.Pane.TerminalID) == "" {
+		return errors.New("review retirement manifest requires exact tab, pane, and terminal identity")
+	}
+	generation := strings.TrimSpace(tab.Generation)
+	if generation == "" {
+		generation = fmt.Sprintf("%d", lease.LeasedAt.UnixNano())
+	}
+	sessionGeneration := generation
+	if cfg == nil {
+		return errors.New("review retirement manifest requires launch configuration")
+	}
+	m := herdr.NewReviewRetirementManifest(time.Now(), herdr.ReviewRetirementManifest{
+		Repository: repositoryIdentityForLaunch(cfg), TaskRef: ref, TaskID: task.ID,
+		CandidateSHA: sha, BaseSHA: baseSHA, Branch: ref,
+		Worktree: filepath.ToSlash(worktreeRel), Pool: filepath.ToSlash(poolRel), Slot: lease.Name,
+		LeaseGeneration: lease.LeasedAt.UnixNano(), Workspace: workspace, TabID: tab.ID, PaneID: tab.Pane.ID,
+		TerminalID: tab.Pane.TerminalID, SessionGeneration: sessionGeneration, Reviewer: agentName,
+		ReviewerFamily: reviewer.Family, ReviewerModel: reviewer.Model, PromptArtifact: filepath.ToSlash(packetRel),
+		Generation: generation, Nonce: lease.LeaseID,
+	})
+	registry := herdr.ReviewRetirementRegistry{Path: filepath.Join(rootAbs, ".herd", "review", "retirement-manifests.jsonl")}
+	return registry.Record(m)
 }
 
 // resolvePoolReviewCandidate first preserves the dispatched ticket convention,
