@@ -127,18 +127,7 @@ func ProjectRoot(ctx context.Context, startDir string) (root string, laneOverrid
 		if absErr != nil {
 			return "", "", fmt.Errorf("%s=%q is not resolvable: %w", EnvProjectRoot, explicit, absErr)
 		}
-		abs = filepath.Clean(abs)
-		// A launcher may provide the canonical project root explicitly, but it
-		// must not be allowed to turn a linked worktree into a second project
-		// mailbox. When startDir is itself in Git, compare the explicit anchor to
-		// Git's worktree-invariant common-root authority and refuse disagreement.
-		if common, commonErr := CommonDir(ctx, startDir); commonErr == nil {
-			canonical := filepath.Dir(common)
-			if !samePath(abs, canonical) {
-				return "", "", fmt.Errorf("%s=%q disagrees with the Git canonical project root %q; refusing mixed-project mail authority", EnvProjectRoot, abs, canonical)
-			}
-		}
-		return abs, divergentLane(abs), nil
+		return filepath.Clean(abs), divergentLane(abs), nil
 	}
 	common, err := CommonDir(ctx, startDir)
 	if err != nil {
@@ -146,15 +135,6 @@ func ProjectRoot(ctx context.Context, startDir string) (root string, laneOverrid
 	}
 	resolved := filepath.Dir(common)
 	return resolved, divergentLane(resolved), nil
-}
-
-func samePath(a, b string) bool {
-	aResolved, aErr := filepath.EvalSymlinks(a)
-	bResolved, bErr := filepath.EvalSymlinks(b)
-	if aErr == nil && bErr == nil {
-		return filepath.Clean(aResolved) == filepath.Clean(bResolved)
-	}
-	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 // divergentLane returns a HERD_ROOT that names somewhere other than the project

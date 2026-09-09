@@ -165,7 +165,6 @@ func TestLaneRootDoesNotHijackTheProjectRoot(t *testing.T) {
 // to state the project root explicitly.
 func TestExplicitProjectRootWins(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(t.TempDir())
 	t.Setenv(EnvProjectRoot, dir)
 	t.Setenv(EnvLaneRoot, filepath.Join(dir, "lane"))
 	root, laneOverride, err := ProjectRoot(context.Background(), ".")
@@ -177,25 +176,6 @@ func TestExplicitProjectRootWins(t *testing.T) {
 	}
 	if laneOverride == "" {
 		t.Error("a lane root that disagrees must still be surfaced")
-	}
-}
-
-func TestExplicitProjectRootRejectsLinkedWorktreeAnchor(t *testing.T) {
-	base := t.TempDir()
-	repo := filepath.Join(base, "repo")
-	if err := os.MkdirAll(repo, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	grGit(t, repo, "init", "-q", "-b", "main")
-	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
-	lane := filepath.Join(base, "lane")
-	grGit(t, repo, "worktree", "add", "-q", "-b", "feature", lane)
-
-	t.Setenv(EnvProjectRoot, lane)
-	if _, _, err := ProjectRoot(context.Background(), lane); err == nil {
-		t.Fatal("a linked worktree must not be accepted as the explicit project mailbox root")
-	} else if !strings.Contains(err.Error(), "disagrees with the Git canonical project root") {
-		t.Fatalf("wrong explicit-root error: %v", err)
 	}
 }
 
