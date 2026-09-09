@@ -1,9 +1,12 @@
 # FAC-773 completion wake
 
-The coordinator-side safe-boundary consumer is:
+The coordinator-side safe-boundary consumer is the native Herdforge CLI. When
+PATH has an older `$HOME/.local/bin/herd` Herdr-only wrapper, invoke the source
+entry point explicitly (or first verify that the installed `herd` is this
+Herdforge build):
 
 ```zsh
-herd watch --wake --recipient <exact-herdr-name> --workspace <exact-workspace-id> \
+go run ./cmd/herd watch --wake --recipient <exact-herdr-name> --workspace <exact-workspace-id> \
   --stream --interval 5 --timeout 14400
 ```
 
