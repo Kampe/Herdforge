@@ -32,14 +32,16 @@ const (
 )
 
 type Envelope struct {
-	ID        string    `json:"id"`
-	Sequence  int64     `json:"seq"`
-	Sender    string    `json:"sender"`
-	Recipient string    `json:"recipient"`
-	Subject   string    `json:"subject"`
-	Body      string    `json:"body"`
-	Read      bool      `json:"read"`
-	Timestamp time.Time `json:"timestamp"`
+	ID                 string    `json:"id"`
+	Sequence           int64     `json:"seq"`
+	Sender             string    `json:"sender"`
+	Recipient          string    `json:"recipient"`
+	Subject            string    `json:"subject"`
+	Body               string    `json:"body"`
+	Read               bool      `json:"read"`
+	Timestamp          time.Time `json:"timestamp"`
+	OriginalSourceHost string    `json:"original_source_host,omitempty"`
+	OriginalSourceID   string    `json:"original_source_id,omitempty"`
 }
 
 // QuarantineEntry records one mailbox line that failed to parse as an
