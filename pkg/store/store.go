@@ -78,6 +78,14 @@ func New(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
+	// Same-Store SQL must serialize on one OS connection: unbounded pool
+	// fan-out lets concurrent writers stampede BEGIN IMMEDIATE on separate
+	// connections and starves the SQLite busy-handler ladder past the fixed
+	// busy_timeout, losing writes with SQLITE_BUSY under load. Cross-Store
+	// writers remain file-level contenders and are resolved by the existing
+	// per-connection busy_timeout; long-lived external holders still fail
+	// closed when they exhaust it.
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -219,6 +220,76 @@ func TestConcurrentStoreOpenAndRefreshSerializesRecency(t *testing.T) {
 	}
 	if history[0].Ref != "FAC-shared" || history[0].Reason != "refresh-0" && history[0].Reason != "refresh-1" {
 		t.Fatalf("latest concurrent refresh not persisted first: %+v", history[0])
+	}
+}
+
+// A single Store must not fan concurrent blocked-evidence writers out onto
+// separate OS SQL connections. Unbounded same-Store fan-out stampedes
+// BEGIN IMMEDIATE across the connection pool and starves the SQLite
+// busy-handler ladder past the fixed busy_timeout, losing writes with
+// SQLITE_BUSY under load. Same-Store writes must serialize on the pool so
+// the only file-level contenders are distinct Stores, which the existing
+// per-connection busy_timeout already resolves.
+func TestSameStoreConcurrentWritesSerializeOnOneSQLConnection(t *testing.T) {
+	s := tempStore(t)
+
+	const writers = 12
+	var writes sync.WaitGroup
+	writeErrs := make(chan error, writers)
+	stop := make(chan struct{})
+	var peakOpen, samples atomic.Int64
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				samples.Add(1)
+				n := int64(s.db.Stats().OpenConnections)
+				for {
+					peak := peakOpen.Load()
+					if n <= peak || peakOpen.CompareAndSwap(peak, n) {
+						break
+					}
+				}
+			}
+		}
+	}()
+	for j := 0; j < writers; j++ {
+		j := j
+		writes.Add(1)
+		go func() {
+			defer writes.Done()
+			ref := fmt.Sprintf("FAC-fanout-%02d", j)
+			if _, err := s.RecordBlockedSelection(ref, ref, "pulse", "drift", "new", ref, "provider"); err != nil {
+				writeErrs <- err
+			}
+		}()
+	}
+	writes.Wait()
+	close(stop)
+	close(writeErrs)
+	for err := range writeErrs {
+		t.Fatalf("same-store write lost to contention: %v", err)
+	}
+	if samples.Load() == 0 {
+		t.Fatal("connection sampler never observed the store pool")
+	}
+	if peak := peakOpen.Load(); peak != 1 {
+		t.Fatalf("same-store fan-out reached %d simultaneously open SQL connections; unbounded same-store BEGIN IMMEDIATE fan-out is the retained SQLITE_BUSY root cause", peak)
+	}
+
+	history, err := s.BlockedSelectionHistory(writers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != writers {
+		t.Fatalf("lost evidence under same-store contention: got %d records", len(history))
+	}
+	for i := 1; i < len(history); i++ {
+		if history[i-1].RecencySeq <= history[i].RecencySeq {
+			t.Fatalf("recency sequence is not strictly descending: %d then %d", history[i-1].RecencySeq, history[i].RecencySeq)
+		}
 	}
 }
 
