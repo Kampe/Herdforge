@@ -41,10 +41,13 @@ type StopConditions struct {
 // lane. It is persisted beside the goal so the Stop hook enforces a grant
 // that already exists; the hook never creates continuation authority.
 type AuthorityEnvelope struct {
-	Grantor          string   `json:"grantor"`
-	PacketPath       string   `json:"packet_path"`
-	BoundedAutonomy  string   `json:"bounded_autonomy"`
-	MutationLimits   string   `json:"mutation_limits"`
+	Grantor         string `json:"grantor"`
+	PacketPath      string `json:"packet_path"`
+	BoundedAutonomy string `json:"bounded_autonomy"`
+	MutationLimits  string `json:"mutation_limits"`
+	// AllowedBranch is the exact native worktree branch, when the grant
+	// includes branch publication. An empty value means no branch is granted.
+	AllowedBranch    string   `json:"allowed_branch,omitempty"`
 	ForbiddenActions []string `json:"forbidden_actions"`
 	StopConditions   []string `json:"stop_conditions"`
 }

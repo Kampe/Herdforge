@@ -140,6 +140,8 @@ type Options struct {
 	// the raise, since a missing goal degrades to the Stop hook's quiet
 	// no-goal path rather than blocking the agent.
 	SetGoal func(cwd, lane, task, owner string) error
+	// SetGoalWithAuthority persists the exact envelope rendered to the lane.
+	SetGoalWithAuthority func(cwd, lane, task, owner string, envelope goalguard.AuthorityEnvelope) error
 
 	// WorktreeHead reports a lane's checked-out branch and HEAD from its own
 	// worktree. Nil means those fields stay absent rather than falsely empty
@@ -296,6 +298,10 @@ func boundedAgentName(base, identity string) string {
 // understood by the supported harnesses and is intentionally part of the
 // prompt rather than an out-of-band shell command.
 func withContinuationGoal(lane config.LaneDef, prompt string) string {
+	return withContinuationGoalAndEnvelope(lane, prompt, AuthorityEnvelopeForLane(lane))
+}
+
+func withContinuationGoalAndEnvelope(lane config.LaneDef, prompt string, envelope goalguard.AuthorityEnvelope) string {
 	goal := strings.TrimSpace(lane.GoalTemplate)
 	if goal == "" {
 		goal = fmt.Sprintf(`Continue as the standing %s lane. When the current assignment is complete or there is no ticket, inspect the repo and board, create the next actionable ticket with provenance, claim it, and work it in an isolated worktree. Report progress and blockers to the coordinator/review supervisor; stop only on an explicit stop, lease loss, or wind-down condition.`, strings.TrimSpace(lane.Role))
@@ -303,21 +309,74 @@ func withContinuationGoal(lane config.LaneDef, prompt string) string {
 		goal = strings.ReplaceAll(goal, "{{role}}", strings.TrimSpace(lane.Role))
 		goal = strings.TrimSpace(strings.TrimPrefix(goal, "/goal"))
 	}
-	return strings.TrimSpace(prompt) + "\n\n" + RenderAuthorityEnvelope(AuthorityEnvelopeForLane(lane)) + "\n/goal " + goal
+	return strings.TrimSpace(prompt) + "\n\n" + RenderAuthorityEnvelope(envelope) + "\n/goal " + goal
 }
 
 // AuthorityEnvelopeForLane builds the standing grant from repository
 // configuration. The packet path is deliberately the exact configured path,
 // so a lane can verify the grant from its own transcript and worktree.
 func AuthorityEnvelopeForLane(lane config.LaneDef) goalguard.AuthorityEnvelope {
+	return authorityEnvelopeForLane(lane, nil, "", "")
+}
+
+// AuthorityEnvelopeForLaneWithPolicy derives the grant from validated policy
+// and the lane's native worktree branch. Publication is granted only when all
+// native evidence is present.
+func AuthorityEnvelopeForLaneWithPolicy(lane config.LaneDef, policy *config.MergePolicy, defaultBranch, branch string) goalguard.AuthorityEnvelope {
+	return authorityEnvelopeForLane(lane, policy, defaultBranch, branch)
+}
+
+func authorityEnvelopeForLane(lane config.LaneDef, policy *config.MergePolicy, defaultBranch, branch string) goalguard.AuthorityEnvelope {
+	branch = strings.TrimSpace(branch)
+	canPublish := policy != nil && strings.TrimSpace(policy.BranchPublication) == config.BranchPublicationLanePush && lane.Authority == config.AuthorityWrite && hasCapability(lane, config.CapabilityGitWrite) && !strings.EqualFold(strings.TrimSpace(lane.Role), "reviewer") && safePublicationBranch(branch, defaultBranch)
+	forbidden := []string{"open or update a PR", "merge", "self-review", "change standing policy or authority"}
+	mutation := fmt.Sprintf("Only change files in the isolated worktree %s, using declared %s authority and capabilities.", filepath.Clean(lane.Worktree), lane.Authority)
+	if canPublish {
+		mutation += fmt.Sprintf(" Publish only the assigned branch %s after verification, and confirm its exact remote head equals git rev-parse HEAD before handoff.", branch)
+	} else {
+		forbidden = append([]string{"push"}, forbidden...)
+	}
 	return goalguard.AuthorityEnvelope{
 		Grantor:          "coordinator",
 		PacketPath:       filepath.Clean(lane.Prompt),
 		BoundedAutonomy:  fmt.Sprintf("Improve the standing %s lane indefinitely by selecting and completing the next actionable work item; do not self-grant new authority.", strings.TrimSpace(lane.Role)),
-		MutationLimits:   fmt.Sprintf("Only change files in the isolated worktree %s, using declared %s authority and capabilities.", filepath.Clean(lane.Worktree), lane.Authority),
-		ForbiddenActions: []string{"push", "open or update a PR", "merge", "self-review", "change standing policy or authority"},
+		MutationLimits:   mutation,
+		AllowedBranch:    branchIf(canPublish, branch),
+		ForbiddenActions: forbidden,
 		StopConditions:   []string{"explicit coordinator stop", "lease loss", "wind-down", "completed goal with coordinator acknowledgement"},
 	}
+}
+
+func branchIf(ok bool, branch string) string {
+	if ok {
+		return branch
+	}
+	return ""
+}
+
+func hasCapability(lane config.LaneDef, want config.Capability) bool {
+	for _, capability := range lane.Capabilities {
+		if capability == want {
+			return true
+		}
+	}
+	return false
+}
+
+func safePublicationBranch(branch, defaultBranch string) bool {
+	branch, defaultBranch = strings.TrimSpace(branch), strings.TrimSpace(defaultBranch)
+	// Without the repository's declared default branch there is no reliable
+	// protected-branch identity. Literal main is not a safe substitute: valid
+	// repositories may use master, trunk, develop, or another default.
+	if branch == "" || defaultBranch == "" || branch == "main" || branch == defaultBranch || strings.HasPrefix(branch, "-") || strings.Contains(branch, "..") || strings.Contains(branch, "//") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
+		return false
+	}
+	for _, segment := range strings.Split(branch, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // RenderAuthorityEnvelope is the transcript-visible, human-verifiable grant.
@@ -334,6 +393,31 @@ func durableGoalTask(lane config.LaneDef) string {
 		goal = strings.TrimSpace(strings.TrimPrefix(goal, "/goal"))
 	}
 	return strings.TrimSpace(goal)
+}
+
+func standingEnvelope(cfg *config.Config, lane config.LaneDef, cwd string, head func(string) (string, string, error)) (goalguard.AuthorityEnvelope, error) {
+	var policy *config.MergePolicy
+	defaultBranch := ""
+	if cfg != nil {
+		policy = cfg.MergePolicy
+		defaultBranch = cfg.Project.DefaultBranch
+	}
+	branch := ""
+	if policy != nil && strings.TrimSpace(policy.BranchPublication) == config.BranchPublicationLanePush &&
+		lane.Authority == config.AuthorityWrite && hasCapability(lane, config.CapabilityGitWrite) && !strings.EqualFold(strings.TrimSpace(lane.Role), "reviewer") {
+		if head == nil {
+			return goalguard.AuthorityEnvelope{}, fmt.Errorf("standing lane %q: lane-push requires native branch resolution", lane.Name)
+		}
+		var err error
+		branch, _, err = head(cwd)
+		if err != nil {
+			return goalguard.AuthorityEnvelope{}, fmt.Errorf("standing lane %q: resolve publication branch: %w", lane.Name, err)
+		}
+		if !safePublicationBranch(branch, defaultBranch) {
+			return goalguard.AuthorityEnvelope{}, fmt.Errorf("standing lane %q: refusing publication branch %q", lane.Name, branch)
+		}
+	}
+	return AuthorityEnvelopeForLaneWithPolicy(lane, policy, defaultBranch, branch), nil
 }
 
 // StandingLanes returns standing control roles in config declaration order.
@@ -1009,7 +1093,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 				if a.Cwd != "" {
 					rr.CWD = a.Cwd
 				}
-				if opts.SetGoal != nil {
+				if opts.SetGoal != nil || opts.SetGoalWithAuthority != nil {
 					// Re-raising is also a policy refresh. Set replaces the atomic
 					// goal file, so a later corrective instruction cannot be shadowed
 					// by the previous durable wording.
@@ -1018,7 +1102,27 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 						goalCWD, _ = ValidateLane(*lane, repoRoot, opts.PromptReadable, opts.AbsPath)
 					}
 					if goalCWD != "" {
-						_ = opts.SetGoal(goalCWD, lane.Name, durableGoalTask(*lane), "coordinator")
+						if envelope, envelopeErr := standingEnvelope(cfg, *lane, goalCWD, opts.WorktreeHead); envelopeErr != nil {
+							rr.Outcome = OutcomeFailed
+							rr.Reason = "authority envelope: " + envelopeErr.Error()
+							result.Failed++
+							failures = append(failures, fmt.Errorf("%s: %w", lane.Name, envelopeErr))
+							result.Roles = append(result.Roles, rr)
+							continue
+						} else {
+							if opts.SetGoalWithAuthority != nil {
+								if err := opts.SetGoalWithAuthority(goalCWD, lane.Name, durableGoalTask(*lane), "coordinator", envelope); err != nil {
+									rr.Outcome = OutcomeFailed
+									rr.Reason = "authority goal: " + err.Error()
+									result.Failed++
+									failures = append(failures, fmt.Errorf("%s: %w", lane.Name, err))
+									result.Roles = append(result.Roles, rr)
+									continue
+								}
+							} else {
+								_ = opts.SetGoal(goalCWD, lane.Name, durableGoalTask(*lane), "coordinator")
+							}
+						}
 					}
 				}
 				result.Skipped++
@@ -1066,8 +1170,23 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			}
 		}
 
-		if opts.SetGoal != nil {
-			if err := opts.SetGoal(cwd, lane.Name, durableGoalTask(*lane), "coordinator"); err != nil {
+		envelope, envelopeErr := standingEnvelope(cfg, *lane, cwd, opts.WorktreeHead)
+		if envelopeErr != nil {
+			rr.Outcome = OutcomeFailed
+			rr.Reason = "authority envelope: " + envelopeErr.Error()
+			result.Failed++
+			failures = append(failures, fmt.Errorf("%s: %w", lane.Name, envelopeErr))
+			result.Roles = append(result.Roles, rr)
+			continue
+		}
+		if opts.SetGoalWithAuthority != nil || opts.SetGoal != nil {
+			setGoal := func() error {
+				if opts.SetGoalWithAuthority != nil {
+					return opts.SetGoalWithAuthority(cwd, lane.Name, durableGoalTask(*lane), "coordinator", envelope)
+				}
+				return opts.SetGoal(cwd, lane.Name, durableGoalTask(*lane), "coordinator")
+			}
+			if err := setGoal(); err != nil {
 				rr.Outcome = OutcomeFailed
 				rr.Reason = "authority goal: " + err.Error()
 				result.Failed++
@@ -1163,7 +1282,7 @@ func runRaise(result *Result, cfg *config.Config, lanes []config.LaneDef, repoRo
 			result.Roles = append(result.Roles, rr)
 			continue
 		}
-		promptText := withContinuationGoal(*lane, string(promptBytes))
+		promptText := withContinuationGoalAndEnvelope(*lane, string(promptBytes), envelope)
 		if promptText == "" {
 			rr.Outcome = OutcomeFailed
 			rr.Reason = "prompt file is empty"
