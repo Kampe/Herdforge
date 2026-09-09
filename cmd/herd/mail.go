@@ -28,6 +28,8 @@ func runMail() {
 	switch args[0] {
 	case "send":
 		runMailSend(args[1:])
+	case "ack":
+		runMailAck(args[1:])
 	case "inbox", "read":
 		runMailInbox(args[0], args[1:])
 	case "control":
@@ -38,6 +40,30 @@ func runMail() {
 		fmt.Fprintf(os.Stderr, "mail: unknown mode %q\n%s\n", args[0], usageFor("mail"))
 		os.Exit(2)
 	}
+}
+
+func runMailAck(args []string) {
+	fs := flag.NewFlagSet("mail ack", flag.ContinueOnError)
+	recipient := fs.String("recipient", "", "exact envelope recipient")
+	id := fs.String("id", "", "exact envelope ID")
+	mailPath := fs.String("mail", "", "mailbox path override")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*recipient) == "" || strings.TrimSpace(*id) == "" {
+		fmt.Fprintln(os.Stderr, "mail ack: --recipient and --id are required")
+		os.Exit(2)
+	}
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail ack: %v\n", err)
+		os.Exit(1)
+	}
+	if err := mail.NewMailbox(path).AcknowledgeOrdinary(*recipient, *id); err != nil {
+		fmt.Fprintf(os.Stderr, "mail ack: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("mail ack: handled %s for %s\n", strings.TrimSpace(*id), strings.TrimSpace(*recipient))
 }
 
 func runMailSend(args []string) {

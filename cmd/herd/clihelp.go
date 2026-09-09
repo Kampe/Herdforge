@@ -315,11 +315,13 @@ Commands:
 	"slot":         "Usage: herd slot <acquire|release|status|with> [flags]\n  Machine-wide heavy-phase semaphore.",
 	"mail": `Usage:
   herd mail send --from NAME --to RECIPIENT (--body TEXT | --file path | stdin) [--subject TEXT] [--mail path]
+  herd mail ack --recipient NAME --id ID [--mail path]
   herd mail inbox --recipient NAME [--mail path]
   herd mail read --recipient NAME [--mail path]
   herd mail control <issue|drain> [flags]
 
 Ordinary durable messages use the local mailbox and are not authenticated control.
+herd mail ack is the explicit ordinary-report disposition; inbox/read remain read-only.
 herd send delivers to a pane and verifies consumption; herd mail send is durable-only and is not surfaced in the pane.
 The body may be supplied byte-for-byte with --file, --file -, or stdin; do not combine payload sources.
 Privileged authenticated control callbacks/envelopes are available only through

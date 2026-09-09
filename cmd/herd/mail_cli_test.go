@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -217,6 +219,104 @@ func TestMailCLISendsAndReadsDurableMessage(t *testing.T) {
 	}
 	if len(inbox) != 1 || inbox[0].Recipient != "worker-a" || inbox[0].Body != "ready" {
 		t.Fatalf("unexpected inbox: %+v", inbox)
+	}
+}
+
+func TestMailAckCLIReadThenAckSuppressesWake(t *testing.T) {
+	proc := startFakeCommand(t)
+	repo := queuedSendRepo(t)
+	bin, logPath, _ := installQueuedSendFake(t, "idle", strconv.Itoa(proc.Pid))
+	env := queuedSendEnv(bin, repo)
+	mailFile := filepath.Join(repo, ".herd", "control-mail.jsonl")
+	body := "report remains pending after read"
+
+	out, _, err := runHerdWithSeparateOutput(t, repo, env, "mail", "send", "--from", "worker", "--to", "worker", "--subject", "FAC-773 report", "--body", body, "--mail", mailFile)
+	if err != nil {
+		t.Fatalf("mail send: %v\n%s", err, out)
+	}
+	var sent mail.Envelope
+	if err := json.Unmarshal(out, &sent); err != nil {
+		t.Fatalf("decode sent envelope: %v\n%s", err, out)
+	}
+
+	out, err = runHerd(t, repo, env, "mail", "read", "--recipient", "worker", "--mail", mailFile)
+	if err != nil || !strings.Contains(string(out), body) {
+		t.Fatalf("mail read: %v\n%s", err, out)
+	}
+	box := mail.NewMailbox(mailFile)
+	pending, err := box.PendingRoutine("worker")
+	if err != nil || len(pending) != 1 || pending[0].ID != sent.ID {
+		t.Fatalf("read changed pending state: pending=%+v err=%v", pending, err)
+	}
+
+	out, err = runHerd(t, repo, env, "mail", "ack", "--recipient", "worker", "--id", sent.ID, "--mail", mailFile)
+	if err != nil || !strings.Contains(string(out), "handled "+sent.ID) {
+		t.Fatalf("mail ack: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runHerd(t, repo, env, "watch", "--wake", "--recipient", "worker", "--workspace", "wK", "--interval", "1", "--timeout", "1")
+	if exitCode(err) != 2 {
+		t.Fatalf("post-ack watch exit=%d, want bounded timeout; output=%s", exitCode(err), out)
+	}
+	log := fakeCallLog(t, logPath)
+	if strings.Contains(log, "pane read") || strings.Contains(log, "agent prompt") || strings.Contains(log, "agent send-keys") {
+		t.Fatalf("acknowledged report caused pane activity:\n%s", log)
+	}
+	handled, err := box.Handled("worker", sent.ID)
+	if err != nil || !handled {
+		t.Fatalf("ack state = %t, %v", handled, err)
+	}
+}
+
+func TestMailAckCLIFailsClosedAndLeavesEnvelopeUnacknowledged(t *testing.T) {
+	tests := []struct {
+		name       string
+		subject    string
+		recipient  string
+		ackID      string
+		envelopeID string
+		makeBroken bool
+	}{
+		{name: "wrong recipient", subject: "FAC-773 report", recipient: "other", ackID: "report-id"},
+		{name: "missing id", subject: "FAC-773 report", recipient: "worker", ackID: "missing-id", envelopeID: "present-id"},
+		{name: "control envelope", subject: mail.ControlSubjectPrefix + " issue", recipient: "worker", ackID: "control-id"},
+		{name: "callback envelope", subject: "complete: FAC-773", recipient: "worker", ackID: "callback-id"},
+		{name: "failed ack write", subject: "FAC-773 report", recipient: "worker", ackID: "report-id", makeBroken: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := queuedSendRepo(t)
+			mailFile := filepath.Join(repo, ".herd", "control-mail.jsonl")
+			box := mail.NewMailbox(mailFile)
+			envelopeID := tt.envelopeID
+			if envelopeID == "" {
+				envelopeID = tt.ackID
+			}
+			if err := box.AppendEnvelopeContext(context.Background(), &mail.Envelope{
+				ID: envelopeID, Sender: "worker", Recipient: "worker", Subject: tt.subject, Body: "payload",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if tt.makeBroken {
+				if err := os.Mkdir(mail.HandledStatePath(mailFile), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := runHerd(t, repo, nil, "mail", "ack", "--recipient", tt.recipient, "--id", tt.ackID, "--mail", mailFile)
+			if err == nil {
+				t.Fatalf("ack unexpectedly succeeded: %s", out)
+			}
+			handled, hErr := box.Handled("worker", tt.ackID)
+			if hErr != nil {
+				if !tt.makeBroken {
+					t.Fatal(hErr)
+				}
+			} else if handled {
+				t.Fatalf("rejected envelope was acknowledged")
+			}
+		})
 	}
 }
 

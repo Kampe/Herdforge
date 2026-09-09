@@ -86,6 +86,35 @@ func (m *Mailbox) PendingRoutine(recipient string) ([]*Envelope, error) {
 	})
 }
 
+// AcknowledgeOrdinary marks one exact ordinary report handled after its
+// recipient has consumed it. Reads remain read-only; this is the explicit
+// durable disposition operation. Queued routine, control, and callback
+// envelopes stay on their native consumers.
+func (m *Mailbox) AcknowledgeOrdinary(recipient, id string) error {
+	if m == nil {
+		return fmt.Errorf("mail: nil mailbox")
+	}
+	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
+	if recipient == "" || id == "" {
+		return fmt.Errorf("mail: recipient and envelope id are required")
+	}
+	envs, err := m.ReadInbox(recipient)
+	if err != nil {
+		return err
+	}
+	for _, env := range envs {
+		if env == nil || env.ID != id {
+			continue
+		}
+		if env.Subject == QueuedDeliverySubject || IsControlSubject(env.Subject) ||
+			strings.HasPrefix(env.Subject, "complete:") || strings.HasPrefix(env.Subject, "blocked:") {
+			return fmt.Errorf("mail: envelope %q is not an ordinary report", id)
+		}
+		return m.MarkHandled(recipient, id)
+	}
+	return fmt.Errorf("mail: ordinary envelope %q for recipient %q was not found", id, recipient)
+}
+
 func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool) ([]*Envelope, error) {
 	if m == nil {
 		return nil, fmt.Errorf("mail: nil mailbox")
