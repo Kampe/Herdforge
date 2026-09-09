@@ -197,6 +197,10 @@ type ClaimRequest struct {
 	// lease provenance token and must never be used as hold authority identity.
 	HoldIdentity   lifecycle.HoldIdentity
 	HoldIdentities []lifecycle.HoldIdentity
+	// AliasKeys are an authenticated, bounded repository-alias set. When
+	// present, the SQLite claim transaction selects history and acquires the
+	// lease while excluding every alias; callers must not pre-select a key.
+	AliasKeys []LeaseKey
 }
 
 func exactClaimComposite(req ClaimRequest) ([]lifecycle.HoldIdentity, error) {
@@ -299,7 +303,15 @@ func (m *ClaimManager) Claim(ctx context.Context, req ClaimRequest) (*Lease, err
 		if _, ok := m.store.(UnreservedAbortStore); !ok {
 			return fmt.Errorf("claim: lease store cannot atomically abort an unreserved replacement")
 		}
-		lease, err = atomicStore.AcquireWithIdentity(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, identities[0].Repository, identities[0].Owner, identities[0].Lane, m.now(), m.ttl)
+		if len(req.AliasKeys) > 0 {
+			aliasStore, aliasOK := m.store.(AliasAtomicLeaseStore)
+			if !aliasOK {
+				return fmt.Errorf("claim: lease store cannot atomically acquire recognized aliases")
+			}
+			lease, err = aliasStore.AcquireFromAliases(ctx, req.AliasKeys, req.Key, req.OwnerID, req.Role, req.WorktreePath, identities[0].Repository, identities[0].Owner, identities[0].Lane, m.now(), m.ttl)
+		} else {
+			lease, err = atomicStore.AcquireWithIdentity(ctx, req.Key, req.OwnerID, req.Role, req.WorktreePath, identities[0].Repository, identities[0].Owner, identities[0].Lane, m.now(), m.ttl)
+		}
 		if err != nil {
 			return err
 		}

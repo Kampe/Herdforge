@@ -555,6 +555,23 @@ func (s *ClaimStack) AcquireLease(ctx context.Context, key claim.LeaseKey, owner
 	})
 }
 
+// AcquireLeaseFromAliases is the approval/recovery path for a bounded set of
+// authenticated repository aliases. ClaimManager keeps selection, alias
+// exclusion, and durable insertion inside the SQLite claim transaction.
+func (s *ClaimStack) AcquireLeaseFromAliases(ctx context.Context, aliases []claim.LeaseKey, preferred claim.LeaseKey, ownerID, role, taskRole string) (*claim.Lease, error) {
+	if s == nil || s.Manager == nil {
+		return nil, fmt.Errorf("provider: nil ClaimStack")
+	}
+	if taskRole == "" {
+		taskRole = role
+	}
+	holdIDs := []lifecycle.HoldIdentity{
+		{Repository: preferred.Repo, Owner: role, Lane: role, Scope: "lane"},
+		{Repository: preferred.Repo, Owner: role, Lane: role, Task: preferred.TaskRef, Scope: "task"},
+	}
+	return s.Manager.Claim(ctx, claim.ClaimRequest{Key: preferred, AliasKeys: aliases, OwnerID: ownerID, Role: role, TaskRole: taskRole, HoldIdentities: holdIDs})
+}
+
 // MutateStatusGuarded is the production board status write: Claim must
 // succeed (live lease), then AdvanceFence(taskID, generation) + Begin/
 // Complete. On claim conflict the write is refused — contenders must not

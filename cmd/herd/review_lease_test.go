@@ -36,33 +36,26 @@ func TestApprovalLeaseKey_UsesOneIdentityAcrossRegisteredWorktrees(t *testing.T)
 
 	repository := dispatch.RepositoryIdentityOrName(root, "herdforge-test")
 	stack := provider.NewTestStack(t, provider.NewMemoryProvider())
-	keyA, err := approvalLeaseKey(context.Background(), stack, root, repository, "herdforge-test", "memory", "proj", "FAC-782:review")
+	aliases, err := approvalLeaseAliases(context.Background(), root, repository, "herdforge-test", "memory", "proj", "FAC-782:review")
 	if err != nil {
 		t.Fatal(err)
-	}
-	keyB, err := approvalLeaseKey(context.Background(), stack, root, repository, "herdforge-test", "memory", "proj", "FAC-782:review")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if keyA != keyB {
-		t.Fatalf("approval lease identity split across registered worktrees: A=%+v B=%+v", keyA, keyB)
 	}
 	canonical := provider.LeaseKey(root, "memory", "proj", "FAC-782:review")
-	if keyA != canonical {
-		t.Fatalf("approval key=%+v, want canonical filesystem-root key=%+v", keyA, canonical)
+	if len(aliases) < 3 || aliases[0] != canonical {
+		t.Fatalf("approval aliases=%+v, want canonical plus registered worktree aliases", aliases)
 	}
 
-	owner, err := stack.AcquireLease(context.Background(), keyA, "live-owner", "worker", "worker")
+	owner, err := stack.AcquireLeaseFromAliases(context.Background(), aliases, canonical, "live-owner", "worker", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stack.AcquireLease(context.Background(), keyB, "foreign-owner", "worker", "worker"); err == nil {
+	if _, err := stack.AcquireLeaseFromAliases(context.Background(), aliases, canonical, "foreign-owner", "worker", "worker"); err == nil {
 		t.Fatal("live owner on the recognized worktree alias must block a second approval lease")
 	}
-	if _, _, err := stack.Leases.Release(context.Background(), keyA, owner.OwnerID, owner.Generation, time.Now()); err != nil {
+	if _, _, err := stack.Leases.Release(context.Background(), owner.LeaseKey, owner.OwnerID, owner.Generation, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	next, err := stack.AcquireLease(context.Background(), keyB, "next-owner", "worker", "worker")
+	next, err := stack.AcquireLeaseFromAliases(context.Background(), aliases, canonical, "next-owner", "worker", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,8 +66,16 @@ func TestApprovalLeaseKey_UsesOneIdentityAcrossRegisteredWorktrees(t *testing.T)
 	if _, err := stack.AcquireLease(context.Background(), foreignProject, "foreign-project-owner", "worker", "worker"); err != nil {
 		t.Fatalf("foreign project row should remain isolated, not join the approval key: %v", err)
 	}
-	if _, err := approvalLeaseKey(context.Background(), stack, root, "foreign-repository", "herdforge-test", "memory", "proj", "FAC-782:review"); err == nil {
+	foreignTask := provider.LeaseKey(root, "memory", "proj", "FAC-782:other")
+	foreignAliases := append(append([]claim.LeaseKey(nil), aliases...), foreignTask)
+	if _, err := stack.AcquireLeaseFromAliases(context.Background(), foreignAliases, canonical, "foreign-task-owner", "worker", "worker"); err == nil {
+		t.Fatal("foreign task alias must be refused")
+	}
+	if _, err := approvalLeaseAliases(context.Background(), root, "foreign-repository", "herdforge-test", "memory", "proj", "FAC-782:review"); err == nil {
 		t.Fatal("foreign repository identity must be refused")
+	}
+	if _, err := approvalLeaseAliases(context.Background(), filepath.Join(t.TempDir(), "unregistered"), "unregistered-repository", "herdforge-test", "memory", "proj", "FAC-782:review"); err == nil {
+		t.Fatal("unregistered repository identity must be refused")
 	}
 	if owner.Generation != 1 {
 		t.Fatalf("first approval generation=%d, want 1", owner.Generation)
@@ -101,7 +102,11 @@ func TestApprovalLeaseKey_ContinuesRecognizedLegacyHistory(t *testing.T) {
 	// Exact pre-FAC-782 shape: an opaque identity was passed to LeaseKey while
 	// cwd was the registered coordinator worktree, so filepath.Abs bound it to
 	// that worktree instead of the repository common root.
-	legacyKey := provider.LeaseKey(filepath.Join(coordinatorCWD, repository), providerType, projectID, taskRef)
+	coordinatorPath, err := filepath.EvalSymlinks(coordinatorCWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyKey := claim.LeaseKey{Repo: filepath.Join(coordinatorPath, repository), Provider: providerType, Project: projectID, TaskRef: taskRef}
 	stack := provider.NewTestStack(t, provider.NewMemoryProvider())
 	for generation := 1; generation <= 2; generation++ {
 		lease, err := stack.AcquireLease(context.Background(), legacyKey, fmt.Sprintf("legacy-owner-%d", generation), "worker", "worker")
@@ -116,36 +121,30 @@ func TestApprovalLeaseKey_ContinuesRecognizedLegacyHistory(t *testing.T) {
 		}
 	}
 
-	keyFromCanonical, err := approvalLeaseKey(context.Background(), stack, root, repository, "herdforge-test", providerType, projectID, taskRef)
+	aliasesFromCanonical, err := approvalLeaseAliases(context.Background(), root, repository, "herdforge-test", providerType, projectID, taskRef)
 	if err != nil {
-		t.Fatalf("canonical cwd legacy recovery: %v", err)
+		t.Fatalf("canonical cwd legacy recovery inventory: %v", err)
 	}
-	if keyFromCanonical != legacyKey {
-		t.Fatalf("canonical cwd selected key=%+v want recognized legacy=%+v", keyFromCanonical, legacyKey)
-	}
-	next, err := stack.AcquireLease(context.Background(), keyFromCanonical, "recovered-owner", "worker", "worker")
+	next, err := stack.AcquireLeaseFromAliases(context.Background(), aliasesFromCanonical, provider.LeaseKey(root, providerType, projectID, taskRef), "recovered-owner", "worker", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.Generation != 3 {
+	if next.Generation != 3 || next.LeaseKey != legacyKey {
 		t.Fatalf("recovery generation=%d want 3", next.Generation)
 	}
-	if _, _, err := stack.Leases.Release(context.Background(), keyFromCanonical, next.OwnerID, next.Generation, time.Now()); err != nil {
+	if _, _, err := stack.Leases.Release(context.Background(), next.LeaseKey, next.OwnerID, next.Generation, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
-	keyFromOther, err := approvalLeaseKey(context.Background(), stack, otherCWD, repository, "herdforge-test", providerType, projectID, taskRef)
+	aliasesFromOther, err := approvalLeaseAliases(context.Background(), otherCWD, repository, "herdforge-test", providerType, projectID, taskRef)
 	if err != nil {
 		t.Fatalf("registered other cwd legacy recovery: %v", err)
 	}
-	if keyFromOther != legacyKey {
-		t.Fatalf("other cwd selected key=%+v want recognized legacy=%+v", keyFromOther, legacyKey)
-	}
-	live, err := stack.AcquireLease(context.Background(), legacyKey, "live-legacy-owner", "worker", "worker")
+	live, err := stack.AcquireLeaseFromAliases(context.Background(), aliasesFromOther, provider.LeaseKey(otherCWD, providerType, projectID, taskRef), "live-legacy-owner", "worker", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := approvalLeaseKey(context.Background(), stack, root, repository, "herdforge-test", providerType, projectID, taskRef); err == nil || !strings.Contains(err.Error(), "live owner") {
+	if _, err := stack.AcquireLeaseFromAliases(context.Background(), aliasesFromOther, provider.LeaseKey(otherCWD, providerType, projectID, taskRef), "blocked-owner", "worker", "worker"); err == nil || !strings.Contains(err.Error(), "active owner") {
 		t.Fatalf("live recognized legacy owner was not refused: %v", err)
 	}
 	_ = live
@@ -168,7 +167,11 @@ func TestApprovalLeaseKey_RefusesAmbiguousRecognizedLegacyHistory(t *testing.T) 
 	repository := dispatch.RepositoryIdentityOrName(root, "herdforge-test")
 	stack := provider.NewTestStack(t, provider.NewMemoryProvider())
 	for _, cwd := range []string{wtA, wtB} {
-		key := provider.LeaseKey(filepath.Join(cwd, repository), "memory", "proj", "FAC-782:review")
+		resolvedCWD, err := filepath.EvalSymlinks(cwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := claim.LeaseKey{Repo: filepath.Join(resolvedCWD, repository), Provider: "memory", Project: "proj", TaskRef: "FAC-782:review"}
 		lease, err := stack.AcquireLease(context.Background(), key, cwd, "worker", "worker")
 		if err != nil {
 			t.Fatal(err)
@@ -177,7 +180,11 @@ func TestApprovalLeaseKey_RefusesAmbiguousRecognizedLegacyHistory(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if _, err := approvalLeaseKey(context.Background(), stack, root, repository, "herdforge-test", "memory", "proj", "FAC-782:review"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+	aliases, err := approvalLeaseAliases(context.Background(), root, repository, "herdforge-test", "memory", "proj", "FAC-782:review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stack.AcquireLeaseFromAliases(context.Background(), aliases, provider.LeaseKey(root, "memory", "proj", "FAC-782:review"), "ambiguous-owner", "worker", "worker"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("equal recognized legacy histories were not refused: %v", err)
 	}
 }
