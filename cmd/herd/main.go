@@ -3623,8 +3623,8 @@ func validateRecoveryTarget(ctx context.Context, root, target string, tc dispatc
 	if err != nil || base != tc.BaseSHA {
 		return fmt.Errorf("recovery target cannot resolve the signed base")
 	}
-	if _, err := shotGit(ctx, resolved, "merge-base", "--is-ancestor", tc.BaseSHA, tc.CandidateSHA); err != nil {
-		return fmt.Errorf("recovery candidate is not descended from the signed base")
+	if err := gitroot.RequireAncestorContext(ctx, resolved, tc.BaseSHA, tc.CandidateSHA); err != nil {
+		return fmt.Errorf("recovery candidate is not descended from the signed base: %w", err)
 	}
 	return nil
 }
