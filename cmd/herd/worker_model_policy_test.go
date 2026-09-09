@@ -227,7 +227,9 @@ func TestLaunchAdmissionLifecycleComposesModelGateBeforeClaim(t *testing.T) {
 func TestForgeAdmissionRejectsBeforeClaimWhenLaneForbidden(t *testing.T) {
 	cfg := &config.Config{Lanes: []config.LaneDef{{
 		Name: "bad-forge", Role: "worker", AgentKind: "codex", Harness: "codex",
-		Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation",
+		// codex/gpt-5.6-sol is now a valid configured surface; keep this
+		// fixture forbidden at the actual config-policy boundary.
+		Provider: "not-a-provider", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation",
 	}}}
 	claimed := false
 	_, err := forgeLaunchAdmission(cfg, &cfg.Lanes[0], context.Background(), func(*router.LaunchDecision) error {
