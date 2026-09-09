@@ -153,10 +153,12 @@ func TestBoardDoneFenced_RequiresLiveLease(t *testing.T) {
 }
 
 // TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog is the FAC-783
-// reviewer-c7102a76 regression at the real fenced entrypoint: an already-done
-// card must never return success after only a lease check on a validly sealed
-// stale receipt — the done log's record of THIS receipt's digest is the
-// receipt-bound durable evidence, and the refusal must not mutate.
+// reviewer-c7102a76 + reviewer-dc7d0755 regression at the real fenced
+// entrypoint: an already-done card must never return success after only a
+// lease check — not for a sealed stale receipt, and not for a receipt whose
+// revision matches the done task either. The done log's record of THIS
+// receipt's digest is the receipt-bound durable evidence, and the refusal
+// must not mutate.
 func TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
 	ctx := context.Background()
 	rdir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
@@ -174,12 +176,15 @@ func TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
 	}
 
 	r := validReceipt(t, rdir, "FAC-783b", mergeSHA, baseSHA)
-	bindLiveRevision(t, r, cp, testTaskID)
-	// The card reached done through another authority after the receipt was
-	// minted: done status, no done-log record anywhere in rdir.
+	// The card reached done through another authority BEFORE the receipt was
+	// bound, and the receipt is then bound to the live DONE revision: the
+	// revision matches, yet no done-log record exists — matching is not
+	// proof this receipt effected the done transition (FAC-783 reviewer
+	// dc7d0755).
 	if err := cp.UpdateStatus(ctx, testTaskID, "done"); err != nil {
 		t.Fatal(err)
 	}
+	bindLiveRevision(t, r, cp, testTaskID)
 	baseline := cp.updates
 	req := DoneRequest{
 		RepoDir: rdir, ProjectID: "p1", Ref: "FAC-783b", Receipt: r,
@@ -187,7 +192,7 @@ func TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
 	}
 	if _, err := BoardDoneFenced(ctx, cp, stack, key, "owner-1", lease.Generation, req); err == nil ||
 		!strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
-		t.Fatalf("fenced already-done short-circuit must not accept a sealed stale receipt without a matching done-log digest, got %v", err)
+		t.Fatalf("fenced already-done short-circuit must not accept a sealed receipt without a matching done-log digest, stale or revision-matching alike, got %v", err)
 	}
 	if got := statusOf(t, cp, testTaskID); got != "done" {
 		t.Fatalf("status = %q, want unchanged done", got)
@@ -196,10 +201,11 @@ func TestBoardDoneFenced_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
 		t.Fatalf("zero mutation on refusal: updates=%d baseline=%d comments=%d", cp.updates, baseline, cp.comments)
 	}
 
-	// A different validly sealed digest is likewise not the card's evidence.
+	// A different validly sealed digest, also bound to the matching done
+	// revision, is likewise not the card's evidence.
 	rB := validReceipt(t, rdir, "FAC-783b", mergeSHA, baseSHA)
 	rB.VerificationDigest = "verification-digest-2"
-	rB.Seal()
+	bindLiveRevision(t, rB, cp, testTaskID)
 	if rB.Digest == r.Digest {
 		t.Fatal("receipt B must hash differently from receipt A")
 	}

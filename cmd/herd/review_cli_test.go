@@ -2848,3 +2848,45 @@ func TestApproveCLI_DoneCardRefusesSealedStaleReceiptWithoutLogRecord(t *testing
 		}
 	}
 }
+
+// TestApproveCLI_MatchingRevisionTerminalCardWithoutLogRecordRefuses is the
+// FAC-783 reviewer-dc7d0755 regression at the actual approve entrypoint,
+// driven through the real reconcile sweep: the journaled intent is re-driven
+// against an already-done card whose completion receipt was minted against
+// the live DONE revision — the revision matches, but no done-log record
+// exists. Matching the revision is not proof this receipt effected the done
+// transition, so approveOne must refuse: no board write, no fabricated done
+// record, no published callback.
+func TestApproveCLI_MatchingRevisionTerminalCardWithoutLogRecordRefuses(t *testing.T) {
+	binary := buildHerd(t)
+	// The sandbox task serves done from the start, so the seeded receipt is
+	// bound to the live done revision (the fixture binds EncodeRevision of
+	// exactly this status).
+	dir, keyDir, fk := approveFixtureWithStatus(t, "done")
+	provisionFence(t, binary, dir, keyDir)
+	sha := fixtureEvidenceSHA(t, dir)
+	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
+	// Deliberately NO done-log record: the durable receipt-bound evidence the
+	// terminal card requires is absent.
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "cannot be accepted on stale evidence") {
+		t.Fatalf("a revision-matching receipt with no done-log record must refuse through the reconcile sweep, got err %v:\n%s", err, out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 0 {
+		t.Fatalf("zero board write on refusal: saw %d write(s)", got)
+	}
+	if _, statErr := os.Stat(hsync.DoneLogPath(dir)); statErr == nil {
+		t.Fatalf("the refusal must not fabricate a done-log record")
+	}
+	if data, rErr := os.ReadFile(mail.CallbackMailPath(dir)); rErr == nil {
+		if strings.Contains(string(data), `"complete: FAC-1"`) {
+			t.Fatalf("the refusal must publish no callback:\n%s", data)
+		}
+	}
+	if data, rErr := os.ReadFile(filepath.Join(dir, ".herd", "approve-intents.jsonl")); rErr == nil {
+		if strings.Contains(string(data), `"state":"published"`) {
+			t.Fatalf("the refusal must not journal a publication:\n%s", data)
+		}
+	}
+}

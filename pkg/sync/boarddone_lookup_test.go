@@ -659,3 +659,67 @@ func TestBoardDone_TerminalCardRequiresReceiptBoundDoneLog(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveDoneTask_TerminalCardMatchingRevisionStillRequiresDoneLog is the
+// FAC-783 reviewer-dc7d0755 regression: a sealed full receipt whose provider
+// revision matches the live DONE revision is still refused without a
+// matching done-log record — a matching revision is not proof this receipt
+// effected the done transition.
+func TestResolveDoneTask_TerminalCardMatchingRevisionStillRequiresDoneLog(t *testing.T) {
+	dir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
+	ctx := context.Background()
+	cp := newReceiptBoard(t, "FAC-132", testTaskID)
+	// Drive the card terminal through another authority, THEN bind the
+	// receipt to the live done revision: the revision now matches, and no
+	// done-log record exists anywhere.
+	if err := cp.UpdateStatus(ctx, testTaskID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
+	live, err := cp.GetTask(ctx, testTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(provider.EncodeRevision(live)) != r.ProviderRevision {
+		t.Fatalf("fixture must bind the matching revision: receipt %q live %q", r.ProviderRevision, provider.EncodeRevision(live))
+	}
+	req := DoneRequest{
+		RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
+		Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
+	}
+	if _, err := ResolveDoneTask(ctx, cp, req); err == nil ||
+		!strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+		t.Fatalf("a revision-matching sealed receipt on a terminal card must still require the done-log record, got %v", err)
+	}
+}
+
+func TestBoardDone_TerminalMatchingRevisionWithoutLogRecordRefusesWithoutMutating(t *testing.T) {
+	dir, baseSHA, mergeSHA, _, _ := receiptRepo(t)
+	ctx := context.Background()
+	cp := newReceiptBoard(t, "FAC-132", testTaskID)
+	if err := cp.UpdateStatus(ctx, testTaskID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	baseline := cp.updates
+	r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
+	req := DoneRequest{
+		RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
+		Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
+	}
+	if _, err := BoardDone(ctx, cp, req); err == nil ||
+		!strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+		t.Fatalf("unfenced close must refuse a revision-matching receipt with no done-log record, got %v", err)
+	}
+	if got := statusOf(t, cp, testTaskID); got != "done" {
+		t.Fatalf("status = %q, want unchanged done", got)
+	}
+	if cp.updates != baseline || cp.comments != 0 {
+		t.Fatalf("zero provider write on refusal: updates=%d baseline=%d comments=%d", cp.updates, baseline, cp.comments)
+	}
+	log, err := ReadDoneLog(dir)
+	if err != nil || len(log) != 0 {
+		t.Fatalf("the refusal must not fabricate a done-log record, got %+v err %v", log, err)
+	}
+}
