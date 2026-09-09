@@ -89,7 +89,7 @@ func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
 }
 
 func TestReviewPacketNamesRepositoryOwnedContractPaths(t *testing.T) {
-	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2")
+	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-668")
 	for _, path := range []string{".herd/prompts/reviewer.md", ".herd/prompts/review-verdict.template.md"} {
 		if !strings.Contains(body, path) {
 			t.Errorf("packet must name candidate-owned contract path %q", path)
