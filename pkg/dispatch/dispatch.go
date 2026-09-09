@@ -25,6 +25,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/recovery"
 	"github.com/Kampe/Herdforge/pkg/residual"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/runstate"
 	"github.com/Kampe/Herdforge/pkg/scopefence"
@@ -391,6 +392,9 @@ type Dispatcher struct {
 	// dispatch owns the task and has admitted its worktree. Nil uses the
 	// production-safe executor; tests may inject an attributable failure seam.
 	Bootstrap WorktreeBootstrapper
+	// Resources serializes safe derived-data reaping with task worktree creation.
+	// Nil preserves repositories that have not declared resource_governor.v1.
+	Resources DispatchResourceGovernor
 	// taskArtifacts is the FAC-666 generation-fenced packet/context publisher.
 	// Nil selects the production implementation; tests inject only phase faults.
 	taskArtifacts *taskArtifactPublisher
@@ -404,6 +408,35 @@ type Dispatcher struct {
 // It cannot create a worktree, claim a task, or launch an agent.
 type WorktreeBootstrapper interface {
 	Execute(context.Context, string, config.WorktreeBootstrap) (*worktreebootstrap.Result, error)
+}
+
+// DispatchResourceGovernor returns a permit that remains held across the
+// worktree mutation. Implementations must fail closed when host capacity or
+// reaper evidence is unavailable.
+type DispatchResourceGovernor interface {
+	AcquireDispatch(context.Context) (io.Closer, resources.GovernorReport, error)
+}
+
+func (d *Dispatcher) withResourcePermit(ctx context.Context, create func() (*worktree.WorktreeInfo, error)) (*worktree.WorktreeInfo, error) {
+	if create == nil {
+		return nil, errors.New("dispatch worktree create operation is required")
+	}
+	var permit io.Closer
+	if d.Resources != nil {
+		admitted, report, err := d.Resources.AcquireDispatch(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("host-local resource governor refused dispatch: %w; report=%s", err, report.JSON())
+		}
+		if admitted == nil {
+			return nil, errors.New("host-local resource governor admitted dispatch without a permit")
+		}
+		permit = admitted
+	}
+	info, createErr := create()
+	if permit != nil {
+		createErr = errors.Join(createErr, permit.Close())
+	}
+	return info, createErr
 }
 
 func (d *Dispatcher) bootstrapWorktree(ctx context.Context, worktreePath string) error {
@@ -1030,7 +1063,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if d.Worktree == nil {
 		return nil, failOwned("worktree_service_missing", fmt.Errorf("dispatch worktree service is required"))
 	}
-	wtInfo, err := d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
+	wtInfo, err := d.withResourcePermit(ctx, func() (*worktree.WorktreeInfo, error) {
+		return d.Worktree.CreateTaskWorktreeFrom(ctx, task.Ref, defaultBranch)
+	})
 	if err != nil {
 		return nil, failOwned("worktree_create_failed", fmt.Errorf("failed to create worktree: %w", err))
 	}

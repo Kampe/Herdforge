@@ -125,6 +125,13 @@ func (e Executor) Execute(ctx context.Context, worktreePath string, contract con
 		return nil, fmt.Errorf("resolve bootstrap toolchain %q: empty identity", contract.Toolchain)
 	}
 	contractDigest := digest(contract.Version + "\x00" + contract.Toolchain + "\x00" + strings.Join(contract.Command, "\x00"))
+	if len(contract.Scopes) != 0 {
+		scopePayload, marshalErr := json.Marshal(contract.Scopes)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("encode bootstrap scopes: %w", marshalErr)
+		}
+		contractDigest = digest("scoped-v1\x00" + contractDigest + "\x00" + string(scopePayload))
+	}
 	toolchainDigest := digest(identity)
 	cacheRel := filepath.ToSlash(filepath.Join(".herd", "bootstrap", "cache", toolchainDigest))
 	runtimeRel := filepath.ToSlash(filepath.Join(".herd", "bootstrap", "runtime", toolchainDigest))
@@ -162,8 +169,40 @@ func (e Executor) Execute(ctx context.Context, worktreePath string, contract con
 	if runner == nil {
 		runner = execRunner{}
 	}
-	if err := runner.Run(ctx, root, append([]string(nil), contract.Command...), bootstrapEnv(cachePath, runtimePath)); err != nil {
-		return nil, err
+	scopes := append([]string(nil), contract.Scopes...)
+	if len(scopes) == 0 {
+		scopes = []string{"."}
+	}
+	for _, scope := range scopes {
+		scopeDir := root
+		if scope != "." {
+			scopeDir, err = safeChild(root, scope)
+			if err != nil {
+				return nil, fmt.Errorf("bootstrap scope: %w", err)
+			}
+			info, statErr := os.Lstat(scopeDir)
+			if statErr != nil {
+				return nil, fmt.Errorf("bootstrap scope %q is unavailable or not a directory", scope)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("bootstrap scope %q is a symlink", scope)
+			}
+			if !info.IsDir() {
+				return nil, fmt.Errorf("bootstrap scope %q is unavailable or not a directory", scope)
+			}
+			resolvedScope, resolveErr := filepath.EvalSymlinks(scopeDir)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("bootstrap scope %q realpath: %w", scope, resolveErr)
+			}
+			rel, relErr := filepath.Rel(root, resolvedScope)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("bootstrap scope %q escapes worktree", scope)
+			}
+			scopeDir = resolvedScope
+		}
+		if err := runner.Run(ctx, scopeDir, append([]string(nil), contract.Command...), bootstrapEnv(cachePath, runtimePath, scope)); err != nil {
+			return nil, err
+		}
 	}
 	if err := writeReceipt(receiptPath, want); err != nil {
 		return nil, err
@@ -176,11 +215,12 @@ func digest(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func bootstrapEnv(cachePath, runtimePath string) []string {
+func bootstrapEnv(cachePath, runtimePath, scope string) []string {
 	env := append([]string(nil), os.Environ()...)
 	return append(env,
 		"HERD_BOOTSTRAP_CACHE="+cachePath,
 		"HERD_BOOTSTRAP_RUNTIME="+runtimePath,
+		"HERD_BOOTSTRAP_SCOPE="+filepath.ToSlash(scope),
 		"GOCACHE="+filepath.Join(cachePath, "go-build"),
 		"GOMODCACHE="+filepath.Join(cachePath, "go-mod"),
 		"TMPDIR="+filepath.Join(runtimePath, "tmp"),

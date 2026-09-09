@@ -437,6 +437,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "resource-governor":
+		if err := runResourceGovernorCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd resource-governor: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "worktree-reap":
 		if err := runWorktreeReap(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "herd worktree-reap: %v\n", err)
@@ -5165,6 +5171,15 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		d.Compensator = compensator
 		defer compensator.Close()
 	}
+	governorRoot := "."
+	if wm != nil && strings.TrimSpace(wm.RepoRoot) != "" {
+		governorRoot = wm.RepoRoot
+	}
+	resourceGovernor, governorErr := newResourceGovernor(cfg, governorRoot)
+	if governorErr != nil {
+		return nil, nil, fmt.Errorf("resource governor: %w", governorErr)
+	}
+	d.Resources = resourceGovernor
 	// A fresh checkout may not have a previously published scopefence row.
 	// Dispatch's dependency gate can still establish the authoritative graph,
 	// so bind run-state admission to that same provider-backed snapshot instead

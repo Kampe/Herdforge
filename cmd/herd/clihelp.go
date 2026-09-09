@@ -269,6 +269,8 @@ Commands:
 		"  census (herdr server, agent list, memory) rather than configured slots.\n" +
 		"  Exits 3 on a refusal so a shell caller cannot ignore it by not parsing output.\n" +
 		"  Memory it cannot measure is reported unknown, never as a refusal.",
+	"resource-governor": "Usage: herd resource-governor [--json] [--apply] [--max-reaps N] [--foreign owner:kind:path]\n" +
+		"  Inventory host-local registered worktrees and safely reap declared generated data.",
 	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main]\n" +
 		"  Retire worktrees whose work has LANDED: no unique commits against base, so\n" +
 		"  removal is provably lossless. Never touches unmerged, dirty, locked or\n" +
