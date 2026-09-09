@@ -4690,10 +4690,14 @@ func runDoctorModels() {
 	ctx := context.Background()
 	deadLanes := 0
 	for _, lane := range cfg.Lanes {
-		model, trail := herdr.ResolveHealthyModel(ctx, lane.Model, lane.FallbackModels)
+		provider := strings.TrimSpace(lane.Provider)
+		if provider == "" {
+			provider = "opencode"
+		}
+		model, trail := herdr.ResolveHealthyProviderModel(ctx, provider, lane.Model, lane.Effort, lane.FallbackModels)
 		if model == "" {
 			deadLanes++
-			fmt.Printf("DEAD  %s — every candidate exhausted:\n", lane.Name)
+			fmt.Printf("DEAD  %s (%s) — every candidate exhausted:\n", lane.Name, provider)
 			for _, p := range trail {
 				fmt.Printf("        %s: %s\n", p.Model, p.Reason)
 			}
@@ -4707,9 +4711,9 @@ func runDoctorModels() {
 			}
 		}
 		if model == lane.Model {
-			fmt.Printf("OK    %s -> %s\n", lane.Name, model)
+			fmt.Printf("OK    %s -> %s/%s\n", lane.Name, provider, model)
 		} else {
-			fmt.Printf("FELL-OVER %s -> %s (primary %s exhausted)\n", lane.Name, model, lane.Model)
+			fmt.Printf("FELL-OVER %s -> %s/%s (primary %s exhausted)\n", lane.Name, provider, model, lane.Model)
 		}
 	}
 	if deadLanes > 0 {
