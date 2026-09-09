@@ -19,6 +19,7 @@
 package reviewingest
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -45,6 +46,9 @@ const (
 
 // VerdictEffect is the parsed, signed delivered-verdict effect.
 type VerdictEffect struct {
+	// Repo is the repository component of the effect identity — the first
+	// segment of the effect id the coordinator signed.
+	Repo string
 	// TaskRef is the task the verdict was composed for.
 	TaskRef string
 	// VerdictToken is the broker token: APPROVED or REJECTED.
@@ -105,6 +109,14 @@ func ParseVerdictEffect(body string) (VerdictEffect, error) {
 	e.Signature = trailer[si+len(effectSigJoin):]
 	if strings.ContainsAny(e.EffectID, " \t") || !strings.HasPrefix(e.EffectID, mail.VerdictDeliveredPrefix) {
 		return e, fmt.Errorf("effect identity %q is not a delivered verdict id (FAC-351)", e.EffectID)
+	}
+	// The effect identity's repository component is signed authority: it is
+	// part of the preimage, so recovery must parse and bind it — a record
+	// claiming a different repo may never reuse this effect.
+	identity, found := strings.CutPrefix(e.EffectID, mail.VerdictDeliveredPrefix)
+	e.Repo, _, found = strings.Cut(identity, ":")
+	if !found || e.Repo == "" || strings.ContainsAny(e.Repo, " \t") {
+		return e, fmt.Errorf("effect identity %q carries no repository component (FAC-351 fail-closed)", e.EffectID)
 	}
 	if _, err := hex.DecodeString(e.Signature); err != nil || e.Signature == "" {
 		return e, fmt.Errorf("effect signature is not hex — refusing unsigned or corrupted evidence (FAC-351 fail-closed)")
@@ -322,6 +334,9 @@ func RetainVerdictArtifact(projectRoot string, rec VerdictRecoveryRecord, opts V
 
 	// Every signed binding must equal the record's claim. A mismatch on any
 	// one of them is wrong-SHA / wrong-generation / wrong-task evidence.
+	if strings.TrimSpace(rec.Repo) != effect.Repo {
+		return "", fmt.Errorf("signed effect repository %q does not match record repository %q (FAC-351 fail-closed)", effect.Repo, rec.Repo)
+	}
 	effectTask := reviewledger.CloseableCardRef(effect.TaskRef)
 	recTask := reviewledger.CloseableCardRef(rec.Ref)
 	if effectTask == "" || !strings.EqualFold(effectTask, recTask) {
@@ -431,10 +446,11 @@ func retainVerdictBytes(projectRoot string, rec VerdictRecoveryRecord, effect Ve
 		return "", fmt.Errorf("create review inbox: %w", err)
 	}
 	// Idempotent same-content hit: this exact effect was already retained for
-	// this candidate and reviewer. Never rewrite review evidence.
+	// this candidate and reviewer. Equality is EXACT BYTES — a digest prefix
+	// can collide and would admit different evidence as an idempotent success
+	// (FAC-351). Never rewrite review evidence.
 	if existing, err := os.ReadFile(dst); err == nil {
-		sum := sha256.Sum256(existing)
-		if fmt.Sprintf("%x", sum)[:8] == contentDigest8(text) {
+		if bytes.Equal(existing, []byte(text)) {
 			if err := confirmRetainedHit(dst); err != nil {
 				return "", err
 			}
@@ -459,11 +475,6 @@ func retainVerdictBytes(projectRoot string, rec VerdictRecoveryRecord, effect Ve
 // verdictArtifactMode requires owner-only permissions on retained verdict
 // evidence.
 func verdictArtifactMode(m os.FileMode) bool { return m.Perm() == 0o600 }
-
-func contentDigest8(text string) string {
-	sum := sha256.Sum256([]byte(text))
-	return fmt.Sprintf("%x", sum)[:8]
-}
 
 // verdictRetainedName keys the artifact on the EFFECT identity only: one
 // delivered effect is one artifact, whoever claims to have reviewed it. The

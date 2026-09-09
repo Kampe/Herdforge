@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -939,6 +940,22 @@ func reclaimReviewPoolSlotFor(sha string) {
 }
 */
 
+// decodeRecoveryRecordStrict decodes exactly ONE typed recovery record and
+// refuses anything after it. Recovery evidence is a single JSON value: a
+// trailing value or garbage after it is malformed evidence, never an
+// afterthought to recover (FAC-351 fail-closed).
+func decodeRecoveryRecordStrict(body []byte, rec any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(rec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data after the JSON value")
+	}
+	return nil
+}
+
 // runSignRecoveryRecord mints a coordinator-signed recovery record: the only
 // sanctioned authority binding reviewer identity, reviewer family, and the
 // verification digest to a delivered effect (FAC-351). The unsigned record is
@@ -961,9 +978,7 @@ func runSignRecoveryRecord(projectRoot, recordPath string) {
 		os.Exit(1)
 	}
 	var rec reviewingest.VerdictRecoveryRecord
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&rec); err != nil {
+	if err := decodeRecoveryRecordStrict(body, &rec); err != nil {
 		fmt.Fprintf(os.Stderr, "herd review-ingest: malformed recovery record: %v\n", err)
 		os.Exit(1)
 	}
@@ -1027,9 +1042,7 @@ func runVerdictRecovery(projectRoot string, records []string) {
 			continue
 		}
 		var rec reviewingest.VerdictRecoveryRecord
-		dec := json.NewDecoder(bytes.NewReader(body))
-		dec.DisallowUnknownFields()
-		if decodeErr := dec.Decode(&rec); decodeErr != nil {
+		if decodeErr := decodeRecoveryRecordStrict(body, &rec); decodeErr != nil {
 			fmt.Fprintf(os.Stderr, "REFUSED %s: malformed recovery record: %v\n", filepath.Base(r), decodeErr)
 			refused++
 			continue

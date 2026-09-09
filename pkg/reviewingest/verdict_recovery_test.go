@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -468,5 +470,99 @@ func TestParseVerdictEffect_RejectsMalformedEvidence(t *testing.T) {
 	}
 	if _, err := ParseVerdictEffect(f.effect.Body); err != nil {
 		t.Fatalf("the exact delivered body must parse: %v", err)
+	}
+}
+
+// TestRetainVerdictArtifact_RefusesRepoIdentityMismatch binds the record's
+// repository to the SIGNED effect identity: a coordinator-signed record may
+// never re-use a valid effect from another repository — that would attribute
+// review authority across repository boundaries (R3 round 5, finding 1).
+func TestRetainVerdictArtifact_RefusesRepoIdentityMismatch(t *testing.T) {
+	f := newRecoveryFixture(t, "APPROVED")
+	f.record.Repo = "some-other-repo"
+	f.signRecord()
+	_, err := RetainVerdictArtifact(f.root, f.record, f.opts())
+	if err == nil {
+		t.Fatal("a record whose repository differs from the signed effect identity must be refused")
+	}
+	if !strings.Contains(err.Error(), "does not match record repository") {
+		t.Fatalf("refusal must name the repository binding: %v", err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(f.root, InboxRel)); len(entries) != 0 {
+		t.Fatalf("a refused record must publish nothing, got %d artifacts", len(entries))
+	}
+}
+
+// TestRetainVerdictArtifact_DigestPrefixCollisionIsNotIdempotent proves the
+// idempotence check is EXACT BYTES: a different artifact under the same effect
+// name whose content merely shares the old 8-hex digest prefix must be
+// REFUSED, never reported as an idempotent success (R3 round 5, finding 2).
+// A 32-bit prefix collision is constructed directly (birthday over the
+// verification suffix), which is exactly the class the digest-prefix check
+// let through.
+func TestRetainVerdictArtifact_DigestPrefixCollisionIsNotIdempotent(t *testing.T) {
+	f := newRecoveryFixture(t, "APPROVED")
+	// Compose with the effect exactly as production parses it from the
+	// canonical body — never with fixture-side state.
+	effect, perr := ParseVerdictEffect(f.record.CanonicalBody)
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	digest8 := func(text string) string {
+		sum := sha256.Sum256([]byte(text))
+		return fmt.Sprintf("%x", sum)[:8]
+	}
+	// Birthday-search two verification suffixes whose composed artifacts
+	// collide on the first 32 bits.
+	seen := map[string]string{}
+	var verA, verB string
+	for n := 0; ; n++ {
+		v := fmt.Sprintf("reviewer ran the verifier probe %d", n)
+		f.record.Verification = v
+		f.record.VerificationDigest = verificationDigestOf(v)
+		d := digest8(composeVerdictArtifact(f.record, effect))
+		if prev, ok := seen[d]; ok {
+			verA, verB = prev, v
+			break
+		}
+		seen[d] = v
+		if n > 1<<20 {
+			t.Fatal("birthday search exceeded budget")
+		}
+	}
+
+	mk := func(ver string) VerdictRecoveryRecord {
+		r := f.record
+		r.Verification = ver
+		r.VerificationDigest = verificationDigestOf(ver)
+		return r
+	}
+	recA, recB := mk(verA), mk(verB)
+	if digest8(composeVerdictArtifact(recA, effect)) != digest8(composeVerdictArtifact(recB, effect)) ||
+		composeVerdictArtifact(recA, effect) == composeVerdictArtifact(recB, effect) {
+		t.Fatal("fixture must produce distinct contents sharing the digest prefix")
+	}
+
+	f.record = recA
+	f.signRecord()
+	relA, err := RetainVerdictArtifact(f.root, f.record, f.opts())
+	if err != nil {
+		t.Fatalf("first retain: %v", err)
+	}
+	f.record = recB
+	f.signRecord()
+	relB, err := RetainVerdictArtifact(f.root, f.record, f.opts())
+	if err == nil {
+		t.Fatalf("a 32-bit digest-prefix collision must NOT be an idempotent success: both retained at %s and %s", relA, relB)
+	}
+	if !strings.Contains(err.Error(), "exists with different content") {
+		t.Fatalf("refusal must name the content conflict: %v", err)
+	}
+	if relB == relA {
+		t.Fatal("collision must not report the artifact path as success")
+	}
+	existing, readErr := os.ReadFile(filepath.Join(f.root, filepath.FromSlash(relA)))
+	if readErr != nil || string(existing) != composeVerdictArtifact(recA, effect) {
+		t.Fatalf("first-published evidence must survive byte-for-byte: %v", readErr)
 	}
 }

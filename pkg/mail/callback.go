@@ -196,15 +196,21 @@ func (m *Mailbox) scanCallbackDedupeLocked(cb Callback) (*Envelope, error) {
 		if err := json.Unmarshal([]byte(env.Body), &c); err != nil {
 			return nil, fmt.Errorf("mailbox line %d callback body is malformed — refusing dedupe decision on corrupt state (FAC-145 fail-closed): %w", i+1, err)
 		}
-		// Completion is an effect keyed by the task ref and lease fence. A
-		// producer retry must converge even when it did not provide a
-		// caller-generated DedupeID (or generated a different one).
-		if cb.Kind == CallbackComplete && c.Kind == CallbackComplete &&
-			c.Ref == cb.Ref && c.LeaseGeneration == cb.LeaseGeneration {
-			e := env
-			return &e, nil
-		}
+		// A callback WITH an identity is deduped by that identity alone —
+		// never by ref and fence. The FAC-740 delivered-verdict marker
+		// carries its own DedupeID: an unrelated completion with the same
+		// task ref and lease generation must not swallow it, or the broker
+		// reports OK while the consumable verdict never lands.
 		if cb.DedupeID == "" {
+			// Completion is an effect keyed by the task ref and lease fence.
+			// A producer retry must converge even when it did not provide a
+			// caller-generated DedupeID (or generated a different one) —
+			// this fast path is only for identity-less completions.
+			if cb.Kind == CallbackComplete && c.Kind == CallbackComplete &&
+				c.Ref == cb.Ref && c.LeaseGeneration == cb.LeaseGeneration {
+				e := env
+				return &e, nil
+			}
 			continue
 		}
 		if c.DedupeID != cb.DedupeID {

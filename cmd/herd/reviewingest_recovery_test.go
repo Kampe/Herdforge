@@ -301,3 +301,85 @@ func TestRecoverVerdictRefusesIntentOnlyAndSupersededEvidence(t *testing.T) {
 		t.Fatalf("recovery must not duplicate artifacts, got %d", len(entries))
 	}
 }
+
+// TestSignAndRecoveryRefuseTrailingData proves both JSON surfaces are strict
+// to end-of-input: a record followed by garbage (or another JSON value) is
+// malformed evidence and must be refused, not signed or recovered (R3 round
+// 5, finding 3).
+func TestSignAndRecoveryRefuseTrailingData(t *testing.T) {
+	binary := buildHerd(t)
+	repo, candidate := corroborationRepo(t)
+	baseOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD~1").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strings.TrimSpace(string(baseOut))
+
+	keyDir := t.TempDir()
+	if err := dispatch.WriteIsolationAttestation(keyDir, "test-sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	identity, idErr := dispatch.RepositoryIdentity(repo, "herdforge")
+	if idErr != nil {
+		t.Fatal(idErr)
+	}
+	signer, err := dispatch.LoadOrCreateSigner(keyDir, identity, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".herd", "herd.yaml"), []byte("version: \"1\"\nproject:\n  name: herdforge\ntask_provider:\n  type: memory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := map[string]any{
+		"repo": "herdforge", "ref": "FAC-741", "candidate_sha": candidate,
+		"base_sha": base, "branch": "main", "lease_id": "claim:77",
+		"lease_generation": 1, "verdict": "APPROVED", "reviewer": "reviewer-fac741",
+		"reviewer_family": "openai", "bus_sequence": 0,
+		"canonical_body": signDeliveredEffect(t, signer, "FAC-741", candidate, base, "claim:77", 1, "APPROVED", ""),
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// (a) The signing surface refuses a record followed by another value.
+	tampered := filepath.Join(t.TempDir(), "trailing.json")
+	if err := os.WriteFile(tampered, append(raw, []byte(` {"later":true}`)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	signCmd := exec.Command(binary, "review-ingest", "--sign-recovery-record", tampered)
+	signCmd.Dir = repo
+	signCmd.Env = append(os.Environ(), "HERD_ROOT="+repo, "HERD_REPO_ROOT="+repo, "HERD_KEY_DIR="+keyDir)
+	signOut, signErr := signCmd.CombinedOutput()
+	if signErr == nil {
+		t.Fatalf("signing must refuse a record with trailing data:\n%s", signOut)
+	}
+	if !strings.Contains(string(signOut), "trailing data") {
+		t.Fatalf("refusal must be explicit about trailing data:\n%s", signOut)
+	}
+
+	// (b) The recovery surface refuses a signed record followed by garbage.
+	signed := signRecoveryRecord(t, binary, repo, keyDir, rec)
+	signedBody, err := os.ReadFile(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := filepath.Join(t.TempDir(), "signed-trailing.json")
+	if err := os.WriteFile(corrupt, append(signedBody, []byte("\ngarbage after the record")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, recoverErr := runRecover(t, binary, repo, corrupt)
+	if recoverErr == nil {
+		t.Fatalf("recovery must refuse a record with trailing data:\n%s", out)
+	}
+	if !strings.Contains(out, "trailing data") {
+		t.Fatalf("refusal must be explicit about trailing data:\n%s", out)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(repo, ".herd", "review", "inbox")); len(entries) != 0 {
+		t.Fatalf("refused input must publish nothing, got %d artifacts", len(entries))
+	}
+}
