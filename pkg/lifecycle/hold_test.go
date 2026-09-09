@@ -554,3 +554,168 @@ func TestSingleCandidateWithNoRefIsNotReportedAsNoCandidate(t *testing.T) {
 		t.Fatalf("a rejected candidate reads as no candidate: %v", err)
 	}
 }
+
+// FAC-743: valid() used to throw away which field failed, so Check,
+// CurrentGeneration, HasCurrent, and WithUnheldTransition all reported the
+// same bare "ambiguous identity" for an untrimmed ref that taskBindingMismatch
+// had already accepted. Name the field; do not canonicalize it.
+func TestUntrimmedIdentityIsNamedAtEveryHoldSeam(t *testing.T) {
+	a, id, _ := holdFixture(t)
+	untrimmed := id
+	untrimmed.Task = " FAC-1 "
+
+	seams := []struct {
+		name     string
+		sentinel error
+		call     func() error
+	}{
+		{"Check", ErrActiveTaskUnknown, func() error {
+			_, err := a.Check(context.Background(), untrimmed, 1)
+			return err
+		}},
+		{"CurrentGeneration", ErrActiveTaskUnknown, func() error {
+			_, err := a.CurrentGeneration(context.Background(), untrimmed)
+			return err
+		}},
+		{"HasCurrent", ErrHoldDenied, func() error {
+			_, err := a.HasCurrent(context.Background(), untrimmed)
+			return err
+		}},
+		{"WithUnheldTransition", ErrActiveTaskUnknown, func() error {
+			return a.WithUnheldTransition(context.Background(), []HoldIdentity{untrimmed}, func() error {
+				t.Fatal("transition callback must not run for an invalid identity")
+				return nil
+			})
+		}},
+	}
+	for _, seam := range seams {
+		t.Run(seam.name, func(t *testing.T) {
+			err := seam.call()
+			if err == nil {
+				t.Fatal("untrimmed identity was admitted")
+			}
+			if !errors.Is(err, seam.sentinel) {
+				t.Fatalf("sentinel=%v err=%v", seam.sentinel, err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "task is untrimmed") {
+				t.Fatalf("did not name the untrimmed field: %v", err)
+			}
+			if strings.HasSuffix(msg, "ambiguous identity") || strings.HasSuffix(msg, "ambiguous transition identity") {
+				t.Fatalf("bare refusal: %v", err)
+			}
+		})
+	}
+}
+
+func TestTaskBindingMismatchAgreesWithValidOnUntrimmedRef(t *testing.T) {
+	task := HoldIdentity{Repository: "repo", Owner: "owner", Lane: "lane", Task: " FAC-1 ", Scope: "task"}
+	if task.valid() {
+		t.Fatal("untrimmed ref must fail valid()")
+	}
+	mismatch := taskBindingMismatch(task, "repo", "owner", "lane")
+	reason := task.invalidField()
+	if mismatch == "" {
+		t.Fatal("untrimmed ref passed taskBindingMismatch and will die later as ambiguous identity")
+	}
+	if mismatch != reason {
+		t.Fatalf("mismatch=%q invalidField=%q", mismatch, reason)
+	}
+	if !strings.Contains(mismatch, "task is untrimmed") {
+		t.Fatalf("mismatch does not name the untrimmed task: %q", mismatch)
+	}
+
+	resolver := func(context.Context, string) ([]HoldIdentity, error) {
+		return []HoldIdentity{task}, nil
+	}
+	err := CheckLaneAndTaskHold(context.Background(), stubReader{}, resolver, "repo", "owner", "lane", stubGeneration)
+	if err == nil {
+		t.Fatal("untrimmed candidate was admitted")
+	}
+	if !strings.Contains(err.Error(), "task is untrimmed") {
+		t.Fatalf("lane check did not name the untrimmed field: %v", err)
+	}
+	if strings.HasSuffix(err.Error(), "ambiguous identity") {
+		t.Fatalf("lane check still emits the bare refusal: %v", err)
+	}
+}
+
+func TestHoldIdentityValidityAcceptRejectMatrix(t *testing.T) {
+	base := HoldIdentity{Repository: "repo", Owner: "owner", Lane: "lane", Task: "FAC-1", Scope: "task"}
+	tests := []struct {
+		name string
+		mut  func(*HoldIdentity)
+		ok   bool
+	}{
+		{name: "canonical task", mut: func(*HoldIdentity) {}, ok: true},
+		{name: "canonical lane", mut: func(id *HoldIdentity) { id.Task = ""; id.Scope = "lane" }, ok: true},
+		{name: "internal space remains canonical", mut: func(id *HoldIdentity) { id.Lane = "api crusader" }, ok: true},
+		{name: "untrimmed task", mut: func(id *HoldIdentity) { id.Task = " FAC-1 " }, ok: false},
+		{name: "untrimmed owner", mut: func(id *HoldIdentity) { id.Owner = " owner" }, ok: false},
+		{name: "empty repository", mut: func(id *HoldIdentity) { id.Repository = "" }, ok: false},
+		{name: "whitespace task", mut: func(id *HoldIdentity) { id.Task = "  " }, ok: false},
+		{name: "lane with task", mut: func(id *HoldIdentity) { id.Scope = "lane" }, ok: false},
+		{name: "task with empty ref", mut: func(id *HoldIdentity) { id.Task = "" }, ok: false},
+		{name: "unknown scope", mut: func(id *HoldIdentity) { id.Scope = "other" }, ok: false},
+		{name: "empty scope", mut: func(id *HoldIdentity) { id.Scope = "" }, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := base
+			tt.mut(&id)
+			if got := id.valid(); got != tt.ok {
+				t.Fatalf("valid()=%v want %v identity=%+v field=%q", got, tt.ok, id, id.invalidField())
+			}
+		})
+	}
+}
+
+func TestHoldIdentityInvalidFieldNamesEmptyUntrimmedAndPairing(t *testing.T) {
+	tests := []struct {
+		name string
+		id   HoldIdentity
+		want string
+	}{
+		{
+			name: "empty repository",
+			id:   HoldIdentity{Owner: "owner", Lane: "lane", Task: "FAC-1", Scope: "task"},
+			want: "repository is empty",
+		},
+		{
+			name: "untrimmed owner",
+			id:   HoldIdentity{Repository: "repo", Owner: " owner", Lane: "lane", Task: "FAC-1", Scope: "task"},
+			want: "owner is untrimmed",
+		},
+		{
+			name: "lane with task is pairing",
+			id:   HoldIdentity{Repository: "repo", Owner: "owner", Lane: "lane", Task: "FAC-1", Scope: "lane"},
+			want: "task is set (lane identities require an empty task)",
+		},
+		{
+			name: "unknown scope is pairing",
+			id:   HoldIdentity{Repository: "repo", Owner: "owner", Lane: "lane", Task: "FAC-1", Scope: "other"},
+			want: "scope=other, want lane or task",
+		},
+		{
+			name: "empty scope is pairing",
+			id:   HoldIdentity{Repository: "repo", Owner: "owner", Lane: "lane", Task: "FAC-1"},
+			want: "scope is empty, want lane or task",
+		},
+		{
+			name: "canonical is empty reason",
+			id:   HoldIdentity{Repository: "repo", Owner: "owner", Lane: "lane", Task: "FAC-1", Scope: "task"},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.id.invalidField(); got != tt.want {
+				t.Fatalf("invalidField()=%q want %q", got, tt.want)
+			}
+			if got := tt.id.valid(); got != (tt.want == "") {
+				t.Fatalf("valid()=%v want %v", got, tt.want == "")
+			}
+		})
+	}
+}
+
