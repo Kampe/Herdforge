@@ -609,25 +609,14 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 			c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("candidate SHA %q is not 40 hex chars", c.CandidateSHA))
 		}
 
-		if c.State != StateBlocked && c.State != StateConsumed {
-			generationCandidates := 0
-			shaCandidates := 0
-			for _, item := range list {
-				if item.CandidateSHA != "" {
-					shaCandidates++
-				}
-				if item.CandidateSHA != "" && item.LeaseGeneration > 0 {
-					if !item.CompletionCallback {
-						continue
-					}
-					generationCandidates++
-				}
-			}
-			if shaCandidates > 1 && generationCandidates > 0 && c.LeaseGeneration > 0 && !c.CompletionValid {
-				c.State = StateBlocked
-				c.BlockedReasons = append(c.BlockedReasons, BlockedMissingReceipt)
-				c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("lease generation %d has no exact full-suite PASS receipt bound to candidate %s and its completion callback", c.LeaseGeneration, c.CandidateSHA))
-			}
+		// A positive-generation completion claim is only review-admissible
+		// with its exact full-suite PASS receipt. The requirement holds for
+		// every authoritative candidate, including a single reused candidate
+		// SHA, and there is no fallback to an older receipt or verdict.
+		if c.State != StateBlocked && c.State != StateConsumed && c.LeaseGeneration > 0 && c.CompletionCallback && !c.CompletionValid {
+			c.State = StateBlocked
+			c.BlockedReasons = append(c.BlockedReasons, BlockedMissingReceipt)
+			c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("lease generation %d has no exact full-suite PASS receipt bound to candidate %s and its completion callback", c.LeaseGeneration, c.CandidateSHA))
 		}
 		if c.State != StateBlocked && c.State != StateConsumed {
 			if c.Verdict == string(reviewledger.VerdictFAIL) || c.Verdict == string(reviewledger.VerdictBLOCKED) {
