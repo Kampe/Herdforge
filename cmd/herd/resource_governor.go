@@ -122,7 +122,7 @@ func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string,
 	if governor == nil {
 		return nil
 	}
-	_, err = governor.Sweep(ctx, trigger, false)
+	_, err = governor.Sweep(ctx, trigger, governor.LifecycleApply())
 	return err
 }
 

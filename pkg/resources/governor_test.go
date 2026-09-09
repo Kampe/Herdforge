@@ -305,6 +305,80 @@ func TestGovernorApplyIsBoundedIdempotentAndReadsPhysicalBytes(t *testing.T) {
 	}
 }
 
+func TestLifecycleApplyRequiresBothPolicySwitches(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	if g.LifecycleApply() {
+		t.Fatal("observe-by-default governor admitted lifecycle mutation")
+	}
+	g.Policy.AllowApply = true
+	if g.LifecycleApply() {
+		t.Fatal("AllowApply alone admitted lifecycle mutation")
+	}
+	g.Policy.ApplyBeforeDispatch = true
+	if !g.LifecycleApply() {
+		t.Fatal("enabled lifecycle policy did not admit apply")
+	}
+}
+
+func TestSafeRemoveGeneratedTreeDefaultAndRollbackFailures(t *testing.T) {
+	t.Run("default remover", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "generated")
+		if err := os.MkdirAll(filepath.Join(target, "nested"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(target, "nested", "data"), []byte("keep no longer"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := safeRemoveGeneratedTree(root, target, os.RemoveAll); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("target remains: %v", err)
+		}
+	})
+
+	t.Run("remove failure rolls back", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "generated")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		want := errors.New("injected remover failure")
+		if err := safeRemoveGeneratedTree(root, target, func(string) error { return want }); !errors.Is(err, want) {
+			t.Fatalf("error=%v", err)
+		}
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("rollback lost target: %v", err)
+		}
+	})
+
+	t.Run("rollback failure records durable evidence", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "generated")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		removeErr := errors.New("injected remover failure")
+		err := safeRemoveGeneratedTree(root, target, func(quarantine string) error {
+			if removeErr := os.RemoveAll(quarantine); removeErr != nil {
+				t.Fatal(removeErr)
+			}
+			return removeErr
+		})
+		if err == nil || !strings.Contains(err.Error(), "recovery record") {
+			t.Fatalf("error=%v", err)
+		}
+		data, readErr := os.ReadFile(filepath.Join(root, ".herd", "resource-reap-recovery.jsonl"))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !strings.Contains(string(data), `"target":"./generated"`) {
+			t.Fatalf("recovery record=%q", data)
+		}
+	})
+}
+
 func TestGovernorMixedCensusAndCrossMachineIndependence(t *testing.T) {
 	gA, _, lanesA := governorFor(t, "host-a", 700000, 700000)
 	rootA := gA.Policy.RepositoryRoot

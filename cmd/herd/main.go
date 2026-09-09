@@ -10733,7 +10733,7 @@ func (d *cliForgeDriver) SweepCapacity(ctx context.Context, trigger resources.Sw
 	if d == nil || d.resourceGovernor == nil {
 		return nil
 	}
-	report, err := d.resourceGovernor.Sweep(ctx, trigger, false)
+	report, err := d.resourceGovernor.Sweep(ctx, trigger, d.resourceGovernor.LifecycleApply())
 	if err != nil {
 		return err
 	}

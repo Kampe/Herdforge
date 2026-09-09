@@ -264,6 +264,13 @@ func (g *Governor) Sweep(ctx context.Context, trigger SweepTrigger, apply bool) 
 	return report, err
 }
 
+// LifecycleApply reports whether repository policy permits lifecycle seams to
+// act. Observe is the safe default; both switches are required before a
+// daemon-triggered sweep can mutate generated data.
+func (g *Governor) LifecycleApply() bool {
+	return g != nil && g.Policy.AllowApply && g.Policy.ApplyBeforeDispatch
+}
+
 func (g *Governor) defaults() {
 	if g.Capacity == nil {
 		g.Capacity = OSBackend{}
@@ -606,17 +613,19 @@ func containsCanonicalState(root string, maxEntries int) (bool, error) {
 // so a symlink retarget cannot redirect RemoveTree into foreign state.
 func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) error {
 	root, err := filepath.EvalSymlinks(repoRoot)
-	if err != nil || !containedPath(root, target) {
+	targetAbs, absErr := filepath.Abs(target)
+	if err != nil || absErr != nil {
 		return errors.New("generated target containment changed before removal")
 	}
-	resolved, err := filepath.EvalSymlinks(target)
-	if err != nil || !containedPath(root, resolved) || filepath.Clean(resolved) != filepath.Clean(target) {
-		return errors.New("generated target realpath changed before removal")
-	}
-	parent := filepath.Dir(resolved)
+	parent := filepath.Dir(targetAbs)
 	parentResolved, err := filepath.EvalSymlinks(parent)
-	if err != nil || !containedPath(root, parentResolved) || filepath.Clean(parentResolved) != filepath.Clean(parent) {
+	if err != nil || !containedPath(root, parentResolved) {
 		return errors.New("generated target parent realpath changed before removal")
+	}
+	resolved, err := filepath.EvalSymlinks(targetAbs)
+	expected := filepath.Join(parentResolved, filepath.Base(targetAbs))
+	if err != nil || !containedPath(root, resolved) || filepath.Clean(resolved) != filepath.Clean(expected) {
+		return errors.New("generated target realpath changed before removal")
 	}
 	parentInfo, err := os.Stat(parent)
 	if err != nil {
@@ -635,30 +644,45 @@ func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) err
 		if rollbackErr := os.Rename(quarantined, resolved); rollbackErr != nil {
 			return fmt.Errorf("generated target parent changed and rollback failed: %v; quarantine retained at %s", statErr, quarantine)
 		}
-		_ = os.Remove(quarantine)
+		if cleanupErr := os.Remove(quarantine); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
+			return fmt.Errorf("generated target parent changed during removal; quarantine cleanup: %w", cleanupErr)
+		}
 		return errors.New("generated target parent changed during removal")
 	}
 	if err := remove(quarantine); err != nil {
 		if rollbackErr := os.Rename(quarantined, resolved); rollbackErr != nil {
 			recovery := filepath.Join(root, ".herd", "resource-reap-recovery.jsonl")
-			_ = os.MkdirAll(filepath.Dir(recovery), 0o700)
-			record, recordErr := os.OpenFile(recovery, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-			if recordErr == nil {
-				_, recordErr = fmt.Fprintf(record, "{\"target\":%q,\"quarantine\":%q,\"reason\":%q}\n", reportPath(root, resolved), reportPath(root, quarantine), err.Error())
-				_ = record.Close()
-			}
+			recordErr := appendRecoveryRecord(recovery, root, resolved, quarantine, err)
 			if recordErr != nil {
 				return fmt.Errorf("remove quarantined generated target: %v; rollback failed: %v; recovery record failed: %v; quarantine retained at %s", err, rollbackErr, recordErr, quarantine)
 			}
 			return fmt.Errorf("remove quarantined generated target: %v; rollback failed: %v; recovery record=%s; quarantine retained at %s", err, rollbackErr, reportPath(root, recovery), quarantine)
 		}
-		_ = os.Remove(quarantine)
+		if cleanupErr := os.Remove(quarantine); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
+			return fmt.Errorf("remove quarantined generated target: %v; rollback cleanup failed: %w", err, cleanupErr)
+		}
 		return fmt.Errorf("remove quarantined generated target: %w", err)
 	}
-	if err := os.Remove(quarantine); err != nil {
+	if err := os.Remove(quarantine); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove empty quarantine: %w", err)
 	}
 	return nil
+}
+
+func appendRecoveryRecord(path, root, target, quarantine string, reason error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create recovery record directory: %w", err)
+	}
+	record, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open recovery record: %w", err)
+	}
+	_, writeErr := fmt.Fprintf(record, "{\"target\":%q,\"quarantine\":%q,\"reason\":%q}\n", reportPath(root, target), reportPath(root, quarantine), reason.Error())
+	if writeErr == nil {
+		writeErr = record.Sync()
+	}
+	closeErr := record.Close()
+	return errors.Join(writeErr, closeErr)
 }
 
 func exactLane(lanes []RegisteredWorktree, path string) (RegisteredWorktree, bool) {
@@ -685,10 +709,14 @@ func (g *Governor) setConcurrency(report *GovernorReport) {
 	ceiling := 0
 	if free > g.Policy.PressureBytes {
 		slots := (free - g.Policy.PressureBytes) / reserve
-		if slots >= uint64(g.Policy.MaxDispatchConcurrency) {
+		// Policy validation requires MaxDispatchConcurrency > 0. A positive
+		// int is representable as uint64, and the reverse conversion below is
+		// fenced by this same bound.
+		maxSlots := uint64(g.Policy.MaxDispatchConcurrency) // #nosec G115 -- bounded by validated positive int
+		if slots >= maxSlots {
 			ceiling = g.Policy.MaxDispatchConcurrency
 		} else {
-			ceiling = int(slots)
+			ceiling = int(slots) // #nosec G115 -- slots is strictly below validated MaxDispatchConcurrency
 		}
 	}
 	active := 0
