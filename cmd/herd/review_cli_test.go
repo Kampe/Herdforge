@@ -25,6 +25,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/mail"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/verifier"
@@ -704,7 +705,7 @@ func TestVerifyCLI_PostsReceiptBoundFailCallback(t *testing.T) {
 // `herd approve` now requires: a real merged candidate on origin/main, a
 // sealed task-bound receipt over it, and durable lifecycle state at
 // "integrated" for the same lease generation and candidate.
-func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, configure ...func(*hsync.CompletionReceipt)) {
+func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, providerRevision string, configure ...func(*hsync.CompletionReceipt)) {
 	t.Helper()
 	// A candidate commit with actual content, merged into main so the
 	// receipt's merge SHA is an ancestor of origin/main and carries the
@@ -729,7 +730,10 @@ func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, config
 	}
 	r := &hsync.CompletionReceipt{
 		RepoID: repoID, TaskRef: ref, TaskID: "t1",
-		ProviderRevision: "provider-rev-1", LeaseGeneration: leaseGen,
+		// FAC-783: the receipt's provider revision is bound to the revision
+		// the live sandbox task encodes at close time — how a real integrator
+		// mints it.
+		ProviderRevision: providerRevision, LeaseGeneration: leaseGen,
 		BaseSHA: base, CandidateSHA: merge, MergeSHA: merge,
 		PatchID: patch, AcceptanceDigest: "acceptance-digest-1",
 		AcceptanceEvidence: "context: Herdforge worktree\n$ go test ./...\nPASS",
@@ -799,11 +803,20 @@ func seedDisabledWinddown(t *testing.T, dir string) {
 }
 
 func approveFixture(t *testing.T, configure ...func(*hsync.CompletionReceipt)) (dir, keyDir string, fk *fakeKaneo) {
+	return approveFixtureWithStatus(t, "in-review", configure...)
+}
+
+// approveFixtureWithStatus seeds the fleet fixture with the sandbox task
+// serving the given status, and binds the completion receipt's provider
+// revision to that live task state (FAC-783) — the broker board-done entry
+// closes a landed card that never projected In Review (FAC-756), so its
+// receipt must be minted against the in-progress revision.
+func approveFixtureWithStatus(t *testing.T, status string, configure ...func(*hsync.CompletionReceipt)) (dir, keyDir string, fk *fakeKaneo) {
 	t.Helper()
 	fk, server := newFakeKaneo()
 	t.Cleanup(server.Close)
 	fk.mu.Lock()
-	fk.status = "in-review"
+	fk.status = status
 	fk.mu.Unlock()
 
 	dir, keyDir = t.TempDir(), t.TempDir()
@@ -835,7 +848,8 @@ func approveFixture(t *testing.T, configure ...func(*hsync.CompletionReceipt)) (
 	// with "no positive lease generation (lifecycle must record the active
 	// lease)". Seed the same generation into the lifecycle so the two agree.
 	seedFixtureLifecycle(t, dir, "FAC-1", leaseGen)
-	seedCompletionReceipt(t, dir, "FAC-1", leaseGen, configure...)
+	liveRevision := string(provider.EncodeRevision(&provider.Task{ID: "t1", Status: status}))
+	seedCompletionReceipt(t, dir, "FAC-1", leaseGen, liveRevision, configure...)
 	return dir, keyDir, fk
 }
 
@@ -2732,10 +2746,10 @@ func TestApproveBroker(t *testing.T) {
 			dir, keyDir, fk := approveFixture(t)
 			if entrypoint == "board-done" {
 				// Receipt reconciliation must also close a landed card whose worker
-				// never projected In Review, as observed for FAC-756.
-				fk.mu.Lock()
-				fk.status = "in-progress"
-				fk.mu.Unlock()
+				// never projected In Review, as observed for FAC-756. Re-seed with
+				// the receipt minted against the in-progress revision the card
+				// serves at close time.
+				dir, keyDir, fk = approveFixtureWithStatus(t, "in-progress")
 			}
 			provisionFence(t, binary, dir, keyDir)
 			cmd := herdCmd(binary, dir, keyDir, entrypoint, "FAC-1")

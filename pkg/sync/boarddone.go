@@ -265,6 +265,17 @@ func validateAutomaticReceipt(req DoneRequest, repoDir, ref string) error {
 	return nil
 }
 
+// AuthenticateDoneReceipt authenticates req.Receipt for ref BEFORE any provider
+// locator derived from the receipt is consumed (FAC-783). It applies the same
+// full/reduced lifecycle-mode contract as BoardDone and BoardDoneFenced, and
+// exists for callers — approveOne — that resolve the task through
+// ResolveDoneTask directly: the receipt's task id is untrusted input, so the
+// digest, repository, lifecycle, and integration proof must all be proven
+// before that id reaches the provider.
+func AuthenticateDoneReceipt(req DoneRequest, repoDir, ref string) error {
+	return validateAutomaticReceipt(req, repoDir, ref)
+}
+
 // authorizeDoneClosureEvidence preserves the pre-declared acceptance contract
 // for full receipts and overrides. A reduced receipt has no such fields by
 // design; its producer already proved exact review verification and PR landing
@@ -290,21 +301,22 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	if repoDir == "" {
 		repoDir = "."
 	}
-	task, err := ResolveDoneTask(ctx, tp, req)
-	if err != nil {
-		return nil, err
+	// FAC-783: authenticate the receipt BEFORE any locator derived from it is
+	// consumed. ResolveDoneTask reads the provider with the receipt's own task
+	// id, so an unauthenticated receipt must never reach that read.
+	if req.Receipt != nil {
+		if req.Override != nil {
+			return nil, fmt.Errorf("%w for %s: a manual override cannot accompany a receipt; "+
+				"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
+		}
+		if err := validateAutomaticReceipt(req, repoDir, ref); err != nil {
+			return nil, err
+		}
 	}
 	var proof string
 	var override *OverrideRecord
 	switch {
-	case req.Receipt != nil && req.Override != nil:
-		return nil, fmt.Errorf("%w for %s: a manual override cannot accompany a receipt; "+
-			"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
-
 	case req.Receipt != nil:
-		if err := validateAutomaticReceipt(req, repoDir, ref); err != nil {
-			return nil, err
-		}
 		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
 			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
 			shortDigest(req.Receipt.PatchID), shortDigest(req.Receipt.VerificationDigest),
@@ -326,6 +338,33 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 	if strings.TrimSpace(evidence) == "" && req.Receipt != nil {
 		evidence = req.Receipt.AcceptanceEvidence
 	}
+
+	// Exactly-once: a receipt already recorded in the append-only done log
+	// never advances the card a second time. Read errors refuse rather than
+	// look like "not yet consumed". The check precedes task resolution
+	// (FAC-783): closing the card advances its live revision, so an
+	// already-consumed full receipt can never satisfy the revision binding
+	// again — the idempotent hit must be found before the task read, never
+	// after it.
+	log, err := ReadDoneLog(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	if req.Receipt != nil {
+		for _, rec := range log {
+			if rec.ReceiptDigest != "" && rec.ReceiptDigest == req.Receipt.Digest {
+				return &DoneResult{
+					Ref: ref, TaskID: rec.TaskID, Proof: proof,
+					Idempotent: true, ReceiptDigest: req.Receipt.Digest,
+				}, nil
+			}
+		}
+	}
+
+	task, err := ResolveDoneTask(ctx, tp, req)
+	if err != nil {
+		return nil, err
+	}
 	// FAC-564: two authorization routes. A pre-existing acceptance block plus
 	// literal output (preferred), or -- for a legacy operator-external-merge
 	// override on a card that never had a block -- an admitted cross-family
@@ -345,24 +384,6 @@ func BoardDone(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (
 			override.LegacyReviewerFamily = legacyEvidence.ReviewerFamily
 			override.LegacyBuilderFamily = legacyEvidence.BuilderFamily
 			override.LegacyMergeSHA = legacyEvidence.MergeSHA
-		}
-	}
-
-	// Exactly-once: a receipt already recorded in the append-only done log
-	// never advances the card a second time. Read errors refuse rather than
-	// look like "not yet consumed".
-	log, err := ReadDoneLog(repoDir)
-	if err != nil {
-		return nil, err
-	}
-	if req.Receipt != nil {
-		for _, rec := range log {
-			if rec.ReceiptDigest != "" && rec.ReceiptDigest == req.Receipt.Digest {
-				return &DoneResult{
-					Ref: ref, TaskID: rec.TaskID, Proof: proof,
-					Idempotent: true, ReceiptDigest: req.Receipt.Digest,
-				}, nil
-			}
 		}
 	}
 
@@ -441,40 +462,86 @@ func shortDigest(s string) string {
 }
 
 // ResolveDoneTask resolves the target board task for a DoneRequest.
-// When an authenticated completion receipt is present, it MUST use the exact
-// receipt task identity (TaskID) to perform a direct GetTask read on the provider,
-// without calling ListTasks, and validate the task identity, canonical ref,
-// project ID, and acceptance revision. If no receipt is present (e.g. manual override
-// without authenticated task identity), it falls back to resolveTaskByRef.
+// A full-provenance receipt MUST resolve through its exact signed task
+// identity (TaskID) with a direct GetTask read on the provider — never
+// ListTasks — and the read must return a complete identity: exact task id,
+// non-empty canonical ref and project matching the request, and the live
+// provider revision the receipt sealed. A missing full-receipt task id
+// refuses BEFORE any provider call. Reduced post-merge receipts omit
+// dispatch task identity by design; they take the explicit ref-resolution
+// rule below, never the full-receipt exact path. With no receipt at all
+// (e.g. manual override) it falls back to resolveTaskByRef.
 func ResolveDoneTask(ctx context.Context, tp provider.TaskProvider, req DoneRequest) (*provider.Task, error) {
 	ref := NormalizeRef(req.Ref)
-	if req.Receipt != nil && strings.TrimSpace(req.Receipt.TaskID) != "" {
-		receipt := req.Receipt
-		task, err := tp.GetTask(ctx, receipt.TaskID)
-		if err != nil {
-			return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but board lookup failed: %w", ErrNoEvidence, ref, receipt.TaskID, err)
-		}
-		if task == nil || strings.TrimSpace(task.ID) == "" {
-			return nil, fmt.Errorf("%w for %s: exact task read returned invalid or error-shaped response for task id %s", ErrNoEvidence, ref, receipt.TaskID)
-		}
-		if task.ID != receipt.TaskID {
-			return nil, fmt.Errorf("%w for %s: receipt task id %s does not match board task id %s", ErrNoEvidence, ref, receipt.TaskID, task.ID)
-		}
-		if receipt.TaskRef != "" && NormalizeRef(receipt.TaskRef) != ref {
-			return nil, fmt.Errorf("%w for %s: receipt task ref %s does not match requested ref %s", ErrNoEvidence, ref, receipt.TaskRef, ref)
-		}
-		if task.Ref != "" && NormalizeRef(task.Ref) != ref {
-			return nil, fmt.Errorf("%w for %s: board task ref %s does not match requested ref %s", ErrNoEvidence, ref, task.Ref, ref)
-		}
-		if req.ProjectID != "" && task.ProjectID != "" && task.ProjectID != req.ProjectID {
-			return nil, fmt.Errorf("%w for %s: board task project %s does not match requested project %s", ErrNoEvidence, ref, task.ProjectID, req.ProjectID)
-		}
-		if receipt.ProvenanceMode != ProvenanceReduced && strings.TrimSpace(receipt.ProviderRevision) == "" {
-			return nil, fmt.Errorf("%w for %s: receipt is missing provider_revision", ErrNoEvidence, ref)
-		}
-		return task, nil
+	if req.Receipt == nil {
+		return resolveTaskByRef(ctx, tp, req.ProjectID, ref)
 	}
-	return resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+	receipt := req.Receipt
+	if receipt.ProvenanceMode == ProvenanceReduced {
+		// Reduced-receipt compatibility rule (FAC-783): reduced receipts omit
+		// task_id and provider_revision by design; their signed authority is
+		// the post-merge PR reconciliation. Only this mode resolves through
+		// the legacy ref resolver — never a full receipt with a missing task
+		// identity.
+		return resolveTaskByRef(ctx, tp, req.ProjectID, ref)
+	}
+	// FAC-783: task identity is required signed identity on a full receipt.
+	// Its absence rejects BEFORE any provider call — an invalid receipt must
+	// never be laundered into the legacy ref resolver's provider-wide lookup.
+	if strings.TrimSpace(receipt.TaskID) == "" {
+		return nil, fmt.Errorf("%w for %s: receipt is missing task_id", ErrNoEvidence, ref)
+	}
+	task, err := tp.GetTask(ctx, receipt.TaskID)
+	if err != nil {
+		return nil, fmt.Errorf("%w for %s: receipt is bound to task id %s but board lookup failed: %w", ErrNoEvidence, ref, receipt.TaskID, err)
+	}
+	if task == nil || strings.TrimSpace(task.ID) == "" {
+		return nil, fmt.Errorf("%w for %s: exact task read returned invalid or error-shaped response for task id %s", ErrNoEvidence, ref, receipt.TaskID)
+	}
+	if task.ID != receipt.TaskID {
+		return nil, fmt.Errorf("%w for %s: receipt task id %s does not match board task id %s", ErrNoEvidence, ref, receipt.TaskID, task.ID)
+	}
+	if NormalizeRef(receipt.TaskRef) != ref {
+		return nil, fmt.Errorf("%w for %s: receipt task ref %s does not match requested ref %s", ErrNoEvidence, ref, receipt.TaskRef, ref)
+	}
+	// FAC-783: exact identity requires the provider record to carry its
+	// canonical ref and project. A partial record — a response that echoes
+	// only the requested id — must refuse, not slip past conditional checks.
+	if strings.TrimSpace(task.Ref) == "" {
+		return nil, fmt.Errorf("%w for %s: board task %s carries no canonical ref", ErrNoEvidence, ref, task.ID)
+	}
+	if NormalizeRef(task.Ref) != ref {
+		return nil, fmt.Errorf("%w for %s: board task ref %s does not match requested ref %s", ErrNoEvidence, ref, task.Ref, ref)
+	}
+	if strings.TrimSpace(req.ProjectID) == "" {
+		return nil, fmt.Errorf("%w for %s: exact receipt lookup requires the requested project identity", ErrNoEvidence, ref)
+	}
+	if strings.TrimSpace(task.ProjectID) == "" {
+		return nil, fmt.Errorf("%w for %s: board task %s carries no project identity", ErrNoEvidence, ref, task.ID)
+	}
+	if task.ProjectID != req.ProjectID {
+		return nil, fmt.Errorf("%w for %s: board task project %s does not match requested project %s", ErrNoEvidence, ref, task.ProjectID, req.ProjectID)
+	}
+	// FAC-783: a full receipt's provider revision is bound to the live task.
+	// Non-empty is not enough — it must equal the revision the exact task read
+	// encodes, so a card whose board acceptance state changed since the
+	// receipt was minted refuses instead of closing on stale evidence.
+	// The binding guards the transition INTO done: a card that already reads
+	// done is closed (closure is monotonic), and refusing here would strand
+	// the crash-recovery replay — a write that landed but whose done-log
+	// record did not — which must converge (FAC-132). Idempotent replays are
+	// still governed by the done-log digest short-circuit and, on the fenced
+	// path, the live-lease gate.
+	if strings.TrimSpace(receipt.ProviderRevision) == "" {
+		return nil, fmt.Errorf("%w for %s: receipt is missing provider_revision", ErrNoEvidence, ref)
+	}
+	if provider.NormalizeStatus(task.Status) != provider.StatusDone {
+		liveRev := string(provider.EncodeRevision(task))
+		if receipt.ProviderRevision != liveRev {
+			return nil, fmt.Errorf("%w for %s: receipt provider revision %q does not match live task revision %q (board acceptance state changed since the receipt was minted)", ErrNoEvidence, ref, receipt.ProviderRevision, liveRev)
+		}
+	}
+	return task, nil
 }
 
 // resolveTaskByRef finds the board card for ref through the task provider.
@@ -562,6 +629,63 @@ func BoardDoneFenced(
 	if repoDir == "" {
 		repoDir = "."
 	}
+	// FAC-783: authenticate the receipt BEFORE any locator derived from it is
+	// consumed. ResolveDoneTask reads the provider with the receipt's own task
+	// id, so an unauthenticated receipt must never reach that read.
+	if req.Receipt != nil {
+		if req.Override != nil {
+			return nil, fmt.Errorf("%w for %s: a manual override cannot accompany a receipt; "+
+				"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
+		}
+		if err := validateAutomaticReceipt(req, repoDir, ref); err != nil {
+			return nil, err
+		}
+	}
+	var proof string
+	var override *OverrideRecord
+	switch {
+	case req.Receipt != nil:
+		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
+			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
+			shortDigest(req.Receipt.PatchID), shortDigest(req.Receipt.VerificationDigest),
+			req.Receipt.RiskTier, req.Receipt.AuthorFamily, req.Receipt.ReviewerFamily)
+
+	case req.Override != nil:
+		rec, err := authorizeOverride(*req.Override)
+		if err != nil {
+			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
+		}
+		override = rec
+		proof = fmt.Sprintf("manual override by %s under policy %s (%s): %s [evidence: %s]",
+			rec.Actor, rec.Policy, rec.Decision, rec.Reason, rec.Evidence)
+
+	default:
+		return nil, MissingCompletionReceiptError(repoDir, ref)
+	}
+
+	// Exactly-once: a receipt already recorded never advances the card again.
+	// The check precedes task resolution (FAC-783): closing the card advances
+	// its live revision, so an already-consumed full receipt can never satisfy
+	// the revision binding again — the idempotent hit must be found before the
+	// task read, never after it.
+	log, err := ReadDoneLog(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	if req.Receipt != nil {
+		for _, rec := range log {
+			if rec.ReceiptDigest != "" && rec.ReceiptDigest == req.Receipt.Digest {
+				if err := requireLiveLease(ctx, stack.Manager, key, ownerID, generation); err != nil {
+					return nil, boardCallErr(fmt.Sprintf("fenced done short-circuit for %s", ref), err)
+				}
+				return &DoneResult{
+					Ref: ref, TaskID: rec.TaskID, Proof: proof,
+					Idempotent: true, ReceiptDigest: req.Receipt.Digest,
+				}, nil
+			}
+		}
+	}
+
 	task, err := ResolveDoneTask(ctx, tp, req)
 	if err != nil {
 		return nil, err
@@ -581,35 +705,6 @@ func BoardDoneFenced(
 		evidence = req.Receipt.AcceptanceEvidence
 	}
 
-	var proof string
-	var override *OverrideRecord
-	switch {
-	case req.Receipt != nil && req.Override != nil:
-		return nil, fmt.Errorf("%w for %s: a manual override cannot accompany a receipt; "+
-			"drop one of them so the closing authority is unambiguous", ErrNoEvidence, ref)
-
-	case req.Receipt != nil:
-		if err := validateAutomaticReceipt(req, repoDir, ref); err != nil {
-			return nil, err
-		}
-		proof = fmt.Sprintf("completion receipt %s: candidate %s merged as %s, patch %s, verification %s, tier %s, %s reviewed by %s",
-			shortDigest(req.Receipt.Digest), shortSHA(req.Receipt.CandidateSHA), shortSHA(req.Receipt.MergeSHA),
-			shortDigest(req.Receipt.PatchID), shortDigest(req.Receipt.VerificationDigest),
-			req.Receipt.RiskTier, req.Receipt.AuthorFamily, req.Receipt.ReviewerFamily)
-
-	case req.Override != nil:
-		rec, err := authorizeOverride(*req.Override)
-		if err != nil {
-			return nil, fmt.Errorf("%w for %s: %v", ErrNoEvidence, ref, err)
-		}
-		override = rec
-		proof = fmt.Sprintf("manual override by %s under policy %s (%s): %s [evidence: %s]",
-			rec.Actor, rec.Policy, rec.Decision, rec.Reason, rec.Evidence)
-
-	default:
-		return nil, MissingCompletionReceiptError(repoDir, ref)
-	}
-
 	// Same two-route authorization as the unfenced path: a pre-existing
 	// acceptance block plus literal output, or -- for a legacy-policy override
 	// on a card that never had a block -- an admitted cross-family review
@@ -627,25 +722,6 @@ func BoardDoneFenced(
 			override.LegacyReviewerFamily = legacyEvidence.ReviewerFamily
 			override.LegacyBuilderFamily = legacyEvidence.BuilderFamily
 			override.LegacyMergeSHA = legacyEvidence.MergeSHA
-		}
-	}
-
-	// Exactly-once: a receipt already recorded never advances the card again.
-	log, err := ReadDoneLog(repoDir)
-	if err != nil {
-		return nil, err
-	}
-	if req.Receipt != nil {
-		for _, rec := range log {
-			if rec.ReceiptDigest != "" && rec.ReceiptDigest == req.Receipt.Digest {
-				if err := requireLiveLease(ctx, stack.Manager, key, ownerID, generation); err != nil {
-					return nil, boardCallErr(fmt.Sprintf("fenced done short-circuit for %s", ref), err)
-				}
-				return &DoneResult{
-					Ref: ref, TaskID: rec.TaskID, Proof: proof,
-					Idempotent: true, ReceiptDigest: req.Receipt.Digest,
-				}, nil
-			}
 		}
 	}
 

@@ -3865,6 +3865,13 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	}
 	receipt := req.Receipt
 	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
+	// FAC-783: authenticate the receipt BEFORE any locator derived from it is
+	// consumed — ResolveDoneTask reads the provider with the receipt's own
+	// task id, so the digest, repository, lifecycle, and integration proof
+	// must be proven before that read happens.
+	if err := hsync.AuthenticateDoneReceipt(req, root, ref); err != nil {
+		return nil, err
+	}
 	approvalTask, err := hsync.ResolveDoneTask(ctx, tp, req)
 	if err != nil {
 		return nil, err
