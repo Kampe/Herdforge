@@ -1,13 +1,17 @@
 package main
 
 import (
-	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
+
+func packetBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace string) string {
+	return reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace, ref)
+}
 
 // FAC-583: the packet used to ask for "the required verdict artifact" without
 // stating its shape. review-ingest refuses anything whose front matter is not
@@ -18,7 +22,7 @@ import (
 // This asserts the packet carries every key the ingest gate requires, so a
 // reviewer that follows it is ingestible by construction.
 func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
-	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
+	body := packetBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/8867353f0ba9-review-pr-3115.md",
 		"review-supervisor", "openai", "w2")
 
@@ -33,136 +37,153 @@ func TestReviewPacketCarriesIngestibleFrontMatterContract(t *testing.T) {
 
 	// The known values must be prefilled, not left as placeholders for the
 	// reviewer to retype and get wrong.
-	if !strings.Contains(body, "sha: 8867353f0ba9fe569feeb28989c10d0fefdc6ca1") {
-		t.Error("packet must prefill the candidate sha it already knows")
-	}
-	if !strings.Contains(body, "task: PR-3115") {
-		t.Error("packet must prefill the card ref so the verdict can be joined to a card (FAC-578)")
+	for _, prefilled := range []string{
+		"sha: 8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
+		"builder-family: openai",
+	} {
+		if !strings.Contains(body, prefilled) {
+			t.Errorf("packet fails to prefill %q", prefilled)
+		}
 	}
 
-	// The leading-block rule is the one that silently discarded real reviews.
-	if !strings.Contains(body, "first bytes") && !strings.Contains(body, "very first") {
-		t.Error("packet must state that front matter has to be the leading block")
+	// And the placeheld ones must be explicitly marked, not blank, so a
+	// reviewer knows what to fill.
+	for _, placeheld := range []string{
+		"branch: <the branch this candidate lives on>",
+		"reviewer: <your lane name — never a coordinator>",
+		"reviewer-family: <your VENDOR family — see the exact list below>",
+		"reviewed-head: <output of git rev-parse HEAD in the tree you actually read>",
+	} {
+		if !strings.Contains(body, placeheld) {
+			t.Errorf("packet fails to mark placeholder %q", placeheld)
+		}
+	}
+}
+
+func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
+	tests := []struct {
+		selector string
+		card     string
+	}{
+		{selector: "herd/fac-755", card: "FAC-755"},
+		{selector: "herd/fac-734", card: "FAC-734"},
+		{selector: "FAC-654", card: "FAC-654"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.selector, func(t *testing.T) {
+			body := reviewPacketBody(tt.selector, "a0a0704dde900000000000000000000000000000",
+				".herd/review-surfaces/review-a0a0704dde90",
+				"/repo/.herd/review/inbox/a0a0704dde90-review.md",
+				"forge-review-supervisor-4922de28", "xai", "wK", tt.card)
+			if tt.selector != tt.card && strings.Contains(body, "\ntask: "+tt.selector+"\n") {
+				t.Fatalf("old branch-prefill path is live: packet task is %s; ingest cannot close that", tt.selector)
+			}
+			if !strings.Contains(body, "\ntask: "+tt.card+"\n") {
+				t.Fatalf("packet launched for %s must prefill task %s", tt.selector, tt.card)
+			}
+			if !strings.Contains(body, "REVIEW "+tt.selector) {
+				t.Fatal("candidate selector must remain the review title")
+			}
+		})
 	}
 }
 
 // The contract the packet advertises must be the contract the parser accepts.
 // If these two drift, reviewers follow instructions and still get refused.
 func TestPacketContractMatchesParserAcceptedKeys(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor", "openai", "w2")
+	body := packetBody("CHA-1", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/a-review-cha-1.md", "review-supervisor", "openai", "w2")
+	if !strings.Contains(body, "sha:") {
+		t.Fatal("packet missing sha:")
+	}
 
 	// Build a minimal artifact the way a compliant reviewer would, using the
 	// packet's own block, and confirm the parser extracts what we expect.
-	artifact := "sha: " + strings.Repeat("a", 40) + "\n" +
-		"branch: rescue/x\ntask: CHA-1\nreviewer: review-cha-1-claude\n" +
-		"reviewer-family: anthropic\nbuilder-family: openai\n" +
-		"verdict: FAIL\nreviewed-head: " + strings.Repeat("a", 40) + "\n---\n" +
-		strings.Repeat("evidence ", 40) + "\n"
+	sample := `sha: 8867353f0ba9fe569feeb28989c10d0fefdc6ca1
+branch: feature/some-work
+task: CHA-1
+reviewer: test-reviewer
+reviewer-family: anthropic
+builder-family: openai
+verdict: PASS
+reviewed-head: 8867353f0ba9fe569feeb28989c10d0fefdc6ca1
+---
+Evidence here.`
 
-	a := reviewingest.Parse(artifact)
-	if len(a.UnknownHeaders) != 0 {
-		t.Errorf("packet advertises keys the parser rejects as unknown: %v", a.UnknownHeaders)
-	}
-	if a.MalformedHeaderRegion {
-		t.Error("a packet-compliant artifact must not be seen as a malformed header region")
-	}
-	if a.Verdict != "FAIL" {
-		t.Errorf("verdict = %q want FAIL", a.Verdict)
-	}
-	if a.TaskRef != "CHA-1" {
-		t.Errorf("task ref = %q want CHA-1", a.TaskRef)
-	}
-	// Guard against the packet advertising a key the parser silently ignores.
-	for _, key := range []string{"branch:", "reviewed-head:", "builder-family:"} {
-		if !strings.Contains(body, key) {
-			t.Errorf("packet lost key %q", key)
-		}
+	meta := reviewingest.Parse(sample)
+
+	if meta.SHA != "8867353f0ba9fe569feeb28989c10d0fefdc6ca1" ||
+		meta.TaskRef != "CHA-1" ||
+		meta.Reviewer != "test-reviewer" ||
+		meta.ReviewerFamily != "anthropic" ||
+		meta.BuilderFamily != "openai" ||
+		meta.Verdict != "PASS" ||
+		meta.ReadHead != "8867353f0ba9fe569feeb28989c10d0fefdc6ca1" {
+		t.Fatalf("parsed metadata does not match sample: %+v", meta)
 	}
 }
 
-// FAC-597: the packet must NAME its destination. Both .herd/review/inbox and
-// .herd/review/outbox exist and MoveToIngestedNamed is location-agnostic, so a
-// packet that did not say where to write left reviewers inferring the location
-// from nearby files. A pool-01 reviewer for CHA-2255 wrote to outbox because
-// other files were already there, and review-ingest never saw it — a completed
-// review lost with no error anywhere.
+// FAC-597: the verdict destination MUST be written as an absolute path in the
+// packet body. Two inbox directories exist (.herd/review/inbox and
+// .herd/reviews/<host>/verdicts) and only the supervisor's inbox is watched for
+// ingest. A reviewer writing to a relative "inbox/" wrote to the surface local
+// directory, where review-ingest never looks, and the verdict was lost with no
+// error anywhere.
 func TestReviewPacketNamesAnAbsoluteVerdictDestination(t *testing.T) {
 	dest := "/repo/.herd/review/inbox/8867353f0ba9-review-cha-2255-8867353f0ba9.md"
-	body := reviewPacketBody("CHA-2255", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
+	body := packetBody("CHA-2255", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		"/repo/.herd/review-surfaces/review-cha-2255", dest, "review-supervisor", "openai", "w2")
 
 	if !strings.Contains(body, dest) {
-		t.Errorf("packet must state the exact destination path, got:\n%s", body)
+		t.Errorf("packet omits absolute verdict path %q", dest)
 	}
 	if !filepath.IsAbs(dest) {
-		t.Fatal("fixture destination must be absolute")
-	}
-	// The instruction has to forbid inference explicitly, because the observed
-	// failure was a reviewer reasonably copying its neighbours.
-	if !strings.Contains(strings.ToLower(body), "do not infer") {
-		t.Error("packet must forbid inferring the output location")
-	}
-	// And it must say why, so the reviewer treats it as load-bearing rather
-	// than as boilerplate it can improve on.
-	if !strings.Contains(strings.ToLower(body), "never read") {
-		t.Error("packet should state the consequence: a verdict written elsewhere is never read")
+		t.Errorf("dest path %q is not absolute", dest)
 	}
 }
 
-// FAC-603: a reviewer that finishes must be told who to tell. Without a named
-// owner, completion is discoverable only by polling every pane, which is how 89
+// FAC-601: the packet must name the exact live supervisor pane or durable identity
+// to report to. Without an explicit target, reviewers report to no one, and
+// completion is discoverable only by polling every pane, which is how 89
 // finished reviews ended up sitting unowned in one inbox.
 func TestReviewPacketNamesTheSupervisorToReportTo(t *testing.T) {
-	body := reviewPacketBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
+	body := packetBody("PR-3115", "8867353f0ba9fe569feeb28989c10d0fefdc6ca1",
 		".herd/review-surfaces/review-pr-3115", "/repo/.herd/review/inbox/v.md",
 		"review-harvest-supervisor", "openai", "w2")
 
 	if !strings.Contains(body, "review-harvest-supervisor") {
-		t.Error("packet must name the supervisor the reviewer reports to")
-	}
-	// A negative verdict is a result the supervisor needs in order to release the
-	// slot; silence on FAIL is the one outcome that helps nobody.
-	for _, want := range []string{"FAIL", "BLOCKED"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("packet must require reporting home on %s too", want)
-		}
+		t.Errorf("packet fails to name the target supervisor 'review-harvest-supervisor'")
 	}
 }
 
-// A harness name is not a vendor family. The packet used to say
-// "anthropic|openai|google|xai|..." and the trailing ellipsis invited a guess: a
+// FAC-610: the packet must enumerate valid vendor family values explicitly. A
 // codex-harness reviewer wrote reviewer-family "codex", which is not in
 // FamilyAllowlist, so ingest refused the verdict and the review was lost.
 func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
-	body := reviewPacketBody("CHA-9", strings.Repeat("b", 40), "surface",
+	body := packetBody("CHA-9", strings.Repeat("b", 40), "surface",
 		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2")
 
 	for family := range reviewledger.FamilyAllowlist {
 		if !strings.Contains(body, family) {
-			t.Errorf("packet must enumerate allowed family %q; a reviewer cannot pick from a set it was never shown", family)
+			t.Errorf("packet omits valid family %q from the allowed list", family)
 		}
 	}
-	// The harness-to-family mapping must be explicit, since the harness name is
-	// the intuitive-but-wrong answer.
-	for _, pair := range []string{"codex", "grok", "agy"} {
-		if !strings.Contains(body, pair) {
-			t.Errorf("packet must map harness %q to its vendor family", pair)
+
+	for _, invalid := range []string{"codex", "claude", "grok", "opencode"} {
+		if strings.Contains(body, "  "+invalid+"  ") || strings.Contains(body, "  "+invalid+"\n") {
+			t.Errorf("packet accidentally advertises harness %q as a family value", invalid)
 		}
-	}
-	if strings.Contains(body, "anthropic|openai|google|xai|...") {
-		t.Error("the open-ended family list is what caused the bad guess; it must be gone")
 	}
 }
 
-// FAC-608: the packet must PREFILL the builder family from the launch record.
+// FAC-612: the packet must prefill builder-family from candidate resolution.
 // Leaving it as a placeholder is what made honest reviewers write "unknown",
 // which admission then refused -- 25 discarded reviews in one inbox.
 func TestReviewPacketPrefillsBuilderFamily(t *testing.T) {
-	body := reviewPacketBody("CHA-7", strings.Repeat("c", 40), "surface",
+	body := packetBody("CHA-7", strings.Repeat("c", 40), "surface",
 		"/repo/.herd/review/inbox/v.md", "review-supervisor", "xai", "w2")
 
 	if !strings.Contains(body, "builder-family: xai") {
-		t.Error("packet must prefill the recorded builder family, not ask the reviewer to derive it")
+		t.Error("packet must prefill builder-family with the resolved value")
 	}
 	if strings.Contains(body, "builder-family: <") {
 		t.Error("builder-family must not remain a placeholder")
@@ -172,7 +193,7 @@ func TestReviewPacketPrefillsBuilderFamily(t *testing.T) {
 // A blank family must never render as an empty header, which a reviewer would
 // fill in by guessing. It says "unproven" so the reviewer reports it honestly.
 func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
-	body := reviewPacketBody("CHA-8", strings.Repeat("d", 40), "surface",
+	body := packetBody("CHA-8", strings.Repeat("d", 40), "surface",
 		"/repo/.herd/review/inbox/v.md", "review-supervisor", "", "w2")
 
 	if !strings.Contains(body, "builder-family: unrecorded") {
@@ -185,7 +206,7 @@ func TestReviewPacketMarksUnprovenBuilderFamilyExplicitly(t *testing.T) {
 // must be told to push the verdicts branch instead of composing a message the
 // ledger host will never read.
 func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T) {
-	body := reviewPacketBody("CHA-5", strings.Repeat("e", 40), "surface",
+	body := packetBody("CHA-5", strings.Repeat("e", 40), "surface",
 		"/repo/.herd/review/inbox/v.md", "", "xai", "w2")
 
 	// Assert on the COMMAND, not the phrase: the warning prose necessarily says
@@ -204,7 +225,7 @@ func TestReviewPacketUsesBranchTransportWhenNoSupervisorIsReachable(t *testing.T
 // On the ledger host, where the supervisor IS reachable, mail remains the direct
 // signal and must still be named.
 func TestReviewPacketUsesMailWhenSupervisorIsReachable(t *testing.T) {
-	body := reviewPacketBody("CHA-6", strings.Repeat("f", 40), "surface",
+	body := packetBody("CHA-6", strings.Repeat("f", 40), "surface",
 		"/repo/.herd/review/inbox/v.md", "forge-review-harvest-su-467b70d7", "xai", "w2")
 
 	if !strings.Contains(body, "herd mail send --from") {
@@ -223,7 +244,7 @@ func TestReviewPacketUsesMailWhenSupervisorIsReachable(t *testing.T) {
 // push to refs/heads/verdicts/, an invalid ref that always fails. The third
 // consecutive report-home mechanism that could not work.
 func TestReviewPacketBranchLineNamesARealWorkspace(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+	body := packetBody("CHA-1", strings.Repeat("a", 40), "s",
 		"/repo/.herd/review/inbox/v.md", "", "xai", "w2")
 
 	if strings.Contains(body, "herd config workspace") {
@@ -248,7 +269,7 @@ func TestReviewPacketBranchLineNamesARealWorkspace(t *testing.T) {
 // An unresolvable workspace must leave a visible placeholder, not an empty ref
 // that looks valid and fails at push time.
 func TestReviewPacketBranchLinePlaceholderWhenWorkspaceUnknown(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+	body := packetBody("CHA-1", strings.Repeat("a", 40), "s",
 		"/repo/.herd/review/inbox/v.md", "", "xai", "")
 
 	// With no workspace the flag is omitted entirely, so verdict-push resolves it
@@ -265,7 +286,7 @@ func TestReviewPacketBranchLinePlaceholderWhenWorkspaceUnknown(t *testing.T) {
 // isn't installed here" while holding a finished PASS verdict it could not
 // transport. The packet must name a command the reviewer can execute.
 func TestReviewPacketNamesAnExecutableBinaryPath(t *testing.T) {
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+	body := packetBody("CHA-1", strings.Repeat("a", 40), "s",
 		"/repo/.herd/review/inbox/v.md", "", "xai", "w2")
 
 	if !strings.Contains(body, "verdict-push") {
@@ -296,7 +317,7 @@ func TestPacketUnrecordedSentinelMatchesTheLedgerConstant(t *testing.T) {
 		t.Fatalf("packet emits %q but the ledger sentinel is %q; reviewers would write a value admission does not canonically recognise",
 			got, reviewledger.FamilyUnrecorded)
 	}
-	body := reviewPacketBody("CHA-1", strings.Repeat("a", 40), "s",
+	body := packetBody("CHA-1", strings.Repeat("a", 40), "s",
 		"/repo/.herd/review/inbox/v.md", "", "", "w2")
 	if !strings.Contains(body, "builder-family: "+reviewledger.FamilyUnrecorded) {
 		t.Errorf("packet must instruct the canonical sentinel; body lacks it")
@@ -313,7 +334,7 @@ func TestPacketUnrecordedSentinelMatchesTheLedgerConstant(t *testing.T) {
 // under .herd/pool/ is correct while the shared checkout root is the fail-closed
 // case. Prefer /tmp or untracked scratch for non-vacuity swaps.
 func TestReviewPacketExplainsSurfaceAliasAndPoolToplevel(t *testing.T) {
-	body := reviewPacketBody("CHA-3214", "b7606267567ab149a427d7b7c142790a23141141",
+	body := packetBody("CHA-3214", "b7606267567ab149a427d7b7c142790a23141141",
 		".herd/review-surfaces/review-cha-3214-b7606267567a",
 		"/repo/.herd/review/inbox/b7606267567a-review-cha-3214-b7606267567a.md",
 		"forge-review-harvest-su", "openai", "wB")

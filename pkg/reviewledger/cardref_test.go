@@ -13,10 +13,12 @@ func TestCloseableCardRefExactOnly(t *testing.T) {
 		"standing/api-crusader":   "",
 		"wt/chain-indexer":       "",
 		"fix/cha-2120-telegram": "", // substring must not count
-		"feat/some-branch":       "",
-		"":                       "",
-		"nonsense":               "",
-		"toolongprefix-1":        "",
+		"herd/fac-755":          "", // branch selector is not a card
+		"herd/fac-734":          "",
+		"feat/some-branch":      "",
+		"":                      "",
+		"nonsense":              "",
+		"toolongprefix-1":       "",
 	}
 	for in, want := range cases {
 		if got := CloseableCardRef(in); got != want {
@@ -32,6 +34,19 @@ func TestRequireCloseableCardRefNamesTheBadValue(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{"FAC-578", `artifact x.md task "standing/api-crusader"`, "closeable card ref"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("refusal missing %q in %q", want, msg)
+		}
+	}
+}
+
+func TestRequireCloseableCardRefRejectsBranchPrefill(t *testing.T) {
+	err := RequireCloseableCardRef("herd/fac-755", "artifact review-herd-fac-755.md task")
+	if err == nil {
+		t.Fatal("branch-prefilled task herd/fac-755 must be refused")
+	}
+	msg := err.Error()
+	for _, want := range []string{"FAC-578", "herd/fac-755", "closeable card ref"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("refusal missing %q in %q", want, msg)
 		}
