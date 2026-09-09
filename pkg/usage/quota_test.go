@@ -196,6 +196,104 @@ func TestPoolResources(t *testing.T) {
 	}
 }
 
+func TestClaudeFableExhaustionDoesNotExhaustDefaultPool(t *testing.T) {
+	now := freezeTime()
+	snap := &UsageSnapshot{
+		Providers: map[string]ProviderUsage{
+			"claude": {
+				DisplayName: "Claude",
+				Plan:        "Max",
+				Stale:       false,
+				Resources: map[string]ResourceUsage{
+					"session": {
+						Kind: "consumption", Unit: "percent", Used: 21, Utilization: 0.21,
+						Remaining: 79, Limit: 100, ResetsAt: now.Add(4 * time.Hour).Format(time.RFC3339), WindowSeconds: Window5h,
+					},
+					"weekly": {
+						Kind: "consumption", Unit: "percent", Used: 71, Utilization: 0.71,
+						Remaining: 29, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: WindowWeekly,
+					},
+					"sonnetWeekly": {
+						Kind: "consumption", Unit: "percent", Used: 71, Utilization: 0.71,
+						Remaining: 29, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: WindowWeekly,
+					},
+					"fableWeekly": {
+						Kind: "consumption", Unit: "percent", Used: 95, Utilization: 0.95,
+						Remaining: 5, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: WindowWeekly,
+					},
+				},
+			},
+		},
+	}
+	e := newTestEngine()
+	computed := e.ComputeAll(snap)
+
+	claude, ok := computed["claude"]
+	if !ok {
+		t.Fatal("missing claude in computed")
+	}
+	defPool, ok := claude.Pools["default"]
+	if !ok {
+		t.Fatal("missing default pool in claude")
+	}
+	if !defPool.Available {
+		t.Errorf("claude/default should be AVAILABLE when only fableWeekly is at 95%% (got reason=%s used=%f)", defPool.Reason, defPool.Used)
+	}
+	if defPool.Used != 71 {
+		t.Errorf("claude/default used: expected 71, got %f", defPool.Used)
+	}
+
+	fablePool, ok := claude.Pools["fable"]
+	if !ok {
+		t.Fatal("missing fable pool in claude")
+	}
+	if fablePool.Available {
+		t.Errorf("claude/fable should NOT be available when fableWeekly is at 95%%")
+	}
+	if fablePool.Used != 95 {
+		t.Errorf("claude/fable used: expected 95, got %f", fablePool.Used)
+	}
+}
+
+func TestClaudeDefaultExhaustedRefuses(t *testing.T) {
+	now := freezeTime()
+	snap := &UsageSnapshot{
+		Providers: map[string]ProviderUsage{
+			"claude": {
+				DisplayName: "Claude",
+				Plan:        "Max",
+				Stale:       false,
+				Resources: map[string]ResourceUsage{
+					"session": {
+						Kind: "consumption", Unit: "percent", Used: 95, Utilization: 0.95,
+						Remaining: 5, Limit: 100, ResetsAt: now.Add(4 * time.Hour).Format(time.RFC3339), WindowSeconds: Window5h,
+					},
+					"weekly": {
+						Kind: "consumption", Unit: "percent", Used: 71, Utilization: 0.71,
+						Remaining: 29, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: WindowWeekly,
+					},
+					"fableWeekly": {
+						Kind: "consumption", Unit: "percent", Used: 21, Utilization: 0.21,
+						Remaining: 79, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: WindowWeekly,
+					},
+				},
+			},
+		},
+	}
+	e := newTestEngine()
+	computed := e.ComputeAll(snap)
+
+	claude := computed["claude"]
+	defPool := claude.Pools["default"]
+	if defPool.Available {
+		t.Errorf("claude/default should be EXHAUSTED when session is at 95%%")
+	}
+	fablePool := claude.Pools["fable"]
+	if fablePool.Available {
+		t.Errorf("claude/fable should be EXHAUSTED when session is at 95%%")
+	}
+}
+
 func TestComputeAll(t *testing.T) {
 	snap := parseFixture(t)
 	e := newTestEngine()
