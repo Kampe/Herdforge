@@ -60,11 +60,24 @@ func TestBuilderWorkspaceUsesRegisteredBinding(t *testing.T) {
 	}
 }
 
-func TestWorkerConfigDriftRejectsBeforeLaunch(t *testing.T) {
-	lane := &config.LaneDef{Name: "mutant", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}
-	err := validateLaneLaunchConfig(lane)
-	if !errors.Is(err, ErrWorkerConfigPolicy) {
-		t.Fatalf("drift must fail at worker policy boundary, got %v", err)
+func TestWorkerUnknownModelStillRejectsThroughRouter(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	pinHealthyQuota(t, dir, "codex")
+	lane := &config.LaneDef{Name: "mutant", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "not-a-real-model", Effort: "medium", TaskShape: launch.Implementation}
+	if err := validateLaneLaunchConfig(lane); err != nil {
+		t.Fatalf("surface validation should defer model authority to router: %v", err)
+	}
+	_, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err == nil {
+		t.Fatal("unknown worker model must be refused by native router authority")
 	}
 }
 
@@ -126,8 +139,8 @@ func TestCustomStandingRoleRejectsMalformedNativeWorkerTuple(t *testing.T) {
 	lane := &config.LaneDef{
 		Name: "docs-custodian", Role: "docs-custodian", Standing: true,
 		StandingRolePolicy: &config.StandingRolePolicy{NativeRole: launch.WorkerRole},
-		AgentKind:          "codex", Harness: "codex", Provider: testWorkerProvider,
-		Model: "gpt-5.6-sol", Effort: testWorkerEffort, TaskShape: "implementation",
+		AgentKind:          "codex", Harness: "codex", Provider: "not-a-provider",
+		Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: "implementation",
 	}
 	err := validateLaneLaunchConfig(lane)
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
@@ -191,7 +204,7 @@ func (r *fakeLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*
 }
 
 func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "mutant", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "not-a-provider", Model: testWorkerModel, Effort: "medium", TaskShape: "implementation"}}}
 	rec := &fakeLaunchLifecycle{}
 	valid, err := testLaunchRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, TaskRef: "worker", Scope: router.ScopeLane, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
@@ -413,7 +426,7 @@ func TestPrepareStandingWorktreePropagatesFailure(t *testing.T) {
 }
 
 func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-standing", Role: "worker", Standing: true, AgentKind: "codex", Harness: "codex", Provider: "not-a-provider", Model: testWorkerModel, Effort: "medium", TaskShape: "implementation"}}}
 	err := runStandingConfig(cfg, true)
 	if !errors.Is(err, ErrWorkerConfigPolicy) {
 		t.Fatalf("standing entrypoint must return worker policy failure: %v", err)
@@ -421,7 +434,7 @@ func TestStandingEntryPointReturnsPolicyFailureBeforeHerdr(t *testing.T) {
 }
 
 func TestForgeEntryPointReturnsPolicyFailureBeforeClaim(t *testing.T) {
-	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-sol", Effort: "medium", TaskShape: "implementation"}}}
+	cfg := &config.Config{Lanes: []config.LaneDef{{Name: "bad-forge", Role: "worker", AgentKind: "codex", Harness: "codex", Provider: "not-a-provider", Model: testWorkerModel, Effort: "medium", TaskShape: "implementation"}}}
 	claimed := false
 	_, err := forgeLaunchAdmission(cfg, &cfg.Lanes[0], context.Background(), func(*router.LaunchDecision) error {
 		claimed = true
@@ -489,6 +502,94 @@ func TestLaneLaunchConfigVendorHarnesses(t *testing.T) {
 	pi := &config.LaneDef{Name: "pi-reviewer", Role: launch.ReviewerRole, AgentKind: router.PiHarness, Harness: router.PiHarness, Provider: "codex", Model: "test-model", Effort: "medium", TaskShape: "qa"}
 	if err := validateLaneLaunchConfig(pi); !errors.Is(err, ErrHarnessConfigPolicy) {
 		t.Fatalf("Pi must fail closed as an unsupported harness: %v", err)
+	}
+}
+
+func TestWorkerLaunchConfigUsesRouterSurfaceAuthority(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		harness  string
+		model    string
+	}{
+		{name: "antigravity gemini flash", provider: "agy", harness: "agy", model: "gemini-3.7-flash"},
+		{name: "opencode glm flash", provider: "opencode", harness: "opencode", model: "litellm/lazer/glm-5.3-flash"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lane := &config.LaneDef{
+				Name: "cheap-worker", Role: launch.WorkerRole,
+				AgentKind: tt.harness, Harness: tt.harness, Provider: tt.provider,
+				Model: tt.model, Effort: "medium", TaskShape: launch.Implementation,
+			}
+			if err := validateLaneLaunchConfig(lane); err != nil {
+				t.Fatalf("router-authorized worker tuple rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkerLaunchConfigRejectsUnknownOrMismatchedSurface(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		harness  string
+		want     error
+	}{
+		{name: "unknown provider", provider: "unknown", harness: "codex", want: ErrWorkerConfigPolicy},
+		{name: "mismatched harness", provider: "agy", harness: "opencode", want: ErrHarnessConfigPolicy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lane := &config.LaneDef{
+				Name: "invalid-worker", Role: launch.WorkerRole,
+				AgentKind: tt.harness, Harness: tt.harness, Provider: tt.provider,
+				Model: "gemini-3.7-flash", Effort: "medium", TaskShape: launch.Implementation,
+			}
+			err := validateLaneLaunchConfig(lane)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("invalid worker tuple error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkerLaunchDecisionPreservesConfiguredCheapModel(t *testing.T) {
+	dir := t.TempDir()
+	for _, harness := range []string{"agy", "opencode"} {
+		if err := os.WriteFile(filepath.Join(dir, harness), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HERD_MODE", "local")
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	pinHealthyQuota(t, dir, "agy", "opencode")
+
+	for _, tt := range []struct {
+		provider string
+		harness  string
+		model    string
+	}{
+		{provider: "agy", harness: "agy", model: "gemini-3.7-flash"},
+		{provider: "opencode", harness: "opencode", model: "litellm/lazer/glm-5.3-flash"},
+	} {
+		t.Run(tt.provider, func(t *testing.T) {
+			lane := &config.LaneDef{
+				Name: "cheap-worker", Role: launch.WorkerRole,
+				AgentKind: tt.harness, Harness: tt.harness, Provider: tt.provider,
+				Model: tt.model, Effort: "medium", TaskShape: launch.Implementation,
+			}
+			decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+				return herdr.ProbeResult{Model: model, Available: true}
+			})
+			if err != nil {
+				t.Fatalf("native route rejected configured worker: %v", err)
+			}
+			if decision.Provider != tt.provider || decision.Harness != tt.harness || decision.Model != tt.model {
+				t.Fatalf("native route changed explicit tuple: got provider=%q harness=%q model=%q", decision.Provider, decision.Harness, decision.Model)
+			}
+		})
 	}
 }
 
