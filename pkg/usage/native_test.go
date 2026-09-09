@@ -409,7 +409,7 @@ func TestPollersErrorRatherThanReportZeroQuota(t *testing.T) {
 // The whole point of FAC-229: these providers are pollable WITHOUT the
 // OpenUsage macOS helper.
 func TestNativePollersCoverEveryHarness(t *testing.T) {
-	for _, want := range []string{"grok", "claude", "codex", "gemini", "antigravity", "litellm", "opencode", "kimi"} {
+	for _, want := range []string{"grok", "claude", "codex", "gemini", "antigravity", "litellm", "opencode", "ollama", "kimi"} {
 		if _, ok := nativePollers[want]; !ok {
 			t.Errorf("%s has no native poller; it would still need the OpenUsage binary", want)
 		}

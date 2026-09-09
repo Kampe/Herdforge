@@ -225,3 +225,26 @@ func TestFetchProviderModelUsesBillingAuthority(t *testing.T) {
 		t.Fatalf("billing result was not re-keyed to requested route: %+v", snap.Providers)
 	}
 }
+
+func TestFetchProviderModelUsesOllamaAuthorityForCloudFlash(t *testing.T) {
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+	var opencodeCalls, ollamaCalls int
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){
+		"opencode": func() (ProviderUsage, error) {
+			opencodeCalls++
+			return ProviderUsage{}, pollErrf("auth-missing", "opencode-go is absent")
+		},
+		"ollama": func() (ProviderUsage, error) {
+			ollamaCalls++
+			return ProviderUsage{Resources: map[string]ResourceUsage{"weekly": {Unit: "percent", Used: 20, Limit: 100, Remaining: 80, WindowSeconds: WindowWeekly}}}, nil
+		},
+	})
+	defer restore()
+	snap, err := FetchProviderModelForce("opencode", "ollama-cloud/deepseek-v4-flash", false)
+	if err != nil || snap == nil || ollamaCalls != 1 || opencodeCalls != 0 {
+		t.Fatalf("Ollama model authority was not selected: snap=%+v err=%v ollama=%d opencode=%d", snap, err, ollamaCalls, opencodeCalls)
+	}
+	if _, ok := snap.Providers["opencode"]; !ok {
+		t.Fatalf("Ollama result was not re-keyed for the requested launcher: %+v", snap.Providers)
+	}
+}

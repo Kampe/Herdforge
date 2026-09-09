@@ -2,7 +2,10 @@ package usage
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +16,202 @@ import (
 	"strings"
 	"time"
 )
+
+// Ollama Cloud authenticates quota reads with the same-host OpenSSH Ed25519
+// signing key that Ollama maintains. The key is read only for the duration of
+// one request; it is never refreshed, copied, returned, or included in a
+// snapshot. The request URI is signed verbatim, including the timestamp query.
+type ollamaSigningKey struct {
+	private ed25519.PrivateKey
+	public  ed25519.PublicKey
+	blob    []byte
+}
+
+func ollamaPoll() (ProviderUsage, error) {
+	key, err := readOllamaSigningKey()
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	defer zeroOllamaKey(&key)
+	return ollamaPollWithURL("https://ollama.com/api/usage", key, time.Now)
+}
+
+func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Time) (ProviderUsage, error) {
+	ts := strconv.FormatInt(now().Unix(), 10)
+	requestURI := "/api/usage?ts=" + ts
+	url := strings.TrimRight(endpoint, "/")
+	if parsed, err := http.NewRequest("GET", url+requestURI, nil); err == nil {
+		signature := ed25519.Sign(key.private, []byte("GET,"+requestURI))
+		parsed.Header.Set("Authorization", base64.StdEncoding.EncodeToString(key.blob)+":"+base64.StdEncoding.EncodeToString(signature))
+		resp, requestErr := pollClient().Do(parsed)
+		if requestErr != nil {
+			return ProviderUsage{}, netPollError(requestErr)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return ProviderUsage{}, httpRateLimitPollError("ollama quota", resp)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return ProviderUsage{}, httpStatusPollError("ollama quota", resp.StatusCode)
+		}
+		var body ollamaUsageResponse
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return ProviderUsage{}, pollErrf("decode-failed", "ollama quota decode: %v", err)
+		}
+		if strings.TrimSpace(body.Error) != "" {
+			return ProviderUsage{}, pollErrf("provider-error", "ollama quota: %s", strings.TrimSpace(body.Error))
+		}
+		resources := map[string]ResourceUsage{}
+		add := func(name string, usage *float64, seconds int) {
+			if usage == nil || *usage < 0 || *usage > 1 {
+				return
+			}
+			used := *usage * 100
+			resources[name] = ResourceUsage{Kind: "consumption", State: "active", Pool: "default", Unit: "percent", Limit: 100, Used: used, Remaining: 100 - used, Utilization: *usage, WindowSeconds: seconds}
+		}
+		if body.Limits.Session != nil {
+			add("session", body.Limits.Session.Usage, Window5h)
+		}
+		if body.Limits.Weekly != nil {
+			add("weekly", body.Limits.Weekly.Usage, WindowWeekly)
+		}
+		if len(resources) == 0 {
+			return ProviderUsage{}, pollErrf("no-windows", "ollama quota: no usable session or weekly window")
+		}
+		return ProviderUsage{DisplayName: "Ollama Cloud", Plan: body.Plan, Account: identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signing-key:public-key"), Resources: resources}, nil
+	}
+	return ProviderUsage{}, pollErrf("decode-failed", "ollama quota URL is invalid")
+}
+
+type ollamaUsageResponse struct {
+	Plan   string `json:"plan"`
+	Error  string `json:"error"`
+	Limits struct {
+		Session *struct {
+			Usage *float64 `json:"usage"`
+		} `json:"session"`
+		Weekly *struct {
+			Usage *float64 `json:"usage"`
+		} `json:"weekly"`
+	} `json:"limits"`
+}
+
+func ollamaKeyPath() (string, error) {
+	base := strings.TrimSpace(os.Getenv("OLLAMA_HOME"))
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", pollErrf("auth-missing", "ollama home is unavailable")
+		}
+		base = filepath.Join(home, ".ollama")
+	}
+	return filepath.Join(base, "id_ed25519"), nil
+}
+
+func readOllamaSigningKey() (ollamaSigningKey, error) {
+	path, err := ollamaKeyPath()
+	if err != nil {
+		return ollamaSigningKey{}, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ollamaSigningKey{}, pollErrf("auth-missing", "ollama signing key is unavailable; run ollama login")
+	}
+	defer zeroBytes(raw)
+	key, parseErr := parseOllamaOpenSSHKey(raw)
+	if parseErr != nil {
+		return ollamaSigningKey{}, pollErrf("auth-invalid", "ollama signing key is unusable")
+	}
+	return key, nil
+}
+
+func parseOllamaOpenSSHKey(raw []byte) (ollamaSigningKey, error) {
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "OPENSSH PRIVATE KEY" {
+		return ollamaSigningKey{}, fmt.Errorf("not an OpenSSH private key")
+	}
+	c := ollamaCursor{data: block.Bytes}
+	if string(c.takeBytes(len("openssh-key-v1"))) != "openssh-key-v1" || c.takeByte() != 0 {
+		return ollamaSigningKey{}, fmt.Errorf("invalid OpenSSH key magic")
+	}
+	if string(c.takeString()) != "none" || string(c.takeString()) != "none" || len(c.takeString()) != 0 || c.takeUint32() != 1 {
+		return ollamaSigningKey{}, fmt.Errorf("encrypted or multi-key OpenSSH key")
+	}
+	publicBlob := append([]byte(nil), c.takeString()...)
+	privateBlob := c.takeString()
+	if len(publicBlob) == 0 || len(privateBlob) == 0 || c.bad {
+		return ollamaSigningKey{}, fmt.Errorf("truncated OpenSSH key")
+	}
+	p := ollamaCursor{data: privateBlob}
+	check1, check2 := p.takeUint32(), p.takeUint32()
+	if p.bad || check1 != check2 || string(p.takeString()) != "ssh-ed25519" {
+		return ollamaSigningKey{}, fmt.Errorf("invalid OpenSSH private section")
+	}
+	public := append([]byte(nil), p.takeString()...)
+	private := append([]byte(nil), p.takeString()...)
+	_ = p.takeString() // comment is intentionally discarded
+	if p.bad || len(public) != ed25519.PublicKeySize || len(private) != ed25519.PrivateKeySize || len(private) < ed25519.SeedSize || !equalBytes(public, private[ed25519.SeedSize:]) {
+		return ollamaSigningKey{}, fmt.Errorf("invalid Ed25519 key material")
+	}
+	publicCursor := ollamaCursor{data: publicBlob}
+	if string(publicCursor.takeString()) != "ssh-ed25519" || !equalBytes(publicCursor.takeString(), public) || publicCursor.bad || len(publicCursor.data) != 0 {
+		return ollamaSigningKey{}, fmt.Errorf("public key blob mismatch")
+	}
+	privateKey := ed25519.NewKeyFromSeed(private[:ed25519.SeedSize])
+	zeroBytes(private)
+	if !equalBytes(privateKey[ed25519.SeedSize:], public) {
+		zeroBytes(privateKey)
+		return ollamaSigningKey{}, fmt.Errorf("derived public key mismatch")
+	}
+	return ollamaSigningKey{private: privateKey, public: ed25519.PublicKey(public), blob: publicBlob}, nil
+}
+
+type ollamaCursor struct {
+	data []byte
+	bad  bool
+}
+
+func (c *ollamaCursor) takeByte() byte {
+	if len(c.data) < 1 {
+		c.bad = true
+		return 0
+	}
+	b := c.data[0]
+	c.data = c.data[1:]
+	return b
+}
+func (c *ollamaCursor) takeUint32() uint32 {
+	if len(c.data) < 4 {
+		c.bad = true
+		return 0
+	}
+	v := uint32(c.data[0])<<24 | uint32(c.data[1])<<16 | uint32(c.data[2])<<8 | uint32(c.data[3])
+	c.data = c.data[4:]
+	return v
+}
+func (c *ollamaCursor) takeBytes(n int) []byte {
+	if n < 0 || len(c.data) < n {
+		c.bad = true
+		return nil
+	}
+	v := c.data[:n]
+	c.data = c.data[n:]
+	return v
+}
+func (c *ollamaCursor) takeString() []byte { n := c.takeUint32(); return c.takeBytes(int(n)) }
+func equalBytes(a, b []byte) bool          { return len(a) == len(b) && string(a) == string(b) }
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+func zeroOllamaKey(k *ollamaSigningKey) {
+	zeroBytes(k.private)
+	zeroBytes(k.blob)
+	k.private = nil
+	k.blob = nil
+	k.public = nil
+}
 
 // Antigravity quota is a same-host language-server authority. The collector
 // never starts AGY and never substitutes Gemini CLI data for these buckets.

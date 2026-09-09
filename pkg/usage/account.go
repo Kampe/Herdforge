@@ -66,6 +66,21 @@ func providerAccountIdentity(name string) *AccountIdentity {
 		return geminiAccountIdentity()
 	case "opencode":
 		return opencodeAccountIdentity()
+	case "ollama":
+		path, err := ollamaKeyPath()
+		if err != nil {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		key, err := parseOllamaOpenSSHKey(raw)
+		if err != nil {
+			return nil
+		}
+		defer zeroOllamaKey(&key)
+		return identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signing-key:public-key")
 	}
 	return nil
 }

@@ -72,12 +72,15 @@ func FetchProviderForce(provider string, force bool) (*UsageSnapshot, error) {
 
 // FetchProviderModelForce acquires the quota authority for the requested model,
 // rather than confusing the harness that launches it with its billing pool.
-// OpenCode is a launcher for several gateways: litellm/ and ollama/ models use
-// the LiteLLM authority, while opencode/ models use the OpenCode authority.
+// OpenCode is a launcher for several gateways: litellm/ models use the
+// LiteLLM authority, ollama-cloud/ models use Ollama's signed authority, and
+// opencode/ models use the OpenCode Go authority.
 func FetchProviderModelForce(provider, model string, force bool) (*UsageSnapshot, error) {
 	target := strings.ToLower(strings.TrimSpace(provider))
 	m := strings.ToLower(strings.TrimSpace(model))
-	if strings.Contains(m, "litellm/") || strings.Contains(m, "lazer/") || strings.Contains(m, "ollama/") || strings.Contains(m, "ollama-cloud") {
+	if strings.Contains(m, "ollama-cloud/") {
+		target = "ollama"
+	} else if strings.Contains(m, "litellm/") || strings.Contains(m, "lazer/") || strings.Contains(m, "litellm/ollama/") {
 		target = "litellm"
 	}
 	snap, err := fetchProviderCached(target, force)
@@ -111,6 +114,7 @@ var nativePollers = map[string]func() (ProviderUsage, error){
 	"antigravity": antigravityPoll,
 	"litellm":     litellmPoll,
 	"opencode":    opencodePoll,
+	"ollama":      ollamaPoll,
 	"kimi":        kimiPoll,
 }
 
@@ -156,6 +160,7 @@ var providerSource = map[string]string{
 	"antigravity": "native:same-host-language-server/RetrieveUserQuotaSummary",
 	"litellm":     "native:authenticated-key-info",
 	"opencode":    "native:opencode.ai/zen/go/v1/usage",
+	"ollama":      "native:ollama.com/api/usage:signed-ed25519",
 	"kimi":        "native:unsupported-no-quota-endpoint",
 }
 

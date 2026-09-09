@@ -323,6 +323,8 @@ func FamilyFor(provider, model string) string {
 		return "open-weight"
 	case "opencode":
 		switch {
+		case strings.Contains(m, "gemini"):
+			return "google"
 		case strings.Contains(m, "deepseek"):
 			return "deepseek"
 		case strings.Contains(m, "kimi"):

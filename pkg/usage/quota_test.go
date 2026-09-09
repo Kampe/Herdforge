@@ -463,10 +463,10 @@ func TestComputeAllPublicFixtureCoversEveryNativeProvider(t *testing.T) {
 		"claude": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "codex": {Resources: map[string]ResourceUsage{"weekly": percent(100)}},
 		"gemini": {Resources: map[string]ResourceUsage{"weekly": request(10)}}, "grok": {Resources: map[string]ResourceUsage{"weekly": percent(100)}},
 		"antigravity": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "litellm": {Resources: map[string]ResourceUsage{"weekly": usd(10)}},
-		"opencode": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "kimi": {Resources: map[string]ResourceUsage{"weekly": request(100)}},
+		"opencode": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "ollama": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "kimi": {Resources: map[string]ResourceUsage{"weekly": request(100)}},
 	}}
 	computed := newTestEngine().ComputeAll(snap)
-	for _, provider := range []string{"claude", "gemini", "antigravity", "litellm", "opencode"} {
+	for _, provider := range []string{"claude", "gemini", "antigravity", "litellm", "opencode", "ollama"} {
 		if !computed[provider].Available {
 			t.Errorf("%s fixture should be available: %+v", provider, computed[provider])
 		}
