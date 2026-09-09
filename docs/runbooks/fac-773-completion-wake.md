@@ -24,6 +24,20 @@ lane-specific `HERD_ROOT` is not a project-mail anchor. If a launcher supplies
 `HERD_PROJECT_ROOT`, it must name the exact canonical project root; do not
 replace it with a guessed worktree basename or fall back to a foreign repo.
 
+Incident evidence confirms the misplaced WSL report was caused by an explicit
+cwd-relative override, not by canonical-root resolution: the retained P7
+Codex session invoked `go run ./cmd/herd mail send ... --mail
+.herd/control-mail.jsonl` while its working directory was the linked worktree
+`.worktrees/mender-fac781-route`. That correctly wrote the envelope to that
+worktree's mailbox even though `HERD_PROJECT_ROOT` was already the canonical
+repository. When reporting to the coordinator, omit `--mail` so native
+canonical resolution applies, or pass a canonical-root-qualified path. Never
+use cwd-relative `.herd/control-mail.jsonl` from a linked worktree. The generic
+explicit-project-root rejection experiment was reverted and is not part of
+this contract. The old WSL PATH wrapper was separately backed up and replaced
+with the relative `../../Projects/Herdforge/bin/herd` symlink; verify its
+version and native `mail --help` before use.
+
 Delivery states are distinct: mailbox append is `queued`, prompt submission is
 `submitted`, pane/task evidence is `consumed`, and the handled sidecar is
 `handled`. Pending state is retained until consumption proof and handled-state
