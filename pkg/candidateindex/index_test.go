@@ -643,7 +643,7 @@ func TestCandidateIndex_LaterGenerationClearsEarlierSameSHABlockedCallback(t *te
 
 	receipt := verifier.Receipt{
 		Version: 1, TaskRef: "FAC-618", LeaseGeneration: "2",
-		CandidateSHA: sha, BaseSHA: base, Command: []string{"go", "test", "-count=1", "./..."},
+		CandidateSHA: sha, BaseSHA: base, Command: []string{"go", "test", "./..."},
 		ExitCode: 0, Outcome: verifier.OutcomePASS,
 	}
 	receipt.Digest = receipt.ComputeDigest()
@@ -687,6 +687,169 @@ func TestCandidateIndex_LaterGenerationClearsEarlierSameSHABlockedCallback(t *te
 	}
 	if c.State != StateEligible || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
 		t.Fatalf("generation 1 block contaminated completed generation 2: %+v", c)
+	}
+}
+
+func writeFAC744CallbackMail(t *testing.T, mailPath string, callbacks []struct {
+	sequence, generation int64
+	kind                 mail.CallbackKind
+	detail               string
+}) {
+	t.Helper()
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	defer func() {
+		if closeErr := mailFile.Close(); closeErr != nil {
+			t.Fatalf("close mail: %v", closeErr)
+		}
+	}()
+	for _, cb := range callbacks {
+		body, marshalErr := json.Marshal(mail.Callback{
+			Ref: "FAC-744", Kind: cb.kind, SHA: "56be267dd2cc0a42acb70141838d0e3f5645605b",
+			Detail: cb.detail, LeaseGeneration: cb.generation,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal callback: %v", marshalErr)
+		}
+		if encodeErr := json.NewEncoder(mailFile).Encode(mail.Envelope{
+			ID: fmt.Sprintf("fac-744-callback-%d", cb.sequence), Sequence: cb.sequence,
+			Sender: "worker", Recipient: mail.CoordinatorInbox,
+			Subject: string(cb.kind) + ": FAC-744", Body: string(body),
+			Timestamp: time.Unix(cb.sequence, 0).UTC(),
+		}); encodeErr != nil {
+			t.Fatalf("write callback: %v", encodeErr)
+		}
+	}
+}
+
+func writeFAC744Receipt(t *testing.T, dir, generation string, command []string, profileDigest, profileName, configRevision string) verifier.Receipt {
+	t.Helper()
+	receipt := verifier.Receipt{
+		Version: 1, TaskRef: "FAC-744", LeaseGeneration: generation,
+		CandidateSHA: "56be267dd2cc0a42acb70141838d0e3f5645605b",
+		BaseSHA:      "b42b69763598436c29d49e7922b27f011ae168a5",
+		Command:      command, ExitCode: 0, Outcome: verifier.OutcomePASS,
+		ProfileDigest:       profileDigest,
+		VerificationProfile: profileName,
+		ConfigRevision:      configRevision,
+	}
+	receipt.Digest = receipt.ComputeDigest()
+	receiptDir := filepath.Join(dir, ".herd", "verification-receipts")
+	if err := os.MkdirAll(receiptDir, 0700); err != nil {
+		t.Fatalf("create receipt dir: %v", err)
+	}
+	receiptData, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal receipt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(receiptDir, receipt.Digest[len("sha256:"):]+".json"), receiptData, 0600); err != nil {
+		t.Fatalf("write receipt: %v", err)
+	}
+	return receipt
+}
+
+func writeFAC744PassVerdict(t *testing.T, dir string) string {
+	t.Helper()
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	ledgerFile, err := os.Create(ledgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	if err := json.NewEncoder(ledgerFile).Encode(reviewledger.LedgerRow{
+		Timestamp: "2026-09-02T00:00:00Z", Event: string(reviewledger.EventVerdict),
+		SHA: "56be267dd2cc0a42acb70141838d0e3f5645605b", Task: "FAC-744",
+		Verdict: string(reviewledger.VerdictPASS),
+	}); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+	if err := ledgerFile.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	return ledgerPath
+}
+
+// FAC-744 finding 3: a PASS receipt only counts as the exact full-suite
+// completion proof when its command is the repository's authorized full-suite
+// test command and any profile identity it carries matches the live profile.
+// Targeted runs, scoped package subsets, and token lookalikes must not mark a
+// completion valid.
+func TestCandidateIndex_ReceiptAdmissionRequiresExactFullSuiteCommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		command        []string
+		profileDigest  string
+		profileName    string
+		configRevision string
+		wantAdmitted   bool
+	}{
+		{
+			name:    "targeted run flag is not the full suite",
+			command: []string{"go", "test", "./...", "-run", "TestOne"},
+		},
+		{
+			name:    "extra scoped package arguments are not the full suite",
+			command: []string{"go", "test", "./pkg/candidateindex", "./..."},
+		},
+		{
+			name:    "token lookalike non-Go command is refused",
+			command: []string{"echo", "go", "test", "./..."},
+		},
+		{
+			name:          "foreign profile digest is refused",
+			command:       []string{"go", "test", "./..."},
+			profileDigest: "sha256:" + strings.Repeat("1", 64),
+		},
+		{
+			name:        "foreign verification profile name is refused",
+			command:     []string{"go", "test", "./..."},
+			profileName: "not-the-verification-profile",
+		},
+		{
+			name:           "foreign config revision is refused",
+			command:        []string{"go", "test", "./..."},
+			configRevision: "sha256:" + strings.Repeat("2", 64),
+		},
+		{
+			name:         "exact authorized full-suite command is admitted",
+			command:      []string{"go", "test", "./..."},
+			wantAdmitted: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mailPath := filepath.Join(dir, "mail.jsonl")
+			writeFAC744CallbackMail(t, mailPath, []struct {
+				sequence, generation int64
+				kind                 mail.CallbackKind
+				detail               string
+			}{{sequence: 621, generation: 2, kind: mail.CallbackComplete}})
+			writeFAC744Receipt(t, dir, "2", tt.command, tt.profileDigest, tt.profileName, tt.configRevision)
+			ledgerPath := writeFAC744PassVerdict(t, dir)
+
+			cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+			if err != nil {
+				t.Fatalf("BuildIndex failed: %v", err)
+			}
+			if len(cands) != 1 {
+				t.Fatalf("expected one candidate, got %d", len(cands))
+			}
+			c := cands[0]
+			if tt.wantAdmitted {
+				if !c.CompletionValid {
+					t.Fatalf("exact full-suite receipt was not admitted: %+v", c)
+				}
+				if c.State == StateBlocked || len(c.BlockedReasons) != 0 {
+					t.Fatalf("admitted receipt left candidate blocked: %+v", c)
+				}
+				return
+			}
+			if c.CompletionValid {
+				t.Fatalf("non-full-suite receipt was admitted as the completion proof: command=%v", tt.command)
+			}
+		})
 	}
 }
 
