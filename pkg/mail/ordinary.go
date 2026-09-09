@@ -55,7 +55,7 @@ func (m *Mailbox) StatusOrdinary(recipient, id string) (OrdinaryStatus, error) {
 	}
 	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
 	if recipient == "" || id == "" {
-		return OrdinaryStatus{}, fmt.Errorf("mail: recipient and envelope id are required")
+		return OrdinaryStatus{}, ErrRecipientAndEnvelopeIDRequired
 	}
 	envs, err := m.ReadInbox(recipient)
 	if err != nil {
@@ -66,7 +66,7 @@ func (m *Mailbox) StatusOrdinary(recipient, id string) (OrdinaryStatus, error) {
 			continue
 		}
 		if !IsOrdinaryReport(env) {
-			return OrdinaryStatus{}, fmt.Errorf("mail: envelope %q is not an ordinary report", id)
+			return OrdinaryStatus{}, ordinaryEnvelopeClassError(id)
 		}
 		handled, err := m.Handled(recipient, id)
 		if err != nil {
@@ -74,7 +74,7 @@ func (m *Mailbox) StatusOrdinary(recipient, id string) (OrdinaryStatus, error) {
 		}
 		return OrdinaryStatus{ID: id, Recipient: recipient, Ordinary: true, Pending: !handled, Handled: handled}, nil
 	}
-	return OrdinaryStatus{}, fmt.Errorf("mail: ordinary envelope %q for recipient %q was not found", id, recipient)
+	return OrdinaryStatus{}, ordinaryEnvelopeNotFound(id, recipient)
 }
 
 // ImportOrdinary appends one source-host-labelled ordinary envelope. Retries

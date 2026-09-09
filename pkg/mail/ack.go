@@ -61,7 +61,7 @@ func loadAck(mailFile string) (*ackState, error) {
 func (m *Mailbox) MarkHandled(recipient, id string) error {
 	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
 	if recipient == "" || id == "" {
-		return fmt.Errorf("mail: recipient and envelope id are required")
+		return ErrRecipientAndEnvelopeIDRequired
 	}
 	st, err := loadAck(m.MailFile)
 	if err != nil {

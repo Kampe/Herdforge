@@ -96,7 +96,7 @@ func (m *Mailbox) AcknowledgeOrdinary(recipient, id string) error {
 	}
 	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
 	if recipient == "" || id == "" {
-		return fmt.Errorf("mail: recipient and envelope id are required")
+		return ErrRecipientAndEnvelopeIDRequired
 	}
 	envs, err := m.ReadInbox(recipient)
 	if err != nil {
@@ -108,11 +108,11 @@ func (m *Mailbox) AcknowledgeOrdinary(recipient, id string) error {
 		}
 		if env.Subject == QueuedDeliverySubject || IsControlSubject(env.Subject) ||
 			strings.HasPrefix(env.Subject, "complete:") || strings.HasPrefix(env.Subject, "blocked:") {
-			return fmt.Errorf("mail: envelope %q is not an ordinary report", id)
+			return ordinaryEnvelopeClassError(id)
 		}
 		return m.MarkHandled(recipient, id)
 	}
-	return fmt.Errorf("mail: ordinary envelope %q for recipient %q was not found", id, recipient)
+	return ordinaryEnvelopeNotFound(id, recipient)
 }
 
 func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool) ([]*Envelope, error) {
