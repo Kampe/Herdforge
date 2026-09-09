@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	probeToken  = "PROBE_OK"
-	probePrompt = "Reply with exactly: " + probeToken
+	probeToken            = "PROBE_OK"
+	probePrompt           = "Reply with exactly: " + probeToken
+	maxProbeFailureDetail = 4096
+	probeDetailTruncation = "... [probe detail truncated]"
 )
 
 // ProbeResult is the outcome of a single model probe.
@@ -115,11 +117,13 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 		return ProbeResult{Model: model, Reason: "probe timeout"}
 	}
 	if runErr != nil {
-		detail := firstLine(combined)
+		detail := strings.TrimSpace(combined)
+		status := spin.StripTerminalControlSequences(runErr.Error())
 		if detail == "" {
-			detail = spin.StripTerminalControlSequences(runErr.Error())
+			detail = status
+			status = ""
 		}
-		return ProbeResult{Model: model, Reason: "probe failed: " + detail}
+		return ProbeResult{Model: model, Reason: "probe failed: " + boundProbeFailureDetail(detail, status)}
 	}
 	if strings.TrimSpace(sanitizedOut) != probeToken {
 		return ProbeResult{Model: model, Reason: "no exact probe output"}
@@ -127,14 +131,32 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 	return ProbeResult{Model: model, Available: true}
 }
 
-// firstLine returns the first non-empty trimmed line from s.
-func firstLine(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if t := strings.TrimSpace(line); t != "" {
-			return t
-		}
+// boundProbeDetail retains useful multiline provider diagnostics while keeping
+// doctor output bounded. The marker makes truncation explicit to operators.
+func boundProbeDetail(s string) string {
+	s = strings.TrimSpace(spin.StripTerminalControlSequences(s))
+	if len(s) <= maxProbeFailureDetail {
+		return s
 	}
-	return ""
+	limit := maxProbeFailureDetail - len(probeDetailTruncation)
+	return s[:limit] + probeDetailTruncation
+}
+
+func boundProbeFailureDetail(detail, status string) string {
+	detail = strings.TrimSpace(spin.StripTerminalControlSequences(detail))
+	status = strings.TrimSpace(spin.StripTerminalControlSequences(status))
+	if status == "" {
+		return boundProbeDetail(detail)
+	}
+	suffix := "\n" + status
+	if len(detail)+len(suffix) <= maxProbeFailureDetail {
+		return detail + suffix
+	}
+	limit := maxProbeFailureDetail - len(suffix)
+	if limit <= len(probeDetailTruncation) {
+		return status[:maxProbeFailureDetail]
+	}
+	return detail[:limit-len(probeDetailTruncation)] + probeDetailTruncation + suffix
 }
 
 // providerProbeCommand builds the noninteractive probe invocation.
@@ -264,12 +286,23 @@ func piProbeCommand(provider, model, effort string) (string, []string, error) {
 // when every candidate is exhausted so the caller can fail loudly instead of
 // launching a dead lane.
 func ResolveHealthyModel(ctx context.Context, primary string, fallbacks []string) (string, []ProbeResult) {
+	return ResolveHealthyProviderModel(ctx, "opencode", primary, "", fallbacks)
+}
+
+// ResolveHealthyProviderModel probes primary then fallbacks through the exact
+// configured provider. Keeping ResolveHealthyModel above as an explicit
+// OpenCode wrapper preserves callers that predate provider-aware lanes.
+func ResolveHealthyProviderModel(ctx context.Context, provider, primary, effort string, fallbacks []string) (string, []ProbeResult) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		provider = "opencode"
+	}
 	var trail []ProbeResult
 	for _, m := range append([]string{primary}, fallbacks...) {
 		if m == "" {
 			continue
 		}
-		r := ProbeModel(ctx, m)
+		r := ProbeProviderModel(ctx, provider, m, effort)
 		trail = append(trail, r)
 		if r.Available {
 			return m, trail
