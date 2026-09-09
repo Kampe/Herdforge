@@ -223,6 +223,79 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 	return true, nil
 }
 
+// FenceOpReadback is the full read-only view of one fenced operation, mirroring
+// the broker's GET /v1/ops/<opID> receipt shape (FAC-785).
+type FenceOpReadback struct {
+	Applied        bool   `json:"applied"`
+	Ambiguous      bool   `json:"ambiguous"`
+	OpID           string `json:"op_id,omitempty"`
+	TaskID         string `json:"task_id,omitempty"`
+	FenceToken     int64  `json:"fence_token,omitempty"`
+	ExpectedStatus string `json:"expected_status,omitempty"`
+	Revision       string `json:"revision,omitempty"`
+}
+
+// LookupOp performs the exact-operation readback GET /v1/ops/<opID> and
+// returns the full receipt. Read-only: it issues a GET and nothing else.
+// Fail-closed: a 404 means unknown op (nil, nil); an HTTP 200 body carrying
+// {"error":...}, a malformed body, or any non-200 is a hard error — never
+// silently read as "not applied". opID is validated so it can never alter
+// the request path.
+func (c *FenceBrokerClient) LookupOp(ctx context.Context, opID string) (*FenceOpReadback, error) {
+	if c == nil || opID == "" {
+		return nil, fmt.Errorf("fence-broker: op lookup requires client+op")
+	}
+	if err := ValidateOpID(opID); err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/v1/ops/"+opID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("fence-broker op lookup HTTP %d: %s", resp.StatusCode, body)
+	}
+	var out FenceOpReadback
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("fence-broker op lookup: malformed body: %w", err)
+	}
+	if out.Ambiguous && out.Applied {
+		return nil, fmt.Errorf("fence-broker op lookup: contradictory receipt (applied and ambiguous)")
+	}
+	return &out, nil
+}
+
+// ValidateOpID refuses op identifiers that could alter an HTTP request path
+// or smuggle anything but an opaque operation id (hex UUID shape produced by
+// the claim outbox, case-insensitive).
+func ValidateOpID(opID string) error {
+	s := strings.TrimSpace(opID)
+	if s == "" {
+		return fmt.Errorf("fence-broker: op id is required")
+	}
+	if s != opID {
+		return fmt.Errorf("fence-broker: op id has surrounding whitespace")
+	}
+	if len(s) > 128 {
+		return fmt.Errorf("fence-broker: op id too long")
+	}
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '-' {
+			continue
+		}
+		return fmt.Errorf("fence-broker: op id %q is not a hex/dash operation id", opID)
+	}
+	return nil
+}
+
 // MutateStatus performs broker-enforced status mutation with an immutable
 // per-op pre-minted capability. Never mints. Never stores capability on client.
 func (c *FenceBrokerClient) MutateStatus(ctx context.Context, taskID, status string, fence int64, opID, capability string) error {

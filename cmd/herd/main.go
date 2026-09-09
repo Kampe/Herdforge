@@ -346,6 +346,9 @@ func main() {
 	case "fence-broker":
 		runFenceBroker()
 
+	case "fence-op":
+		runFenceOps()
+
 	case "board-done":
 		runBoardDone()
 

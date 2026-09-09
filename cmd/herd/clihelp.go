@@ -163,6 +163,11 @@ var subcommandUsage = map[string]string{
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--acceptance-output <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",
+	"fence-op": "Usage: herd fence-op status <opID> [--json] | herd fence-op reconcile [--op <opID>] [--json]\n" +
+		"  Read-only exact fenced-operation readback and evidence-only reconcile report.\n" +
+		"  Never mutates a provider or local bookkeeping; --settle is refused (no coordinator\n" +
+		"  authority primitive exists for a one-shot CLI). Exit: 0 applied/nothing pending,\n" +
+		"  1 error/refusal, 3 ambiguous/work remains, 4 unknown.",
 	"hooks-pin":   "Usage: herd hooks-pin [--provider claude] [--file PATH] [--dry-run]\n  Refresh the pinned hook policy set against the harness's LIVE hooks.\n  Drops policies whose handler no longer exists (those ground every launch\n  with hook.policy_mismatch) and adds newly discovered hooks as optional.\n  Preserves existing classifications; verifies the result binds before writing.",
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",

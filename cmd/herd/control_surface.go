@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 36
+const controlSurfaceVersion = 37
 
 type commandClass string
 
@@ -48,7 +48,7 @@ type controlSurfaceManifest struct {
 // list only: validation rejects omissions and duplicate classifications.
 var commandNamesByClass = map[commandClass][]string{
 	classPublicAgent: {
-		"board-audit", "candidate", "capacity", "handoffs", "utilization", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
+		"board-audit", "candidate", "capacity", "fence-op", "handoffs", "utilization", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
 		"activate", "approve", "attention", "board-card", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "idle-pool", "install", "kick", "labels", "lane-cut", "worktree-reap", "bundle-reclaim", "bundle-manifest", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resource-governor", "review", "review-host", "integrate", "integration-wake", "review-classify", "review-ingest", "review-bind-evidence", "review-abort", "review-complete-record", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
@@ -67,6 +67,7 @@ func commandMutates(name string) bool {
 		"process": true, "resources": true, "route": true, "scope": true, "selftest": true,
 		"status": true, "tests-for": true, "throughput": true, "tool-probe": true,
 		"timeline": true, "unmerged": true, "verify": true, "worktrees": true, "usage": true,
+		"fence-op": true,
 	}
 	return !readOnly[name]
 }
@@ -110,6 +111,9 @@ func controlSurface() controlSurfaceManifest {
 // or reclassifying a command changes the hash and fails tests until the author
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
+	// 37 registers the read-only `fence-op` exact-operation readback (FAC-785)
+	// alongside the current coordinator/operator command surface.
+	37: "44356189880c6d4f84c12101bcd0eb834c071fd8dd60d756792a6654afda04bb",
 	// 36 admits review-abort: coordinator-attributed abort of an exact review
 	// launch (quota-dead before verdict). It is not a reviewer verdict.
 	36: "4ab45143b3b9dd6b69bb698dc84f443d489cb279574894ce118875098da42ef6",
