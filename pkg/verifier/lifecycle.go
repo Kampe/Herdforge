@@ -157,13 +157,18 @@ type ownedSubprocess struct {
 // drain runs while the original process group is still owned by a live
 // supervisor.
 const ownershipWrapperScript = `
+proc_ready=0
+if [ "$1" = "--proc-ready" ]; then
+  proc_ready=1
+  shift
+fi
 user_path="$1"
 shift
 # Make the inherited root mount private before replacing proc. This keeps the
 # namespace-relative proc view local to the owned supervisor and its children.
 # The fixed hermetic Docker profile already supplies the proc authority and
 # intentionally disables nested namespace setup.
-if [ "${HERD_HERMETIC_CONTAINER:-}" != "1" ]; then
+if [ "$proc_ready" -ne 1 ] && [ "${HERD_HERMETIC_CONTAINER:-}" != "1" ]; then
   mount --make-rprivate / || exit 1
   mount -t proc proc /proc || exit 1
 fi
@@ -193,16 +198,16 @@ exit "$ec"
 // prepareOwnedCommand builds a Setpgid supervisor with status+ack pipes and an
 // inherited ownership marker FD. On Linux, also applies required PID/user
 // namespace containment; cmd.Start fails closed if the kernel refuses it.
-func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW, marker *os.File, markerPath string, err error) {
+func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW, marker *os.File, markerPath string, infoR, infoW *os.File, err error) {
 	statusR, statusW, err = os.Pipe()
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("status pipe: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("status pipe: %w", err)
 	}
 	ackR, ackW, err = os.Pipe()
 	if err != nil {
 		_ = statusR.Close()
 		_ = statusW.Close()
-		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("ack pipe: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("ack pipe: %w", err)
 	}
 	marker, markerPath, err = createOwnershipMarker()
 	if err != nil {
@@ -210,31 +215,50 @@ func prepareOwnedCommand(ctx context.Context, path string, args []string, dir st
 		_ = statusW.Close()
 		_ = ackR.Close()
 		_ = ackW.Close()
-		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("ownership marker: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("ownership marker: %w", err)
+	}
+	infoR, infoW, err = os.Pipe()
+	if err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		_ = marker.Close()
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("ownership info pipe: %w", err)
 	}
 	wrapArgs := append([]string{"-c", ownershipWrapperScript, "owned-wrap", path}, args...)
-	cmd = exec.CommandContext(ctx, "sh", wrapArgs...)
-	cmd.Dir = dir
+	cmd, err = ownershipCommand(ctx, dir, wrapArgs)
+	if err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		_ = marker.Close()
+		_ = infoR.Close()
+		_ = infoW.Close()
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, err
+	}
 	if env != nil {
 		cmd.Env = env
 	}
 	attr := &syscall.SysProcAttr{Setpgid: true}
-	applyOwnershipContainment(attr)
 	cmd.SysProcAttr = attr
-	// ExtraFiles: child FD3=statusW, FD4=ackR, FD5=marker
-	cmd.ExtraFiles = []*os.File{statusW, ackR, marker}
-	return cmd, statusR, statusW, ackR, ackW, marker, markerPath, nil
+	// ExtraFiles: child FD3=statusW, FD4=ackR, FD5=marker, FD6=bwrap info.
+	cmd.ExtraFiles = []*os.File{statusW, ackR, marker, infoW}
+	return cmd, statusR, statusW, ackR, ackW, marker, markerPath, infoR, infoW, nil
 }
 
 // adoptOwnedCmd records the leader and prepares for the two-phase protocol.
 // handshake pipes: statusR reads start/done; ackW writes go.
 // marker/markerPath are the inherited lineage marker (kill authority for
 // escaped descendants). candidateDir is corroboration-only.
-func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
+func adoptOwnedCmd(cmd *exec.Cmd, leader int, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, errors.New("adopt owned cmd: nil process")
 	}
-	leader := cmd.Process.Pid
+	if leader <= 1 {
+		return nil, fmt.Errorf("adopt owned cmd: invalid supervisor pid %d", leader)
+	}
 	tok, err := tokenOf(leader)
 	if err != nil {
 		return nil, fmt.Errorf("adopt owned cmd: leader token: %w", err)
@@ -922,7 +946,11 @@ func ReapOwnedCmd(cmd *exec.Cmd) error {
 	if cmd != nil {
 		dir = cmd.Dir
 	}
-	owned, err := adoptOwnedCmd(cmd, nil, nil, dir, "", nil)
+	leader := 0
+	if cmd != nil && cmd.Process != nil {
+		leader = cmd.Process.Pid
+	}
+	owned, err := adoptOwnedCmd(cmd, leader, nil, nil, dir, "", nil)
 	if err != nil {
 		return err
 	}

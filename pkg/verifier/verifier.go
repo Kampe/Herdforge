@@ -234,7 +234,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	// Two-phase ownership supervisor: start/done handshake + residual drain
 	// while the supervisor still owns the process group, then ack to exit.
 	// Marker FD (ExtraFiles FD5) is the unforgeable lineage for escaped writers.
-	cmd, statusR, statusW, ackR, ackW, marker, markerPath, prepErr := prepareOwnedCommand(commandCtx, commandPath, v.Argv[1:], dir, env)
+	cmd, statusR, statusW, ackR, ackW, marker, markerPath, infoR, infoW, prepErr := prepareOwnedCommand(commandCtx, commandPath, v.Argv[1:], dir, env)
 	if prepErr != nil {
 		return newOutputResult(OutcomeBLOCKED, []byte(prepErr.Error()), -1, time.Since(started)), nil
 	}
@@ -263,13 +263,45 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 			_ = marker.Close()
 			_ = os.Remove(markerPath)
 		}
+		_ = infoR.Close()
+		_ = infoW.Close()
 		return newOutputResult(OutcomeBLOCKED, []byte(err.Error()), -1, time.Since(started)), nil
 	}
 	// Parent keeps statusR + ackW + marker; close child-only ends in parent.
 	_ = statusW.Close()
 	_ = ackR.Close()
+	_ = infoW.Close()
+	leaderPID := cmd.Process.Pid
+	if ownershipInfoExpected() {
+		var info struct {
+			ChildPID int `json:"child-pid"`
+		}
+		readErr := json.NewDecoder(infoR).Decode(&info)
+		_ = infoR.Close()
+		if readErr != nil {
+			_ = killProcessGroupIfLive(cmd.Process.Pid)
+			waitErr := cmd.Wait()
+			message := fmt.Sprintf("ownership bootstrap info: %v", readErr)
+			if waitErr != nil {
+				message += ": " + waitErr.Error()
+			}
+			return newOutputResult(OutcomeBLOCKED, []byte(message), exitCode(cmd, waitErr), time.Since(started)), nil
+		}
+		if info.ChildPID <= 1 {
+			_ = killProcessGroupIfLive(cmd.Process.Pid)
+			waitErr := cmd.Wait()
+			message := fmt.Sprintf("ownership bootstrap info: invalid child pid %d", info.ChildPID)
+			if waitErr != nil {
+				message += ": " + waitErr.Error()
+			}
+			return newOutputResult(OutcomeBLOCKED, []byte(message), exitCode(cmd, waitErr), time.Since(started)), nil
+		}
+		leaderPID = info.ChildPID
+	} else {
+		_ = infoR.Close()
+	}
 
-	owned, adoptErr := adoptOwnedCmd(cmd, statusR, ackW, dir, markerPath, marker)
+	owned, adoptErr := adoptOwnedCmd(cmd, leaderPID, statusR, ackW, dir, markerPath, marker)
 	if adoptErr != nil {
 		var parts []string
 		parts = append(parts, "adopt owned cmd: "+adoptErr.Error())

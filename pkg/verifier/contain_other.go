@@ -2,9 +2,13 @@
 
 package verifier
 
-import "syscall"
+import (
+	"context"
+	"os/exec"
+)
 
-// applyOwnershipContainment is a no-op outside Linux. Darwin has no PID
-// namespace / subreaper equivalent; escaped-descendant residual ownership uses
-// the inherited marker FD (see processesHoldingMarker) plus live-group drain.
-func applyOwnershipContainment(attr *syscall.SysProcAttr) {}
+func ownershipCommand(ctx context.Context, dir string, argv []string) (*exec.Cmd, error) {
+	return exec.CommandContext(ctx, "sh", argv...), nil
+}
+
+func ownershipInfoExpected() bool { return false }

@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,6 +62,7 @@ func pidField(path string) (int, error) {
 }
 
 func main() {
+    fmt.Printf("identity %d %d\n", os.Getuid(), os.Getgid())
     pid := os.Getpid()
     statPID, err := pidField("/proc/self/stat")
     if err != nil { panic(err) }
@@ -89,5 +92,16 @@ func main() {
 	}
 	if result == nil || !result.Passed || result.Outcome != OutcomePASS {
 		t.Fatalf("owned namespace/proc canary failed: %+v", result)
+	}
+	if !strings.Contains(string(result.Output), fmt.Sprintf("identity %d %d", os.Getuid(), os.Getgid())) {
+		t.Fatalf("owned command identity missing from canary output: %q", result.Output)
+	}
+}
+
+func TestFAC679OwnershipBootstrapFailsClosedWithoutBwrap(t *testing.T) {
+	t.Setenv(hermeticContainerEnv, "")
+	t.Setenv("PATH", t.TempDir())
+	if _, err := ownershipCommand(context.Background(), t.TempDir(), nil); err == nil || !strings.Contains(err.Error(), "ownership containment requires bwrap") {
+		t.Fatalf("missing bwrap must fail closed with exact containment reason: %v", err)
 	}
 }
