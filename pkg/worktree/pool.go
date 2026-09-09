@@ -17,12 +17,15 @@ import (
 
 // PoolSlot is the durable lease record for one warm worktree.
 type PoolSlot struct {
-	Name     string    `json:"name"`
-	Path     string    `json:"path"`
-	Purpose  string    `json:"purpose,omitempty"`
-	LeaseID  string    `json:"lease_id,omitempty"`
-	LeasedAt time.Time `json:"leased_at,omitempty"`
-	Base     string    `json:"base,omitempty"`
+	Name                  string    `json:"name"`
+	Path                  string    `json:"path"`
+	Purpose               string    `json:"purpose,omitempty"`
+	LeaseID               string    `json:"lease_id,omitempty"`
+	LeasedAt              time.Time `json:"leased_at,omitempty"`
+	Base                  string    `json:"base,omitempty"`
+	LastReleaseLeaseID    string    `json:"last_release_lease_id,omitempty"`
+	LastReleaseGeneration int64     `json:"last_release_generation,omitempty"`
+	LastReleasePath       string    `json:"last_release_path,omitempty"`
 }
 
 type poolState struct {
@@ -265,6 +268,7 @@ func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string
 		if !clean {
 			continue
 		}
+		slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
 		slot.Purpose, slot.LeaseID = "", ""
 		slot.LeasedAt = time.Time{}
 		freed = append(freed, slot.Name)
@@ -329,6 +333,7 @@ func (p *Pool) Release(ctx context.Context, leaseID string) error {
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
+			slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
 			slot.Purpose, slot.LeaseID = "", ""
 			slot.LeasedAt = time.Time{}
 			return p.writeState(state)
@@ -385,6 +390,7 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
+			slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
 			slot.Purpose, slot.LeaseID, slot.LeasedAt = "", "", time.Time{}
 			return p.writeState(state)
 		}

@@ -93,11 +93,30 @@ func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *tes
 	if d := EvaluateReviewRetirement(evidence); !d.Eligible {
 		t.Fatalf("closed generationless lane refused: %+v", d)
 	}
+	if err := os.WriteFile(ledgerPath, []byte(strings.Join(append(rows, `{"event":"record","sha":"`+sha+`","reviewer":"`+reviewer+`","lease":"`+nonce+`","branch":"FAC-708","pane":"different"}`), "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Observe(m); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("duplicate launch provenance was accepted: %v", err)
+	}
+	if err := os.WriteFile(ledgerPath, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := op.ReleaseLease(t.Context(), m); err != nil {
 		t.Fatalf("exact legacy lease release: %v", err)
 	}
 	if released, err := op.LeaseReleased(m); err != nil || !released {
 		t.Fatalf("release readback=%v err=%v", released, err)
+	}
+	// A later lease/release of the same named slot must not authorize the old
+	// manifest: release history is an incarnation fence, not an absent-state
+	// guess.
+	stale := []byte(`{"version":1,"slots":[{"name":"pool-01","path":"` + slotPath + `","last_release_lease_id":"lease-new","last_release_generation":8,"last_release_path":"` + slotPath + `"}]}` + "\n")
+	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Observe(m); err == nil || !strings.Contains(err.Error(), "release history") {
+		t.Fatalf("reused released slot was not refused: %v", err)
 	}
 	var agent AgentEntry
 	if err := json.Unmarshal([]byte(`{"name":"r","revision":2,"state_change_seq":3}`), &agent); err != nil {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/reviewack"
@@ -42,12 +43,21 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 		return ReviewRetirementEvidence{}, fmt.Errorf("read review ledger: %w", err)
 	}
 	var launch, verdict reviewledger.LedgerRow
+	launchFound, verdictFound := false, false
 	for _, row := range rows {
 		if row.Event == string(reviewledger.EventRecord) && row.SHA == m.CandidateSHA && row.Reviewer == m.Reviewer && row.Lease == m.Nonce {
+			if launchFound && !reflect.DeepEqual(launch, row) {
+				return ReviewRetirementEvidence{}, errors.New("ambiguous matching launch provenance")
+			}
 			launch = row
+			launchFound = true
 		}
 		if row.Event == string(reviewledger.EventVerdict) && row.SHA == m.CandidateSHA && row.Reviewer == m.Reviewer {
+			if verdictFound && !reflect.DeepEqual(verdict, row) {
+				return ReviewRetirementEvidence{}, errors.New("ambiguous matching terminal verdict")
+			}
 			verdict = row
+			verdictFound = true
 		}
 	}
 	ack, ackErr := reviewack.Read(n.Root, m.CandidateSHA, m.Reviewer)
@@ -132,10 +142,13 @@ func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, all
 			continue
 		}
 		worktreePath, pathErr := filepath.Abs(filepath.Join(n.Root, filepath.Clean(m.Worktree)))
-		if pathErr != nil || filepath.Clean(slot.Path) != filepath.Clean(filepath.Join(poolPath, m.Slot)) || filepath.Clean(slot.Path) != filepath.Clean(worktreePath) {
+		if pathErr != nil || !sameRealPath(slot.Path, filepath.Join(poolPath, m.Slot)) || !sameRealPath(slot.Path, worktreePath) {
 			return worktree.PoolSlot{}, errors.New("review pool slot path differs from authenticated manifest")
 		}
 		if slot.LeaseID == "" && allowReleased {
+			if slot.LastReleaseLeaseID != m.Nonce || slot.LastReleaseGeneration != m.LeaseGeneration || !sameRealPath(slot.LastReleasePath, slot.Path) {
+				return worktree.PoolSlot{}, errors.New("review pool slot has no matching authenticated release history")
+			}
 			return slot, nil
 		}
 		if slot.LeaseID != m.Nonce || slot.LeasedAt.UnixNano() != m.LeaseGeneration {
@@ -144,6 +157,15 @@ func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, all
 		return slot, nil
 	}
 	return worktree.PoolSlot{}, errors.New("authenticated review pool slot is missing")
+}
+
+func sameRealPath(a, b string) bool {
+	ra, ea := filepath.EvalSymlinks(a)
+	rb, eb := filepath.EvalSymlinks(b)
+	if ea == nil && eb == nil {
+		return filepath.Clean(ra) == filepath.Clean(rb)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -402,7 +424,7 @@ func (n *NativeReviewRetirementOp) ReleaseLease(ctx context.Context, m ReviewRet
 	}
 	p := worktree.NewPool(n.Root, filepath.Join(n.Root, filepath.Clean(m.Pool)), 0)
 	p.DefaultBase = slot.Base
-	return p.ReleaseExact(ctx, m.Slot, m.Nonce, m.LeaseGeneration, filepath.Join(n.Root, filepath.Clean(m.Worktree)))
+	return p.ReleaseExact(ctx, m.Slot, m.Nonce, m.LeaseGeneration, slot.Path)
 }
 
 func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) error {
@@ -429,7 +451,11 @@ func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) er
 	if err != nil {
 		return err
 	}
-	return worktree.NewPool(n.Root, poolPath, 0).RetireExact(context.Background(), m.Slot, filepath.Join(poolPath, m.Slot))
+	slot, err := n.exactPoolSlot(m, true)
+	if err != nil {
+		return err
+	}
+	return worktree.NewPool(n.Root, poolPath, 0).RetireExact(context.Background(), m.Slot, slot.Path)
 }
 func (n *NativeReviewRetirementOp) RemoveBranch(m ReviewRetirementManifest) error {
 	if m.ReviewRef == "" {
