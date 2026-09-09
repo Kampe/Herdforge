@@ -143,7 +143,7 @@ func TestRetireReviewLanesPreflightsAllBeforeMutationAndOrdersOperations(t *test
 	if err != nil || r.Retired != 2 {
 		t.Fatalf("report=%+v err=%v", r, err)
 	}
-	want := []string{"close", "lease-read", "lease-release", "worktree", "branch", "journal-artifacts-ready", "artifact", "receipt", "close", "lease-read", "lease-release", "worktree", "branch", "journal-artifacts-ready", "artifact", "receipt"}
+	want := []string{"close", "lease-read", "lease-release", "journal-worktree-intent", "worktree", "journal-worktree-done", "journal-ref-intent", "branch", "journal-ref-done", "journal-artifacts-intent", "artifact", "journal-artifacts-done", "receipt", "close", "lease-read", "lease-release", "journal-worktree-intent", "worktree", "journal-worktree-done", "journal-ref-intent", "branch", "journal-ref-done", "journal-artifacts-intent", "artifact", "journal-artifacts-done", "receipt"}
 	for i := range want {
 		if f.events[i] != want[i] {
 			t.Fatalf("events=%v want=%v", f.events, want)

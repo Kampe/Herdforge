@@ -407,29 +407,49 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 			r.Failed++
 			return r, fmt.Errorf("revalidate before worktree removal %s: %w", m.Worktree, err)
 		}
+		if err := op.Journal(m, "worktree-intent"); err != nil {
+			r.Failed++
+			return r, fmt.Errorf("journal worktree phase %s: %w", m.Generation, err)
+		}
 		if err := op.RemoveWorktree(m); err != nil {
 			r.Failed++
 			return r, fmt.Errorf("remove worktree %s: %w", m.Worktree, err)
+		}
+		if err := op.Journal(m, "worktree-done"); err != nil {
+			r.Failed++
+			return r, fmt.Errorf("journal worktree completion %s: %w", m.Generation, err)
 		}
 		if err := op.Revalidate(m, "branch"); err != nil {
 			r.Failed++
 			return r, fmt.Errorf("revalidate before branch removal %s: %w", m.Branch, err)
 		}
+		if err := op.Journal(m, "ref-intent"); err != nil {
+			r.Failed++
+			return r, fmt.Errorf("journal ref phase %s: %w", m.Generation, err)
+		}
 		if err := op.RemoveBranch(m); err != nil {
 			r.Failed++
 			return r, fmt.Errorf("remove branch %s: %w", m.Branch, err)
+		}
+		if err := op.Journal(m, "ref-done"); err != nil {
+			r.Failed++
+			return r, fmt.Errorf("journal ref completion %s: %w", m.Generation, err)
 		}
 		if err := op.Revalidate(m, "artifact"); err != nil {
 			r.Failed++
 			return r, fmt.Errorf("revalidate before artifact removal %s: %w", m.PromptArtifact, err)
 		}
-		if err := op.Journal(m, "artifacts-ready"); err != nil {
+		if err := op.Journal(m, "artifacts-intent"); err != nil {
 			r.Failed++
 			return r, fmt.Errorf("journal artifact phase %s: %w", m.Generation, err)
 		}
 		if err := op.RemoveArtifact(m); err != nil {
 			r.Failed++
 			return r, fmt.Errorf("remove owned artifacts %s: %w", m.PromptArtifact, err)
+		}
+		if err := op.Journal(m, "artifacts-done"); err != nil {
+			r.Failed++
+			return r, fmt.Errorf("journal artifacts completion %s: %w", m.Generation, err)
 		}
 		if err := op.Receipt(m, c.Decision); err != nil {
 			r.Failed++

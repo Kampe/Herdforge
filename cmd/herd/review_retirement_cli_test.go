@@ -71,6 +71,12 @@ func TestReviewRetirementCLIActingDrainTwice(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(promptRel)), prompt, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(root, ".herd", "reviews"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(slotPath, filepath.Join(root, ".herd", "reviews", "fac-708")); err != nil {
+		t.Fatal(err)
+	}
 	reviewer := "forge-mender-fac708-nat-d4b3b8dc"
 	m := herdr.NewReviewRetirementManifest(time.Now(), herdr.ReviewRetirementManifest{Repository: repository, TaskRef: "FAC-708", TaskID: "task-708", CandidateSHA: sha, BaseSHA: sha, Branch: ref, Worktree: ".herd/pool-fac708/pool-01", Pool: ".herd/pool-fac708", Slot: "pool-01", LeaseGeneration: leaseGeneration, Workspace: "wK", TabID: "wK:t15T", PaneID: "wK:p15T", TerminalID: "term-fixture", SessionID: "session-fixture", Reviewer: reviewer, ReviewerFamily: "openai", ReviewerModel: "gpt-5.6-luna", PromptArtifact: promptRel, PromptDigest: reviewack.ArtifactDigest(prompt), Surface: ".herd/reviews/fac-708", ReviewRef: ref, ManifestArtifact: manifestRel, Generation: "cli-1", Nonce: lease})
 	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, filepath.FromSlash(manifestRel))), 0o700); err != nil {
@@ -152,7 +158,7 @@ esac
 			t.Fatalf("preserved evidence %s: %v", rel, err)
 		}
 	}
-	for _, rel := range []string{promptRel, manifestRel, ".herd/reviews/fac-708"} {
+	for _, rel := range []string{promptRel, manifestRel, ".herd/reviews/fac-708", ".herd/pool-fac708/pool-01", ".herd/pool-fac708"} {
 		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(rel))); !os.IsNotExist(err) {
 			t.Fatalf("owned artifact %s remains or failed unexpectedly: %v", rel, err)
 		}

@@ -404,7 +404,7 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath string) error
 	if strings.TrimSpace(slotName) == "" || strings.TrimSpace(wantPath) == "" {
 		return errors.New("worktree pool: exact retirement requires slot and path")
 	}
-	return p.withLock(func() error {
+	err := p.withLock(func() error {
 		state, err := p.readState()
 		if err != nil {
 			return err
@@ -433,12 +433,17 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath string) error
 			}
 			if len(state.Slots) == 0 {
 				_ = os.Remove(p.statePath())
-				_ = os.Remove(p.Root)
 			}
 			return nil
 		}
 		return nil
 	})
+	if err == nil {
+		if entries, readErr := os.ReadDir(p.Root); readErr == nil && len(entries) == 0 {
+			_ = os.Remove(p.Root)
+		}
+	}
+	return err
 }
 
 // GC tears down every unleased slot so the next Ensure rebuilds the pool.

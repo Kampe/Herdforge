@@ -28,6 +28,12 @@ type NativeReviewRetirementOp struct {
 	JournalPath        string
 }
 
+type retirementPhaseRecord struct {
+	Generation, CandidateSHA, Reviewer, BindingDigest string
+	Pool, Slot, Worktree, Nonce, Phase                string
+	LeaseGeneration                                   int64 `json:"lease_generation"`
+}
+
 func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRetirementEvidence, error) {
 	if n == nil || n.Ledger == nil || strings.TrimSpace(n.Root) == "" || strings.TrimSpace(n.RepositoryIdentity) == "" {
 		return ReviewRetirementEvidence{}, errors.New("native review retirement authority is incomplete")
@@ -35,7 +41,7 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	if err := ValidateReviewRetirementManifest(m); err != nil {
 		return ReviewRetirementEvidence{}, err
 	}
-	if _, err := n.exactPoolSlot(m, true); err != nil {
+	if _, err := n.exactPoolSlot(m, true); err != nil && !errors.Is(err, errRetirementPoolAlreadyRemoved) {
 		return ReviewRetirementEvidence{}, err
 	}
 	rows, err := n.Ledger.AllRows()
@@ -116,6 +122,56 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: live, Worktree: wt, WorktreeRoot: m.Pool, PromptRoot: filepath.Dir(m.PromptArtifact), Repository: n.RepositoryIdentity}, nil
 }
 
+var errRetirementPoolAlreadyRemoved = errors.New("review retirement pool already removed under authenticated phase intent")
+
+func (n *NativeReviewRetirementOp) phasePath() string {
+	if n.JournalPath != "" {
+		return n.JournalPath
+	}
+	return filepath.Join(n.Root, ".herd", "review", "retirement-phases.jsonl")
+}
+
+func (n *NativeReviewRetirementOp) phaseRecords(m ReviewRetirementManifest) ([]retirementPhaseRecord, error) {
+	f, err := os.Open(n.phasePath())
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var records []retirementPhaseRecord
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var rec retirementPhaseRecord
+		if err := json.Unmarshal([]byte(sc.Text()), &rec); err != nil {
+			return nil, fmt.Errorf("decode retirement journal: %w", err)
+		}
+		if rec.Generation == m.Generation && rec.CandidateSHA == m.CandidateSHA && rec.Reviewer == m.Reviewer {
+			if rec.BindingDigest != m.BindingDigest || rec.Pool != m.Pool || rec.Slot != m.Slot || rec.Worktree != m.Worktree || rec.Nonce != m.Nonce || rec.LeaseGeneration != m.LeaseGeneration {
+				return nil, errors.New("retirement journal identity conflicts with manifest")
+			}
+		}
+		records = append(records, rec)
+	}
+	return records, sc.Err()
+}
+
+func (n *NativeReviewRetirementOp) hasPhase(m ReviewRetirementManifest, phases ...string) (bool, error) {
+	records, err := n.phaseRecords(m)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range records {
+		for _, phase := range phases {
+			if rec.Phase == phase {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // paneProcessesForRetirement distinguishes the supported closed-pane
 // envelope from transport/tool failures. Only pane_not_found is absence;
 // every other error remains a hard observation failure.
@@ -130,6 +186,18 @@ func paneProcessesForRetirement(paneID string) ([]PaneProcess, error) {
 func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, allowReleased bool) (worktree.PoolSlot, error) {
 	poolPath, err := n.boundPath(m.Pool)
 	if err != nil {
+		abs, absErr := filepath.Abs(filepath.Join(n.Root, filepath.Clean(m.Pool)))
+		if absErr == nil {
+			if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+				ok, phaseErr := n.hasPhase(m, "worktree-intent", "worktree-done", "ref-intent", "ref-done", "artifacts-intent", "artifacts-done", "complete")
+				if phaseErr != nil {
+					return worktree.PoolSlot{}, phaseErr
+				}
+				if ok {
+					return worktree.PoolSlot{}, errRetirementPoolAlreadyRemoved
+				}
+			}
+		}
 		return worktree.PoolSlot{}, err
 	}
 	p := worktree.NewPool(n.Root, poolPath, 0)
@@ -155,6 +223,15 @@ func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, all
 			return worktree.PoolSlot{}, errors.New("review pool lease incarnation differs from authenticated manifest")
 		}
 		return slot, nil
+	}
+	if allowReleased {
+		ok, phaseErr := n.hasPhase(m, "worktree-intent", "worktree-done", "ref-intent", "ref-done", "artifacts-intent", "artifacts-done", "complete")
+		if phaseErr != nil {
+			return worktree.PoolSlot{}, phaseErr
+		}
+		if ok {
+			return worktree.PoolSlot{}, errRetirementPoolAlreadyRemoved
+		}
 	}
 	return worktree.PoolSlot{}, errors.New("authenticated review pool slot is missing")
 }
@@ -348,14 +425,11 @@ func (n *NativeReviewRetirementOp) Revalidate(m ReviewRetirementManifest, phase 
 }
 
 func (n *NativeReviewRetirementOp) Journal(m ReviewRetirementManifest, phase string) error {
-	p := n.JournalPath
-	if p == "" {
-		p = filepath.Join(n.Root, ".herd", "review", "retirement-phases.jsonl")
-	}
+	p := n.phasePath()
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	rec := struct{ Generation, CandidateSHA, Reviewer, BindingDigest, Phase string }{m.Generation, m.CandidateSHA, m.Reviewer, m.BindingDigest, phase}
+	rec := retirementPhaseRecord{Generation: m.Generation, CandidateSHA: m.CandidateSHA, Reviewer: m.Reviewer, BindingDigest: m.BindingDigest, Pool: m.Pool, Slot: m.Slot, Worktree: m.Worktree, Nonce: m.Nonce, LeaseGeneration: m.LeaseGeneration, Phase: phase}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -372,29 +446,16 @@ func (n *NativeReviewRetirementOp) Journal(m ReviewRetirementManifest, phase str
 }
 
 func (n *NativeReviewRetirementOp) Completed(m ReviewRetirementManifest) (bool, error) {
-	p := n.JournalPath
-	if p == "" {
-		p = filepath.Join(n.Root, ".herd", "review", "retirement-phases.jsonl")
-	}
-	f, err := os.Open(p)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
+	records, err := n.phaseRecords(m)
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		var rec struct{ Generation, CandidateSHA, Reviewer, BindingDigest, Phase string }
-		if json.Unmarshal([]byte(sc.Text()), &rec) != nil {
-			continue
-		}
+	for _, rec := range records {
 		if rec.Phase == "complete" && rec.Generation == m.Generation && rec.CandidateSHA == m.CandidateSHA && rec.Reviewer == m.Reviewer && rec.BindingDigest == m.BindingDigest {
 			return true, nil
 		}
 	}
-	return false, sc.Err()
+	return false, nil
 }
 
 func (n *NativeReviewRetirementOp) Close(m ReviewRetirementManifest) error {
@@ -412,6 +473,9 @@ func (n *NativeReviewRetirementOp) Close(m ReviewRetirementManifest) error {
 
 func (n *NativeReviewRetirementOp) LeaseReleased(m ReviewRetirementManifest) (bool, error) {
 	slot, err := n.exactPoolSlot(m, true)
+	if errors.Is(err, errRetirementPoolAlreadyRemoved) {
+		return true, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -428,30 +492,44 @@ func (n *NativeReviewRetirementOp) ReleaseLease(ctx context.Context, m ReviewRet
 }
 
 func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) error {
-	if m.Surface == "" {
-		return nil
-	}
-	p, err := n.boundSurfacePath(m.Surface, m.Pool)
-	if err != nil {
-		return err
-	}
-	info, err := os.Lstat(p)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err == nil && info.Mode()&os.ModeSymlink == 0 {
-		return errors.New("review surface is not an owned symlink")
-	}
-	if err == nil {
-		if err := os.Remove(p); err != nil {
+	if m.Surface != "" {
+		p, err := n.boundSurfacePath(m.Surface, m.Pool)
+		if err != nil {
 			return err
+		}
+		info, err := os.Lstat(p)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err == nil && info.Mode()&os.ModeSymlink == 0 {
+			return errors.New("review surface is not an owned symlink")
+		}
+		if err == nil {
+			if err := os.Remove(p); err != nil {
+				return err
+			}
 		}
 	}
 	poolPath, err := n.boundPath(m.Pool)
 	if err != nil {
+		abs, absErr := filepath.Abs(filepath.Join(n.Root, filepath.Clean(m.Pool)))
+		if absErr == nil {
+			if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+				ok, phaseErr := n.hasPhase(m, "worktree-intent", "worktree-done", "ref-intent", "ref-done", "artifacts-intent", "artifacts-done", "complete")
+				if phaseErr != nil {
+					return phaseErr
+				}
+				if ok {
+					return nil
+				}
+			}
+		}
 		return err
 	}
 	slot, err := n.exactPoolSlot(m, true)
+	if errors.Is(err, errRetirementPoolAlreadyRemoved) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}

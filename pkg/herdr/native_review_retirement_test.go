@@ -14,6 +14,17 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
+func TestNativeRetirementCorruptJournalFailsClosed(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "retirement-phases.jsonl")
+	if err := os.WriteFile(p, []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	op := &NativeReviewRetirementOp{Root: t.TempDir(), JournalPath: p}
+	if _, err := op.Completed(ReviewRetirementManifest{Generation: "g", CandidateSHA: strings.Repeat("a", 40), Reviewer: "r", BindingDigest: "d"}); err == nil {
+		t.Fatal("corrupt retirement journal was silently ignored")
+	}
+}
+
 func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *testing.T) {
 	root := t.TempDir()
 	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
