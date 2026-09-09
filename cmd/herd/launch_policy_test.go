@@ -824,6 +824,30 @@ func TestStandingQuotaAdmissionStillRefusesWhenEverySurfaceIsSpent(t *testing.T)
 	}
 }
 
+func TestStandingQuotaAdmissionAdmitsClaudeDefaultWhenOnlyFableIsExhausted(t *testing.T) {
+	lane := &config.LaneDef{Name: "review-supervisor", Provider: "claude", Model: "claude-sonnet-5"}
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	snap := &usage.UsageSnapshot{
+		Providers: map[string]usage.ProviderUsage{
+			"claude": {
+				DisplayName: "Claude", Plan: "Max", Stale: false,
+				Resources: map[string]usage.ResourceUsage{
+					"session":     {Kind: "consumption", Unit: "percent", Used: 21, Remaining: 79, Limit: 100, ResetsAt: now.Add(4 * time.Hour).Format(time.RFC3339), WindowSeconds: usage.Window5h},
+					"weekly":      {Kind: "consumption", Unit: "percent", Used: 71, Remaining: 29, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: usage.WindowWeekly},
+					"fableWeekly": {Kind: "consumption", Unit: "percent", Used: 95, Remaining: 5, Limit: 100, ResetsAt: now.Add(5 * time.Hour).Format(time.RFC3339), WindowSeconds: usage.WindowWeekly},
+				},
+			},
+		},
+	}
+	engine := usage.NewQuotaEngine()
+	engine.Now = func() time.Time { return now }
+	computed := engine.ComputeAll(snap)
+
+	if err := admitStandingQuotaState(lane, computed); err != nil {
+		t.Fatalf("standing admission for claude/default must succeed when fableWeekly is 95%% but default weekly is 71%%: %v", err)
+	}
+}
+
 // FAC-643: found by herd-smith. reviewLedgerPath was cwd-relative while
 // readPulseReview's own inbox sweep resolves the PROJECT root, so from a standing
 // worktree the gating stat missed the real ledger, took the absent branch, and

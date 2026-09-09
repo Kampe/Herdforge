@@ -298,14 +298,18 @@ func poolResources(name string, prov ProviderUsage) map[string]map[string]bool {
 	case "claude":
 		generic := make(map[string]bool)
 		for n := range names {
-			if n != "fable" {
+			lower := strings.ToLower(n)
+			if !strings.HasPrefix(lower, "fable") && !strings.Contains(lower, "fable") {
 				generic[n] = true
 			}
 		}
 		pools["default"] = generic
 		fable := make(map[string]bool)
 		for n := range names {
-			fable[n] = true
+			lower := strings.ToLower(n)
+			if !strings.HasPrefix(lower, "sonnet") && !strings.Contains(lower, "sonnet") {
+				fable[n] = true
+			}
 		}
 		pools["fable"] = fable
 	case "antigravity":
@@ -426,30 +430,39 @@ func (e *QuotaEngine) PickProvider(computed map[string]BurnState, among []string
 	var candidates []ranked
 	for _, name := range resolved {
 		p, ok := computed[name]
-		if !ok || !p.Available {
+		if !ok {
 			continue
 		}
-		rin := resetsIn(p.ResetsAt, now)
+		st := p
+		if len(p.Pools) > 0 {
+			if def, ok := p.Pools["default"]; ok {
+				st = def
+			}
+		}
+		if !st.Available {
+			continue
+		}
+		rin := resetsIn(st.ResetsAt, now)
 		var resetDuration time.Duration
 		if rin != nil {
 			resetDuration = *rin
 		} else {
 			resetDuration = time.Duration(math.MaxInt64)
 		}
-		risky := p.ExhaustsBeforeReset != nil && *p.ExhaustsBeforeReset
-		unknown := p.ExhaustsBeforeReset == nil
+		risky := st.ExhaustsBeforeReset != nil && *st.ExhaustsBeforeReset
+		unknown := st.ExhaustsBeforeReset == nil
 		rwy := 1_000_000_000
-		if risky && p.RunwayMinutes != nil {
-			rwy = *p.RunwayMinutes
+		if risky && st.RunwayMinutes != nil {
+			rwy = *st.RunwayMinutes
 		}
 		candidates = append(candidates, ranked{
 			unknown:   boolToInt(unknown)*2 + boolToInt(risky)*1,
 			runway:    -rwy,
-			pressure:  p.Pressure,
-			remaining: -p.Remaining,
+			pressure:  st.Pressure,
+			remaining: -st.Remaining,
 			reset:     resetDuration,
 			name:      name,
-			state:     p,
+			state:     st,
 		})
 	}
 
@@ -500,6 +513,11 @@ func (e *QuotaEngine) ProviderOK(computed map[string]BurnState, provider string)
 	}
 	if p.Reason == "no-quota-data" {
 		return p, false
+	}
+	if len(p.Pools) > 0 {
+		if def, ok := p.Pools["default"]; ok {
+			return def, def.Available
+		}
 	}
 	return p, p.Available
 }
