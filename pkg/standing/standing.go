@@ -365,7 +365,10 @@ func hasCapability(lane config.LaneDef, want config.Capability) bool {
 
 func safePublicationBranch(branch, defaultBranch string) bool {
 	branch, defaultBranch = strings.TrimSpace(branch), strings.TrimSpace(defaultBranch)
-	if branch == "" || branch == "main" || (defaultBranch != "" && branch == defaultBranch) || strings.HasPrefix(branch, "-") || strings.Contains(branch, "..") || strings.Contains(branch, "//") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
+	// Without the repository's declared default branch there is no reliable
+	// protected-branch identity. Literal main is not a safe substitute: valid
+	// repositories may use master, trunk, develop, or another default.
+	if branch == "" || defaultBranch == "" || branch == "main" || branch == defaultBranch || strings.HasPrefix(branch, "-") || strings.Contains(branch, "..") || strings.Contains(branch, "//") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
 		return false
 	}
 	for _, segment := range strings.Split(branch, "/") {

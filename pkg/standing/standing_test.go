@@ -257,6 +257,7 @@ func TestLanePushStandingGrantMatchesRenderedAndDurableAuthority(t *testing.T) {
 
 func TestLanePushStandingGrantFailsClosedForNonWritersAndProtectedBranches(t *testing.T) {
 	policy := &config.MergePolicy{BranchPublication: config.BranchPublicationLanePush}
+	writer := config.LaneDef{Role: "harvest", Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite}}
 	for _, test := range []struct {
 		name   string
 		lane   config.LaneDef
@@ -282,10 +283,24 @@ func TestLanePushStandingGrantFailsClosedForNonWritersAndProtectedBranches(t *te
 		t.Fatalf("explicit coordinator-harvest must remain no-push: %+v", coordinatorHarvest)
 	}
 	defaultPolicy := AuthorityEnvelopeForLaneWithPolicy(
-		config.LaneDef{Role: "harvest", Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite}},
+		writer,
 		nil, "main", "feature/x")
 	if defaultPolicy.AllowedBranch != "" || !strings.Contains(strings.Join(defaultPolicy.ForbiddenActions, ";"), "push") {
 		t.Fatalf("omitted policy must remain no-push: %+v", defaultPolicy)
+	}
+	for _, branch := range []string{"master", "trunk", "feature/x"} {
+		got := AuthorityEnvelopeForLaneWithPolicy(writer, policy, "", branch)
+		if got.AllowedBranch != "" || !strings.Contains(strings.Join(got.ForbiddenActions, ";"), "push") {
+			t.Fatalf("unknown default must refuse %q publication: %+v", branch, got)
+		}
+	}
+	knownMain := AuthorityEnvelopeForLaneWithPolicy(writer, policy, "main", "feature/x")
+	if knownMain.AllowedBranch != "feature/x" {
+		t.Fatalf("known default main must allow assigned feature branch: %+v", knownMain)
+	}
+	knownMaster := AuthorityEnvelopeForLaneWithPolicy(writer, policy, "master", "master")
+	if knownMaster.AllowedBranch != "" || !strings.Contains(strings.Join(knownMaster.ForbiddenActions, ";"), "push") {
+		t.Fatalf("known default master must refuse master publication: %+v", knownMaster)
 	}
 }
 
