@@ -1770,13 +1770,14 @@ func (d *Dispatcher) launch(
 			return &launchFailure{Reason: reason, Err: serr}
 		}
 		tabID, paneID = spawn.TabID, spawn.PaneID
+		// launcherSpawner prepares the lifecycle inside LaunchAgent's
+		// CreateTab→StartAgent boundary. Carry its reserved generation back to
+		// dispatch for the existing confinement/control bindings.
+		request.SessionGeneration = spawner.request.SessionGeneration
 		result.TabID = tabID
 		result.AgentName = tabLabel
 		if sink := eventCount(policy); sink > 0 {
 			result.SecurityEvents = sink
-		}
-		if err := herdr.PrepareToolChildLifecycle(tabID, paneID, &request, tabLabel); err != nil {
-			return &launchFailure{Reason: "tool_child_lifecycle_failed", Err: closeTabLocal(h, tabID, "tool_child_lifecycle_failed", err)}
 		}
 		if request.SessionGeneration <= 0 {
 			return &launchFailure{

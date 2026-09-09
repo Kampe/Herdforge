@@ -46,6 +46,15 @@ func (s *launcherSpawner) CreateTab(workspace, label, cwd string, env []string, 
 	}
 	s.lastTab = tab.ID
 	s.lastPane = tab.Pane.ID
+	// LaunchAgent owns the process boundary and calls CreateTab immediately
+	// before StartAgent. Prepare the existing Herdr lifecycle authority at that
+	// boundary so AgentStartWithDecision cannot observe a missing lifecycle.
+	// The request is copied into this spawner, allowing the reserved session
+	// generation and bound Pi decision to reach the subsequent start call.
+	if err := herdr.PrepareToolChildLifecycle(tab.ID, tab.Pane.ID, &s.request, label); err != nil {
+		_ = s.h.TabClose(tab.ID)
+		return "", "", fmt.Errorf("prepare tool-child lifecycle before agent start: %w", err)
+	}
 	return tab.ID, tab.Pane.ID, nil
 }
 
