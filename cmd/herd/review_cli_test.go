@@ -25,6 +25,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/mail"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 	"github.com/Kampe/Herdforge/pkg/verifier"
@@ -704,7 +705,7 @@ func TestVerifyCLI_PostsReceiptBoundFailCallback(t *testing.T) {
 // `herd approve` now requires: a real merged candidate on origin/main, a
 // sealed task-bound receipt over it, and durable lifecycle state at
 // "integrated" for the same lease generation and candidate.
-func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, configure ...func(*hsync.CompletionReceipt)) {
+func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, providerRevision string, configure ...func(*hsync.CompletionReceipt)) {
 	t.Helper()
 	// A candidate commit with actual content, merged into main so the
 	// receipt's merge SHA is an ancestor of origin/main and carries the
@@ -729,7 +730,10 @@ func seedCompletionReceipt(t *testing.T, dir, ref string, leaseGen int64, config
 	}
 	r := &hsync.CompletionReceipt{
 		RepoID: repoID, TaskRef: ref, TaskID: "t1",
-		ProviderRevision: "provider-rev-1", LeaseGeneration: leaseGen,
+		// FAC-783: the receipt's provider revision is bound to the revision
+		// the live sandbox task encodes at close time — how a real integrator
+		// mints it.
+		ProviderRevision: providerRevision, LeaseGeneration: leaseGen,
 		BaseSHA: base, CandidateSHA: merge, MergeSHA: merge,
 		PatchID: patch, AcceptanceDigest: "acceptance-digest-1",
 		AcceptanceEvidence: "context: Herdforge worktree\n$ go test ./...\nPASS",
@@ -799,11 +803,20 @@ func seedDisabledWinddown(t *testing.T, dir string) {
 }
 
 func approveFixture(t *testing.T, configure ...func(*hsync.CompletionReceipt)) (dir, keyDir string, fk *fakeKaneo) {
+	return approveFixtureWithStatus(t, "in-review", configure...)
+}
+
+// approveFixtureWithStatus seeds the fleet fixture with the sandbox task
+// serving the given status, and binds the completion receipt's provider
+// revision to that live task state (FAC-783) — the broker board-done entry
+// closes a landed card that never projected In Review (FAC-756), so its
+// receipt must be minted against the in-progress revision.
+func approveFixtureWithStatus(t *testing.T, status string, configure ...func(*hsync.CompletionReceipt)) (dir, keyDir string, fk *fakeKaneo) {
 	t.Helper()
 	fk, server := newFakeKaneo()
 	t.Cleanup(server.Close)
 	fk.mu.Lock()
-	fk.status = "in-review"
+	fk.status = status
 	fk.mu.Unlock()
 
 	dir, keyDir = t.TempDir(), t.TempDir()
@@ -835,7 +848,8 @@ func approveFixture(t *testing.T, configure ...func(*hsync.CompletionReceipt)) (
 	// with "no positive lease generation (lifecycle must record the active
 	// lease)". Seed the same generation into the lifecycle so the two agree.
 	seedFixtureLifecycle(t, dir, "FAC-1", leaseGen)
-	seedCompletionReceipt(t, dir, "FAC-1", leaseGen, configure...)
+	liveRevision := string(provider.EncodeRevision(&provider.Task{ID: "t1", Status: status}))
+	seedCompletionReceipt(t, dir, "FAC-1", leaseGen, liveRevision, configure...)
 	return dir, keyDir, fk
 }
 
@@ -1088,6 +1102,10 @@ func TestApproveCLI_DoneWithoutPublishReconcilesByPublicationOnly(t *testing.T) 
 	fk.mu.Lock()
 	fk.status = "done"
 	fk.mu.Unlock()
+	// A real state=done journal implies the crashed run already appended the
+	// receipt-bound done-log record (the board write and record both landed).
+	// Seed that durable evidence; without it the reconcile refuses (FAC-783).
+	seedDoneLogRecord(t, dir, "FAC-1", "t1")
 
 	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
 	if err != nil {
@@ -2732,10 +2750,10 @@ func TestApproveBroker(t *testing.T) {
 			dir, keyDir, fk := approveFixture(t)
 			if entrypoint == "board-done" {
 				// Receipt reconciliation must also close a landed card whose worker
-				// never projected In Review, as observed for FAC-756.
-				fk.mu.Lock()
-				fk.status = "in-progress"
-				fk.mu.Unlock()
+				// never projected In Review, as observed for FAC-756. Re-seed with
+				// the receipt minted against the in-progress revision the card
+				// serves at close time.
+				dir, keyDir, fk = approveFixtureWithStatus(t, "in-progress")
 			}
 			provisionFence(t, binary, dir, keyDir)
 			cmd := herdCmd(binary, dir, keyDir, entrypoint, "FAC-1")
@@ -2764,5 +2782,111 @@ func TestApproveBroker(t *testing.T) {
 				t.Fatalf("receipt replay duplicated provider mutation: %d", got)
 			}
 		})
+	}
+}
+
+// seedDoneLogRecord appends the receipt-bound done-log record the real
+// board-done flow writes for ref, so fixtures simulating a crash AFTER the
+// record landed carry the receipt-bound durable evidence (FAC-783).
+func seedDoneLogRecord(t *testing.T, dir, ref, taskID string) {
+	t.Helper()
+	r, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, ref))
+	if err != nil {
+		t.Fatalf("load receipt for done log: %v", err)
+	}
+	rec := hsync.DoneRecord{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Ref: ref,
+		TaskID: taskID, ProviderReadback: "done",
+		ReceiptDigest: r.Digest, MergeSHA: r.MergeSHA,
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(hsync.DoneLogPath(dir)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hsync.DoneLogPath(dir), append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestApproveCLI_DoneCardRefusesSealedStaleReceiptWithoutLogRecord is the
+// FAC-783 reviewer-c7102a76 regression at the approveOne entrypoint, reached
+// through the real reconcile sweep: a journaled intent re-driven against an
+// already-done card with no matching done-log record refuses — generic done
+// status is never evidence — and the refusal neither touches the board nor
+// publishes a callback.
+func TestApproveCLI_DoneCardRefusesSealedStaleReceiptWithoutLogRecord(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, fk := approveFixture(t)
+	provisionFence(t, binary, dir, keyDir)
+	// The crash left a journaled intent and the card reached done through
+	// another authority after the receipt was minted: done status, no
+	// done-log record anywhere.
+	sha := fixtureEvidenceSHA(t, dir)
+	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
+	fk.mu.Lock()
+	fk.status = "done"
+	fk.mu.Unlock()
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "cannot be accepted on stale evidence") {
+		t.Fatalf("stale sealed evidence on a done card must refuse through the reconcile sweep, got err %v:\n%s", err, out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 0 {
+		t.Fatalf("zero mutation on refusal: saw %d board write(s)", got)
+	}
+	if data, rErr := os.ReadFile(mail.CallbackMailPath(dir)); rErr == nil {
+		if strings.Contains(string(data), `"complete: FAC-1"`) {
+			t.Fatalf("the refusal must publish no callback:\n%s", data)
+		}
+	}
+	if data, rErr := os.ReadFile(filepath.Join(dir, ".herd", "approve-intents.jsonl")); rErr == nil {
+		if strings.Contains(string(data), `"state":"published"`) {
+			t.Fatalf("the refusal must not journal a publication:\n%s", data)
+		}
+	}
+}
+
+// TestApproveCLI_MatchingRevisionTerminalCardWithoutLogRecordRefuses is the
+// FAC-783 reviewer-dc7d0755 regression at the actual approve entrypoint,
+// driven through the real reconcile sweep: the journaled intent is re-driven
+// against an already-done card whose completion receipt was minted against
+// the live DONE revision — the revision matches, but no done-log record
+// exists. Matching the revision is not proof this receipt effected the done
+// transition, so approveOne must refuse: no board write, no fabricated done
+// record, no published callback.
+func TestApproveCLI_MatchingRevisionTerminalCardWithoutLogRecordRefuses(t *testing.T) {
+	binary := buildHerd(t)
+	// The sandbox task serves done from the start, so the seeded receipt is
+	// bound to the live done revision (the fixture binds EncodeRevision of
+	// exactly this status).
+	dir, keyDir, fk := approveFixtureWithStatus(t, "done")
+	provisionFence(t, binary, dir, keyDir)
+	sha := fixtureEvidenceSHA(t, dir)
+	writeIntentRecord(t, dir, keyDir, "FAC-1", sha, "intent")
+	// Deliberately NO done-log record: the durable receipt-bound evidence the
+	// terminal card requires is absent.
+
+	out, err := herdCmd(binary, dir, keyDir, "approve").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "cannot be accepted on stale evidence") {
+		t.Fatalf("a revision-matching receipt with no done-log record must refuse through the reconcile sweep, got err %v:\n%s", err, out)
+	}
+	if got := atomic.LoadInt32(&fk.patches); got != 0 {
+		t.Fatalf("zero board write on refusal: saw %d write(s)", got)
+	}
+	if _, statErr := os.Stat(hsync.DoneLogPath(dir)); statErr == nil {
+		t.Fatalf("the refusal must not fabricate a done-log record")
+	}
+	if data, rErr := os.ReadFile(mail.CallbackMailPath(dir)); rErr == nil {
+		if strings.Contains(string(data), `"complete: FAC-1"`) {
+			t.Fatalf("the refusal must publish no callback:\n%s", data)
+		}
+	}
+	if data, rErr := os.ReadFile(filepath.Join(dir, ".herd", "approve-intents.jsonl")); rErr == nil {
+		if strings.Contains(string(data), `"state":"published"`) {
+			t.Fatalf("the refusal must not journal a publication:\n%s", data)
+		}
 	}
 }
