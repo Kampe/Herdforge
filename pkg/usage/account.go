@@ -84,13 +84,18 @@ func claudeConfigAccountIdentity() *AccountIdentity {
 		}
 		var cfg struct {
 			OauthAccount struct {
-				AccountUUID string `json:"accountUuid"`
+				AccountUUID      string `json:"accountUuid"`
+				OrganizationUUID string `json:"organizationUuid"`
 			} `json:"oauthAccount"`
 		}
 		if json.Unmarshal(raw, &cfg) != nil {
 			continue
 		}
-		if id := identity("claude", cfg.OauthAccount.AccountUUID, "claude-config:"+confinement.ClaudeTopLevelConfigFile+":oauthAccount.accountUuid"); id != nil {
+		claim := strings.TrimSpace(cfg.OauthAccount.AccountUUID)
+		if org := strings.TrimSpace(cfg.OauthAccount.OrganizationUUID); org != "" {
+			claim += "|" + org
+		}
+		if id := identity("claude", claim, "claude-config:"+confinement.ClaudeTopLevelConfigFile+":oauthAccount.accountUuid"); id != nil {
 			return id
 		}
 	}

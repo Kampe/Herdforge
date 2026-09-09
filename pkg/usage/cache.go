@@ -70,8 +70,17 @@ func snapshotCachePath() string {
 }
 
 type cachedSnapshot struct {
-	FetchedAt time.Time      `json:"fetched_at"`
-	Snapshot  *UsageSnapshot `json:"snapshot"`
+	FetchedAt time.Time                       `json:"fetched_at,omitempty"` // legacy format
+	Snapshot  *UsageSnapshot                  `json:"snapshot,omitempty"`   // legacy format
+	Providers map[string]cachedProviderRecord `json:"providers,omitempty"`
+}
+
+type cachedProviderRecord struct {
+	ObservedAt   time.Time     `json:"observed_at"`
+	Provider     ProviderUsage `json:"provider"`
+	AccountKey   string        `json:"account_key,omitempty"`
+	BackoffUntil time.Time     `json:"backoff_until,omitempty"`
+	Error        string        `json:"error,omitempty"`
 }
 
 // readSnapshotFile returns a persisted reading and its age when it is younger
@@ -90,20 +99,92 @@ func readSnapshotFile(ttl time.Duration) (*UsageSnapshot, time.Duration, bool) {
 		return nil, 0, false
 	}
 	var c cachedSnapshot
-	if err := json.Unmarshal(raw, &c); err != nil || c.Snapshot == nil || c.FetchedAt.IsZero() {
+	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, 0, false
 	}
-	age := time.Since(c.FetchedAt)
-	if age < 0 || age >= ttl {
-		// A negative age means the clock moved; treat it as unusable rather than
-		// as infinitely fresh.
-		return nil, 0, false
+	if len(c.Providers) == 0 && c.Snapshot != nil && !c.FetchedAt.IsZero() {
+		c.Providers = make(map[string]cachedProviderRecord, len(c.Snapshot.Providers))
+		for name, provider := range c.Snapshot.Providers {
+			record := cachedProviderRecord{ObservedAt: c.FetchedAt, Provider: provider}
+			if provider.Account != nil {
+				record.AccountKey = provider.Account.Key
+			}
+			c.Providers[name] = record
+		}
 	}
-	bound, ok := bindSnapshotToAccounts(c.Snapshot)
+	bound, age, ok := boundCachedProviders(c.Providers, ttl)
 	if !ok {
 		return nil, 0, false
 	}
 	return bound, age, true
+}
+
+func boundCachedProviders(records map[string]cachedProviderRecord, ttl time.Duration) (*UsageSnapshot, time.Duration, bool) {
+	if len(records) == 0 {
+		return nil, 0, false
+	}
+	out := &UsageSnapshot{GeneratedAt: time.Now().UTC(), Providers: map[string]ProviderUsage{}}
+	var oldest time.Duration
+	for name, record := range records {
+		age := time.Since(record.ObservedAt)
+		if record.ObservedAt.IsZero() || age < 0 || age >= ttl || !providerCacheUsable(name, record.Provider) || record.AccountKey != record.Provider.Account.Key {
+			continue
+		}
+		if record.BackoffUntil.After(time.Now()) {
+			if record.Error != "" {
+				if out.Errors == nil {
+					out.Errors = map[string]string{}
+				}
+				out.Errors[name] = record.Error
+			}
+			continue
+		}
+		out.Providers[name] = record.Provider
+		if age > oldest {
+			oldest = age
+		}
+	}
+	if len(out.Providers) == 0 {
+		return nil, 0, false
+	}
+	return out, oldest, true
+}
+
+func freshBoundSnapshot(snap *UsageSnapshot, ttl time.Duration, fallback time.Time) (*UsageSnapshot, time.Duration, bool) {
+	if snap == nil || len(snap.Providers) == 0 {
+		return nil, 0, false
+	}
+	out := &UsageSnapshot{GeneratedAt: snap.GeneratedAt, Providers: make(map[string]ProviderUsage)}
+	if len(snap.Errors) != 0 {
+		out.Errors = snap.Errors
+	}
+	var oldest time.Duration
+	for name, provider := range snap.Providers {
+		observed := provider.ObservedAt
+		if observed.IsZero() {
+			observed = fallback
+		}
+		age := time.Since(observed)
+		if observed.IsZero() || age < 0 || age >= ttl || !providerCacheUsable(name, provider) {
+			continue
+		}
+		out.Providers[name] = provider
+		if age > oldest {
+			oldest = age
+		}
+	}
+	if len(out.Providers) == 0 {
+		return nil, 0, false
+	}
+	return out, oldest, true
+}
+
+func providerCacheUsable(name string, provider ProviderUsage) bool {
+	if name == "claude" && (provider.Account == nil || !strings.HasPrefix(strings.TrimSpace(provider.Account.Provenance), "claude-profile:")) {
+		return false
+	}
+	current := providerAccountIdentity(name)
+	return provider.Account != nil && current != nil && provider.Account.Key == current.Key
 }
 
 // bindSnapshotToAccounts filters a persisted snapshot down to the providers
@@ -151,22 +232,90 @@ func bindSnapshotToAccounts(snap *UsageSnapshot) (*UsageSnapshot, bool) {
 // (write-temp-then-rename) with private permissions; the body is quota data
 // plus opaque account keys — never credentials.
 func writeSnapshotFile(snap *UsageSnapshot) {
-	path := snapshotCachePath()
-	if path == "" || snap == nil {
+	if err := mergeSnapshotFile(snap, nil); err != nil {
 		return
+	}
+}
+
+func withSnapshotFileLock(fn func() error) error {
+	path := snapshotCachePath()
+	if path == "" {
+		return os.ErrInvalid
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
+		return err
 	}
-	body, err := json.Marshal(cachedSnapshot{FetchedAt: time.Now(), Snapshot: snap})
+	return withCacheFileLock(path+".lock", fn)
+}
+
+func mergeSnapshotFile(snap *UsageSnapshot, backoff *cachedProviderRecord) error {
+	path := snapshotCachePath()
+	if path == "" || snap == nil {
+		return os.ErrInvalid
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	records := map[string]cachedProviderRecord{}
+	if raw, err := os.ReadFile(path); err == nil {
+		var prior cachedSnapshot
+		if json.Unmarshal(raw, &prior) == nil {
+			records = prior.Providers
+			if len(records) == 0 && prior.Snapshot != nil {
+				for name, provider := range prior.Snapshot.Providers {
+					record := cachedProviderRecord{ObservedAt: prior.FetchedAt, Provider: provider}
+					if provider.Account != nil {
+						record.AccountKey = provider.Account.Key
+					}
+					records[name] = record
+				}
+			}
+		}
+	}
+	for name, provider := range snap.Providers {
+		record := cachedProviderRecord{ObservedAt: provider.ObservedAt, Provider: provider}
+		if record.ObservedAt.IsZero() {
+			record.ObservedAt = time.Now().UTC()
+		}
+		if provider.Account != nil {
+			record.AccountKey = provider.Account.Key
+		}
+		records[name] = record
+	}
+	if backoff != nil {
+		for name := range snap.Errors {
+			records[name] = *backoff
+		}
+	}
+	body, err := json.Marshal(cachedSnapshot{Providers: records})
 	if err != nil {
-		return
+		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
 	}
-	_ = os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 // FetchSnapshotCached returns a recent quota reading, fetching only when the
@@ -180,16 +329,17 @@ func FetchSnapshotCached() (*UsageSnapshot, time.Duration, error) {
 	return FetchSnapshotCachedForce(false)
 }
 
-// FetchSnapshotCachedForce bypasses both cache layers for this request when
-// force is true. A successful forced fetch still refreshes persisted state.
+// FetchSnapshotCachedForce bypasses successful observation caches when force is
+// true. Persisted rate-limit backoff is still honored: force cannot turn a
+// provider's explicit 429 cooldown into another upstream request.
 func FetchSnapshotCachedForce(force bool) (*UsageSnapshot, time.Duration, error) {
 	ttl := snapshotTTL()
 	quotaCache.Lock()
 	defer quotaCache.Unlock()
 
 	if !force && ttl > 0 && quotaCache.snap != nil {
-		if age := time.Since(quotaCache.fetchedAt); age < ttl {
-			return quotaCache.snap, age, nil
+		if bound, age, ok := freshBoundSnapshot(quotaCache.snap, ttl, quotaCache.fetchedAt); ok {
+			return bound, age, nil
 		}
 	}
 	// FAC-679 (second pass): the in-process cache alone did nothing for the case
@@ -201,23 +351,77 @@ func FetchSnapshotCachedForce(force bool) (*UsageSnapshot, time.Duration, error)
 	// that the cache could account for. The reading is therefore persisted, with
 	// the same rules: short TTL, age reported, identity-bound, and a failed
 	// refresh never served from disk.
-	if !force && ttl > 0 {
-		if snap, age, ok := readSnapshotFile(ttl); ok {
-			quotaCache.snap, quotaCache.fetchedAt = snap, time.Now().Add(-age)
-			return snap, age, nil
+	var snap *UsageSnapshot
+	var err error
+	var ageUsed time.Duration
+	lockErr := withSnapshotFileLock(func() error {
+		if !force && ttl > 0 {
+			if cached, age, ok := readSnapshotFile(ttl); ok {
+				quotaCache.snap, quotaCache.fetchedAt = cached, time.Now().Add(-age)
+				snap = cached
+				ageUsed = age
+				return nil
+			}
 		}
+		pollers := activeNativePollers()
+		available := make(map[string]func() (ProviderUsage, error), len(pollers))
+		suppressed := make(map[string]string)
+		for name, poll := range pollers {
+			if record, ok := readProviderRecord(name); ok && record.BackoffUntil.After(time.Now()) && record.AccountKey == currentProviderAccountKey(name) {
+				suppressed[name] = record.Error
+				continue
+			}
+			available[name] = poll
+		}
+		snap, err = fetchDirectAllWithPollers(available)
+		if len(suppressed) > 0 {
+			if snap.Errors == nil {
+				snap.Errors = make(map[string]string)
+			}
+			for name, detail := range suppressed {
+				if detail == "" {
+					detail = "rate-limited: provider is in persisted backoff"
+				}
+				snap.Errors[name] = detail
+			}
+		}
+		if len(snap.Providers) > 0 {
+			quotaCache.snap = snap
+			quotaCache.fetchedAt = time.Now()
+			if writeErr := mergeSnapshotFile(snap, nil); writeErr != nil {
+				return writeErr
+			}
+		}
+		if writeErr := persistRateLimitErrors(snap); writeErr != nil {
+			return writeErr
+		}
+		return nil
+	})
+	if lockErr != nil {
+		return nil, 0, lockErr
 	}
-	snap, err := FetchSnapshot()
 	if err != nil {
 		// Deliberately do NOT fall back to the cached value. A provider that has
 		// stopped answering is precisely when routing on remembered numbers can
 		// spend a request against a surface that has gone to zero.
 		return snap, 0, err
 	}
-	quotaCache.snap = snap
-	quotaCache.fetchedAt = time.Now()
-	writeSnapshotFile(snap)
-	return snap, 0, nil
+	return snap, ageUsed, nil
+}
+
+func persistRateLimitErrors(snap *UsageSnapshot) error {
+	if snap == nil {
+		return nil
+	}
+	for name, detail := range snap.Errors {
+		if strings.HasPrefix(detail, "rate-limited: ") {
+			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: currentProviderAccountKey(name), BackoffUntil: time.Now().Add(rateLimitBackoff(pollErrf("rate-limited", "%s", detail))), Error: detail}
+			if err := mergeSnapshotFile(&UsageSnapshot{Errors: map[string]string{name: detail}}, &record); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // fetchProviderCached is the provider-scoped companion to
@@ -238,29 +442,98 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 	quotaCache.Lock()
 	defer quotaCache.Unlock()
 	if !force && ttl > 0 && quotaCache.snap != nil {
-		if age := time.Since(quotaCache.fetchedAt); age >= 0 && age < ttl {
-			if snap := providerOnlySnapshot(quotaCache.snap, name); snap != nil {
+		if bound, _, ok := freshBoundSnapshot(quotaCache.snap, ttl, quotaCache.fetchedAt); ok {
+			if snap := providerOnlySnapshot(bound, name); snap != nil {
 				return snap, nil
 			}
 		}
 	}
-	if !force && ttl > 0 {
-		if snap, _, ok := readSnapshotFile(ttl); ok {
-			if selected := providerOnlySnapshot(snap, name); selected != nil {
-				quotaCache.snap = snap
-				quotaCache.fetchedAt = time.Now()
-				return selected, nil
+	var snap *UsageSnapshot
+	var err error
+	lockErr := withSnapshotFileLock(func() error {
+		if record, ok := readProviderRecord(name); ok && record.BackoffUntil.After(time.Now()) && record.AccountKey == currentProviderAccountKey(name) {
+			return nil
+		}
+		if !force && ttl > 0 {
+			if cached, age, ok := readSnapshotFile(ttl); ok {
+				if selected := providerOnlySnapshot(cached, name); selected != nil {
+					quotaCache.snap = cached
+					quotaCache.fetchedAt = time.Now().Add(-age)
+					snap = selected
+					return nil
+				}
 			}
 		}
+		snap, err = fetchDirectProvider(provider)
+		if err == nil {
+			if quotaCache.snap == nil {
+				quotaCache.snap = &UsageSnapshot{Providers: map[string]ProviderUsage{}}
+			}
+			for k, v := range snap.Providers {
+				quotaCache.snap.Providers[k] = v
+			}
+			quotaCache.fetchedAt = time.Now()
+			return mergeSnapshotFile(snap, nil)
+		}
+		if pollErrorCode(err) == "rate-limited" {
+			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: currentProviderAccountKey(name), BackoffUntil: time.Now().Add(rateLimitBackoff(err)), Error: classifyPollError(err)}
+			return mergeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{}, Errors: map[string]string{name: classifyPollError(err)}}, &record)
+		}
+		return nil
+	})
+	if lockErr != nil {
+		return nil, lockErr
 	}
-	snap, err := fetchDirectProvider(provider)
+	if snap == nil && err == nil {
+		if record, ok := readProviderRecord(name); ok && record.Error != "" {
+			err = pollErrf("rate-limited", "%s", record.Error)
+		} else {
+			err = pollErrf("rate-limited", "provider %s is in persisted backoff", name)
+		}
+	}
 	if err != nil {
 		return snap, err
 	}
-	quotaCache.snap = snap
-	quotaCache.fetchedAt = time.Now()
-	writeSnapshotFile(snap)
 	return snap, nil
+}
+
+func currentProviderAccountKey(name string) string {
+	if account := providerAccountIdentity(name); account != nil {
+		return account.Key
+	}
+	return ""
+}
+
+func readProviderRecord(name string) (cachedProviderRecord, bool) {
+	raw, err := os.ReadFile(snapshotCachePath())
+	if err != nil {
+		return cachedProviderRecord{}, false
+	}
+	var c cachedSnapshot
+	if json.Unmarshal(raw, &c) != nil {
+		return cachedProviderRecord{}, false
+	}
+	if record, ok := c.Providers[name]; ok {
+		return record, true
+	}
+	return cachedProviderRecord{}, false
+}
+
+func rateLimitBackoff(err error) time.Duration {
+	const defaultBackoff = 15 * time.Second
+	const maxBackoff = 5 * time.Minute
+	text := classifyPollError(err)
+	marker := "retry-after="
+	if i := strings.Index(text, marker); i >= 0 {
+		value := strings.TrimSpace(strings.TrimPrefix(text[i+len(marker):], ""))
+		if seconds, parseErr := strconv.Atoi(value); parseErr == nil && seconds > 0 {
+			if d := time.Duration(seconds) * time.Second; d <= maxBackoff {
+				return d
+			}
+			return maxBackoff
+		}
+	}
+	return defaultBackoff
 }
 
 func providerOnlySnapshot(snap *UsageSnapshot, provider string) *UsageSnapshot {
