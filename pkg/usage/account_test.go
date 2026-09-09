@@ -25,6 +25,23 @@ func isolatedHome(t *testing.T) string {
 	return home
 }
 
+func TestOpenCodeAccountIdentityUsesConfiguredClaim(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_DATA_DIR", "")
+	dir := filepath.Join(home, ".local", "share", "opencode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"opencode-go":{"key":"secret","account_id":"go-account"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id := opencodeAccountIdentity()
+	if id == nil || id.Key != opaqueAccountKey("opencode", "go-account") {
+		t.Fatalf("OpenCode account claim was not bound: %+v", id)
+	}
+}
+
 // The opaque key is the ONLY account material that ever leaves this package.
 // It must be deterministic, distinct per account, and must not embed the claim.
 func TestOpaqueAccountKeyIsStableAndNonReversible(t *testing.T) {
