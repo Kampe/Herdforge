@@ -305,6 +305,135 @@ func recoveryCLIArgs(tc dispatch.TaskContext, target string) []string {
 		"--session-id", tc.SessionID, tc.TaskRef, target}
 }
 
+func publicRecoveryCase(t *testing.T, owner, role string, generationOffset int64) (recoveryReceiptFixture, dispatch.TaskContext, string, *claim.Lease) {
+	t.Helper()
+	f := newRecoveryReceiptFixture(t)
+	storePath := filepath.Join(f.root, ".herd", "herdforge.db")
+	store, err := claim.NewSQLiteLeaseStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := f.prior
+	recovery.Role = dispatch.RoleRecovery
+	recovery.AuthorityScope = dispatch.AuthorityScopeCandidateSupersession
+	recovery.LeaseTaskRef = f.task.Ref + ":recovery"
+	recovery.SessionID = "public-cli-" + strings.ReplaceAll(t.Name(), "/", "-")
+	recovery.AllowedOps = dispatch.OpsForRole(dispatch.RoleRecovery)
+	recovery.ExpiresAt = time.Now().Add(time.Hour)
+	lease, err := store.Acquire(context.Background(), claim.LeaseKey{Repo: recovery.Repository, Provider: recovery.ProviderType, Project: recovery.ProjectID, TaskRef: recovery.LeaseTaskRef}, owner, role, f.worktree, time.Now(), time.Hour)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovery.LeaseID = fmt.Sprintf("claim:%d", lease.ID)
+	recovery.LeaseGeneration = lease.Generation + generationOffset
+	recovery, err = f.signer.Issue(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.StoreCanonicalReceipt(f.root, recovery); err != nil {
+		t.Fatal(err)
+	}
+	return f, recovery, storePath, lease
+}
+
+func assertRecoveryCLIRefusalPreservesState(t *testing.T, binary string, f recoveryReceiptFixture, recovery dispatch.TaskContext, storePath string, expected *claim.Lease) {
+	t.Helper()
+	before, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(recovery, f.worktree)...).CombinedOutput()
+	if err == nil {
+		t.Fatalf("invalid recovery authority unexpectedly succeeded: %s", out)
+	}
+	after, err := os.ReadFile(filepath.Join(f.worktree, dispatch.TaskContextFile))
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("recovery refusal changed target bytes: %v", err)
+	}
+	store, err := claim.OpenSQLiteLeaseStoreReadOnly(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.CurrentLease(context.Background(), expected.LeaseKey)
+	store.Close()
+	if err != nil || current == nil || current.ID != expected.ID || current.Status != expected.Status || current.OwnerID != expected.OwnerID || current.Role != expected.Role || current.Generation != expected.Generation {
+		t.Fatalf("recovery refusal changed durable lease: err=%v current=%+v expected=%+v", err, current, expected)
+	}
+}
+
+func TestReceiptRecoverCLIRejectsDurableLeaseAuthorityVariants(t *testing.T) {
+	binary := buildHerd(t)
+	tests := []struct {
+		name, owner, role string
+		generationOffset  int64
+		mutate            func(t *testing.T, storePath string, lease *claim.Lease)
+	}{
+		{name: "released", owner: "coordinator-recovery", role: dispatch.RoleRecovery, mutate: func(t *testing.T, path string, lease *claim.Lease) {
+			store, err := claim.NewSQLiteLeaseStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := store.Release(context.Background(), lease.LeaseKey, lease.OwnerID, lease.Generation, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+		}},
+		{name: "superseded", owner: "coordinator-recovery", role: dispatch.RoleRecovery, mutate: func(t *testing.T, path string, lease *claim.Lease) {
+			store, err := claim.NewSQLiteLeaseStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := store.Release(context.Background(), lease.LeaseKey, lease.OwnerID, lease.Generation, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Acquire(context.Background(), lease.LeaseKey, "coordinator-recovery", dispatch.RoleRecovery, lease.WorktreePath, time.Now(), time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+		}},
+		{name: "wrong-owner", owner: "other-owner", role: dispatch.RoleRecovery},
+		{name: "wrong-role", owner: "coordinator-recovery", role: dispatch.RoleWorker},
+		{name: "wrong-generation", owner: "coordinator-recovery", role: dispatch.RoleRecovery, generationOffset: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f, recovery, storePath, lease := publicRecoveryCase(t, tc.owner, tc.role, tc.generationOffset)
+			if tc.mutate != nil {
+				tc.mutate(t, storePath, lease)
+				if tc.name == "released" {
+					lease.Status = claim.StatusReleased
+				}
+				if tc.name == "superseded" {
+					store, err := claim.OpenSQLiteLeaseStoreReadOnly(storePath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					lease, err = store.CurrentLease(context.Background(), lease.LeaseKey)
+					store.Close()
+					if err != nil || lease == nil {
+						t.Fatalf("read superseding lease: %v", err)
+					}
+				}
+			}
+			assertRecoveryCLIRefusalPreservesState(t, binary, f, recovery, storePath, lease)
+		})
+	}
+
+	f, recovery, _, _ := publicRecoveryCase(t, "coordinator-recovery", dispatch.RoleRecovery, 0)
+	out, err := herdCmd(binary, f.root, f.keyDir, recoveryCLIArgs(recovery, f.worktree)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("valid recovery authority should succeed: %v output=%s", err, out)
+	}
+	got, err := dispatch.ReadTaskContext(f.worktree)
+	if err != nil || !got.EqualsIssued(recovery) || got.BaseSHA != f.base {
+		t.Fatalf("valid recovery changed signed base/authority: %v got=%+v", err, got)
+	}
+}
+
 func TestReceiptRecoverCLIRequiresExactTargetAndReadOnlyLeaseObservation(t *testing.T) {
 	f := newRecoveryReceiptFixture(t)
 	recovery := f.prior
