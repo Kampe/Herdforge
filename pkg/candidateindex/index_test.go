@@ -853,6 +853,60 @@ func TestCandidateIndex_ReceiptAdmissionRequiresExactFullSuiteCommand(t *testing
 	}
 }
 
+// FAC-744 finding 2: an older generation's completion must never clear a
+// newer generation's veto, including when callbacks arrive out of order.
+func TestCandidateIndex_OlderCompletionMustNotClearNewerGenerationVeto(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	writeFAC744CallbackMail(t, mailPath, []struct {
+		sequence, generation int64
+		kind                 mail.CallbackKind
+		detail               string
+	}{
+		{sequence: 20, generation: 2, kind: mail.CallbackBlocked, detail: "generation 2 failed review"},
+		{sequence: 21, generation: 1, kind: mail.CallbackBlocked, detail: "generation 1 failed"},
+		{sequence: 22, generation: 1, kind: mail.CallbackComplete},
+	})
+	writeFAC744Receipt(t, dir, "1", []string{"go", "test", "./..."}, "", "", "")
+	ledgerPath := writeFAC744PassVerdict(t, dir)
+
+	cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.State != StateBlocked {
+		t.Fatalf("older completion cleared the newer generation's veto: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
+	}
+	if !containsBlockedReason(c.BlockedReasons, BlockedVetoVerdict) {
+		t.Fatalf("expected the newer generation's veto to survive: reasons=%v", c.BlockedReasons)
+	}
+	if !containsBlockedEvidence(c.BlockedEvidence, "generation 2 failed review") {
+		t.Fatalf("expected the newer generation's veto evidence to survive: evidence=%v", c.BlockedEvidence)
+	}
+}
+
+func containsBlockedReason(reasons []BlockedReason, want BlockedReason) bool {
+	for _, reason := range reasons {
+		if reason == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBlockedEvidence(evidence []string, want string) bool {
+	for _, item := range evidence {
+		if strings.Contains(item, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsCandidateSource(sources []CandidateSource, want CandidateSource) bool {
 	for _, source := range sources {
 		if source == want {

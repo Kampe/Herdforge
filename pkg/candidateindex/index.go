@@ -291,9 +291,21 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 							c.State = StateBlocked
 							c.BlockedReasons = append(c.BlockedReasons, BlockedVetoVerdict)
 							c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("callback blocked: %s", cb.Detail))
-							callbackBlocks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							// Retain the highest active generation's block. A
+							// lower-generation block never supersedes a newer
+							// generation's veto, so out-of-order arrival must
+							// not overwrite the newer block's fencing.
+							if block, ok := callbackBlocks[key]; !ok || cb.LeaseGeneration > block.lease || (cb.LeaseGeneration == block.lease && env.Sequence > block.sequence) {
+								callbackBlocks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							}
 						} else if cb.Kind == mail.CallbackComplete {
-							completionCallbacks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							// Retain the highest completed generation so an
+							// out-of-order older completion cannot become the
+							// receipt join target and mask the authoritative
+							// newer generation's missing receipt.
+							if prev, ok := completionCallbacks[key]; !ok || cb.LeaseGeneration > prev.lease || (cb.LeaseGeneration == prev.lease && env.Sequence > prev.sequence) {
+								completionCallbacks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							}
 							c.CompletionCallback = true
 							// A completion from the same or a later lease generation
 							// supersedes the block it causally follows. A later
@@ -450,7 +462,13 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 					continue
 				}
 				c := getOrCreate(key.ref, key.sha, provider.PriorityMedium)
-				c.LeaseGeneration, c.BaseSHA = gen, receipt.BaseSHA
+				// The joined receipt validates its own generation's
+				// completion claim; it must never downgrade a higher lease
+				// generation already observed for this candidate.
+				if gen > c.LeaseGeneration {
+					c.LeaseGeneration = gen
+				}
+				c.BaseSHA = receipt.BaseSHA
 				c.ReceiptDigest, c.CompletionSequence = receipt.Digest, cb.sequence
 				c.CompletionValid = true
 			}
