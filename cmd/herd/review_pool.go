@@ -109,6 +109,17 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
+	// FAC-769: resolve the exact review base from the validated launch pin and
+	// fail closed if it cannot be resolved. The packet must carry the exact
+	// base/head the reviewer is expected to read; an unresolved or invalid base
+	// must refuse generation before any packet/provenance/launch effect. We never
+	// invent a base from the latest parent when the launcher has not resolved a
+	// valid review base.
+	base, err := resolveReviewBase(root, sha)
+	if err != nil {
+		return err
+	}
+
 	// FAC-668 correction finding 1: validate the candidate's review contract
 	// against the EXACT candidate tree BEFORE any provenance or pool state
 	// changes. Below this point the launch may record an operator-asserted
@@ -415,7 +426,7 @@ func runPoolReview(ref string) error {
 	if wsErr != nil {
 		packetWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	}
-	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
+	packetBody := reviewPacketBody(ref, sha, base, surface, lease.Path, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -1730,6 +1741,28 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID, packetTask string) 
 	})
 }
 
+// resolveReviewBase resolves the exact base the candidate is reviewed against.
+//
+// FAC-769: the packet must carry the exact reviewed-base/head from the validated
+// launch pin, never a base invented from the latest parent. The base is the
+// merge-base of the candidate against origin/main, which is the same anchor the
+// admission binding and risk classification use. An unresolved or invalid base
+// fails closed so generation refuses before any packet/provenance/launch effect.
+func resolveReviewBase(root, sha string) (string, error) {
+	out, err := exec.Command("git", "-C", root, "merge-base", sha, "origin/main").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve review base for %s: %w", shortSHA(sha), err)
+	}
+	base := strings.TrimSpace(string(out))
+	if len(base) < 12 {
+		return "", fmt.Errorf("resolve review base for %s: unresolved or invalid base %q", shortSHA(sha), base)
+	}
+	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", base+"^{commit}").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("resolve review base for %s: base %s is not a commit: %s", shortSHA(sha), shortSHA(base), strings.TrimSpace(string(out)))
+	}
+	return base, nil
+}
+
 // candidatePatchIdentity computes the stable patch id for a candidate against
 // its merge base. Verified stable across a clean rebase, which is the property
 // the admission binding depends on.
@@ -1959,7 +1992,7 @@ func liveAgentByPrefix(prefixes ...string) string {
 	return ""
 }
 
-func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
+func reviewPacketBody(ref, sha, base, surface, poolSlotPath, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
@@ -1967,7 +2000,7 @@ Your cwd is an isolated review surface. Every command you run must stay inside i
 NEVER run git, or any command that writes, against the canonical shared checkout.
 
 The Surface path below is a SYMLINK into your exclusive leased warm-pool slot
-(.herd/pool/pool-NN). That alias is intentional: herd review --pool leases one
+(%s). That alias is intentional: herd review --pool leases one
 clean slot, pins the candidate there, and points the surface at that same tree.
 Seeing the symlink resolve to your own pool cwd is NOT a broken isolation
 contract and is NOT shared main. Isolation means exclusive lease + pool
@@ -1975,7 +2008,7 @@ worktree, not "surface path string differs from cwd".
 
 git rev-parse --show-toplevel resolves THROUGH the symlink to the pool
 worktree path. That is correct. Fail closed only if toplevel is the canonical
-shared checkout (the repo root that is not under .herd/pool/). Comparing
+shared checkout (the repo root that is not under the pool root). Comparing
 toplevel to the literal Surface symlink string and calling a match
 "non-isolated" is a false positive.
 
@@ -1988,7 +2021,7 @@ and a coordinator had to restore it by hand.
 
 If you swap a file to prove non-vacuity:
   1. confirm where you are first: git rev-parse --show-toplevel
-     it MUST resolve under .herd/pool/ (your leased slot). If it names the
+     it MUST resolve under the pool root (your leased slot). If it names the
      shared checkout root, STOP.
   2. prefer /tmp or an untracked scratch file; if you must swap a tracked file
      inside the pool, do the swap, run the test, then restore: git checkout -- <path>
@@ -1997,8 +2030,15 @@ Never pass -C, --git-dir or --work-tree pointing outside your surface/pool, and
 never cd out of it to run a build or test. If something seems to require the
 shared checkout, that is a finding to report, not a step to take.
 
+The ONLY operations permitted outside your source surface are:
+  * writing your verdict artifact to the canonical inbox path below, and
+  * transporting that verdict home (verdict-push or mail) as instructed below.
+Everything else — every git command, build, and test — stays inside your
+exclusive leased pool slot.
+
 Candidate: %s
 Surface: %s
+Leased slot: %s
 
 Read .herd/prompts/reviewer.md and .herd/prompts/review-verdict.template.md from
 the candidate surface and inspect only this candidate. These paths are
@@ -2024,6 +2064,7 @@ reviewer: <your lane name — never a coordinator>
 reviewer-family: <your VENDOR family — see the exact list below>
 builder-family: %s
 verdict: PASS|FAIL|BLOCKED
+reviewed-base: %s
 reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
 ---
 
@@ -2033,6 +2074,11 @@ that disagrees with the ledger is refused as a launch/verdict identity conflict.
 If it reads "unproven", this review was dispatched with
 --allow-unproven-builder and its verdict will need hand admission -- say so in
 your evidence.
+
+The reviewed-base above is PREFILLED from the exact launch pin. Review the whole
+range from that base to the candidate head; do not start partway through. A
+verdict whose reviewed-base is a strict descendant of this base is refused as
+covering less than the candidate spans.
 
 FAMILY VALUES ARE A CLOSED SET. Use exactly one of:
 
@@ -2064,7 +2110,7 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+`, ref, poolSlotPath, sha, surface, poolSlotPath, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), base, reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
