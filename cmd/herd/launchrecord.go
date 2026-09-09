@@ -153,18 +153,12 @@ func gitBranchOf(dir string) string {
 // manual recorder's existing rule: unprovable authorship must not be written
 // down as if it were provenance.
 func recordResolvedLaunchReceipt(decision *router.LaunchDecision, lane *config.LaneDef, agentName, cwd, repository string, tabID, paneID string) error {
-	if decision == nil {
-		return fmt.Errorf("launch receipt requires a resolved decision")
-	}
 	if lane == nil {
 		return fmt.Errorf("launch receipt requires a lane")
 	}
-	provider := strings.TrimSpace(decision.Provider)
-	model := strings.TrimSpace(decision.Model)
-	family := router.FamilyFor(provider, model)
-	if strings.TrimSpace(family) == "" {
-		return fmt.Errorf("resolved route %s/%s maps to no vendor family; refusing to record unprovable authorship for lane %q",
-			provider, model, lane.Name)
+	provider, model, family, err := launch.ReceiptProvenance(decision)
+	if err != nil {
+		return fmt.Errorf("lane %q: %w", lane.Name, err)
 	}
 	branch := gitBranchOf(cwd)
 	if branch == "" {

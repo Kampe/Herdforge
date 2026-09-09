@@ -416,6 +416,37 @@ func TestLeaseOwnershipCloseJoinsHoldAndStoreErrors(t *testing.T) {
 	}
 }
 
+// FAC-703: two lanes share role worker. A claim bound to the exact lane name
+// must keep their hold identities distinct; the role resolver would collapse
+// smith-grok onto smith (the first worker lane).
+func TestClaimExclusiveNamedLaneKeepsSharedWorkerLanesDistinct(t *testing.T) {
+	ownership, err := OpenLeaseOwnership(filepath.Join(t.TempDir(), "launch.db"), "herd", "memory", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ownership.Close()
+	ownership.LaneResolver = func(role string) (string, error) {
+		if role == "worker" {
+			return "smith", nil // first worker lane — the FAC-608 collapse
+		}
+		return "", fmt.Errorf("unknown role %q", role)
+	}
+	tok, err := ownership.ClaimExclusiveNamedLane(context.Background(), "id", "FAC-703", "worker", "smith-grok", "rev", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := ownership.Store.(claim.LeaseSnapshotStore).CurrentLease(context.Background(), ownership.key("FAC-703"))
+	if err != nil || current == nil {
+		t.Fatalf("named-lane claim missing: current=%+v err=%v", current, err)
+	}
+	if current.HoldLane != "smith-grok" {
+		t.Fatalf("hold lane = %q, want smith-grok (resolver would have returned smith); tok=%+v", current.HoldLane, tok)
+	}
+	if current.HoldOwner != "worker" || current.Generation != tok.Generation {
+		t.Fatalf("hold owner/generation drifted: %+v tok=%+v", current, tok)
+	}
+}
+
 func TestClaimExclusiveMissingLaneResolverFailsBeforeLeaseMutation(t *testing.T) {
 	ownership, err := OpenLeaseOwnership(filepath.Join(t.TempDir(), "launch.db"), "herd", "memory", "p")
 	if err != nil {

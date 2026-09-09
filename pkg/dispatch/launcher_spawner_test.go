@@ -16,7 +16,12 @@ func TestLauncherSpawner_PreparesLifecycleBeforeAgentStart(t *testing.T) {
 	restoreRoute := herdr.SetPiSessionRouteAttesterForTest(func(string, []string) error { return nil })
 	t.Cleanup(restoreRoute)
 
-	decision, err := testRouter(t).Decide(router.LaunchRequest{
+	// FAC-703 made dispatch fixtures compile native vendor argv by default.
+	// This test asserts the Pi adapter's tool-child lifecycle ordering, so pin
+	// the legacy adapter explicitly instead of relying on the library default.
+	r := testRouter(t)
+	t.Setenv("HERD_USE_PI", "1")
+	decision, err := r.Decide(router.LaunchRequest{
 		Role: router.RoleWorker, Shape: launch.Implementation, TaskRef: "FAC-746",
 		LeaseGeneration: 7, Scope: router.ScopeTask, RequestedProvider: testWorkerProvider,
 		RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort,

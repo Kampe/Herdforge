@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -652,13 +653,13 @@ func (d *Dispatcher) ownershipClaimer() (deps.OwnershipClaimer, error) {
 		return nil, err
 	}
 	if d.Config != nil {
-		ownership.LaneResolver = func(role string) (string, error) {
-			for _, lane := range d.Config.Lanes {
-				if lane.Role == role {
-					return lane.Name, nil
-				}
+		cfg := d.Config
+		ownership.LaneResolver = func(roleOrName string) (string, error) {
+			lane, err := config.ResolveLane(cfg, roleOrName)
+			if err != nil {
+				return "", err
 			}
-			return "", fmt.Errorf("unknown configured role %q", role)
+			return lane.Name, nil
 		}
 	}
 	return ownership, nil
@@ -830,6 +831,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	if err != nil {
 		return nil, err
 	}
+	if !opts.NoLaunch {
+		// FAC-703: refuse a lane/provider/model/harness/argv mismatch before
+		// claim or pane creation. Standing lanes retain their existing quota
+		// reroute.
+		if err := validateDecisionForLane(opts.Decision, lane); err != nil {
+			return nil, err
+		}
+	}
 	publication, err := branchPublicationMode(d.Config)
 	if err != nil {
 		return nil, err
@@ -891,7 +900,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (*Dispa
 	} else if lane.Name != "" {
 		claimRole = lane.Name
 	}
-	tok, cerr := own.ClaimExclusive(ctx, pre.TaskID, deps.Ref(task.Ref), claimRole, pre.GraphRevision, pre.ProviderRevision, "")
+	tok, cerr := own.ClaimExclusiveNamedLane(ctx, pre.TaskID, deps.Ref(task.Ref), claimRole, lane.Name, pre.GraphRevision, pre.ProviderRevision, "")
 	if cerr != nil {
 		return nil, fmt.Errorf("dispatch lease claim: %w", cerr)
 	}
@@ -2110,6 +2119,76 @@ func validateWorkerLaunchRequest(opts DispatchOptions) (launch.Request, error) {
 		return req, err
 	}
 	return req, nil
+}
+
+// validateDecisionForLane is the FAC-703 admission fence: the decision an
+// explicit `--lane NAME` dispatch carries must be the decision THAT lane's
+// configuration compiles to. A lane resolved by name that then launches
+// another lane's argv (the live FAC-608 defect: --lane smith-grok launched
+// codex/gpt-5.6-luna from lane smith) is refused before the ownership claim
+// and before any pane exists.
+func validateDecisionForLane(decision *router.LaunchDecision, lane *config.LaneDef) error {
+	if decision == nil || lane == nil {
+		return fmt.Errorf("dispatch lane admission requires a decision and lane")
+	}
+	if strings.TrimSpace(decision.LaneName) != strings.TrimSpace(lane.Name) {
+		return fmt.Errorf("dispatch lane identity mismatch: decision=%q configured=%q", decision.LaneName, lane.Name)
+	}
+	if err := bindDecisionToLaunchedArgv(decision); err != nil {
+		return err
+	}
+	if lane.Standing {
+		return nil
+	}
+	wantHarness := strings.ToLower(strings.TrimSpace(lane.Harness))
+	if strings.ToLower(strings.TrimSpace(decision.Provider)) != strings.ToLower(strings.TrimSpace(lane.Provider)) ||
+		strings.TrimSpace(decision.Model) != strings.TrimSpace(lane.Model) ||
+		strings.TrimSpace(decision.Effort) != strings.TrimSpace(lane.Effort) ||
+		strings.ToLower(strings.TrimSpace(decision.Harness)) != wantHarness ||
+		strings.ToLower(strings.TrimSpace(lane.AgentKind)) != wantHarness {
+		return fmt.Errorf("dispatch lane %q launch tuple mismatch: configured %s/%s/%s/%s, decision %s/%s/%s/%s", lane.Name, lane.Provider, lane.Model, lane.Effort, wantHarness, decision.Provider, decision.Model, decision.Effort, decision.Harness)
+	}
+	wantArgv := router.ArgvFor(lane.Provider, lane.Model, lane.Effort)
+	if !reflect.DeepEqual(decision.HarnessArgv, wantArgv) {
+		return fmt.Errorf("dispatch lane %q harness argv mismatch: configured=%v decision=%v", lane.Name, wantArgv, decision.HarnessArgv)
+	}
+	return nil
+}
+
+// bindDecisionToLaunchedArgv refuses a decision whose provider/model/family
+// would not match the argv that AgentStart actually execs. Relabeling after
+// launch is out of scope; mismatch is a hard error.
+func bindDecisionToLaunchedArgv(decision *router.LaunchDecision) error {
+	if decision == nil {
+		return fmt.Errorf("dispatch lane admission requires a decision")
+	}
+	argv := decision.HarnessArgv
+	if len(argv) == 0 {
+		argv = decision.Argv
+	}
+	if len(argv) == 0 {
+		return nil
+	}
+	provider, model, err := router.ProvenanceFromArgv(argv)
+	if err != nil {
+		return fmt.Errorf("dispatch lane %q argv provenance: %w", decision.LaneName, err)
+	}
+	if provider == router.PiHarness {
+		return nil
+	}
+	if !strings.EqualFold(provider, strings.TrimSpace(decision.Provider)) ||
+		(model != "" && model != strings.TrimSpace(decision.Model)) {
+		return fmt.Errorf("dispatch lane %q argv provenance %s/%s disagrees with decision %s/%s",
+			decision.LaneName, provider, model, decision.Provider, decision.Model)
+	}
+	family := router.FamilyFor(decision.Provider, decision.Model)
+	if family == "" {
+		return fmt.Errorf("dispatch lane %q resolved %s/%s maps to no vendor family", decision.LaneName, decision.Provider, decision.Model)
+	}
+	if got := strings.TrimSpace(decision.Family); got != "" && got != family {
+		return fmt.Errorf("dispatch lane %q family mismatch: decision=%q argv=%q", decision.LaneName, got, family)
+	}
+	return nil
 }
 
 // signReceipt issues the receipt with the coordinator's private key (kept

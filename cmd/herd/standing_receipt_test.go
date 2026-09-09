@@ -186,6 +186,43 @@ func TestANonReroutedLaneRecordsItsConfiguredProvider(t *testing.T) {
 	}
 }
 
+// FAC-703 RED: a smith-grok lane must never record a receipt whose argv
+// execs codex. The decision below names grok/grok-4.6 but carries codex
+// harness argv; the receipt writer has to refuse instead of writing
+// mismatched provenance down as if it were authorship.
+func TestSmithGrokReceiptRefusesCodexArgv(t *testing.T) {
+	_, lane := receiptFixture(t)
+	lane = &config.LaneDef{Name: "smith-grok", Role: "worker", Provider: "grok", Model: "grok-4.6", Harness: "grok"}
+	decision := &router.LaunchDecision{
+		LaneName: lane.Name, Provider: "grok", Model: "grok-4.6", Family: "xai",
+		Harness: "grok", Shape: "implementation",
+		HarnessArgv: router.ArgvFor("codex", "gpt-5.6-luna", "medium"),
+	}
+	if err := recordResolvedLaunchReceipt(decision, lane, "forge-smith-grok", ".", "herdforge", "t", "p"); err == nil {
+		t.Fatal("codex argv under smith-grok must not write a receipt")
+	}
+}
+
+// FAC-703: the standing receipt binds the exact named lane's grok argv, never
+// the first worker lane's codex tuple.
+func TestSmithGrokReceiptBindsGrokArgvNotFirstWorker(t *testing.T) {
+	root, _ := receiptFixture(t)
+	lane := &config.LaneDef{Name: "smith-grok", Role: "worker", Provider: "grok", Model: "grok-4.6", Harness: "grok"}
+	argv := router.ArgvFor("grok", "grok-4.6", "medium")
+	decision := &router.LaunchDecision{
+		LaneName: lane.Name, Provider: "grok", Model: "grok-4.6", Family: "xai",
+		Harness: "grok", Effort: "medium", Shape: "implementation",
+		HarnessArgv: argv, Argv: argv,
+	}
+	if err := recordResolvedLaunchReceipt(decision, lane, "forge-smith-grok", ".", "herdforge", "wK:t1", "wK:p1"); err != nil {
+		t.Fatal(err)
+	}
+	r := readReceipts(t, root)[0]
+	if r.Provider != "grok" || r.Model != "grok-4.6" || r.BuilderFamily != "xai" || r.Lane != "smith-grok" {
+		t.Fatalf("receipt = %+v, want smith-grok grok/grok-4.6/xai", r)
+	}
+}
+
 // THE live-path regression the operator required: it must FAIL when the
 // production write is deleted.
 //

@@ -115,6 +115,9 @@ type fixedGenerationOwnership struct {
 }
 
 func (o *fixedGenerationOwnership) ClaimExclusive(_ context.Context, taskID deps.TaskID, taskRef deps.Ref, role, graphRev, providerRev, _ string) (*deps.OwnershipToken, error) {
+	return o.ClaimExclusiveNamedLane(context.Background(), taskID, taskRef, role, "", graphRev, providerRev, "")
+}
+func (o *fixedGenerationOwnership) ClaimExclusiveNamedLane(_ context.Context, taskID deps.TaskID, taskRef deps.Ref, role, _, graphRev, providerRev, _ string) (*deps.OwnershipToken, error) {
 	return &deps.OwnershipToken{TaskID: taskID, TaskRef: taskRef, OwnerID: "test-owner", Generation: o.generation, GraphRev: graphRev, ProviderRev: providerRev, Role: role}, nil
 }
 func (o *fixedGenerationOwnership) StillOwns(context.Context, *deps.OwnershipToken) (bool, error) {
@@ -198,11 +201,17 @@ func (f *targetCapturingHerdr) ReadControlTarget(target control.WakeTarget) (con
 
 func testRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
+	// Dispatch fixtures use the native provider argv contract. Do not inherit
+	// a developer's legacy Pi adapter setting into the compiled decision.
+	t.Setenv("HERD_USE_PI", "0")
+	// Native local launch fixtures do not require the hosted Pi lifecycle
+	// ledger; production hosting keeps that prerequisite enabled.
+	t.Setenv("HERD_MODE", "local")
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
 	t.Setenv("PI_CODING_AGENT_SESSION_DIR", t.TempDir())
 	r := router.NewRouter(nil, nil)
 	r.Probes = &router.Probes{
-		CLIPresent: func(cli string) bool { return cli == router.PiHarness },
+		CLIPresent: func(cli string) bool { return cli == router.PiHarness || cli == testWorkerProvider },
 		Now:        func() time.Time { return time.Unix(1_800_000_000, 0) },
 	}
 	return r
@@ -210,11 +219,16 @@ func testRouter(t *testing.T) *router.SurfaceRouter {
 
 func validLaunchOptions(t *testing.T, ref string) DispatchOptions {
 	t.Helper()
-	d, err := testRouter(t).Decide(router.LaunchRequest{Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
+	const laneName = "worker"
+	d, err := testRouter(t).Decide(router.LaunchRequest{LaneName: laneName, Role: router.RoleWorker, Shape: launch.Implementation, RequestedProvider: testWorkerProvider, RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort, ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true}})
 	if err != nil {
 		t.Fatalf("build launch fixture: %v", err)
 	}
-	return DispatchOptions{TicketRef: ref, Decision: d}
+	// Dispatch admission binds the compiled decision to the exact configured
+	// lane. Keep this fixture coherent with testCfg rather than relying on the
+	// pre-FAC-703 empty lane identity.
+	d.LaneName = laneName
+	return DispatchOptions{TicketRef: ref, LaneName: laneName, Decision: d}
 }
 
 // leasedLaunchOptions is validLaunchOptions carrying a real claim-store lease.
@@ -348,7 +362,7 @@ func testCfg() *config.Config {
 		Project:      config.ProjectConfig{Name: "Herdforge", DefaultBranch: "main"},
 		TaskProvider: config.TaskProvider{Type: "memory", ProjectID: "test"},
 		Lanes: []config.LaneDef{
-			{Name: "worker", Role: "worker", Model: "deepseek-v4-flash", AgentKind: "opencode", Prompt: ".herd/prompts/worker.md"},
+			{Name: "worker", Role: "worker", AgentKind: testWorkerProvider, Harness: testWorkerProvider, Provider: testWorkerProvider, Model: testWorkerModel, Effort: testWorkerEffort, TaskShape: launch.Implementation, Prompt: ".herd/prompts/worker.md"},
 		},
 		Verification: config.Verification{TestCommand: "go test ./...", PreflightCommand: "go build ./..."},
 	}
@@ -438,11 +452,8 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
-	if targetReader.target.Provider != router.PiHarness {
-		t.Fatalf("control target provider = %q, want %q", targetReader.target.Provider, router.PiHarness)
-	}
-	if targetReader.target.Provider == testWorkerProvider {
-		t.Fatalf("control target provider = %q, want not worker provider %q", targetReader.target.Provider, testWorkerProvider)
+	if targetReader.target.Provider != testWorkerProvider {
+		t.Fatalf("control target provider = %q, want %q", targetReader.target.Provider, testWorkerProvider)
 	}
 	t.Cleanup(func() { os.RemoveAll(res.Worktree) })
 
@@ -465,28 +476,18 @@ func TestDispatch_Launch_SetsCwdAndProvesPrompt(t *testing.T) {
 	if fh.startReq.Decision == nil || !reflect.DeepEqual(fh.startReq.Decision.Argv, wantArgv) || fh.startReq.Decision.Provider != testWorkerProvider {
 		t.Fatalf("dispatch launch decision = %+v, want provider/argv %s", fh.startReq.Decision, wantArgv)
 	}
-	wantHarnessArgv := []string{"pi", "--model", "openai-codex/gpt-5.6-luna", "--thinking", testWorkerEffort}
-	if fh.startKind != router.PiHarness {
-		t.Fatalf("AgentStart kind = %q, want %q", fh.startKind, router.PiHarness)
+	// Native vendor launch (FAC-703 fixture alignment): the compiled harness
+	// argv is the vendor argv contract itself, not a Pi adapter session file.
+	wantHarnessArgv := router.ArgvFor(testWorkerProvider, testWorkerModel, testWorkerEffort)
+	if fh.startKind != testWorkerProvider {
+		t.Fatalf("AgentStart kind = %q, want %q", fh.startKind, testWorkerProvider)
 	}
-	if fh.startReq.Decision.Harness != router.PiHarness {
-		t.Fatalf("decision harness = %q, want %q", fh.startReq.Decision.Harness, router.PiHarness)
+	if fh.startReq.Decision.Harness != testWorkerProvider {
+		t.Fatalf("decision harness = %q, want %q", fh.startReq.Decision.Harness, testWorkerProvider)
 	}
 	hav := fh.startReq.Decision.HarnessArgv
-	if len(hav) != 7 {
-		t.Fatalf("decision harness argv len = %d, want 7: %#v", len(hav), hav)
-	}
-	if !reflect.DeepEqual(hav[:5], wantHarnessArgv) {
-		t.Fatalf("decision harness argv base = %#v, want %#v", hav[:5], wantHarnessArgv)
-	}
-	if hav[5] != "--session" { //hermetic:allow-argv-position fixed pi contract: --session is always at index 5 after the 5-element base
-		t.Fatalf("decision harness argv[5] = %q, want --session", hav[5])
-	}
-	if hav[6] == "" || !filepath.IsAbs(hav[6]) {
-		t.Fatalf("decision harness argv[6] = %q, want nonempty absolute path", hav[6])
-	}
-	if fh.startReq.Decision.HarnessSession != hav[6] {
-		t.Fatalf("decision harness session = %q, want argv[6] %q", fh.startReq.Decision.HarnessSession, hav[6])
+	if !reflect.DeepEqual(hav, wantHarnessArgv) {
+		t.Fatalf("decision harness argv = %#v, want %#v", hav, wantHarnessArgv)
 	}
 	if fh.startName == "" {
 		t.Fatal("AgentStart name is blank")

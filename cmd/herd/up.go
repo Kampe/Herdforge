@@ -79,7 +79,7 @@ func runUpCommand(laneName string, runtime upRuntime, out io.Writer) error {
 	cwd := filepath.Join(".", lane.Worktree)
 	name := standing.AgentNameForRepository(lane.Name, repository)
 	var tab *herdr.TabInfo
-	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, runtime.Route, func(d *router.LaunchDecision) error {
+	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, runtime.Route, func(d *router.LaunchDecision) error {
 		var e error
 		tab, e = runtime.Open(d, launch.Request{Decision: d, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}, lane, workspace, name, cwd)
 		return e

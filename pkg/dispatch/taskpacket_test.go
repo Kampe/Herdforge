@@ -159,7 +159,11 @@ type releaseTrackingOwnership struct {
 	releases   int
 }
 
-func (o *releaseTrackingOwnership) ClaimExclusive(_ context.Context, taskID deps.TaskID, taskRef deps.Ref, role, graphRev, providerRev, _ string) (*deps.OwnershipToken, error) {
+func (o *releaseTrackingOwnership) ClaimExclusive(ctx context.Context, taskID deps.TaskID, taskRef deps.Ref, role, graphRev, providerRev, worktreeHint string) (*deps.OwnershipToken, error) {
+	return o.ClaimExclusiveNamedLane(ctx, taskID, taskRef, role, "", graphRev, providerRev, worktreeHint)
+}
+
+func (o *releaseTrackingOwnership) ClaimExclusiveNamedLane(_ context.Context, taskID deps.TaskID, taskRef deps.Ref, role, _ string, graphRev, providerRev, _ string) (*deps.OwnershipToken, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.owned = true
