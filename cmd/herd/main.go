@@ -9023,45 +9023,14 @@ func containsDrainSHA(shas []string, want string) bool {
 }
 
 func verificationCommandProfile(root string) (verifier.CommandProfile, string, error) {
-	buildCommand := "true"
-	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
-		buildCommand = "go build ./..."
+	// The one derivation is pkg/verifier.ResolveProfile; this wrapper only
+	// keeps the cmd/herd error contract. Both the managed completion gate and
+	// the candidate index admit receipts against that same derivation.
+	resolved := verifier.ResolveProfile(root)
+	if resolved.Refusal != "" {
+		return verifier.CommandProfile{}, "", errors.New(resolved.Refusal)
 	}
-	profile := verifier.CommandProfile{
-		ID: verificationProfile,
-		// Repositories without a Go module must not be forced through a
-		// meaningless Go build. Their declared test command (for example
-		// bin/ci-local) owns build/typecheck coverage; the no-op build keeps
-		// the receipt profile explicit without claiming a Go build ran.
-		BuildCommand: buildCommand,
-		TestCommand:  "go test ./...",
-		TestTimeout:  30 * time.Minute,
-	}
-	path := filepath.Join(root, ".herd", "herd.yaml")
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return profile, "default", nil
-	}
-	if err != nil {
-		return profile, "", fmt.Errorf("read verification config: %w", err)
-	}
-	cfg, err := config.ParseConfig(data)
-	if err != nil {
-		return profile, "", err
-	}
-	if strings.TrimSpace(cfg.Verification.TestCommand) == "" {
-		return profile, "", errors.New("verification.test_command is required")
-	}
-	profile.TestCommand = strings.TrimSpace(cfg.Verification.TestCommand)
-	if raw := strings.TrimSpace(cfg.Verification.TestTimeout); raw != "" {
-		profile.TestTimeout, err = time.ParseDuration(raw)
-		if err != nil || profile.TestTimeout <= 0 {
-			return profile, "", fmt.Errorf("verification.test_timeout must be a positive Go duration: %q", raw)
-		}
-	}
-	profile.PreflightCommand = strings.TrimSpace(cfg.Verification.PreflightCommand)
-	sum := sha256.Sum256(data)
-	return profile, "sha256:" + hex.EncodeToString(sum[:]), nil
+	return resolved.Base, resolved.Revision, nil
 }
 
 // verificationExecutionProfile derives the exact command profile executed by

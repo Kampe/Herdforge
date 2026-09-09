@@ -2,8 +2,6 @@ package candidateindex
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -437,8 +435,8 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 	// repository profile admits no receipts at all.
 	if idx.opts.RepoRoot != "" {
 		receiptDir := filepath.Join(idx.opts.RepoRoot, ".herd", "verification-receipts")
-		profiles := resolveVerificationProfiles(idx.opts.RepoRoot)
-		if entries, err := os.ReadDir(receiptDir); err == nil && profiles.refusal == "" {
+		profiles := verifier.ResolveProfile(idx.opts.RepoRoot)
+		if entries, err := os.ReadDir(receiptDir); err == nil && profiles.Refusal == "" {
 			for _, entry := range entries {
 				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 					continue
@@ -449,7 +447,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 				}
 				var receipt verifier.Receipt
 				if json.Unmarshal(data, &receipt) != nil || receipt.Outcome != verifier.OutcomePASS || receipt.ValidateDigest() != nil ||
-					!profiles.commandAdmitted(receipt.Command) || !profiles.identityAdmitted(receipt) {
+					!profiles.CommandAdmitted(receipt.Command) || !profiles.ReceiptAdmitted(receipt) {
 					continue
 				}
 				gen, genErr := strconv.ParseInt(strings.TrimSpace(receipt.LeaseGeneration), 10, 64)
@@ -736,98 +734,4 @@ func candidateIsNewer(candidate *Candidate, current candidateEvidence, selected 
 		return false
 	}
 	return candidate.CandidateSHA < selected.CandidateSHA
-}
-
-// verificationProfileSet is the immutable command set authorized by this
-// repository's configuration, resolved exactly as managed verification
-// resolves it: the configured base profile plus the executed form with the
-// test timeout applied. A receipt counts as the full-suite completion proof
-// only when its command matches one of these forms and any profile identity
-// it carries matches this set.
-type verificationProfileSet struct {
-	base      verifier.CommandProfile
-	execution verifier.CommandProfile
-	name      string
-	revision  string
-	// refusal explains why the repository profile could not be resolved;
-	// non-empty means no receipt may be admitted.
-	refusal string
-}
-
-func (p verificationProfileSet) commandAdmitted(command []string) bool {
-	joined := strings.Join(command, " ")
-	if joined == "" {
-		return false
-	}
-	return joined == strings.TrimSpace(p.base.TestCommand) || joined == strings.TrimSpace(p.execution.TestCommand)
-}
-
-func (p verificationProfileSet) identityAdmitted(receipt verifier.Receipt) bool {
-	if receipt.VerificationProfile != "" && receipt.VerificationProfile != p.name {
-		return false
-	}
-	if receipt.ProfileDigest != "" && receipt.ProfileDigest != p.base.Digest() && receipt.ProfileDigest != p.execution.Digest() {
-		return false
-	}
-	if receipt.ConfigRevision != "" && receipt.ConfigRevision != p.revision {
-		return false
-	}
-	return true
-}
-
-// resolveVerificationProfiles mirrors the managed-verification profile
-// derivation (cmd/herd verificationCommandProfile and
-// verificationExecutionProfile) so the candidate scanner admits exactly the
-// full-suite receipts the managed completion gate would bind: the configured
-// test command from .herd/herd.yaml (required when the file exists), the
-// default go-test profile otherwise, and the executed form with the test
-// timeout applied for a configured repository.
-func resolveVerificationProfiles(root string) verificationProfileSet {
-	buildCommand := "true"
-	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
-		buildCommand = "go build ./..."
-	}
-	base := verifier.CommandProfile{
-		ID:           "config-verification",
-		BuildCommand: buildCommand,
-		TestCommand:  "go test ./...",
-		TestTimeout:  30 * time.Minute,
-	}
-	revision := "default"
-	data, err := os.ReadFile(filepath.Join(root, ".herd", "herd.yaml"))
-	if err == nil {
-		cfg, cfgErr := config.ParseConfig(data)
-		if cfgErr != nil {
-			return verificationProfileSet{refusal: fmt.Sprintf("parse verification config: %v", cfgErr)}
-		}
-		if strings.TrimSpace(cfg.Verification.TestCommand) == "" {
-			return verificationProfileSet{refusal: "verification.test_command is required"}
-		}
-		base.TestCommand = strings.TrimSpace(cfg.Verification.TestCommand)
-		if raw := strings.TrimSpace(cfg.Verification.TestTimeout); raw != "" {
-			timeout, parseErr := time.ParseDuration(raw)
-			if parseErr != nil || timeout <= 0 {
-				return verificationProfileSet{refusal: fmt.Sprintf("verification.test_timeout must be a positive Go duration: %q", raw)}
-			}
-			base.TestTimeout = timeout
-		}
-		base.PreflightCommand = strings.TrimSpace(cfg.Verification.PreflightCommand)
-		sum := sha256.Sum256(data)
-		revision = "sha256:" + hex.EncodeToString(sum[:])
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return verificationProfileSet{refusal: fmt.Sprintf("read verification config: %v", err)}
-	}
-	execution := base
-	if revision != "default" {
-		testCommand, timeoutErr := verifier.ApplyTestTimeout(base.TestCommand, base.TestTimeout)
-		if timeoutErr != nil {
-			return verificationProfileSet{refusal: fmt.Sprintf("apply test timeout: %v", timeoutErr)}
-		}
-		execution.TestCommand = testCommand
-	}
-	name := base.ID
-	if base.PreflightCommand != "" {
-		name += "+preflight"
-	}
-	return verificationProfileSet{base: base, execution: execution, name: name, revision: revision}
 }
