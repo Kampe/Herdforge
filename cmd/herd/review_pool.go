@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
@@ -68,6 +69,22 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("advance admission phase to candidate: %w", err)
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		return fmt.Errorf("review task identity: load config: %w", err)
+	}
+	tasks, err := loadTaskProvider(cfg)
+	if err != nil {
+		return fmt.Errorf("review task identity: load provider: %w", err)
+	}
+	providerTask, err := resolveReviewTaskRef(context.Background(), tasks, cfg.TaskProvider.ProjectID, ref)
+	if err != nil {
+		return err
+	}
+	packetTask, err := reviewPacketTaskIdentity(providerTask)
+	if err != nil {
+		return err
+	}
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.
 	candidateDir, err := resolvePoolReviewCandidateAt(root, ref, strings.TrimSpace(*shaFlag))
@@ -124,7 +141,7 @@ func runPoolReview(ref string) error {
 				asserted, provenFamily, shortSHA(sha))
 		}
 		if provenFamily == "" {
-			if err := recordAssertedBuilderLaunch(root, ref, sha, asserted); err != nil {
+			if err := recordAssertedBuilderLaunch(root, ref, sha, asserted, packetTask); err != nil {
 				return fmt.Errorf("record asserted builder family: %w", err)
 			}
 			fmt.Printf("recorded asserted builder-family=%s for %s (operator-attributed provenance)\n", asserted, shortSHA(sha))
@@ -359,7 +376,7 @@ func runPoolReview(ref string) error {
 	if wsErr != nil {
 		packetWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	}
-	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace)
+	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -375,7 +392,7 @@ func runPoolReview(ref string) error {
 	// the authority for that. A failure here costs admissibility later, which is
 	// recoverable and visible, whereas failing the launch would waste a leased
 	// slot and a provider call for a bookkeeping problem.
-	if err := completeReviewLaunchProvenance(root, ref, sha, lease.LeaseID); err != nil {
+	if err := completeReviewLaunchProvenance(root, ref, sha, lease.LeaseID, packetTask); err != nil {
 		fmt.Fprintf(os.Stderr, "review --pool: reviewer launched but launch provenance is INCOMPLETE (%v); "+
 			"this candidate will be refused at harvest admission until a record row carries its lease and patch id\n", err)
 	}
@@ -1226,7 +1243,7 @@ func sharedCheckoutDirtyPaths(root string) []string {
 // Patch identity comes from git, never from the reviewer: it is what allows a
 // REBASED candidate to keep its verdict rather than be re-reviewed, and it must
 // therefore be computed from the tree rather than asserted by anyone.
-func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
+func completeReviewLaunchProvenance(root, ref, sha, leaseID, packetTask string) error {
 	patch, err := candidatePatchIdentity(root, sha)
 	if err != nil {
 		return fmt.Errorf("patch identity for %s: %w", shortSHA(sha), err)
@@ -1235,7 +1252,10 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 	if err != nil {
 		return err
 	}
-	reviewer := reviewAgentName(ref, sha)
+	reviewer, task, err := reviewLaunchRecordBinding(ref, packetTask, sha)
+	if err != nil {
+		return err
+	}
 	// FAC-667: ensure the record row EXISTS before completing it.
 	//
 	// FAC-656 completed a launch record, and completion requires a prior row --
@@ -1253,7 +1273,7 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 	if err := l.EnsureRecord(reviewledger.RecordOpts{
 		SHA:           sha,
 		Reviewer:      reviewer,
-		Task:          ref,
+		Task:          task,
 		BuilderFamily: reviewledger.FamilyUnrecorded,
 		Gate:          reviewledger.GateProvenanceUnrecorded,
 	}); err != nil {
@@ -1262,7 +1282,7 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID string) error {
 	return l.CompleteLaunchProvenance(reviewledger.RecordOpts{
 		SHA:      sha,
 		Reviewer: reviewer,
-		Task:     ref,
+		Task:     task,
 		Lease:    strings.TrimSpace(leaseID),
 		PatchURL: patch,
 		Gate:     "launch-provenance",
@@ -1298,16 +1318,20 @@ func candidatePatchIdentity(root, sha string) (string, error) {
 // recordAssertedBuilderLaunch writes the launch row admission reads, so an
 // operator-asserted family produces an ADMISSIBLE verdict rather than a review
 // that is refused after it has already been paid for.
-func recordAssertedBuilderLaunch(root, ref, sha, family string) error {
+func recordAssertedBuilderLaunch(root, ref, sha, family, packetTask string) error {
 	l, err := reviewledger.NewReviewLedger(root, reviewledger.DefaultPath(root))
+	if err != nil {
+		return err
+	}
+	reviewer, task, err := reviewLaunchRecordBinding(ref, packetTask, sha)
 	if err != nil {
 		return err
 	}
 	return l.EnsureRecord(reviewledger.RecordOpts{
 		SHA:           sha,
 		BuilderFamily: family,
-		Reviewer:      reviewAgentName(ref, sha),
-		Task:          ref,
+		Reviewer:      reviewer,
+		Task:          task,
 		Gate:          "operator-asserted",
 	})
 }
@@ -1494,7 +1518,7 @@ func liveAgentByPrefix(prefixes ...string) string {
 	return ""
 }
 
-func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace string) string {
+func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
@@ -1597,7 +1621,7 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, ref, builderFamilyOrUnrecorded(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+`, ref, sha, surface, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
