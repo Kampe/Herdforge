@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/progress"
+	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 // Kind is what a lane is being asked to do.
@@ -127,13 +128,16 @@ func Decide(in Inputs) Decision {
 	}
 
 	candidates := append([]Task(nil), in.Queue...)
-	// Deterministic: priority descending, then ref ascending. A selector whose
-	// order depends on map iteration cannot be reasoned about or reproduced.
+	// Deterministic: priority descending, then ref ascending in NUMERIC ticket
+	// order (FAC-9 < FAC-61 < FAC-100) via the repo's shared ref comparator.
+	// Plain lexical order put FAC-100 before FAC-99, violating the Priority
+	// DESC, Ref ASC claim-order invariant. A selector whose order depends on
+	// map iteration or lexical accident cannot be reasoned about or reproduced.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority > candidates[j].Priority
 		}
-		return candidates[i].Ref < candidates[j].Ref
+		return provider.CompareRefs(candidates[i].Ref, candidates[j].Ref) < 0
 	})
 
 	for _, t := range candidates {

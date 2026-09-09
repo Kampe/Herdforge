@@ -167,10 +167,21 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	if preview.Claimable == 0 && preview.ProvenanceBlocked > 0 {
 		claimCommand = "herd deps migrate"
 	}
+	// FAC-581 correction (independent review finding 6): the claim action
+	// consumes the broker decision, not just the preview count. A work
+	// decision names the EXACT task to claim; a wait decision already names
+	// its event through Description(); a preview that reports claimable work
+	// without naming a ref is surfaced as the defect it is.
+	claimDesc := preview.Description()
+	if d, derr := preview.Decision("next"); derr != nil {
+		claimDesc += " (broker decision unavailable: " + derr.Error() + ")"
+	} else if d.Outcome == broker.OutcomeWork && d.Task != nil {
+		claimDesc = "Next claimable: " + d.Task.Ref + " — " + preview.Description()
+	}
 	actions = append(actions, &NextAction{
 		Type:        ActionClaim,
 		Priority:    100,
-		Description: preview.Description(),
+		Description: claimDesc,
 		Command:     claimCommand,
 		AutoSafe:    false,
 	})

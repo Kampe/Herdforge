@@ -245,9 +245,10 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 	return collectPulseProviderObservation(ctx, tp, project)
 }
 
-// collectPulseProviderObservation turns both scoped board reads into one
+// collectPulseProviderObservation turns the scoped board reads into one
 // all-or-unknown provider observation. A failed in-review read is not zero
-// review work and cannot leave a dispatch candidate behind.
+// review work and cannot leave a dispatch candidate behind; a failed done read
+// is unknown dependency state and cannot leave one either.
 func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvider, project string) (pulse.ProviderObservation, map[string]bool) {
 	tasks, err := tp.ListTasks(ctx, project, provider.StatusToDo)
 	if err != nil {
@@ -279,6 +280,30 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 		return pulse.ProviderObservation{Known: false, Error: fmt.Sprintf("list in-review tasks: %v", err)}, nil
 	}
 
+	// FAC-581 correction (independent review finding 1): the closed-task
+	// snapshot must be AUTHORITATIVE, not whatever a to-do listing happens to
+	// return. A status-filtered to-do read can never contain done cards, so
+	// dependency edges parsed from to-do fences were evaluated against a
+	// closed set that could never be populated — a resolved dependency stayed
+	// blocked forever. One scoped done-column read (the same pattern as the
+	// to-do and in-review reads) populates closure for the broker decision and
+	// the FAC-218 reap evidence doneRefs was designed to feed. A failed done
+	// read is unknown dependency state: fail closed, exactly like a failed
+	// in-review read.
+	doneTasks, err := tp.ListTasks(ctx, project, provider.StatusDone)
+	if err != nil {
+		return pulse.ProviderObservation{Known: false, Error: fmt.Sprintf("list done tasks: %v", err)}, nil
+	}
+	for _, t := range doneTasks {
+		if t == nil {
+			continue
+		}
+		ref := strings.ToUpper(strings.TrimSpace(t.Ref))
+		if ref != "" {
+			doneRefs[ref] = true
+		}
+	}
+
 	obs := pulse.ProviderObservation{
 		Known:      true,
 		QueueDepth: int64(len(tasks)),
@@ -286,39 +311,45 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 		InProgress: inProgress,
 		InReview:   int64(len(inReviewTasks)),
 	}
-	if next := selectPulseDispatchTask(claimableTasks); next != nil {
-		obs.NextTaskRef = strings.TrimSpace(next.Ref)
-		obs.NextTaskID = strings.TrimSpace(next.ID)
-	}
-	return obs, doneRefs
-}
-
-// selectPulseDispatchTask keeps pulse's one-dispatch bound on pkg/broker.Decide:
-// exact task identity, dependency readiness, priority descending, then ref
-// ascending. Review saturation is a review-adapter bound and never vetoes a
-// builder. Nil and ref-less tasks cannot be dispatched.
-func selectPulseDispatchTask(tasks []*provider.Task) *provider.Task {
-	d := pulseDispatchDecision(tasks, broker.Inputs{
-		Lane:    "pulse",
-		Accepts: []broker.Kind{broker.KindBuild},
+	// FAC-581 correction (finding 4): the broker decision is the consumed
+	// control result, not a claimable count. A wait carries its named reason
+	// into the observation so planning reports the event instead of
+	// converting a blocked queue into dispatch authority.
+	d := pulseDispatchDecision(claimableTasks, broker.Inputs{
+		Lane:        "pulse",
+		Accepts:     []broker.Kind{broker.KindBuild},
+		ClosedTasks: doneRefs,
 		Progress: progress.Record{
 			Lane:   "pulse",
 			Action: progress.ClassBuild,
 		},
 	})
-	if err := d.Validate(); err != nil || d.Outcome != broker.OutcomeWork || d.Task == nil {
-		return nil
+	if err := d.Validate(); err != nil {
+		obs.NextWaitReason = "invalid dispatch decision: " + err.Error()
+		return obs, doneRefs
 	}
-	want := strings.TrimSpace(d.Task.Ref)
-	for _, task := range tasks {
-		if task == nil {
-			continue
+	if d.Outcome == broker.OutcomeWork && d.Task != nil {
+		want := strings.TrimSpace(d.Task.Ref)
+		for _, task := range claimableTasks {
+			if task == nil {
+				continue
+			}
+			if strings.TrimSpace(task.Ref) == want {
+				obs.NextTaskRef = strings.TrimSpace(task.Ref)
+				obs.NextTaskID = strings.TrimSpace(task.ID)
+				return obs, doneRefs
+			}
 		}
-		if strings.TrimSpace(task.Ref) == want {
-			return task
-		}
+		// A work decision naming a task absent from the claimable listing is
+		// not authority either; record the named wait instead.
+		obs.NextWaitReason = "invalid dispatch decision: task " + want + " is not present in the claimable listing"
+		return obs, doneRefs
 	}
-	return nil
+	obs.NextWaitReason = d.WaitReason
+	if len(d.Blocked) > 0 {
+		obs.NextBlocked = d.Blocked
+	}
+	return obs, doneRefs
 }
 
 // pulseDispatchDecision is the production pulse selector seam. Callers must
@@ -330,8 +361,9 @@ func pulseDispatchDecision(tasks []*provider.Task, in broker.Inputs) broker.Deci
 	if len(in.Accepts) == 0 {
 		in.Accepts = []broker.Kind{broker.KindBuild}
 	}
+	invalid := map[string]string{}
 	if len(in.Queue) == 0 {
-		in.Queue = pulseBrokerQueue(tasks)
+		in.Queue, invalid = pulseBrokerQueue(tasks)
 	}
 	prog := in.Progress
 	if strings.TrimSpace(prog.Lane) == "" {
@@ -358,11 +390,38 @@ func pulseDispatchDecision(tasks []*provider.Task, in broker.Inputs) broker.Deci
 		}
 	}
 	in.Progress = prog
-	return broker.Decide(in)
+	d := broker.Decide(in)
+	// FAC-581 correction (independent review finding 2): a task whose declared
+	// provenance cannot be parsed is UNKNOWN dependency state. It is reported
+	// as blocked with the parse failure — never silently converted into a
+	// ready task with no dependencies.
+	if len(invalid) > 0 {
+		if d.Blocked == nil {
+			d.Blocked = map[string]string{}
+		}
+		for ref, reason := range invalid {
+			d.Blocked[ref] = reason
+		}
+		if d.Outcome == broker.OutcomeWait && strings.Contains(d.WaitReason, "the queue is empty") {
+			refs := make([]string, 0, len(invalid))
+			for ref := range invalid {
+				refs = append(refs, ref)
+			}
+			sort.Strings(refs)
+			d.WaitReason = "invalid herd-deps-v1 provenance (fail-closed): " + strings.Join(refs, ", ")
+		}
+	}
+	return d
 }
 
-func pulseBrokerQueue(tasks []*provider.Task) []broker.Task {
+// pulseBrokerQueue projects provider tasks onto the broker queue. Dependency
+// edges are parsed from herd-deps-v1 fences and normalized to the closed-set
+// key space (uppercase). A fence that fails to parse is INVALID provenance:
+// the task is excluded from the queue and reported in invalid, because
+// dependency state that cannot be read must not become a ready task.
+func pulseBrokerQueue(tasks []*provider.Task) ([]broker.Task, map[string]string) {
 	queue := make([]broker.Task, 0, len(tasks))
+	invalid := map[string]string{}
 	for _, task := range tasks {
 		if task == nil || (task.Status != "" && task.Status != provider.StatusToDo) || strings.TrimSpace(task.Ref) == "" {
 			continue
@@ -373,14 +432,19 @@ func pulseBrokerQueue(tasks []*provider.Task) []broker.Task {
 			Kind:     broker.KindBuild,
 			Priority: candidateindex.PriorityRank(task.Priority),
 		}
-		if prov, err := deps.ExtractProvenanceFromText(task.Description); err == nil && prov != nil && prov.Present {
+		prov, err := deps.ExtractProvenanceFromText(task.Description)
+		if err != nil {
+			invalid[ref] = "invalid herd-deps-v1 provenance: " + err.Error()
+			continue
+		}
+		if prov != nil && prov.Present {
 			seen := map[string]struct{}{}
 			for _, edge := range prov.Edges {
 				if edge.Type != deps.EdgeBlocks {
 					continue
 				}
 				tgt := strings.TrimSpace(string(edge.TargetRef))
-				src := strings.TrimSpace(string(edge.SourceRef))
+				src := strings.ToUpper(strings.TrimSpace(string(edge.SourceRef)))
 				if src == "" || !strings.EqualFold(tgt, ref) {
 					continue
 				}
@@ -393,7 +457,7 @@ func pulseBrokerQueue(tasks []*provider.Task) []broker.Task {
 		}
 		queue = append(queue, item)
 	}
-	return queue
+	return queue, invalid
 }
 
 // readPulseHerdr reads the live fleet and enriches each agent with reap

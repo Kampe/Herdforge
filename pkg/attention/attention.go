@@ -101,6 +101,13 @@ func NeedsEyes(l AttentionLevel) bool {
 
 // ClassifyProgress maps pkg/progress onto attention. Event waits are visible
 // without being mistaken for useful work that needs escalation.
+//
+// FAC-581 scope note (independent review finding 6): the attention triage's
+// data source is the herdr agent list, which carries no progress records, so
+// this classifier has no production feeder yet — production progress records
+// exist on broker.Decisions (pulse selection, goal-guard stop hook). Wiring it
+// into the attention CLI requires a progress sidecar that does not exist
+// today; that adoption is tracked as future work, not silently claimed here.
 func ClassifyProgress(rec progress.Record) (AttentionLevel, string) {
 	if rec.Action == progress.ClassWait || rec.Action == progress.ClassProbe || rec.Plateaued(progress.PlateauAfter) {
 		reason := strings.TrimSpace(rec.WaitReason)

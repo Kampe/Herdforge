@@ -9,6 +9,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/progress"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -144,6 +145,17 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 		return nil
 	}
 	evidence := goalguard.Evidence{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, LeaseHeld: leaseHeld, Now: time.Now().UTC()}
+	// FAC-581 correction (independent review finding 5): the event-wait branch
+	// needs the production observation, not only test-constructed evidence.
+	// The HEAD commit of the worktree the hook runs in (cwd is the lane's
+	// worktree) is the artifact a builder lane actually produces; the durable
+	// baseline on the goal makes an UNCHANGED HEAD an event wait instead of a
+	// silently spent continuation. Best-effort: a non-git cwd reports no
+	// observation and leaves the pre-existing behavior unchanged.
+	if head := goalGuardObserveWorktreeHEAD(); head != "" {
+		evidence.ProgressClass = progress.ClassBuild
+		evidence.Artifact = head
+	}
 	decision, err := s.Evaluate(evidence)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "goal-guard: cannot evaluate goal, allowing stop: %v\n", err)
@@ -168,11 +180,43 @@ func runGoalGuardStopHook(s *goalguard.Store, payload []byte) error {
 		}
 	}
 
+	blockReason := goalGuardContinueReason(g.Task, g.Lane, decision.Continuations)
+	if decision.Reason == "event_wait" {
+		blockReason = goalGuardEventWaitReason(g.Task, g.Lane, decision.Continuations)
+	}
 	block := map[string]string{
 		"decision": "block",
-		"reason":   goalGuardContinueReason(g.Task, g.Lane, decision.Continuations),
+		"reason":   blockReason,
 	}
 	return writeGoalJSON(os.Stdout, block)
+}
+
+// goalGuardObserveWorktreeHEAD observes the lane's actual production artifact:
+// the HEAD commit of the worktree the Stop hook runs in. The hook's cwd is the
+// lane worktree, so this is the exact artifact the lane produced since its last
+// stop. Best-effort by design: git is always present, but a non-git cwd (or a
+// git failure) reports no observation and the guard behaves as before.
+func goalGuardObserveWorktreeHEAD() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// goalGuardEventWaitReason is the block instruction for a lane that produced no
+// new artifact since the last continuation. FAC-652 landed "block means hold,
+// quietly"; FAC-581 stops the wait from SPENDING budget. The lane is held, not
+// killed, and is told to wait for a real transition instead of re-probing the
+// unchanged state that just returned.
+func goalGuardEventWaitReason(task, lane string, continuations int) string {
+	const preamble = "AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT. goal-guard: "
+	return fmt.Sprintf(preamble+"goal %q on lane %q produced no new artifact since the last continuation (event wait; continuation %d NOT spent). "+
+		"Waiting is valid progress for a standing lane: do NOT re-run the probe that just returned unchanged. "+
+		"Wait for a real transition -- a verdict callback, a freed pool slot, a dependency card closing, or new claimable work -- or produce a new artifact and continue.",
+		task, lane, continuations)
 }
 
 // goalGuardPlateauAfter is the shared plateau threshold, taken from the package

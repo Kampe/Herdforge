@@ -79,6 +79,12 @@ func ScoutQueue(ctx context.Context, tp provider.TaskProvider, projectID string,
 // ScoutDecision projects scout rows onto pkg/broker.Decide so selection,
 // dependency blocking, and review-saturation independence stay identical to
 // the pulse production caller.
+//
+// FAC-581 scope note (independent review finding 6): ScoutQueue itself is a
+// landed library seam (FAC-114) with no production caller — no scout CLI
+// exists. ScoutDecision brings its projection onto the broker seam so any
+// future scout consumer inherits conformant decisions; wiring a scout CLI is
+// scout's own adoption story, not FAC-581's.
 func ScoutDecision(claimable, blocked []ScoutRow, reviewSaturated bool, reviewWait string, prog progress.Record) broker.Decision {
 	queue := make([]broker.Task, 0, len(claimable)+len(blocked))
 	for _, row := range claimable {

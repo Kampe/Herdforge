@@ -163,6 +163,30 @@ func TestSelectionIsDeterministic(t *testing.T) {
 	}
 }
 
+// FAC-581 correction: equal-priority refs must order by NUMERIC ticket number,
+// not lexically. Lexical order put FAC-10 before FAC-3 and FAC-100 before
+// FAC-99, violating the Priority DESC, Ref ASC claim-order invariant
+// (AGENTS.md deterministic task selection) that provider.CompareRefs encodes.
+func TestSelectionOrdersEqualPriorityRefsNumerically(t *testing.T) {
+	q := []Task{
+		{Ref: "FAC-10", Kind: KindBuild, Priority: 5},
+		{Ref: "FAC-100", Kind: KindBuild, Priority: 5},
+		{Ref: "FAC-3", Kind: KindBuild, Priority: 5},
+	}
+	d := Decide(Inputs{Lane: "x", Accepts: []Kind{KindBuild}, Queue: q})
+	if d.Task == nil || d.Task.Ref != "FAC-3" {
+		t.Fatalf("equal priority must select the numerically lowest ref FAC-3, got %+v", d.Task)
+	}
+	q2 := []Task{
+		{Ref: "FAC-61", Kind: KindBuild, Priority: 5},
+		{Ref: "FAC-9", Kind: KindBuild, Priority: 5},
+	}
+	d = Decide(Inputs{Lane: "x", Accepts: []Kind{KindBuild}, Queue: q2})
+	if d.Task == nil || d.Task.Ref != "FAC-9" {
+		t.Fatalf("FAC-9 must sort before FAC-61 (numeric, not lexical), got %+v", d.Task)
+	}
+}
+
 // The decision carries progress classification, so a lane that only polled is
 // not reported as having worked.
 func TestTheDecisionCarriesProgressClassification(t *testing.T) {

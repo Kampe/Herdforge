@@ -139,8 +139,15 @@ type ProviderObservation struct {
 	NextTaskRef string `json:"next_task_ref,omitempty"`
 	// NextTaskID is the provider identity captured with NextTaskRef. Dispatch
 	// uses it for an O(1) re-read instead of hydrating the whole board again.
-	NextTaskID  string `json:"next_task_id,omitempty"`
-	ObservedSeq uint64 `json:"observed_seq,omitempty"`
+	NextTaskID string `json:"next_task_id,omitempty"`
+	// NextWaitReason is the broker's named wait when NO task is dispatchable
+	// (FAC-581). A blocked or identityless queue is a named event, never a
+	// count wearing dispatch authority.
+	NextWaitReason string `json:"next_wait_reason,omitempty"`
+	// NextBlocked records why each candidate was rejected (FAC-581), so a
+	// queue that looks empty can always be explained.
+	NextBlocked map[string]string `json:"next_blocked,omitempty"`
+	ObservedSeq uint64            `json:"observed_seq,omitempty"`
 }
 
 // HerdrObservation is one read of the live fleet.
@@ -974,8 +981,14 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 		actions = append(actions, act)
 	}
 
-	// Dispatch: only when act+spawn and not blocked. Observe/act print would-run.
-	if opts.Act && opts.Spawn && !snap.BuilderDispatchBlocked {
+	// Dispatch: only when act+spawn, not builder-blocked, and the broker named
+	// an EXACT task (FAC-581). A claimable count is reportable, not
+	// dispatchable: an all-blocked or identityless queue is a named wait, and
+	// emitting a dispatch action from Claimable > 0 alone is the selector
+	// defect this seam exists to remove.
+	nextRef := strings.TrimSpace(obs.Provider.NextTaskRef)
+	switch {
+	case opts.Act && opts.Spawn && !snap.BuilderDispatchBlocked && nextRef != "":
 		// Prefer a healthy idle lane as target; else generic queue. A held lease
 		// names the canonical lane it protects, so exclude it before selecting
 		// the one bounded dispatch target for this beat.
@@ -1001,7 +1014,7 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 			actions = append(actions, Action{
 				Kind:   ActionDispatch,
 				Target: target,
-				Reason: "safe bounded dispatch: capacity known, no critical unknown",
+				Reason: "safe bounded dispatch of " + nextRef + ": capacity known, no critical unknown",
 				Safe:   true,
 			})
 		} else {
@@ -1017,13 +1030,29 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 				Safe:     false,
 			})
 		}
-	} else if opts.Spawn || (opts.Act && opts.Spawn) {
-		// unreachable spawn-without-act already rejected
-	} else {
+	case opts.Act && opts.Spawn:
+		// act+spawn but no dispatchable identity: all-blocked, identityless, or
+		// builder-blocked. Surface the named wait instead of a misleading
+		// would-run/action.
+		reason := "dispatch withheld: no dispatchable task (no exact identity)"
+		if snap.BuilderDispatchBlocked {
+			reason = "dispatch blocked: " + blockReason
+		} else if wait := strings.TrimSpace(obs.Provider.NextWaitReason); wait != "" {
+			reason = "dispatch withheld: broker wait — " + wait
+		}
+		actions = append(actions, Action{
+			Kind:     ActionWouldRun,
+			Target:   "dispatch",
+			Reason:   reason,
+			WouldRun: "dispatch withheld",
+			Safe:     false,
+		})
+	default:
 		// Record withheld dispatch plan when there would be work under spawn.
-		if obs.Provider.Claimable > 0 {
+		// The would-run names the exact task the broker admitted.
+		if nextRef != "" {
 			hint := "--act --spawn"
-			reason := "would dispatch"
+			reason := "would dispatch " + nextRef
 			if snap.DispatchBlocked {
 				reason = "dispatch blocked: " + blockReason
 			}
@@ -1214,7 +1243,8 @@ func CountActions(agents []AgentObservation, actions []Action) Counts {
 // Apply executes Safe actions under an Act/ActSpawn snapshot. Observe mode is
 // a no-op. Renewals pass the planned generation (never invent a newer one).
 // Callback consumption is idempotent at the Actor boundary. Dispatch is
-// refused when UnknownCritical or DispatchBlocked.
+// refused when UnknownCritical or BuilderDispatchBlocked (FAC-581: review-only
+// saturation is not a builder bound at the final mutation gate either).
 func Apply(ctx context.Context, snap Snapshot, actor Actor) (Snapshot, error) {
 	if snap.Mode == ModeObserve {
 		return snap, nil
@@ -1285,9 +1315,16 @@ func Apply(ctx context.Context, snap Snapshot, actor Actor) (Snapshot, error) {
 			}
 			err = actor.ConsumeCallback(ctx, cb)
 		case ActionDispatch:
+			// FAC-581 correction (independent review finding 4): the final
+			// mutation gate enforces the SAME builder bound planning used.
+			// Rejecting on the global DispatchBlocked let a review-only
+			// saturation veto a dispatch that planning had legitimately
+			// planned under BuilderDispatchBlocked=false, failing the beat
+			// with "one or more act steps failed". Builder admission and
+			// review admission stay separate at this gate too.
 			if out.UnknownCritical {
 				err = fmt.Errorf("%w: %s", ErrUnknownCritical, strings.Join(out.UnknownReasons, "; "))
-			} else if out.DispatchBlocked {
+			} else if out.BuilderDispatchBlocked {
 				err = fmt.Errorf("%w: %s", ErrDispatchBlocked, out.DispatchBlockReason)
 			} else {
 				err = actor.Dispatch(ctx, a.Target, a.Reason)

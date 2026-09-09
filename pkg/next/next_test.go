@@ -272,3 +272,69 @@ func TestProvenanceBlockedQueueWaitsAndNamesTheBlockedRefs(t *testing.T) {
 		t.Fatalf("blocked refs were not carried into the decision: %+v", d)
 	}
 }
+
+// FAC-581 correction (independent review finding 6): the claim action consumes
+// the broker decision. A work decision names the EXACT task to claim instead
+// of presenting only a count.
+func TestEvalClaimActionNamesBrokerDecisionTask(t *testing.T) {
+	cfg := testConfig()
+	tasks := []testTask{
+		{ref: "FAC-9", status: "to-do", priority: "urgent", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-9\",\"task_id\":\"t9\",\"edges\":[]}\n```"},
+		{ref: "FAC-10", status: "to-do", priority: "high", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-10\",\"task_id\":\"t10\",\"edges\":[]}\n```"},
+	}
+	p := NewNextPicker(cfg, newTestProvider(tasks))
+	acts, err := p.EvalAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim *NextAction
+	for _, a := range acts {
+		if a.Type == ActionClaim {
+			claim = a
+		}
+	}
+	if claim == nil {
+		t.Fatalf("no claim action: %+v", acts)
+	}
+	if !strings.Contains(claim.Description, "Next claimable: FAC-9") {
+		t.Fatalf("claim action must name the broker-admitted task, got %q", claim.Description)
+	}
+}
+
+// FAC-581 correction (finding 6): with no claimable work the claim action
+// carries the broker WAIT (the preview description already names the event);
+// the decision must still be consumable, not an error.
+func TestEvalClaimActionConsumesBrokerWait(t *testing.T) {
+	cfg := testConfig()
+	tasks := []testTask{
+		{ref: "FAC-9", status: "to-do", priority: "high", description: "missing fence"},
+	}
+	p := NewNextPicker(cfg, newTestProvider(tasks))
+	acts, err := p.EvalAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim *NextAction
+	for _, a := range acts {
+		if a.Type == ActionClaim {
+			claim = a
+		}
+	}
+	if claim == nil {
+		t.Fatalf("no claim action: %+v", acts)
+	}
+	preview, err := PreviewClaimQueue(context.Background(), newTestProvider(tasks), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := preview.Decision("next")
+	if err != nil {
+		t.Fatalf("wait decision must be consumable: %v", err)
+	}
+	if d.Outcome != broker.OutcomeWait || strings.TrimSpace(d.WaitReason) == "" {
+		t.Fatalf("no claimable work must be a named wait, got %+v", d)
+	}
+	if !strings.Contains(claim.Description, "FAC-9") {
+		t.Fatalf("claim action must still name the blocking event, got %q", claim.Description)
+	}
+}
