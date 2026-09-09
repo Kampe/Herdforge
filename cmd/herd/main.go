@@ -2056,6 +2056,18 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			}
 			return errors.New("standing authority envelope: lane not found")
 		},
+		SetGoalWithAuthority: func(cwd, lane, task, owner string, envelope goalguard.AuthorityEnvelope) error {
+			if err := setDurableGoal(cwd, lane, task, owner, 1, &envelope); err != nil {
+				return err
+			}
+			for _, configured := range cfg.Lanes {
+				if configured.Name == lane {
+					declareStandingLoop(configured, task)
+					return nil
+				}
+			}
+			return errors.New("standing authority envelope: lane not found")
+		},
 		CloseTab: func(tabID string) error {
 			return herdr.CloseTabVerified(tabID)
 		},
