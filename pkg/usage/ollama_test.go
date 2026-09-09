@@ -104,7 +104,7 @@ func TestOllamaPollRejectsHTTP200ErrorAndInvalidFraction(t *testing.T) {
 func TestOllamaSignerAccountDoesNotMatchOpenCodeClaim(t *testing.T) {
 	key, _ := ollamaFixtureKey(t)
 	defer zeroOllamaKey(&key)
-	ollama := identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signing-key:public-key")
+	ollama := identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signed:/api/usage")
 	opencode := identity("opencode", "same-looking-api-key", "opencode-auth:auth.json:account_id")
 	if ollama.Key == opencode.Key || ollama.Provenance == opencode.Provenance {
 		t.Fatalf("Ollama signer was incorrectly bound to OpenCode API-key identity: %+v / %+v", ollama, opencode)
@@ -123,8 +123,23 @@ func TestOllamaAccountIdentityReadsOnlySameHostSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := providerAccountIdentity("ollama")
-	want := identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signing-key:public-key")
+	want := identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signed:/api/usage")
 	if got == nil || got.Key != want.Key || got.Provenance != want.Provenance {
 		t.Fatalf("same-host signer identity mismatch: got=%+v want=%+v", got, want)
+	}
+}
+
+func TestOllamaCloudBearerContractIsCredentialBoundAndNetworkFree(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("OPENCODE_DATA_DIR", data)
+	if err := os.WriteFile(filepath.Join(data, "auth.json"), []byte(`{"ollama-cloud":{"key":"bearer-fixture"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ollamaCloudBearerPoll()
+	if err != nil || got.Status != "untracked" || got.Account == nil {
+		t.Fatalf("direct bearer contract should be typed unknown without an endpoint: got=%+v err=%v", got, err)
+	}
+	if got.Account.Provenance != "ollama-cloud:credential-fingerprint" || strings.Contains(got.Account.Key, "bearer-fixture") {
+		t.Fatalf("bearer credential was not opaquely bound: %+v", got.Account)
 	}
 }

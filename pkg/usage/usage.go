@@ -79,7 +79,7 @@ func FetchProviderModelForce(provider, model string, force bool) (*UsageSnapshot
 	target := strings.ToLower(strings.TrimSpace(provider))
 	m := strings.ToLower(strings.TrimSpace(model))
 	if strings.Contains(m, "ollama-cloud/") {
-		target = "ollama"
+		target = "ollama-cloud"
 	} else if strings.Contains(m, "litellm/") || strings.Contains(m, "lazer/") || strings.Contains(m, "litellm/ollama/") {
 		target = "litellm"
 	}
@@ -107,15 +107,16 @@ func FetchProviderModelForce(provider, model string, force bool) (*UsageSnapshot
 // harness the fleet routes for has a native poller; there is no helper-binary
 // path anywhere.
 var nativePollers = map[string]func() (ProviderUsage, error){
-	"grok":        grokPoll,
-	"claude":      claudePoll,
-	"codex":       codexPoll,
-	"gemini":      geminiPoll,
-	"antigravity": antigravityPoll,
-	"litellm":     litellmPoll,
-	"opencode":    opencodePoll,
-	"ollama":      ollamaPoll,
-	"kimi":        kimiPoll,
+	"grok":         grokPoll,
+	"claude":       claudePoll,
+	"codex":        codexPoll,
+	"gemini":       geminiPoll,
+	"antigravity":  antigravityPoll,
+	"litellm":      litellmPoll,
+	"opencode":     opencodePoll,
+	"ollama":       ollamaPoll,
+	"ollama-cloud": ollamaCloudBearerPoll,
+	"kimi":         kimiPoll,
 }
 
 var nativePollerOverride struct {
@@ -153,15 +154,16 @@ func activeNativePollers() map[string]func() (ProviderUsage, error) {
 
 // providerSource names the native authority per provider.
 var providerSource = map[string]string{
-	"claude":      "native:api.anthropic.com/api/oauth/usage",
-	"codex":       "native:chatgpt.com/backend-api/wham/usage",
-	"gemini":      "native:cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-	"grok":        "native:cli-chat-proxy.grok.com/v1/billing?format=credits",
-	"antigravity": "native:same-host-language-server/RetrieveUserQuotaSummary",
-	"litellm":     "native:authenticated-key-info",
-	"opencode":    "native:opencode.ai/zen/go/v1/usage",
-	"ollama":      "native:ollama.com/api/usage:signed-ed25519",
-	"kimi":        "native:unsupported-no-quota-endpoint",
+	"claude":       "native:api.anthropic.com/api/oauth/usage",
+	"codex":        "native:chatgpt.com/backend-api/wham/usage",
+	"gemini":       "native:cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+	"grok":         "native:cli-chat-proxy.grok.com/v1/billing?format=credits",
+	"antigravity":  "native:same-host-language-server/RetrieveUserQuotaSummary",
+	"litellm":      "native:authenticated-key-info",
+	"opencode":     "native:opencode.ai/zen/go/v1/usage",
+	"ollama":       "native:ollama.com/api/usage:signed-ed25519",
+	"ollama-cloud": "native:ollama-cloud/bearer-quota:unverified",
+	"kimi":         "native:unsupported-no-quota-endpoint",
 }
 
 // decorateProvider attaches the reading's provenance: which native endpoint

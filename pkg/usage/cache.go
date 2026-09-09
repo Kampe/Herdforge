@@ -134,7 +134,7 @@ func boundCachedProviders(records map[string]cachedProviderRecord, ttl time.Dura
 		if record.ObservedAt.IsZero() || age < 0 || age >= ttl || !providerCacheUsable(name, record.Provider) || record.AccountKey != record.Provider.Account.Key {
 			continue
 		}
-		if record.BackoffUntil.After(time.Now()) {
+		if record.BackoffUntil.After(time.Now()) && len(record.Provider.Resources) == 0 {
 			if record.Error != "" {
 				if out.Errors == nil {
 					out.Errors = map[string]string{}
@@ -301,6 +301,12 @@ func mergeSnapshotFile(snap *UsageSnapshot, backoff *cachedProviderRecord) error
 	}
 	if backoff != nil {
 		for name := range snap.Errors {
+			if prior, ok := records[name]; ok && len(prior.Provider.Resources) > 0 {
+				backoff.Provider = prior.Provider
+				if backoff.ObservedAt.IsZero() {
+					backoff.ObservedAt = prior.ObservedAt
+				}
+			}
 			records[name] = *backoff
 		}
 	}
@@ -430,9 +436,6 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 	}); err != nil {
 		return nil, err
 	}
-	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
-		return nil, pollErrf("rate-limited", "%s", persisted.Error)
-	}
 	if !force && ttl > 0 {
 		quotaCache.Lock()
 		if quotaCache.snap != nil {
@@ -444,6 +447,14 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 			}
 		}
 		quotaCache.Unlock()
+		if cached, _, ok := readSnapshotFile(ttl); ok {
+			if snap := providerOnlySnapshot(cached, name); snap != nil {
+				return snap, nil
+			}
+		}
+	}
+	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
+		return nil, pollErrf("rate-limited", "%s", persisted.Error)
 	}
 	var snap *UsageSnapshot
 	var err error

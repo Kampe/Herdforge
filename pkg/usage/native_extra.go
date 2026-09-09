@@ -36,6 +36,19 @@ func ollamaPoll() (ProviderUsage, error) {
 	return ollamaPollWithURL("https://ollama.com/api/usage", key, time.Now)
 }
 
+// The OpenCode ollama-cloud bearer credential is a distinct authority from
+// both the signed ~/.ollama account and LiteLLM. No supported native quota GET
+// for that bearer credential has been established yet, so this contract reads
+// only the exact local credential and remains explicitly untracked. It is
+// intentionally network-free until a reviewed endpoint/client is available.
+func ollamaCloudBearerPoll() (ProviderUsage, error) {
+	account := ollamaCloudCredentialIdentity()
+	if account == nil {
+		return ProviderUsage{}, pollErrf("auth-missing", "ollama-cloud bearer credential is unavailable")
+	}
+	return ProviderUsage{DisplayName: "Ollama Cloud (bearer)", Account: account, Status: "untracked"}, nil
+}
+
 func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Time) (ProviderUsage, error) {
 	ts := strconv.FormatInt(now().Unix(), 10)
 	requestURI := "/api/usage?ts=" + ts
@@ -78,7 +91,7 @@ func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Ti
 		if len(resources) == 0 {
 			return ProviderUsage{}, pollErrf("no-windows", "ollama quota: no usable session or weekly window")
 		}
-		return ProviderUsage{DisplayName: "Ollama Cloud", Plan: body.Plan, Account: identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signing-key:public-key"), Resources: resources}, nil
+		return ProviderUsage{DisplayName: "Ollama Cloud", Plan: body.Plan, Account: identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signed:/api/usage"), Resources: resources}, nil
 	}
 	return ProviderUsage{}, pollErrf("decode-failed", "ollama quota URL is invalid")
 }

@@ -228,23 +228,69 @@ func TestFetchProviderModelUsesBillingAuthority(t *testing.T) {
 
 func TestFetchProviderModelUsesOllamaAuthorityForCloudFlash(t *testing.T) {
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
-	var opencodeCalls, ollamaCalls int
+	var opencodeCalls, ollamaCloudCalls int
 	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){
 		"opencode": func() (ProviderUsage, error) {
 			opencodeCalls++
 			return ProviderUsage{}, pollErrf("auth-missing", "opencode-go is absent")
 		},
-		"ollama": func() (ProviderUsage, error) {
-			ollamaCalls++
-			return ProviderUsage{Resources: map[string]ResourceUsage{"weekly": {Unit: "percent", Used: 20, Limit: 100, Remaining: 80, WindowSeconds: WindowWeekly}}}, nil
+		"ollama-cloud": func() (ProviderUsage, error) {
+			ollamaCloudCalls++
+			return ProviderUsage{Status: "untracked", Account: identity("ollama-cloud", "bearer", "ollama-cloud:credential-fingerprint")}, nil
 		},
 	})
 	defer restore()
-	snap, err := FetchProviderModelForce("opencode", "ollama-cloud/deepseek-v4-flash", false)
-	if err != nil || snap == nil || ollamaCalls != 1 || opencodeCalls != 0 {
-		t.Fatalf("Ollama model authority was not selected: snap=%+v err=%v ollama=%d opencode=%d", snap, err, ollamaCalls, opencodeCalls)
+	snap, err := FetchProviderModelForce("opencode", "opencode+ollama-cloud/deepseek-v4-flash", false)
+	if err != nil || snap == nil || ollamaCloudCalls != 1 || opencodeCalls != 0 {
+		t.Fatalf("direct Ollama bearer authority was not selected: snap=%+v err=%v bearer=%d opencode=%d", snap, err, ollamaCloudCalls, opencodeCalls)
 	}
 	if _, ok := snap.Providers["opencode"]; !ok {
 		t.Fatalf("Ollama result was not re-keyed for the requested launcher: %+v", snap.Providers)
+	}
+}
+
+func TestDirectOllamaSignerAndLiteLLMOllamaRemainSeparateAuthorities(t *testing.T) {
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(t.TempDir(), "quota.json"))
+	ollamaAccount := identity("ollama", "signer-a", "ollama-signed:/api/usage")
+	litellmAccount := identity("litellm", "key-b", "litellm:key-info:key_name")
+	var ollamaCalls, litellmCalls, bearerCalls int
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){
+		"ollama-cloud": func() (ProviderUsage, error) {
+			bearerCalls++
+			return ProviderUsage{Account: identity("ollama-cloud", "key-b", "ollama-cloud:credential-fingerprint"), Status: "untracked"}, nil
+		},
+		"ollama": func() (ProviderUsage, error) {
+			ollamaCalls++
+			return ProviderUsage{Account: ollamaAccount, Resources: map[string]ResourceUsage{"weekly": {Unit: "percent", Used: 20, Limit: 100, Remaining: 80, WindowSeconds: WindowWeekly}}}, nil
+		},
+		"litellm": func() (ProviderUsage, error) {
+			litellmCalls++
+			return ProviderUsage{Account: litellmAccount, Resources: map[string]ResourceUsage{"budget": {Unit: "usd", Used: 2, Limit: 10, Remaining: 8, WindowSeconds: WindowWeekly}}}, nil
+		},
+	})
+	defer restore()
+	direct, err := FetchProviderModelForce("opencode", "ollama-cloud/deepseek-v4-flash", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := FetchProviderModelForce("ollama", "ollama/deepseek-v4-flash", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyed, err := FetchProviderModelForce("opencode", "litellm/ollama/deepseek-v4-flash:cloud", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directUsage := direct.Providers["opencode"]
+	signedUsage := signed.Providers["ollama"]
+	keyedUsage := keyed.Providers["opencode"]
+	if bearerCalls != 1 || ollamaCalls != 1 || litellmCalls != 1 || directUsage.Source != providerSource["ollama-cloud"] || signedUsage.Source != providerSource["ollama"] || keyedUsage.Source != providerSource["litellm"] {
+		t.Fatalf("billing authorities were not kept distinct: direct=%+v signed=%+v keyed=%+v calls=%d/%d/%d", directUsage, signedUsage, keyedUsage, bearerCalls, ollamaCalls, litellmCalls)
+	}
+	if len(directUsage.Resources) != 0 || directUsage.Status != "untracked" {
+		t.Fatalf("signed quota must not become direct bearer capacity: %+v", directUsage)
+	}
+	if directUsage.Account == nil || signedUsage.Account == nil || keyedUsage.Account == nil || directUsage.Account.Key == signedUsage.Account.Key || directUsage.Account.Key == keyedUsage.Account.Key || signedUsage.Account.Key == keyedUsage.Account.Key {
+		t.Fatalf("cross-authority account binding occurred: direct=%+v signed=%+v keyed=%+v", directUsage.Account, signedUsage.Account, keyedUsage.Account)
 	}
 }

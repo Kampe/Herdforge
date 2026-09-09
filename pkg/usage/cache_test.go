@@ -448,6 +448,44 @@ func TestProviderCacheRejectsClockSkewAndPersists429Backoff(t *testing.T) {
 	}
 }
 
+func TestProviderCacheKeepsFreshPositiveReadingDuring429Backoff(t *testing.T) {
+	dir, home := t.TempDir(), t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"fresh-429-account"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
+		calls++
+		if calls == 1 {
+			return ProviderUsage{Account: codexAccountIdentity(), Resources: map[string]ResourceUsage{"primary": {Unit: "percent", Used: 20, Remaining: 80, Limit: 100, WindowSeconds: Window5h}}}, nil
+		}
+		return ProviderUsage{}, pollErrf("rate-limited", "HTTP 429 retry-after=60")
+	}})
+	defer restore()
+	quotaCache.Lock()
+	quotaCache.snap, quotaCache.fetchedAt = nil, time.Time{}
+	quotaCache.Unlock()
+	if _, err := FetchProviderForce("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FetchProviderForce("codex", true); err == nil || pollErrorCode(err) != "rate-limited" {
+		t.Fatalf("forced refresh should expose typed 429, got %v", err)
+	}
+	quotaCache.Lock()
+	quotaCache.snap, quotaCache.fetchedAt = nil, time.Time{}
+	quotaCache.Unlock()
+	snap, err := FetchProviderForce("codex", false)
+	if err != nil || snap == nil || calls != 2 {
+		t.Fatalf("fresh positive quota was lost during 429 backoff: snap=%+v err=%v calls=%d", snap, err, calls)
+	}
+	if got := snap.Providers["codex"].Resources["primary"].Remaining; got != 80 {
+		t.Fatalf("fresh positive quota changed during 429 backoff: %v", got)
+	}
+}
+
 func TestRateLimitBackoffHonorsLongAndHTTPDateRetryAfter(t *testing.T) {
 	if got := rateLimitBackoff(pollErrf("rate-limited", "HTTP 429 retry-after=601")); got != 601*time.Second {
 		t.Fatalf("long Retry-After was truncated: got %v", got)

@@ -80,7 +80,39 @@ func providerAccountIdentity(name string) *AccountIdentity {
 			return nil
 		}
 		defer zeroOllamaKey(&key)
-		return identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signing-key:public-key")
+		return identity("ollama", base64.StdEncoding.EncodeToString(key.public), "ollama-signed:/api/usage")
+	case "ollama-cloud":
+		return ollamaCloudCredentialIdentity()
+	}
+	return nil
+}
+
+func ollamaCloudCredentialIdentity() *AccountIdentity {
+	for _, path := range opencodeAuthFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var auth map[string]struct {
+			Key   string `json:"key"`
+			Token string `json:"token"`
+		}
+		if json.Unmarshal(raw, &auth) != nil {
+			continue
+		}
+		entry, ok := auth["ollama-cloud"]
+		if !ok {
+			continue
+		}
+		credential := strings.TrimSpace(entry.Key)
+		if credential == "" {
+			credential = strings.TrimSpace(entry.Token)
+		}
+		if credential == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(credential))
+		return identity("ollama-cloud", hex.EncodeToString(sum[:]), "ollama-cloud:credential-fingerprint")
 	}
 	return nil
 }
