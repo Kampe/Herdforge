@@ -148,6 +148,10 @@ func TestGrokBillingExhausted(t *testing.T) {
 	}
 }
 
+// FAC-786: a credits response that proves no window — all-zero counts, no
+// config block — is indistinguishable from absent data. Reporting it as a
+// healthy 0%-used reading would route work at a surface with no evidence, so
+// it must error (no-windows) instead.
 func TestGrokBillingZeroTotal(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -156,11 +160,11 @@ func TestGrokBillingZeroTotal(t *testing.T) {
 	defer ts.Close()
 
 	p, err := grokPollWithURL(ts.URL, "test-token")
-	if err != nil {
-		t.Fatalf("grok poll: %v", err)
+	if err == nil {
+		t.Fatalf("a zero-total response must not fabricate a healthy reading, got %+v", p)
 	}
-	if p.Resources["weekly"].Utilization != 0 {
-		t.Errorf("expected util 0 for zero total, got %f", p.Resources["weekly"].Utilization)
+	if code := pollErrorCode(err); code != "no-windows" {
+		t.Errorf("error code = %q, want no-windows", code)
 	}
 }
 

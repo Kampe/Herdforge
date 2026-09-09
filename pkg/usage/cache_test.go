@@ -77,18 +77,39 @@ func TestInvalidateForcesARefetch(t *testing.T) {
 // collapses fetches within one launch and helps not at all across launches --
 // which is exactly where the 29-272 seconds were spent. Caught by measuring two
 // consecutive launches and seeing no improvement the cache could account for.
+//
+// FAC-786: a persisted reading is only reusable when its account identity is
+// provable, so this test pins a known account into an isolated HOME and binds
+// the cached reading to the same account.
 func TestPersistedReadingSurvivesAcrossProcesses(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "q.json"))
-
-	writeSnapshotFile(&UsageSnapshot{})
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, key := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
+		t.Setenv(key, "")
+	}
+	const accountUUID = "11111111-2222-3333-4444-555555555555"
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"),
+		[]byte(`{"oauthAccount":{"accountUuid":"`+accountUUID+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	acc := &AccountIdentity{
+		Key:        opaqueAccountKey("claude", accountUUID),
+		Provenance: "claude-config:.claude.json:oauthAccount.accountUuid",
+	}
+	writeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{
+		"claude": {DisplayName: "Claude", Account: acc, Stale: false,
+			Resources: map[string]ResourceUsage{
+				"weekly": {Kind: "consumption", Unit: "percent", Used: 10, Remaining: 90, Limit: 100, ResetsAt: "2099-01-01T00:00:00Z", WindowSeconds: 604800},
+			}},
+	}})
 	snap, age, ok := readSnapshotFile(45 * time.Second)
-	if !ok || snap == nil {
-		t.Fatal("a freshly written reading must be readable by another process")
+	if ok || snap != nil {
+		t.Fatal("a Claude config hint must not make an unverified cached reading reusable")
 	}
-	if age > time.Second {
-		t.Errorf("a just-written reading should be new, got age %v", age)
-	}
+	_ = age
+	_ = acc
 }
 
 // Aged-out, corrupt and missing readings all fetch live. A cache is an

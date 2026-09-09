@@ -2,12 +2,13 @@ package usage
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -17,7 +18,8 @@ import (
 // pkg/usage polled grok natively but shelled the OpenUsage macOS helper for
 // these three, so on any host without that app — a Linux box, CI — their pools
 // reported nothing and the router lost proactive visibility for the surfaces it
-// leans on most.
+// leans on most. FAC-786 removed the helper path entirely; these pollers (plus
+// grok's, in usage.go) are the only quota authority.
 //
 // The endpoints below were read out of the OpenUsage helper's own strings
 // rather than guessed, and each was confirmed with a live request before this
@@ -29,8 +31,9 @@ import (
 //
 // Every poller degrades gracefully: a missing credential, an expired token or
 // an unreachable API returns an error, and the caller keeps the provider absent
-// rather than reporting a fabricated zero. A zero would read as "plenty of
-// quota" and send work at a surface that is actually spent.
+// (with the reason recorded in the snapshot's errors map) rather than reporting
+// a fabricated zero. A zero would read as "plenty of quota" and send work at a
+// surface that is actually spent.
 const (
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
 	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
@@ -44,6 +47,9 @@ const (
 	claudeCredentialFile  = ".credentials.json"
 	claudeKeychainService = "Claude Code-credentials"
 	pollTimeout           = 10 * time.Second
+	// keychainTimeout bounds the optional noninteractive keychain lookup so a
+	// stuck security agent cannot stretch a quota fetch.
+	keychainTimeout = 5 * time.Second
 )
 
 func pollClient() *http.Client { return &http.Client{Timeout: pollTimeout} }
@@ -75,6 +81,9 @@ type claudeUsage struct {
 	// what surfaced this; inferring endpoints from the binary's strings got the
 	// URL right and the response shape wrong.
 	Limits []claudeScopedLimit `json:"limits"`
+	// Plan, when the response carries it at all.
+	SubscriptionType string `json:"subscriptionType"`
+	RateLimitTier    string `json:"rateLimitTier"`
 }
 
 // claudeToken resolves the OAuth access token the way Claude Code itself does.
@@ -84,6 +93,12 @@ type claudeUsage struct {
 // a credentials FILE first and treats the keychain as one source among several,
 // honouring CLAUDE_CONFIG_DIR and XDG_CONFIG_HOME. Ported here in that order,
 // so a Linux host with ~/.claude/.credentials.json works with no keychain at all.
+//
+// The keychain lookup is optional, noninteractive and bounded: darwin only,
+// 5-second deadline, and disabled entirely with HERD_QUOTA_KEYCHAIN=0 (also the
+// way tests keep it hermetic). This collector never writes or refreshes
+// credentials — an expired token is an explicit auth-expired error pointing at
+// the owning CLI, never a silent re-login.
 func claudeToken() (string, error) {
 	for _, path := range claudeCredentialFiles() {
 		raw, err := os.ReadFile(path)
@@ -97,15 +112,36 @@ func claudeToken() (string, error) {
 		// A present-but-expired file is a definitive answer, not a reason to
 		// keep looking: silently falling through to another login would report
 		// a different account's quota.
-		if strings.Contains(err.Error(), "expired") {
+		if pollErrorCode(err) == "auth-expired" {
 			return "", err
 		}
 	}
-	out, err := exec.Command("security", "find-generic-password", "-s", claudeKeychainService, "-w").Output()
+	if !claudeKeychainEnabled() {
+		return "", pollErrf("auth-missing",
+			"claude credentials: none of the credential files resolved and keychain access is disabled or unavailable on this platform; re-authenticate with the claude CLI")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), keychainTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "security", "find-generic-password", "-s", claudeKeychainService, "-w").Output()
 	if err != nil {
-		return "", fmt.Errorf("claude credentials: no credentials file and keychain lookup failed")
+		return "", pollErrf("auth-missing",
+			"claude credentials: no credentials file and keychain lookup failed; re-authenticate with the claude CLI")
 	}
 	return claudeTokenFromJSON(bytes.TrimSpace(out))
+}
+
+// claudeKeychainEnabled reports whether the optional macOS keychain source may
+// be consulted. Bounded: noninteractive (a locked keychain fails rather than
+// prompting), darwin-only, and explicitly disableable.
+func claudeKeychainEnabled() bool {
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("HERD_QUOTA_KEYCHAIN"))) {
+	case "0", "off", "false", "disabled":
+		return false
+	}
+	return true
 }
 
 // claudeCredentialFiles lists candidate credential files, most specific first.
@@ -138,13 +174,14 @@ func claudeTokenFromJSON(raw []byte) (string, error) {
 		} `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(raw, &creds); err != nil {
-		return "", fmt.Errorf("claude credentials decode: %w", err)
+		return "", pollErrf("decode-failed", "claude credentials decode: %v", err)
 	}
 	if creds.ClaudeAiOauth.AccessToken == "" {
-		return "", fmt.Errorf("claude credentials: no access token")
+		return "", pollErrf("auth-missing", "claude credentials: no access token")
 	}
 	if e := creds.ClaudeAiOauth.ExpiresAt; e > 0 && time.Now().After(time.UnixMilli(int64(e))) {
-		return "", fmt.Errorf("claude credentials expired at %s; re-authenticate",
+		return "", pollErrf("auth-expired",
+			"claude credentials expired at %s; re-authenticate with the claude CLI",
 			time.UnixMilli(int64(e)).Format(time.RFC3339))
 	}
 	return creds.ClaudeAiOauth.AccessToken, nil
@@ -155,7 +192,58 @@ func claudePoll() (ProviderUsage, error) {
 	if err != nil {
 		return ProviderUsage{}, err
 	}
-	return claudePollWithURL(claudeUsageURL, tok)
+	return claudePollAuthenticated(claudeUsageURL, tok)
+}
+
+type claudeProfile struct {
+	Account struct {
+		UUID string `json:"uuid"`
+	} `json:"account"`
+	Organization struct {
+		UUID string `json:"uuid"`
+	} `json:"organization"`
+}
+
+func claudePollAuthenticated(usageURL, token string) (ProviderUsage, error) {
+	profileURL := strings.TrimSuffix(usageURL, "/usage") + "/profile"
+	req, err := http.NewRequest("GET", profileURL, nil)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("anthropic-beta", claudeOAuthBeta)
+	resp, err := pollClient().Do(req)
+	if err != nil {
+		return ProviderUsage{}, netPollError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ProviderUsage{}, httpStatusPollError("claude profile", resp.StatusCode)
+	}
+	var profile claudeProfile
+	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "claude profile decode: %v", err)
+	}
+	account := strings.TrimSpace(profile.Account.UUID)
+	if account == "" {
+		return ProviderUsage{}, pollErrf("auth-ambiguous", "claude profile carried no account identity")
+	}
+	claim := account
+	provenance := "claude-profile:api.anthropic.com/api/oauth/profile:account.uuid"
+	if org := strings.TrimSpace(profile.Organization.UUID); org != "" {
+		claim += "|" + org
+		provenance += "+organization.uuid"
+	}
+	if expected := claudeConfigAccountClaim(); expected != "" && !strings.EqualFold(expected, claim) {
+		return ProviderUsage{}, pollErrf("auth-ambiguous", "claude profile does not match the local account hint")
+	}
+	p, err := claudePollWithURL(usageURL, token)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	p.Account = identity("claude", claim, provenance)
+	return p, nil
 }
 
 func claudePollWithURL(url, token string) (ProviderUsage, error) {
@@ -169,15 +257,15 @@ func claudePollWithURL(url, token string) (ProviderUsage, error) {
 
 	resp, err := pollClient().Do(req)
 	if err != nil {
-		return ProviderUsage{}, fmt.Errorf("claude usage: %w", err)
+		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ProviderUsage{}, fmt.Errorf("claude usage: HTTP %d", resp.StatusCode)
+		return ProviderUsage{}, httpStatusPollError("claude usage", resp.StatusCode)
 	}
 	var u claudeUsage
 	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return ProviderUsage{}, fmt.Errorf("claude usage decode: %w", err)
+		return ProviderUsage{}, pollErrf("decode-failed", "claude usage decode: %v", err)
 	}
 
 	res := map[string]ResourceUsage{}
@@ -188,8 +276,12 @@ func claudePollWithURL(url, token string) (ProviderUsage, error) {
 		if w == nil {
 			return
 		}
+		state := "active"
+		if strings.TrimSpace(w.ResetsAt) == "" {
+			state = "not-started"
+		}
 		res[name] = ResourceUsage{
-			Kind: "consumption", Unit: "percent",
+			Kind: "consumption", State: state, Pool: name, Unit: "percent",
 			Used: w.Utilization, Utilization: w.Utilization / 100,
 			Remaining: 100 - w.Utilization, Limit: 100,
 			ResetsAt: w.ResetsAt, WindowSeconds: window,
@@ -209,17 +301,27 @@ func claudePollWithURL(url, token string) (ProviderUsage, error) {
 		if name == "" {
 			continue
 		}
+		state := "active"
+		if strings.TrimSpace(l.ResetsAt) == "" {
+			state = "not-started"
+		}
 		res[name+"Weekly"] = ResourceUsage{
-			Kind: "consumption", Unit: "percent",
+			Kind: "consumption", State: state, Model: name, Pool: name + "Weekly", Unit: "percent",
 			Used: l.Percent, Utilization: l.Percent / 100,
 			Remaining: 100 - l.Percent, Limit: 100,
 			ResetsAt: l.ResetsAt, WindowSeconds: 7 * 24 * 3600,
 		}
 	}
 	if len(res) == 0 {
-		return ProviderUsage{}, fmt.Errorf("claude usage: response carried no quota windows")
+		return ProviderUsage{}, pollErrf("no-windows", "claude usage: response carried no quota windows")
 	}
-	return ProviderUsage{DisplayName: "Claude", Plan: "Max", Resources: res}, nil
+	// Plan only when the response actually carries it; a hardcoded plan would
+	// be a fabricated fact about someone's subscription.
+	plan := u.SubscriptionType
+	if plan == "" {
+		plan = u.RateLimitTier
+	}
+	return ProviderUsage{DisplayName: "Claude", Plan: plan, Resources: res}, nil
 }
 
 // ---------- codex ----------
@@ -265,7 +367,7 @@ func codexToken() (string, error) {
 			} `json:"tokens"`
 		}
 		if err := json.Unmarshal(raw, &auth); err != nil {
-			lastErr = fmt.Errorf("codex auth decode: %w", err)
+			lastErr = pollErrf("decode-failed", "codex auth decode: %v", err)
 			continue
 		}
 		if strings.TrimSpace(auth.Tokens.AccessToken) != "" {
@@ -273,12 +375,14 @@ func codexToken() (string, error) {
 		}
 		// An API-key-only auth.json cannot read plan quota; upstream refuses it
 		// for the same reason rather than sending a request that will 401.
-		lastErr = fmt.Errorf("codex auth.json at %s has no OAuth access token (an API key alone cannot read plan quota)", path)
+		lastErr = pollErrf("auth-insufficient",
+			"codex auth.json at %s has no OAuth access token (an API key alone cannot read plan quota); run codex login", path)
 	}
 	if lastErr != nil {
 		return "", lastErr
 	}
-	return "", fmt.Errorf("codex auth.json: not found in $CODEX_HOME, ~/.config/codex or ~/.codex")
+	return "", pollErrf("auth-missing",
+		"codex auth.json: not found in $CODEX_HOME, ~/.config/codex or ~/.codex; run codex login")
 }
 
 func codexCredentialFiles() []string {
@@ -312,15 +416,15 @@ func codexPollWithURL(url, token string) (ProviderUsage, error) {
 
 	resp, err := pollClient().Do(req)
 	if err != nil {
-		return ProviderUsage{}, fmt.Errorf("codex usage: %w", err)
+		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ProviderUsage{}, fmt.Errorf("codex usage: HTTP %d", resp.StatusCode)
+		return ProviderUsage{}, httpStatusPollError("codex usage", resp.StatusCode)
 	}
 	var u codexUsage
 	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
-		return ProviderUsage{}, fmt.Errorf("codex usage decode: %w", err)
+		return ProviderUsage{}, pollErrf("decode-failed", "codex usage decode: %v", err)
 	}
 
 	res := map[string]ResourceUsage{}
@@ -352,7 +456,7 @@ func codexPollWithURL(url, token string) (ProviderUsage, error) {
 		add(key+"Session", extra.RateLimit.Secondary)
 	}
 	if len(res) == 0 {
-		return ProviderUsage{}, fmt.Errorf("codex usage: response carried no rate-limit windows")
+		return ProviderUsage{}, pollErrf("no-windows", "codex usage: response carried no rate-limit windows")
 	}
 	plan := u.PlanType
 	if plan == "" {
@@ -387,18 +491,19 @@ func geminiToken() (string, error) {
 			ExpiryDate  float64 `json:"expiry_date"`
 		}
 		if err := json.Unmarshal(raw, &creds); err != nil {
-			lastErr = fmt.Errorf("gemini creds decode: %w", err)
+			lastErr = pollErrf("decode-failed", "gemini creds decode: %v", err)
 			continue
 		}
 		if creds.AccessToken == "" {
-			lastErr = fmt.Errorf("gemini creds at %s: no access token", path)
+			lastErr = pollErrf("auth-missing", "gemini creds at %s: no access token", path)
 			continue
 		}
 		// expiry_date is epoch MILLISECONDS. "Expired, re-authenticate" is
 		// actionable; a bare 401 from the API is not. Float for the same reason
 		// claude's expiresAt is — do not assume an integer.
 		if e := creds.ExpiryDate; e > 0 && time.Now().After(time.UnixMilli(int64(e))) {
-			return "", fmt.Errorf("gemini credentials expired at %s; run the gemini CLI to refresh",
+			return "", pollErrf("auth-expired",
+				"gemini credentials expired at %s; run the gemini CLI to refresh",
 				time.UnixMilli(int64(e)).Format(time.RFC3339))
 		}
 		return creds.AccessToken, nil
@@ -406,7 +511,8 @@ func geminiToken() (string, error) {
 	if lastErr != nil {
 		return "", lastErr
 	}
-	return "", fmt.Errorf("gemini oauth_creds.json: not found in $GEMINI_CONFIG_DIR, $XDG_CONFIG_HOME/gemini or ~/.gemini")
+	return "", pollErrf("auth-missing",
+		"gemini oauth_creds.json: not found in $GEMINI_CONFIG_DIR, $XDG_CONFIG_HOME/gemini or ~/.gemini; run the gemini CLI to log in")
 }
 
 func geminiCredentialFiles() []string {
@@ -446,15 +552,15 @@ func geminiPollWithURL(url, token string) (ProviderUsage, error) {
 
 	resp, err := pollClient().Do(req)
 	if err != nil {
-		return ProviderUsage{}, fmt.Errorf("gemini quota: %w", err)
+		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ProviderUsage{}, fmt.Errorf("gemini quota: HTTP %d", resp.StatusCode)
+		return ProviderUsage{}, httpStatusPollError("gemini quota", resp.StatusCode)
 	}
 	var q geminiQuota
 	if err := json.NewDecoder(resp.Body).Decode(&q); err != nil {
-		return ProviderUsage{}, fmt.Errorf("gemini quota decode: %w", err)
+		return ProviderUsage{}, pollErrf("decode-failed", "gemini quota decode: %v", err)
 	}
 
 	res := map[string]ResourceUsage{}
@@ -474,9 +580,11 @@ func geminiPollWithURL(url, token string) (ProviderUsage, error) {
 		}
 	}
 	if len(res) == 0 {
-		return ProviderUsage{}, fmt.Errorf("gemini quota: response carried no quotas")
+		return ProviderUsage{}, pollErrf("no-windows", "gemini quota: response carried no quotas")
 	}
-	return ProviderUsage{DisplayName: "Gemini", Plan: "Pro", Resources: res}, nil
+	// No hardcoded plan: the quota response does not carry one, and a guessed
+	// "Pro" would be a fabricated fact about someone's subscription.
+	return ProviderUsage{DisplayName: "Gemini", Resources: res}, nil
 }
 
 // codexPoolKey turns a per-model limit name into a pool key.
