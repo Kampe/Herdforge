@@ -523,6 +523,27 @@ func HarnessArgvFor(provider, model, effort string) (string, []string, error) {
 	return PiHarness, []string{PiHarness, "--model", piModel, "--thinking", effort}, nil
 }
 
+// ProvenanceFromArgv reads provider and model from compiled launch argv.
+// argv[0] is the harness that will actually exec; --model is located by
+// search, never by a fixed index, because vendor flag order is not a contract.
+func ProvenanceFromArgv(argv []string) (provider, model string, err error) {
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
+		return "", "", fmt.Errorf("launch argv is empty")
+	}
+	provider = strings.ToLower(strings.TrimSpace(argv[0]))
+	for i := range argv {
+		if argv[i] != "--model" {
+			continue
+		}
+		if i+1 >= len(argv) || strings.TrimSpace(argv[i+1]) == "" {
+			return "", "", fmt.Errorf("launch argv has --model without a value")
+		}
+		model = strings.TrimSpace(argv[i+1])
+		break
+	}
+	return provider, model, nil
+}
+
 // ArgvFor mirrors argv_json: the exact launch argv per provider contract.
 // opencode-family argv is launcher-owned (herd_opencode_persistent_argv);
 // here we emit the canonical model invocation.

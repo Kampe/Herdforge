@@ -482,6 +482,41 @@ func fields(req Request) (role, shape, provider, model, effort, digest string, a
 	return string(d.Role), d.Shape, d.Provider, d.Model, d.Effort, DecisionDigest(d), clone(d.Argv)
 }
 
+func launchedArgv(d *router.LaunchDecision) []string {
+	if d == nil {
+		return nil
+	}
+	if len(d.HarnessArgv) > 0 && strings.ToLower(strings.TrimSpace(d.HarnessArgv[0])) != router.PiHarness {
+		return clone(d.HarnessArgv)
+	}
+	return clone(d.Argv)
+}
+
+// ReceiptProvenance binds provider/model/family to the argv that actually
+// launches. A decision that names grok while argv execs codex is refused —
+// relabeling after launch is out of scope.
+func ReceiptProvenance(d *router.LaunchDecision) (provider, model, family string, err error) {
+	if d == nil {
+		return "", "", "", fmt.Errorf("launch receipt requires a resolved decision")
+	}
+	provider = strings.TrimSpace(d.Provider)
+	model = strings.TrimSpace(d.Model)
+	if p, m, perr := router.ProvenanceFromArgv(launchedArgv(d)); perr == nil && p != router.PiHarness {
+		if !strings.EqualFold(p, provider) || (m != "" && m != model) {
+			return "", "", "", fmt.Errorf("launch receipt argv provenance %s/%s disagrees with decision %s/%s", p, m, provider, model)
+		}
+		provider = p
+		if m != "" {
+			model = m
+		}
+	}
+	family = router.FamilyFor(provider, model)
+	if family == "" {
+		return "", "", "", fmt.Errorf("resolved route %s/%s maps to no vendor family; refusing to record unprovable authorship", provider, model)
+	}
+	return provider, model, family, nil
+}
+
 func fleetReceiptFields(req Request) (digest, auth, family, surface string) {
 	b := req.FleetBinding
 	return b.PolicyDigest, b.AuthTag, b.ParentExecutionFamily, b.AllowedHerdrSurface
@@ -504,7 +539,8 @@ func receiptFrom(req Request, role, shape, provider, model, effort, digest strin
 	return Receipt{
 		CreatedAt: time.Now().UTC(), TaskRef: req.TaskRef, Role: role, TaskShape: shape,
 		Provider: provider, Model: model, Effort: effort, DecisionDigest: digest, Argv: argv,
-		Accepted: accepted, Reason: reason, Name: req.Name, PaneID: req.PaneID,
+		BuilderFamily: router.FamilyFor(provider, model),
+		Accepted:      accepted, Reason: reason, Name: req.Name, PaneID: req.PaneID,
 		LeaseGeneration: req.LeaseGeneration, SessionGeneration: req.SessionGeneration,
 		Repository: req.Repository, Lane: req.Lane, TabID: req.TabID, HerdrSession: req.HerdrSession,
 		CWD: req.CWD, ProcessIdentity: req.ProcessIdentity, StartToken: req.StartToken,
@@ -526,6 +562,14 @@ func RecordStarted(req Request, sink Sink) error {
 		sink = DefaultSink()
 	}
 	role, shape, provider, model, effort, digest, argv := fields(req)
+	if req.Decision != nil {
+		boundProvider, boundModel, _, bindErr := ReceiptProvenance(req.Decision)
+		if bindErr != nil {
+			return bindErr
+		}
+		provider, model = boundProvider, boundModel
+		argv = launchedArgv(req.Decision)
+	}
 	policyRevision, err := currentPolicyRevision(req)
 	if err != nil {
 		return err

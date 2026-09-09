@@ -210,7 +210,7 @@ func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = launchAdmissionWithLifecycle(rec, cfg, "worker", true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
+	_, err = launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
 		if admitted != valid {
 			t.Fatalf("lifecycle received a different decision: got %p want %p", admitted, valid)
 		}
@@ -232,7 +232,7 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &fakeLaunchLifecycle{}
-	got, err := launchAdmissionWithLifecycle(rec, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
+	got, err := launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
 		if admitted != valid || admitted.Proof != valid.Proof {
 			t.Fatalf("lifecycle did not receive exact admitted decision")
 		}
@@ -262,7 +262,7 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 	t.Run("candidate context reaches effect once", func(t *testing.T) {
 		decision := newDecision(t, "FAC-153")
 		effects := 0
-		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
 			effects++
 			return nil
 		})
@@ -275,7 +275,7 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 		decision := newDecision(t, "FAC-153")
 		decision.TaskRef = "FAC-154"
 		effects := 0
-		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
 			effects++
 			return nil
 		})
@@ -293,7 +293,7 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 			t.Fatal(err)
 		}
 		effects := 0
-		_, err = launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane.Role, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+		_, err = launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
 			effects++
 			return nil
 		})
@@ -325,7 +325,7 @@ func TestWorkerUnprobedFallbackRejectsBeforeAnySideEffect(t *testing.T) {
 			})
 			r.Probes = &router.Probes{CLIPresent: func(cli string) bool { return cli == router.PiHarness }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
 			rec := &fakeLaunchLifecycle{}
-			decision, err := launchAdmissionWithLifecycle(rec, cfg, role, true, func(lane *config.LaneDef) (*router.LaunchDecision, error) {
+			decision, err := launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(lane *config.LaneDef) (*router.LaunchDecision, error) {
 				return r.Decide(router.LaunchRequest{
 					Role:              router.Role(role),
 					Shape:             launch.Implementation,
@@ -455,7 +455,7 @@ func TestUnsupportedHarnessConfigRejectsBeforeLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &fakeLaunchLifecycle{}
-	_, err = launchAdmissionWithLifecycle(rec, cfg, launch.WorkerRole, true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(*router.LaunchDecision) error {
+	_, err = launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(*router.LaunchDecision) error {
 		t.Fatal("unsupported harness reached lifecycle")
 		return nil
 	})
@@ -609,6 +609,9 @@ func TestLaneLaunchDecisionBindsConfiguredCodexHarnessWithoutPi(t *testing.T) {
 	if err != nil {
 		t.Fatalf("configured Codex route rejected: %v", err)
 	}
+	if decision.LaneName != lane.Name {
+		t.Fatalf("decision lane = %q, want %q", decision.LaneName, lane.Name)
+	}
 	if decision.Provider != launch.WorkerProvider || decision.Model != launch.WorkerModel || decision.Effort != launch.WorkerEffort || decision.Harness != "codex" {
 		t.Fatalf("routed tuple drifted: %+v", decision)
 	}
@@ -618,6 +621,42 @@ func TestLaneLaunchDecisionBindsConfiguredCodexHarnessWithoutPi(t *testing.T) {
 	}
 	if err := launch.Validate(launch.Request{Decision: decision, TaskRef: lane.Name, Scope: router.ScopeLane}, nil); err != nil {
 		t.Fatalf("direct Codex launch decision must validate: %v", err)
+	}
+}
+
+// FAC-703: two lanes sharing role worker must each compile their OWN vendor
+// tuple and argv. The fake binaries in PATH satisfy the harness LookPath gate
+// hermetically; no real vendor CLI is invoked.
+func TestSharedWorkerLaneCompilesExactVendorTupleAndArgv(t *testing.T) {
+	for _, tt := range []struct {
+		name, provider, model string
+	}{
+		{name: "smith-grok", provider: "grok", model: "grok-4.6"},
+		{name: "smith-claude", provider: "claude", model: "claude-sonnet-5"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, tt.provider), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir)
+			t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+			pinHealthyQuota(t, dir, tt.provider)
+			lane := &config.LaneDef{Name: tt.name, Role: launch.WorkerRole, AgentKind: tt.provider, Harness: tt.provider, Provider: tt.provider, Model: tt.model, Effort: "medium", TaskShape: launch.Implementation}
+			decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+				return herdr.ProbeResult{Model: model, Available: true}
+			})
+			if err != nil {
+				t.Fatalf("exact lane route rejected: %v", err)
+			}
+			if decision.LaneName != lane.Name || decision.Provider != tt.provider || decision.Model != tt.model || decision.Harness != tt.provider {
+				t.Fatalf("compiled decision drifted from %s: %+v", lane.Name, decision)
+			}
+			wantArgv := router.ArgvFor(tt.provider, tt.model, "medium")
+			if strings.Join(decision.HarnessArgv, "\x00") != strings.Join(wantArgv, "\x00") {
+				t.Fatalf("harness argv = %v, want %v", decision.HarnessArgv, wantArgv)
+			}
+		})
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -135,5 +136,63 @@ func TestDispatchCancelOutputNamesStoreTaskGenerationDisposition(t *testing.T) {
 	}
 	if strings.Contains(got, "coordinator-dispatch") || strings.Contains(got, "pid") {
 		t.Fatalf("CLI report leaked owner identity: %q", got)
+	}
+}
+
+// FAC-703: a failed launch releases the EXACT lease generation it acquired,
+// pulse no longer reports that generation active, and releasing a stale
+// generation never drops the live lease a later dispatch took.
+func TestFailedLaunchReleasesExactGenerationAndPulseIsIdle(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, ".herd", "herdforge.db")
+	if err := os.MkdirAll(filepath.Dir(db), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_LEASE_DB", db)
+	store, err := claim.NewSQLiteLeaseStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	key := claim.LeaseKey{Repo: "repo", Provider: "kaneo", Project: "project", TaskRef: "FAC-703"}
+	first, err := store.Acquire(context.Background(), key, "coordinator-dispatch", "worker", "", time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", first.Generation); err != nil {
+		t.Fatalf("exact-generation compensation: %v", err)
+	}
+	leases, _, err := readPulseLeases(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range leases {
+		if l.TaskRef == "FAC-703" && l.Active {
+			t.Fatalf("pulse still reports released generation %d as active: %+v", l.Generation, l)
+		}
+	}
+
+	second, err := store.Acquire(context.Background(), key, "coordinator-dispatch", "worker", "", time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseCoordinationLeaseBounded(root, key, "coordinator-dispatch", first.Generation); err != nil {
+		t.Fatalf("stale-generation compensation: %v", err)
+	}
+	leases, _, err = readPulseLeases(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, l := range leases {
+		if l.TaskRef == "FAC-703" && l.Generation == second.Generation && l.Active {
+			found = true
+		}
+		if l.TaskRef == "FAC-703" && l.Generation == first.Generation && l.Active {
+			t.Fatalf("released generation %d became active again", first.Generation)
+		}
+	}
+	if !found {
+		t.Fatalf("releasing a stale generation dropped the live lease %+v", leases)
 	}
 }

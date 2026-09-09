@@ -50,6 +50,10 @@ type OwnershipToken struct {
 // then compensate (B can acquire and get stomped by stale A).
 type OwnershipClaimer interface {
 	ClaimExclusive(ctx context.Context, taskID TaskID, taskRef Ref, role, graphRev, providerRev, worktreeHint string) (*OwnershipToken, error)
+	// ClaimExclusiveNamedLane is ClaimExclusive bound to an exact configured
+	// lane name. Roles are shared; the hold identity must not re-resolve the
+	// first worker lane when the caller named smith-grok.
+	ClaimExclusiveNamedLane(ctx context.Context, taskID TaskID, taskRef Ref, role, laneName, graphRev, providerRev, worktreeHint string) (*OwnershipToken, error)
 	StillOwns(ctx context.Context, tok *OwnershipToken) (bool, error)
 	// ReleaseIfOwner drops the generation fence only when owner+generation still
 	// match. Call AFTER successful durable compensation — never before.
@@ -155,6 +159,14 @@ func newOwnerID(role string) (string, error) {
 // non-empty (selection relation revision). Provider board status is NOT
 // mutated here — the lease is the ownership boundary until FAC-147 CAS.
 func (o *LeaseOwnership) ClaimExclusive(ctx context.Context, taskID TaskID, taskRef Ref, role, graphRev, providerRev, worktreeHint string) (*OwnershipToken, error) {
+	return o.ClaimExclusiveNamedLane(ctx, taskID, taskRef, role, "", graphRev, providerRev, worktreeHint)
+}
+
+// ClaimExclusiveNamedLane binds the hold identity to the exact configured lane
+// NAME. An empty laneName falls back to role resolution (default-role
+// dispatch); a non-empty one is used verbatim after trimming, so two lanes
+// sharing role worker never collapse onto the first one's hold identity.
+func (o *LeaseOwnership) ClaimExclusiveNamedLane(ctx context.Context, taskID TaskID, taskRef Ref, role, laneName, graphRev, providerRev, worktreeHint string) (*OwnershipToken, error) {
 	if o == nil || o.CM == nil {
 		return nil, fmt.Errorf("deps: lease ownership not configured")
 	}
@@ -169,9 +181,14 @@ func (o *LeaseOwnership) ClaimExclusive(ctx context.Context, taskID TaskID, task
 	}
 	// claim.Claim requires Role == TaskRole and non-empty TaskRole.
 	key := o.key(taskRef)
-	laneName, err := o.canonicalLane(role)
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(laneName) == "" {
+		resolved, err := o.canonicalLane(role)
+		if err != nil {
+			return nil, err
+		}
+		laneName = resolved
+	} else {
+		laneName = strings.TrimSpace(laneName)
 	}
 	ownerID, err := newOwnerID(role)
 	if err != nil {

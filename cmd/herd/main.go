@@ -1714,7 +1714,7 @@ func runDaemon() {
 			return fmt.Errorf("no lane configured for role %q", *role)
 		}
 		var tp provider.TaskProvider
-		decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, *role, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
+		decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
 			var tpErr error
 			tp, tpErr = loadTaskProvider(cfg)
 			return tpErr
@@ -1997,7 +1997,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			// provider probes, cooldowns, or the router's fallback decision.
 			// FAC-618: two health authorities must not silently disagree and
 			// strand a standing lane before the actual launch decision runs.
-			decision, err := launchAdmission(cfg, lane.Role, true, routedLaneDecision(context.Background(), nil))
+			decision, err := launchAdmission(cfg, lane, true, routedLaneDecision(context.Background(), nil))
 			if err != nil {
 				return standing.Route{}, err
 			}
@@ -2719,7 +2719,7 @@ func runReview() {
 		}
 		restoreHooks := useHarnessHooksFromWorktree(wt)
 		defer restoreHooks()
-		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
+		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
 			_, listErr := herdr.AgentList()
 			return listErr
 		})
@@ -5309,9 +5309,18 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 	}
 
 	if !noLaunch {
-		// canonicalLane.Role, not a second lookup: this is the same lane the hold
-		// gate above already admitted.
-		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, canonicalLane.Role, true, routedLaneDecision(ctx, nil), func(admitted *router.LaunchDecision) error {
+		// FAC-703: the exact lane the registry resolved BY NAME, never its role.
+		// This is the same lane the hold gate above already admitted; handing
+		// admission the lane itself is what stops a shared role from
+		// re-resolving it to a different pane's argv.
+		launchLane := findLaneByName(cfg, canonicalLane.Name)
+		if launchLane == nil {
+			if relErr := releaseCoordinationLeaseBounded(dispatchRoot, leaseKey, "coordinator-dispatch", leaseGen); relErr != nil {
+				return nil, nil, fmt.Errorf("dispatch lane %q is not configured for launch; LEASE COMPENSATION ALSO FAILED: %v", canonicalLane.Name, relErr)
+			}
+			return nil, nil, fmt.Errorf("dispatch lane %q is not configured for launch", canonicalLane.Name)
+		}
+		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, launchLane, true, routedLaneDecision(ctx, nil), func(admitted *router.LaunchDecision) error {
 			if err := admitDispatch(); err != nil {
 				return err
 			}
@@ -6364,7 +6373,25 @@ func forgeGitOutput(dir string, args ...string) string {
 }
 
 func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
-	return launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane.Role, true, routedLaneDecision(ctx, nil), effect)
+	return launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(ctx, nil), effect)
+}
+
+// findLaneByName resolves the one lane an operator named. Unlike a role, a lane
+// name is unique, so this is the only lookup safe to use for launch admission.
+func findLaneByName(cfg *config.Config, name string) *config.LaneDef {
+	if cfg == nil {
+		return nil
+	}
+	want := strings.ToLower(strings.TrimSpace(name))
+	if want == "" {
+		return nil
+	}
+	for i := range cfg.Lanes {
+		if strings.ToLower(strings.TrimSpace(cfg.Lanes[i].Name)) == want {
+			return &cfg.Lanes[i]
+		}
+	}
+	return nil
 }
 
 func findLaneForRole(cfg *config.Config, role string) *config.LaneDef {
@@ -6473,7 +6500,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		}
 	}
 	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
-	request := router.LaunchRequest{Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
+	request := router.LaunchRequest{LaneName: strings.TrimSpace(lane.Name), Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	request.Standing = lane.Standing
 	if pinnedBuilder {
 		request.RequestedProvider = provider
@@ -6996,8 +7023,8 @@ func (liveLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*rou
 	return effect(decision)
 }
 
-func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, role string, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
-	decision, err := launchAdmission(cfg, role, herdrAvailable, route)
+func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
+	decision, err := launchAdmission(cfg, lane, herdrAvailable, route)
 	if err != nil {
 		return nil, err
 	}
@@ -7007,13 +7034,25 @@ func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, role s
 	return decision, nil
 }
 
-func launchAdmission(cfg *config.Config, role string, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
-	lane := findLaneForRole(cfg, role)
+// launchAdmission takes the EXACT lane to launch, never a role. FAC-703: it
+// used to accept a role string and re-resolve it with findLaneForRole, which
+// returns the first lane holding that role. Roles are not unique -- smith and
+// smith-grok are both "worker" -- so `herd dispatch --lane smith-grok` resolved
+// smith-grok by name, passed only its role here, and launched smith's codex
+// argv under smith-grok's identity. Taking the lane makes that unrepresentable.
+func launchAdmission(cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
 	if lane == nil {
-		return nil, fmt.Errorf("no lane configured for role %q", role)
+		return nil, fmt.Errorf("launch admission requires an exact lane")
+	}
+	// Re-bind to the compiled config by NAME, which is unique, so the launched
+	// tuple is always the configured one and never a caller-supplied variant.
+	requested := lane.Name
+	lane = findLaneByName(cfg, requested)
+	if lane == nil {
+		return nil, fmt.Errorf("lane %q is not configured; refusing launch", requested)
 	}
 	if !herdrAvailable {
-		return nil, fmt.Errorf("herdr unavailable for launch-required role %q", role)
+		return nil, fmt.Errorf("herdr unavailable for launch-required lane %q", lane.Name)
 	}
 	if err := validateLaneLaunchConfig(lane); err != nil {
 		return nil, err

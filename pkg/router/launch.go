@@ -91,6 +91,9 @@ const (
 // affect effort or coherence must be set by the caller; missing probe proof
 // for probe-gated models fails closed.
 type LaunchRequest struct {
+	// LaneName binds a decision to the exact configured lane. It is separate
+	// from Role because roles are shared by multiple lanes.
+	LaneName string
 	// Role selects worker vs reviewer policy (effort ladder, family gates).
 	Role Role
 	// NativeRole is the canonical policy role for a repository-defined standing
@@ -160,6 +163,8 @@ type LaunchRequest struct {
 // reviewer launch. FAC-139 consumes this at every launch boundary; no field
 // may be left to harness defaults.
 type LaunchDecision struct {
+	// LaneName is the exact configured lane that produced this decision.
+	LaneName          string         `json:"lane_name,omitempty"`
 	Provider          string         `json:"provider"`
 	Model             string         `json:"model,omitempty"`
 	Harness           string         `json:"harness"`
@@ -310,7 +315,7 @@ func decisionProof(d LaunchDecision) string {
 		}
 		return v
 	}
-	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%t|%t|%s|%d|%s|%s|%s|%s|%s|%s|%s", decisionProofDomain, norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Harness), norm(d.Effort), d.EffortApplicable, d.ArgvAuthoritative, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, d.HarnessSession, strings.Join(d.Argv, "\x00"), strings.Join(d.HarnessArgv, "\x00"))
+	canonical := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%t|%t|%s|%d|%s|%s|%s|%s|%s|%s|%s", decisionProofDomain, norm(d.LaneName), norm(string(d.Role)), norm(d.Shape), norm(d.Provider), norm(d.Model), norm(d.Harness), norm(d.Effort), d.EffortApplicable, d.ArgvAuthoritative, d.CandidateSHA, d.LeaseGeneration, d.TaskRef, norm(d.Scope), d.ProbeKey, d.Rationale, d.HarnessSession, strings.Join(d.Argv, "\x00"), strings.Join(d.HarnessArgv, "\x00"))
 	sum := sha256.Sum256([]byte(canonical))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
@@ -1270,6 +1275,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		return nil, fmt.Errorf("herd-route: Pi harness: %w", err)
 	}
 	d := &LaunchDecision{
+		LaneName:          req.LaneName,
 		Provider:          best.provider,
 		Model:             model,
 		Harness:           harness,

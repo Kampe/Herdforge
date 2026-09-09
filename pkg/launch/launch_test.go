@@ -115,6 +115,50 @@ func TestValidateWorkerDecisionDoesNotPreAccept(t *testing.T) {
 	}
 }
 
+// FAC-703 RED: the acceptance receipt must bind to the argv that actually
+// launches. A decision naming grok/grok-4.6 while carrying codex argv must
+// not be recorded as an accepted launch.
+func TestRecordStartedRefusesArgvDecisionDrift(t *testing.T) {
+	req := Request{
+		Decision: &router.LaunchDecision{
+			LaneName: "smith-grok", Provider: "grok", Model: "grok-4.6", Family: "xai",
+			Harness: "grok", Effort: "medium", Role: router.RoleWorker, Shape: Implementation,
+			HarnessArgv: router.ArgvFor("codex", "gpt-5.6-luna", "medium"),
+			Argv:        router.ArgvFor("codex", "gpt-5.6-luna", "medium"),
+		},
+		HookDiscovery: harness.NoHooksDiscovery(),
+	}
+	if err := RecordStarted(req, &MemorySink{}); err == nil {
+		t.Fatal("codex argv under a grok decision must not write a receipt")
+	}
+}
+
+// FAC-703: the acceptance receipt records the provider/model/family and argv
+// of the lane that actually launches, never the first worker lane's.
+func TestRecordStartedBindsBuilderFamilyFromArgv(t *testing.T) {
+	argv := router.ArgvFor("grok", "grok-4.6", "medium")
+	req := Request{
+		Decision: &router.LaunchDecision{
+			LaneName: "smith-grok", Provider: "grok", Model: "grok-4.6", Family: "xai",
+			Harness: "grok", Effort: "medium", Role: router.RoleWorker, Shape: Implementation,
+			HarnessArgv: argv, Argv: argv,
+		},
+		HookDiscovery: harness.NoHooksDiscovery(),
+		Lane:          "smith-grok",
+	}
+	s := &MemorySink{}
+	if err := RecordStarted(req, s); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Receipts[0]
+	if got.Provider != "grok" || got.Model != "grok-4.6" || got.BuilderFamily != "xai" {
+		t.Fatalf("receipt provider/model/family = %s/%s/%s, want grok/grok-4.6/xai", got.Provider, got.Model, got.BuilderFamily)
+	}
+	if len(got.Argv) == 0 || got.Argv[0] != "grok" {
+		t.Fatalf("receipt argv = %v, want grok launch argv", got.Argv)
+	}
+}
+
 func TestValidateRejectsEveryMissingLaunchFieldAndRecords(t *testing.T) {
 	cases := []struct {
 		name   string
