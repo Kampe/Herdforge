@@ -126,8 +126,8 @@ func (b *authoritativeBoard) serve() *httptest.Server {
 			return
 		}
 
-		// GET /api/task?projectId=
-		if r.URL.Path == "/api/task" && r.Method == http.MethodGet {
+		// GET /api/task/tasks/{projectId} or legacy /api/task
+		if (strings.HasPrefix(r.URL.Path, "/api/task/tasks/") || r.URL.Path == "/api/task") && r.Method == http.MethodGet {
 			b.mu.Lock()
 			var list []map[string]any
 			for _, t := range b.tasks {
@@ -137,7 +137,22 @@ func (b *authoritativeBoard) serve() *httptest.Server {
 				})
 			}
 			b.mu.Unlock()
-			_ = json.NewEncoder(w).Encode(list)
+			if strings.HasPrefix(r.URL.Path, "/api/task/tasks/") {
+				projID := strings.TrimPrefix(r.URL.Path, "/api/task/tasks/")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"data": map[string]any{
+						"id": projID,
+						"columns": []map[string]any{
+							{"id": "col-1", "name": "Column 1", "tasks": list},
+						},
+					},
+					"pagination": map[string]any{
+						"page": 1, "pageSize": 100, "total": len(list), "totalPages": 1,
+					},
+				})
+			} else {
+				_ = json.NewEncoder(w).Encode(list)
+			}
 			return
 		}
 

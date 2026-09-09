@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -647,6 +648,66 @@ func kaneoTaskResourceURL(apiURL, taskID string) string {
 	return fmt.Sprintf("%s/api/task/%s", strings.TrimRight(strings.TrimSpace(apiURL), "/"), url.PathEscape(taskID))
 }
 
+func kaneoListTasksURL(apiURL, projectID, status string, page, limit int) string {
+	base := fmt.Sprintf("%s/api/task/tasks/%s", strings.TrimRight(strings.TrimSpace(apiURL), "/"), url.PathEscape(projectID))
+	v := url.Values{}
+	if strings.TrimSpace(status) != "" {
+		v.Set("status", strings.TrimSpace(status))
+	}
+	v.Set("limit", strconv.Itoa(limit))
+	v.Set("page", strconv.Itoa(page))
+	return fmt.Sprintf("%s?%s", base, v.Encode())
+}
+
+type kaneoBoardPaginationDTO struct {
+	Page       int `json:"page"`
+	PageSize   int `json:"pageSize"`
+	Total      int `json:"total"`
+	TotalPages int `json:"totalPages"`
+}
+
+type kaneoBoardResponseDTO struct {
+	Data struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Columns []struct {
+			ID    string         `json:"id"`
+			Name  string         `json:"name"`
+			Tasks []kaneoTaskDTO `json:"tasks"`
+		} `json:"columns"`
+	} `json:"data"`
+	Pagination kaneoBoardPaginationDTO `json:"pagination"`
+}
+
+func validateBoardPagination(p kaneoBoardPaginationDTO, requestedPage int) error {
+	if p.Page != requestedPage {
+		return fmt.Errorf("kaneo ListTasks: pagination page mismatch: requested %d got %d", requestedPage, p.Page)
+	}
+	if p.PageSize <= 0 {
+		return fmt.Errorf("kaneo ListTasks: invalid pagination pageSize %d", p.PageSize)
+	}
+	if p.Total < 0 {
+		return fmt.Errorf("kaneo ListTasks: invalid pagination total %d", p.Total)
+	}
+	if p.TotalPages < 0 {
+		return fmt.Errorf("kaneo ListTasks: invalid pagination totalPages %d", p.TotalPages)
+	}
+	if p.Total == 0 {
+		if p.TotalPages > 1 {
+			return fmt.Errorf("kaneo ListTasks: contradictory pagination totalPages %d for total 0", p.TotalPages)
+		}
+	} else {
+		expectedTotalPages := (p.Total + p.PageSize - 1) / p.PageSize
+		if p.TotalPages != expectedTotalPages {
+			return fmt.Errorf("kaneo ListTasks: contradictory pagination totalPages %d: total=%d pageSize=%d expected %d", p.TotalPages, p.Total, p.PageSize, expectedTotalPages)
+		}
+	}
+	if p.TotalPages > 0 && requestedPage > p.TotalPages {
+		return fmt.Errorf("kaneo ListTasks: requested page %d exceeds totalPages %d", requestedPage, p.TotalPages)
+	}
+	return nil
+}
+
 // kaneoRunCLI is the CLI runner for Kaneo production UseCLI mode. Tests may
 // swap it for a hermetic counter; production uses process-group RunCLI.
 var kaneoRunCLI = RunCLI
@@ -791,25 +852,79 @@ func (k *KaneoProvider) listTasksOnce(ctx context.Context, projectID, status str
 		return filterTasks(all, status), nil
 	}
 
-	url := fmt.Sprintf("%s/api/task?projectId=%s", k.APIURL, projectID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	k.authorizeKaneo(req)
-	resp, err := k.httpClient().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	var dtos []kaneoTaskDTO
-	if err := DecodeJSONResponse(resp, &dtos); err != nil {
-		if pe, ok := err.(*ProviderError); ok {
-			pe.Provider = "kaneo"
-			pe.Op = "ListTasks"
+	const limit = 100
+	var all []kaneoTaskDTO
+	acc := NewPageAccumulator()
+
+	for page := 1; page <= DefaultMaxListPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, AsTimeout("kaneo", "ListTasks", OpList, k.deadlines().For(OpList), err)
 		}
-		return nil, err
+		endpoint := kaneoListTasksURL(k.APIURL, projectID, status, page, limit)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		k.authorizeKaneo(req)
+		resp, err := k.httpClient().Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		var env kaneoBoardResponseDTO
+		if err := DecodeJSONResponse(resp, &env); err != nil {
+			if pe, ok := err.(*ProviderError); ok {
+				pe.Provider = "kaneo"
+				pe.Op = "ListTasks"
+			}
+			return nil, err
+		}
+
+		if strings.TrimSpace(env.Data.ID) == "" || env.Data.ID != projectID {
+			return nil, fmt.Errorf("kaneo ListTasks: board project identity mismatch: requested %q got %q", projectID, env.Data.ID)
+		}
+
+		if err := validateBoardPagination(env.Pagination, page); err != nil {
+			return nil, err
+		}
+
+		var pageTasks []kaneoTaskDTO
+		for _, col := range env.Data.Columns {
+			for _, dto := range col.Tasks {
+				if strings.TrimSpace(dto.ID) == "" || strings.TrimSpace(dto.Ref) == "" {
+					return nil, fmt.Errorf("kaneo ListTasks: response task missing identity")
+				}
+				if dto.ProjectId != "" && dto.ProjectId != projectID {
+					return nil, fmt.Errorf("kaneo ListTasks: task project identity mismatch: requested %q got %q", projectID, dto.ProjectId)
+				}
+				if dto.ProjectId == "" {
+					dto.ProjectId = projectID
+				}
+				pageTasks = append(pageTasks, dto)
+			}
+		}
+
+		freshCount := 0
+		for _, dto := range pageTasks {
+			if acc.Add(dto.ID) {
+				freshCount++
+				all = append(all, dto)
+			}
+		}
+
+		dec := DecidePagination(len(pageTasks), freshCount)
+		if dec == PageStopDuplicate {
+			return nil, fmt.Errorf("kaneo task list (page %d): %w", page, ErrDuplicatePage)
+		}
+
+		if env.Pagination.TotalPages == 0 || page >= env.Pagination.TotalPages || dec == PageStopEmpty {
+			if acc.Len() != env.Pagination.Total {
+				return nil, fmt.Errorf("kaneo ListTasks: accumulated tasks count (%d) does not match pagination total (%d)", acc.Len(), env.Pagination.Total)
+			}
+			return filterTasks(all, status), nil
+		}
 	}
-	return filterTasks(dtos, status), nil
+	return nil, fmt.Errorf("kaneo task list: %w (maxPages=%d)", ErrPaginationCap, DefaultMaxListPages)
 }
 
 // walkStatusPages paginates one Kaneo column to exhaustion. Callers run these

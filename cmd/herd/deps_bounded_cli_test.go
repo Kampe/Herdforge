@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -200,9 +201,38 @@ func newDepsCheckKaneoServer(t *testing.T, failProviderGet bool) *httptest.Serve
 	}}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/task", func(w http.ResponseWriter, _ *http.Request) {
+	// ListTasks serves the deployed board envelope: GET
+	// /api/task/tasks/{project}?limit=&page= returns {data:{id,columns[].tasks},
+	// pagination} (FAC-784). The board read stays healthy under
+	// failProviderGet so the UNKNOWN classification isolates the per-task read
+	// failure, exactly as the classification test intends.
+	mux.HandleFunc("/api/task/tasks/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(tasks)
+		project := strings.TrimPrefix(r.URL.Path, "/api/task/tasks/")
+		page := 1
+		if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 0 {
+			page = p
+		}
+		boardTasks := tasks
+		totalPages := 0
+		if project == "proj-deps" && len(tasks) > 0 {
+			totalPages = 1
+		} else {
+			boardTasks = nil
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"id":   project,
+				"name": "Board",
+				"columns": []map[string]any{
+					{"id": "c-todo", "name": "To Do", "tasks": boardTasks},
+				},
+			},
+			"pagination": map[string]any{
+				"page": page, "pageSize": 100,
+				"total": len(boardTasks), "totalPages": totalPages,
+			},
+		})
 	})
 	mux.HandleFunc("/api/task/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -10,14 +10,25 @@ import (
 
 func TestKaneoProvider_ListTaskLabelsBulkReportsCompleteInventory(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/task" || r.URL.Query().Get("projectId") != "project-1" {
+		if r.URL.Path != "/api/task/tasks/project-1" {
 			t.Fatalf("unexpected request: %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[
-            {"id":"task-1","ref":"FAC-1","status":"to-do","labels":[{"name":"lane:alpha"}]},
-            {"id":"task-2","ref":"FAC-2","status":"to-do","labels":[{"name":"lane:beta"},{"name":"risk:R1"}]}
-        ]`))
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"id": "project-1",
+				"columns": [
+					{
+						"id": "c1",
+						"tasks": [
+							{"id":"task-1","ref":"FAC-1","status":"to-do","labels":[{"name":"lane:alpha"}]},
+							{"id":"task-2","ref":"FAC-2","status":"to-do","labels":[{"name":"lane:beta"},{"name":"risk:R1"}]}
+						]
+					}
+				]
+			},
+			"pagination": {"page": 1, "pageSize": 100, "total": 2, "totalPages": 1}
+		}`))
 	}))
 	defer server.Close()
 
@@ -40,7 +51,20 @@ func TestKaneoProvider_ListTaskLabelsBulkReportsCompleteInventory(t *testing.T) 
 func TestKaneoProvider_ListTaskLabelsBulkMarksMissingTasksTruncated(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`[{"id":"task-1","ref":"FAC-1","status":"to-do","labels":[]}]`))
+		_, _ = w.Write([]byte(`{
+			"data": {
+				"id": "project-1",
+				"columns": [
+					{
+						"id": "c1",
+						"tasks": [
+							{"id":"task-1","ref":"FAC-1","status":"to-do","labels":[]}
+						]
+					}
+				]
+			},
+			"pagination": {"page": 1, "pageSize": 100, "total": 1, "totalPages": 1}
+		}`))
 	}))
 	defer server.Close()
 
