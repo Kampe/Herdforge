@@ -30,7 +30,9 @@ func applyOwnershipContainment(attr *syscall.SysProcAttr) {
 	}
 	uid := os.Getuid()
 	gid := os.Getgid()
-	attr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWPID
+	// CLONE_NEWNS gives the new PID namespace its own proc mount. Without it,
+	// namespace-local PIDs are interpreted through the parent's proc view.
+	attr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNS
 	attr.UidMappings = []syscall.SysProcIDMap{
 		{ContainerID: 0, HostID: uid, Size: 1},
 	}

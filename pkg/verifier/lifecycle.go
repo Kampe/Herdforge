@@ -159,6 +159,14 @@ type ownedSubprocess struct {
 const ownershipWrapperScript = `
 user_path="$1"
 shift
+# Make the inherited root mount private before replacing proc. This keeps the
+# namespace-relative proc view local to the owned supervisor and its children.
+# The fixed hermetic Docker profile already supplies the proc authority and
+# intentionally disables nested namespace setup.
+if [ "${HERD_HERMETIC_CONTAINER:-}" != "1" ]; then
+  mount --make-rprivate / || exit 1
+  mount -t proc proc /proc || exit 1
+fi
 (
   # Block before exec until parent has recorded causal handles (pre-fork barrier).
   IFS= read -r _cont <&4 || exit 1
