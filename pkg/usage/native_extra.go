@@ -3,6 +3,7 @@ package usage
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -78,7 +79,12 @@ type litellmKeyInfo struct {
 }
 
 func litellmPoll() (ProviderUsage, error) {
-	return ProviderUsage{}, pollErrf("auth-missing", "litellm self-key is unavailable; run the owning CLI login")
+	key := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("LITELLM_BASE_URL")), "/")
+	if key == "" || base == "" {
+		return ProviderUsage{}, pollErrf("auth-missing", "litellm self-key or configured base URL is unavailable")
+	}
+	return litellmPollWithURL(base+"/key/info", key)
 }
 
 func litellmPollWithURL(url, token string) (ProviderUsage, error) {

@@ -162,6 +162,12 @@ func fetchDirectProviderWithPollers(provider string, pollers map[string]func() (
 		Providers:   make(map[string]ProviderUsage),
 	}
 	name := strings.ToLower(strings.TrimSpace(provider))
+	switch name {
+	case "agy":
+		name = "antigravity"
+	case "lazer":
+		name = "litellm"
+	}
 	poll, ok := pollers[name]
 	if !ok {
 		snap.Errors = map[string]string{name: classifyPollError(pollErrf("unsupported", "direct polling not available for provider %q", name))}

@@ -1423,7 +1423,17 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 	// launch was 1.4s. The reading's age is reported rather than hidden, because
 	// routing on quota that is silently minutes old can spend a request against a
 	// surface that has since gone to zero.
-	snap, age, err := usage.FetchSnapshotCached()
+	var snap *usage.UsageSnapshot
+	var age time.Duration
+	var err error
+	if strings.TrimSpace(provider) != "" {
+		// An explicit provider is already a routing decision. Acquire only that
+		// native authority so a Claude review cannot trigger unrelated AGY/Grok
+		// requests or fail because an unused account is unavailable.
+		snap, err = usage.FetchProviderForce(provider, false)
+	} else {
+		snap, age, err = usage.FetchSnapshotCached()
+	}
 	if err == nil {
 		if age > 0 {
 			fmt.Printf("using quota reading from %s ago\n", age.Round(time.Second))
