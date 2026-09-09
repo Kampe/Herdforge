@@ -140,8 +140,7 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 		return nil
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
-	p := worktree.NewPool(a.root, filepath.Join(a.root, ".herd", "pool"), 2)
-	op := &herdr.NativeReviewRetirementOp{Root: a.root, RepositoryIdentity: a.repository, Ledger: a.ledger, Pool: p}
+	op := &herdr.NativeReviewRetirementOp{Root: a.root, RepositoryIdentity: a.repository, Ledger: a.ledger}
 	result, err := herdr.RetireReviewLanesContext(ctx, op, manifests, false)
 	if err != nil {
 		return err

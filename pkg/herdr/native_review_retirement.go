@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,9 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	if err := ValidateReviewRetirementManifest(m); err != nil {
 		return ReviewRetirementEvidence{}, err
 	}
+	if _, err := n.exactPoolSlot(m, true); err != nil {
+		return ReviewRetirementEvidence{}, err
+	}
 	rows, err := n.Ledger.AllRows()
 	if err != nil {
 		return ReviewRetirementEvidence{}, fmt.Errorf("read review ledger: %w", err)
@@ -63,9 +67,9 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 		if m.SessionID != "" && a.Session.Value != m.SessionID {
 			return ReviewRetirementEvidence{}, errors.New("review session identity differs from the bound launch")
 		}
-		live = ReviewRetirementLive{Status: a.Status, Focused: a.Focused, TabPresent: true, Workspace: a.Workspace, TabID: a.TabID, PaneID: a.PaneID, TerminalID: a.TerminalID, SessionGeneration: m.SessionGeneration}
+		live = ReviewRetirementLive{Status: a.Status, Focused: a.Focused, TabPresent: true, Workspace: a.Workspace, TabID: a.TabID, PaneID: a.PaneID, TerminalID: a.TerminalID, SessionID: a.Session.Value, SessionGeneration: ""}
 		focused = a.Focused
-		procs, pErr := PaneProcessInfo(a.PaneID)
+		procs, pErr := paneProcessesForRetirement(a.PaneID)
 		if pErr != nil {
 			return ReviewRetirementEvidence{}, pErr
 		}
@@ -74,7 +78,7 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	}
 	if focused == nil {
 		live.Focused = boolPtr(false)
-		procs, pErr := PaneProcessInfo(m.PaneID)
+		procs, pErr := paneProcessesForRetirement(m.PaneID)
 		if pErr != nil {
 			return ReviewRetirementEvidence{}, pErr
 		}
@@ -100,6 +104,46 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 		return ReviewRetirementEvidence{}, wtErr
 	}
 	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: live, Worktree: wt, WorktreeRoot: m.Pool, PromptRoot: filepath.Dir(m.PromptArtifact), Repository: n.RepositoryIdentity}, nil
+}
+
+// paneProcessesForRetirement distinguishes the supported closed-pane
+// envelope from transport/tool failures. Only pane_not_found is absence;
+// every other error remains a hard observation failure.
+func paneProcessesForRetirement(paneID string) ([]PaneProcess, error) {
+	procs, err := PaneProcessInfo(paneID)
+	if errors.Is(err, ErrPaneNotFound) {
+		return nil, nil
+	}
+	return procs, err
+}
+
+func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, allowReleased bool) (worktree.PoolSlot, error) {
+	poolPath, err := n.boundPath(m.Pool)
+	if err != nil {
+		return worktree.PoolSlot{}, err
+	}
+	p := worktree.NewPool(n.Root, poolPath, 0)
+	slots, err := p.Slots()
+	if err != nil {
+		return worktree.PoolSlot{}, err
+	}
+	for _, slot := range slots {
+		if slot.Name != m.Slot {
+			continue
+		}
+		worktreePath, pathErr := filepath.Abs(filepath.Join(n.Root, filepath.Clean(m.Worktree)))
+		if pathErr != nil || filepath.Clean(slot.Path) != filepath.Clean(filepath.Join(poolPath, m.Slot)) || filepath.Clean(slot.Path) != filepath.Clean(worktreePath) {
+			return worktree.PoolSlot{}, errors.New("review pool slot path differs from authenticated manifest")
+		}
+		if slot.LeaseID == "" && allowReleased {
+			return slot, nil
+		}
+		if slot.LeaseID != m.Nonce || slot.LeasedAt.UnixNano() != m.LeaseGeneration {
+			return worktree.PoolSlot{}, errors.New("review pool lease incarnation differs from authenticated manifest")
+		}
+		return slot, nil
+	}
+	return worktree.PoolSlot{}, errors.New("authenticated review pool slot is missing")
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -242,7 +286,7 @@ func (n *NativeReviewRetirementOp) Revalidate(m ReviewRetirementManifest, phase 
 			if phase != "close" {
 				return fmt.Errorf("review incarnation still present before %s", phase)
 			}
-			if a.Name != m.Reviewer || a.TabID != m.TabID || a.PaneID != m.PaneID || a.Workspace != m.Workspace || a.TerminalID != m.TerminalID {
+			if a.Name != m.Reviewer || a.TabID != m.TabID || a.PaneID != m.PaneID || a.Workspace != m.Workspace || a.TerminalID != m.TerminalID || a.Session.Value != m.SessionID {
 				return errors.New("review incarnation changed before close")
 			}
 			if a.Status != "idle" && a.Status != "done" {
@@ -251,7 +295,7 @@ func (n *NativeReviewRetirementOp) Revalidate(m ReviewRetirementManifest, phase 
 			if a.Focused == nil || *a.Focused {
 				return errors.New("review focus is not explicitly unfocused")
 			}
-			procs, pErr := PaneProcessInfo(a.PaneID)
+			procs, pErr := paneProcessesForRetirement(a.PaneID)
 			if pErr != nil {
 				return pErr
 			}
@@ -261,7 +305,7 @@ func (n *NativeReviewRetirementOp) Revalidate(m ReviewRetirementManifest, phase 
 		}
 	}
 	if phase != "close" {
-		procs, pErr := PaneProcessInfo(m.PaneID)
+		procs, pErr := paneProcessesForRetirement(m.PaneID)
 		if pErr != nil {
 			return fmt.Errorf("process absence readback: %w", pErr)
 		}
@@ -289,7 +333,7 @@ func (n *NativeReviewRetirementOp) Journal(m ReviewRetirementManifest, phase str
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	rec := struct{ Generation, CandidateSHA, Reviewer, Phase string }{m.Generation, m.CandidateSHA, m.Reviewer, phase}
+	rec := struct{ Generation, CandidateSHA, Reviewer, BindingDigest, Phase string }{m.Generation, m.CandidateSHA, m.Reviewer, m.BindingDigest, phase}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -303,6 +347,32 @@ func (n *NativeReviewRetirementOp) Journal(m ReviewRetirementManifest, phase str
 		return err
 	}
 	return f.Sync()
+}
+
+func (n *NativeReviewRetirementOp) Completed(m ReviewRetirementManifest) (bool, error) {
+	p := n.JournalPath
+	if p == "" {
+		p = filepath.Join(n.Root, ".herd", "review", "retirement-phases.jsonl")
+	}
+	f, err := os.Open(p)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var rec struct{ Generation, CandidateSHA, Reviewer, BindingDigest, Phase string }
+		if json.Unmarshal([]byte(sc.Text()), &rec) != nil {
+			continue
+		}
+		if rec.Phase == "complete" && rec.Generation == m.Generation && rec.CandidateSHA == m.CandidateSHA && rec.Reviewer == m.Reviewer && rec.BindingDigest == m.BindingDigest {
+			return true, nil
+		}
+	}
+	return false, sc.Err()
 }
 
 func (n *NativeReviewRetirementOp) Close(m ReviewRetirementManifest) error {
@@ -319,25 +389,20 @@ func (n *NativeReviewRetirementOp) Close(m ReviewRetirementManifest) error {
 }
 
 func (n *NativeReviewRetirementOp) LeaseReleased(m ReviewRetirementManifest) (bool, error) {
-	if n.Pool == nil {
-		return false, errors.New("review retirement pool authority is missing")
-	}
-	slots, err := n.Pool.Slots()
+	slot, err := n.exactPoolSlot(m, true)
 	if err != nil {
 		return false, err
 	}
-	for _, s := range slots {
-		if s.LeaseID == m.Nonce {
-			return false, nil
-		}
-	}
-	return true, nil
+	return slot.LeaseID == "", nil
 }
 func (n *NativeReviewRetirementOp) ReleaseLease(ctx context.Context, m ReviewRetirementManifest) error {
-	if n.Pool == nil {
-		return errors.New("review retirement pool authority is missing")
+	slot, err := n.exactPoolSlot(m, false)
+	if err != nil {
+		return err
 	}
-	return n.Pool.Release(ctx, m.Nonce)
+	p := worktree.NewPool(n.Root, filepath.Join(n.Root, filepath.Clean(m.Pool)), 0)
+	p.DefaultBase = slot.Base
+	return p.ReleaseExact(ctx, m.Slot, m.Nonce, m.LeaseGeneration, filepath.Join(n.Root, filepath.Clean(m.Worktree)))
 }
 
 func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) error {
@@ -349,24 +414,35 @@ func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) er
 		return err
 	}
 	info, err := os.Lstat(p)
-	if os.IsNotExist(err) {
-		return nil
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
+	if err == nil && info.Mode()&os.ModeSymlink == 0 {
+		return errors.New("review surface is not an owned symlink")
+	}
+	if err == nil {
+		if err := os.Remove(p); err != nil {
+			return err
+		}
+	}
+	poolPath, err := n.boundPath(m.Pool)
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return errors.New("review surface is not an owned symlink")
-	}
-	return os.Remove(p)
+	return worktree.NewPool(n.Root, poolPath, 0).RetireExact(context.Background(), m.Slot, filepath.Join(poolPath, m.Slot))
 }
 func (n *NativeReviewRetirementOp) RemoveBranch(m ReviewRetirementManifest) error {
 	if m.ReviewRef == "" {
 		return errors.New("review retirement ref is missing")
 	}
-	if _, err := n.git(n.Root, "show-ref", "--verify", "--quiet", m.ReviewRef); err != nil {
-		// A completed retry may already have removed this exact owned ref.
-		return nil
+	cmd := exec.Command("git", "-C", n.Root, "show-ref", "--verify", "--quiet", m.ReviewRef)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			// A completed retry may already have removed this exact owned ref.
+			return nil
+		}
+		return fmt.Errorf("git show-ref %s: %w (%s)", m.ReviewRef, err, strings.TrimSpace(string(out)))
 	}
 	_, err := n.git(n.Root, "update-ref", "-d", m.ReviewRef, m.CandidateSHA)
 	return err
@@ -375,6 +451,16 @@ func (n *NativeReviewRetirementOp) RemoveArtifact(m ReviewRetirementManifest) er
 	p, err := n.boundPath(m.PromptArtifact)
 	if err != nil {
 		return err
+	}
+	if m.PromptDigest == "" {
+		return errors.New("review prompt lacks authenticated content digest")
+	}
+	if body, readErr := os.ReadFile(p); readErr == nil {
+		if reviewack.ArtifactDigest(body) != m.PromptDigest {
+			return errors.New("review prompt content changed; refusing removal")
+		}
+	} else if !os.IsNotExist(readErr) {
+		return readErr
 	}
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		return err

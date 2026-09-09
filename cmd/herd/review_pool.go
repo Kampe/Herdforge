@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -555,8 +555,8 @@ func runPoolReview(ref string) error {
 	if err != nil {
 		return errors.Join(fmt.Errorf("resolve launched reviewer identity: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
 	}
-	if launchedAgent.Session.Value == "" || launchedAgent.TabGeneration == 0 {
-		return errors.Join(errors.New("launched reviewer lacks authenticated session and tab generation"), herdr.CloseReviewTab(tab.ID, agentName))
+	if launchedAgent.Session.Value == "" {
+		return errors.Join(errors.New("launched reviewer lacks authenticated session identity"), herdr.CloseReviewTab(tab.ID, agentName))
 	}
 	if err := recordReviewRetirementManifest(root, cfg, providerTask, ref, sha, lease, ws, *tab, agentName, reviewer, packet, surface, launchedAgent); err != nil {
 		return errors.Join(fmt.Errorf("record review retirement manifest: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
@@ -593,6 +593,10 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 	if err != nil || filepath.IsAbs(packetRel) || strings.HasPrefix(packetRel, ".."+string(filepath.Separator)) {
 		return errors.New("review retirement prompt escaped repository root")
 	}
+	packetBody, err := os.ReadFile(packetAbs)
+	if err != nil {
+		return fmt.Errorf("read review prompt for retirement binding: %w", err)
+	}
 	poolAbs, err := filepath.Abs(filepath.Dir(lease.Path))
 	if err != nil {
 		return err
@@ -616,7 +620,10 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 	if generation == "" {
 		generation = fmt.Sprintf("%d", lease.LeasedAt.UnixNano())
 	}
-	sessionGeneration := strconv.FormatUint(launchedAgent.TabGeneration, 10)
+	// Current Herdr agent-get/list payloads do not expose immutable tab
+	// generation. Preserve that uncertainty explicitly; terminal_id plus the
+	// authenticated agent session is the supported legacy incarnation binding.
+	sessionGeneration := ""
 	if cfg == nil {
 		return errors.New("review retirement manifest requires launch configuration")
 	}
@@ -644,7 +651,7 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 		Worktree: filepath.ToSlash(worktreeRel), Pool: filepath.ToSlash(poolRel), Slot: lease.Name,
 		LeaseGeneration: lease.LeasedAt.UnixNano(), Workspace: workspace, TabID: tab.ID, PaneID: tab.Pane.ID,
 		TerminalID: tab.Pane.TerminalID, SessionID: launchedAgent.Session.Value, SessionGeneration: sessionGeneration, Reviewer: agentName,
-		ReviewerFamily: reviewer.Family, ReviewerModel: reviewer.Model, PromptArtifact: filepath.ToSlash(packetRel), Surface: filepath.ToSlash(surfaceRel), ReviewRef: reviewRef,
+		ReviewerFamily: reviewer.Family, ReviewerModel: reviewer.Model, PromptArtifact: filepath.ToSlash(packetRel), PromptDigest: reviewack.ArtifactDigest(packetBody), Surface: filepath.ToSlash(surfaceRel), ReviewRef: reviewRef,
 		Generation: generation, Nonce: lease.LeaseID,
 	})
 	registry := herdr.ReviewRetirementRegistry{Path: filepath.Join(rootAbs, ".herd", "review", "retirement-manifests.jsonl")}

@@ -9,7 +9,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
-	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // runReviewRetirementCleanup is shared by `herd cleanup` and the acting drain
@@ -52,6 +51,6 @@ func runReviewRetirementCleanup(ctx context.Context, root string, dryRun bool) (
 	if err != nil {
 		return herdr.ReviewRetirementReport{}, err
 	}
-	op := &herdr.NativeReviewRetirementOp{Root: root, RepositoryIdentity: repositoryIdentityForLaunch(cfg), Ledger: ledger, Pool: worktree.NewPool(root, filepath.Join(root, ".herd", "pool"), 2)}
+	op := &herdr.NativeReviewRetirementOp{Root: root, RepositoryIdentity: repositoryIdentityForLaunch(cfg), Ledger: ledger}
 	return herdr.RetireReviewLanesContext(ctx, op, manifests, dryRun)
 }

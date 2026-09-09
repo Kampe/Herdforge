@@ -17,7 +17,7 @@ func retirementManifest(t *testing.T, generation string) ReviewRetirementManifes
 		Repository: "herdforge", TaskRef: "FAC-708", TaskID: "task-708",
 		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Branch: "review/FAC-708",
 		Worktree: ".herd/reviews/fac-708", Pool: ".herd/pool", Slot: "pool-01", LeaseGeneration: 7,
-		Workspace: "wK", TabID: "wK:t15T", PaneID: "wK:p15T", TerminalID: "term-1", SessionGeneration: "g1",
+		Workspace: "wK", TabID: "wK:t15T", PaneID: "wK:p15T", TerminalID: "term-1", SessionID: "session-1", SessionGeneration: "",
 		Reviewer: "forge-mender-fac708-nat-d4b3b8dc", ReviewerFamily: "openai", ReviewerModel: "gpt-5.6-luna",
 		PromptArtifact: ".herd/review/prompts/fac-708.md", Generation: generation, Nonce: "nonce-1",
 	})
@@ -32,7 +32,7 @@ func retirementEvidence(m ReviewRetirementManifest) ReviewRetirementEvidence {
 	verdict := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: m.CandidateSHA, CandidateSHA: m.CandidateSHA, Reviewer: m.Reviewer, Verdict: string(reviewledger.VerdictPASS), ArtifactDigest: "artifact"}
 	ack := reviewack.Ack{SHA: m.CandidateSHA, Reviewer: m.Reviewer, LaunchIdentity: m.Reviewer, ArtifactDigest: verdict.ArtifactDigest}
 	focused := false
-	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: ReviewRetirementLive{Status: "idle", Focused: &focused}, Worktree: ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch}, WorktreeRoot: ".herd/reviews", PromptRoot: ".herd/review/prompts", Repository: m.Repository}
+	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: ReviewRetirementLive{Status: "idle", Focused: &focused, SessionID: m.SessionID}, Worktree: ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch}, WorktreeRoot: ".herd/reviews", PromptRoot: ".herd/review/prompts", Repository: m.Repository}
 }
 
 func TestEvaluateReviewRetirementRequiresExactTerminalVerdict(t *testing.T) {

@@ -44,6 +44,7 @@ type ReviewRetirementManifest struct {
 	ReviewerFamily    string `json:"reviewer_family"`
 	ReviewerModel     string `json:"reviewer_model"`
 	PromptArtifact    string `json:"prompt_artifact"`
+	PromptDigest      string `json:"prompt_digest,omitempty"`
 	Surface           string `json:"surface,omitempty"`
 	ReviewRef         string `json:"review_ref,omitempty"`
 	ManifestArtifact  string `json:"manifest_artifact,omitempty"`
@@ -70,11 +71,11 @@ type ReviewRetirementEvidence struct {
 }
 
 type ReviewRetirementLive struct {
-	Status                                                  string
-	Focused                                                 *bool
-	ProcessPresent                                          bool
-	TabPresent                                              bool
-	Workspace, TabID, PaneID, TerminalID, SessionGeneration string
+	Status                                                             string
+	Focused                                                            *bool
+	ProcessPresent                                                     bool
+	TabPresent                                                         bool
+	Workspace, TabID, PaneID, TerminalID, SessionID, SessionGeneration string
 }
 
 type ReviewRetirementWorktree struct {
@@ -122,7 +123,7 @@ func EvaluateReviewRetirement(e ReviewRetirementEvidence) ReviewRetirementDecisi
 		{"candidate_sha", m.CandidateSHA}, {"base_sha", m.BaseSHA}, {"branch", m.Branch},
 		{"worktree", m.Worktree}, {"pool", m.Pool}, {"slot", m.Slot}, {"workspace", m.Workspace},
 		{"tab_id", m.TabID}, {"pane_id", m.PaneID}, {"terminal_id", m.TerminalID},
-		{"session_generation", m.SessionGeneration}, {"reviewer", m.Reviewer},
+		{"reviewer", m.Reviewer},
 		{"reviewer_family", m.ReviewerFamily}, {"reviewer_model", m.ReviewerModel},
 		{"prompt_artifact", m.PromptArtifact}, {"generation", m.Generation},
 		{"nonce", m.Nonce}, {"binding_digest", m.BindingDigest}, {"recorded_at", m.RecordedAt},
@@ -153,6 +154,12 @@ func EvaluateReviewRetirement(e ReviewRetirementEvidence) ReviewRetirementDecisi
 	}
 	if e.Live.Focused == nil {
 		return blockReviewRetirement("review tab focus is unknown")
+	}
+	if strings.TrimSpace(m.SessionID) == "" {
+		return blockReviewRetirement("legacy launch lacks authenticated session identity; native retirement unsupported")
+	}
+	if e.Live.SessionID != m.SessionID && e.Live.Status != "done" {
+		return blockReviewRetirement("live session identity differs from the bound launch")
 	}
 	if *e.Live.Focused {
 		return blockReviewRetirement("review tab is focused")
@@ -202,7 +209,8 @@ func ValidateReviewRetirementManifest(m ReviewRetirementManifest) error {
 	fields := []struct{ name, value string }{
 		{"repository", m.Repository}, {"task_ref", m.TaskRef}, {"task_id", m.TaskID}, {"branch", m.Branch},
 		{"worktree", m.Worktree}, {"pool", m.Pool}, {"slot", m.Slot}, {"workspace", m.Workspace},
-		{"tab_id", m.TabID}, {"pane_id", m.PaneID}, {"terminal_id", m.TerminalID}, {"session_generation", m.SessionGeneration},
+		{"tab_id", m.TabID}, {"pane_id", m.PaneID}, {"terminal_id", m.TerminalID},
+		{"session_id", m.SessionID},
 		{"reviewer", m.Reviewer}, {"reviewer_family", m.ReviewerFamily}, {"reviewer_model", m.ReviewerModel},
 		{"prompt_artifact", m.PromptArtifact}, {"generation", m.Generation}, {"nonce", m.Nonce}, {"recorded_at", m.RecordedAt},
 	}
@@ -298,9 +306,16 @@ type ReviewRetirementOp interface {
 	Receipt(ReviewRetirementManifest, ReviewRetirementDecision) error
 }
 
+// ReviewRetirementPhaseReader supplies identity-bound durable completion
+// receipts so replay never inspects a recycled incarnation.
+type ReviewRetirementPhaseReader interface {
+	Completed(ReviewRetirementManifest) (bool, error)
+}
+
 type ReviewRetirementCandidate struct {
-	Manifest ReviewRetirementManifest
-	Decision ReviewRetirementDecision `json:"decision"`
+	Manifest  ReviewRetirementManifest
+	Decision  ReviewRetirementDecision `json:"decision"`
+	Completed bool                     `json:"completed,omitempty"`
 }
 type ReviewRetirementReport struct {
 	DryRun     bool                        `json:"dry_run"`
@@ -332,6 +347,16 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 			r.Candidates = append(r.Candidates, ReviewRetirementCandidate{Manifest: m, Decision: blockReviewRetirement("manifest validation failed: " + err.Error())})
 			continue
 		}
+		if reader, ok := op.(ReviewRetirementPhaseReader); ok {
+			complete, err := reader.Completed(m)
+			if err != nil {
+				return r, fmt.Errorf("read retirement phase %s: %w", m.Generation, err)
+			}
+			if complete {
+				r.Candidates = append(r.Candidates, ReviewRetirementCandidate{Manifest: m, Completed: true, Decision: ReviewRetirementDecision{Eligible: true, Reason: "already completed for exact manifest identity"}})
+				continue
+			}
+		}
 		e, err := op.Observe(m)
 		if err != nil {
 			r.Failed++
@@ -351,6 +376,9 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 		return r, nil
 	}
 	for _, c := range r.Candidates {
+		if c.Completed {
+			continue
+		}
 		m := c.Manifest
 		if err := op.Revalidate(m, "close"); err != nil {
 			r.Failed++
