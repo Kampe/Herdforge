@@ -29,6 +29,7 @@ type ProviderUsage struct {
 	Source     string                   `json:"source,omitempty"`
 	Account    *AccountIdentity         `json:"account,omitempty"`
 	ObservedAt time.Time                `json:"observedAt"`
+	Status     string                   `json:"status,omitempty"`
 	Resources  map[string]ResourceUsage `json:"resources"`
 	Stale      bool                     `json:"stale"`
 }
@@ -73,18 +74,22 @@ func FetchProviderForce(provider string, force bool) (*UsageSnapshot, error) {
 // harness the fleet routes for has a native poller; there is no helper-binary
 // path anywhere.
 var nativePollers = map[string]func() (ProviderUsage, error){
-	"grok":   grokPoll,
-	"claude": claudePoll,
-	"codex":  codexPoll,
-	"gemini": geminiPoll,
+	"grok":        grokPoll,
+	"claude":      claudePoll,
+	"codex":       codexPoll,
+	"gemini":      geminiPoll,
+	"antigravity": antigravityPoll,
+	"litellm":     litellmPoll,
 }
 
 // providerSource names the native authority per provider.
 var providerSource = map[string]string{
-	"claude": "native:api.anthropic.com/api/oauth/usage",
-	"codex":  "native:chatgpt.com/backend-api/wham/usage",
-	"gemini": "native:cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-	"grok":   "native:cli-chat-proxy.grok.com/v1/billing?format=credits",
+	"claude":      "native:api.anthropic.com/api/oauth/usage",
+	"codex":       "native:chatgpt.com/backend-api/wham/usage",
+	"gemini":      "native:cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+	"grok":        "native:cli-chat-proxy.grok.com/v1/billing?format=credits",
+	"antigravity": "native:same-host-language-server/RetrieveUserQuotaSummary",
+	"litellm":     "native:authenticated-key-info",
 }
 
 // decorateProvider attaches the reading's provenance: which native endpoint

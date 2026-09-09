@@ -165,6 +165,45 @@ func TestGeminiPollKeepsEveryNamedQuota(t *testing.T) {
 	}
 }
 
+func TestAntigravityMapsOnlyExactFractionBuckets(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-codeium-csrf-token") != "csrf" {
+			t.Errorf("missing csrf")
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.25,"resetTime":"2099-01-01T00:00:00Z"},{"bucketId":"unknown","remainingFraction":1},{"bucketId":"3p-5h","remainingFraction":0.5}]}]}`))
+	}))
+	defer s.Close()
+	p, err := antigravityPollWithURL(s.URL, "csrf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Resources) != 2 || p.Resources["geminiWeekly"].Remaining != 25 || p.Resources["nonGeminiSession"].Used != 50 {
+		t.Fatalf("exact buckets/fractions not preserved: %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMWithoutEnforceableBudgetIsUntracked(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","budget_max":null,"budget_spent":null}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != "untracked" || len(p.Resources) != 0 {
+		t.Fatalf("missing budget must be untracked, got %+v", p)
+	}
+}
+
+func TestLiteLLMMapsEnforcedBudget(t *testing.T) {
+	s := serve(t, 200, `{"budget_max":100,"budget_spent":40}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["budget"].Remaining != 60 || p.Resources["budget"].Utilization != 0.4 {
+		t.Fatalf("budget mapping wrong: %+v", p.Resources)
+	}
+}
+
 // Graceful degradation: an unreachable or refusing API must ERROR, so the
 // caller omits the provider. Returning an empty ProviderUsage would put a
 // zero-utilization entry in the snapshot, which the router reads as healthy.
