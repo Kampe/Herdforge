@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +22,39 @@ import (
 // own fleet daemon happens to be up.
 func noHerdPATH() string {
 	return "/usr/bin:/bin"
+}
+
+func TestAdmissionLeaseLockHelper(t *testing.T) {
+	if os.Getenv("HERD_ADMISSION_LOCK_HELPER") != "1" {
+		return
+	}
+	path := os.Getenv("HERD_ADMISSION_LOCK_PATH")
+	ready := os.Getenv("HERD_ADMISSION_LOCK_READY")
+	release := os.Getenv("HERD_ADMISSION_LOCK_RELEASE")
+	lock, err := acquireAdmissionLeaseLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ready, []byte("held\n"), 0o600); err != nil {
+		_ = lock.Close()
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(release); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeAdmissionFixture(t *testing.T, path string, r admissionLeaseRecord) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("token=%s pid=%d taken=%s ttl=%s phase=%s\n", r.Token, r.PID, r.Taken.UTC().Format(time.RFC3339Nano), r.TTL, r.Phase)), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // runCapacitySubprocess runs the real, compiled herd binary rather than
@@ -215,9 +251,11 @@ func TestAdmissionLeaseIsExclusiveThenReclaimableAfterExpiry(t *testing.T) {
 		t.Fatalf("a second concurrent launch was admitted alongside the first: held=%v err=%v", held2, err)
 	}
 	release()
-	if _, held3, err := holdAdmissionLease(time.Minute); err != nil || !held3 {
+	release3, held3, err := holdAdmissionLease(time.Minute)
+	if err != nil || !held3 {
 		t.Fatalf("lease was not reusable after release: held=%v err=%v", held3, err)
 	}
+	release3()
 
 	// A launch killed mid-flight must not fence the host forever: that turns a
 	// crash into an outage.
@@ -430,7 +468,9 @@ func TestExpiredHolderReleaseDoesNotEvictTheNewOwner(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 
 	// B reclaims the expired lease. A is still live.
-	releaseB, heldB, err := holdAdmissionLease(time.Nanosecond)
+	// B's recorded owner TTL must control later expiry; the reclaimer/caller's
+	// TTL is not allowed to shorten a live successor's lease.
+	releaseB, heldB, err := holdAdmissionLease(time.Hour)
 	if err != nil || !heldB {
 		t.Fatalf("B failed to reclaim an expired lease: held=%v err=%v", heldB, err)
 	}
@@ -470,5 +510,245 @@ func TestDefaultLeaseTTLExceedsMeasuredRouteResolution(t *testing.T) {
 	if defaultAdmissionLeaseTTL <= 272*time.Second {
 		t.Fatalf("default TTL %s does not exceed measured route resolution (272s); the lease can expire mid-launch",
 			defaultAdmissionLeaseTTL)
+	}
+}
+
+func TestAdmissionLeaseReclaimsDeadPreProbeHolderWithinRecordedTTL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "dead-token", PID: 999999, Taken: time.Now().Add(-time.Minute), TTL: time.Hour, Phase: admissionPhaseCandidate})
+	release, held, err := holdAdmissionLeaseWithHooks(time.Minute, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return admissionDead }})
+	if err != nil || !held {
+		t.Fatalf("dead candidate was not reclaimed: held=%v err=%v", held, err)
+	}
+	release()
+	if _, err := os.Stat(admissionLeaseLockPath(path)); err != nil {
+		t.Fatalf("permanent lock sidecar missing: %v", err)
+	}
+}
+
+func TestAdmissionLeaseDoesNotEarlyReclaimLiveUnknownOrInFlight(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		phase admissionLeasePhase
+		live  admissionLeaseLiveness
+	}{
+		{"live candidate", admissionPhaseCandidate, admissionLive},
+		{"unknown candidate", admissionPhaseCandidate, admissionUnknown},
+		{"dead route", admissionPhaseRoute, admissionDead},
+		{"dead probe", admissionPhaseProbe, admissionDead},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.lease")
+			t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+			writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "protected", PID: 4321, Taken: time.Now(), TTL: time.Hour, Phase: tt.phase})
+			_, held, err := holdAdmissionLeaseWithHooks(time.Nanosecond, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return tt.live }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held {
+				t.Fatal("protected lease was reclaimed by an unproven-dead or in-flight holder")
+			}
+			raw, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !strings.Contains(string(raw), "token=protected ") {
+				t.Fatalf("protected lease changed: %s", raw)
+			}
+		})
+	}
+}
+
+func TestAdmissionLeaseExpiryUsesRecordedOwnerTTL(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		ttl        time.Duration
+		age        time.Duration
+		expectHeld bool
+	}{
+		{"long owner ttl remains held", 1200 * time.Second, 700 * time.Second, false},
+		{"short owner ttl expires", 60 * time.Second, 120 * time.Second, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "admission.lease")
+			t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+			writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "owner", PID: 4321, Taken: time.Now().Add(-tt.age), TTL: tt.ttl, Phase: admissionPhaseRoute})
+			release, held, err := holdAdmissionLeaseWithHooks(600*time.Second, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return admissionUnknown }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if held != tt.expectHeld {
+				t.Fatalf("held=%v, want %v", held, tt.expectHeld)
+			}
+			if held {
+				release()
+			}
+		})
+	}
+}
+
+func TestAdmissionLeaseLegacyNoPhaseUsesRecordedOwnerTTL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "legacy", PID: 4321, Taken: time.Now(), TTL: time.Hour})
+	_, held, err := holdAdmissionLeaseWithHooks(time.Nanosecond, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return admissionDead }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatal("fresh legacy lease without a phase was reclaimed early")
+	}
+
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "legacy-expired", PID: 4321, Taken: time.Now().Add(-time.Hour), TTL: 10 * time.Minute})
+	release, held, err := holdAdmissionLeaseWithHooks(600*time.Second, admissionLeaseHooks{processAlive: func(int) admissionLeaseLiveness { return admissionUnknown }})
+	if err != nil || !held {
+		t.Fatalf("expired readable legacy lease was not reclaimed: held=%v err=%v", held, err)
+	}
+	release()
+}
+
+func TestAdmissionLeaseReleaseLeavesOnlyPermanentSidecar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	release, held, err := holdAdmissionLease(time.Hour)
+	if err != nil || !held {
+		t.Fatalf("acquire failed: held=%v err=%v", held, err)
+	}
+	release()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "admission.lease.lock" {
+		t.Fatalf("lease directory contains unexpected files: %v", entries)
+	}
+}
+
+func TestAdmissionLeaseStatusRedactsToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "super-secret-token", PID: os.Getpid(), Taken: time.Now(), TTL: time.Hour, Phase: admissionPhaseCandidate})
+	old := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	err = emitAdmissionLeaseStatus()
+	_ = write.Close()
+	os.Stdout = old
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(read)
+	if strings.Contains(string(out), "super-secret-token") {
+		t.Fatalf("status exposed raw token: %s", out)
+	}
+	if !strings.Contains(string(out), "token_digest") || !strings.Contains(string(out), "candidate") {
+		t.Fatalf("status omitted digest or phase: %s", out)
+	}
+}
+
+func TestAdmissionLeasePhaseAndReleaseRefuseSuccessor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	release, held, err := holdAdmissionLease(time.Hour)
+	if err != nil || !held {
+		t.Fatal(err)
+	}
+	r, _, err := readAdmissionLease(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAdmissionLeasePhase(path, r.Token, admissionPhaseRoute); err != nil {
+		t.Fatal(err)
+	}
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "successor", PID: os.Getpid(), Taken: time.Now(), TTL: time.Hour, Phase: admissionPhaseRoute})
+	release()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "token=successor ") {
+		t.Fatalf("stale release removed successor: %s", raw)
+	}
+	if err := updateAdmissionLeasePhase(path, r.Token, admissionPhaseSpawn); err == nil {
+		t.Fatal("stale phase update modified successor")
+	}
+}
+
+func TestAdmissionLeaseReclaimRejectsStaleObservationABA(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admission.lease")
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "old", PID: 4321, Taken: time.Now().Add(-time.Minute), TTL: time.Hour, Phase: admissionPhaseCandidate})
+	_, held, err := holdAdmissionLeaseWithHooks(time.Minute, admissionLeaseHooks{
+		processAlive: func(int) admissionLeaseLiveness { return admissionDead },
+		beforeReplace: func() {
+			writeAdmissionFixture(t, path, admissionLeaseRecord{Token: "successor", PID: os.Getpid(), Taken: time.Now(), TTL: time.Hour, Phase: admissionPhaseRoute})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatal("stale reclaim observation admitted over a successor")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "token=successor ") {
+		t.Fatalf("successor was not preserved: %s", raw)
+	}
+}
+
+func TestAdmissionLeaseLockIsCrossProcessAndSidecarIsPermanent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "admission.lease")
+	ready, release := filepath.Join(dir, "ready"), filepath.Join(dir, "release")
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Other CLI tests legitimately redirect os.Args[0] while exercising a
+	// compiled herd binary. The child must use the test process identity, not
+	// that mutable display/argv alias.
+	originalArg0 := os.Args[0]
+	os.Args[0] = "herd"
+	t.Cleanup(func() { os.Args[0] = originalArg0 })
+	cmd := exec.Command(testExecutable, "-test.run=^TestAdmissionLeaseLockHelper$")
+	cmd.Env = append(os.Environ(), "HERD_ADMISSION_LOCK_HELPER=1", "HERD_ADMISSION_LOCK_PATH="+path, "HERD_ADMISSION_LOCK_READY="+ready, "HERD_ADMISSION_LOCK_RELEASE="+release)
+	var childOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &childOut, &childOut
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.WriteFile(release, []byte("release\n"), 0o600)
+		_ = cmd.Wait()
+	}()
+	// This is a test-only child-start budget, not an admission deadline. Full
+	// shuffled unit runs can contend for four Go workers while starting the
+	// already-built test binary; one second was shorter than that startup path
+	// on Linux. Ten seconds remains bounded, and a child that cannot publish its
+	// marker still fails with its captured diagnostic.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock helper did not acquire lock within test startup budget: %s", childOut.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", path)
+	if _, _, err := holdAdmissionLease(time.Hour); err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("held cross-process lock did not refuse with timeout: %v", err)
+	}
+	if _, err := os.Stat(admissionLeaseLockPath(path)); err != nil {
+		t.Fatalf("sidecar vanished: %v", err)
 	}
 }

@@ -59,12 +59,13 @@ func runPoolReview(ref string) error {
 	// can prepare a detached worktree when none holds the SHA; that is already
 	// repository mutation. The W4 incident prepared a worktree and then died
 	// because herdr was down -- this gate makes that order impossible.
-	releaseCapacity, err := acquirePoolCapacityOrRefuse()
+	capacityLease, err := acquirePoolCapacityLeaseOrRefuse()
 	if err != nil {
 		return err
 	}
-	if releaseCapacity != nil {
-		defer releaseCapacity()
+	defer capacityLease.release()
+	if err := capacityLease.update(admissionPhaseCandidate); err != nil {
+		return fmt.Errorf("advance admission phase to candidate: %w", err)
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 	// FAC-648: the exact SHA participates in candidate resolution, because a
@@ -151,6 +152,9 @@ func runPoolReview(ref string) error {
 	// without starting a harness, so provider readiness is not its business.
 	reviewer := poolReviewer{}
 	if !*noLaunch {
+		if err := capacityLease.update(admissionPhaseRoute); err != nil {
+			return fmt.Errorf("advance admission phase to route: %w", err)
+		}
 		// FAC-677: the route resolution fetches live quota across every provider
 		// and can take tens of seconds -- measured between 29s and 272s on this
 		// fleet, tracking provider API latency. It said nothing while it ran.
@@ -166,6 +170,9 @@ func runPoolReview(ref string) error {
 			return err
 		}
 		reviewer = resolved
+	}
+	if err := capacityLease.update(admissionPhasePool); err != nil {
+		return fmt.Errorf("advance admission phase to pool: %w", err)
 	}
 
 	// FAC-682: refuse to launch INTO a shared checkout that is already dirty.
@@ -313,6 +320,9 @@ func runPoolReview(ref string) error {
 	}
 
 	packet := filepath.Join(*packetRoot, surfaceName+".md")
+	if err := capacityLease.update(admissionPhasePacket); err != nil {
+		return fmt.Errorf("advance admission phase to packet: %w", err)
+	}
 	if err := os.MkdirAll(*packetRoot, 0o755); err != nil {
 		return fmt.Errorf("create review packet root: %w", err)
 	}
@@ -396,6 +406,9 @@ func runPoolReview(ref string) error {
 	if !herdr.IsAvailable() {
 		return errors.New("herdr CLI is unavailable; use --no-launch to prepare the surface")
 	}
+	if err := capacityLease.update(admissionPhaseTab); err != nil {
+		return fmt.Errorf("advance admission phase to tab: %w", err)
+	}
 	ws, err := herdr.RequireWorkspace(root)
 	if err != nil {
 		return err
@@ -423,6 +436,9 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}
 	agentName := reviewAgentName(ref, sha)
+	if err := capacityLease.update(admissionPhaseSpawn); err != nil {
+		return fmt.Errorf("advance admission phase to spawn: %w", err)
+	}
 	cleanupTab := true
 	defer func() {
 		if cleanupTab {
