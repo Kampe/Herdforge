@@ -4,9 +4,58 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/security"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
+
+func TestLauncherSpawner_PreparesLifecycleBeforeAgentStart(t *testing.T) {
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", t.TempDir())
+	restoreRoute := herdr.SetPiSessionRouteAttesterForTest(func(string, []string) error { return nil })
+	t.Cleanup(restoreRoute)
+
+	decision, err := testRouter(t).Decide(router.LaunchRequest{
+		Role: router.RoleWorker, Shape: launch.Implementation, TaskRef: "FAC-746",
+		LeaseGeneration: 7, Scope: router.ScopeTask, RequestedProvider: testWorkerProvider,
+		RequestedModel: testWorkerModel, RequestedEffort: testWorkerEffort,
+		ProbeResults: map[string]bool{router.ProbeKey(testWorkerProvider, testWorkerModel): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := launch.Request{
+		Decision: decision, TaskRef: "FAC-746", Repository: "repo", Lane: "worker",
+		LeaseGeneration: 7, Scope: decision.Scope,
+	}
+	var events []string
+	lifecycle := toolchild.NewLifecycle(toolchild.Identity{}, &toolchild.FakeTree{}, &toolchild.MemorySink{})
+	restoreFactory := herdr.SetToolChildLifecycleFactory(func(launch.Request, string, string) (herdr.ToolChildLifecycle, error) {
+		events = append(events, "prepare")
+		return lifecycle, nil
+	})
+	t.Cleanup(restoreFactory)
+
+	fake := &fakeHerdr{available: true}
+	spawner := newLauncherSpawner(fake, req)
+	if _, _, err := spawner.CreateTab("wK", "task-fac-746", ".herd/worktrees/fac-746", []string{"PATH=/bin"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := spawner.StartAgent("task-fac-746", decision.Harness, "pane-test", nil); err != nil {
+		t.Fatal(err)
+	}
+	events = append(events, "start")
+	if spawner.request.SessionGeneration <= 0 {
+		t.Fatalf("lifecycle preparation did not reserve a positive session generation: %d", spawner.request.SessionGeneration)
+	}
+	if fake.startReq.SessionGeneration != spawner.request.SessionGeneration {
+		t.Fatalf("agent start generation=%d, prepared generation=%d", fake.startReq.SessionGeneration, spawner.request.SessionGeneration)
+	}
+	if len(events) != 2 || events[0] != "prepare" || events[1] != "start" {
+		t.Fatalf("launch ordering=%v, want prepare before start", events)
+	}
+}
 
 func TestLauncherSpawner_RequireLiveIdentitySessionOptional(t *testing.T) {
 	s := newLauncherSpawner(&fakeHerdr{available: true}, launch.Request{})
