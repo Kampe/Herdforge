@@ -56,6 +56,29 @@ func TestPendingQueuedSkipsHandledAndPreservesOrder(t *testing.T) {
 	}
 }
 
+func TestPendingRoutineIncludesReportsButNotControlOrCallbacks(t *testing.T) {
+	box := NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
+	for _, msg := range []struct {
+		subject string
+		body    string
+	}{
+		{"FAC-773 report", "report bytes"},
+		{ControlSubjectPrefix + " issue FAC-1", "signed control"},
+		{"complete: FAC-2", "callback"},
+	} {
+		if _, err := box.SendMessage("worker", "coordinator", msg.subject, msg.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := box.PendingRoutine("coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Subject != "FAC-773 report" || pending[0].Body != "report bytes" {
+		t.Fatalf("routine pending = %+v", pending)
+	}
+}
+
 func TestQueueRoutineCancelBeforeAppendLeavesNoEnvelope(t *testing.T) {
 	box := NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
 	ctx, cancel := context.WithCancel(context.Background())

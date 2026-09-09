@@ -146,7 +146,7 @@ var subcommandUsage = map[string]string{
 	"stop":            "Usage: herd stop [flags]\n  Stop the herd without deleting worktrees; dry-run by default.",
 	"task":            "Usage: herd task <get|comment|verdict> [flags]\n  Access the receipt-gated task broker.",
 	"verify-fac151":   "Usage: herd verify-fac151 [flags]\n  Run the fixed hermetic FAC-151 verifier profile.",
-	"watch":           "Usage: herd watch [--stream] [flags]\n  Fire when an agent settles and optionally feed harvest triggers.",
+	"watch":           "Usage: herd watch [--stream] [--wake --recipient NAME --workspace ID] [flags]\n  Fire when an agent settles; --wake reconciles exact-target ordinary durable mail at safe idle/done boundaries.\n  Control/callback envelopes stay on their native consumers; unavailable sources remain pending.",
 	"board-done": "Usage: herd board-done <ref> [--receipt <path>] [--acceptance-output <path>] [--override-policy <p> --override-actor <who> --override-reason <why> --override-evidence <what>]\n" +
 		"  Close a card from its task-bound completion receipt, or by an attributable manual override.",
 	"board-audit": "Usage: herd board-audit [--json]\n  Report Done cards no completion receipt closed. Read-only; never mutates the board.",

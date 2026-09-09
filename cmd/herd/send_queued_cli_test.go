@@ -250,6 +250,46 @@ func TestSendCLIDrainSurfacesThenAcksWithoutStoppingCommand(t *testing.T) {
 	}
 }
 
+func TestWatchWakeReconcilesPreexistingOrdinaryReportAndRestartDoesNotRedeliver(t *testing.T) {
+	proc := startFakeCommand(t)
+	repo := queuedSendRepo(t)
+	bin, logPath, _ := installQueuedSendFake(t, "idle", strconv.Itoa(proc.Pid))
+	env := queuedSendEnv(bin, repo)
+	body := "exact report bytes\nsecond line"
+	box := mail.NewMailbox(filepath.Join(repo, ".herd", "control-mail.jsonl"))
+	report, err := box.SendMessage("worker", "worker", "FAC-773 report", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runHerd(t, repo, env, "watch", "--wake", "--recipient", "worker", "--workspace", "wK", "--interval", "1", "--timeout", "3")
+	if err != nil {
+		t.Fatalf("watch wake: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "WAKE worker workspace=wK durable mail consumed") {
+		t.Fatalf("wake output = %s", out)
+	}
+	log := fakeCallLog(t, logPath)
+	if strings.Count(log, "agent prompt") != 1 || !strings.Contains(log, body) {
+		t.Fatalf("report was not delivered byte-for-byte once:\n%s", log)
+	}
+	handled, err := box.Handled("worker", report.ID)
+	if err != nil || !handled {
+		t.Fatalf("report acknowledgement = %t, %v", handled, err)
+	}
+
+	if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = runHerd(t, repo, env, "watch", "--wake", "--recipient", "worker", "--workspace", "wK", "--interval", "1", "--timeout", "1")
+	if exitCode(err) != 2 {
+		t.Fatalf("empty post-ack watch exit = %d, want bounded timeout", exitCode(err))
+	}
+	if strings.Contains(fakeCallLog(t, logPath), "agent prompt") {
+		t.Fatalf("restart redelivered acknowledged report:\n%s", fakeCallLog(t, logPath))
+	}
+}
+
 func TestSendCLIRefusesForeignWorkspace(t *testing.T) {
 	proc := startFakeCommand(t)
 	repo := queuedSendRepo(t)
