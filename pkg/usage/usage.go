@@ -73,8 +73,9 @@ func FetchProviderForce(provider string, force bool) (*UsageSnapshot, error) {
 // FetchProviderModelForce acquires the quota authority for the requested model,
 // rather than confusing the harness that launches it with its billing pool.
 // OpenCode is a launcher for several gateways: litellm/ models use the
-// LiteLLM authority, ollama-cloud/ models use Ollama's signed authority, and
-// opencode/ models use the OpenCode Go authority.
+// LiteLLM authority, ollama-cloud/ models use the distinct direct-bearer
+// authority, and opencode/ models use the OpenCode Go authority. The signed
+// ~/.ollama authority is selected only for an explicit ollama provider.
 func FetchProviderModelForce(provider, model string, force bool) (*UsageSnapshot, error) {
 	target := strings.ToLower(strings.TrimSpace(provider))
 	m := strings.ToLower(strings.TrimSpace(model))
