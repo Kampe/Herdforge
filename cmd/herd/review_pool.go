@@ -336,6 +336,16 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("create review surface symlink: %w", err)
 	}
 
+	// Validate the exact pinned candidate and its repository-owned review
+	// contract before creating any packet or provenance artifact. Failure is
+	// handled by the pool-lease cleanup defer above.
+	if err := verifySurfaceCandidate(surface, sha); err != nil {
+		return err
+	}
+	if err := verifyReviewContract(surface); err != nil {
+		return err
+	}
+
 	packet := filepath.Join(*packetRoot, surfaceName+".md")
 	if err := capacityLease.update(admissionPhasePacket); err != nil {
 		return fmt.Errorf("advance admission phase to packet: %w", err)
@@ -395,17 +405,6 @@ func runPoolReview(ref string) error {
 	if err := completeReviewLaunchProvenance(root, ref, sha, lease.LeaseID, packetTask); err != nil {
 		fmt.Fprintf(os.Stderr, "review --pool: reviewer launched but launch provenance is INCOMPLETE (%v); "+
 			"this candidate will be refused at harvest admission until a record row carries its lease and patch id\n", err)
-	}
-
-	// FAC-626: verify the surface's actual content agrees with the candidate
-	// BEFORE reporting anything ready or launching anything into it. The
-	// reset above pins THIS process's own leased slot, which is sound on its
-	// own -- this re-reads through the exact symlink a reviewer (or an
-	// operator reading the "ready" line) would follow, so a defect anywhere
-	// in that chain (a reused lease, a symlink pointing somewhere unexpected)
-	// is caught here rather than trusted because a path merely exists.
-	if err := verifySurfaceCandidate(surface, sha); err != nil {
-		return err
 	}
 
 	if *noLaunch {
@@ -705,6 +704,29 @@ func verifySurfaceCandidate(surface, wantSHA string) error {
 			"a reviewer dispatched here would review a different commit and its verdict would be misattributed to the "+
 			"requested candidate (FAC-626 refuses rather than serve it)",
 		surface, wantSHA, resolvedTarget, target, gotHead)
+}
+
+const (
+	reviewerContractPath = ".herd/prompts/reviewer.md"
+	verdictTemplatePath  = ".herd/prompts/review-verdict.template.md"
+)
+
+// verifyReviewContract checks the pinned candidate surface, not the checkout
+// that launched the review. A reviewer must receive the same instructions and
+// artifact template that exist in the commit being reviewed; consulting a
+// shared-root copy would make a stale candidate appear reviewable.
+func verifyReviewContract(surface string) error {
+	for _, rel := range []string{reviewerContractPath, verdictTemplatePath} {
+		path := filepath.Join(surface, rel)
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("review candidate is missing required contract/template %s: %w", rel, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("review candidate required contract/template %s is not a regular file", rel)
+		}
+	}
+	return nil
 }
 
 // headMatchesSHA reports whether dir's HEAD is exactly sha. A resolution error
@@ -1559,7 +1581,9 @@ shared checkout, that is a finding to report, not a step to take.
 Candidate: %s
 Surface: %s
 
-Read docs/prompts/review-contract.md and inspect only this candidate.
+Read .herd/prompts/reviewer.md and .herd/prompts/review-verdict.template.md from
+the candidate surface and inspect only this candidate. These paths are
+candidate-owned; never fall back to files from the shared checkout.
 
 WRITE YOUR VERDICT ARTIFACT TO EXACTLY THIS PATH:
 
