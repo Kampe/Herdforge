@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -395,16 +396,33 @@ func (fk *fakeKaneo) setNoTasks(noTasks bool) {
 func newFakeKaneo() (*fakeKaneo, *httptest.Server) {
 	fk := &fakeKaneo{status: "in-progress"}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/task", func(w http.ResponseWriter, r *http.Request) {
+	// ListTasks serves the deployed board envelope: GET
+	// /api/task/tasks/{project}?limit=&page= returns {data:{id,columns[].tasks},
+	// pagination} (FAC-784). The legacy flat-array /api/task list route no
+	// longer exists in production and must not come back here.
+	mux.HandleFunc("/api/task/tasks/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fk.mu.Lock()
 		noTasks := fk.noTasks
 		fk.mu.Unlock()
-		if noTasks {
-			fmt.Fprint(w, "[]")
-			return
+		project := strings.TrimPrefix(r.URL.Path, "/api/task/tasks/")
+		page := 1
+		if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 0 {
+			page = p
 		}
-		fmt.Fprintf(w, "[%s]", fk.taskJSON())
+		// The fixture task belongs to proj-x; any other project gets a valid
+		// empty board rather than a foreign task.
+		var tasks []string
+		if !noTasks && project == "proj-x" {
+			tasks = []string{fk.taskJSON()}
+		}
+		totalPages := 0
+		if len(tasks) > 0 {
+			totalPages = 1
+		}
+		fmt.Fprintf(w,
+			`{"data":{"id":%q,"name":"Board","columns":[{"id":"c-board","name":"Board","tasks":[%s]}]},"pagination":{"page":%d,"pageSize":100,"total":%d,"totalPages":%d}}`,
+			project, strings.Join(tasks, ","), page, len(tasks), totalPages)
 	})
 	mux.HandleFunc("/api/task/t1/comment", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
