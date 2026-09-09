@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -317,6 +318,189 @@ func TestMailAckCLIFailsClosedAndLeavesEnvelopeUnacknowledged(t *testing.T) {
 				t.Fatalf("rejected envelope was acknowledged")
 			}
 		})
+	}
+}
+
+func TestMailCLIOrdinaryPendingImportAndStatusAreIdempotent(t *testing.T) {
+	dir := sandbox(t)
+	remoteFile := filepath.Join(dir, "remote.jsonl")
+	localFile := filepath.Join(dir, "local.jsonl")
+	body := "exact relay body\n$(not shell)"
+	out, _, err := runHerdWithSeparateOutput(t, dir, nil, "mail", "send", "--from", "worker", "--to", "coordinator", "--subject", "FAC-773 report", "--body", body, "--mail", remoteFile)
+	if err != nil {
+		t.Fatalf("source send: %v\n%s", err, out)
+	}
+	pending, err := runHerd(t, dir, nil, "mail", "pending", "--recipient", "coordinator", "--mail", remoteFile)
+	if err != nil {
+		t.Fatalf("source pending: %v\n%s", err, pending)
+	}
+	var source []mail.Envelope
+	if err := json.Unmarshal(pending, &source); err != nil || len(source) != 1 || source[0].Body != body {
+		t.Fatalf("source pending = %s, err=%v", pending, err)
+	}
+	input := filepath.Join(dir, "pending.json")
+	if err := os.WriteFile(input, pending, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := runHerd(t, dir, nil, "mail", "import", "--source-host", "wsl-box", "--recipient", "coordinator", "--file", input, "--mail", localFile)
+	if err != nil {
+		t.Fatalf("ordinary import: %v\n%s", err, imported)
+	}
+	var local []mail.Envelope
+	if err := json.Unmarshal(imported, &local); err != nil || len(local) != 1 || local[0].Body != body || local[0].OriginalSourceID != source[0].ID {
+		t.Fatalf("imported = %s, err=%v", imported, err)
+	}
+	if _, err := runHerd(t, dir, nil, "mail", "import", "--source-host", "wsl-box", "--recipient", "coordinator", "--file", input, "--mail", localFile); err != nil {
+		t.Fatalf("duplicate import: %v", err)
+	}
+	status, err := runHerd(t, dir, nil, "mail", "status", "--recipient", "coordinator", "--id", local[0].ID, "--mail", localFile)
+	if err != nil || !strings.Contains(string(status), `"pending":true`) {
+		t.Fatalf("pending local status: %v\n%s", err, status)
+	}
+	if _, err := runHerd(t, dir, nil, "mail", "ack", "--recipient", "coordinator", "--id", local[0].ID, "--mail", localFile); err != nil {
+		t.Fatal(err)
+	}
+	status, err = runHerd(t, dir, nil, "mail", "status", "--recipient", "coordinator", "--id", local[0].ID, "--mail", localFile)
+	if err != nil || !strings.Contains(string(status), `"handled":true`) || strings.Contains(string(status), `"pending":true`) {
+		t.Fatalf("handled local status: %v\n%s", err, status)
+	}
+}
+
+func TestFAC773RelayFakeSSHSafeBoundaryAndRetry(t *testing.T) {
+	repo := queuedSendRepo(t)
+	localMail := filepath.Join(repo, ".herd", "local-mail.jsonl")
+	remotePending := filepath.Join(repo, "remote-pending.json")
+	remoteEnvelope := mail.Envelope{ID: "wsl-report-1306", Sender: "worker", Recipient: "worker", Subject: "FAC-773 report", Body: "exact relay body $(not shell)"}
+	data, err := json.Marshal([]mail.Envelope{remoteEnvelope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePending, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		initial    string
+		failAck    bool
+		wantFirst  int
+		wantSecond int
+	}{
+		{name: "busy then idle", initial: "working", wantFirst: 2, wantSecond: 0},
+		{name: "remote ack retry", initial: "idle", failAck: true, wantFirst: 1, wantSecond: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bin, logPath, statusPath := installQueuedSendFake(t, tt.initial, "0")
+			sshDir := t.TempDir()
+			fakeSSH := filepath.Join(sshDir, "ssh")
+			if err := os.WriteFile(fakeSSH, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_RELAY_LOG"
+case "$*" in
+  *"mail pending"*) cat "$FAKE_RELAY_PENDING" ;;
+  *"mail ack"*)
+    if [ "$FAKE_RELAY_FAIL_ACK" = "1" ]; then exit 1; fi
+    printf 'ACKED\n' >> "$FAKE_RELAY_LOG"
+    ;;
+  *) exit 1 ;;
+esac
+`), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(logPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			env := queuedSendEnv(bin, repo)
+			failAck := "0"
+			if tt.failAck {
+				failAck = "1"
+			}
+			env = append(env,
+				"PATH="+sshDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"FAKE_RELAY_PENDING="+remotePending,
+				"FAKE_RELAY_LOG="+logPath,
+				"FAKE_RELAY_FAIL_ACK="+failAck,
+			)
+			run := func() (int, []byte) {
+				cmd := exec.Command("zsh", filepath.Join(repoRootForTest(t), "scripts", "fac773-mail-relay.zsh"),
+					"--host", "wsl-box", "--remote-binary", "/wsl/bin/herd", "--remote-mail", "/wsl/.herd/control-mail.jsonl",
+					"--local-binary", buildHerd(t), "--local-mail", localMail, "--recipient", "worker", "--workspace", "wK",
+					"--command-timeout", "5", "--watch-timeout", "1")
+				cmd.Dir = repo
+				cmd.Env = append(os.Environ(), env...)
+				out, runErr := cmd.CombinedOutput()
+				return exitCode(runErr), out
+			}
+			firstExit, firstOut := run()
+			if firstExit != tt.wantFirst {
+				t.Fatalf("first relay exit=%d want %d: %s", firstExit, tt.wantFirst, firstOut)
+			}
+			box := mail.NewMailbox(localMail)
+			local, err := box.ReadInbox("worker")
+			if err != nil || len(local) != 1 || local[0].Body != remoteEnvelope.Body {
+				t.Fatalf("local relay inbox=%+v err=%v", local, err)
+			}
+			if tt.initial == "working" {
+				if pending, err := box.PendingOrdinary("worker"); err != nil || len(pending) != 1 {
+					t.Fatalf("busy relay pending=%+v err=%v", pending, err)
+				}
+				if strings.Contains(fakeCallLog(t, logPath), "agent prompt") || strings.Contains(fakeCallLog(t, logPath), "agent send-keys") {
+					t.Fatalf("busy relay wrote to pane:\n%s", fakeCallLog(t, logPath))
+				}
+				if err := os.WriteFile(statusPath, []byte("idle"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.failAck {
+				handled, err := box.Handled("worker", local[0].ID)
+				if err != nil || !handled {
+					t.Fatalf("failed remote ack lost local handling: %t %v", handled, err)
+				}
+				env[len(env)-1] = "FAKE_RELAY_FAIL_ACK=0"
+			}
+			secondExit, secondOut := run()
+			if secondExit != tt.wantSecond {
+				t.Fatalf("second relay exit=%d want %d: %s", secondExit, tt.wantSecond, secondOut)
+			}
+			local, err = box.ReadInbox("worker")
+			if err != nil || len(local) != 1 {
+				t.Fatalf("relay duplicated local envelope: %+v err=%v", local, err)
+			}
+			pending, err := box.PendingOrdinary("worker")
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("local handled state = %+v err=%v", pending, err)
+			}
+			if !strings.Contains(fakeCallLog(t, logPath), "mail ack") {
+				t.Fatalf("relay never attempted native remote ack:\n%s", fakeCallLog(t, logPath))
+			}
+		})
+	}
+}
+
+func repoRootForTest(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime caller unavailable")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func TestFAC773RelayFailsLoudlyOnUnavailableRemoteState(t *testing.T) {
+	sshDir := t.TempDir()
+	fakeSSH := filepath.Join(sshDir, "ssh")
+	if err := os.WriteFile(fakeSSH, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	localMail := filepath.Join(t.TempDir(), "local.jsonl")
+	cmd := exec.Command("zsh", filepath.Join(repoRootForTest(t), "scripts", "fac773-mail-relay.zsh"),
+		"--host", "wsl-box", "--remote-binary", "/wsl/bin/herd", "--remote-mail", "/wsl/.herd/control-mail.jsonl",
+		"--local-binary", "/bin/false", "--local-mail", localMail, "--recipient", "worker", "--workspace", "wK",
+		"--command-timeout", "1", "--watch-timeout", "1")
+	cmd.Env = append(os.Environ(), "PATH="+sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if exitCode(err) == 0 || !strings.Contains(string(out), "remote pending collection failed") {
+		t.Fatalf("unavailable remote state exit=%d output=%s", exitCode(err), out)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,6 +29,12 @@ func runMail() {
 	switch args[0] {
 	case "send":
 		runMailSend(args[1:])
+	case "import":
+		runMailImport(args[1:])
+	case "pending":
+		runMailPending(args[1:])
+	case "status":
+		runMailStatus(args[1:])
 	case "ack":
 		runMailAck(args[1:])
 	case "inbox", "read":
@@ -40,6 +47,162 @@ func runMail() {
 		fmt.Fprintf(os.Stderr, "mail: unknown mode %q\n%s\n", args[0], usageFor("mail"))
 		os.Exit(2)
 	}
+}
+
+func runMailPending(args []string) {
+	fs := flag.NewFlagSet("mail pending", flag.ContinueOnError)
+	recipient := fs.String("recipient", "", "exact envelope recipient")
+	mailPath := fs.String("mail", "", "mailbox path override")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*recipient) == "" {
+		fmt.Fprintln(os.Stderr, "mail pending: --recipient is required")
+		os.Exit(2)
+	}
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail pending: %v\n", err)
+		os.Exit(1)
+	}
+	envs, err := mail.NewMailbox(path).PendingOrdinary(strings.TrimSpace(*recipient))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail pending: %v\n", err)
+		os.Exit(1)
+	}
+	if envs == nil {
+		envs = make([]*mail.Envelope, 0)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(envs); err != nil {
+		fmt.Fprintf(os.Stderr, "mail pending: encode response: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runMailStatus(args []string) {
+	fs := flag.NewFlagSet("mail status", flag.ContinueOnError)
+	recipient := fs.String("recipient", "", "exact envelope recipient")
+	id := fs.String("id", "", "exact ordinary envelope ID")
+	mailPath := fs.String("mail", "", "mailbox path override")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*recipient) == "" || strings.TrimSpace(*id) == "" {
+		fmt.Fprintln(os.Stderr, "mail status: --recipient and --id are required")
+		os.Exit(2)
+	}
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail status: %v\n", err)
+		os.Exit(1)
+	}
+	status, err := mail.NewMailbox(path).StatusOrdinary(*recipient, *id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail status: %v\n", err)
+		os.Exit(1)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(status); err != nil {
+		fmt.Fprintf(os.Stderr, "mail status: encode response: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runMailImport(args []string) {
+	fs := flag.NewFlagSet("mail import", flag.ContinueOnError)
+	sourceHost := fs.String("source-host", "", "explicit source host label")
+	recipient := fs.String("recipient", "", "exact local envelope recipient")
+	inputFile := fs.String("file", "-", "JSON envelope or array; use - for stdin")
+	mailPath := fs.String("mail", "", "mailbox path override")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*sourceHost) == "" || strings.TrimSpace(*recipient) == "" {
+		fmt.Fprintln(os.Stderr, "mail import: --source-host and --recipient are required")
+		os.Exit(2)
+	}
+	data, err := readBoundedMailInput(*inputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail import: %v\n", err)
+		os.Exit(1)
+	}
+	sources, err := decodeOrdinaryImport(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail import: %v\n", err)
+		os.Exit(1)
+	}
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail import: %v\n", err)
+		os.Exit(1)
+	}
+	box := mail.NewMailbox(path)
+	imported := make([]*mail.Envelope, 0, len(sources))
+	for i := range sources {
+		env, importErr := box.ImportOrdinary(nil, *sourceHost, *recipient, &sources[i])
+		if importErr != nil {
+			fmt.Fprintf(os.Stderr, "mail import: envelope %d: %v\n", i, importErr)
+			os.Exit(1)
+		}
+		imported = append(imported, env)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(imported); err != nil {
+		fmt.Fprintf(os.Stderr, "mail import: encode response: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func readBoundedMailInput(path string) ([]byte, error) {
+	var reader io.Reader = os.Stdin
+	var closer io.Closer
+	if path != "-" {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		reader, closer = file, file
+		defer closer.Close()
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, mail.MaxOrdinaryImportBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > mail.MaxOrdinaryImportBytes {
+		return nil, fmt.Errorf("input exceeds %d bytes", mail.MaxOrdinaryImportBytes)
+	}
+	return data, nil
+}
+
+func decodeOrdinaryImport(data []byte) ([]mail.Envelope, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("input is empty")
+	}
+	var rawItems []json.RawMessage
+	if trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &rawItems); err != nil {
+			return nil, err
+		}
+	} else {
+		rawItems = []json.RawMessage{trimmed}
+	}
+	items := make([]mail.Envelope, 0, len(rawItems))
+	for i, raw := range rawItems {
+		var env mail.Envelope
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&env); err != nil {
+			return nil, fmt.Errorf("envelope %d: %w", i, err)
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			if err == nil {
+				return nil, fmt.Errorf("envelope %d: trailing JSON data", i)
+			}
+			return nil, fmt.Errorf("envelope %d: trailing data: %w", i, err)
+		}
+		items = append(items, env)
+	}
+	return items, nil
 }
 
 func runMailAck(args []string) {

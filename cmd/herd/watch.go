@@ -23,6 +23,7 @@ func runWatch() {
 	wake := fs.Bool("wake", false, "Reconcile ordinary durable mail for one exact idle/done recipient")
 	recipient := fs.String("recipient", "", "Exact recipient for --wake")
 	workspace := fs.String("workspace", "", "Exact Herdr workspace for --wake")
+	mailOverride := fs.String("mail", "", "mailbox path override for --wake")
 	intervalSec := fs.Int("interval", int(watch.DefaultInterval.Seconds()), "Seconds between polls")
 	timeoutSec := fs.Int("timeout", 14400, "Give up after this many seconds")
 	fs.Parse(os.Args[2:])
@@ -66,7 +67,7 @@ func runWatch() {
 		}
 
 		if *wake {
-			mailPath, mailErr := controlMailPath("")
+			mailPath, mailErr := controlMailPath(*mailOverride)
 			if mailErr != nil {
 				fmt.Fprintf(os.Stderr, "herd watch: wake mailbox: %v\n", mailErr)
 				os.Exit(1)

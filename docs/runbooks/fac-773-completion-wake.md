@@ -53,3 +53,42 @@ approved transport, then run the command above on Mac. If that source or
 transport is unavailable, the envelope remains pending and the wake command
 fails visibly; it does not invent an SSH alias, host receipt, or read another
 project's mailbox. Review artifacts continue through `herd verdict-push`.
+
+## Explicit WSL ordinary-mail relay
+
+The supported ordinary-report bridge is the operator-invoked relay script,
+using the native `mail pending`, `mail import`, `watch --wake`, `mail status`,
+and `mail ack` operations. `herdr-deliver` is not this bridge: it submits
+directly and has no durable working-pane refusal/retry identity.
+
+Run one relay/watch owner per exact recipient, with the configured host and
+canonical mailbox paths supplied explicitly:
+
+```zsh
+./scripts/fac773-mail-relay.zsh \
+  --host wsl-box \
+  --remote-binary /home/kampe/Projects/Herdforge/bin/herd \
+  --remote-mail /home/kampe/Projects/Herdforge/.herd/control-mail.jsonl \
+  --local-binary /Users/kampe/Projects/Herdforge/bin/herd \
+  --local-mail /Users/kampe/Projects/Herdforge/.herd/control-mail.jsonl \
+  --recipient <exact-herdr-name> --workspace <exact-workspace-id>
+```
+
+The relay uses `ssh` with `BatchMode`, bounded connection/command deadlines,
+and the literal supported host `wsl-box`; it rejects unsafe or relative path
+arguments. Remote JSON is collected as ordinary pending mail, imported with an
+identity derived from `source-host + source-envelope-id`, and appended through
+`Mailbox.AppendEnvelopeContext`. The source ID is informational metadata, not
+authentication. Exact duplicate imports are no-ops; changed bytes, recipient,
+sender, subject, control/callback class, or unknown privileged fields fail
+closed. Message bodies never enter an SSH command argument or shell evaluation.
+
+The relay invokes the existing safe-boundary watcher and checks local
+`mail status` before issuing remote `mail ack` for the original source ID.
+Busy/unknown recipients make zero pane writes and leave both sides pending.
+A crash or failed remote ack after local handling is at-least-once: the next
+run imports idempotently, observes the existing local handled sidecar, and
+retries only the remote acknowledgement. An unavailable or unreadable remote
+mailbox is a visible failure. This relay transports ordinary progress only;
+it cannot admit privileged control, reviews, or authenticated reviewer-host
+claims.
