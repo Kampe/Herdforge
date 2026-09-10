@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	urlpkg "net/url"
 	"os"
@@ -448,6 +449,19 @@ type litellmKeyInfo struct {
 	Info        *litellmKeyInfo `json:"info"`
 }
 
+func litellmExplicitlyUnmetered(raw map[string]json.RawMessage, spend *float64) bool {
+	if spend == nil || *spend < 0 {
+		return false
+	}
+	for _, name := range []string{"budget_max", "max_budget"} {
+		value, present := raw[name]
+		if present && strings.TrimSpace(string(value)) == "null" {
+			return true
+		}
+	}
+	return false
+}
+
 func litellmPoll() (ProviderUsage, error) {
 	key := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
 	if key == "" {
@@ -800,9 +814,17 @@ func litellmPollWithURL(url, token string) (ProviderUsage, error) {
 	if resp.StatusCode != http.StatusOK {
 		return ProviderUsage{}, httpStatusPollError("litellm key info", resp.StatusCode)
 	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "litellm key info read: %v", err)
+	}
 	var info litellmKeyInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	if err := json.Unmarshal(body, &info); err != nil {
 		return ProviderUsage{}, pollErrf("decode-failed", "litellm key info decode: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return ProviderUsage{}, pollErrf("decode-failed", "litellm key info schema: %v", err)
 	}
 	if strings.TrimSpace(info.Error) != "" {
 		return ProviderUsage{}, pollErrf("provider-error", "litellm key info: %s", strings.TrimSpace(info.Error))
@@ -812,6 +834,11 @@ func litellmPollWithURL(url, token string) (ProviderUsage, error) {
 			return ProviderUsage{}, pollErrf("provider-error", "litellm key info: %s", strings.TrimSpace(info.Info.Error))
 		}
 		info = *info.Info
+		if nested, ok := raw["info"]; ok {
+			if err := json.Unmarshal(nested, &raw); err != nil {
+				return ProviderUsage{}, pollErrf("decode-failed", "litellm key info nested schema: %v", err)
+			}
+		}
 	}
 	account := strings.TrimSpace(info.KeyName)
 	accountIdentity := identity("litellm", account, "litellm:key-info:key_name")
@@ -824,6 +851,9 @@ func litellmPollWithURL(url, token string) (ProviderUsage, error) {
 	}
 	if spent == nil {
 		spent = info.Spend
+	}
+	if max == nil && litellmExplicitlyUnmetered(raw, spent) {
+		return ProviderUsage{DisplayName: "LiteLLM", Account: accountIdentity, Status: "unmetered"}, nil
 	}
 	if max == nil || *max <= 0 || spent == nil || *spent < 0 {
 		return ProviderUsage{DisplayName: "LiteLLM", Account: accountIdentity, Status: "untracked"}, nil

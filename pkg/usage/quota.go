@@ -435,6 +435,16 @@ func (e *QuotaEngine) ComputeAll(snap *UsageSnapshot) map[string]BurnState {
 		plan := prov.Plan
 		pools := make(map[string]BurnState)
 		providerError := false
+		if prov.Status == "unmetered" && prov.Account != nil && !stale {
+			computed[name] = BurnState{
+				Class:     BurnUntracked,
+				Available: true,
+				Reason:    "unmetered-authenticated",
+				Account:   prov.Account,
+				Plan:      plan,
+			}
+			continue
+		}
 
 		for pool, resources := range poolResources(name, prov) {
 			bs := computeBinding(prov, resources, e.ExhaustedPct, now)

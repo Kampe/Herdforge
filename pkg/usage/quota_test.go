@@ -500,6 +500,19 @@ func TestComputeAllKeepsFiniteLiteLLMBudgetWithoutReset(t *testing.T) {
 	}
 }
 
+func TestComputeAllKeepsAuthenticatedLiteLLMUnmeteredState(t *testing.T) {
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{
+		"opencode": {
+			Status:  "unmetered",
+			Account: identity("litellm", "lazer-unmetered", "litellm:key-info:key_name"),
+		},
+	}}
+	state, ok := newTestEngine().ComputeAll(snap)["opencode"]
+	if !ok || !state.Available || state.Reason != "unmetered-authenticated" || state.Account == nil {
+		t.Fatalf("authenticated unmetered LiteLLM state was not routable: ok=%v state=%+v", ok, state)
+	}
+}
+
 func TestComputeBinding_NoWindows(t *testing.T) {
 	prov := ProviderUsage{
 		Resources: map[string]ResourceUsage{

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/credits"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -107,6 +108,23 @@ func TestLiteLLMFiniteBudgetRoutesOpenCodeDefaultPool(t *testing.T) {
 	state, ok := r.quotaState("opencode", "default")
 	if !ok || !state.Available || state.Reason != "ok" {
 		t.Fatalf("native finite LiteLLM budget did not reach opencode/default: ok=%v state=%+v", ok, state)
+	}
+}
+
+func TestAuthenticatedLiteLLMUnmeteredRoutesWithBoundedConcurrency(t *testing.T) {
+	snap := &usage.UsageSnapshot{Providers: map[string]usage.ProviderUsage{
+		"opencode": {
+			Status:  "unmetered",
+			Account: usageTestIdentity("lazer-unmetered"),
+		},
+	}}
+	r := &SurfaceRouter{Computed: usage.NewQuotaEngine().ComputeAll(snap)}
+	state, ok := r.quotaState("opencode", "default")
+	if !ok || !state.Available || state.Reason != "unmetered-authenticated" {
+		t.Fatalf("authenticated unmetered LiteLLM state did not reach opencode/default: ok=%v state=%+v", ok, state)
+	}
+	if got := credits.ClassConcurrency(credits.PaceClass(state.Class)); got <= 0 || got > 2 {
+		t.Fatalf("unmetered state lost bounded concurrency: %d", got)
 	}
 }
 

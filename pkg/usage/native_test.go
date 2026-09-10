@@ -245,6 +245,30 @@ func TestLiteLLMWithoutEnforceableBudgetIsUntracked(t *testing.T) {
 	}
 }
 
+func TestLiteLLMExplicitNullBudgetIsAuthenticatedUnmetered(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","max_budget":null,"spend":0}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != "unmetered" || len(p.Resources) != 0 || p.Account == nil {
+		t.Fatalf("explicit unlimited budget must retain authenticated unmetered state: %+v", p)
+	}
+}
+
+func TestLiteLLMResponseFlowsThroughQuotaEngineAsUnmetered(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","max_budget":null,"spend":0}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{"opencode": p}}
+	state, ok := NewQuotaEngine().ComputeAll(snap)["opencode"]
+	if !ok || !state.Available || state.Reason != "unmetered-authenticated" || state.Account == nil {
+		t.Fatalf("native response did not flow to authenticated unmetered quota: ok=%v state=%+v provider=%+v", ok, state, p)
+	}
+}
+
 func TestLiteLLMMapsEnforcedBudget(t *testing.T) {
 	s := serve(t, 200, `{"key_name":"lazer","budget_max":100,"budget_spent":40}`)
 	p, err := litellmPollWithURL(s.URL, "tok")
