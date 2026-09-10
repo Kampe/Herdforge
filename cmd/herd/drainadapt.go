@@ -151,6 +151,44 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 	return nil
 }
 
+// retireSourceLanes is the bounded acting drain edge for settled one-off source/mender
+// lanes. It consumes only exact launch manifests; no tab label, board status,
+// callback, or broad filesystem scan can create a cleanup target.
+func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
+	if a == nil || strings.TrimSpace(a.root) == "" {
+		return fmt.Errorf("source retirement authority is unavailable")
+	}
+	registry := herdr.SourceRetirementRegistry{Path: herdr.SourceRetirementRegistryPath(a.root)}
+	all, err := registry.Latest()
+	if err != nil {
+		return err
+	}
+	latest := make(map[string]herdr.SourceRetirementManifest, len(all))
+	for _, m := range all {
+		if err := herdr.ValidateSourceRetirementManifest(m); err != nil {
+			return fmt.Errorf("source manifest generation %s: %w", m.Generation, err)
+		}
+		latest[m.Generation] = m
+	}
+	manifests := make([]herdr.SourceRetirementManifest, 0, len(latest))
+	for _, m := range latest {
+		manifests = append(manifests, m)
+	}
+	if len(manifests) == 0 {
+		return nil
+	}
+	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
+	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: a.repository}
+	result, err := herdr.RetireSourceLanesContext(ctx, op, manifests, false)
+	if err != nil {
+		return err
+	}
+	if result.Blocked > 0 {
+		return fmt.Errorf("%d source retirement lane(s) blocked; retained exact manifests", result.Blocked)
+	}
+	return nil
+}
+
 // authority refuses before any side effect when a required compiled authority
 // was never wired. Unknown authority is never treated as permission.
 func (a *drainAdapters) authority() error {
