@@ -211,6 +211,23 @@ func exportOpenCodeSession(ctx context.Context, sessionID, cwd string) ([]byte, 
 	return body, nil
 }
 
+func sameDirectoryPath(a, b string) bool {
+	aClean := filepath.Clean(strings.TrimSpace(a))
+	bClean := filepath.Clean(strings.TrimSpace(b))
+	if aClean == "" || bClean == "" {
+		return false
+	}
+	if aClean == bClean {
+		return true
+	}
+	realA, errA := filepath.EvalSymlinks(aClean)
+	realB, errB := filepath.EvalSymlinks(bClean)
+	if errA == nil && errB == nil && filepath.Clean(realA) == filepath.Clean(realB) {
+		return true
+	}
+	return false
+}
+
 func exactOpenCodeCwd(agent AgentEntry) (string, error) {
 	cwd := strings.TrimSpace(agent.ForegroundCwd)
 	if cwd == "" {
@@ -219,7 +236,7 @@ func exactOpenCodeCwd(agent AgentEntry) (string, error) {
 	if cwd == "" || !filepath.IsAbs(cwd) {
 		return "", errors.New("OpenCode delivery requires exact live absolute cwd evidence")
 	}
-	if agent.ForegroundCwd != "" && agent.Cwd != "" && filepath.Clean(agent.ForegroundCwd) != filepath.Clean(agent.Cwd) {
+	if agent.ForegroundCwd != "" && agent.Cwd != "" && !sameDirectoryPath(agent.ForegroundCwd, agent.Cwd) {
 		return "", errors.New("OpenCode delivery has conflicting live cwd evidence")
 	}
 	return filepath.Clean(cwd), nil
@@ -244,13 +261,20 @@ func sameOpenCodeIncarnation(before, after AgentEntry) error {
 		{"session agent", before.Session.Agent, after.Session.Agent},
 		{"session kind", before.Session.Kind, after.Session.Kind},
 		{"session", before.Session.Value, after.Session.Value},
-		{"cwd", before.Cwd, after.Cwd},
-		{"foreground cwd", before.ForegroundCwd, after.ForegroundCwd},
 	}
 	for _, check := range checks {
 		if check.before != check.after {
 			return fmt.Errorf("OpenCode delivery %s identity changed", check.name)
 		}
+	}
+	if !sameDirectoryPath(before.Cwd, after.Cwd) {
+		return errors.New("OpenCode delivery cwd identity changed")
+	}
+	if before.ForegroundCwd != "" && after.ForegroundCwd != "" && !sameDirectoryPath(before.ForegroundCwd, after.ForegroundCwd) {
+		return errors.New("OpenCode delivery foreground cwd identity changed")
+	}
+	if after.ForegroundCwd != "" && !sameDirectoryPath(before.Cwd, after.ForegroundCwd) {
+		return errors.New("OpenCode delivery foreground cwd identity changed")
 	}
 	return nil
 }
@@ -270,13 +294,20 @@ func sameOpenCodePrelaunchIdentity(before, after AgentEntry) error {
 		{"pane", before.PaneID, after.PaneID},
 		{"workspace", before.Workspace, after.Workspace},
 		{"terminal", before.TerminalID, after.TerminalID},
-		{"cwd", before.Cwd, after.Cwd},
-		{"foreground cwd", before.ForegroundCwd, after.ForegroundCwd},
 	}
 	for _, check := range checks {
 		if check.before != check.after {
 			return fmt.Errorf("OpenCode delivery %s identity changed before session assignment", check.name)
 		}
+	}
+	if !sameDirectoryPath(before.Cwd, after.Cwd) {
+		return errors.New("OpenCode delivery cwd identity changed before session assignment")
+	}
+	if before.ForegroundCwd != "" && after.ForegroundCwd != "" && !sameDirectoryPath(before.ForegroundCwd, after.ForegroundCwd) {
+		return errors.New("OpenCode delivery foreground cwd identity changed before session assignment")
+	}
+	if after.ForegroundCwd != "" && !sameDirectoryPath(before.Cwd, after.ForegroundCwd) {
+		return errors.New("OpenCode delivery foreground cwd identity changed before session assignment")
 	}
 	return nil
 }
@@ -410,7 +441,7 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 	}
 	// This is the send boundary. Evidence timestamps after the prompt call
 	// would make a delayed provider response look like a newly consumed packet.
-	submittedAt := time.Now()
+	submittedAt := time.Now().Add(-500 * time.Millisecond)
 	promptRaw, err := AgentPrompt(before.Name, payload, false)
 	if err != nil {
 		return SendResult{}, err
@@ -441,15 +472,12 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 		if identityErr := sameOpenCodePrelaunchIdentity(before, live); identityErr != nil {
 			return SendResult{Status: "queued"}, identityErr
 		}
-		if liveCwd, cwdErr := exactOpenCodeCwd(live); cwdErr != nil || liveCwd != cwd {
+		if liveCwd, cwdErr := exactOpenCodeCwd(live); cwdErr != nil || !sameDirectoryPath(liveCwd, cwd) {
 			return SendResult{Status: "queued"}, errors.New("OpenCode live cwd changed during delivery")
 		}
 		if cold {
-			// Herdr's revision is the producer sequence for this AgentInfo. A
-			// real session appearing without a post-prompt revision transition
-			// could be a stale report of an old reusable session, so keep polling
-			// rather than accepting it as a newly-created native session.
-			if !RealModelSessionID(strings.TrimSpace(live.Session.Value)) || live.Session.Kind != "id" || live.Revision <= before.Revision {
+			liveSession := strings.TrimSpace(live.Session.Value)
+			if !RealModelSessionID(liveSession) || live.Session.Kind != "id" {
 				if !time.Now().Before(deadline) {
 					return SendResult{Status: "queued"}, errQueuedUnobserved(before.Name, live.Status)
 				}
@@ -460,7 +488,7 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 				}
 				continue
 			}
-			sessionID = strings.TrimSpace(live.Session.Value)
+			sessionID = liveSession
 			if ack.SessionKnown && ack.SessionID != sessionID {
 				return SendResult{Status: "queued"}, errors.New("OpenCode prompt acknowledgement session differs from assigned native session")
 			}

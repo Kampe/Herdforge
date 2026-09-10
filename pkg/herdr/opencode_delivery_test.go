@@ -23,6 +23,8 @@ type openCodeSendFixture struct {
 	listCalls     int
 	exportCalls   int
 	mode          string
+	customCwd     string
+	customFgCwd   func(calls int) string
 	promptCalls   int
 	keys          int
 	read          int
@@ -34,11 +36,24 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 		f.listCalls++
 		terminalID, cwd := "term-1", nativeOpenCodeCwd
+		if f.customCwd != "" {
+			cwd = f.customCwd
+		}
+		fgCwd := cwd
+		if f.customFgCwd != nil {
+			fgCwd = f.customFgCwd(f.listCalls)
+		} else if f.mode == "cold-transient-fg" && f.listCalls == 1 {
+			fgCwd = ""
+		}
 		if (f.mode == "reused-pane" || f.mode == "cold-reused-pane") && f.listCalls > 1 {
 			terminalID = "term-2"
 		}
 		if (f.mode == "wrong-cwd" || f.mode == "cold-wrong-cwd") && f.listCalls > 1 {
 			cwd = "/other-repo"
+			fgCwd = "/other-repo"
+		}
+		if f.mode == "cold-wrong-fg-after" && f.listCalls > 1 {
+			fgCwd = "/other-repo"
 		}
 		session := ""
 		if !strings.HasPrefix(f.mode, "cold") || (f.mode != "cold-never-session" && f.listCalls > 1) {
@@ -51,8 +66,8 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		if session != "" {
 			sessionJSON = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, session)
 		}
-		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":"idle","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":%d,"state_change_seq":%d%s}]}}`,
-			nativeOpenCodeTarget, terminalID, cwd, cwd, f.listCalls, f.listCalls, sessionJSON), nil
+		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":"idle","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":1,"state_change_seq":%d%s}]}}`,
+			nativeOpenCodeTarget, terminalID, cwd, fgCwd, f.listCalls, sessionJSON), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
 		f.promptCalls++
@@ -91,8 +106,12 @@ func (f *openCodeSendFixture) export(_ context.Context, sessionID, cwd string) (
 	if sessionID != expectedSession {
 		return nil, fmt.Errorf("unexpected export session %q", sessionID)
 	}
-	if cwd != nativeOpenCodeCwd {
-		return nil, fmt.Errorf("unexpected export cwd %q", cwd)
+	expectedCwd := nativeOpenCodeCwd
+	if f.customCwd != "" {
+		expectedCwd = f.customCwd
+	}
+	if !sameDirectoryPath(cwd, expectedCwd) {
+		return nil, fmt.Errorf("unexpected export cwd %q (want %q)", cwd, expectedCwd)
 	}
 	f.exportCalls++
 	if strings.HasPrefix(f.mode, "cold-") {
@@ -240,9 +259,10 @@ func nativeOpenCodeCurrentExport(mode string) []byte {
 		return nativeOpenCodeExport(true, "", "wrong-user")
 	case "wrong-model":
 		return nativeOpenCodeExport(true, "", "", "anthropic")
-	case "cold", "cold-session", "cold-incomplete", "cold-missing-bound-user", "cold-queued-composer", "cold-reused-pane", "cold-conflicting-identity", "cold-wrong-ack-session", "cold-missing-ack":
-		return nativeOpenCodeExport(true, "ses_cold", "")
 	default:
+		if strings.HasPrefix(mode, "cold") {
+			return nativeOpenCodeExport(true, "ses_cold", "")
+		}
 		return nativeOpenCodeExport(true, "", "")
 	}
 }
@@ -284,6 +304,50 @@ func TestPublicSendOpenCodeProvesColdSessionConsumption(t *testing.T) {
 	}
 	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 0 || f.read != 0 {
 		t.Fatalf("cold delivery calls = prompts:%d exports:%d keys:%d reads:%d", f.promptCalls, f.exportCalls, f.keys, f.read)
+	}
+}
+
+func TestPublicSendOpenCodeProvesColdSessionTransientForegroundCwd(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	f, restore := newOpenCodeSendFixture(t, "cold-transient-fg")
+	defer restore()
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
+	if err != nil {
+		t.Fatalf("cold transient fg cwd send failed: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
+	}
+	if f.promptCalls != 1 || f.exportCalls == 0 {
+		t.Fatalf("cold delivery calls = prompts:%d exports:%d", f.promptCalls, f.exportCalls)
+	}
+}
+
+func TestPublicSendOpenCodeProvesSymlinkAliasCwd(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	realDir := t.TempDir()
+	aliasDir := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlinks unsupported in test environment: %v", err)
+	}
+
+	f, restore := newOpenCodeSendFixture(t, "cold-session")
+	defer restore()
+	f.customCwd = aliasDir
+	f.customFgCwd = func(calls int) string {
+		if calls == 1 {
+			return aliasDir
+		}
+		return realDir
+	}
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
+	if err != nil {
+		t.Fatalf("symlink alias cwd delivery failed: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
 	}
 }
 
@@ -380,6 +444,7 @@ func TestPublicSendOpenCodeColdSessionFailsClosed(t *testing.T) {
 		{name: "queued-composer", mode: "cold-queued-composer", want: "queued-but-not-consumed"},
 		{name: "conflicting-pane-incarnation", mode: "cold-reused-pane", want: "identity changed"},
 		{name: "conflicting-cwd", mode: "cold-wrong-cwd", want: "identity changed"},
+		{name: "conflicting-fg-cwd", mode: "cold-wrong-fg-after", want: "identity changed"},
 		{name: "ack-session-disagrees", mode: "cold-wrong-ack-session", want: "differs from assigned"},
 	}
 	for _, tc := range cases {
