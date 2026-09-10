@@ -182,14 +182,20 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	g, _, _ := governorFor(t, "host", 900000, 900000)
 	g.Processes = idleProcessInspector{}
 	g.Policy.OrphanRoots = []string{filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")}
-	g.Policy.OrphanDerivedTargets = []string{"graph.db", "bootstrap-go-mod"}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db", "bootstrap-go-mod", "bootstrap-go-build"}
 	g.Policy.OrphanCacheTTL = time.Hour
 	g.Policy.OrphanCacheBudgetBytes = 1 << 20
+	g.Policy.ReapBatchLimit = 4
 	g.Policy.GeneratedDirectories = []string{"unused-generated-cache"}
 	orphan := filepath.Join(g.Policy.OrphanRoots[0], "fac-683")
 	digest := strings.Repeat("b", 64)
-	cache := filepath.Join(orphan, ".herd", "bootstrap", "cache", digest, "go-mod")
+	cacheRoot := filepath.Join(orphan, ".herd", "bootstrap", "cache", digest)
+	cache := filepath.Join(cacheRoot, "go-mod")
+	buildCache := filepath.Join(cacheRoot, "go-build")
 	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(buildCache, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	// The producer owns the private digest ancestor, while the package tool
@@ -197,11 +203,17 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	if err := os.Chmod(cache, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(buildCache, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	graph := filepath.Join(orphan, "graph.db")
 	if err := os.WriteFile(graph, []byte("graph-index"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cache, "module.zip"), []byte("module-cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(buildCache, "compile.a"), []byte("build-cache"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	receipt := `{"version":1,"contract_digest":"contract","toolchain_digest":"` + digest + `","cache_dir":".herd/bootstrap/cache/` + digest + `"}`
@@ -218,11 +230,14 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	if err := os.Chtimes(cache, old, old); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chtimes(buildCache, old, old); err != nil {
+		t.Fatal(err)
+	}
 	report, err := g.Run(context.Background(), RunOptions{Apply: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Reaped != 2 || report.ReclaimedBytes == 0 || len(report.OrphanTargets) != 2 {
+	if report.Reaped != 3 || report.ReclaimedBytes == 0 || len(report.OrphanTargets) != 3 {
 		t.Fatalf("proof-backed orphan cleanup=%+v", report)
 	}
 	if _, err := os.Stat(graph); !errors.Is(err, os.ErrNotExist) {
@@ -230,6 +245,9 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	}
 	if _, err := os.Stat(cache); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("go-mod cache was not reaped: %v", err)
+	}
+	if _, err := os.Stat(buildCache); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("go-build cache was not reaped: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json")); err != nil {
 		t.Fatalf("bootstrap receipt was removed: %v", err)

@@ -97,7 +97,7 @@ func (p GovernorPolicy) validate() error {
 	if strings.TrimSpace(p.HostID) == "" || strings.TrimSpace(p.RepositoryRoot) == "" || strings.TrimSpace(p.LockPath) == "" {
 		return errors.New("resource governor requires host, repository root, and lock path")
 	}
-	if len(p.GeneratedDirectories) == 0 {
+	if len(p.GeneratedDirectories) == 0 && len(p.OrphanDerivedTargets) == 0 {
 		return errors.New("resource governor requires declared generated directories")
 	}
 	if p.PressureBytes == 0 || p.RecoveryBytes <= p.PressureBytes || p.TaskReserveBytes == 0 {
@@ -116,7 +116,7 @@ func (p GovernorPolicy) validate() error {
 		return errors.New("orphan cache targets require a positive TTL and nonzero budget")
 	}
 	for _, target := range p.OrphanDerivedTargets {
-		if target != "graph.db" && target != "bootstrap-go-mod" {
+		if target != "graph.db" && target != "bootstrap-go-mod" && target != "bootstrap-go-build" {
 			return fmt.Errorf("unsupported orphan derived target %q", target)
 		}
 	}
@@ -604,7 +604,7 @@ func orphanTargetPath(orphan, policyTarget string) (string, string, error) {
 	switch policyTarget {
 	case "graph.db":
 		return filepath.Join(orphan, "graph.db"), "graph.db", nil
-	case "bootstrap-go-mod":
+	case "bootstrap-go-mod", "bootstrap-go-build":
 		data, err := os.ReadFile(filepath.Join(orphan, filepath.FromSlash(gitroot.BootstrapReceiptPath)))
 		if err != nil {
 			return "", "", errors.New("bootstrap_receipt_unavailable")
@@ -618,7 +618,11 @@ func orphanTargetPath(orphan, policyTarget string) (string, string, error) {
 		if !strings.HasPrefix(cache, wantPrefix) || strings.Count(strings.TrimPrefix(cache, wantPrefix), "/") != 0 {
 			return "", "", errors.New("bootstrap_cache_receipt_path_invalid")
 		}
-		return filepath.Join(orphan, filepath.FromSlash(cache), "go-mod"), filepath.ToSlash(filepath.Join(cache, "go-mod")), nil
+		child := "go-mod"
+		if policyTarget == "bootstrap-go-build" {
+			child = "go-build"
+		}
+		return filepath.Join(orphan, filepath.FromSlash(cache), child), filepath.ToSlash(filepath.Join(cache, child)), nil
 	default:
 		return "", "", errors.New("orphan_derived_target_policy_invalid")
 	}
@@ -639,7 +643,7 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if info.Mode()&os.ModeSymlink != 0 {
 		return PhysicalUsage{}, false, "derived_target_symlink"
 	}
-	if policyTarget == "bootstrap-go-mod" && !info.IsDir() {
+	if (policyTarget == "bootstrap-go-mod" || policyTarget == "bootstrap-go-build") && !info.IsDir() {
 		return PhysicalUsage{}, false, "bootstrap_cache_not_directory"
 	}
 	if policyTarget == "graph.db" && !info.Mode().IsRegular() {
@@ -836,6 +840,8 @@ func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorRepor
 		policyTarget := "graph.db"
 		if strings.HasSuffix(report.OrphanTargets[i].RelativePath, "/go-mod") {
 			policyTarget = "bootstrap-go-mod"
+		} else if strings.HasSuffix(report.OrphanTargets[i].RelativePath, "/go-build") {
+			policyTarget = "bootstrap-go-build"
 		}
 		usage, eligible, reason := g.orphanTargetProof(ctx, orphan, report.OrphanTargets[i].Path, policyTarget, report.CapacityBefore)
 		if !eligible {

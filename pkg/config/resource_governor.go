@@ -67,7 +67,7 @@ func (g ResourceGovernor) Validate() error {
 	if g.Version != "v1" {
 		return fmt.Errorf("resource_governor.version: unsupported version %q", g.Version)
 	}
-	if len(g.GeneratedDirectories) == 0 {
+	if len(g.GeneratedDirectories) == 0 && len(g.OrphanDerivedTargets) == 0 {
 		return fmt.Errorf("resource_governor.generated_directories: at least one exact repository-relative directory is required")
 	}
 	seenOrphan := make(map[string]struct{}, len(g.OrphanDerivedTargets))
@@ -76,7 +76,7 @@ func (g ResourceGovernor) Validate() error {
 		if clean != raw || clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: must be an exact orphan-relative path", i)
 		}
-		if clean != "graph.db" && clean != "bootstrap-go-mod" {
+		if clean != "graph.db" && clean != "bootstrap-go-mod" && clean != "bootstrap-go-build" {
 			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: unsupported derived target %q", i, raw)
 		}
 		if _, ok := seenOrphan[clean]; ok {
