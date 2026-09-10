@@ -437,6 +437,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "resource-governor":
+		if err := runResourceGovernorCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd resource-governor: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "worktree-reap":
 		if err := runWorktreeReap(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "herd worktree-reap: %v\n", err)
@@ -5240,6 +5246,13 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		}
 		d.Compensator = compensator
 		defer compensator.Close()
+	}
+	governorRoot := "."
+	if wm != nil && strings.TrimSpace(wm.RepoRoot) != "" {
+		governorRoot = wm.RepoRoot
+	}
+	if governorErr := attachResourceGovernor(d, cfg, governorRoot); governorErr != nil {
+		return nil, nil, fmt.Errorf("resource governor: %w", governorErr)
 	}
 	// A fresh checkout may not have a previously published scopefence row.
 	// Dispatch's dependency gate can still establish the authoritative graph,
@@ -10802,9 +10815,25 @@ type cliForgeDriver struct {
 	cfg               *config.Config
 	maxLanes          int
 	environmentPlanID string
+	resourceGovernor  *resources.Governor
 	observer          *herdr.ProductionReconciliationObserver
 	fleet             herdr.FleetStatus
 	reconcileBlocked  bool
+}
+
+// SweepCapacity binds the forge loop's lifecycle contract to the native
+// repository governor. A disabled policy is an explicit no-op; an enabled
+// policy is always observed fail-closed at each required seam.
+func (d *cliForgeDriver) SweepCapacity(ctx context.Context, trigger resources.SweepTrigger) error {
+	if d == nil || d.resourceGovernor == nil {
+		return nil
+	}
+	report, err := d.resourceGovernor.Sweep(ctx, trigger, d.resourceGovernor.LifecycleApply())
+	if err != nil {
+		return err
+	}
+	d.Log(fmt.Sprintf("resource governor: trigger=%s mode=%s available=%d", trigger, report.Mode, report.AvailableDispatchConcurrency))
+	return nil
 }
 
 // newProductionForgeObserver is the one production composition for the
@@ -11842,7 +11871,12 @@ func forgeLoopMain() int {
 		fmt.Fprintf(os.Stderr, "forge --loop: %v\n", observerErr)
 		return 1
 	}
-	driver := &cliForgeDriver{cfg: cfg, maxLanes: maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID)}
+	resourceGovernor, governorErr := newResourceGovernor(cfg, forgeControlRoot)
+	if governorErr != nil {
+		fmt.Fprintf(os.Stderr, "forge --loop: resource governor: %v\n", governorErr)
+		return 1
+	}
+	driver := &cliForgeDriver{cfg: cfg, maxLanes: maxLanes, environmentPlanID: strings.TrimSpace(*environmentPlanID), resourceGovernor: resourceGovernor}
 	driver.observer = observer
 	forgeBudget := budget.NewBudgetManager(*maxBudgetUSD)
 	blockers := func(ctx context.Context) (map[string]string, error) {
