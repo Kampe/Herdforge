@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
@@ -482,7 +483,15 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 		}
 	}
 	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
-	r := Triage(agents, kick.StandingIDs(), check, kick.ProviderDeathCheck)
+	evidenceResolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string) {
+		a, found := findAttentionAgent(agents, name)
+		if !found {
+			return nil, process.SessionContext{}, ""
+		}
+		ev, sctx, paneText, _ := process.ResolveNativeAgentEvidence(context.Background(), a.Session.Value, a.Kind, a.Cwd, time.Now().UTC(), 5*time.Minute)
+		return ev, sctx, paneText
+	}
+	r := TriageWithEvidence(agents, kick.StandingIDs(), check, evidenceResolver, kick.ProviderDeathCheck)
 	// A degraded lane is CRITICAL and must not be silently downgraded to
 	// whatever its live status happened to be: an ambiguous task binding is a
 	// real finding, not a healthy idle lane.

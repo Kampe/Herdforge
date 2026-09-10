@@ -96,6 +96,12 @@ func runSpin() {
 		tail, _ := herdr.PaneRead(a.PaneID, *tailLines)
 		pid, cwd, alive := paneProcessState(a.PaneID)
 
+		ev, sctx, _, _ := process.ResolveNativeAgentEvidence(ctx, a.Session.Value, a.Kind, cwd, now, 5*time.Minute)
+		target := process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)
+		if target.Class == process.Quota && ev != nil {
+			process.EvaluateAndRecordStop(ev, sctx, tail, 15*time.Minute)
+		}
+
 		obs := spin.Observation{
 			PaneID:      a.PaneID,
 			Name:        a.Name,
@@ -103,7 +109,7 @@ func runSpin() {
 			PID:         pid,
 			ProcAlive:   alive,
 			UniqueWork:  spin.TriUnknown,
-			Diagnostic:  string(process.ClassifyTarget(a.PaneID, a.Name, a.Status, tail).Class),
+			Diagnostic:  string(target.Class),
 			Progress:    spin.Progress{StateChangeSeq: a.StateChangeSeq},
 		}
 

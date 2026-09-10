@@ -39,15 +39,39 @@ import (
 // LiveStatuses identifies statuses that mean "agent session still holds the name".
 const LiveStatuses = "working|idle|starting|done|blocked"
 
+// AgentSession captures the agent session object or string value from herdr.
+type AgentSession struct {
+	Value string `json:"value,omitempty"`
+}
+
+func (s *AgentSession) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		s.Value = str
+		return nil
+	}
+	var obj struct {
+		Value string `json:"value,omitempty"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		s.Value = obj.Value
+		return nil
+	}
+	return nil
+}
+
 // AgentEntry represents a single agent from herdr agent list.
 type AgentEntry struct {
-	Name        string `json:"name,omitempty"`
-	Label       string `json:"label,omitempty"`
-	Status      string `json:"agent_status,omitempty"`
-	PaneID      string `json:"pane_id,omitempty"`
-	TabID       string `json:"tab_id,omitempty"`
-	Workspace   string `json:"workspace_id,omitempty"`
-	Interactive *bool  `json:"interactive,omitempty"`
+	Name        string       `json:"name,omitempty"`
+	Label       string       `json:"label,omitempty"`
+	Kind        string       `json:"agent,omitempty"`
+	Status      string       `json:"agent_status,omitempty"`
+	PaneID      string       `json:"pane_id,omitempty"`
+	TabID       string       `json:"tab_id,omitempty"`
+	Workspace   string       `json:"workspace_id,omitempty"`
+	Cwd         string       `json:"cwd,omitempty"`
+	Interactive *bool        `json:"interactive,omitempty"`
+	Session     AgentSession `json:"agent_session,omitempty"`
 }
 
 // AgentListResult wraps the herdr agent list response.
