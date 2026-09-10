@@ -160,7 +160,8 @@ func TestReviewPacketBindsResolvedCardFromBranchSelector(t *testing.T) {
 		t.Fatalf("packet identity = %q, want FAC-755", card)
 	}
 	body := reviewPacketBody("herd/fac-755", strings.Repeat("a", 40),
-		".herd/review-surfaces/review-herd-fac-755",
+		"base", ".herd/review-surfaces/review-herd-fac-755",
+		".herd/pool/pool-01",
 		"/repo/.herd/review/inbox/v.md",
 		"forge-review-supervisor-4922de28", "xai", "wK", card)
 	if strings.Contains(body, "\ntask: herd/fac-755\n") {
