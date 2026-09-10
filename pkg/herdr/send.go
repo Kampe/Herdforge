@@ -10,10 +10,10 @@ import (
 )
 
 // Port of bin/herd-send: submit text to a herdr agent pane and confirm the
-// agent CONSUMED it. Status is only one part of the proof: verified delivery
-// also requires the submitted task text to appear in pane readback. A submit
-// that lands in a dead pane, or remains staged as pasted text, must not look
-// successful.
+// agent CONSUMED it. Status is only one part of the proof: normal verified
+// delivery requires task-specific pane evidence, while native OpenCode uses
+// its identity-bound session export. A submit that lands in a dead pane, or
+// remains staged as pasted text, must not look successful.
 
 // StatusFromList extracts the agent_status for a target (name or pane id).
 // Pure so the selftest can pin extraction without a live herdr.
@@ -226,7 +226,7 @@ func SendKeys(target, keys string) error {
 // payload is filed on the durable mailbox and the status is queued-durable.
 // Authenticated urgent control uses SendStatus, which still delivers
 // immediately. When verify is set on the idle path, Send polls for
-// prompt-correlated pane evidence. It does NOT answer trust/approval dialogs.
+// prompt-correlated evidence. It does NOT answer trust/approval dialogs.
 func Send(target, text string, verify bool, timeout time.Duration) (string, error) {
 	result, err := deliverRoutine(target, text, verify, timeout, "")
 	return result.Status, err
@@ -316,11 +316,12 @@ func formatSendResult(target, workspace, status, envelopeID string) string {
 // visible in its pane, which is what makes echo-based proof possible.
 //
 // Codex echoes, which is why delivery verification has always worked there.
-// Claude Code does not. Listing the echoing harnesses rather than the silent
-// ones keeps the strong proof as the default for anything unrecognised.
+// Claude Code does not. OpenCode has a structured native session export, so it
+// is deliberately excluded from the pane-echo list and verified through that
+// stronger identity-bound path instead.
 func harnessEchoesPrompt(kind string) bool {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "codex", "opencode", "ollama", "lazer", "pi":
+	case "codex", "ollama", "lazer", "pi":
 		return true
 	default:
 		return false
@@ -447,6 +448,9 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 	}
 	baselinePane := ""
 	if verify {
+		if strings.EqualFold(resolved.Kind, "opencode") {
+			return deliverOpenCode(resolvedTarget, text, timeout, resolved, workspace)
+		}
 		baselinePane, err = PaneRead(resolved.PaneID, 120)
 		if err != nil {
 			return SendResult{}, fmt.Errorf("agent '%s' pre-send pane readback failed: %w", resolvedTarget, err)
@@ -458,7 +462,9 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 	// Herdr can return after writing TEXT while the pane composer is still
 	// processing it.  Submit once immediately so a following status poll does
 	// not observe text stranded in the composer (FAC-388).
-	_ = SendKeys(resolvedTarget, "Enter")
+	if !strings.EqualFold(resolved.Kind, "opencode") {
+		_ = SendKeys(resolvedTarget, "Enter")
+	}
 	if !verify {
 		return SendResult{Status: "submitted"}, nil
 	}
