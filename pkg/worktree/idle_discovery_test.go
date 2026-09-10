@@ -3,6 +3,7 @@ package worktree
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,11 +40,53 @@ func makeIdlePoolRoot(t *testing.T, repoRoot, name string, base string) *Pool {
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure %s: %v", name, err)
 	}
+	// A fixture pool root carries positive retirement evidence by default:
+	// under the native contract a pool absent from the manifest registry is
+	// not automatically disposable, so every fixture pool records one
+	// completed generation. Guards under test (dirty/leased/unmerged) keep
+	// their own refusals on top of this.
+	makeRetirementEvidence(t, repoRoot, name)
 	return pool
 }
 
+// makeRetirementEvidence appends the positive retirement evidence the
+// native contract requires before a pool root is disposable: a manifest
+// registry row naming the pool and a phase journal record confirming that
+// exact generation complete. Without it a pool root retains, whatever its
+// cleanliness. Appending keeps evidence for every fixture pool cumulative.
+func makeRetirementEvidence(t *testing.T, repoRoot, poolName string) (string, string) {
+	t.Helper()
+	manifestPath := filepath.Join(repoRoot, "retirement-manifests.jsonl")
+	journalPath := filepath.Join(repoRoot, "retirement-phases.jsonl")
+	row := fmt.Sprintf(`{"pool":".herd/%s","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1"}`+"\n", poolName)
+	if err := appendEvidenceLine(manifestPath, row); err != nil {
+		t.Fatal(err)
+	}
+	rec := fmt.Sprintf(`{"pool":".herd/%s","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1","phase":"complete"}`+"\n", poolName)
+	if err := appendEvidenceLine(journalPath, rec); err != nil {
+		t.Fatal(err)
+	}
+	return manifestPath, journalPath
+}
+
+func appendEvidenceLine(path, line string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(line)
+	return err
+}
+
 func testCfg(root string) IdlePoolDiscoveryConfig {
-	return IdlePoolDiscoveryConfig{RepoRoot: root, DefaultBase: "main", ProcessInspector: fakeKnownEmptyInspector{}}
+	return IdlePoolDiscoveryConfig{
+		RepoRoot:         root,
+		DefaultBase:      "main",
+		ProcessInspector: fakeKnownEmptyInspector{},
+		ManifestPath:     filepath.Join(root, "retirement-manifests.jsonl"),
+		PhaseJournalPath: filepath.Join(root, "retirement-phases.jsonl"),
+	}
 }
 
 func TestDiscoverIdlePools_FindsCleanNonCurrentPoolsEligible(t *testing.T) {
@@ -523,5 +566,51 @@ func TestDiscoverIdlePools_CanceledContextIsRespectedNotSilentlyIgnored(t *testi
 	slots, err := NewPool(root, filepath.Join(root, ".herd", "pool-fac-a"), 0).Slots()
 	if err != nil || len(slots) != 1 {
 		t.Fatalf("a canceled tick must not mutate anything: slots=%d err=%v", len(slots), err)
+	}
+}
+
+// TestDiscoverIdlePools_PoolAbsentFromManifestRetains pins the positive-
+// evidence contract at the discovery surface: a clean, unleased, registered,
+// reachable pool root that the manifest registry never named is RETAINED,
+// not eligible -- unknown scope is not automatically disposable.
+func TestDiscoverIdlePools_PoolAbsentFromManifestRetains(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	makeIdlePoolRoot(t, root, "pool-fac-a", "main")
+	// pool-fac-b gets NO evidence file rows: its manifest mention is
+	// stripped after the fixture created it.
+	evidenced := makeIdlePoolRoot(t, root, "pool-fac-b", "main")
+	_ = evidenced
+	manifestPath := filepath.Join(root, "retirement-manifests.jsonl")
+	journalPath := filepath.Join(root, "retirement-phases.jsonl")
+	stripRow := func(path, pool string) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var kept []string
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if !strings.Contains(line, `.herd/`+pool+`"`) {
+				kept = append(kept, line)
+			}
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stripRow(manifestPath, "pool-fac-b")
+	stripRow(journalPath, "pool-fac-b")
+
+	result, err := DiscoverIdlePools(context.Background(), testCfg(root))
+	if err != nil {
+		t.Fatalf("DiscoverIdlePools: %v", err)
+	}
+	if result.Eligible != 1 || result.Retained != 1 {
+		t.Fatalf("absent-evidence pool must retain while evidenced pool is eligible: %+v", result)
+	}
+	for _, d := range result.Dispositions {
+		if d.Root == "pool-fac-b" && d.Status != IdlePoolRetained {
+			t.Fatalf("pool-fac-b must be retained, got %+v", d)
+		}
 	}
 }

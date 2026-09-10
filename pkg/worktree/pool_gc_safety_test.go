@@ -3,11 +3,13 @@ package worktree
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -653,5 +655,141 @@ func TestPoolGCPlanReflectsRetirementEvidenceRefusal(t *testing.T) {
 	}
 	if len(decisions) != 1 || !decisions[0].Refused || !strings.Contains(decisions[0].Reason, "retirement evidence") {
 		t.Fatalf("dry run must refuse the protected pool, got %+v", decisions)
+	}
+}
+
+// TestPoolGCRefusesPoolAbsentFromManifest pins the positive-evidence
+// contract: a same-owner pool with NO retirement evidence on file is not
+// automatically disposable -- lease/history plus registered/reachable clean
+// state alone is not authority. Unknown scope retains.
+func TestPoolGCRefusesPoolAbsentFromManifest(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	// Real authority over evidence files that exist but never name this
+	// pool: some OTHER pool's completed generation, or nothing at all.
+	manifestPath := filepath.Join(root, "retirement-manifests.jsonl")
+	journalPath := filepath.Join(root, "retirement-phases.jsonl")
+	if err := os.WriteFile(manifestPath, []byte(`{"pool":".herd/pool-other","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authority := NewManifestRetirementAuthority(root, manifestPath, journalPath)
+
+	if err := pool.GC(context.Background(), authority); err == nil || !strings.Contains(err.Error(), "not automatically disposable") {
+		t.Fatalf("pool absent from the manifest must refuse GC, got err=%v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("refused GC must remove nothing, slots=%d err=%v", len(slots), err)
+	}
+	decisions, err := pool.GCPlan(context.Background(), authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || !decisions[0].Refused || !strings.Contains(decisions[0].Reason, "not automatically disposable") {
+		t.Fatalf("dry run must refuse the unknown-scope pool, got %+v", decisions)
+	}
+}
+
+// TestPoolGCReplacementAtDestructiveBoundarySurvives is the deterministic
+// regression for the destructive bug: a replacement that occupies the slot
+// path exactly at the destructive boundary (via the injected seam, standing
+// in for the racer that otherwise needs a microscopic timing window to
+// exploit) must survive untouched, the pass must refuse, and git metadata
+// must stay consistent. Under the previous direct git-worktree-remove
+// behavior the same injected replacement is silently destroyed and the
+// removal is claimed as success.
+func TestPoolGCReplacementAtDestructiveBoundarySurvives(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("precondition: 1 clean slot, got %d err=%v", len(slots), err)
+	}
+	slotPath := slots[0].Path
+
+	// The forged replacement must look exactly like the registered worktree
+	// it displaced (same .git pointer, fully clean tree) so that the
+	// previous direct-removal behavior has nothing to refuse it on.
+	gitPointer, err := os.ReadFile(filepath.Join(slotPath, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacementIno uint64
+	pool.OnDestructiveBoundary = func(path string) error {
+		scratch := filepath.Join(t.TempDir(), "racer-stole-the-original")
+		if err := os.Rename(path, scratch); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(path, ".git"), gitPointer, 0o644); err != nil {
+			return err
+		}
+		reset := exec.Command("git", "-C", path, "reset", "--hard")
+		if out, resetErr := reset.CombinedOutput(); resetErr != nil {
+			return fmt.Errorf("forging clean replacement: %v (%s)", resetErr, strings.TrimSpace(string(out)))
+		}
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			return statErr
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Skip("stat_t identity unavailable on this platform")
+		}
+		replacementIno = stat.Ino
+		return nil
+	}
+
+	gcErr := pool.GC(context.Background(), allowAllRetirementAuthority{})
+
+	// No removal may be claimed for a pass that met a replacement at the
+	// destructive boundary.
+	if gcErr == nil || !strings.Contains(gcErr.Error(), "replaced at the destructive boundary") {
+		t.Fatalf("replacement at the destructive boundary must refuse GC, got err=%v", gcErr)
+	}
+	// The replacement's content survives untouched at the slot path.
+	info, statErr := os.Lstat(slotPath)
+	if statErr != nil {
+		t.Fatalf("replacement must survive the refused pass, stat err=%v", statErr)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Ino != replacementIno {
+		t.Fatalf("the surviving directory is not the replacement (ino %d != %d)", stat.Ino, replacementIno)
+	}
+	if _, statErr := os.Lstat(filepath.Join(slotPath, ".git")); statErr != nil {
+		t.Fatalf("replacement content must be intact, stat err=%v", statErr)
+	}
+	// Pool state was not mutated by the refused pass.
+	after, err := pool.Slots()
+	if err != nil || len(after) != 1 || after[0].Path != slotPath {
+		t.Fatalf("refused pass must leave pool state intact, slots=%+v err=%v", after, err)
+	}
+	// Git metadata stays consistent: the registration still exists.
+	listed, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").CombinedOutput()
+	if listErr != nil || !strings.Contains(string(listed), slotPath) {
+		t.Fatalf("refused pass must keep git registration consistent: %v (%s)", listErr, strings.TrimSpace(string(listed)))
+	}
+	// Nothing was left parked: the atomic rollback restored the directory.
+	entries, readErr := os.ReadDir(filepath.Join(root, ".herd", "pool"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".gc-quarantine-") {
+			t.Fatalf("refused pass must not park a quarantine dir: %s", e.Name())
+		}
 	}
 }

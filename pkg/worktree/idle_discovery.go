@@ -357,9 +357,18 @@ func scanJSONL(path string, fn func([]byte) error) error {
 	return nil
 }
 
-// manifestProtectedPools returns the set of pool roots -- keyed by their
-// absolute, repo-root-resolved identity, never by basename -- still under
-// active or unconfirmed retirement evidence.
+// manifestProtectedPools returns two things, keyed by absolute,
+// repo-identity-bound pool-root paths, never by basename:
+//
+//   - protected: pool roots named by ANY manifest generation that lacks a
+//     matching "complete" record in the retirement phase journal.
+//   - known: pool roots the manifest registry positively names at all.
+//
+// A pool root absent from the manifest is NOT automatically disposable:
+// the destructive authority requires positive evidence, so an unknown or
+// unresolvable pool identity retains. All three evidence inputs are
+// resolved through the ACTUAL repository root identity (symlink-resolved
+// once, here), not the current spelling of a possibly-replaced directory.
 //
 // A pool root is protected while ANY generation the manifest registry ever
 // named for it lacks a matching "complete" record in the retirement phase
@@ -371,12 +380,11 @@ func scanJSONL(path string, fn func([]byte) error) error {
 // retained -- its evidence is preserved (this scan never touches the
 // manifest or phase files), but its now-idle worktrees are eligible again.
 //
-// Manifests are never ignored (a pool never mentioned there gets no
-// protection from this check at all, same as before); what changed is that
-// a mention is no longer a permanent veto. Any unparseable line in either
-// file fails the whole tick closed: evidence integrity is not this scan's
-// to resolve, and protecting nothing is worse than protecting too much when
-// completion cannot be verified.
+// Manifests are never ignored; what changed over time is that a mention is
+// no longer a permanent veto once completion is provable. Any unparseable
+// line in either file fails the whole tick closed: evidence integrity is
+// not this scan's to resolve, and protecting nothing is worse than
+// protecting too much when completion cannot be verified.
 //
 // Keying is by absolute pool-root identity: a recorded manifest path is
 // resolved against the repository root (absolute forms pass through), and
@@ -384,7 +392,15 @@ func scanJSONL(path string, fn func([]byte) error) error {
 // recorded as either a pool root or a slot path protects exactly that pool
 // -- and can never misassociate a same-basename pool under a different
 // repository root.
-func manifestProtectedPools(repoRoot, manifestPath, phaseJournalPath string) (map[string]bool, error) {
+func manifestProtectedPools(repoRoot, manifestPath, phaseJournalPath string) (protected map[string]bool, known map[string]bool, err error) {
+	// Bind every identity to the actual repository root, symlink-resolved:
+	// evidence belongs to the repository and pool that exist on disk under
+	// this root, not to a current path spelling that a replacement could
+	// have rewritten.
+	rootIdentity := filepath.Clean(repoRoot)
+	if resolved, resolveErr := filepath.EvalSymlinks(rootIdentity); resolveErr == nil {
+		rootIdentity = filepath.Clean(resolved)
+	}
 	resolvePoolIdentity := func(recorded string) (string, string) {
 		p := strings.TrimSpace(filepath.ToSlash(recorded))
 		if p == "" {
@@ -397,8 +413,9 @@ func manifestProtectedPools(repoRoot, manifestPath, phaseJournalPath string) (ma
 		// Identity is the real filesystem object, not a path spelling: the
 		// same directory reachable as /var/x and /private/var/x (or through
 		// an ancestor symlink) must resolve to one key. An unresolvable
-		// path (gone mid-tick) keeps its cleaned spelling.
-		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		// path (gone mid-tick) keeps its cleaned spelling -- which can only
+		// over-protect, never under-protect.
+		if resolved, resolveErr := filepath.EvalSymlinks(p); resolveErr == nil {
 			p = resolved
 		}
 		return p, filepath.Dir(p)
@@ -422,10 +439,10 @@ func manifestProtectedPools(repoRoot, manifestPath, phaseJournalPath string) (ma
 		}
 		return nil
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(manifestsByPool) == 0 {
-		return map[string]bool{}, nil
+		return map[string]bool{}, map[string]bool{}, nil
 	}
 
 	completed := make(map[string]bool)
@@ -450,19 +467,29 @@ func manifestProtectedPools(repoRoot, manifestPath, phaseJournalPath string) (ma
 		}
 		return nil
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	protected := make(map[string]bool)
-	for pool, ids := range manifestsByPool {
-		for _, id := range ids {
+	protected = make(map[string]bool)
+	known = make(map[string]bool)
+	for pool := range manifestsByPool {
+		// A pool root that resolves outside the actual repository identity
+		// is mismatched scope: it can never be authorized for destruction
+		// from this root, and its mention protects it (retain, fail closed).
+		if pool != rootIdentity && !strings.HasPrefix(pool, rootIdentity+string(filepath.Separator)) {
+			protected[pool] = true
+			known[pool] = true
+			continue
+		}
+		known[pool] = true
+		for _, id := range manifestsByPool[pool] {
 			if !completed[id.key(pool)] {
 				protected[pool] = true
 				break
 			}
 		}
 	}
-	return protected, nil
+	return protected, known, nil
 }
 
 // ManifestRetirementAuthority is the production SlotRetirementAuthority: it
@@ -495,12 +522,16 @@ func (a *ManifestRetirementAuthority) AuthorizePoolRoot(poolRootAbs string) erro
 	if resolved, err := filepath.EvalSymlinks(poolRootAbs); err == nil {
 		poolRootAbs = resolved
 	}
-	protected, err := manifestProtectedPools(a.RepoRoot, a.ManifestPath, a.PhaseJournalPath)
+	poolRootAbs = filepath.Clean(poolRootAbs)
+	protected, known, err := manifestProtectedPools(a.RepoRoot, a.ManifestPath, a.PhaseJournalPath)
 	if err != nil {
 		return err
 	}
-	if protected[filepath.Clean(poolRootAbs)] {
-		return fmt.Errorf("pool root %s is under active or unconfirmed retirement evidence, refusing", filepath.Clean(poolRootAbs))
+	if !known[poolRootAbs] {
+		return fmt.Errorf("pool root %s has no retirement evidence on file; unknown-scope pools are not automatically disposable, refusing", poolRootAbs)
+	}
+	if protected[poolRootAbs] {
+		return fmt.Errorf("pool root %s is under active or unconfirmed retirement evidence, refusing", poolRootAbs)
 	}
 	return nil
 }
@@ -554,7 +585,7 @@ func runIdlePoolTickLocked(ctx context.Context, cfg IdlePoolDiscoveryConfig, act
 	if err != nil {
 		return IdlePoolDiscoveryResult{}, err
 	}
-	protected, err := manifestProtectedPools(cfg.RepoRoot, cfg.ManifestPath, cfg.PhaseJournalPath)
+	protected, _, err := manifestProtectedPools(cfg.RepoRoot, cfg.ManifestPath, cfg.PhaseJournalPath)
 	if err != nil {
 		return IdlePoolDiscoveryResult{}, err
 	}

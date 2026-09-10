@@ -61,6 +61,16 @@ type Pool struct {
 	// refusal, never evidence that the slot is idle. Tests may inject a
 	// deterministic fixture; production defaults to the bounded native census.
 	ProcessInspector resources.ProcessInspector
+	// OnDestructiveBoundary is a test seam fired at the destructive
+	// boundary -- after every identity and evidence gate has passed and
+	// before the verified directory is moved into quarantine. Production
+	// leaves it nil. It gives a regression harness a deterministic hook to
+	// replace the candidate path exactly where the replacement race
+	// otherwise lives, so the protocol's guarantees (the replacement's
+	// content survives untouched, the pass refuses, nothing is deleted) can
+	// be watched RED against the previous direct-removal behavior and GREEN
+	// after the fix, instead of trusting a microscopic timing window.
+	OnDestructiveBoundary func(slotPath string) error
 }
 
 func NewPool(repoRoot, root string, size int) *Pool {
@@ -552,27 +562,62 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) error 
 			if err := candidate.sameIdentity(latest); err != nil {
 				return fmt.Errorf("worktree pool: gc refused for slot %s immediately before removal: %w", slot.Name, err)
 			}
-			// Narrow the destructive-boundary replacement window one last
-			// time against the exact directory identity GC verified: if the
-			// path no longer names the same directory, refuse instead of
-			// letting git act on whatever is there now.
-			preInfo, err := os.Lstat(candidate.path)
-			if err != nil {
-				return fmt.Errorf("worktree pool: gc refused for slot %s at the destructive boundary: %w", slot.Name, err)
+			// Test seam at the destructive boundary: production leaves it
+			// nil. It exists so the replacement race between identity
+			// verification and destruction is deterministically exercisable.
+			if p.OnDestructiveBoundary != nil {
+				if err := p.OnDestructiveBoundary(candidate.path); err != nil {
+					return fmt.Errorf("worktree pool: gc refused for slot %s at the destructive boundary: %w", slot.Name, err)
+				}
 			}
-			if !os.SameFile(candidate.info, preInfo) {
-				return fmt.Errorf("worktree pool: gc refused for slot %s: path was replaced at the destructive boundary", slot.Name)
+			// Destructive protocol: git never acts on a path a replacement
+			// could occupy. The verified directory itself is atomically
+			// renamed into a private quarantine under the same pool
+			// directory (same filesystem, one syscall -- exclusive ownership
+			// of the exact inode just verified), the quarantine entry is
+			// proven to be that same inode, and only then is the now-vacant
+			// registration cleaned up through git. If the quarantined
+			// identity does not match -- the path was replaced between the
+			// gate and the move, so the racer's directory was moved instead
+			// -- the move is rolled back atomically and the pass refuses:
+			// the replacement's content survives untouched and git metadata
+			// stays consistent. The protocol never deletes content directly
+			// and has no RemoveAll fallback: the atomic move is the
+			// destruction boundary, and a crash parks the directory in
+			// quarantine instead of losing it (the next pass refuses the
+			// missing path; recovery of parked quarantine dirs is a
+			// root-owned action).
+			quarantine := filepath.Join(p.Root, fmt.Sprintf(".gc-quarantine-%s-%d", slot.Name, p.Now().UnixNano()))
+			if err := os.Rename(candidate.path, quarantine); err != nil {
+				return fmt.Errorf("worktree pool: gc refused for slot %s: quarantine move failed: %w", slot.Name, err)
 			}
-			// Pool slots are tracked by their own slot.LeaseID, verified
-			// above, never by pkg/claim -- the full RefuseRemovalWithLiveLease
-			// would refuse every slot unconditionally. See its doc comment.
-			// No --force: verifyGCCandidate already proved this exact,
-			// symlink-free, contained path is a clean registered worktree, so
-			// git's own dirty/HEAD-mismatch refusal is redundant defense-in-
-			// depth, not an obstacle to bypass.
+			quarantined, statErr := os.Lstat(quarantine)
+			if statErr != nil || !os.SameFile(candidate.info, quarantined) {
+				// The verified directory was replaced between the gate and
+				// the move; give the replacement its directory back, byte
+				// for byte, and refuse. The rename back is atomic; if the
+				// path is meanwhile re-occupied, park the quarantine dir
+				// and fail loudly rather than deleting anything.
+				if restoreErr := os.Rename(quarantine, candidate.path); restoreErr != nil {
+					return fmt.Errorf("worktree pool: slot %s identity changed inside quarantine and rollback failed (%v); directory parked at %s for root recovery", slot.Name, restoreErr, quarantine)
+				}
+				return fmt.Errorf("worktree pool: gc refused for slot %s: path was replaced at the destructive boundary; replacement preserved in place", slot.Name)
+			}
+			// The slot path is now vacant and git's registration for it is
+			// stale. git answers "no longer exists"/"is not a working tree"
+			// for the registered-but-gone path; `worktree prune` then
+			// removes the stale registration -- metadata only, never
+			// content, and only for directories that are already gone.
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", candidate.path)
-			if out, err := boundedCombinedOutput(cmd, maxGitOutputBytes); err != nil && !strings.Contains(out, "is not a working tree") {
-				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(out))
+			out, removeErr := boundedCombinedOutput(cmd, maxGitOutputBytes)
+			if removeErr != nil && !strings.Contains(out, "is not a working tree") && !strings.Contains(out, "no longer exists") {
+				// Preserve the quarantined content and report the git
+				// failure: nothing is deleted, the directory stays parked.
+				return fmt.Errorf("worktree pool: remove %s: %v (%s); content parked at %s", slot.Name, removeErr, strings.TrimSpace(out), quarantine)
+			}
+			prune := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "prune")
+			if out, pruneErr := boundedCombinedOutput(prune, maxGitOutputBytes); pruneErr != nil {
+				return fmt.Errorf("worktree pool: prune registration for %s: %v (%s); content parked at %s", slot.Name, pruneErr, strings.TrimSpace(out), quarantine)
 			}
 			if info, statErr := os.Lstat(candidate.path); statErr == nil {
 				if !os.SameFile(candidate.info, info) {
