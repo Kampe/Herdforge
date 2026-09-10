@@ -17,12 +17,15 @@ import (
 
 // PoolSlot is the durable lease record for one warm worktree.
 type PoolSlot struct {
-	Name     string    `json:"name"`
-	Path     string    `json:"path"`
-	Purpose  string    `json:"purpose,omitempty"`
-	LeaseID  string    `json:"lease_id,omitempty"`
-	LeasedAt time.Time `json:"leased_at,omitempty"`
-	Base     string    `json:"base,omitempty"`
+	Name                  string    `json:"name"`
+	Path                  string    `json:"path"`
+	Purpose               string    `json:"purpose,omitempty"`
+	LeaseID               string    `json:"lease_id,omitempty"`
+	LeasedAt              time.Time `json:"leased_at,omitempty"`
+	Base                  string    `json:"base,omitempty"`
+	LastReleaseLeaseID    string    `json:"last_release_lease_id,omitempty"`
+	LastReleaseGeneration int64     `json:"last_release_generation,omitempty"`
+	LastReleasePath       string    `json:"last_release_path,omitempty"`
 }
 
 type poolState struct {
@@ -265,6 +268,7 @@ func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string
 		if !clean {
 			continue
 		}
+		slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
 		slot.Purpose, slot.LeaseID = "", ""
 		slot.LeasedAt = time.Time{}
 		freed = append(freed, slot.Name)
@@ -329,12 +333,120 @@ func (p *Pool) Release(ctx context.Context, leaseID string) error {
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
+			slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
 			slot.Purpose, slot.LeaseID = "", ""
 			slot.LeasedAt = time.Time{}
 			return p.writeState(state)
 		}
 		return errors.New("worktree pool: lease not found")
 	})
+}
+
+// ReleaseExact releases only the named slot when its path, nonce, and lease
+// incarnation all match the caller's authenticated manifest. A nonce alone
+// is insufficient because a recycled pool can legally reuse identifiers.
+func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, leaseGeneration int64, wantPath string) error {
+	if strings.TrimSpace(slotName) == "" || strings.TrimSpace(leaseID) == "" || leaseGeneration <= 0 || strings.TrimSpace(wantPath) == "" {
+		return errors.New("worktree pool: exact release requires slot, lease, generation, and path")
+	}
+	return p.withLock(func() error {
+		state, err := p.readState()
+		if err != nil {
+			return err
+		}
+		for i := range state.Slots {
+			slot := &state.Slots[i]
+			if slot.Name != slotName {
+				continue
+			}
+			if filepath.Clean(slot.Path) != filepath.Clean(wantPath) {
+				return fmt.Errorf("worktree pool: slot %s path changed", slotName)
+			}
+			if slot.LeaseID == "" {
+				return nil
+			}
+			if slot.LeaseID != leaseID || slot.LeasedAt.UnixNano() != leaseGeneration {
+				return fmt.Errorf("worktree pool: slot %s lease incarnation changed", slotName)
+			}
+			base := slot.Base
+			if base == "" {
+				base = p.DefaultBase
+				if base == "" {
+					base = "origin/main"
+				}
+			}
+			cmd := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("worktree pool: reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
+			}
+			cmd = exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("worktree pool: clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
+			}
+			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			if err != nil {
+				return err
+			}
+			if !clean {
+				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
+			}
+			slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
+			slot.Purpose, slot.LeaseID, slot.LeasedAt = "", "", time.Time{}
+			return p.writeState(state)
+		}
+		return errors.New("worktree pool: exact slot not found")
+	})
+}
+
+// RetireExact removes one already-released owned slot and preserves every
+// other slot in the pool. It is intentionally narrower than GC.
+func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeaseID string, expectedGeneration int64) error {
+	if strings.TrimSpace(slotName) == "" || strings.TrimSpace(wantPath) == "" || strings.TrimSpace(expectedLeaseID) == "" || expectedGeneration <= 0 {
+		return errors.New("worktree pool: exact retirement requires slot and path")
+	}
+	err := p.withLock(func() error {
+		state, err := p.readState()
+		if err != nil {
+			return err
+		}
+		for i := range state.Slots {
+			slot := state.Slots[i]
+			if slot.Name != slotName {
+				continue
+			}
+			if filepath.Clean(slot.Path) != filepath.Clean(wantPath) {
+				return fmt.Errorf("worktree pool: slot %s path changed", slotName)
+			}
+			if slot.LeaseID != "" {
+				return fmt.Errorf("worktree pool: slot %s is still leased", slotName)
+			}
+			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || filepath.Clean(slot.LastReleasePath) != filepath.Clean(slot.Path) {
+				return fmt.Errorf("worktree pool: slot %s release incarnation changed", slotName)
+			}
+			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
+			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
+				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
+			}
+			if err := os.RemoveAll(slot.Path); err != nil {
+				return err
+			}
+			state.Slots = append(state.Slots[:i], state.Slots[i+1:]...)
+			if err := p.writeState(state); err != nil {
+				return err
+			}
+			if len(state.Slots) == 0 {
+				_ = os.Remove(p.statePath())
+			}
+			return nil
+		}
+		return nil
+	})
+	if err == nil {
+		if entries, readErr := os.ReadDir(p.Root); readErr == nil && len(entries) == 0 {
+			_ = os.Remove(p.Root)
+		}
+	}
+	return err
 }
 
 // GC tears down every unleased slot so the next Ensure rebuilds the pool.
@@ -345,16 +457,22 @@ func (p *Pool) GC(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// FAC-708: validate the complete selected set before removing the first
+		// slot. A later leased/unsafe slot must not be discovered after earlier
+		// pool worktrees were already deleted; filesystem removal is not
+		// transactionally rollbackable.
 		for _, slot := range state.Slots {
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: gc refused while slot %s is leased", slot.Name)
 			}
-			// Pool slots are tracked by their own slot.LeaseID above, never
-			// by pkg/claim -- the full RefuseRemovalWithLiveLease would
-			// refuse every slot unconditionally. See its doc comment.
 			if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, slot.Path); err != nil {
 				return fmt.Errorf("worktree pool: gc lease fence for %s: %w", slot.Name, err)
 			}
+		}
+		for _, slot := range state.Slots {
+			// Pool slots are tracked by their own slot.LeaseID above, never
+			// by pkg/claim -- the full RefuseRemovalWithLiveLease would
+			// refuse every slot unconditionally. See its doc comment.
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))

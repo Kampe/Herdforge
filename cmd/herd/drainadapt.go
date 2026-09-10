@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -108,7 +109,46 @@ func (a *drainAdapters) hooks() drainActionHooks {
 		launchReview:          a.launchReview,
 		dryRun:                func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, true) },
 		harvest:               func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, false) },
+		retireReviews:         a.retireReviews,
 	}
+}
+
+// retireReviews is the bounded acting drain edge for admitted one-off review
+// lanes. It consumes only exact launch manifests; no tab label, board status,
+// callback, or broad filesystem scan can create a cleanup target.
+func (a *drainAdapters) retireReviews(ctx context.Context) error {
+	if a == nil || strings.TrimSpace(a.root) == "" {
+		return fmt.Errorf("review retirement authority is unavailable")
+	}
+	registry := herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(a.root)}
+	all, err := registry.Latest()
+	if err != nil {
+		return err
+	}
+	latest := make(map[string]herdr.ReviewRetirementManifest, len(all))
+	for _, m := range all {
+		if err := herdr.ValidateReviewRetirementManifest(m); err != nil {
+			return fmt.Errorf("review manifest generation %s: %w", m.Generation, err)
+		}
+		latest[m.Generation] = m
+	}
+	manifests := make([]herdr.ReviewRetirementManifest, 0, len(latest))
+	for _, m := range latest {
+		manifests = append(manifests, m)
+	}
+	if len(manifests) == 0 {
+		return nil
+	}
+	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
+	op := &herdr.NativeReviewRetirementOp{Root: a.root, RepositoryIdentity: a.repository, Ledger: a.ledger}
+	result, err := herdr.RetireReviewLanesContext(ctx, op, manifests, false)
+	if err != nil {
+		return err
+	}
+	if result.Blocked > 0 {
+		return fmt.Errorf("%d review retirement lane(s) blocked; retained exact manifests", result.Blocked)
+	}
+	return nil
 }
 
 // authority refuses before any side effect when a required compiled authority

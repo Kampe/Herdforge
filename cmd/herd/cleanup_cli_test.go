@@ -118,7 +118,7 @@ func TestCleanupCLI_MutationFailsClosedJSON(t *testing.T) {
 	binary := buildHerd(t)
 	fake := cleanupFakeHerdr(t,
 		`{"result":{"agents":[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1","workspace_id":"w","revision":3}],"type":"agents"}}`)
-	cmd := exec.Command(binary, "cleanup", "--json")
+	cmd := exec.Command(binary, "cleanup", "--act", "--json")
 	cmd.Env = cleanupEnv(fake)
 	out, _ := cmd.CombinedOutput()
 	var pkt map[string]interface{}
@@ -145,7 +145,7 @@ func TestCleanupCLI_MutationFailsClosedText(t *testing.T) {
 	binary := buildHerd(t)
 	fake := cleanupFakeHerdr(t,
 		`{"result":{"agents":[{"name":"task-fac-1","agent_status":"done","tab_id":"t1","pane_id":"p1","workspace_id":"w","revision":3}],"type":"agents"}}`)
-	cmd := exec.Command(binary, "cleanup")
+	cmd := exec.Command(binary, "cleanup", "--act")
 	cmd.Env = cleanupEnv(fake)
 	out, _ := cmd.CombinedOutput()
 	s := string(out)
