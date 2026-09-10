@@ -66,7 +66,7 @@ func TestReviewRetirementCLIActingDrainTwice(t *testing.T) {
 		t.Fatal(string(out))
 	}
 	lease, leaseGeneration := "cli-lease-1", int64(7)
-	state := []byte(`{"version":1,"slots":[{"name":"pool-01","path":"` + slotPath + `","lease_id":"` + lease + `","leased_at":"1970-01-01T00:00:00.000000007Z","base":"HEAD"}]}` + "\n")
+	state := []byte(`{"version":1,"slots":[{"name":"pool-01","path":".herd/pool-fac708/pool-01","lease_id":"` + lease + `","leased_at":"1970-01-01T00:00:00.000000007Z","base":"HEAD"}]}` + "\n")
 	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), state, 0o600); err != nil {
 		t.Fatal(err)
 	}

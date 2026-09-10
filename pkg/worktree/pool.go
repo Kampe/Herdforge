@@ -359,7 +359,8 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 			if slot.Name != slotName {
 				continue
 			}
-			if filepath.Clean(slot.Path) != filepath.Clean(wantPath) {
+			slotPath := p.repoPath(slot.Path)
+			if slotPath != p.repoPath(wantPath) {
 				return fmt.Errorf("worktree pool: slot %s path changed", slotName)
 			}
 			if slot.LeaseID == "" {
@@ -375,15 +376,15 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 					base = "origin/main"
 				}
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base)
+			cmd := exec.CommandContext(ctx, "git", "-C", slotPath, "reset", "--hard", base)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			cmd = exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd")
+			cmd = exec.CommandContext(ctx, "git", "-C", slotPath, "clean", "-fd")
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, err := gitClean(ctx, p.RepoRoot, slotPath)
 			if err != nil {
 				return err
 			}
@@ -414,20 +415,21 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 			if slot.Name != slotName {
 				continue
 			}
-			if filepath.Clean(slot.Path) != filepath.Clean(wantPath) {
+			slotPath := p.repoPath(slot.Path)
+			if slotPath != p.repoPath(wantPath) {
 				return fmt.Errorf("worktree pool: slot %s path changed", slotName)
 			}
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: slot %s is still leased", slotName)
 			}
-			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || filepath.Clean(slot.LastReleasePath) != filepath.Clean(slot.Path) {
+			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || p.repoPath(slot.LastReleasePath) != slotPath {
 				return fmt.Errorf("worktree pool: slot %s release incarnation changed", slotName)
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
+			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slotPath)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			if err := os.RemoveAll(slot.Path); err != nil {
+			if err := os.RemoveAll(slotPath); err != nil {
 				return err
 			}
 			state.Slots = append(state.Slots[:i], state.Slots[i+1:]...)
@@ -447,6 +449,13 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 		}
 	}
 	return err
+}
+
+func (p *Pool) repoPath(path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(filepath.Join(p.RepoRoot, path))
 }
 
 // GC tears down every unleased slot so the next Ensure rebuilds the pool.

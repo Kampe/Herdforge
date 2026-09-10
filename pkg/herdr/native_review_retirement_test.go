@@ -27,6 +27,8 @@ func TestNativeRetirementCorruptJournalFailsClosed(t *testing.T) {
 }
 
 func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *testing.T) {
+	foreignCWD := t.TempDir()
+	t.Chdir(foreignCWD)
 	root := t.TempDir()
 	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v (%s)", err, out)
@@ -54,7 +56,7 @@ func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *tes
 		t.Fatal(string(out))
 	}
 	nonce, generation := "lease-legacy-1", int64(7)
-	state := []byte(`{"version":1,"slots":[{"name":"pool-01","path":"` + slotPath + `","lease_id":"` + nonce + `","leased_at":"1970-01-01T00:00:00.000000007Z","base":"HEAD"}]}` + "\n")
+	state := []byte(`{"version":1,"slots":[{"name":"pool-01","path":".herd/pool-fac708/pool-01","lease_id":"` + nonce + `","leased_at":"1970-01-01T00:00:00.000000007Z","base":"HEAD"}]}` + "\n")
 	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), state, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +107,24 @@ func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *tes
 	if d := EvaluateReviewRetirement(evidence); !d.Eligible {
 		t.Fatalf("closed generationless lane refused: %+v", d)
 	}
+	absoluteState := []byte(`{"version":1,"slots":[{"name":"pool-01","path":"` + slotPath + `","lease_id":"` + nonce + `","leased_at":"1970-01-01T00:00:00.000000007Z","base":"HEAD"}]}` + "\n")
+	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), absoluteState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Observe(m); err != nil {
+		t.Fatalf("equivalent absolute pool path was refused: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "pool-01")
+	outsideState := []byte(`{"version":1,"slots":[{"name":"pool-01","path":"` + outside + `","lease_id":"` + nonce + `","leased_at":"1970-01-01T00:00:00.000000007Z","base":"HEAD"}]}` + "\n")
+	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), outsideState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Observe(m); err == nil || !strings.Contains(err.Error(), "path differs") {
+		t.Fatalf("outside-root pool path was accepted: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), state, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(ledgerPath, []byte(strings.Join(append(rows, `{"event":"record","sha":"`+sha+`","reviewer":"`+reviewer+`","lease":"`+nonce+`","branch":"FAC-708","pane":"different"}`), "\n")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +143,7 @@ func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *tes
 	// A later lease/release of the same named slot must not authorize the old
 	// manifest: release history is an incarnation fence, not an absent-state
 	// guess.
-	stale := []byte(`{"version":1,"slots":[{"name":"pool-01","path":"` + slotPath + `","last_release_lease_id":"lease-new","last_release_generation":8,"last_release_path":"` + slotPath + `"}]}` + "\n")
+	stale := []byte(`{"version":1,"slots":[{"name":"pool-01","path":".herd/pool-fac708/pool-01","last_release_lease_id":"lease-new","last_release_generation":8,"last_release_path":".herd/pool-fac708/pool-01"}]}` + "\n")
 	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), stale, 0o600); err != nil {
 		t.Fatal(err)
 	}

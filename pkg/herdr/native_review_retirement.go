@@ -225,19 +225,23 @@ func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, all
 		if slot.Name != m.Slot {
 			continue
 		}
-		worktreePath, pathErr := filepath.Abs(filepath.Join(n.Root, filepath.Clean(m.Worktree)))
-		if pathErr != nil || !sameRealPath(slot.Path, filepath.Join(poolPath, m.Slot)) || !sameRealPath(slot.Path, worktreePath) {
+		slotPath, slotPathErr := n.canonicalPoolRecordPath(slot.Path)
+		worktreePath, worktreePathErr := n.boundPath(m.Worktree)
+		if slotPathErr != nil || worktreePathErr != nil || !sameRealPath(slotPath, filepath.Join(poolPath, m.Slot)) || !sameRealPath(slotPath, worktreePath) {
 			return worktree.PoolSlot{}, errors.New("review pool slot path differs from authenticated manifest")
 		}
 		if slot.LeaseID == "" && allowReleased {
-			if slot.LastReleaseLeaseID != m.Nonce || slot.LastReleaseGeneration != m.LeaseGeneration || !sameRealPath(slot.LastReleasePath, slot.Path) {
+			releasePath, releasePathErr := n.canonicalPoolRecordPath(slot.LastReleasePath)
+			if releasePathErr != nil || slot.LastReleaseLeaseID != m.Nonce || slot.LastReleaseGeneration != m.LeaseGeneration || !sameRealPath(releasePath, slotPath) {
 				return worktree.PoolSlot{}, errors.New("review pool slot has no matching authenticated release history")
 			}
+			slot.Path = slotPath
 			return slot, nil
 		}
 		if slot.LeaseID != m.Nonce || slot.LeasedAt.UnixNano() != m.LeaseGeneration {
 			return worktree.PoolSlot{}, errors.New("review pool lease incarnation differs from authenticated manifest")
 		}
+		slot.Path = slotPath
 		return slot, nil
 	}
 	if allowReleased {
@@ -250,6 +254,43 @@ func (n *NativeReviewRetirementOp) exactPoolSlot(m ReviewRetirementManifest, all
 		}
 	}
 	return worktree.PoolSlot{}, errors.New("authenticated review pool slot is missing")
+}
+
+// canonicalPoolRecordPath resolves the two path formats emitted by pool
+// producers (repository-relative and absolute) against the authenticated
+// repository root. Relative paths are never interpreted using the caller's
+// CWD, and both forms must resolve inside the root before identity comparison.
+func (n *NativeReviewRetirementOp) canonicalPoolRecordPath(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", errors.New("review pool record path is empty")
+	}
+	root, err := filepath.Abs(n.Root)
+	if err != nil {
+		return "", err
+	}
+	root = filepath.Clean(root)
+	candidate := filepath.Clean(raw)
+	if !filepath.IsAbs(candidate) {
+		if candidate == "." || strings.HasPrefix(candidate, ".."+string(filepath.Separator)) {
+			return "", errors.New("review pool record path is not repository-relative")
+		}
+		candidate = filepath.Join(root, candidate)
+	}
+	if candidate == root || !strings.HasPrefix(candidate, root+string(filepath.Separator)) {
+		return "", errors.New("review pool record path escaped repository root")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	realCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", err
+	}
+	if realCandidate == realRoot || !strings.HasPrefix(realCandidate, realRoot+string(filepath.Separator)) {
+		return "", errors.New("review pool record path real path escaped repository root")
+	}
+	return candidate, nil
 }
 
 func sameRealPath(a, b string) bool {
