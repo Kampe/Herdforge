@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/slot"
 )
 
@@ -146,16 +145,12 @@ type Verifier struct {
 	Timeout    time.Duration
 	// DiskAdmission is checked before mutation/test fan-out. It is injectable
 	// so rejected paths can prove zero process and filesystem callbacks.
-	DiskAdmission resources.DiskAdmission
+	DiskAdmission DiskAdmission
 	// afterMutationApplied runs after mutant bytes are on disk and before the
 	// mutant command is executed. Nil in production.
 	afterMutationApplied func()
 	beforeCommandStart   func(context.Context)
 	afterFunc            func(time.Duration, func()) *time.Timer
-}
-
-func defaultDiskAdmission() resources.DiskAdmission {
-	return resources.NewCapacityGate(resources.OSBackend{}, resources.DefaultDiskPolicy())
 }
 
 // NewVerifier preserves the existing config-string entry point, but parses a
@@ -867,15 +862,15 @@ func (v *Verifier) admitMutationDisk(dir string) error {
 	if v == nil || v.DiskAdmission == nil {
 		return errors.New("disk capacity gate unavailable for mutation")
 	}
-	candidate, err := resources.ResolveExistingPath(dir)
+	candidate, err := resolveExistingPath(dir)
 	if err != nil {
 		return fmt.Errorf("disk capacity gate: resolve candidate volume: %w", err)
 	}
-	tmp, err := resources.ResolveExistingPath(os.TempDir())
+	tmp, err := resolveExistingPath(os.TempDir())
 	if err != nil {
 		return fmt.Errorf("disk capacity gate: resolve temporary volume: %w", err)
 	}
-	decision := v.DiskAdmission.Admit(resources.DiskRequest{
+	decision := v.DiskAdmission.Admit(DiskRequest{
 		Operation: "verifier_mutation",
 		Path:      candidate,
 		TempPath:  tmp,

@@ -1,3 +1,5 @@
+//go:build !fac151_hermetic_integration
+
 package verifier
 
 import (
