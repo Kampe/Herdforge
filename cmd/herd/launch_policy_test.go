@@ -78,6 +78,55 @@ func TestHardPinnedLaunchScopesNativeQuotaAndModelProbe(t *testing.T) {
 	}
 }
 
+// TestHardPinnedLiteLLMLaneQuotasAgainstLiteLLMNotOpenCodeGo is the FAC-786
+// regression: a lane routed through the opencode harness with a
+// litellm/lazer/ model billed against opencode-go quota instead of the
+// LiteLLM authority actually backing the model.
+func TestHardPinnedLiteLLMLaneQuotasAgainstLiteLLMNotOpenCodeGo(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HERD_MODE", "production")
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HOME", t.TempDir())
+	var calls = map[string]int{}
+	providers := map[string]func() (usage.ProviderUsage, error){
+		"litellm": func() (usage.ProviderUsage, error) {
+			calls["litellm"]++
+			return usage.ProviderUsage{DisplayName: "LiteLLM", Resources: map[string]usage.ResourceUsage{
+				"weekly": {Kind: "consumption", Unit: "usd", Limit: 100, Remaining: 90, WindowSeconds: 604800},
+			}}, nil
+		},
+		"opencode": func() (usage.ProviderUsage, error) {
+			calls["opencode"]++
+			return usage.ProviderUsage{}, errors.New("unexpected opencode-go poll")
+		},
+	}
+	restore := usage.SetNativePollersForTest(providers)
+	t.Cleanup(restore)
+	usage.InvalidateSnapshotCache()
+	t.Cleanup(usage.InvalidateSnapshotCache)
+	lane := &config.LaneDef{Name: "pinned-litellm", Role: launch.WorkerRole, AgentKind: "opencode", Harness: "opencode", Provider: "opencode", Model: "litellm/lazer/gemini-3.7-flash", Effort: "medium", TaskShape: launch.Implementation}
+	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Provider != "opencode" {
+		t.Fatalf("hard pin rerouted to %q", decision.Provider)
+	}
+	if calls["opencode"] != 0 {
+		t.Fatalf("hard-pinned litellm/lazer model billed against opencode-go quota: %+v", calls)
+	}
+	if calls["litellm"] != 1 {
+		t.Fatalf("expected exactly one litellm poll, got %+v", calls)
+	}
+}
+
 func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())

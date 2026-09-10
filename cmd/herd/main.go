@@ -6681,7 +6681,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	engine := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
 	if hardPin {
-		if snap, err := usage.FetchProviderForce(provider, false); err == nil && snap != nil {
+		if snap, err := usage.FetchProviderModelForce(provider, model, false); err == nil && snap != nil {
 			computed = engine.ComputeAll(snap)
 		} else if err != nil {
 			fmt.Fprintf(os.Stderr, "herd: WARN lane %q native quota unavailable for pinned provider %s (%v); routing on availability only\n", lane.Name, provider, err)
