@@ -8,8 +8,10 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/daemon"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/standing"
@@ -295,4 +297,86 @@ func TestAttemptIDContextIsolatedAcrossConcurrentGoroutines(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestRecoveryCycleAdmissionAttemptIdentityDistinguishesTwoAttemptsInSameProcess
+// is the missing public pulse/recovery admission fixture: it drives the REAL
+// production scheduler and cycle-transaction wrapper -- daemon.RunPulseScheduler
+// and runDaemonCycle, exactly as `herd daemon` wires them -- for two ticks
+// against the same failing lane, in one process. No live store, board,
+// broker, provider, or claim operation is reachable: admit is a no-op
+// (runDaemonCycle's admit parameter is already injectable in production;
+// requireFleetAdmission is a live check this test deliberately does not
+// call), and recoveryCycleAdmission's live task-provider construction is
+// never invoked because admission itself is refused before any effect
+// runs. recoveryCycleAdmission is a minimal, declared extraction of
+// runDaemon's cycle closure (main.go) -- identical production code, pulled
+// into a named function only so it is callable without the daemon's
+// store/signal/flag scaffolding.
+func TestRecoveryCycleAdmissionAttemptIdentityDistinguishesTwoAttemptsInSameProcess(t *testing.T) {
+	root, cfg, _ := standingClaudeAttemptFixture(t)
+
+	ticks := 0
+	cycle := func(ctx context.Context) error {
+		ticks++
+		_, _, _, admitErr := recoveryCycleAdmission(ctx, cfg, "worker", loadTaskProvider)
+		return admitErr
+	}
+	noopAdmit := func(context.Context) error { return nil }
+
+	err := daemon.RunPulseScheduler(context.Background(), daemon.PulseSchedulerOptions{Interval: time.Millisecond, MaxTicks: 2}, func(ctx context.Context) error {
+		return runDaemonCycle(ctx, noopAdmit, cycle)
+	})
+	if err == nil {
+		t.Fatal("two ticks against an empty policy set must both fail closed")
+	}
+	if ticks != 2 {
+		t.Fatalf("expected exactly 2 real scheduler ticks, got %d", ticks)
+	}
+
+	var policySetMissing []launch.Receipt
+	for _, r := range readReceipts(t, root) {
+		if r.HookCode == "hook.policy_set_missing" {
+			policySetMissing = append(policySetMissing, r)
+		}
+	}
+	if len(policySetMissing) != 2 {
+		t.Fatalf("two genuinely separate recovery cycle attempts via the real daemon.RunPulseScheduler/runDaemonCycle path did not each get their own receipt: %+v", policySetMissing)
+	}
+	if policySetMissing[0].ReceiptKey == policySetMissing[1].ReceiptKey {
+		t.Fatalf("two distinct recovery cycle attempts collapsed onto the same receipt key: %q", policySetMissing[0].ReceiptKey)
+	}
+}
+
+// TestRecoveryCycleRepeatedCheckWithinOneAttemptDedupes is the other half:
+// a caller (up.go's and standing's own double-check pattern; also the
+// routing function's internal check reached via the SAME route closure) can
+// legitimately validate the SAME attempt more than once. Calling the real
+// production route closure -- routedLaneDecision(ctx, nil), which reaches
+// laneLaunchDecisionWithProbe's own internal validateDecisionBeforeSideEffect
+// call -- twice with an IDENTICAL, already-minted attempt ctx (simulating a
+// caller that retries without re-minting) must still leave exactly one
+// receipt, proving the dedup is keyed correctly on attempt identity, not on
+// call count.
+func TestRecoveryCycleRepeatedCheckWithinOneAttemptDedupes(t *testing.T) {
+	root, _, lane := standingClaudeAttemptFixture(t)
+	ctx := withAttemptID(context.Background(), "fixed-recovery-attempt")
+	route := routedLaneDecision(ctx, nil)
+
+	if _, err := route(lane); err == nil {
+		t.Fatal("first check: empty policy set must fail closed")
+	}
+	if _, err := route(lane); err == nil {
+		t.Fatal("second check (same attempt, retried without re-minting): empty policy set must fail closed")
+	}
+
+	var policySetMissing []launch.Receipt
+	for _, r := range readReceipts(t, root) {
+		if r.HookCode == "hook.policy_set_missing" {
+			policySetMissing = append(policySetMissing, r)
+		}
+	}
+	if len(policySetMissing) != 1 {
+		t.Fatalf("two checks sharing one attempt identity did not dedupe to a single receipt: %+v", policySetMissing)
+	}
 }

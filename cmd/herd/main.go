@@ -1717,6 +1717,51 @@ func runQuotaLimits(oneProvider string, force bool) {
 	}
 }
 
+// recoveryCycleAdmission is the FAC-196/FAC-624 admission seam extracted
+// from runDaemon's per-tick cycle closure (minimal extraction, declared
+// here) so it is directly testable without a live store, board, broker, or
+// task provider -- exactly the launch-admission portion cycle performs
+// before any live daemon.Engine/RunDaemonTick work begins. buildTaskProvider
+// is loadTaskProvider in production; injected here only so a test can prove
+// admission-refusal behavior without needing a real one (it is never
+// invoked when admission itself is refused, since launchAdmissionWithLifecycle
+// only runs its effect after a successful decision).
+//
+// FAC-196: claim-to-dispatch is one transaction. Non-compensable prep (lane,
+// routed decision, Herdr) happens before RunPulse. FAC-194 still owns
+// removing any residual OpenCode ModelRouter constructions on other
+// entrypoints; this path uses the authoritative launchAdmission +
+// SurfaceRouter waterfall only.
+//
+// FAC-624: this is re-run on every daemon.RunPulseScheduler tick for the
+// coordinator's entire uptime (herd daemon, default unbounded), all in one
+// process -- the same shape standing's AdmitRoute has. Scope hook policy to
+// the lane's own worktree and mint one attempt identity per cycle, carried
+// on ctx (not a package global) so two textually-concurrent admissions --
+// were this ever made concurrent -- cannot observe each other's value.
+func recoveryCycleAdmission(ctx context.Context, cfg *config.Config, role string, buildTaskProvider func(*config.Config) (provider.TaskProvider, error)) (*router.LaunchDecision, provider.TaskProvider, *config.LaneDef, error) {
+	lane := findLaneForRole(cfg, role)
+	if lane == nil {
+		return nil, nil, nil, fmt.Errorf("no lane configured for role %q", role)
+	}
+	restoreHooks := laneHookPolicyScope(lane)
+	defer restoreHooks()
+	ctx = withAttemptID(ctx, launch.NewAttemptID())
+	var tp provider.TaskProvider
+	decision, admitErr := launchAdmissionWithLifecycle(ctx, liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
+		var tpErr error
+		tp, tpErr = buildTaskProvider(cfg)
+		return tpErr
+	})
+	if admitErr != nil {
+		return nil, nil, nil, fmt.Errorf("launch route rejected before claim: %w", admitErr)
+	}
+	if tp == nil {
+		return nil, nil, nil, fmt.Errorf("task provider: not constructed after launch admission")
+	}
+	return decision, tp, lane, nil
+}
+
 func runDaemon() {
 	if err := requireFleetAdmission(context.Background()); err != nil {
 		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
@@ -1753,36 +1798,9 @@ func runDaemon() {
 	}
 
 	cycle := func(ctx context.Context) error {
-		// FAC-196: claim-to-dispatch is one transaction. Non-compensable
-		// prep (lane, routed decision, Herdr) happens before RunPulse.
-		// FAC-194 still owns removing any residual OpenCode ModelRouter
-		// constructions on other entrypoints; this path uses the
-		// authoritative launchAdmission + SurfaceRouter waterfall only.
-		lane := findLaneForRole(cfg, *role)
-		if lane == nil {
-			return fmt.Errorf("no lane configured for role %q", *role)
-		}
-		// FAC-624: this cycle is re-run on every daemon.RunPulseScheduler
-		// tick for the coordinator's entire uptime (herd daemon, default
-		// unbounded), all in one process -- the same shape standing's
-		// AdmitRoute has. Scope hook policy to the lane's own worktree and
-		// mint one attempt identity per cycle, carried on ctx (not a
-		// package global) so two textually-concurrent admissions -- were
-		// this ever made concurrent -- cannot observe each other's value.
-		restoreHooks := laneHookPolicyScope(lane)
-		defer restoreHooks()
-		ctx = withAttemptID(ctx, launch.NewAttemptID())
-		var tp provider.TaskProvider
-		decision, admitErr := launchAdmissionWithLifecycle(ctx, liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
-			var tpErr error
-			tp, tpErr = loadTaskProvider(cfg)
-			return tpErr
-		})
+		decision, tp, lane, admitErr := recoveryCycleAdmission(ctx, cfg, *role, loadTaskProvider)
 		if admitErr != nil {
-			return fmt.Errorf("launch route rejected before claim: %w", admitErr)
-		}
-		if tp == nil {
-			return fmt.Errorf("task provider: not constructed after launch admission")
+			return admitErr
 		}
 		repository := repositoryIdentityForLaunch(cfg)
 		if repository == "" {
