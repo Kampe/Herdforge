@@ -142,10 +142,13 @@ run_gosec() {
 	# must therefore be exactly ONE complete JSON document. The pinned
 	# gosec v2.22.10 emits, for no findings, a JSON OBJECT whose "Issues"
 	# member is null (an empty Go slice marshals as null); that
-	# representation is accepted. A bare top-level null is the Gitleaks
-	# no-findings contract, not gosec's, and is rejected here.
+	# representation is accepted. jq reads a MISSING member as null, so
+	# the Issues key must be REQUIRED with has("Issues") - {} alone is
+	# rejected. Error-shaped bodies are rejected even when they also
+	# supply Issues: null or Issues: []. A bare top-level null is the
+	# Gitleaks no-findings contract, not gosec's, and is rejected here.
 	for subrep in "${subreports[@]}"; do
-		if [[ ! -s "$subrep" ]] || ! jq -e -s 'length == 1 and (.[0] | type == "object") and (.[0].Issues | type == "null" or type == "array")' "$subrep" >/dev/null 2>&1; then
+		if [[ ! -s "$subrep" ]] || ! jq -e -s 'length == 1 and (.[0] | type == "object" and has("Issues") and ([has("Err"), has("error"), has("Error")] | any | not) and (.Issues | type == "null" or type == "array"))' "$subrep" >/dev/null 2>&1; then
 			print -u2 'error: gosec produced no complete single-document JSON report'
 			return 1
 		fi

@@ -125,6 +125,70 @@ grep -F -- 'error: gosec produced no complete single-document JSON report' "$gos
 	exit 1
 }
 
+# A subreport WITHOUT an Issues key must fail closed: jq reads a missing
+# member as null, so only the pinned gosec shape (an object that HAS the
+# Issues member) may pass.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_missing_key_out="$tmp/gosec-missing-key.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_missing_key_out" 2>&1; then
+	print -u2 "error: gosec report without an Issues key was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_missing_key_out" >/dev/null || {
+	print -u2 "error: missing gosec missing-key diagnostic"
+	exit 1
+}
+
+# Error-shaped bodies must fail closed even when they also supply
+# Issues: null or Issues: [].
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Err":"gosec panicked: stack overflow","Issues":null}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_err_body_out="$tmp/gosec-err-body.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_err_body_out" 2>&1; then
+	print -u2 "error: gosec Err body with Issues null was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_err_body_out" >/dev/null || {
+	print -u2 "error: missing gosec error-body diagnostic"
+	exit 1
+}
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"error":"exit status 2","Issues":[]}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_error_body_out="$tmp/gosec-error-body.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_error_body_out" 2>&1; then
+	print -u2 "error: gosec error body with Issues array was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_error_body_out" >/dev/null || {
+	print -u2 "error: missing gosec error-body (lowercase) diagnostic"
+	exit 1
+}
+
 # A gosec crash that leaves a MALFORMED subreport must fail closed; the
 # aggregation must not swallow the parse failure and evaluate zero findings.
 cat << 'EOF' > "$mock_bin/gosec"
