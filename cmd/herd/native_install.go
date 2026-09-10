@@ -123,8 +123,12 @@ func executeNativeInstall(ctx context.Context, opts nativeInstallOptions, build 
 	return binding, nil
 }
 
+// buildHerdScriptPath is the single source of truth for the native build
+// script's repo-relative path, shared by every caller that invokes it.
+const buildHerdScriptPath = "./scripts/build-herd.sh"
+
 func buildNativeRuntime(ctx context.Context, source string) error {
-	cmd := exec.CommandContext(ctx, "sh", "./scripts/build-herd.sh", ".")
+	cmd := exec.CommandContext(ctx, "sh", buildHerdScriptPath, ".")
 	cmd.Dir = source
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
