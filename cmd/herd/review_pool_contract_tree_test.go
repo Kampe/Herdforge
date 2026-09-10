@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -77,6 +78,38 @@ func poolContractFixture(t *testing.T, binary string) (dir, keyDir string, shas 
 	keyDir = t.TempDir()
 	attestKeyDir(t, keyDir)
 	provisionFence(t, binary, dir, keyDir)
+
+	// Every public pool candidate carries the same authenticated launch context
+	// as a real task worktree. The context is tracked in this fixture so a
+	// detached candidate surface receives it without ambient fallback; later
+	// contract variants inherit it and therefore reach the contract gate before
+	// any base-resolution refusal.
+	baseSHA := gitIn(t, dir, "rev-parse", "HEAD")
+	signer := fixtureSigner(t, keyDir, dir)
+	contextReceipt, err := signer.Issue(dispatch.TaskContext{
+		ProviderType:    "kaneo",
+		ProjectID:       "proj-x",
+		Repository:      dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
+		Role:            dispatch.RoleWorker,
+		TaskRef:         "FAC-1",
+		TaskID:          "fixture-task",
+		Branch:          "herd/fac-1",
+		BaseSHA:         baseSHA,
+		LeaseID:         "fixture-review-lease",
+		LeaseGeneration: 1,
+		LeaseTaskRef:    "FAC-1",
+		SessionID:       "fixture-review-session",
+		AllowedOps:      dispatch.WorkerOps,
+		ExpiresAt:       time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(dir, contextReceipt); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "TASK-CONTEXT.json")
+	gitIn(t, dir, "commit", "-q", "-m", "chore: authenticate pool fixture context")
 
 	shas = map[string]string{}
 	commit := func(name string) string {

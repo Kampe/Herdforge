@@ -117,7 +117,7 @@ var subcommandUsage = map[string]string{
 		"    --acceptance-digest --author-family --author-identity --provider-revision\n" +
 		"\n" +
 		"  Other: --verdict --reconstructed-from --content-proof --dry-run --allow-markers",
-	"hostcreds":        "Usage: herd hostcreds <diagnose|session|selftest> [flags]\n  Query the host credentials oracle without launching OpenCode.",
+	"hostcreds":        "Usage: herd hostcreds <diagnose|session|selftest> [flags]\n  Query the host credentials oracle (native auth diagnose; no OpenCode broker session).",
 	"labels":           "Usage: herd labels [flags]\n  Reconcile drifted Herdforge tab labels in place.",
 	"merge-admit":      "Usage: herd merge-admit [flags]\n  Admit a reviewed candidate to the coordinator merge path.",
 	"merge-complete":   "Usage: herd merge-complete [flags]\n  Record and validate completion of an admitted merge.",

@@ -69,8 +69,8 @@ func DiagnoseKindAuthReadinessWith(kind string, auth CredentialAuthority) KindAu
 		d.Class = KindAuthConfig
 		d.Brokerable = false
 		d.ReasonCode = "unknown_kind"
-		d.Blocker = fmt.Sprintf("FAC-170 BLOCKED: kind %q has no HostCreds mapping (OpenCode out of scope)", kind)
-		d.RecommendedAction = "use grok, claude, codex, or agy"
+		d.Blocker = fmt.Sprintf("FAC-170 BLOCKED: kind %q has no HostCreds mapping (unknown kind)", kind)
+		d.RecommendedAction = "use grok, claude, codex, agy, or opencode"
 		return d
 	}
 

@@ -16,21 +16,23 @@ import (
 
 // harnessAuthKinds are the kinds that authenticate through their own harness.
 //
-// FAC-587: that is EVERY kind this fleet launches. Agents run as harnesses
-// inside herdr panes and never against a provider API, so codex and grok hold
-// their own CLI login sessions exactly as claude and agy do. Listing only
-// claude and agy left codex and grok classified as API-key kinds and refused at
-// admission for credentials this fleet does not have — the same category error
-// FAC-576 fixed for claude, left in place for the other two.
+// FAC-587, FAC-791: that is EVERY kind this fleet launches. Agents run as
+// harnesses inside herdr panes and never against a provider API, so codex, grok,
+// and opencode hold their own CLI login sessions and configuration exactly as
+// claude and agy do. Listing only some harnesses left opencode classified as an
+// API-key kind and refused at admission for credentials this fleet does not
+// have — the same category error FAC-576 fixed for claude and FAC-587 fixed for
+// the others.
 //
 // If this fleet ever adopts raw API execution, the change belongs in
 // RequestRulesForKind and RequiredBrokerHostsForKind behind an explicit opt-in,
 // not by reclassifying a kind here.
 var harnessAuthKinds = map[string]bool{
-	AuthorKindAGY: true, "antigravity": true,
-	AuthorKindClaude: true,
-	AuthorKindCodex:  true,
-	AuthorKindGrok:   true,
+	AuthorKindAGY:      true, "antigravity": true,
+	AuthorKindClaude:   true,
+	AuthorKindCodex:    true,
+	AuthorKindGrok:     true,
+	AuthorKindOpenCode: true,
 }
 
 // harnessAuthenticated reports whether a kind carries its own session.
@@ -59,6 +61,18 @@ const (
 // hung CLI must not hang the gate.
 const harnessLoginProbeTimeout = 8 * time.Second
 
+// harnessLoginProbeHook allows tests to override the status probe for harness auth.
+// When nil, the default CLI execution is used.
+var harnessLoginProbeHook func(ctx context.Context, kind string) ([]byte, error)
+
+// SetHarnessLoginProbeForTesting sets a hook for testing harness login probes.
+// It returns a cleanup function that restores the previous hook.
+func SetHarnessLoginProbeForTesting(fn func(ctx context.Context, kind string) ([]byte, error)) func() {
+	prev := harnessLoginProbeHook
+	harnessLoginProbeHook = fn
+	return func() { harnessLoginProbeHook = prev }
+}
+
 // HarnessLoginState asks a harness whether it is signed in.
 //
 // It reads ONLY the boolean. The response also carries an email, an org id and a
@@ -74,12 +88,20 @@ func HarnessLoginState(kind string) HarnessLogin {
 	if kind != AuthorKindClaude {
 		return HarnessLoginUnknown
 	}
-	if _, err := exec.LookPath("claude"); err != nil {
-		return HarnessLoginUnknown
+	var out []byte
+	var err error
+	if harnessLoginProbeHook != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), harnessLoginProbeTimeout)
+		defer cancel()
+		out, err = harnessLoginProbeHook(ctx, kind)
+	} else {
+		if _, lookErr := exec.LookPath("claude"); lookErr != nil {
+			return HarnessLoginUnknown
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), harnessLoginProbeTimeout)
+		defer cancel()
+		out, err = exec.CommandContext(ctx, "claude", "auth", "status", "--json").Output()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), harnessLoginProbeTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "claude", "auth", "status", "--json").Output()
 	if err != nil {
 		return HarnessLoginUnknown
 	}
