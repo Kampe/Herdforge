@@ -25,6 +25,10 @@ const (
 	// EventEvidenceBind appends an immutable full-suite PASS receipt digest
 	// onto an already-recorded independent PASS without rewriting that verdict.
 	EventEvidenceBind Event = "evidence-bind"
+	// EventTaskBinding appends an authenticated correction when an immutable
+	// verdict was recorded against the wrong closeable card. It changes no
+	// verdict or evidence; consumers resolve the effective task from this row.
+	EventTaskBinding Event = "task-binding"
 )
 
 // Verdict values.
@@ -96,6 +100,11 @@ type LedgerRow struct {
 	Reason             string `json:"reason,omitempty"`
 	ContentProof       string `json:"content_proof,omitempty"`
 	Authority          string `json:"authority,omitempty"`
+	PreviousTask       string `json:"previous_task,omitempty"`
+	// rawEventDigest is populated when a row is read from the append-only
+	// ledger.  Projections may change Task, but the event digest must continue
+	// to identify the stored row rather than its projected view.
+	rawEventDigest string
 }
 
 // familyResolve represents the 3-state family resolution.

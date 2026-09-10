@@ -134,6 +134,7 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		if strings.TrimSpace(row.Verdict) == "" {
 			continue
 		}
+		row.Task = EffectiveTask(rows, row)
 		latest[rowProjection(row)] = row
 	}
 	superseded := retrySupersessionFromLatest(latest, records, "")

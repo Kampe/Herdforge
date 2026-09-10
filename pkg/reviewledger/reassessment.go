@@ -9,6 +9,13 @@ import (
 
 // VerdictEventDigest names the exact prior immutable verdict, not just its SHA.
 func VerdictEventDigest(row LedgerRow) string {
+	if row.rawEventDigest != "" {
+		return row.rawEventDigest
+	}
+	return rawEventDigest(row)
+}
+
+func rawEventDigest(row LedgerRow) string {
 	b, _ := json.Marshal(row)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

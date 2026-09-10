@@ -266,6 +266,11 @@ Commands:
 		"  patch-identity-proof, cleanup. ONE step per invocation, on purpose.\n" +
 		"  Refuses cleanup without patch-identity proof: cleanup destroys the source\n" +
 		"  worktree and branch, and proof is what makes that safe rather than lossy.",
+	"install": "Usage: herd install --source <worktree> --revision <full-sha> --target <canonical-root> [--act|--dry-run]\n" +
+		"  Build and atomically install one explicitly pinned native Herdforge source.\n" +
+		"  Dry-run is the default; --act is required to build or replace the target.\n" +
+		"  Refuses foreign, dirty, mismatched, or unproven source/target identity and\n" +
+		"  retains the prior runtime through the native receipt-bound retention hook.",
 	"utilization": "Usage: herd utilization [--json]\n" +
 		"  Publish the per-lane utilization beat: lane, status, blocker, next wake.\n" +
 		"  Names the one condition that matters -- idle, unheld, with work available --\n" +
