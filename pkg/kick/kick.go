@@ -47,31 +47,36 @@ type AgentSession struct {
 func (s *AgentSession) UnmarshalJSON(data []byte) error {
 	var str string
 	if err := json.Unmarshal(data, &str); err == nil {
+		if str == "" {
+			return errors.New("empty agent_session string")
+		}
 		s.Value = str
 		return nil
 	}
 	var obj struct {
 		Value string `json:"value,omitempty"`
 	}
-	if err := json.Unmarshal(data, &obj); err == nil {
+	if err := json.Unmarshal(data, &obj); err == nil && obj.Value != "" {
 		s.Value = obj.Value
 		return nil
 	}
-	return nil
+	return fmt.Errorf("invalid agent_session payload: %s", string(data))
 }
 
 // AgentEntry represents a single agent from herdr agent list.
 type AgentEntry struct {
-	Name        string       `json:"name,omitempty"`
-	Label       string       `json:"label,omitempty"`
-	Kind        string       `json:"agent,omitempty"`
-	Status      string       `json:"agent_status,omitempty"`
-	PaneID      string       `json:"pane_id,omitempty"`
-	TabID       string       `json:"tab_id,omitempty"`
-	Workspace   string       `json:"workspace_id,omitempty"`
-	Cwd         string       `json:"cwd,omitempty"`
-	Interactive *bool        `json:"interactive,omitempty"`
-	Session     AgentSession `json:"agent_session,omitempty"`
+	Name           string       `json:"name,omitempty"`
+	Label          string       `json:"label,omitempty"`
+	Kind           string       `json:"agent,omitempty"`
+	Status         string       `json:"agent_status,omitempty"`
+	PaneID         string       `json:"pane_id,omitempty"`
+	TabID          string       `json:"tab_id,omitempty"`
+	TerminalID     string       `json:"terminal_id,omitempty"`
+	Workspace      string       `json:"workspace_id,omitempty"`
+	Cwd            string       `json:"cwd,omitempty"`
+	Interactive    *bool        `json:"interactive,omitempty"`
+	StateChangeSeq uint64       `json:"state_change_seq,omitempty"`
+	Session        AgentSession `json:"agent_session,omitempty"`
 }
 
 // AgentListResult wraps the herdr agent list response.

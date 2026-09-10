@@ -488,7 +488,31 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 		if !found {
 			return nil, process.SessionContext{}, ""
 		}
-		ev, sctx, paneText, _ := process.ResolveNativeAgentEvidence(context.Background(), a.Session.Value, a.Kind, a.Cwd, time.Now().UTC(), 5*time.Minute)
+		fence := process.IdentityFence{
+			Name:           a.Name,
+			Kind:           a.Kind,
+			SessionID:      a.Session.Value,
+			PaneID:         a.PaneID,
+			TabID:          a.TabID,
+			TerminalID:     a.TerminalID,
+			Workspace:      a.Workspace,
+			Cwd:            a.Cwd,
+			StateChangeSeq: a.StateChangeSeq,
+		}
+		fetchAfter := func(agentName string) (*kick.AgentEntry, error) {
+			currentAgents, err := fetchAgents()
+			if err != nil {
+				return nil, err
+			}
+			cur, ok := findAttentionAgent(currentAgents, agentName)
+			if !ok {
+				return nil, errors.New("agent not found in current fleet")
+			}
+			return &cur, nil
+		}
+		exportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ev, sctx, paneText, _ := process.ResolveNativeAgentEvidenceWithFence(exportCtx, fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
 		return ev, sctx, paneText
 	}
 	r := TriageWithEvidence(agents, kick.StandingIDs(), check, evidenceResolver, kick.ProviderDeathCheck)

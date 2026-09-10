@@ -14,6 +14,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
@@ -96,7 +97,44 @@ func runSpin() {
 		tail, _ := herdr.PaneRead(a.PaneID, *tailLines)
 		pid, cwd, alive := paneProcessState(a.PaneID)
 
-		ev, sctx, _, _ := process.ResolveNativeAgentEvidence(ctx, a.Session.Value, a.Kind, cwd, now, 5*time.Minute)
+		fence := process.IdentityFence{
+			Name:           a.Name,
+			Kind:           a.Kind,
+			SessionID:      a.Session.Value,
+			PaneID:         a.PaneID,
+			TabID:          a.TabID,
+			TerminalID:     a.TerminalID,
+			Workspace:      a.Workspace,
+			Cwd:            cwd,
+			StateChangeSeq: a.StateChangeSeq,
+		}
+		fetchAfter := func(name string) (*kick.AgentEntry, error) {
+			currentAgents, err := herdr.AgentList()
+			if err != nil {
+				return nil, err
+			}
+			for _, cur := range currentAgents {
+				if cur.Name == name {
+					return &kick.AgentEntry{
+						Name:           cur.Name,
+						Kind:           cur.Kind,
+						Status:         cur.Status,
+						PaneID:         cur.PaneID,
+						TabID:          cur.TabID,
+						TerminalID:     cur.TerminalID,
+						Workspace:      cur.Workspace,
+						Cwd:            cur.Cwd,
+						StateChangeSeq: cur.StateChangeSeq,
+						Session:        kick.AgentSession{Value: cur.Session.Value},
+					}, nil
+				}
+			}
+			return nil, errors.New("agent not found after export")
+		}
+		spinCtx, spinCancel := context.WithTimeout(ctx, 10*time.Second)
+		ev, sctx, _, _ := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, now, 5*time.Minute)
+		spinCancel()
+
 		target := process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)
 		if target.Class == process.Quota && ev != nil {
 			process.EvaluateAndRecordStop(ev, sctx, tail, 15*time.Minute)

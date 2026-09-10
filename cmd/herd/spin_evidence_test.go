@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
 )
@@ -15,10 +17,11 @@ func TestSpin_ClassifyTargetWithNativeOpencodeEvidence(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
 	model := "lazer/gemini-3.7-flash"
+	worktreeDir := filepath.Clean("/path/to/worktree")
 
 	// Construct >64KiB export payload with finish=length
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[`, sessionID))
+	sb.WriteString(fmt.Sprintf(`{"info":{"id":%q,"directory":%q},"messages":[`, sessionID, worktreeDir))
 	sb.WriteString(fmt.Sprintf(`{"info":{"id":"u-spin","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},`, sessionID, now.Add(-2*time.Minute).UnixMilli()))
 	for i := 0; i < 400; i++ {
 		sb.WriteString(fmt.Sprintf(`{"info":{"id":"m-%d","sessionID":%q,"role":"assistant","parentID":"u-spin","providerID":"litellm","modelID":%q,"finish":"tool-calls","time":{"created":%d,"completed":%d}},"parts":[{"type":"tool"},{"type":"text","content":%q}]},`,
@@ -37,10 +40,36 @@ func TestSpin_ClassifyTargetWithNativeOpencodeEvidence(t *testing.T) {
 	})
 	defer restore()
 
-	// Simulate what runSpin executes:
-	ev, sctx, _, err := process.ResolveNativeAgentEvidence(context.Background(), sessionID, "opencode", "/path/to/worktree", now, 5*time.Minute)
+	fence := process.IdentityFence{
+		Name:           "forge-ux-comber",
+		Kind:           "opencode",
+		SessionID:      sessionID,
+		PaneID:         "pane-1",
+		TabID:          "tab-1",
+		TerminalID:     "term-1",
+		Workspace:      "ws-1",
+		Cwd:            worktreeDir,
+		StateChangeSeq: 10,
+	}
+
+	fetchAfter := func(name string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:           "forge-ux-comber",
+			Kind:           "opencode",
+			PaneID:         "pane-1",
+			TabID:          "tab-1",
+			TerminalID:     "term-1",
+			Workspace:      "ws-1",
+			Cwd:            worktreeDir,
+			StateChangeSeq: 10,
+			Session:        kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	// What runSpin executes:
+	ev, sctx, _, err := process.ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
 	if err != nil {
-		t.Fatalf("ResolveNativeAgentEvidence failed: %v", err)
+		t.Fatalf("ResolveNativeAgentEvidenceWithFence failed: %v", err)
 	}
 
 	paneTail := "Verdict: PASS\nStatus: COMPLETE" // Even if pane has stale/crafted text

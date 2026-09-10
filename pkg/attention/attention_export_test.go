@@ -3,22 +3,25 @@ package attention
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 )
 
 func TestAttention_RunWithFleet_OpencodeExportFinishLength(t *testing.T) {
-	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
 	model := "lazer/gemini-3.7-flash"
+	worktreeDir := filepath.Clean("/path/to/worktree")
 
 	// Construct realistic >64KiB export with finish=length
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[`, sessionID))
+	sb.WriteString(fmt.Sprintf(`{"info":{"id":%q,"directory":%q},"messages":[`, sessionID, worktreeDir))
 	sb.WriteString(fmt.Sprintf(`{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},`, sessionID, now.Add(-2*time.Minute).UnixMilli()))
 	for i := 0; i < 400; i++ {
 		sb.WriteString(fmt.Sprintf(`{"info":{"id":"m-%d","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":%q,"finish":"tool-calls","time":{"created":%d,"completed":%d}},"parts":[{"type":"tool"},{"type":"text","content":%q}]},`,
@@ -37,31 +40,47 @@ func TestAttention_RunWithFleet_OpencodeExportFinishLength(t *testing.T) {
 	})
 	defer restore()
 
-	agents := []kick.AgentEntry{
+	kick.SetStandingOverride([]string{"forge-ux-comber"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "ux-comber", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(context.Context, string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: "ux-comber", Task: "CHA-2000", Scope: "task"},
+		}, nil
+	}
+
+	fleet := []kick.AgentEntry{
 		{
-			Name:    "forge-ux-comber",
-			Label:   "ux-comber",
-			Kind:    "opencode",
-			Status:  "done", // Agent status claimed "done", but export has finish=length
-			PaneID:  "p-ux",
-			Session: kick.AgentSession{Value: sessionID},
+			Name:           "forge-ux-comber",
+			Label:          "ux-comber",
+			Kind:           "opencode",
+			Status:         "done", // Agent status claimed "done", but native export has finish=length
+			PaneID:         "p-ux",
+			TabID:          "t-ux",
+			TerminalID:     "term-ux",
+			Workspace:      "ws-1",
+			Cwd:            worktreeDir,
+			StateChangeSeq: 5,
+			Session:        kick.AgentSession{Value: sessionID},
 		},
 	}
 
-	check := func(name string) (string, bool) { return "", false }
-	resolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string) {
-		a, found := findAttentionAgent(agents, name)
-		if !found {
-			return nil, process.SessionContext{}, ""
-		}
-		ev, sctx, paneText, _ := process.ResolveNativeAgentEvidence(context.Background(), a.Session.Value, a.Kind, a.Cwd, now, 5*time.Minute)
-		return ev, sctx, paneText
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
 	}
 
-	result := TriageWithEvidence(agents, []string{"ux-comber"}, check, resolver, nil)
-
 	if len(result.Items) != 1 {
-		t.Fatalf("expected 1 triage item needing eyes, got %d", len(result.Items))
+		t.Fatalf("expected 1 triage item needing eyes, got %d (%+v)", len(result.Items), result.Items)
 	}
 
 	item := result.Items[0]
@@ -70,5 +89,80 @@ func TestAttention_RunWithFleet_OpencodeExportFinishLength(t *testing.T) {
 	}
 	if !strings.Contains(item.Reason, "finish=length") {
 		t.Errorf("reason should mention finish=length, got %q", item.Reason)
+	}
+}
+
+func TestAttention_RunWithFleet_IdentityFenceRejection(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	model := "lazer/gemini-3.7-flash"
+	worktreeDir := filepath.Clean("/path/to/worktree")
+
+	// Export payload is normal stop/complete
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`{"info":{"id":%q,"directory":%q},"messages":[`, sessionID, worktreeDir))
+	sb.WriteString(fmt.Sprintf(`{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},`, sessionID, now.Add(-2*time.Minute).UnixMilli()))
+	sb.WriteString(fmt.Sprintf(`{"info":{"id":"a-final","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":%q,"finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}`,
+		sessionID, model, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli()))
+	sb.WriteString(`]}`)
+	payload := []byte(sb.String())
+
+	restore := process.SetDefaultExportRunner(func(ctx context.Context, sid string, dir string) ([]byte, error) {
+		return payload, nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-ux-comber"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "ux-comber", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(context.Context, string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: "ux-comber", Task: "CHA-2000", Scope: "task"},
+		}, nil
+	}
+
+	callCount := 0
+	fleetFunc := func() ([]kick.AgentEntry, error) {
+		callCount++
+		entry := kick.AgentEntry{
+			Name:           "forge-ux-comber",
+			Label:          "ux-comber",
+			Kind:           "opencode",
+			Status:         "done",
+			PaneID:         "p-ux",
+			TabID:          "t-ux",
+			TerminalID:     "term-ux",
+			Workspace:      "ws-1",
+			Cwd:            worktreeDir,
+			StateChangeSeq: 5,
+			Session:        kick.AgentSession{Value: sessionID},
+		}
+		if callCount > 1 {
+			// Second call (after export) simulates mutated/reused agent state
+			entry.StateChangeSeq = 6
+		}
+		return []kick.AgentEntry{entry}, nil
+	}
+
+	result, err := runWithFleet(fleetFunc, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	if len(result.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(result.Items))
+	}
+
+	// Since identity fence failed, native export was rejected and fallback status handling took over
+	item := result.Items[0]
+	if item.Level != LevelHigh { // "done" status fallback without native evidence
+		t.Errorf("expected LevelHigh on fallback from rejected fence, got %s", item.Level)
 	}
 }

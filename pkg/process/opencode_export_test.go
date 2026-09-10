@@ -2,10 +2,15 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/kick"
 )
 
 // generateLargeExportJSON generates a realistic opencode export JSON payload larger than 64KiB (>65536 bytes).
@@ -89,45 +94,96 @@ func TestExtractTerminalEvidenceFromExport_LargePayloadAndFinishLength(t *testin
 	}
 }
 
-func TestExtractTerminalEvidenceFromExport_SecurityValidations(t *testing.T) {
+func TestExtractTerminalEvidenceFromExport_SecurityMatrix(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
 	model := "lazer/gemini-3.7-flash"
 
 	// Case 1: Wrong session ID
 	payload := generateLargeExportJSON(sessionID, "u1", "a1", "stop", model, now)
-	_, err := ExtractTerminalEvidenceFromExport(payload, "different-session-id", "", now, 5*time.Minute)
+	_, err := ExtractTerminalEvidenceFromExport(payload, "different-session-id", "/path/to/worktree", now, 5*time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "session_id mismatch") {
 		t.Errorf("expected session mismatch error, got %v", err)
 	}
 
 	// Case 2: Broken parent link (assistant does not point to latest user turn)
-	brokenParentPayload := []byte(fmt.Sprintf(`{"info":{"id":%q},"messages":[{"info":{"id":"u-old","role":"user"}},{"info":{"id":"a-old","role":"assistant","parentID":"u-old"}},{"info":{"id":"u-new","role":"user"}},{"info":{"id":"a-orphan","role":"assistant","parentID":"u-old","providerID":"litellm","modelID":%q,"time":{"completed":%d}}}]}`,
-		sessionID, model, now.UnixMilli()))
-	_, err = ExtractTerminalEvidenceFromExport(brokenParentPayload, sessionID, "", now, 5*time.Minute)
+	brokenParentPayload := []byte(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[{"info":{"id":"u-old","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-old","sessionID":%q,"role":"assistant","parentID":"u-old","providerID":"litellm","modelID":%q,"time":{"created":%d,"completed":%d}}},{"info":{"id":"u-new","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-orphan","sessionID":%q,"role":"assistant","parentID":"u-old","providerID":"litellm","modelID":%q,"time":{"created":%d,"completed":%d}}}]}`,
+		sessionID, sessionID, now.Add(-3*time.Minute).UnixMilli(), sessionID, model, now.Add(-3*time.Minute).UnixMilli(), now.Add(-2*time.Minute).UnixMilli(), sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, model, now.Add(-1*time.Minute).UnixMilli(), now.UnixMilli()))
+	_, err = ExtractTerminalEvidenceFromExport(brokenParentPayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "turn binding broken") {
 		t.Errorf("expected turn binding broken error, got %v", err)
 	}
 
-	// Case 3: Stale timestamp (15 minutes old)
+	// Case 3: Empty parent ID
+	emptyParentPayload := []byte(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"","providerID":"litellm","modelID":%q,"time":{"created":%d,"completed":%d}}}]}`,
+		sessionID, sessionID, now.Add(-2*time.Minute).UnixMilli(), sessionID, model, now.Add(-1*time.Minute).UnixMilli(), now.UnixMilli()))
+	_, err = ExtractTerminalEvidenceFromExport(emptyParentPayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "missing parentID") {
+		t.Errorf("expected missing parentID error, got %v", err)
+	}
+
+	// Case 4: Foreign message session ID
+	foreignSessionPayload := []byte(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[{"info":{"id":"u-1","sessionID":"other-sess","role":"user","time":{"created":%d}}},{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":%q,"time":{"created":%d,"completed":%d}}}]}`,
+		sessionID, now.Add(-2*time.Minute).UnixMilli(), sessionID, model, now.Add(-1*time.Minute).UnixMilli(), now.UnixMilli()))
+	_, err = ExtractTerminalEvidenceFromExport(foreignSessionPayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "does not match export sessionID") {
+		t.Errorf("expected message session mismatch error, got %v", err)
+	}
+
+	// Case 5: Directory mismatch (suffix match attempt must be rejected)
+	_, err = ExtractTerminalEvidenceFromExport(payload, sessionID, "/other/prefix/path/to/worktree", now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "directory mismatch") {
+		t.Errorf("expected directory mismatch error on suffix match, got %v", err)
+	}
+
+	// Case 6: Missing directory metadata in export
+	noDirPayload := []byte(fmt.Sprintf(`{"info":{"id":%q},"messages":[{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":%q,"time":{"created":%d,"completed":%d}}}]}`,
+		sessionID, sessionID, now.Add(-2*time.Minute).UnixMilli(), sessionID, model, now.Add(-1*time.Minute).UnixMilli(), now.UnixMilli()))
+	_, err = ExtractTerminalEvidenceFromExport(noDirPayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "missing directory metadata") {
+		t.Errorf("expected missing directory metadata error, got %v", err)
+	}
+
+	// Case 7: Stale completed timestamp (15 minutes old)
 	stalePayload := generateLargeExportJSON(sessionID, "u1", "a1", "stop", model, now.Add(-15*time.Minute))
-	_, err = ExtractTerminalEvidenceFromExport(stalePayload, sessionID, "", now, 5*time.Minute)
+	_, err = ExtractTerminalEvidenceFromExport(stalePayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "outside") {
 		t.Errorf("expected stale evidence error, got %v", err)
 	}
 
-	// Case 4: Loose prose with embedded JSON must be rejected
+	// Case 8: Old in-flight turn (started 15 minutes ago, but still in-flight with no completion time)
+	// Must be accepted as valid active in-flight turn!
+	inFlightPayload := []byte(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":%q,"finish":null,"time":{"created":%d}}}]}`,
+		sessionID, sessionID, now.Add(-15*time.Minute).UnixMilli(), sessionID, model, now.Add(-15*time.Minute).UnixMilli()))
+	inFlightEv, err := ExtractTerminalEvidenceFromExport(inFlightPayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("expected old in-flight turn to be accepted, got error: %v", err)
+	}
+	if inFlightEv.FinishReason != "" {
+		t.Errorf("expected empty in-flight finish reason, got %q", inFlightEv.FinishReason)
+	}
+
+	// Case 9: Missing provider ID (no fallback to fabricated provider)
+	noProviderPayload := []byte(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"","modelID":%q,"finish":"stop","time":{"created":%d,"completed":%d}}}]}`,
+		sessionID, sessionID, now.Add(-2*time.Minute).UnixMilli(), sessionID, model, now.Add(-1*time.Minute).UnixMilli(), now.UnixMilli()))
+	_, err = ExtractTerminalEvidenceFromExport(noProviderPayload, sessionID, "/path/to/worktree", now, 5*time.Minute)
+	if err == nil || !errors.Is(err, ErrMissingProvider) {
+		t.Errorf("expected ErrMissingProvider error, got %v", err)
+	}
+
+	// Case 10: Loose prose with embedded JSON must be rejected
 	looseProse := append([]byte("Log prefix:\n"), payload...)
-	_, err = ExtractTerminalEvidenceFromExport(looseProse, sessionID, "", now, 5*time.Minute)
+	_, err = ExtractTerminalEvidenceFromExport(looseProse, sessionID, "/path/to/worktree", now, 5*time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "must be a structured JSON object") {
 		t.Errorf("expected structured JSON requirement error on loose prose, got %v", err)
 	}
 }
 
-func TestResolveNativeAgentEvidence_WithExportRunner(t *testing.T) {
+func TestResolveNativeAgentEvidenceWithFence_BeforeAfterFencing(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
 	model := "lazer/gemini-3.7-flash"
+	worktreeDir := filepath.Clean("/path/to/worktree")
 
 	fakePayload := generateLargeExportJSON(sessionID, "u-42", "a-42", "length", model, now)
 
@@ -139,23 +195,143 @@ func TestResolveNativeAgentEvidence_WithExportRunner(t *testing.T) {
 	})
 	defer restore()
 
-	ev, sctx, _, err := ResolveNativeAgentEvidence(context.Background(), sessionID, "opencode", "/path/to/worktree", now, 5*time.Minute)
-	if err != nil {
-		t.Fatalf("ResolveNativeAgentEvidence failed: %v", err)
-	}
-	if ev == nil {
-		t.Fatal("expected non-nil evidence")
-	}
-	if ev.FinishReason != "length" {
-		t.Errorf("expected finish_reason length, got %s", ev.FinishReason)
-	}
-	if sctx.TurnID != "u-42" {
-		t.Errorf("expected sctx.TurnID to be bound to u-42, got %s", sctx.TurnID)
+	baseFence := IdentityFence{
+		Name:           "forge-worker-1",
+		Kind:           "opencode",
+		SessionID:      sessionID,
+		PaneID:         "p-100",
+		TabID:          "t-100",
+		TerminalID:     "term-100",
+		Workspace:      "ws-main",
+		Cwd:            worktreeDir,
+		StateChangeSeq: 10,
+		ExpectedModel:  model,
 	}
 
-	// Non-opencode harness returns nil evidence cleanly
-	evClaude, _, _, errClaude := ResolveNativeAgentEvidence(context.Background(), "claude-sess", "claude", "", now, 5*time.Minute)
-	if errClaude != nil || evClaude != nil {
-		t.Errorf("non-opencode harness should return nil evidence with no error, got ev=%+v err=%v", evClaude, errClaude)
+	// 1. Success case: after matches before fence exactly
+	fetchMatching := func(name string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:           "forge-worker-1",
+			Kind:           "opencode",
+			PaneID:         "p-100",
+			TabID:          "t-100",
+			TerminalID:     "term-100",
+			Workspace:      "ws-main",
+			Cwd:            worktreeDir,
+			StateChangeSeq: 10,
+			Session:        kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	ev, sctx, _, err := ResolveNativeAgentEvidenceWithFence(context.Background(), baseFence, fetchMatching, now, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("expected successful resolution with valid fence, got: %v", err)
+	}
+	if ev.TurnID != "u-42" || sctx.TurnID != "u-42" {
+		t.Errorf("turn ID mismatch: %s / %s", ev.TurnID, sctx.TurnID)
+	}
+
+	// 2. StateChangeSeq changed during export (agent mutated/reused)
+	fetchMutated := func(name string) (*kick.AgentEntry, error) {
+		entry, _ := fetchMatching(name)
+		entry.StateChangeSeq = 11
+		return entry, nil
+	}
+	_, _, _, err = ResolveNativeAgentEvidenceWithFence(context.Background(), baseFence, fetchMutated, now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "state_change_seq changed") {
+		t.Errorf("expected state_change_seq fence mismatch error, got: %v", err)
+	}
+
+	// 3. Pane ID changed during export (moved pane)
+	fetchMoved := func(name string) (*kick.AgentEntry, error) {
+		entry, _ := fetchMatching(name)
+		entry.PaneID = "p-999"
+		return entry, nil
+	}
+	_, _, _, err = ResolveNativeAgentEvidenceWithFence(context.Background(), baseFence, fetchMoved, now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "pane_id changed") {
+		t.Errorf("expected pane_id fence mismatch error, got: %v", err)
+	}
+
+	// 4. Session ID replaced
+	fetchReplaced := func(name string) (*kick.AgentEntry, error) {
+		entry, _ := fetchMatching(name)
+		entry.Session = kick.AgentSession{Value: "new-session-id"}
+		return entry, nil
+	}
+	_, _, _, err = ResolveNativeAgentEvidenceWithFence(context.Background(), baseFence, fetchReplaced, now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "session_id changed") {
+		t.Errorf("expected session_id fence mismatch error, got: %v", err)
+	}
+}
+
+func TestCaptureOpencodeExportLive_RegularFDCapturer_SubprocessExecution(t *testing.T) {
+	// Create a fake "opencode" binary in a temp directory
+	tmpDir, err := os.MkdirTemp("", "fake-opencode-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	largePayload := generateLargeExportJSON(sessionID, "u1", "a1", "length", "litellm/model", now)
+
+	payloadFile := filepath.Join(tmpDir, "payload.json")
+	if err := os.WriteFile(payloadFile, largePayload, 0644); err != nil {
+		t.Fatalf("write payload file: %v", err)
+	}
+
+	// Script outputs the payload file to stdout
+	fakeBin := filepath.Join(tmpDir, "opencode")
+	scriptContent := fmt.Sprintf("#!/bin/sh\ncat %s\n", payloadFile)
+	if err := os.WriteFile(fakeBin, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("write fake opencode script: %v", err)
+	}
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", tmpDir+":"+oldPath)
+	defer os.Setenv("PATH", oldPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	captured, err := captureOpencodeExportLive(ctx, sessionID, tmpDir)
+	if err != nil {
+		t.Fatalf("captureOpencodeExportLive failed: %v", err)
+	}
+
+	if len(captured) != len(largePayload) {
+		t.Errorf("expected %d bytes captured, got %d bytes", len(largePayload), len(captured))
+	}
+	if len(captured) <= 65536 {
+		t.Errorf("expected payload to exceed 64KiB (65536 bytes), got %d", len(captured))
+	}
+}
+
+func TestCaptureOpencodeExportLive_HangingCommand(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fake-opencode-hang-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	fakeBin := filepath.Join(tmpDir, "opencode")
+	scriptContent := "#!/bin/sh\nexec sleep 30\n"
+	if err := os.WriteFile(fakeBin, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("write fake opencode script: %v", err)
+	}
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", tmpDir+":"+oldPath)
+	defer os.Setenv("PATH", oldPath)
+
+	// Explicit short context
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err = captureOpencodeExportLive(ctx, "session-hang", "")
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout error for hanging command, got: %v", err)
 	}
 }
