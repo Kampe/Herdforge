@@ -196,6 +196,9 @@ func exportOpenCodeSession(ctx context.Context, sessionID, cwd string) ([]byte, 
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = file.Close()
+		if stderr.Len() > 0 {
+			return nil, fmt.Errorf("OpenCode export failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		}
 		return nil, fmt.Errorf("OpenCode export failed: %w", err)
 	}
 	if err := file.Close(); err != nil {

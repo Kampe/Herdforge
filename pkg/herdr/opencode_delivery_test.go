@@ -370,7 +370,7 @@ func TestPublicSendOpenCodeColdStartedAssistantDoesNotNeedCompletion(t *testing.
 
 func TestExportOpenCodeSessionPreservesCompletePrivateJSON(t *testing.T) {
 	dir := t.TempDir()
-	payload := []byte(`{"info":{"id":"ses_native"},"padding":"` + strings.Repeat("x", 70*1024) + `"}`)
+	payload := []byte(`{"info":{"id":"ses_native"},"padding":"` + strings.Repeat("x", 350*1024) + `"}`)
 	payloadFile := filepath.Join(dir, "export.json")
 	if err := os.WriteFile(payloadFile, payload, 0o600); err != nil {
 		t.Fatal(err)
@@ -389,6 +389,51 @@ func TestExportOpenCodeSessionPreservesCompletePrivateJSON(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("export length = %d, want complete regular-file output length %d", len(got), len(payload))
+	}
+}
+
+func TestExportOpenCodeSessionFailsClosedOnTruncation(t *testing.T) {
+	dir := t.TempDir()
+	// Simulate truncated JSON export near 64KiB boundary.
+	truncated := []byte(`{"info":{"id":"ses_native"},"data":{"messages":[{"role":"user","content":"` + strings.Repeat("a", 60*1024))
+	payloadFile := filepath.Join(dir, "truncated.json")
+	if err := os.WriteFile(payloadFile, truncated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cli := filepath.Join(dir, "opencode")
+	script := "#!/bin/sh\ncat " + shellQuote(payloadFile) + "\n"
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restore := SetOpenCodeExecutableForTest(cli)
+	defer restore()
+
+	got, err := exportOpenCodeSession(context.Background(), nativeOpenCodeSession, dir)
+	if err != nil {
+		t.Fatalf("export returned error: %v", err)
+	}
+	_, parseErr := parseOpenCodeExport(got)
+	if parseErr == nil {
+		t.Fatal("parseOpenCodeExport must fail closed on truncated JSON input")
+	}
+}
+
+func TestExportOpenCodeSessionIncludesStderrDiagnosticsOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	cli := filepath.Join(dir, "opencode")
+	script := "#!/bin/sh\necho 'error: session ses_native is corrupt or locked' >&2\nexit 1\n"
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restore := SetOpenCodeExecutableForTest(cli)
+	defer restore()
+
+	_, err := exportOpenCodeSession(context.Background(), nativeOpenCodeSession, dir)
+	if err == nil {
+		t.Fatal("export must fail on non-zero exit")
+	}
+	if !strings.Contains(err.Error(), "session ses_native is corrupt or locked") {
+		t.Fatalf("export error missing stderr diagnostics: %v", err)
 	}
 }
 
