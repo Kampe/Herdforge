@@ -1,7 +1,9 @@
 package herdr
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -294,5 +296,153 @@ func TestSourceRetirementManifestRegistry(t *testing.T) {
 	}
 	if rows[0].Generation != "g1" || rows[0].CandidateSHA != m.CandidateSHA {
 		t.Fatalf("row mismatch: %+v", rows[0])
+	}
+}
+
+func TestParseStructuredHandoffReport_ValidAndInvalid(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	tests := []struct {
+		name    string
+		content string
+		wantErr bool
+		want    StructuredHandoffReport
+	}{
+		{
+			name:    "valid structured report with key value pairs",
+			content: "# Handoff Report\n\nTask: FAC-794\nAgent: forge-mender-1\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: false,
+			want: StructuredHandoffReport{
+				TaskRef:      "FAC-794",
+				AgentName:    "forge-mender-1",
+				CandidateSHA: sha,
+				Status:       "READY",
+			},
+		},
+		{
+			name:    "valid markdown list format",
+			content: "- Task: FAC-794\n- Agent: forge-mender-1\n- Candidate: " + sha + "\n- Status: READY\n",
+			wantErr: false,
+			want: StructuredHandoffReport{
+				TaskRef:      "FAC-794",
+				AgentName:    "forge-mender-1",
+				CandidateSHA: sha,
+				Status:       "READY",
+			},
+		},
+		{
+			name:    "non ready status",
+			content: "Task: FAC-794\nAgent: forge-mender-1\nCandidate: " + sha + "\nStatus: BLOCKED\n",
+			wantErr: true,
+		},
+		{
+			name:    "prose only without structured status",
+			content: "I finished the work and everything is ready for review.",
+			wantErr: true,
+		},
+		{
+			name:    "missing candidate",
+			content: "Task: FAC-794\nAgent: forge-mender-1\nStatus: READY\n",
+			wantErr: true,
+		},
+		{
+			name:    "short candidate sha",
+			content: "Task: FAC-794\nCandidate: abc123\nStatus: READY\n",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseStructuredHandoffReport([]byte(tt.content))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v, wantErr %v (got %+v)", err, tt.wantErr, got)
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnrollReadySourceManifests_DryRunReadOnly(t *testing.T) {
+	root := t.TempDir()
+	candidateSHA := strings.Repeat("a", 40)
+	reportRel := ".herd/reports/fac-794.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportData := []byte("Task: FAC-794\nAgent: forge-mender-1\nCandidate: " + candidateSHA + "\nStatus: READY\n")
+	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wtDir := filepath.Join(root, ".worktrees", "mender-fac794")
+	if err := os.MkdirAll(wtDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	launchReceiptsRel := ".herd/launch-receipts.jsonl"
+	launchReceiptsPath := filepath.Join(root, launchReceiptsRel)
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lr := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         "forge-mender-1",
+		Branch:       "recovery/fac-794",
+		Worktree:     ".worktrees/mender-fac794",
+		CandidateSHA: candidateSHA,
+		PaneID:       "wK:p17G",
+		TabID:        "wK:t17G",
+		HerdrSession: "session-1",
+	}
+	lrBytes, _ := json.Marshal(lr)
+	if err := os.WriteFile(launchReceiptsPath, append(lrBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifestsPath := SourceRetirementRegistryPath(root)
+
+	// 1. Dry run (persist = false): returns enrolled manifests in memory without creating file
+	manifests, err := EnrollReadySourceManifests(root, "fixture-repo", false)
+	if err != nil {
+		t.Fatalf("EnrollReadySourceManifests(dryRun) failed: %v", err)
+	}
+	if len(manifests) != 1 {
+		t.Fatalf("expected 1 manifest in memory, got %d", len(manifests))
+	}
+	if _, err := os.Stat(manifestsPath); !os.IsNotExist(err) {
+		t.Fatalf("DRY RUN VIOLATION: registry file was written to disk during dry run!")
+	}
+
+	// 2. Act (persist = true): writes file to disk
+	manifests2, err := EnrollReadySourceManifests(root, "fixture-repo", true)
+	if err != nil {
+		t.Fatalf("EnrollReadySourceManifests(persist) failed: %v", err)
+	}
+	if len(manifests2) != 1 {
+		t.Fatalf("expected 1 manifest, got %d", len(manifests2))
+	}
+	if _, err := os.Stat(manifestsPath); err != nil {
+		t.Fatalf("expected registry file to exist after persist=true: %v", err)
+	}
+}
+
+func TestEnrollReadySourceManifests_CorruptRegistryFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	manifestsPath := SourceRetirementRegistryPath(root)
+	if err := os.MkdirAll(filepath.Dir(manifestsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestsPath, []byte("{invalid-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := EnrollReadySourceManifests(root, "fixture-repo", true)
+	if err == nil {
+		t.Fatal("expected failure on corrupt registry file, but got nil")
 	}
 }

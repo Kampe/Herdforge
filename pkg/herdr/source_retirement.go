@@ -12,6 +12,7 @@ package herdr
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -200,20 +201,27 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 		return blockSourceRetirement("canary lane is protected from source retirement policy")
 	}
 
-	// Launch provenance check
-	if e.Launch.Role != "" || e.Launch.TaskRef != "" || e.Launch.Name != "" || e.Launch.Accepted {
-		if !e.Launch.Accepted {
-			return blockSourceRetirement("launch provenance was not accepted")
-		}
-		if e.Launch.TaskRef != "" && e.Launch.TaskRef != m.TaskRef {
-			return blockSourceRetirement("launch provenance task ref mismatch")
-		}
-		if e.Launch.Branch != "" && e.Launch.Branch != m.Branch {
-			return blockSourceRetirement("launch provenance branch mismatch")
-		}
-		if e.Launch.CandidateSHA != "" && e.Launch.CandidateSHA != m.CandidateSHA {
-			return blockSourceRetirement("launch provenance candidate SHA mismatch")
-		}
+	// Launch provenance check - must be authentic, accepted, and match the manifest
+	if !e.Launch.Accepted || strings.TrimSpace(e.Launch.TaskRef) == "" || strings.TrimSpace(e.Launch.Name) == "" {
+		return blockSourceRetirement("launch provenance was not accepted or is missing")
+	}
+	if e.Launch.TaskRef != m.TaskRef {
+		return blockSourceRetirement("launch provenance task ref mismatch")
+	}
+	if e.Launch.Name != m.AgentName {
+		return blockSourceRetirement("launch provenance agent name mismatch")
+	}
+	if e.Launch.Worktree != "" && e.Launch.Worktree != m.Worktree {
+		return blockSourceRetirement("launch provenance worktree mismatch")
+	}
+	if e.Launch.Branch != "" && e.Launch.Branch != m.Branch {
+		return blockSourceRetirement("launch provenance branch mismatch")
+	}
+	if e.Launch.CandidateSHA != "" && e.Launch.CandidateSHA != m.CandidateSHA {
+		return blockSourceRetirement("launch provenance candidate SHA mismatch")
+	}
+	if e.Launch.HerdrSession != "" && m.SessionID != "" && e.Launch.HerdrSession != m.SessionID {
+		return blockSourceRetirement("launch provenance session mismatch")
 	}
 
 	// Durable handoff / report check
@@ -229,8 +237,8 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 	if e.Handoff.AgentName != "" && e.Handoff.AgentName != m.AgentName {
 		return blockSourceRetirement("handoff agent name does not match manifest")
 	}
-	status := strings.ToLower(strings.TrimSpace(e.Handoff.Status))
-	if status != "ready" && status != "complete" && status != "completed" && status != "done" && status != "pass" {
+	status := strings.ToUpper(strings.TrimSpace(e.Handoff.Status))
+	if status != "READY" && status != "COMPLETE" && status != "COMPLETED" && status != "DONE" && status != "PASS" {
 		return blockSourceRetirement("handoff status is not ready or complete: " + e.Handoff.Status)
 	}
 	digest := m.ReportDigest
@@ -286,6 +294,9 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 	}
 	if len(e.Live.ActiveDescendants) > 0 {
 		return blockSourceRetirement("active processes running in pane: " + strings.Join(e.Live.ActiveDescendants, ", "))
+	}
+	if e.Live.Status == "done" && e.Live.ProcessPresent {
+		return blockSourceRetirement("residual processes present in completed pane")
 	}
 
 	return SourceRetirementDecision{Eligible: true, Reason: "exact bound source manifest and durable ready handoff verified"}
@@ -473,13 +484,103 @@ func RetireSourceLanesContext(ctx context.Context, op SourceRetirementOp, manife
 	return r, nil
 }
 
+// StructuredHandoffReport represents the parsed structured fields from a durable handoff report.
+type StructuredHandoffReport struct {
+	TaskRef      string `json:"task_ref"`
+	CandidateSHA string `json:"candidate_sha"`
+	Status       string `json:"status"`
+	AgentName    string `json:"agent_name,omitempty"`
+	Branch       string `json:"branch,omitempty"`
+}
+
+// ParseStructuredHandoffReport parses and strictly validates structured key-value lines from a report.
+func ParseStructuredHandoffReport(data []byte) (StructuredHandoffReport, error) {
+	var r StructuredHandoffReport
+	s := bufio.NewScanner(bytes.NewReader(data))
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			trimmed := strings.TrimLeft(line, "# ")
+			if strings.Contains(trimmed, ":") {
+				line = trimmed
+			} else {
+				continue
+			}
+		}
+		line = strings.TrimPrefix(line, "- ")
+		line = strings.TrimPrefix(line, "* ")
+		line = strings.TrimSpace(line)
+		colonIdx := strings.Index(line, ":")
+		if colonIdx == -1 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:colonIdx]))
+		key = strings.Trim(key, "`*_- ")
+		val := strings.TrimSpace(line[colonIdx+1:])
+		val = strings.Trim(val, "`\"'")
+
+		switch key {
+		case "task", "task_ref", "task-ref", "task_id":
+			if r.TaskRef == "" {
+				r.TaskRef = val
+			}
+		case "candidate", "candidate_sha", "sha", "commit":
+			if r.CandidateSHA == "" && exactSHA(val) {
+				r.CandidateSHA = val
+			}
+		case "status", "verdict", "result":
+			if r.Status == "" {
+				r.Status = strings.ToUpper(val)
+			}
+		case "agent", "agent_name", "builder", "mender", "reviewer":
+			if r.AgentName == "" {
+				r.AgentName = val
+			}
+		case "branch":
+			if r.Branch == "" {
+				r.Branch = val
+			}
+		}
+	}
+	if err := s.Err(); err != nil {
+		return StructuredHandoffReport{}, fmt.Errorf("scan handoff report: %w", err)
+	}
+
+	if r.Status == "" {
+		return StructuredHandoffReport{}, errors.New("report lacks structured status/verdict field")
+	}
+	switch r.Status {
+	case "READY", "COMPLETE", "COMPLETED", "DONE", "PASS":
+		// Accepted ready status
+	case "NOT READY", "NOT_READY", "INCOMPLETE", "FAIL", "FAILED", "BLOCKED", "WORKING", "STARTING", "REJECTED":
+		return StructuredHandoffReport{}, fmt.Errorf("report status %q is not ready", r.Status)
+	default:
+		return StructuredHandoffReport{}, fmt.Errorf("unrecognized report status %q", r.Status)
+	}
+
+	if !exactSHA(r.CandidateSHA) {
+		return StructuredHandoffReport{}, fmt.Errorf("report candidate SHA %q is missing or invalid", r.CandidateSHA)
+	}
+
+	return r, nil
+}
+
 // EnrollReadySourceManifests discovers accepted source/mender launch receipts that have
 // produced authentic durable ready reports, creates their exact SourceRetirementManifest,
-// and records them to the registry if not already enrolled.
-func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]SourceRetirementManifest, error) {
+// and records them to the registry if persist is true.
+func EnrollReadySourceManifests(root string, repositoryIdentity string, persist bool) ([]SourceRetirementManifest, error) {
 	if strings.TrimSpace(root) == "" {
 		root = "."
 	}
+	registry := SourceRetirementRegistry{Path: SourceRetirementRegistryPath(root)}
+	existing, err := registry.Latest()
+	if err != nil {
+		return nil, fmt.Errorf("read source retirement registry for enrollment: %w", err)
+	}
+
 	receiptsPath := launch.ReceiptPathFor(root)
 	receipts, err := launch.ReadReceipts(receiptsPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -488,9 +589,6 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]Sourc
 	if len(receipts) == 0 {
 		return nil, nil
 	}
-
-	registry := SourceRetirementRegistry{Path: SourceRetirementRegistryPath(root)}
-	existing, _ := registry.Latest()
 	enrolledKeys := make(map[string]bool, len(existing))
 	for _, m := range existing {
 		enrolledKeys[m.Generation] = true
@@ -519,6 +617,7 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]Sourc
 		// Find durable handoff report
 		var reportPathRel string
 		var reportData []byte
+		var parsedReport StructuredHandoffReport
 		candidates := []string{
 			filepath.Join(".herd", "reports", r.TaskRef+".md"),
 			filepath.Join(".herd", "reports", strings.ToLower(r.TaskRef)+".md"),
@@ -531,10 +630,16 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]Sourc
 				candAbs = filepath.Join(root, candRel)
 			}
 			if b, err := os.ReadFile(candAbs); err == nil {
-				text := strings.ToUpper(string(b))
-				if strings.Contains(text, "READY") || strings.Contains(text, "STATUS: COMPLETE") || strings.Contains(text, "COMPLETE / READY") {
+				if parsed, pErr := ParseStructuredHandoffReport(b); pErr == nil {
+					if parsed.TaskRef != "" && !strings.EqualFold(parsed.TaskRef, r.TaskRef) {
+						continue
+					}
+					if r.CandidateSHA != "" && parsed.CandidateSHA != r.CandidateSHA {
+						continue
+					}
 					reportPathRel = candRel
 					reportData = b
+					parsedReport = parsed
 					break
 				}
 			}
@@ -546,12 +651,7 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]Sourc
 		sum := sha256.Sum256(reportData)
 		reportDigest := hex.EncodeToString(sum[:])
 
-		// Get candidate SHA and base SHA
-		headOut, err := exec.Command("git", "-C", wtAbs, "rev-parse", "HEAD").Output()
-		if err != nil {
-			continue
-		}
-		candidateSHA := strings.TrimSpace(string(headOut))
+		candidateSHA := parsedReport.CandidateSHA
 		if len(candidateSHA) != 40 {
 			continue
 		}
@@ -598,7 +698,8 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]Sourc
 			}
 		}
 		if sessionID == "" {
-			sessionID = "session-" + r.Name
+			// No unauthenticated fabricated sessions allowed
+			continue
 		}
 		generation := "gen-" + r.TaskRef + "-" + candidateSHA[:8]
 		if enrolledKeys[generation] || enrolledKeys[r.TaskRef+":"+candidateSHA] || enrolledKeys[tabID] {
@@ -629,8 +730,10 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]Sourc
 		if err := ValidateSourceRetirementManifest(m); err != nil {
 			continue
 		}
-		if err := registry.Record(m); err != nil {
-			return nil, fmt.Errorf("record enrolled source retirement manifest: %w", err)
+		if persist {
+			if err := registry.Record(m); err != nil {
+				return nil, fmt.Errorf("record enrolled source retirement manifest: %w", err)
+			}
 		}
 		enrolledKeys[generation] = true
 		newlyEnrolled = append(newlyEnrolled, m)

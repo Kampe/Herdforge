@@ -110,6 +110,7 @@ func (a *drainAdapters) hooks() drainActionHooks {
 		dryRun:                func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, true) },
 		harvest:               func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, false) },
 		retireReviews:         a.retireReviews,
+		retireSources:         a.retireSourceLanes,
 	}
 }
 
@@ -158,6 +159,9 @@ func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
 	if a == nil || strings.TrimSpace(a.root) == "" {
 		return fmt.Errorf("source retirement authority is unavailable")
 	}
+	if _, err := herdr.EnrollReadySourceManifests(a.root, a.repository, true); err != nil {
+		return fmt.Errorf("enroll ready source manifests: %w", err)
+	}
 	registry := herdr.SourceRetirementRegistry{Path: herdr.SourceRetirementRegistryPath(a.root)}
 	all, err := registry.Latest()
 	if err != nil {
@@ -178,7 +182,11 @@ func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
 		return nil
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
-	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: a.repository}
+	var standing map[string]bool
+	if cfg, err := config.LoadConfig(filepath.Join(a.root, ".herd", "herd.yaml")); err == nil && cfg != nil {
+		standing = configuredStandingAgentNames(cfg)
+	}
+	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: a.repository, StandingLanes: standing}
 	result, err := herdr.RetireSourceLanesContext(ctx, op, manifests, false)
 	if err != nil {
 		return err

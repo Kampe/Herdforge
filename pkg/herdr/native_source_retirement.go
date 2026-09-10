@@ -119,18 +119,39 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 	}
 	defer f.Close()
 
-	var best launch.Receipt
+	var matching []launch.Receipt
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		var r launch.Receipt
 		if err := json.Unmarshal(s.Bytes(), &r); err != nil {
 			continue
 		}
-		if r.TaskRef == m.TaskRef || r.Name == m.AgentName || r.Worktree == m.Worktree || (r.Branch == m.Branch && r.Branch != "") {
-			best = r
+		if r.TaskRef == m.TaskRef && r.Name == m.AgentName && r.Worktree == m.Worktree {
+			if r.CandidateSHA != "" && m.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA {
+				continue
+			}
+			if r.Branch != "" && m.Branch != "" && r.Branch != m.Branch {
+				continue
+			}
+			if r.HerdrSession != "" && m.SessionID != "" && r.HerdrSession != m.SessionID {
+				continue
+			}
+			matching = append(matching, r)
 		}
 	}
-	return best
+	if len(matching) == 1 {
+		return matching[0]
+	}
+	if len(matching) > 1 {
+		// Prefer the latest accepted receipt matching exact candidate and session
+		for i := len(matching) - 1; i >= 0; i-- {
+			if matching[i].Accepted && matching[i].CandidateSHA == m.CandidateSHA {
+				return matching[i]
+			}
+		}
+		return matching[len(matching)-1]
+	}
+	return launch.Receipt{}
 }
 
 func (n *NativeSourceRetirementOp) observeHandoff(m SourceRetirementManifest) SourceRetirementHandoff {
@@ -139,48 +160,90 @@ func (n *NativeSourceRetirementOp) observeHandoff(m SourceRetirementManifest) So
 		TaskRef:      m.TaskRef,
 		AgentName:    m.AgentName,
 		ReportDigest: m.ReportDigest,
-		Status:       "READY",
+		Status:       "UNKNOWN",
 	}
 
+	var data []byte
+	var pathRel string
 	if m.ReportArtifact != "" {
 		p := filepath.Join(n.Root, filepath.Clean(m.ReportArtifact))
-		data, err := os.ReadFile(p)
-		if err == nil {
-			sum := sha256.Sum256(data)
-			digest := hex.EncodeToString(sum[:])
-			if m.ReportDigest == "" || m.ReportDigest == digest {
-				h.Known = true
-				h.ReportDigest = digest
-				h.ArtifactPath = m.ReportArtifact
-				return h
-			}
+		if b, err := os.ReadFile(p); err == nil {
+			data = b
+			pathRel = m.ReportArtifact
 		}
 	}
-
-	if m.HandoffArtifact != "" {
+	if len(data) == 0 && m.HandoffArtifact != "" {
 		p := filepath.Join(n.Root, filepath.Clean(m.HandoffArtifact))
-		data, err := os.ReadFile(p)
-		if err == nil {
-			sum := sha256.Sum256(data)
-			digest := hex.EncodeToString(sum[:])
-			if m.HandoffDigest == "" || m.HandoffDigest == digest {
-				h.Known = true
-				h.ReportDigest = digest
-				h.ArtifactPath = m.HandoffArtifact
-				return h
-			}
+		if b, err := os.ReadFile(p); err == nil {
+			data = b
+			pathRel = m.HandoffArtifact
 		}
 	}
 
-	if m.ReportDigest != "" || m.HandoffDigest != "" {
-		h.Known = true
-		if h.ReportDigest == "" {
-			h.ReportDigest = m.HandoffDigest
+	if len(data) > 0 {
+		sum := sha256.Sum256(data)
+		digest := hex.EncodeToString(sum[:])
+		expectedDigest := m.ReportDigest
+		if expectedDigest == "" {
+			expectedDigest = m.HandoffDigest
 		}
-		return h
+		if expectedDigest == "" || expectedDigest == digest {
+			if parsed, err := ParseStructuredHandoffReport(data); err == nil {
+				h.Known = true
+				h.Status = parsed.Status
+				h.CandidateSHA = parsed.CandidateSHA
+				h.ReportDigest = digest
+				h.ArtifactPath = pathRel
+				if parsed.TaskRef != "" {
+					h.TaskRef = parsed.TaskRef
+				}
+				if parsed.AgentName != "" {
+					h.AgentName = parsed.AgentName
+				}
+				return h
+			}
+		}
 	}
 
 	return h
+}
+
+func isShellProcessName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch n {
+	case "zsh", "bash", "sh", "fish", "-zsh", "-bash", "-sh", "-fish":
+		return true
+	}
+	return false
+}
+
+func isIdleHarnessOrShell(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if isShellProcessName(n) {
+		return true
+	}
+	switch n {
+	case "claude", "codex", "opencode", "grok", "agy", "herdr-term":
+		return true
+	}
+	return false
+}
+
+func collectActiveDescendants(procs []PaneProcess) []string {
+	var activeDescendants []string
+	for _, p := range procs {
+		if !isIdleHarnessOrShell(p.Name) {
+			activeDescendants = append(activeDescendants, p.Name)
+		} else if isShellProcessName(p.Name) && len(p.Argv) > 1 {
+			activeDescendants = append(activeDescendants, p.Name+" "+strings.Join(p.Argv[1:], " "))
+		}
+	}
+	if len(procs) > 1 && len(activeDescendants) == 0 {
+		for _, p := range procs[1:] {
+			activeDescendants = append(activeDescendants, p.Name)
+		}
+	}
+	return activeDescendants
 }
 
 func (n *NativeSourceRetirementOp) observeLive(m SourceRetirementManifest) (SourceRetirementLive, error) {
@@ -198,7 +261,7 @@ func (n *NativeSourceRetirementOp) observeLive(m SourceRetirementManifest) (Sour
 		if a.Name != m.AgentName || a.TabID != m.TabID || a.PaneID != m.PaneID || a.Workspace != m.Workspace || a.TerminalID != m.TerminalID {
 			continue
 		}
-		if m.SessionID != "" && a.Session.Value != m.SessionID {
+		if m.SessionID != "" && a.Session.Value != "" && a.Session.Value != m.SessionID {
 			return SourceRetirementLive{}, errors.New("source session identity differs from the bound launch")
 		}
 
@@ -207,13 +270,7 @@ func (n *NativeSourceRetirementOp) observeLive(m SourceRetirementManifest) (Sour
 			return SourceRetirementLive{}, pErr
 		}
 
-		var activeDescendants []string
-		for _, p := range procs {
-			cmd := strings.ToLower(p.Name + " " + strings.Join(p.Argv, " "))
-			if strings.Contains(cmd, "test") || strings.Contains(cmd, "build") || strings.Contains(cmd, "go") || strings.Contains(cmd, "git") || strings.Contains(cmd, "nvim") || strings.Contains(cmd, "vim") || strings.Contains(cmd, "emacs") {
-				activeDescendants = append(activeDescendants, p.Name)
-			}
-		}
+		activeDescendants := collectActiveDescendants(procs)
 
 		return SourceRetirementLive{
 			Status:            a.Status,
@@ -257,19 +314,22 @@ func (n *NativeSourceRetirementOp) observeLive(m SourceRetirementManifest) (Sour
 		status = "done"
 	}
 
+	activeDescendants := collectActiveDescendants(procs)
+
 	return SourceRetirementLive{
-		Status:         status,
-		Focused:        &focused,
-		ProcessPresent: len(procs) > 0,
-		TabPresent:     tabPresent,
-		IsStanding:     isStanding,
-		IsCoordinator:  isCoordinatorName(m.AgentName),
-		IsCanary:       isCanaryName(m.AgentName),
-		Workspace:      m.Workspace,
-		TabID:          m.TabID,
-		PaneID:         m.PaneID,
-		TerminalID:     m.TerminalID,
-		SessionID:      m.SessionID,
+		Status:            status,
+		Focused:           &focused,
+		ProcessPresent:    len(procs) > 0,
+		TabPresent:        tabPresent,
+		IsStanding:        isStanding,
+		IsCoordinator:     isCoordinatorName(m.AgentName),
+		IsCanary:          isCanaryName(m.AgentName),
+		Workspace:         m.Workspace,
+		TabID:             m.TabID,
+		PaneID:            m.PaneID,
+		TerminalID:        m.TerminalID,
+		SessionID:         m.SessionID,
+		ActiveDescendants: activeDescendants,
 	}, nil
 }
 
@@ -412,17 +472,29 @@ func (n *NativeSourceRetirementOp) Close(m SourceRetirementManifest) error {
 		return err
 	}
 	for _, a := range agents {
-		if a.Name == m.AgentName && a.TabID == m.TabID && a.PaneID == m.PaneID && a.TerminalID == m.TerminalID {
+		if a.Name == m.AgentName && a.TabID == m.TabID && a.PaneID == m.PaneID && a.TerminalID == m.TerminalID && a.Workspace == m.Workspace {
+			if m.SessionID != "" && a.Session.Value != "" && a.Session.Value != m.SessionID {
+				return errors.New("cannot close: live agent session identity changed")
+			}
 			return CloseSettledSourceTab(a)
 		}
 	}
-	return hardCloseTab(m.TabID, m.AgentName)
+	tabs, err := TabList(m.Workspace)
+	if err != nil {
+		return err
+	}
+	for _, tab := range tabs {
+		if tab.TabID == m.TabID {
+			return fmt.Errorf("tab %s present in workspace %s but does not match original agent identity %s", m.TabID, m.Workspace, m.AgentName)
+		}
+	}
+	return nil
 }
 
 func (n *NativeSourceRetirementOp) VerifyAbsence(m SourceRetirementManifest) error {
 	tabs, err := TabList(m.Workspace)
 	if err != nil {
-		return err
+		return fmt.Errorf("readback tabs in workspace %s: %w", m.Workspace, err)
 	}
 	for _, tab := range tabs {
 		if tab.TabID == m.TabID {
@@ -431,8 +503,7 @@ func (n *NativeSourceRetirementOp) VerifyAbsence(m SourceRetirementManifest) err
 	}
 	procs, err := paneProcessesForRetirement(m.PaneID)
 	if err != nil {
-		// Pane not found is expected and successful
-		return nil
+		return fmt.Errorf("readback processes in pane %s: %w", m.PaneID, err)
 	}
 	if len(procs) > 0 {
 		return fmt.Errorf("pane %s still has %d residual process(es)", m.PaneID, len(procs))

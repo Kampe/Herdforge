@@ -340,3 +340,27 @@ func TestSourceCleanupNativeAutomaticEnrollmentFromDurableHandoff(t *testing.T) 
 		t.Fatalf("expected retirement receipts file to be created: %v", err)
 	}
 }
+
+func TestDrainSourceRetirementDefaultRefusal(t *testing.T) {
+	hooks := defaultDrainActionHooks()
+	if hooks.retireSources == nil {
+		t.Fatal("retireSources is not set in defaultDrainActionHooks")
+	}
+	err := hooks.retireSources(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no compiled source retirement authority is configured") {
+		t.Fatalf("expected refusal error, got %v", err)
+	}
+}
+
+func TestDrainSourceRetirementWiredInDrainAdapters(t *testing.T) {
+	a := &drainAdapters{}
+	hooks := a.hooks()
+	if hooks.retireSources == nil {
+		t.Fatal("retireSources is not wired in drainAdapters.hooks()")
+	}
+	// Without root authority, it fails closed
+	err := hooks.retireSources(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "source retirement authority is unavailable") {
+		t.Fatalf("expected authority refusal, got %v", err)
+	}
+}

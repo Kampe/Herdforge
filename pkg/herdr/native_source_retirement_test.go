@@ -242,12 +242,46 @@ func TestNativeSourceRetirementBlocksDirtyOrDriftedWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Write launch receipt
+	launchReceiptsPath := filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launchReceipt := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         "forge-mender-dirty",
+		Branch:       branch,
+		Worktree:     wtRel,
+		CandidateSHA: baseSHA,
+		PaneID:       "wK:p17G",
+		TabID:        "wK:t17G",
+	}
+	launchBytes, _ := json.Marshal(launchReceipt)
+	if err := os.WriteFile(launchReceiptsPath, append(launchBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write report artifact
+	reportRel := ".herd/reports/fac-794.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportData := []byte("## Report for FAC-794\nTask: FAC-794\nAgent: forge-mender-dirty\nCandidate: " + baseSHA + "\nStatus: READY\n")
+	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(reportData)
+	reportDigest := hex.EncodeToString(sum[:])
+
 	m := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
 		Repository: "fixture-repo", TaskRef: "FAC-794", TaskID: "task-794",
 		CandidateSHA: baseSHA, BaseSHA: baseSHA, Branch: branch,
 		Worktree: wtRel, Workspace: "wK", TabID: "wK:t17G", PaneID: "wK:p17G", TerminalID: "term-1",
 		SessionID: "session-1", AgentName: "forge-mender-dirty",
-		ReportDigest: strings.Repeat("f", 64), Generation: "gen-dirty", Nonce: "nonce-1",
+		ReportArtifact: reportRel, ReportDigest: reportDigest, Generation: "gen-dirty", Nonce: "nonce-1",
 	})
 
 	oldRunHerdr := runHerdr
@@ -300,12 +334,46 @@ func TestNativeSourceRetirementBlocksActiveDescendantProcesses(t *testing.T) {
 		t.Fatalf("worktree add: %v (%s)", err, out)
 	}
 
+	// Write launch receipt
+	launchReceiptsPath := filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	launchReceipt := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         "forge-mender-active",
+		Branch:       branch,
+		Worktree:     wtRel,
+		CandidateSHA: baseSHA,
+		PaneID:       "wK:p17G",
+		TabID:        "wK:t17G",
+	}
+	launchBytes, _ := json.Marshal(launchReceipt)
+	if err := os.WriteFile(launchReceiptsPath, append(launchBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write report artifact
+	reportRel := ".herd/reports/fac-794.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportData := []byte("## Report for FAC-794\nTask: FAC-794\nAgent: forge-mender-active\nCandidate: " + baseSHA + "\nStatus: READY\n")
+	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(reportData)
+	reportDigest := hex.EncodeToString(sum[:])
+
 	m := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
 		Repository: "fixture-repo", TaskRef: "FAC-794", TaskID: "task-794",
 		CandidateSHA: baseSHA, BaseSHA: baseSHA, Branch: branch,
 		Worktree: wtRel, Workspace: "wK", TabID: "wK:t17G", PaneID: "wK:p17G", TerminalID: "term-1",
 		SessionID: "session-1", AgentName: "forge-mender-active",
-		ReportDigest: strings.Repeat("f", 64), Generation: "gen-active", Nonce: "nonce-1",
+		ReportArtifact: reportRel, ReportDigest: reportDigest, Generation: "gen-active", Nonce: "nonce-1",
 	})
 
 	oldRunHerdr := runHerdr

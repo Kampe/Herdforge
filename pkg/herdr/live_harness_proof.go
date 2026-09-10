@@ -237,7 +237,7 @@ func CloseSettledSourceTab(agent AgentEntry) error {
 			return fmt.Errorf("settled source close process tree: %w", err)
 		}
 	}
-	return hardCloseTab(exact.TabID, exact.Name)
+	return nil
 }
 
 func randomNonce(n int) string {

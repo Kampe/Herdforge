@@ -25,8 +25,9 @@ func runSourceRetirementCleanup(ctx context.Context, root string, dryRun bool) (
 		repoIdent = repositoryIdentityForLaunch(cfg)
 	}
 
-	// Automatic enrollment from durable ready handoff reports
-	if _, err := herdr.EnrollReadySourceManifests(root, repoIdent); err != nil {
+	// Automatic enrollment from durable ready handoff reports (persist only when acting)
+	newlyEnrolled, err := herdr.EnrollReadySourceManifests(root, repoIdent, !dryRun)
+	if err != nil {
 		return herdr.SourceRetirementReport{}, fmt.Errorf("enroll ready source manifests: %w", err)
 	}
 
@@ -41,6 +42,11 @@ func runSourceRetirementCleanup(ctx context.Context, root string, dryRun bool) (
 			return herdr.SourceRetirementReport{}, fmt.Errorf("source retirement manifest %s: %w", m.Generation, err)
 		}
 		latest[m.Generation] = m
+	}
+	if dryRun {
+		for _, m := range newlyEnrolled {
+			latest[m.Generation] = m
+		}
 	}
 	manifests := make([]herdr.SourceRetirementManifest, 0, len(latest))
 	for _, m := range latest {

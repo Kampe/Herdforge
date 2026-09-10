@@ -8815,6 +8815,7 @@ type drainActionHooks struct {
 	dryRun                func(context.Context, drainActionEvidence) error
 	harvest               func(context.Context, drainActionEvidence) error
 	retireReviews         func(context.Context) error
+	retireSources         func(context.Context) error
 }
 
 type drainActionResult struct {
@@ -8840,6 +8841,12 @@ func defaultDrainActionHooks() drainActionHooks {
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
 			return errors.New("no compiled harvest authority is configured")
+		},
+		retireReviews: func(context.Context) error {
+			return errors.New("no compiled review retirement authority is configured")
+		},
+		retireSources: func(context.Context) error {
+			return errors.New("no compiled source retirement authority is configured")
 		},
 	}
 }
@@ -9015,6 +9022,13 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 	if hooks.retireReviews != nil {
 		if err := hooks.retireReviews(ctx); err != nil {
 			fmt.Fprintf(out, "REFUSED review-retirement: %v\n", err)
+			result.Failed = true
+			result.Refusals++
+		}
+	}
+	if hooks.retireSources != nil {
+		if err := hooks.retireSources(ctx); err != nil {
+			fmt.Fprintf(out, "REFUSED source-retirement: %v\n", err)
 			result.Failed = true
 			result.Refusals++
 		}
