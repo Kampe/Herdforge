@@ -20,6 +20,11 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 	}
 	if held := os.Getenv("HERD_CACHE_HOLD_PROVIDER"); held != "" {
 		if err := withProviderFileLock(held, currentProviderAccountKey(held), func() error {
+			if ready := os.Getenv("HERD_CACHE_HOLDER_READY"); ready != "" {
+				if err := os.WriteFile(ready, []byte("ready\n"), 0o600); err != nil {
+					return err
+				}
+			}
 			time.Sleep(time.Second)
 			return nil
 		}); err != nil {
@@ -117,12 +122,25 @@ func TestProviderLocksAreScopedAndBoundedAcrossProcesses(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"lock-scope"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	ready := filepath.Join(dir, "codex-holder.ready")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
-	cmd.Env = append(os.Environ(), "HERD_CACHE_SUBPROCESS_HELPER=1", "HERD_CACHE_HOLD_PROVIDER=codex", "HERD_QUOTA_CACHE_PATH="+cachePath, "HOME="+home, "CODEX_HOME="+home)
+	cmd.Env = append(os.Environ(), "HERD_CACHE_SUBPROCESS_HELPER=1", "HERD_CACHE_HOLD_PROVIDER=codex", "HERD_CACHE_HOLDER_READY="+ready, "HERD_QUOTA_CACHE_PATH="+cachePath, "HOME="+home, "CODEX_HOME="+home)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the child to acquire the provider lock, rather than measuring
+	// unrelated provider latency against process compilation/startup time.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("provider-lock holder did not complete deterministic ready handshake")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	calls := 0
 	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"gemini": func() (ProviderUsage, error) {
 		calls++
