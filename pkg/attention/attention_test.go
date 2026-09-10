@@ -590,7 +590,7 @@ func TestClassifyAgentWithEvidence_FinishLength(t *testing.T) {
 	// Agent nominally reports "done", but was truncated by output limit (finish=length).
 	// Must NOT be LevelHigh (done - awaiting harvest/review) or LevelNone (working).
 	a := kick.AgentEntry{Name: "ux-comber", Status: "done", PaneID: "p1"}
-	item := ClassifyAgentWithEvidence(a, false, "", false, ev, ctx, "Status: COMPLETE\nfinish=length")
+	item := ClassifyAgentWithEvidence(a, false, "", false, ev, ctx, "Status: COMPLETE\nfinish=length", nil)
 
 	if item.Level != LevelMedium {
 		t.Fatalf("finish=length truncated agent must be LevelMedium, got %s", item.Level)
@@ -622,7 +622,7 @@ func TestClassifyAgentWithEvidence_QuotaExhaustion(t *testing.T) {
 	}
 
 	a := kick.AgentEntry{Name: "scout-planner", Status: "working", PaneID: "p2"}
-	item := ClassifyAgentWithEvidence(a, false, "", false, ev, ctx, "")
+	item := ClassifyAgentWithEvidence(a, false, "", false, ev, ctx, "", nil)
 
 	if item.Level != LevelCritical {
 		t.Fatalf("fresh authoritative quota failure must be LevelCritical, got %s", item.Level)
@@ -656,7 +656,7 @@ func TestClassifyAgentWithEvidence_StaleOrMismatchedQuotaRefused(t *testing.T) {
 
 	a := kick.AgentEntry{Name: "scout-planner", Status: "idle", PaneID: "p3"}
 	// Stale evidence with raw quota text in pane must NOT trigger LevelCritical or quota cooldown
-	item := ClassifyAgentWithEvidence(a, false, "", false, staleEv, ctx, "429 Too Many Requests: out of credits")
+	item := ClassifyAgentWithEvidence(a, false, "", false, staleEv, ctx, "429 Too Many Requests: out of credits", nil)
 
 	if item.Level == LevelCritical {
 		t.Fatalf("stale quota evidence must NOT elevate agent to LevelCritical: got %s", item.Level)
@@ -703,8 +703,8 @@ func TestTriageWithEvidence(t *testing.T) {
 		},
 	}
 
-	resolver := func(lane string) (*process.TerminalEvidence, process.SessionContext, string) {
-		return evidenceMap[lane], ctx, ""
+	resolver := func(lane string) (*process.TerminalEvidence, process.SessionContext, string, error) {
+		return evidenceMap[lane], ctx, "", nil
 	}
 
 	r := TriageWithEvidence(agents, []string{"scout-planner", "ux-comber", "api-crusader"}, noHold, resolver, nil)

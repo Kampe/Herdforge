@@ -160,9 +160,92 @@ func TestAttention_RunWithFleet_IdentityFenceRejection(t *testing.T) {
 		t.Fatalf("expected 1 item, got %d", len(result.Items))
 	}
 
-	// Since identity fence failed, native export was rejected and fallback status handling took over
+	// Since identity fence failed, native evidence returned an error and lane is stamped LevelMedium (UNKNOWN/error)
 	item := result.Items[0]
-	if item.Level != LevelHigh { // "done" status fallback without native evidence
-		t.Errorf("expected LevelHigh on fallback from rejected fence, got %s", item.Level)
+	if item.Level != LevelMedium {
+		t.Errorf("expected LevelMedium on rejected fence error, got %s", item.Level)
+	}
+	if !strings.Contains(item.Reason, "native evidence error") {
+		t.Errorf("expected reason to contain 'native evidence error', got %q", item.Reason)
+	}
+}
+
+func TestAttention_RunWithFleet_MultipleHangingLanes_BoundedAggregateContext(t *testing.T) {
+	restore := process.SetDefaultExportRunner(func(ctx context.Context, sid string, dir string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1", "forge-lane-2", "forge-lane-3"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+		{Name: "lane-2", Role: "worker", Standing: true},
+		{Name: "lane-3", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	fleet := []kick.AgentEntry{
+		{
+			Name:       "forge-lane-1",
+			Label:      "lane-1",
+			Kind:       "opencode",
+			Status:     "working",
+			PaneID:     "p-1",
+			Session:    kick.AgentSession{Value: "s-1"},
+			TerminalID: "term-1",
+		},
+		{
+			Name:       "forge-lane-2",
+			Label:      "lane-2",
+			Kind:       "opencode",
+			Status:     "working",
+			PaneID:     "p-2",
+			Session:    kick.AgentSession{Value: "s-2"},
+			TerminalID: "term-2",
+		},
+		{
+			Name:       "forge-lane-3",
+			Label:      "lane-3",
+			Kind:       "opencode",
+			Status:     "working",
+			PaneID:     "p-3",
+			Session:    kick.AgentSession{Value: "s-3"},
+			TerminalID: "term-3",
+		},
+	}
+
+	start := time.Now()
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	// Should finish within fleet timeout (~15s ceiling), not 3 * 10s = 30s
+	if elapsed > 20*time.Second {
+		t.Errorf("fleet scan with multiple hanging lanes took too long: %v (expected <= 20s aggregate)", elapsed)
+	}
+
+	for _, item := range result.Items {
+		if item.Level != LevelMedium {
+			t.Errorf("hanging lane must be stamped LevelMedium on export error, got %s for %s", item.Level, item.Name)
+		}
+		if !strings.Contains(item.Reason, "native evidence error") {
+			t.Errorf("expected reason to contain 'native evidence error', got %q", item.Reason)
+		}
 	}
 }

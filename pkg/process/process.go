@@ -53,17 +53,19 @@ type TerminalEvidence struct {
 	Error        string    `json:"error,omitempty"`
 	Status       string    `json:"status,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
+	CapturedAt   time.Time `json:"captured_at,omitempty"`
 }
 
 // SessionContext provides the expected authoritative session identity, turn, route, and time window.
 type SessionContext struct {
-	SessionID string
-	TurnID    string
-	Provider  string
-	Account   string
-	Model     string
-	Now       time.Time
-	MaxAge    time.Duration
+	SessionID  string
+	TurnID     string
+	Provider   string
+	Account    string
+	Model      string
+	Now        time.Time
+	MaxAge     time.Duration
+	CapturedAt time.Time
 }
 
 var (
@@ -124,8 +126,26 @@ func (ev *TerminalEvidence) Validate(ctx SessionContext) error {
 		if maxAge <= 0 {
 			maxAge = 5 * time.Minute
 		}
-		if ctx.Now.Sub(ev.Timestamp) > maxAge || ev.Timestamp.After(ctx.Now.Add(1*time.Minute)) {
-			return ErrStaleEvidence
+
+		inFlight := (ev.FinishReason == "" || strings.EqualFold(ev.FinishReason, "tool_use") || strings.EqualFold(ev.FinishReason, "tool-calls"))
+		if inFlight {
+			// For in-flight turns, creation time (Timestamp) may have started in the past (>5m ago),
+			// but the captured snapshot (CapturedAt) must be fresh (within maxAge).
+			checkTime := ev.CapturedAt
+			if checkTime.IsZero() {
+				checkTime = ctx.CapturedAt
+			}
+			if checkTime.IsZero() {
+				checkTime = ev.Timestamp
+			}
+			if ctx.Now.Sub(checkTime) > maxAge || checkTime.After(ctx.Now.Add(1*time.Minute)) {
+				return ErrStaleEvidence
+			}
+		} else {
+			// For completed turns, completion time (Timestamp) must be within maxAge.
+			if ctx.Now.Sub(ev.Timestamp) > maxAge || ev.Timestamp.After(ctx.Now.Add(1*time.Minute)) {
+				return ErrStaleEvidence
+			}
 		}
 	}
 
@@ -368,11 +388,15 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		return res
 	}
 
-	// 5. In-flight tool execution vs completion
-	if strings.EqualFold(ev.FinishReason, "tool_use") || strings.EqualFold(ev.FinishReason, "tool_calls") {
+	// 5. In-flight generation or tool execution vs completion
+	if ev.FinishReason == "" || strings.EqualFold(ev.FinishReason, "tool_use") || strings.EqualFold(ev.FinishReason, "tool_calls") {
 		res.Class = Unknown
 		res.Action = "read_pane"
-		res.Reason = "live tool execution in progress"
+		if ev.FinishReason == "" {
+			res.Reason = "generation in progress"
+		} else {
+			res.Reason = "live tool execution in progress"
+		}
 		return res
 	}
 

@@ -41,7 +41,9 @@ const LiveStatuses = "working|idle|starting|done|blocked"
 
 // AgentSession captures the agent session object or string value from herdr.
 type AgentSession struct {
-	Value string `json:"value,omitempty"`
+	Value  string `json:"value,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	Source string `json:"source,omitempty"`
 }
 
 func (s *AgentSession) UnmarshalJSON(data []byte) error {
@@ -54,10 +56,14 @@ func (s *AgentSession) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	var obj struct {
-		Value string `json:"value,omitempty"`
+		Value  string `json:"value,omitempty"`
+		Kind   string `json:"kind,omitempty"`
+		Source string `json:"source,omitempty"`
 	}
 	if err := json.Unmarshal(data, &obj); err == nil && obj.Value != "" {
 		s.Value = obj.Value
+		s.Kind = obj.Kind
+		s.Source = obj.Source
 		return nil
 	}
 	return fmt.Errorf("invalid agent_session payload: %s", string(data))

@@ -101,6 +101,8 @@ func runSpin() {
 			Name:           a.Name,
 			Kind:           a.Kind,
 			SessionID:      a.Session.Value,
+			SessionKind:    a.Session.Kind,
+			SessionSource:  a.Session.Source,
 			PaneID:         a.PaneID,
 			TabID:          a.TabID,
 			TerminalID:     a.TerminalID,
@@ -125,7 +127,11 @@ func runSpin() {
 						Workspace:      cur.Workspace,
 						Cwd:            cur.Cwd,
 						StateChangeSeq: cur.StateChangeSeq,
-						Session:        kick.AgentSession{Value: cur.Session.Value},
+						Session: kick.AgentSession{
+							Value:  cur.Session.Value,
+							Kind:   cur.Session.Kind,
+							Source: cur.Session.Source,
+						},
 					}, nil
 				}
 			}

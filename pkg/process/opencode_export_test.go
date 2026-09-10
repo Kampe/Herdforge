@@ -162,6 +162,36 @@ func TestExtractTerminalEvidenceFromExport_SecurityMatrix(t *testing.T) {
 	if inFlightEv.FinishReason != "" {
 		t.Errorf("expected empty in-flight finish reason, got %q", inFlightEv.FinishReason)
 	}
+	if inFlightEv.CapturedAt.IsZero() {
+		t.Errorf("expected CapturedAt to be set to current snapshot time")
+	}
+
+	// Validate against SessionContext: must not be rejected as stale
+	sctx := SessionContext{
+		SessionID:  sessionID,
+		TurnID:     "u-1",
+		Provider:   "litellm",
+		Model:      model,
+		Now:        now,
+		MaxAge:     5 * time.Minute,
+		CapturedAt: now,
+	}
+	if err := inFlightEv.Validate(sctx); err != nil {
+		t.Fatalf("in-flight turn with fresh CapturedAt failed Validate: %v", err)
+	}
+
+	evalRes := EvaluateEvidence(inFlightEv, sctx, "")
+	if evalRes.Class != Unknown || evalRes.Action != "read_pane" {
+		t.Errorf("expected in-flight turn to evaluate to Unknown / read_pane, got class=%s action=%s", evalRes.Class, evalRes.Action)
+	}
+	if evalRes.Reason != "generation in progress" {
+		t.Errorf("expected reason 'generation in progress', got %q", evalRes.Reason)
+	}
+
+	target := ClassifyTargetWithEvidence("pane-1", "forge-worker-1", "working", "", inFlightEv, sctx)
+	if target.Class != Unknown || target.Action != "read_pane" {
+		t.Errorf("expected target to be Unknown / read_pane, got class=%s action=%s", target.Class, target.Action)
+	}
 
 	// Case 9: Missing provider ID (no fallback to fabricated provider)
 	noProviderPayload := []byte(fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}}},{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"","modelID":%q,"finish":"stop","time":{"created":%d,"completed":%d}}}]}`,
@@ -333,5 +363,65 @@ func TestCaptureOpencodeExportLive_HangingCommand(t *testing.T) {
 	_, err = captureOpencodeExportLive(ctx, "session-hang", "")
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("expected timeout error for hanging command, got: %v", err)
+	}
+}
+
+func TestCaptureOpencodeExportLive_HangingDescendant_Cleanup(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fake-opencode-descendant-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Script spawns a background child process that holds open inherited handles, then hangs
+	fakeBin := filepath.Join(tmpDir, "opencode")
+	scriptContent := "#!/bin/sh\n(sleep 30) & sleep 30\n"
+	if err := os.WriteFile(fakeBin, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("write fake opencode script: %v", err)
+	}
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", tmpDir+":"+oldPath)
+	defer os.Setenv("PATH", oldPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = captureOpencodeExportLive(ctx, "session-descendant", "")
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout error for hanging descendant command, got: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("hanging descendant process held wait too long: %v (expected <= 2s)", elapsed)
+	}
+}
+
+func TestCaptureOpencodeExportLive_OversizeLimit(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fake-opencode-oversize-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Script generates infinite output
+	fakeBin := filepath.Join(tmpDir, "opencode")
+	scriptContent := "#!/bin/sh\nwhile true; do printf '%01024d' 0; done\n"
+	if err := os.WriteFile(fakeBin, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("write fake opencode script: %v", err)
+	}
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", tmpDir+":"+oldPath)
+	defer os.Setenv("PATH", oldPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = captureOpencodeExportLive(ctx, "session-oversize", "")
+	if err == nil || !strings.Contains(err.Error(), "maximum size limit") {
+		t.Errorf("expected maximum size limit error on infinite output, got: %v", err)
 	}
 }

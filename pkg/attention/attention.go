@@ -124,14 +124,14 @@ func classifyStatus(status string) (AttentionLevel, string) {
 // parked the lane); provider death takes precedence over the raw status
 // for non-held lanes.
 func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeath bool) Item {
-	return ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, nil, process.SessionContext{}, "")
+	return ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, nil, process.SessionContext{}, "", nil)
 }
 
 // ClassifyAgentWithEvidence evaluates an agent entry alongside authoritative terminal evidence and pane text.
 // When finish=length (output token limit truncation) is present, the agent is NEVER classified as done/LevelHigh
 // (awaiting harvest/review) or LevelNone (working); it is classified as LevelMedium (incomplete / read pane).
 // When authoritative quota exhaustion is confirmed, it is classified as LevelCritical.
-func ClassifyAgentWithEvidence(a kick.AgentEntry, held bool, heldReason string, providerDeath bool, ev *process.TerminalEvidence, ctx process.SessionContext, paneText string) Item {
+func ClassifyAgentWithEvidence(a kick.AgentEntry, held bool, heldReason string, providerDeath bool, ev *process.TerminalEvidence, ctx process.SessionContext, paneText string, evErr error) Item {
 	name := a.Name
 	if name == "" {
 		name = a.Label
@@ -167,6 +167,11 @@ func ClassifyAgentWithEvidence(a kick.AgentEntry, held bool, heldReason string, 
 	case providerDeath || eval.ProviderDeath:
 		item.Level = LevelCritical
 		item.Reason = "provider death — needs reroute (cooled reset-aware)"
+	case evErr != nil && strings.EqualFold(a.Kind, "opencode"):
+		// When native export/fence fails for an opencode agent, we MUST NOT blindly trust raw status "done".
+		// It is typed UNKNOWN / LevelMedium requiring pane read.
+		item.Level = LevelMedium
+		item.Reason = fmt.Sprintf("native evidence error: %v", evErr)
 	case eval.Reason == "output token limit reached (finish=length)" || process.OutputLimitReason(paneText) != "":
 		// Output token limit truncation MUST NOT be classified as done or healthy working
 		item.Level = LevelMedium
@@ -185,7 +190,7 @@ func TriageWithEvidence(
 	agents []kick.AgentEntry,
 	standingIDs []string,
 	heldChecker func(string) (string, bool),
-	evidenceResolver func(string) (*process.TerminalEvidence, process.SessionContext, string),
+	evidenceResolver func(string) (*process.TerminalEvidence, process.SessionContext, string, error),
 	providerDeathChecker func(string) bool,
 ) Result {
 	index := make(map[string]kick.AgentEntry, len(agents))
@@ -222,15 +227,16 @@ func TriageWithEvidence(
 		var ev *process.TerminalEvidence
 		var sctx process.SessionContext
 		var paneText string
+		var evErr error
 		if evidenceResolver != nil {
-			ev, sctx, paneText = evidenceResolver(id)
+			ev, sctx, paneText, evErr = evidenceResolver(id)
 		}
 		providerDeath := false
 		if providerDeathChecker != nil {
 			providerDeath = providerDeathChecker(id)
 		}
 
-		item := ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, ev, sctx, paneText)
+		item := ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, ev, sctx, paneText, evErr)
 		if providerDeath && item.Level != LevelCritical && !item.Held {
 			item.Level = LevelCritical
 			item.Reason = "provider death — needs reroute (cooled reset-aware)"
@@ -483,15 +489,20 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 		}
 	}
 	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
-	evidenceResolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string) {
+	fleetCtx, fleetCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer fleetCancel()
+
+	evidenceResolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string, error) {
 		a, found := findAttentionAgent(agents, name)
 		if !found {
-			return nil, process.SessionContext{}, ""
+			return nil, process.SessionContext{}, "", nil
 		}
 		fence := process.IdentityFence{
 			Name:           a.Name,
 			Kind:           a.Kind,
 			SessionID:      a.Session.Value,
+			SessionKind:    a.Session.Kind,
+			SessionSource:  a.Session.Source,
 			PaneID:         a.PaneID,
 			TabID:          a.TabID,
 			TerminalID:     a.TerminalID,
@@ -510,10 +521,8 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 			}
 			return &cur, nil
 		}
-		exportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		ev, sctx, paneText, _ := process.ResolveNativeAgentEvidenceWithFence(exportCtx, fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
-		return ev, sctx, paneText
+		ev, sctx, paneText, err := process.ResolveNativeAgentEvidenceWithFence(fleetCtx, fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
+		return ev, sctx, paneText, err
 	}
 	r := TriageWithEvidence(agents, kick.StandingIDs(), check, evidenceResolver, kick.ProviderDeathCheck)
 	// A degraded lane is CRITICAL and must not be silently downgraded to

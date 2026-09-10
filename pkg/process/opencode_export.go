@@ -60,16 +60,18 @@ type OpencodeExportPart struct {
 
 // IdentityFence holds trustworthy Herdr agent metadata captured before export.
 type IdentityFence struct {
-	Name           string
-	Kind           string
-	SessionID      string
-	PaneID         string
-	TabID          string
-	TerminalID     string
-	Workspace      string
-	Cwd            string
-	StateChangeSeq uint64
-	ExpectedModel  string
+	Name             string
+	Kind             string
+	SessionID        string
+	SessionKind      string
+	SessionSource    string
+	PaneID           string
+	TabID            string
+	TerminalID       string
+	Workspace        string
+	Cwd              string
+	StateChangeSeq   uint64
+	ExpectedModel    string
 	ExpectedProvider string
 }
 
@@ -83,6 +85,12 @@ func (f IdentityFence) Verify(after kick.AgentEntry) error {
 	}
 	if after.Session.Value != f.SessionID {
 		return fmt.Errorf("identity fence mismatch: session_id changed from %q to %q", f.SessionID, after.Session.Value)
+	}
+	if f.SessionKind != "" && after.Session.Kind != "" && after.Session.Kind != f.SessionKind {
+		return fmt.Errorf("identity fence mismatch: session_kind changed from %q to %q", f.SessionKind, after.Session.Kind)
+	}
+	if f.SessionSource != "" && after.Session.Source != "" && after.Session.Source != f.SessionSource {
+		return fmt.Errorf("identity fence mismatch: session_source changed from %q to %q", f.SessionSource, after.Session.Source)
 	}
 	if after.PaneID != f.PaneID {
 		return fmt.Errorf("identity fence mismatch: pane_id changed from %q to %q", f.PaneID, after.PaneID)
@@ -162,7 +170,11 @@ func captureOpencodeExportLive(ctx context.Context, sessionID string, targetDir 
 		cmd.Dir = targetDir
 	}
 	cmd.Stdout = tmp
-	cmd.Stderr = io.Discard
+	devNull, errNull := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if errNull == nil {
+		defer devNull.Close()
+		cmd.Stderr = devNull
+	}
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start opencode export: %w", err)
@@ -365,6 +377,7 @@ func ExtractTerminalEvidenceFromExport(data []byte, expectedSessionID string, ex
 		Model:        model,
 		FinishReason: finishReason,
 		Timestamp:    ts,
+		CapturedAt:   now,
 	}
 
 	return ev, nil
@@ -374,10 +387,15 @@ func ExtractTerminalEvidenceFromExport(data []byte, expectedSessionID string, ex
 // while enforcing a Herdr before/after identity fence to reject replaced or moved sessions.
 func ResolveNativeAgentEvidenceWithFence(ctx context.Context, fence IdentityFence, fetchAfter func(name string) (*kick.AgentEntry, error), now time.Time, maxAge time.Duration) (*TerminalEvidence, SessionContext, string, error) {
 	sctx := SessionContext{
-		SessionID: fence.SessionID,
-		Provider:  fence.Kind,
-		Now:       now,
-		MaxAge:    maxAge,
+		SessionID:  fence.SessionID,
+		Provider:   fence.Kind,
+		Now:        now,
+		MaxAge:     maxAge,
+		CapturedAt: now,
+	}
+
+	if fetchAfter == nil {
+		return nil, sctx, "", errors.New("identity fence: fetchAfter callback is required for authoritative capture")
 	}
 
 	if !strings.EqualFold(fence.Kind, "opencode") || strings.TrimSpace(fence.SessionID) == "" {
@@ -394,24 +412,24 @@ func ResolveNativeAgentEvidenceWithFence(ctx context.Context, fence IdentityFenc
 		return nil, sctx, "", fmt.Errorf("native export capture: %w", err)
 	}
 
-	// Check Herdr after-state identity fence if fetchAfter is provided
-	if fetchAfter != nil {
-		after, err := fetchAfter(fence.Name)
-		if err != nil {
-			return nil, sctx, "", fmt.Errorf("fetch agent after export: %w", err)
-		}
-		if after == nil {
-			return nil, sctx, "", errors.New("agent missing from fleet after export")
-		}
-		if err := fence.Verify(*after); err != nil {
-			return nil, sctx, "", fmt.Errorf("identity fence rejected: %w", err)
-		}
+	// Check Herdr after-state identity fence
+	after, err := fetchAfter(fence.Name)
+	if err != nil {
+		return nil, sctx, "", fmt.Errorf("fetch agent after export: %w", err)
+	}
+	if after == nil {
+		return nil, sctx, "", errors.New("agent missing from fleet after export")
+	}
+	if err := fence.Verify(*after); err != nil {
+		return nil, sctx, "", fmt.Errorf("identity fence rejected: %w", err)
 	}
 
 	ev, err := ExtractTerminalEvidenceFromExport(data, fence.SessionID, fence.Cwd, now, maxAge)
 	if err != nil {
 		return nil, sctx, "", fmt.Errorf("native evidence extraction: %w", err)
 	}
+
+	ev.CapturedAt = now
 
 	// Verify model against expected model if provided
 	if fence.ExpectedModel != "" && ev.Model != fence.ExpectedModel {
@@ -435,5 +453,12 @@ func ResolveNativeAgentEvidence(ctx context.Context, sessionID string, kind stri
 		SessionID: sessionID,
 		Cwd:       cwd,
 	}
-	return ResolveNativeAgentEvidenceWithFence(ctx, fence, nil, now, maxAge)
+	mockFetch := func(name string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Kind:    kind,
+			Cwd:     cwd,
+			Session: kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+	return ResolveNativeAgentEvidenceWithFence(ctx, fence, mockFetch, now, maxAge)
 }
