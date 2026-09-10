@@ -202,3 +202,17 @@ func TestLaunchFlagsDoNotRepeatTheHarness(t *testing.T) {
 		t.Errorf("empty argv yields no flags, got %v", got)
 	}
 }
+
+func TestCodexLaunchFlagsDisableInteractiveStartupUpdatePrompt(t *testing.T) {
+	r := poolReviewer{
+		Kind: "codex",
+		Argv: []string{"codex", "--model", "gpt-5.6-luna"},
+	}
+	flags := r.LaunchFlags()
+	for i := range flags {
+		if flags[i] == "-c" && i+1 < len(flags) && flags[i+1] == "check_for_update_on_startup=false" {
+			return
+		}
+	}
+	t.Fatalf("codex review launch must disable the blocking startup update prompt: %v", flags)
+}

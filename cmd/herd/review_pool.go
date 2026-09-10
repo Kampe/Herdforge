@@ -499,6 +499,7 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("advance admission phase to spawn: %w", err)
 	}
 	cleanupTab := true
+	launchFailureReason := ""
 	// FAC-708: record a fail-closed intent before starting or delivering to the
 	// reviewer. A retirement manifest is authority, not a launch scratchpad; it
 	// must not exist until the cold harness has returned a real model session.
@@ -532,11 +533,12 @@ func runPoolReview(ref string) error {
 	}
 	defer func() {
 		if cleanupTab {
-			cleanupPending("cleanup-pending", "launch did not produce an authoritative retirement manifest")
+			reason := reviewCleanupReason(launchFailureReason, "")
+			cleanupPending("cleanup-pending", reason)
 			if err := herdr.CloseReviewTab(tab.ID, agentName); err == nil {
-				cleanupPending("cleanup-complete", "exact tab cleanup completed")
+				cleanupPending("cleanup-complete", reviewCleanupReason(launchFailureReason, "exact tab cleanup completed"))
 			} else {
-				cleanupPending("cleanup-failed", err.Error())
+				cleanupPending("cleanup-failed", reviewCleanupReason(launchFailureReason, err.Error()))
 			}
 		}
 	}()
@@ -555,6 +557,7 @@ func runPoolReview(ref string) error {
 	startedAt := time.Now()
 	fmt.Printf("starting %s agent %s in pane %s\n", reviewer.Kind, agentName, tab.Pane.ID)
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
+		launchFailureReason = err.Error()
 		return fmt.Errorf("start %s reviewer (%s): %w", reviewer.Kind, reviewer.Model, err)
 	}
 	// FAC-601: wait for the harness to actually accept input before delivering
@@ -627,6 +630,22 @@ func runPoolReview(ref string) error {
 	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s pool=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Pool, reviewer.Family)
 	return nil
+}
+
+// reviewCleanupReason preserves a bounded native startup/delivery diagnostic
+// across exact-tab compensation. Cleanup must not turn an actionable Herdr
+// reason (for example agent_not_ready) into a generic orphan message; the
+// receipt is the durable evidence after the pane has been closed.
+func reviewCleanupReason(failure, cleanup string) string {
+	failure = strings.TrimSpace(failure)
+	cleanup = strings.TrimSpace(cleanup)
+	if failure == "" {
+		return cleanup
+	}
+	if cleanup == "" {
+		return "launch failure: " + failure
+	}
+	return "launch failure: " + failure + "; " + cleanup
 }
 
 type reviewRetirementPendingIntent struct {
@@ -1402,12 +1421,21 @@ func (r poolReviewer) LaunchFlags() []string {
 	if len(r.Argv) == 0 {
 		return nil
 	}
+	var flags []string
 	if strings.EqualFold(strings.TrimSpace(r.Argv[0]), strings.TrimSpace(r.Kind)) {
-		return r.Argv[1:]
+		flags = r.Argv[1:]
+	} else {
+		// A harness whose argv[0] is not the kind (a wrapper, for example) is
+		// passed through whole rather than silently truncated.
+		flags = r.Argv
 	}
-	// A harness whose argv[0] is not the kind (a wrapper, for example) is passed
-	// through whole rather than silently truncated.
-	return r.Argv
+	if strings.EqualFold(strings.TrimSpace(r.Kind), "codex") {
+		// Codex 0.153.4 blocks interactive startup on its update-choice prompt.
+		// Review launches cannot answer that unrelated UI prompt: disable only
+		// the supported startup update check through Codex's config override.
+		flags = append(append([]string(nil), flags...), "-c", "check_for_update_on_startup=false")
+	}
+	return flags
 }
 
 // poolReviewer is the resolved launch identity for one exact-SHA review.
