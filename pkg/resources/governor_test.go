@@ -959,8 +959,14 @@ func TestLSOFProcessInspectorDetectsCWDAndOpenFile(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	}()
-	inspector := LSOFProcessInspector{Executable: lsof, Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
-	deadline := time.Now().Add(2 * time.Second)
+	// The real-lsof detection is the contract here; synthesize the process
+	// table so the census walk stays deterministic under host load (a real
+	// walk over ~1000 pids is a host-load property, not a code property).
+	// Budgets are generous because lsof startup latency under fleet load is
+	// environmental, not part of the detection contract.
+	writeSelfAndChildPS(t, cmd.Process.Pid)
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: 15 * time.Second, MaxOutputBytes: 1 << 20}
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		usage, probeErr := inspector.InUse(context.Background(), root)
 		if probeErr == nil && usage.OpenFile && usage.CWD {

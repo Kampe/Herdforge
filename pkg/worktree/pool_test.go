@@ -125,10 +125,11 @@ func TestPoolGCSucceedsWithoutClaimLeaseHistory(t *testing.T) {
 	store.Close()
 
 	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.ProcessInspector = silentCensusInspector()
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if err := pool.GC(context.Background()); err != nil {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("GC on an unleased, never-pkg/claim-tracked pool slot must succeed, got: %v", err)
 	}
 }

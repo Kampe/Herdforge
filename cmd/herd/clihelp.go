@@ -66,6 +66,7 @@ var subcommandUsage = map[string]string{
 	"containers":       "Usage: herd containers [status|reconcile|reap] [flags]\n  Inspect durable container lifecycle state and unowned containers.\n  reap [--apply] [--older-than 45m] [--protect proj,...]: reclaim ABANDONED\n  containers by evidence of ephemerality (testcontainers, long-exited, or a\n  compose stack rooted in a pool slot/worktree/tmp). Dry run by default.\n  Protected projects are never candidates; unrecognised containers are kept.",
 	"control":          "Usage: herd control <issue|drain> [flags]\n  Issue or drain authenticated control envelopes.",
 	"init":             "Usage: herd init [--full]\n  Scaffold .herd/ config (optionally full 3-lane forge).",
+	"idle-pool":        "Usage: herd idle-pool [--base origin/main] [--max-roots 10] [--act]\n  Bounded, non-current pool-root discovery and reclamation. Dry-run report\n  by default; --act reclaims eligible roots through the same fail-closed\n  Pool.GC primitive as pool gc (retirement evidence + native pool state).",
 	"clone":            "Usage: herd clone <repo-url> [target-dir]\n  Clone a repository and run herd init --full.",
 	"preflight":        "Usage: herd preflight [--full-tree]\n  Workspace boundary, merge policy, and fleet readiness scanner.",
 	"preflight-static": "Usage: herd preflight-static [--full-tree]\n  Workspace boundary, signal literal, and merge policy scanner.",
