@@ -37,15 +37,34 @@ func TestHarnessAuthenticatedKindsClassifyNative(t *testing.T) {
 		// ~/.codex/auth.json is auth_mode=chatgpt with an OAuth token and an
 		// empty OPENAI_API_KEY, and `codex exec` executes with no key present.
 		AuthorKindCodex, AuthorKindGrok,
+		// FAC-791: opencode runs as a native vendor harness on this fleet.
+		AuthorKindOpenCode,
 	} {
 		if !harnessAuthenticated(kind) {
 			t.Errorf("%s authenticates through its own harness on this fleet", kind)
 		}
 	}
-	// opencode is still not a harness-auth kind: it is a gateway proxy, not a
-	// CLI holding its own provider session, and it remains out of scope.
-	if harnessAuthenticated("opencode") {
-		t.Error("opencode is a gateway proxy and must not be treated as harness-authenticated")
+	// Unknown kinds remain unauthenticated:
+	if harnessAuthenticated("unknown-kind") {
+		t.Error("unknown-kind must not be treated as harness-authenticated")
+	}
+}
+
+// The diagnosis a preflight prints must say brokerable for a harness-auth kind,
+// with a native authority class — not a HostCreds demand.
+func TestOpenCodeDiagnosisIsBrokerable(t *testing.T) {
+	d := DiagnoseKindAuthReadiness(AuthorKindOpenCode)
+	if !d.Brokerable {
+		t.Fatalf("a harness-authenticated opencode must be brokerable: %+v", d)
+	}
+	if d.AuthorityClass != "native" {
+		t.Errorf("authority = %q, want native", d.AuthorityClass)
+	}
+	if d.ReasonCode != "native_auth" {
+		t.Errorf("reason = %q, want native_auth", d.ReasonCode)
+	}
+	if d.Blocker != "" {
+		t.Errorf("a brokerable kind must carry no blocker, got %q", d.Blocker)
 	}
 }
 
@@ -75,8 +94,10 @@ func TestClaudeDiagnosisIsBrokerable(t *testing.T) {
 // An unanswerable login probe must not be read as logged out: a CLI that is
 // absent or too old to answer is not evidence of a missing session.
 func TestUnknownLoginIsNotLoggedOut(t *testing.T) {
-	if got := HarnessLoginState("codex"); got != HarnessLoginUnknown {
-		t.Errorf("a kind with no session probe must be unknown, got %q", got)
+	for _, kind := range []string{"codex", "grok", "agy", "opencode"} {
+		if got := HarnessLoginState(kind); got != HarnessLoginUnknown {
+			t.Errorf("a kind (%s) with no session probe must be unknown, got %q", kind, got)
+		}
 	}
 	if HarnessLoginUnknown == HarnessLoggedOut {
 		t.Fatal("unknown and logged-out must be distinct")

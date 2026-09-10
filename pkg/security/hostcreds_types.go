@@ -106,10 +106,11 @@ type KindAuthDiagnosis struct {
 }
 
 const (
-	AuthorKindGrok   = "grok"
-	AuthorKindClaude = "claude"
-	AuthorKindCodex  = "codex"
-	AuthorKindAGY    = "agy"
+	AuthorKindGrok     = "grok"
+	AuthorKindClaude   = "claude"
+	AuthorKindCodex    = "codex"
+	AuthorKindAGY      = "agy"
+	AuthorKindOpenCode = "opencode"
 )
 
 // RequestRule is exact allowlisted host + method + path + action (deny-by-default).

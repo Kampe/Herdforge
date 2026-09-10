@@ -160,17 +160,13 @@ func runHostCredsLive(args []string) int {
 func runHostCredsDiagnose(args []string) int {
 	fs := flag.NewFlagSet("hostcreds diagnose", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	kind := fs.String("kind", "", "author kind: grok, claude, or codex")
+	kind := fs.String("kind", "", "author kind: grok, claude, codex, agy, or opencode")
 	asJSON := fs.Bool("json", false, "emit KindAuthDiagnosis JSON")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if strings.TrimSpace(*kind) == "" {
 		fmt.Fprintln(os.Stderr, "hostcreds diagnose: --kind required")
-		return 2
-	}
-	if strings.EqualFold(*kind, "opencode") {
-		fmt.Fprintln(os.Stderr, "hostcreds: OpenCode out of scope")
 		return 2
 	}
 

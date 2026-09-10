@@ -43,13 +43,12 @@ func TestPreflightGatesOnWorkerBrokerability(t *testing.T) {
 // A kind that is not brokerable must be refused with the real blocker and an
 // action, before any lease or tab.
 func TestUnbrokerableKindIsRefusedWithAction(t *testing.T) {
-	// opencode has no HostCreds mapping on any host, so this is stable.
-	d := security.DiagnoseKindAuthReadiness("opencode")
+	d := security.DiagnoseKindAuthReadiness("unknown-kind")
 	if d.Brokerable {
-		t.Skip("fixture assumption changed: opencode became brokerable")
+		t.Fatal("unknown-kind must not be brokerable")
 	}
 	err := preflightReviewerReadiness(poolReviewer{
-		Kind: "opencode", Provider: "opencode", Model: "opencode/deepseek-v4-pro",
+		Kind: "unknown-kind", Provider: "unknown-provider", Model: "unknown-model",
 	})
 	if err == nil {
 		t.Fatal("a kind whose worker credentials cannot be brokered must be refused")
@@ -64,5 +63,39 @@ func TestUnbrokerableKindIsRefusedWithAction(t *testing.T) {
 	// the exact confusion this defect produced.
 	if !strings.Contains(msg, "different credential context") {
 		t.Error("refusal should explain that the pane runs in a different credential context")
+	}
+}
+
+// FAC-791: OpenCode is a supported native vendor harness and passes the brokerability preflight gate.
+func TestOpenCodeReviewerPassesAuthPreflight(t *testing.T) {
+	d := security.DiagnoseKindAuthReadiness("opencode")
+	if !d.Brokerable {
+		t.Fatalf("opencode must be brokerable via native harness auth, got: %+v", d)
+	}
+	if d.AuthorityClass != "native" {
+		t.Errorf("authority class = %q, want native", d.AuthorityClass)
+	}
+	if d.ReasonCode != "native_auth" {
+		t.Errorf("reason code = %q, want native_auth", d.ReasonCode)
+	}
+	if d.Class != security.KindAuthOK {
+		t.Errorf("class = %q, want ok", d.Class)
+	}
+}
+
+// TestPreflightSupportedKindsBrokerable asserts that all supported vendor harnesses
+// pass the auth brokerability gate.
+func TestPreflightSupportedKindsBrokerable(t *testing.T) {
+	for _, kind := range []string{"claude", "codex", "grok", "agy", "opencode"} {
+		d := security.DiagnoseKindAuthReadiness(kind)
+		if kind == "claude" && security.HarnessLoginState("claude") == security.HarnessLoggedOut {
+			if d.Brokerable {
+				t.Errorf("%s is logged out and must not be brokerable", kind)
+			}
+			continue
+		}
+		if !d.Brokerable {
+			t.Errorf("harness %s must be brokerable via native auth, got %+v", kind, d)
+		}
 	}
 }

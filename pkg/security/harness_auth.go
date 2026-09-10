@@ -16,21 +16,23 @@ import (
 
 // harnessAuthKinds are the kinds that authenticate through their own harness.
 //
-// FAC-587: that is EVERY kind this fleet launches. Agents run as harnesses
-// inside herdr panes and never against a provider API, so codex and grok hold
-// their own CLI login sessions exactly as claude and agy do. Listing only
-// claude and agy left codex and grok classified as API-key kinds and refused at
-// admission for credentials this fleet does not have — the same category error
-// FAC-576 fixed for claude, left in place for the other two.
+// FAC-587, FAC-791: that is EVERY kind this fleet launches. Agents run as
+// harnesses inside herdr panes and never against a provider API, so codex, grok,
+// and opencode hold their own CLI login sessions and configuration exactly as
+// claude and agy do. Listing only some harnesses left opencode classified as an
+// API-key kind and refused at admission for credentials this fleet does not
+// have — the same category error FAC-576 fixed for claude and FAC-587 fixed for
+// the others.
 //
 // If this fleet ever adopts raw API execution, the change belongs in
 // RequestRulesForKind and RequiredBrokerHostsForKind behind an explicit opt-in,
 // not by reclassifying a kind here.
 var harnessAuthKinds = map[string]bool{
-	AuthorKindAGY: true, "antigravity": true,
-	AuthorKindClaude: true,
-	AuthorKindCodex:  true,
-	AuthorKindGrok:   true,
+	AuthorKindAGY:      true, "antigravity": true,
+	AuthorKindClaude:   true,
+	AuthorKindCodex:    true,
+	AuthorKindGrok:     true,
+	AuthorKindOpenCode: true,
 }
 
 // harnessAuthenticated reports whether a kind carries its own session.

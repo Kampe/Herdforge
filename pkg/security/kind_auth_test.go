@@ -30,7 +30,7 @@ func TestDiagnoseKindAuthReadiness_NoAPIKeys_External(t *testing.T) {
 	//
 	// The secret-hygiene half of this test is the part that still matters, and it
 	// is kept: a diagnosis must never carry key material, brokerable or not.
-	for _, kind := range []string{"codex", "grok"} {
+	for _, kind := range []string{"codex", "grok", "opencode"} {
 		d := DiagnoseKindAuthReadiness(kind)
 		if !d.Brokerable {
 			t.Errorf("%s runs as a harness on this fleet and must be brokerable", kind)
@@ -47,9 +47,9 @@ func TestDiagnoseKindAuthReadiness_NoAPIKeys_External(t *testing.T) {
 	}
 
 	// A kind that is NOT a harness must still be refused, or this stops being a
-	// gate at all. opencode is a gateway proxy and deliberately out of scope.
-	if d := DiagnoseKindAuthReadiness("opencode"); d.Brokerable {
-		t.Error("opencode is not a harness kind and must not be brokerable")
+	// gate at all.
+	if d := DiagnoseKindAuthReadiness("unknown-kind"); d.Brokerable {
+		t.Error("unknown kind must not be brokerable")
 	}
 }
 
