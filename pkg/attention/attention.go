@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 )
@@ -521,11 +522,26 @@ func runWithFleet(fetchAgents any, reader lifecycle.HoldReader, repository strin
 	}
 	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
 
+	receiptsPath := launch.ReceiptPathFor(repository)
+	receipts, _ := launch.ReadReceipts(receiptsPath)
+
 	evidenceResolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string, error) {
 		a, found := findAttentionAgent(agents, name)
 		if !found {
 			return nil, process.SessionContext{}, "", nil
 		}
+
+		expectedProvider := a.ExpectedProvider
+		expectedModel := a.ExpectedModel
+		expectedAccount := ""
+		if expectedProvider == "" || expectedModel == "" {
+			if p, m, acc, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, a.Name, a.Session.Value, a.PaneID, a.TabID); err == nil {
+				expectedProvider = p
+				expectedModel = m
+				expectedAccount = acc
+			}
+		}
+
 		fence := process.IdentityFence{
 			Name:             a.Name,
 			Kind:             a.Kind,
@@ -540,8 +556,9 @@ func runWithFleet(fetchAgents any, reader lifecycle.HoldReader, repository strin
 			Revision:         a.Revision,
 			StateChangeSeq:   a.StateChangeSeq,
 			TabGeneration:    a.TabGeneration,
-			ExpectedModel:    a.ExpectedModel,
-			ExpectedProvider: a.ExpectedProvider,
+			ExpectedModel:    expectedModel,
+			ExpectedProvider: expectedProvider,
+			ExpectedAccount:  expectedAccount,
 		}
 		fetchAfter := func(agentName string) (*kick.AgentEntry, error) {
 			select {
@@ -556,6 +573,12 @@ func runWithFleet(fetchAgents any, reader lifecycle.HoldReader, repository strin
 			cur, ok := findAttentionAgent(resAgents, agentName)
 			if !ok {
 				return nil, errors.New("agent not found in current fleet")
+			}
+			if cur.ExpectedModel == "" || cur.ExpectedProvider == "" {
+				if p, m, _, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, cur.Name, cur.Session.Value, cur.PaneID, cur.TabID); err == nil {
+					cur.ExpectedProvider = p
+					cur.ExpectedModel = m
+				}
 			}
 			return &cur, nil
 		}

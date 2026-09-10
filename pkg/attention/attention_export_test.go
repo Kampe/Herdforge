@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 )
@@ -607,6 +609,200 @@ func TestAttention_RunWithFleet_UnmarshaledNativeHerdrTransport_AcceptsEvidence(
 			}
 			if strings.Contains(item.Reason, "unbound model route") {
 				t.Errorf("evidence was incorrectly rejected as unbound model route: %s", item.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected lane in attention result items: %#v", result.Items)
+	}
+}
+
+func TestAttention_RunWithFleet_RealNativeHerdrJSONWithoutRouteFields_BindsAcceptedLaunchProvenance(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	model := "lazer/gemini-3.7-flash"
+	provider := "litellm"
+	account := "lazer-prod"
+
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/repo"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":%q,"modelID":%q,"finish":"length","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, provider, model, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	// 1. REAL native Herdr JSON: has agent, cwd, pane_id, session etc. - NO model or provider keys!
+	realNativeJSON := fmt.Sprintf(`{"result":{"agents":[
+		{
+			"name":"forge-lane-1",
+			"label":"lane-1",
+			"agent":"opencode",
+			"agent_status":"working",
+			"pane_id":"p-1",
+			"tab_id":"t-1",
+			"terminal_id":"term-1",
+			"workspace_id":"ws-1",
+			"cwd":"/repo",
+			"revision":10,
+			"state_change_seq":3,
+			"tab_generation":1,
+			"agent_session":{"source":"native","agent":"opencode","kind":"opencode","value":%q}
+		}
+	]}}`, sessionID)
+
+	var listRes kick.AgentListResult
+	if err := json.Unmarshal([]byte(realNativeJSON), &listRes); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	fleet := listRes.Result.Agents
+	if len(fleet) != 1 || fleet[0].ExpectedModel != "" || fleet[0].ExpectedProvider != "" {
+		t.Fatalf("real native JSON must have empty route fields, got: %#v", fleet)
+	}
+
+	// 2. Set up authentic accepted launch receipt store
+	tmpDir := t.TempDir()
+	receiptPath := filepath.Join(tmpDir, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(receiptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
+
+	sink := &launch.JSONLSink{Path: receiptPath}
+	if err := sink.Write(launch.Receipt{
+		CreatedAt:         now.Add(-2 * time.Hour),
+		Accepted:          true,
+		Name:              "forge-lane-1",
+		Lane:              "lane-1",
+		Provider:          provider,
+		Model:             model,
+		RedactedAuthority: account,
+		HerdrSession:      sessionID,
+		PaneID:            "p-1",
+	}); err != nil {
+		t.Fatalf("write launch receipt: %v", err)
+	}
+
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	found := false
+	for _, item := range result.Items {
+		if item.Name == "forge-lane-1" || item.Name == "lane-1" {
+			found = true
+			if item.Level != LevelMedium {
+				t.Errorf("expected finish=length to classify as LevelMedium, got %s (reason: %s)", item.Level, item.Reason)
+			}
+			if strings.Contains(item.Reason, "unbound model route") {
+				t.Errorf("evidence was incorrectly rejected as unbound route despite authentic launch receipt: %s", item.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected lane in attention result items: %#v", result.Items)
+	}
+}
+
+func TestAttention_RunWithFleet_RealNativeHerdrJSON_MissingProvenance_RemainsUnknown(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	model := "lazer/gemini-3.7-flash"
+	provider := "litellm"
+
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/repo"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":%q,"modelID":%q,"finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, provider, model, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	// Real native JSON without route fields
+	realNativeJSON := fmt.Sprintf(`{"result":{"agents":[
+		{
+			"name":"forge-lane-1",
+			"label":"lane-1",
+			"agent":"opencode",
+			"agent_status":"working",
+			"pane_id":"p-1",
+			"tab_id":"t-1",
+			"terminal_id":"term-1",
+			"workspace_id":"ws-1",
+			"cwd":"/repo",
+			"revision":10,
+			"state_change_seq":3,
+			"tab_generation":1,
+			"agent_session":{"source":"native","agent":"opencode","kind":"opencode","value":%q}
+		}
+	]}}`, sessionID)
+
+	var listRes kick.AgentListResult
+	if err := json.Unmarshal([]byte(realNativeJSON), &listRes); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	fleet := listRes.Result.Agents
+
+	// Point to empty receipt log
+	tmpDir := t.TempDir()
+	emptyReceiptPath := filepath.Join(tmpDir, ".herd", "launch-receipts.jsonl")
+	t.Setenv("HERD_LAUNCH_RECEIPTS", emptyReceiptPath)
+
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	found := false
+	for _, item := range result.Items {
+		if item.Name == "forge-lane-1" || item.Name == "lane-1" {
+			found = true
+			if item.Level != LevelMedium {
+				t.Errorf("missing launch provenance must classify as LevelMedium (unknown), got %s", item.Level)
+			}
+			if !strings.Contains(item.Reason, "unbound model route") {
+				t.Errorf("missing provenance must report unbound model route error, got: %s", item.Reason)
 			}
 		}
 	}

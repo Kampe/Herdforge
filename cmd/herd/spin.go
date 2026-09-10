@@ -15,6 +15,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
@@ -116,6 +117,20 @@ func runSpin() {
 		}
 		cwd := worktreeCwd
 
+		receiptsPath := launch.ReceiptPathFor(repoRoot)
+		receipts, _ := launch.ReadReceipts(receiptsPath)
+
+		expectedProvider := a.ExpectedProvider
+		expectedModel := a.ExpectedModel
+		expectedAccount := ""
+		if expectedProvider == "" || expectedModel == "" {
+			if p, m, acc, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, a.Name, a.Session.Value, a.PaneID, a.TabID); err == nil {
+				expectedProvider = p
+				expectedModel = m
+				expectedAccount = acc
+			}
+		}
+
 		spinCtx, spinCancel := context.WithTimeout(ctx, 10*time.Second)
 		fence := process.IdentityFence{
 			Name:             a.Name,
@@ -131,8 +146,9 @@ func runSpin() {
 			Revision:         a.Revision,
 			StateChangeSeq:   a.StateChangeSeq,
 			TabGeneration:    a.TabGeneration,
-			ExpectedModel:    a.ExpectedModel,
-			ExpectedProvider: a.ExpectedProvider,
+			ExpectedModel:    expectedModel,
+			ExpectedProvider: expectedProvider,
+			ExpectedAccount:  expectedAccount,
 		}
 		fetchAfter := func(name string) (*kick.AgentEntry, error) {
 			select {
@@ -146,6 +162,14 @@ func runSpin() {
 			}
 			for _, cur := range currentAgents {
 				if cur.Name == name {
+					p := cur.ExpectedProvider
+					m := cur.ExpectedModel
+					if p == "" || m == "" {
+						if prov, mod, _, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, cur.Name, cur.Session.Value, cur.PaneID, cur.TabID); err == nil {
+							p = prov
+							m = mod
+						}
+					}
 					return &kick.AgentEntry{
 						Name:             cur.Name,
 						Kind:             cur.Kind,
@@ -158,8 +182,8 @@ func runSpin() {
 						Revision:         cur.Revision,
 						StateChangeSeq:   cur.StateChangeSeq,
 						TabGeneration:    cur.TabGeneration,
-						ExpectedModel:    cur.ExpectedModel,
-						ExpectedProvider: cur.ExpectedProvider,
+						ExpectedModel:    m,
+						ExpectedProvider: p,
 						Session: kick.AgentSession{
 							Value:  cur.Session.Value,
 							Kind:   cur.Session.Kind,

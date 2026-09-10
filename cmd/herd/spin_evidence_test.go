@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
 )
@@ -309,5 +311,166 @@ func TestSpin_NativeEvidenceError_DoesNotFallbackToPaneComplete(t *testing.T) {
 	}
 	if target.Action != "observe" {
 		t.Errorf("expected observe target action, got %s", target.Action)
+	}
+}
+
+func TestSpin_RealNativeAgent_BindsAcceptedLaunchProvenance(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	model := "lazer/gemini-3.7-flash"
+	provider := "litellm"
+	account := "lazer-prod"
+
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":%q,"modelID":%q,"finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, provider, model, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	// Launch receipt store with authentic accepted receipt
+	tmpDir := t.TempDir()
+	receiptPath := filepath.Join(tmpDir, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(receiptPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_LAUNCH_RECEIPTS", receiptPath)
+
+	sink := &launch.JSONLSink{Path: receiptPath}
+	if err := sink.Write(launch.Receipt{
+		CreatedAt:         now.Add(-2 * time.Hour),
+		Accepted:          true,
+		Name:              "forge-worker",
+		Lane:              "worker",
+		Provider:          provider,
+		Model:             model,
+		RedactedAuthority: account,
+		HerdrSession:      sessionID,
+		PaneID:            "p-1",
+	}); err != nil {
+		t.Fatalf("write launch receipt: %v", err)
+	}
+
+	// Real agent row from Herdr has NO expected_model/expected_provider fields
+	realAgent := kick.AgentEntry{
+		Name:      "forge-worker",
+		Kind:      "opencode",
+		Status:    "working",
+		PaneID:    "p-1",
+		Workspace: "ws-1",
+		Cwd:       "/path/to/worktree",
+		Session:   kick.AgentSession{Value: sessionID},
+	}
+
+	receipts, _ := launch.ReadReceipts(launch.DefaultReceiptPath())
+	prov, mod, acc, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, realAgent.Name, realAgent.Session.Value, realAgent.PaneID, realAgent.TabID)
+	if err != nil {
+		t.Fatalf("resolve launch route: %v", err)
+	}
+
+	fence := process.IdentityFence{
+		Name:             realAgent.Name,
+		Kind:             realAgent.Kind,
+		SessionID:        realAgent.Session.Value,
+		PaneID:           realAgent.PaneID,
+		Cwd:              realAgent.Cwd,
+		ExpectedModel:    mod,
+		ExpectedProvider: prov,
+		ExpectedAccount:  acc,
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:             realAgent.Name,
+			Kind:             realAgent.Kind,
+			PaneID:           realAgent.PaneID,
+			Cwd:              realAgent.Cwd,
+			Session:          kick.AgentSession{Value: sessionID},
+			ExpectedModel:    mod,
+			ExpectedProvider: prov,
+		}, nil
+	}
+
+	ev, sctx, _, evErr := process.ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
+	if evErr != nil {
+		t.Fatalf("expected evidence resolution to succeed via launch provenance, got: %v", evErr)
+	}
+
+	if ev.Model != model || ev.Provider != provider || ev.Account != account {
+		t.Errorf("evidence route mismatch: model=%q prov=%q acc=%q", ev.Model, ev.Provider, ev.Account)
+	}
+	if sctx.Model != model || sctx.Provider != provider || sctx.Account != account {
+		t.Errorf("session context route mismatch: model=%q prov=%q acc=%q", sctx.Model, sctx.Provider, sctx.Account)
+	}
+
+	target := process.ClassifyTargetWithEvidence(realAgent.PaneID, realAgent.Name, realAgent.Status, "Status: COMPLETE\nsummary of work", ev, sctx)
+	if target.Class != process.Complete {
+		t.Errorf("expected Complete target class with finish=stop, got %s", target.Class)
+	}
+}
+
+func TestSpin_RealNativeAgent_MissingProvenance_FailsClosed(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	model := "lazer/gemini-3.7-flash"
+	provider := "litellm"
+
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":%q,"modelID":%q,"finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, provider, model, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	// Empty receipt store
+	tmpDir := t.TempDir()
+	emptyReceiptPath := filepath.Join(tmpDir, ".herd", "launch-receipts.jsonl")
+	t.Setenv("HERD_LAUNCH_RECEIPTS", emptyReceiptPath)
+
+	realAgent := kick.AgentEntry{
+		Name:      "forge-worker",
+		Kind:      "opencode",
+		Status:    "working",
+		PaneID:    "p-1",
+		Workspace: "ws-1",
+		Cwd:       "/path/to/worktree",
+		Session:   kick.AgentSession{Value: sessionID},
+	}
+
+	receipts, _ := launch.ReadReceipts(launch.DefaultReceiptPath())
+	prov, mod, acc, _ := launch.AcceptedNativeLaunchRouteForAgent(receipts, realAgent.Name, realAgent.Session.Value, realAgent.PaneID, realAgent.TabID)
+
+	fence := process.IdentityFence{
+		Name:             realAgent.Name,
+		Kind:             realAgent.Kind,
+		SessionID:        realAgent.Session.Value,
+		PaneID:           realAgent.PaneID,
+		Cwd:              realAgent.Cwd,
+		ExpectedModel:    mod,
+		ExpectedProvider: prov,
+		ExpectedAccount:  acc,
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:             realAgent.Name,
+			Kind:             realAgent.Kind,
+			PaneID:           realAgent.PaneID,
+			Cwd:              realAgent.Cwd,
+			Session:          kick.AgentSession{Value: sessionID},
+			ExpectedModel:    mod,
+			ExpectedProvider: prov,
+		}, nil
+	}
+
+	_, _, _, evErr := process.ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
+	if evErr == nil || !strings.Contains(evErr.Error(), "unbound model route") {
+		t.Fatalf("missing launch provenance must fail closed as unbound model route, got: %v", evErr)
 	}
 }

@@ -75,6 +75,7 @@ type IdentityFence struct {
 	TabGeneration    uint64
 	ExpectedModel    string
 	ExpectedProvider string
+	ExpectedAccount  string
 }
 
 // Verify compares the after snapshot against the before fence.
@@ -461,6 +462,11 @@ func ResolveNativeAgentEvidenceWithFence(ctx context.Context, fence IdentityFenc
 	}
 	if ev.Provider != fence.ExpectedProvider {
 		return nil, sctx, "", fmt.Errorf("provider mismatch: expected %q, export has %q", fence.ExpectedProvider, ev.Provider)
+	}
+
+	if strings.TrimSpace(fence.ExpectedAccount) != "" {
+		ev.Account = fence.ExpectedAccount
+		sctx.Account = fence.ExpectedAccount
 	}
 
 	sctx.TurnID = ev.TurnID
