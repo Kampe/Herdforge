@@ -236,6 +236,73 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	}
 }
 
+func TestGovernorPreservesActiveManagedCacheLease(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 900000)
+	g.Processes = idleProcessInspector{}
+	g.Policy.OrphanRoots = []string{filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")}
+	g.Policy.OrphanDerivedTargets = []string{"bootstrap-go-mod"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	orphan := filepath.Join(g.Policy.OrphanRoots[0], "fac-613")
+	digest := strings.Repeat("c", 64)
+	cache := filepath.Join(orphan, ".herd", "bootstrap", "cache", digest, "go-mod")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(orphan, ".herd", "bootstrap", "cache", digest), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "module.zip"), []byte("active"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"version":1,"contract_digest":"contract","toolchain_digest":"` + digest + `","cache_dir":".herd/bootstrap/cache/` + digest + `"}`
+	bootstrapDir := filepath.Join(orphan, ".herd", "bootstrap")
+	if err := os.MkdirAll(bootstrapDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bootstrapDir, "receipt.json"), []byte(receipt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lease := managedCacheLease{Version: 1, CacheDir: ".herd/bootstrap/cache/" + digest, ToolchainDigest: digest, ExpiresAt: g.Now().Add(time.Hour)}
+	orphanResolved, err := filepath.EvalSymlinks(orphan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootResolved, err := filepath.EvalSymlinks(g.Policy.RepositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktreeRel, err := filepath.Rel(rootResolved, orphanResolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Consumer.Repository, lease.Consumer.TaskRef, lease.Consumer.LeaseGeneration, lease.Consumer.Worktree = "repo-id", "FAC-613", 7, filepath.ToSlash(worktreeRel)
+	lease.Process.PID, lease.Process.ParentPID, lease.Process.StartToken = 1, 1, "launch-token"
+	data, err := json.Marshal(lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bootstrapDir, "cache-use.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bootstrapDir, "cache-use.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Unix(-10000, 0)
+	if err := os.Chtimes(cache, old, old); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Orphans) != 1 || len(report.Orphans[0].DerivedTargets) != 1 || report.Orphans[0].DerivedTargets[0].Decision != "blocked" || report.Orphans[0].DerivedTargets[0].Reason != "managed_cache_lease_active" {
+		t.Fatalf("active managed cache lease decision=%+v orphans=%+v", report.OrphanTargets, report.Orphans)
+	}
+	if _, err := os.Stat(cache); err != nil {
+		t.Fatalf("active managed cache was removed: %v", err)
+	}
+}
+
 func TestGovernorRefusesOrphanCacheOnOwnershipOrOpenFileUncertainty(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

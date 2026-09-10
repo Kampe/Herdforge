@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -670,6 +671,9 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if err != nil {
 		return usage, false, "derived_target_process_evidence_unavailable"
 	}
+	if active, reason := managedCacheLeaseActive(ctx, g.Policy.RepositoryRoot, orphan, target, g.Now()); active {
+		return usage, false, reason
+	}
 	if process.MetadataUnavailable || process.CWD || process.OpenFile || process.ReferencedPath {
 		return usage, false, "derived_target_active_process"
 	}
@@ -681,6 +685,108 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 		return usage, false, "orphan_cache_ttl_not_reached"
 	}
 	return usage, true, "proof_backed_regenerable_cache"
+}
+
+type managedCacheLease struct {
+	Version         int    `json:"version"`
+	CacheDir        string `json:"cache_dir"`
+	ToolchainDigest string `json:"toolchain_digest"`
+	Consumer        struct {
+		Repository      string `json:"Repository"`
+		TaskRef         string `json:"TaskRef"`
+		LeaseGeneration int64  `json:"LeaseGeneration"`
+		Worktree        string `json:"Worktree"`
+	} `json:"consumer"`
+	Process struct {
+		PID        int    `json:"pid"`
+		ParentPID  int    `json:"parent_pid"`
+		StartToken string `json:"start_token"`
+	} `json:"process"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func managedCacheLeaseActive(ctx context.Context, repositoryRoot, orphan, target string, now time.Time) (bool, string) {
+	path := filepath.Join(orphan, ".herd", "bootstrap", "cache-use.lock")
+	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if _, leaseErr := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "cache-use.json")); errors.Is(leaseErr, os.ErrNotExist) {
+				return false, ""
+			}
+		}
+		return true, "managed_cache_lease_lock_unavailable"
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return true, "managed_cache_lease_lock_unavailable"
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	return managedCacheLeaseActiveUnlocked(ctx, repositoryRoot, orphan, target, now)
+}
+
+func managedCacheLeaseActiveUnlocked(ctx context.Context, repositoryRoot, orphan, target string, now time.Time) (bool, string) {
+	path := filepath.Join(orphan, ".herd", "bootstrap", "cache-use.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, ""
+	}
+	if err != nil {
+		return true, "managed_cache_lease_unreadable"
+	}
+	var lease managedCacheLease
+	root, rootErr := filepath.EvalSymlinks(repositoryRoot)
+	worktreeRel, relErr := filepath.Rel(root, orphan)
+	if rootErr != nil || relErr != nil || json.Unmarshal(data, &lease) != nil || lease.Version != 1 || lease.CacheDir == "" || len(lease.ToolchainDigest) != 64 || lease.Consumer.Repository == "" || lease.Consumer.TaskRef == "" || lease.Consumer.LeaseGeneration <= 0 || filepath.Clean(filepath.FromSlash(lease.Consumer.Worktree)) != filepath.Clean(worktreeRel) || lease.Process.PID <= 0 || lease.Process.ParentPID <= 0 || lease.Process.StartToken == "" || lease.ExpiresAt.IsZero() {
+		return true, "managed_cache_lease_invalid"
+	}
+	cacheRoot := filepath.Clean(filepath.Join(orphan, filepath.FromSlash(lease.CacheDir)))
+	if !containedPath(cacheRoot, filepath.Clean(target)) {
+		return true, "managed_cache_lease_target_mismatch"
+	}
+	if lease.ExpiresAt.After(now) {
+		return true, "managed_cache_lease_active"
+	}
+	current, present, err := processLeaseIdentity(ctx, lease.Process.PID)
+	if err != nil {
+		return true, "managed_cache_lease_identity_unknown"
+	}
+	if !present {
+		return false, ""
+	}
+	if current.ParentPID != lease.Process.ParentPID || current.StartToken != lease.Process.StartToken {
+		return true, "managed_cache_lease_pid_reused"
+	}
+	return true, "managed_cache_lease_expired_process_live"
+}
+
+type leaseProcessIdentity struct {
+	ParentPID  int
+	StartToken string
+}
+
+func processLeaseIdentity(ctx context.Context, pid int) (leaseProcessIdentity, bool, error) {
+	ps, err := exec.LookPath("ps")
+	if err != nil {
+		return leaseProcessIdentity{}, false, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, ps, "-p", strconv.Itoa(pid), "-o", "ppid=,lstart=").Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return leaseProcessIdentity{}, false, nil
+		}
+		return leaseProcessIdentity{}, false, err
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) < 3 {
+		return leaseProcessIdentity{}, false, errors.New("process identity is incomplete")
+	}
+	parent, err := strconv.Atoi(fields[0])
+	if err != nil || parent <= 0 {
+		return leaseProcessIdentity{}, false, errors.New("process parent identity is invalid")
+	}
+	return leaseProcessIdentity{ParentPID: parent, StartToken: strings.Join(fields[1:], " ")}, true, nil
 }
 
 func privateTargetProvenance(orphan, target, owner string) (bool, string) {
@@ -736,11 +842,44 @@ func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorRepor
 			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, reason
 			continue
 		}
+		lockPath := filepath.Join(orphan, ".herd", "bootstrap", "cache-use.lock")
+		lockFile, lockErr := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+		locked := lockErr == nil && syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX) == nil
+		if !locked && !errors.Is(lockErr, os.ErrNotExist) {
+			if lockFile != nil {
+				_ = lockFile.Close()
+			}
+			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "managed_cache_lease_lock_unavailable"
+			continue
+		}
+		if !locked {
+			if _, leaseErr := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "cache-use.json")); !errors.Is(leaseErr, os.ErrNotExist) {
+				report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "managed_cache_lease_lock_unavailable"
+				continue
+			}
+		}
+		active, activeReason := managedCacheLeaseActiveUnlocked(ctx, g.Policy.RepositoryRoot, orphan, report.OrphanTargets[i].Path, g.Now())
+		if active {
+			if locked {
+				_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+				_ = lockFile.Close()
+			}
+			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, activeReason
+			continue
+		}
 		if used > g.Policy.OrphanCacheBudgetBytes-usage.Bytes {
+			if locked {
+				_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+				_ = lockFile.Close()
+			}
 			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "orphan_cache_budget_exhausted"
 			continue
 		}
 		if err := safeRemoveGeneratedTree(g.Policy.RepositoryRoot, report.OrphanTargets[i].Path, g.RemoveTree); err != nil {
+			if locked {
+				_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+				_ = lockFile.Close()
+			}
 			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "orphan_cache_remove_failed"
 			return fmt.Errorf("remove exact orphan cache %q: %w", report.OrphanTargets[i].Path, err)
 		}
@@ -750,7 +889,15 @@ func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorRepor
 			err = nil
 		}
 		if err != nil {
+			if locked {
+				_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+				_ = lockFile.Close()
+			}
 			return fmt.Errorf("orphan cache post-reap readback: %w", err)
+		}
+		if locked {
+			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			_ = lockFile.Close()
 		}
 		report.OrphanTargets[i].Decision = TargetReaped
 		report.OrphanTargets[i].BeforeBytes, report.OrphanTargets[i].AfterBytes = usage.Bytes, after.Bytes

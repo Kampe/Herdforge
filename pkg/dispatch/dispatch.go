@@ -410,6 +410,10 @@ type WorktreeBootstrapper interface {
 	Execute(context.Context, string, config.WorktreeBootstrap) (*worktreebootstrap.Result, error)
 }
 
+type ManagedWorktreeBootstrapper interface {
+	ExecuteManaged(context.Context, string, config.WorktreeBootstrap, worktreebootstrap.ConsumerIdentity) (*worktreebootstrap.Result, error)
+}
+
 // DispatchResourceGovernor returns a permit that remains held across the
 // worktree mutation. Implementations must fail closed when host capacity or
 // reaper evidence is unavailable.
@@ -439,7 +443,7 @@ func (d *Dispatcher) withResourcePermit(ctx context.Context, create func() (*wor
 	return info, createErr
 }
 
-func (d *Dispatcher) bootstrapWorktree(ctx context.Context, worktreePath string) error {
+func (d *Dispatcher) bootstrapWorktree(ctx context.Context, worktreePath string, taskRef string, leaseGeneration int64) error {
 	if d.Config == nil || !d.Config.WorktreeBootstrap.Enabled() {
 		return nil
 	}
@@ -447,7 +451,28 @@ func (d *Dispatcher) bootstrapWorktree(ctx context.Context, worktreePath string)
 	if runner == nil {
 		runner = worktreebootstrap.Executor{}
 	}
-	if _, err := runner.Execute(ctx, worktreePath, d.Config.WorktreeBootstrap); err != nil {
+	var err error
+	if managed, ok := runner.(ManagedWorktreeBootstrapper); ok {
+		repository, identityErr := d.repositoryIdentity()
+		if identityErr != nil {
+			return fmt.Errorf("managed bootstrap repository identity: %w", identityErr)
+		}
+		repositoryRoot := "."
+		if d.Worktree != nil && d.Worktree.RepoRoot() != "" {
+			repositoryRoot = d.Worktree.RepoRoot()
+		}
+		worktreeRel, relErr := filepath.Rel(repositoryRoot, worktreePath)
+		if relErr != nil || worktreeRel == ".." || strings.HasPrefix(worktreeRel, ".."+string(filepath.Separator)) || filepath.IsAbs(worktreeRel) {
+			if relErr != nil {
+				return fmt.Errorf("managed bootstrap worktree relation: %w", relErr)
+			}
+			return errors.New("managed bootstrap worktree is outside repository")
+		}
+		_, err = managed.ExecuteManaged(ctx, worktreePath, d.Config.WorktreeBootstrap, worktreebootstrap.ConsumerIdentity{Repository: repository, TaskRef: taskRef, LeaseGeneration: leaseGeneration, Worktree: filepath.ToSlash(worktreeRel)})
+	} else {
+		_, err = runner.Execute(ctx, worktreePath, d.Config.WorktreeBootstrap)
+	}
+	if err != nil {
 		return fmt.Errorf("worktree bootstrap failed: %w\n  recovery: inspect .herd/bootstrap/receipt.json and repair the declared worktree_bootstrap command", err)
 	}
 	return nil
@@ -1155,7 +1180,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, opts DispatchOptions) (result
 	// scope admission, worktree creation, and worktree boundary admission.
 	// A failed or stale bootstrap is an attributable recovery state and must
 	// never fall through to a write-capable agent launch.
-	if err := d.bootstrapWorktree(ctx, wtInfo.Path); err != nil {
+	if err := d.bootstrapWorktree(ctx, wtInfo.Path, task.Ref, tok.Generation); err != nil {
 		return nil, failOwned("worktree_bootstrap_failed", err)
 	}
 

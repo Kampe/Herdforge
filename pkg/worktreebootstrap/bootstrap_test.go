@@ -23,6 +23,44 @@ type recordingRunner struct {
 	err   error
 }
 
+type managedChildRunner struct {
+	leasePath string
+	observed  bool
+}
+
+func (r *managedChildRunner) Run(_ context.Context, _ string, _ []string, _ []string) error {
+	return errors.New("legacy runner path used")
+}
+
+func (r *managedChildRunner) RunManaged(ctx context.Context, dir string, argv, env []string, enroll func(ProcessIdentity) error) error {
+	return (execRunner{}).RunManaged(ctx, dir, argv, env, func(identity ProcessIdentity) error {
+		if err := enroll(identity); err != nil {
+			return err
+		}
+		_, err := os.Stat(r.leasePath)
+		r.observed = err == nil
+		return err
+	})
+}
+
+func TestExecuteManagedProtectsRealChildEnvOnlyUseUntilCompletion(t *testing.T) {
+	root := t.TempDir()
+	contract := testContract()
+	contract.Command = []string{"sh", "-c", `test -n "$GOCACHE" -a -n "$GOMODCACHE"; sleep 0.1`}
+	runner := &managedChildRunner{leasePath: filepath.Join(root, ".herd", "bootstrap", "cache-use.json")}
+	executor := Executor{Resolver: fakeResolver{identity: strings.Repeat("a", 64)}, Runner: runner}
+	consumer := ConsumerIdentity{Repository: "repo-id", TaskRef: "FAC-613", LeaseGeneration: 7, Worktree: ".herd/worktrees/fac-613"}
+	if _, err := executor.ExecuteManaged(context.Background(), root, contract, consumer); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.observed {
+		t.Fatal("managed child completed without an observable active cache-use lease")
+	}
+	if _, err := os.Stat(runner.leasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache-use lease remained after child completion: %v", err)
+	}
+}
+
 func (r *recordingRunner) Run(_ context.Context, dir string, _ []string, env []string) error {
 	r.calls++
 	r.env = append([]string(nil), env...)
