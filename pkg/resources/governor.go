@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -74,6 +75,8 @@ type GovernorPolicy struct {
 	// deletion target without canonical claim, ownership, and handle proof.
 	OrphanRoots            []string
 	OrphanDerivedTargets   []string
+	OrphanCacheTTL         time.Duration
+	OrphanCacheBudgetBytes uint64
 	PressureBytes          uint64
 	RecoveryBytes          uint64
 	TaskReserveBytes       uint64
@@ -104,6 +107,14 @@ func (p GovernorPolicy) validate() error {
 	}
 	if p.ApplyBeforeDispatch && !p.AllowApply {
 		return errors.New("resource governor dispatch apply is not admitted")
+	}
+	if len(p.OrphanDerivedTargets) != 0 && (p.OrphanCacheTTL <= 0 || p.OrphanCacheBudgetBytes == 0) {
+		return errors.New("orphan cache targets require a positive TTL and nonzero budget")
+	}
+	for _, target := range p.OrphanDerivedTargets {
+		if target != "graph.db" && target != "bootstrap-go-mod" {
+			return fmt.Errorf("unsupported orphan derived target %q", target)
+		}
 	}
 	seen := make(map[string]struct{}, len(p.GeneratedDirectories))
 	for _, path := range p.GeneratedDirectories {
@@ -176,6 +187,7 @@ type Governor struct {
 	Measure    PhysicalMeasurer
 	Locks      LockProvider
 	RemoveTree RemoveTreeFunc
+	Processes  ProcessInspector
 	Now        func() time.Time
 }
 
@@ -234,6 +246,7 @@ type GovernorReport struct {
 	AvailableDispatchConcurrency int                  `json:"available_dispatch_concurrency"`
 	Worktrees                    []RegisteredWorktree `json:"worktrees"`
 	Orphans                      []OrphanWorktree     `json:"unregistered_orphans,omitempty"`
+	OrphanTargets                []TargetReport       `json:"orphan_targets,omitempty"`
 	Targets                      []TargetReport       `json:"targets"`
 	Foreign                      []ForeignTelemetry   `json:"foreign,omitempty"`
 	Reaped                       int                  `json:"reaped"`
@@ -256,6 +269,7 @@ type OrphanWorktree struct {
 
 type OrphanDerivedTarget struct {
 	Path           string `json:"-"`
+	RelativePath   string `json:"relative_path"`
 	ReportPath     string `json:"report_path"`
 	AllocatedBytes uint64 `json:"allocated_bytes"`
 	Decision       string `json:"decision"`
@@ -321,6 +335,9 @@ func (g *Governor) defaults() {
 	if g.Now == nil {
 		g.Now = time.Now
 	}
+	if g.Processes == nil {
+		g.Processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
+	}
 	if g.Policy.MaxScanEntries <= 0 {
 		g.Policy.MaxScanEntries = 250000
 	}
@@ -364,6 +381,9 @@ func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorR
 	}
 	if options.Apply {
 		if err := g.applyTargets(ctx, &report, limit); err != nil {
+			return report, err
+		}
+		if err := g.applyOrphanTargets(ctx, &report, limit-report.Reaped); err != nil {
 			return report, err
 		}
 	}
@@ -429,11 +449,22 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	for i := range report.Worktrees {
 		report.Worktrees[i].ReportPath = reportPath(g.Policy.RepositoryRoot, report.Worktrees[i].Path)
 	}
-	orphans, orphanErr := g.censusOrphans(ctx, report.Worktrees)
+	orphans, orphanErr := g.censusOrphans(ctx, report.Worktrees, before)
 	if orphanErr != nil {
 		return GovernorReport{}, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
 	}
 	report.Orphans = orphans
+	for _, orphan := range orphans {
+		for _, target := range orphan.DerivedTargets {
+			if target.Decision == string(TargetWouldReap) {
+				report.OrphanTargets = append(report.OrphanTargets, TargetReport{
+					Path: target.Path, ReportPath: target.ReportPath, WorktreePath: orphan.Path,
+					ReportWorktreePath: orphan.ReportPath, RelativePath: target.RelativePath,
+					Decision: TargetWouldReap, Reason: target.Reason,
+				})
+			}
+		}
+	}
 	for _, lane := range lanes {
 		for _, rel := range g.Policy.GeneratedDirectories {
 			target := g.inspectTarget(ctx, lane, rel)
@@ -458,7 +489,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	return report, nil
 }
 
-func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree) ([]OrphanWorktree, error) {
+func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree, before Capacity) ([]OrphanWorktree, error) {
 	if len(g.Policy.OrphanRoots) == 0 {
 		return nil, nil
 	}
@@ -519,13 +550,17 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			}
 			orphan := OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), AllocatedBytes: usage.Bytes, Entries: usage.Entries, AllocationTruncated: usage.Truncated, PreserveReason: "unregistered_worktree_authority_unavailable"}
 			for _, rel := range g.Policy.OrphanDerivedTargets {
-				target := filepath.Join(path, filepath.FromSlash(rel))
-				usage, targetErr := g.Measure.Measure(target, g.Policy.MaxScanEntries)
-				row := OrphanDerivedTarget{Path: target, ReportPath: reportPath(g.Policy.RepositoryRoot, target), Decision: "blocked", Reason: "orphan_claim_ownership_and_handle_proof_unavailable"}
-				if targetErr == nil {
-					row.AllocatedBytes = usage.Bytes
-				} else if !errors.Is(targetErr, os.ErrNotExist) {
-					row.Reason = "orphan_derived_target_evidence_unavailable"
+				target, targetRel, resolveErr := orphanTargetPath(path, rel)
+				row := OrphanDerivedTarget{Path: target, RelativePath: targetRel, ReportPath: reportPath(g.Policy.RepositoryRoot, target), Decision: "blocked", Reason: "orphan_derived_target_evidence_unavailable"}
+				if resolveErr != nil {
+					row.Reason = resolveErr.Error()
+					orphan.DerivedTargets = append(orphan.DerivedTargets, row)
+					continue
+				}
+				usage, eligible, reason := g.orphanTargetProof(ctx, path, target, rel, before)
+				row.AllocatedBytes, row.Decision, row.Reason = usage.Bytes, "blocked", reason
+				if eligible {
+					row.Decision = string(TargetWouldReap)
 				}
 				orphan.DerivedTargets = append(orphan.DerivedTargets, row)
 			}
@@ -534,6 +569,138 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
+}
+
+type bootstrapReceiptEvidence struct {
+	Version         int    `json:"version"`
+	ContractDigest  string `json:"contract_digest"`
+	ToolchainDigest string `json:"toolchain_digest"`
+	CacheDir        string `json:"cache_dir"`
+}
+
+func orphanTargetPath(orphan, policyTarget string) (string, string, error) {
+	switch policyTarget {
+	case "graph.db":
+		return filepath.Join(orphan, "graph.db"), "graph.db", nil
+	case "bootstrap-go-mod":
+		data, err := os.ReadFile(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json"))
+		if err != nil {
+			return "", "", errors.New("bootstrap_receipt_unavailable")
+		}
+		var receipt bootstrapReceiptEvidence
+		if err := json.Unmarshal(data, &receipt); err != nil || receipt.Version != 1 || receipt.ContractDigest == "" || len(receipt.ToolchainDigest) != 64 || receipt.CacheDir == "" {
+			return "", "", errors.New("bootstrap_receipt_invalid")
+		}
+		wantPrefix := filepath.ToSlash(filepath.Join(".herd", "bootstrap", "cache")) + "/"
+		cache := filepath.ToSlash(filepath.Clean(receipt.CacheDir))
+		if !strings.HasPrefix(cache, wantPrefix) || strings.Count(strings.TrimPrefix(cache, wantPrefix), "/") != 0 {
+			return "", "", errors.New("bootstrap_cache_receipt_path_invalid")
+		}
+		return filepath.Join(orphan, filepath.FromSlash(cache), "go-mod"), filepath.ToSlash(filepath.Join(cache, "go-mod")), nil
+	default:
+		return "", "", errors.New("orphan_derived_target_policy_invalid")
+	}
+}
+
+func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policyTarget string, before Capacity) (PhysicalUsage, bool, string) {
+	expected, _, err := orphanTargetPath(orphan, policyTarget)
+	if err != nil || filepath.Clean(expected) != filepath.Clean(target) {
+		return PhysicalUsage{}, false, "derived_target_authority_changed"
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return PhysicalUsage{}, false, "derived_target_absent"
+	}
+	if err != nil {
+		return PhysicalUsage{}, false, "derived_target_lstat_unavailable"
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return PhysicalUsage{}, false, "derived_target_symlink"
+	}
+	if policyTarget == "bootstrap-go-mod" && !info.IsDir() {
+		return PhysicalUsage{}, false, "bootstrap_cache_not_directory"
+	}
+	if policyTarget == "graph.db" && !info.Mode().IsRegular() {
+		return PhysicalUsage{}, false, "graph_index_not_regular_file"
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	root, rootErr := filepath.EvalSymlinks(orphan)
+	if err != nil || rootErr != nil || !containedPath(root, resolved) {
+		return PhysicalUsage{}, false, "derived_target_realpath_escape"
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uint32(stat.Uid) != uint32(os.Getuid()) {
+		return PhysicalUsage{}, false, "derived_target_foreign_uid"
+	}
+	usage, err := g.Measure.Measure(target, g.Policy.MaxScanEntries)
+	if err != nil || usage.Truncated {
+		return usage, false, "derived_target_allocation_unavailable"
+	}
+	process, err := g.Processes.InUse(ctx, target)
+	if err != nil {
+		return usage, false, "derived_target_process_evidence_unavailable"
+	}
+	if process.CWD || process.OpenFile {
+		return usage, false, "derived_target_active_process"
+	}
+	if g.Policy.OrphanCacheTTL <= 0 {
+		return usage, false, "orphan_cache_ttl_unconfigured"
+	}
+	pressure := before.FreeBytes < g.Policy.PressureBytes+g.Policy.TaskReserveBytes
+	if !pressure && g.Now().Sub(info.ModTime()) < g.Policy.OrphanCacheTTL {
+		return usage, false, "orphan_cache_ttl_not_reached"
+	}
+	return usage, true, "proof_backed_regenerable_cache"
+}
+
+func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorReport, limit int) error {
+	if limit <= 0 || len(report.OrphanTargets) == 0 {
+		return nil
+	}
+	used := uint64(0)
+	for i := range report.OrphanTargets {
+		if report.Reaped >= limit || report.OrphanTargets[i].Decision != TargetWouldReap {
+			continue
+		}
+		if used >= g.Policy.OrphanCacheBudgetBytes {
+			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "orphan_cache_budget_exhausted"
+			continue
+		}
+		orphan := report.OrphanTargets[i].WorktreePath
+		policyTarget := "graph.db"
+		if strings.HasSuffix(report.OrphanTargets[i].RelativePath, "/go-mod") {
+			policyTarget = "bootstrap-go-mod"
+		}
+		usage, eligible, reason := g.orphanTargetProof(ctx, orphan, report.OrphanTargets[i].Path, policyTarget, report.CapacityBefore)
+		if !eligible {
+			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, reason
+			continue
+		}
+		if used > g.Policy.OrphanCacheBudgetBytes-usage.Bytes {
+			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "orphan_cache_budget_exhausted"
+			continue
+		}
+		if err := safeRemoveGeneratedTree(g.Policy.RepositoryRoot, report.OrphanTargets[i].Path, g.RemoveTree); err != nil {
+			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "orphan_cache_remove_failed"
+			return fmt.Errorf("remove exact orphan cache %q: %w", report.OrphanTargets[i].Path, err)
+		}
+		after, err := g.Measure.Measure(report.OrphanTargets[i].Path, g.Policy.MaxScanEntries)
+		if errors.Is(err, os.ErrNotExist) {
+			after = PhysicalUsage{}
+			err = nil
+		}
+		if err != nil {
+			return fmt.Errorf("orphan cache post-reap readback: %w", err)
+		}
+		report.OrphanTargets[i].Decision = TargetReaped
+		report.OrphanTargets[i].BeforeBytes, report.OrphanTargets[i].AfterBytes = usage.Bytes, after.Bytes
+		report.Reaped++
+		used += usage.Bytes
+		if usage.Bytes >= after.Bytes {
+			report.ReclaimedBytes += usage.Bytes - after.Bytes
+		}
+	}
+	return nil
 }
 
 func reportPath(root, path string) string {

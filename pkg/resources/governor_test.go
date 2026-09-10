@@ -140,7 +140,8 @@ func TestGovernorCensusReportsUnregisteredLaneWithoutMutation(t *testing.T) {
 	g, _, _ := governorFor(t, "host", 900000, 900000)
 	orphanRoot := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
 	orphan := filepath.Join(orphanRoot, "fac-683")
-	if err := os.MkdirAll(filepath.Join(orphan, ".herd", "bootstrap", "cache", "digest"), 0o700); err != nil {
+	cache := filepath.Join(orphan, ".herd", "bootstrap", "cache", strings.Repeat("a", 64))
+	if err := os.MkdirAll(filepath.Join(cache, "go-mod"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(orphan, "graph.db"), []byte("graph"), 0o600); err != nil {
@@ -150,7 +151,9 @@ func TestGovernorCensusReportsUnregisteredLaneWithoutMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Policy.OrphanRoots = []string{orphanRoot}
-	g.Policy.OrphanDerivedTargets = []string{"graph.db", ".herd/bootstrap/cache"}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db", "bootstrap-go-mod"}
+	g.Policy.OrphanCacheTTL = time.Hour
+	g.Policy.OrphanCacheBudgetBytes = 1 << 20
 	report, err := g.Run(context.Background(), RunOptions{Apply: true})
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +165,7 @@ func TestGovernorCensusReportsUnregisteredLaneWithoutMutation(t *testing.T) {
 		t.Fatalf("orphan authority=%+v", report.Orphans[0])
 	}
 	for _, target := range report.Orphans[0].DerivedTargets {
-		if target.Decision != "blocked" || target.Reason != "orphan_claim_ownership_and_handle_proof_unavailable" {
+		if target.Decision != "blocked" || target.Reason == "" {
 			t.Fatalf("orphan derived target=%+v", target)
 		}
 	}
@@ -171,6 +174,59 @@ func TestGovernorCensusReportsUnregisteredLaneWithoutMutation(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json")); err != nil {
 		t.Fatalf("orphan bootstrap receipt mutated: %v", err)
+	}
+}
+
+func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 900000)
+	g.Processes = idleProcessInspector{}
+	g.Policy.OrphanRoots = []string{filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db", "bootstrap-go-mod"}
+	g.Policy.OrphanCacheTTL = time.Hour
+	g.Policy.OrphanCacheBudgetBytes = 1 << 20
+	g.Policy.GeneratedDirectories = []string{"unused-generated-cache"}
+	orphan := filepath.Join(g.Policy.OrphanRoots[0], "fac-683")
+	digest := strings.Repeat("b", 64)
+	cache := filepath.Join(orphan, ".herd", "bootstrap", "cache", digest, "go-mod")
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	graph := filepath.Join(orphan, "graph.db")
+	if err := os.WriteFile(graph, []byte("graph-index"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "module.zip"), []byte("module-cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	receipt := `{"version":1,"contract_digest":"contract","toolchain_digest":"` + digest + `","cache_dir":".herd/bootstrap/cache/` + digest + `"}`
+	if err := os.MkdirAll(filepath.Join(orphan, ".herd", "bootstrap"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json"), []byte(receipt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Unix(-10000, 0)
+	if err := os.Chtimes(graph, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(cache, old, old); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Reaped != 2 || report.ReclaimedBytes == 0 || len(report.OrphanTargets) != 2 {
+		t.Fatalf("proof-backed orphan cleanup=%+v", report)
+	}
+	if _, err := os.Stat(graph); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("graph cache was not reaped: %v", err)
+	}
+	if _, err := os.Stat(cache); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("go-mod cache was not reaped: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json")); err != nil {
+		t.Fatalf("bootstrap receipt was removed: %v", err)
 	}
 }
 

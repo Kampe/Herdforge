@@ -22,7 +22,9 @@ func TestResourceGovernorValidate(t *testing.T) {
 		t.Fatalf("valid policy: %v", err)
 	}
 	orphans := validResourceGovernor()
-	orphans.OrphanDerivedTargets = []string{"graph.db", ".herd/bootstrap/cache"}
+	orphans.OrphanDerivedTargets = []string{"graph.db", "bootstrap-go-mod"}
+	orphans.OrphanCacheTTL = "1h"
+	orphans.OrphanCacheBudgetBytes = 1024
 	if err := orphans.Validate(); err != nil {
 		t.Fatalf("supported orphan derived targets rejected: %v", err)
 	}

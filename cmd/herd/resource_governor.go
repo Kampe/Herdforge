@@ -49,6 +49,10 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 	if err != nil {
 		return nil, err
 	}
+	orphanTTL, err := cfg.ResourceGovernor.OrphanCacheDuration()
+	if err != nil {
+		return nil, err
+	}
 	lockIdentity := sha256.Sum256([]byte(host + "\x00" + capacity.FilesystemID))
 	base := strings.TrimSpace(cfg.Project.DefaultBranch)
 	if base == "" {
@@ -56,11 +60,13 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 	}
 	policy := resources.GovernorPolicy{
 		HostID: host, RepositoryID: repoID, RepositoryRoot: resolved, BaseRef: "origin/" + base,
-		LockPath:             filepath.Join(stateDir(), "resource-governor", fmt.Sprintf("%x.lock", lockIdentity[:12])),
-		GeneratedDirectories: append([]string(nil), cfg.ResourceGovernor.GeneratedDirectories...),
-		OrphanRoots:          []string{filepath.Join(resolved, ".herd", "worktrees")},
-		OrphanDerivedTargets: append([]string(nil), cfg.ResourceGovernor.OrphanDerivedTargets...),
-		PressureBytes:        cfg.ResourceGovernor.PressureBytes, RecoveryBytes: cfg.ResourceGovernor.RecoveryBytes,
+		LockPath:               filepath.Join(stateDir(), "resource-governor", fmt.Sprintf("%x.lock", lockIdentity[:12])),
+		GeneratedDirectories:   append([]string(nil), cfg.ResourceGovernor.GeneratedDirectories...),
+		OrphanRoots:            []string{filepath.Join(resolved, ".herd", "worktrees")},
+		OrphanDerivedTargets:   append([]string(nil), cfg.ResourceGovernor.OrphanDerivedTargets...),
+		OrphanCacheTTL:         orphanTTL,
+		OrphanCacheBudgetBytes: cfg.ResourceGovernor.OrphanCacheBudgetBytes,
+		PressureBytes:          cfg.ResourceGovernor.PressureBytes, RecoveryBytes: cfg.ResourceGovernor.RecoveryBytes,
 		TaskReserveBytes:       cfg.ResourceGovernor.TaskReserveBytes,
 		MaxDispatchConcurrency: cfg.ResourceGovernor.MaxDispatchConcurrency,
 		ReapBatchLimit:         cfg.ResourceGovernor.ReapBatchLimit, MaxScanEntries: 250000,

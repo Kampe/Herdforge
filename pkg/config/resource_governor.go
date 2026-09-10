@@ -16,6 +16,8 @@ type ResourceGovernor struct {
 	Version                string   `yaml:"version,omitempty"`
 	GeneratedDirectories   []string `yaml:"generated_directories,omitempty"`
 	OrphanDerivedTargets   []string `yaml:"orphan_derived_targets,omitempty"`
+	OrphanCacheTTL         string   `yaml:"orphan_cache_ttl,omitempty"`
+	OrphanCacheBudgetBytes uint64   `yaml:"orphan_cache_budget_bytes,omitempty"`
 	PressureBytes          uint64   `yaml:"pressure_bytes,omitempty"`
 	RecoveryBytes          uint64   `yaml:"recovery_bytes,omitempty"`
 	TaskReserveBytes       uint64   `yaml:"task_reserve_bytes,omitempty"`
@@ -47,6 +49,17 @@ func (g ResourceGovernor) Durations() (time.Duration, time.Duration, error) {
 	return timeout, retry, nil
 }
 
+func (g ResourceGovernor) OrphanCacheDuration() (time.Duration, error) {
+	if strings.TrimSpace(g.OrphanCacheTTL) == "" {
+		return 0, nil
+	}
+	ttl, err := time.ParseDuration(strings.TrimSpace(g.OrphanCacheTTL))
+	if err != nil || ttl <= 0 || ttl > 30*24*time.Hour {
+		return 0, fmt.Errorf("resource_governor.orphan_cache_ttl must be a positive duration no greater than 720h")
+	}
+	return ttl, nil
+}
+
 func (g ResourceGovernor) Validate() error {
 	if !g.Enabled() {
 		return nil
@@ -63,13 +76,21 @@ func (g ResourceGovernor) Validate() error {
 		if clean != raw || clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: must be an exact orphan-relative path", i)
 		}
-		if clean != "graph.db" && clean != ".herd/bootstrap/cache" {
+		if clean != "graph.db" && clean != "bootstrap-go-mod" {
 			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: unsupported derived target %q", i, raw)
 		}
 		if _, ok := seenOrphan[clean]; ok {
 			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: duplicate target %q", i, raw)
 		}
 		seenOrphan[clean] = struct{}{}
+	}
+	if len(g.OrphanDerivedTargets) != 0 {
+		if _, err := g.OrphanCacheDuration(); err != nil {
+			return err
+		}
+		if g.OrphanCacheBudgetBytes == 0 {
+			return fmt.Errorf("resource_governor.orphan_cache_budget_bytes must be nonzero when orphan targets are enabled")
+		}
 	}
 	seen := make(map[string]struct{}, len(g.GeneratedDirectories))
 	for i, raw := range g.GeneratedDirectories {
