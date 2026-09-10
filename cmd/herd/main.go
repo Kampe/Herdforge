@@ -4640,6 +4640,10 @@ func runCleanup() {
 	if err == nil {
 		err = reviewErr
 	}
+	sourceReport, sourceErr := runSourceRetirementCleanup(context.Background(), repository, *dryRun)
+	if err == nil {
+		err = sourceErr
+	}
 	stackReport, stackErr := runRepoVerifyReaper(context.Background(), repository, *applyVerifyStacks && !*dryRun)
 	if err == nil {
 		err = stackErr
@@ -4657,6 +4661,7 @@ func runCleanup() {
 			"error_count":       len(res.Attempts) - res.Closed - res.Blocked,
 			"verify_reaper":     stackReport,
 			"review_retirement": reviewReport,
+			"source_retirement": sourceReport,
 		}
 		if err != nil {
 			out["error"] = err.Error()
@@ -4676,6 +4681,9 @@ func runCleanup() {
 			for _, c := range reviewReport.Candidates {
 				fmt.Printf("herd cleanup: would retire review generation=%s tab=%s worktree=%s ref=%s prompt=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.ReviewRef, c.Manifest.PromptArtifact, c.Decision.Reason)
 			}
+			for _, c := range sourceReport.Candidates {
+				fmt.Printf("herd cleanup: would retire source generation=%s tab=%s worktree=%s ref=%s sha=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.TaskRef, c.Manifest.CandidateSHA, c.Decision.Reason)
+			}
 		} else {
 			for _, att := range res.Attempts {
 				switch att.Outcome {
@@ -4694,6 +4702,9 @@ func runCleanup() {
 		}
 		if !res.DryRun && len(reviewReport.Candidates) > 0 {
 			fmt.Printf("herd cleanup: review-retirement retired=%d blocked=%d failed=%d candidates=%d\n", reviewReport.Retired, reviewReport.Blocked, reviewReport.Failed, len(reviewReport.Candidates))
+		}
+		if !res.DryRun && len(sourceReport.Candidates) > 0 {
+			fmt.Printf("herd cleanup: source-retirement retired=%d blocked=%d failed=%d candidates=%d\n", sourceReport.Retired, sourceReport.Blocked, sourceReport.Failed, len(sourceReport.Candidates))
 		}
 		if stackReport.Output != "" {
 			fmt.Printf("herd cleanup: verify reaper: %s\n", stackReport.Output)
@@ -8804,6 +8815,7 @@ type drainActionHooks struct {
 	dryRun                func(context.Context, drainActionEvidence) error
 	harvest               func(context.Context, drainActionEvidence) error
 	retireReviews         func(context.Context) error
+	retireSources         func(context.Context) error
 }
 
 type drainActionResult struct {
@@ -8829,6 +8841,12 @@ func defaultDrainActionHooks() drainActionHooks {
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
 			return errors.New("no compiled harvest authority is configured")
+		},
+		retireReviews: func(context.Context) error {
+			return errors.New("no compiled review retirement authority is configured")
+		},
+		retireSources: func(context.Context) error {
+			return errors.New("no compiled source retirement authority is configured")
 		},
 	}
 }
@@ -9004,6 +9022,13 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 	if hooks.retireReviews != nil {
 		if err := hooks.retireReviews(ctx); err != nil {
 			fmt.Fprintf(out, "REFUSED review-retirement: %v\n", err)
+			result.Failed = true
+			result.Refusals++
+		}
+	}
+	if hooks.retireSources != nil {
+		if err := hooks.retireSources(ctx); err != nil {
+			fmt.Fprintf(out, "REFUSED source-retirement: %v\n", err)
 			result.Failed = true
 			result.Refusals++
 		}
