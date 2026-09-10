@@ -1091,8 +1091,8 @@ func runHarvestMerge() {
 	fs.Parse(args)
 
 	if lane == "" || *branch == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--candidate-range <base>..<sha>] [--verdict PASS]")
-		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <branch> --verify-landed --ref <FAC-x> [...]")
+		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <source-branch> --title <t> [--candidate-range <base>..<sha>]")
+		fmt.Fprintln(os.Stderr, "       herd harvest-merge <lane> --branch <source-branch> --verify-landed --ref <FAC-x> [...]")
 		os.Exit(2)
 	}
 
@@ -1121,7 +1121,7 @@ func runHarvestMerge() {
 	}
 
 	if *title == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <branch> --title <t> [--candidate-range <base>..<sha>] [--verdict PASS]")
+		fmt.Fprintln(os.Stderr, "usage: herd harvest-merge <lane> --branch <source-branch> --title <t> [--candidate-range <base>..<sha>]")
 		fmt.Fprintln(os.Stderr, "       (or use --verify-landed to check if a merge landed)")
 		os.Exit(2)
 	}
@@ -1176,20 +1176,24 @@ func runHarvestMerge() {
 		// Telling the operator to pass `--candidate <last_pass_sha>` when
 		// last_pass_sha is empty is a correct refusal that names no remedy,
 		// which stops work exactly as effectively as a wrong one.
-		switch {
-		case report.LastPassSHA == "" && len(report.OffBranchQueued) > 0:
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: %d PASSed candidate(s) exist but NONE is reachable from %s, so none is selectable for this branch.\n",
-				len(report.OffBranchQueued), *branch)
-			fmt.Fprintf(os.Stderr, "  This is not the same as having no verdict: `herd review-ledger readiness %s` can legitimately report ready=true.\n",
-				shortSHA12(report.OffBranchQueued[0]))
-			fmt.Fprintf(os.Stderr, "  Harvest asks a narrower question -- is a reviewed candidate reachable from THIS branch.\n")
-			fmt.Fprintf(os.Stderr, "  Remedy: harvest the exact candidate with --candidate %s, or push a ref that reaches it.\n",
-				report.OffBranchQueued[0])
-		case report.LastPassSHA == "":
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: no PASSed candidate is queued for %s at all; this branch needs a review, not a different flag\n", *branch)
-		default:
-			fmt.Fprintf(os.Stderr, "herd harvest-merge: branch tip %s has drifted past the reviewed candidate; harvest it exactly with --candidate %s, or obtain a new PASS at the tip\n",
-				shortSHA12(report.Tip), report.LastPassSHA)
+		if refusal := harvestCandidateRefusalReason(report, *candidate); refusal != "" {
+			fmt.Fprintln(os.Stderr, refusal)
+		} else {
+			switch {
+			case report.LastPassSHA == "" && len(report.OffBranchQueued) > 0:
+				fmt.Fprintf(os.Stderr, "herd harvest-merge: %d PASSed candidate(s) exist but NONE is reachable from %s, so none is selectable for this branch.\n",
+					len(report.OffBranchQueued), *branch)
+				fmt.Fprintf(os.Stderr, "  This is not the same as having no verdict: `herd review-ledger readiness %s` can legitimately report ready=true.\n",
+					shortSHA12(report.OffBranchQueued[0]))
+				fmt.Fprintf(os.Stderr, "  Harvest asks a narrower question -- is a reviewed candidate reachable from THIS branch.\n")
+				fmt.Fprintf(os.Stderr, "  Remedy: harvest the exact candidate with --candidate %s, or push a ref that reaches it.\n",
+					report.OffBranchQueued[0])
+			case report.LastPassSHA == "":
+				fmt.Fprintf(os.Stderr, "herd harvest-merge: no PASSed candidate is queued for %s at all; this branch needs a review, not a different flag\n", *branch)
+			default:
+				fmt.Fprintf(os.Stderr, "herd harvest-merge: branch tip %s has drifted past the reviewed candidate; harvest it exactly with --candidate %s, or obtain a new PASS at the tip\n",
+					shortSHA12(report.Tip), report.LastPassSHA)
+			}
 		}
 		os.Exit(1)
 	}
@@ -1379,6 +1383,28 @@ type harvestCandidateReport struct {
 	Eligible         bool
 	ReconstructedSHA string
 	Retired          bool
+	// EligibilityReason is the exact readiness reason for an explicitly pinned
+	// candidate that was not present in the strict harvest queue.
+	EligibilityReason string
+	// ProvenanceUnrecorded distinguishes a real reduced-provenance refusal from
+	// branch drift. It is set only from the canonical ledger readiness result.
+	ProvenanceUnrecorded bool
+}
+
+func harvestCandidateRefusalReason(report harvestCandidateReport, requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return ""
+	}
+	if report.ProvenanceUnrecorded {
+		return fmt.Sprintf("herd harvest-merge: exact candidate %s is refused because builder provenance is unrecorded; no drift is being inferred.\n"+
+			"  The review remains preserved. Use --allow-unrecorded-provenance explicitly for THIS candidate, or record builder provenance; that option does not claim cross-family independence.",
+			shortSHA12(requested))
+	}
+	if report.EligibilityReason != "" {
+		return fmt.Sprintf("herd harvest-merge: exact candidate %s is not eligible: %s", shortSHA12(requested), report.EligibilityReason)
+	}
+	return ""
 }
 
 // resolveHarvestCandidate keeps a moving standing branch from silently
@@ -1544,6 +1570,15 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 
 	_, found := queuedBySHA[sha]
 	if !found {
+		// The strict queue intentionally excludes unrecorded builder provenance.
+		// Consult the same canonical readiness projection so an explicit candidate
+		// is refused with its actual cause instead of being mislabeled as drift.
+		readiness, readinessErr := ledger.MergeReadinessFor(sha)
+		if readinessErr != nil {
+			return harvestCandidateReport{}, fmt.Errorf("review ledger refuses %s: %w", shortSHA12(sha), readinessErr)
+		}
+		report.EligibilityReason = readiness.Reason
+		report.ProvenanceUnrecorded = readiness.OperatorDecidable && readiness.ProvenanceUnrecorded > 0
 		return report, nil
 	}
 	gate := ledger.Eligible

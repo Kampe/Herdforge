@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // --- ResolveCanonicalRoot ----------------------------------------------
@@ -40,6 +42,9 @@ func TestResolveCanonicalRoot_FromInsideLinkedWorktree(t *testing.T) {
 	tmpDir := t.TempDir()
 	initRepo(t, tmpDir)
 	wm := NewWorktreeManager(tmpDir)
+	wm.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	wi, err := wm.CreateTaskWorktree(context.Background(), "FAC-64")
 	if err != nil {
 		t.Fatalf("create source worktree: %v", err)
@@ -194,6 +199,9 @@ func TestCreateTaskWorktreeFrom_RejectsPackageRelativeRepoRoot(t *testing.T) {
 	tmpDir := t.TempDir()
 	initRepo(t, tmpDir)
 	rootWM := NewWorktreeManager(tmpDir)
+	rootWM.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	source, err := rootWM.CreateTaskWorktree(context.Background(), "FAC-64")
 	if err != nil {
 		t.Fatalf("create source worktree: %v", err)
@@ -214,6 +222,9 @@ func TestCreateTaskWorktreeFrom_RejectsPackageRelativeRepoRoot(t *testing.T) {
 	misrooted := &WorktreeManager{
 		RepoRoot:    misrootedRoot,
 		WorktreeDir: filepath.Join(misrootedRoot, ".herd", "worktrees"),
+		DiskAdmission: resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+			return resources.DiskDecision{Allowed: true}
+		}),
 	}
 
 	_, err = misrooted.CreateTaskWorktreeFrom(context.Background(), "FAC-1", "main")
@@ -249,6 +260,9 @@ func TestDetectNestedLanes_FindsRegisteredNestedWorktree(t *testing.T) {
 	tmpDir := t.TempDir()
 	initRepo(t, tmpDir)
 	rootWM := NewWorktreeManager(tmpDir)
+	rootWM.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	source, err := rootWM.CreateTaskWorktree(context.Background(), "FAC-64")
 	if err != nil {
 		t.Fatalf("create source worktree: %v", err)
@@ -313,6 +327,9 @@ func TestDetectNestedLanes_NoFalsePositiveOnNormalPool(t *testing.T) {
 	tmpDir := t.TempDir()
 	initRepo(t, tmpDir)
 	rootWM := NewWorktreeManager(tmpDir)
+	rootWM.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	a, err := rootWM.CreateTaskWorktree(context.Background(), "FAC-1")
 	if err != nil {
 		t.Fatal(err)

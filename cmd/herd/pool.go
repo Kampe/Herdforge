@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -15,7 +16,7 @@ import (
 // coordinator owns lease IDs; workers only receive the leased path.
 func runPool() {
 	fs := flag.NewFlagSet("pool", flag.ContinueOnError)
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	root := canonicalRepoRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
 	size := fs.Int("size", 2, "number of warm worktrees")
 	// FAC-577: this flag is the POOL DIRECTORY, but it was named --root, which
 	// reads as "repository root". A caller passing `--root .` pointed the pool
@@ -32,6 +33,7 @@ func runPool() {
 	poolDefault := filepath.Join(root, ".herd", "pool")
 	poolRoot := fs.String("pool-root", poolDefault, "pool DIRECTORY (not the repository root)")
 	poolRootAlias := fs.String("root", "", "alias for --pool-root (pool directory, not the repository root)")
+	dryRun := fs.Bool("dry-run", false, "gc only: report what would be removed and why, without deleting anything")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		fmt.Fprintf(os.Stderr, "herd pool: %v\n", err)
 		os.Exit(2)
@@ -54,6 +56,22 @@ func runPool() {
 		os.Exit(2)
 	}
 	p := worktree.NewPool(root, resolvedPool, *size)
+	// The direct `herd pool gc` path enforces the SAME retirement-evidence
+	// authority the idle-discovery reclaim path uses: the fence lives in the
+	// destructive primitive, which refuses a nil authority outright, so this
+	// command can never bypass evidence protection by being invoked directly.
+	// Two positive evidence paths with deliberate precedence, each
+	// fail-closed on absence: a pool root the review-retirement manifest
+	// names gets the manifest's verdict as final (active/unconfirmed
+	// protects, completed authorizes); pools the manifest never names fall
+	// through to the native pool-creation state (schema-valid pool.json
+	// bound to real registrations in this repository). Unknown, foreign, or
+	// corrupt pool roots retain.
+	gcAuthority := worktree.NewManifestFirstRetirementAuthority(
+		worktree.NewManifestRetirementAuthority(root,
+			herdr.ReviewRetirementRegistryPath(root), reviewRetirementPhaseJournalPath(root)),
+		worktree.NewNativePoolCreationAuthority(root),
+	)
 	ctx := context.Background()
 	switch fs.Arg(0) {
 	case "ensure":
@@ -82,8 +100,35 @@ func runPool() {
 			os.Exit(1)
 		}
 	case "gc":
-		if err := p.GC(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "herd pool gc: %v\n", err)
+		if *dryRun {
+			decisions, err := p.GCPlan(ctx, gcAuthority)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "herd pool gc --dry-run: %v\n", err)
+				os.Exit(1)
+			}
+			for _, d := range decisions {
+				if d.Refused {
+					fmt.Printf("RETAIN\t%s\t%s\t%s\n", d.Slot, d.Path, d.Reason)
+					continue
+				}
+				fmt.Printf("REMOVE\t%s\t%s\n", d.Slot, d.Path)
+			}
+			return
+		}
+		reports, gcErr := p.GC(ctx, gcAuthority)
+		for _, r := range reports {
+			if r.Removed {
+				fmt.Printf("RECLAIMED\t%s\t%d\n", r.Slot, r.ReclaimedBytes)
+				continue
+			}
+			if r.ParkedAt != "" {
+				fmt.Printf("PENDING\t%s\t%d\t%s\n", r.Slot, r.ReclaimedBytes, r.ParkedAt)
+				continue
+			}
+			fmt.Printf("RETAINED\t%s\t%d\t%s\n", r.Slot, r.ReclaimedBytes, r.Reason)
+		}
+		if gcErr != nil {
+			fmt.Fprintf(os.Stderr, "herd pool gc: %v\n", gcErr)
 			os.Exit(1)
 		}
 	case "list":

@@ -31,6 +31,17 @@ func TestHarvestMergeHelpNamesRealFlags(t *testing.T) {
 	if !strings.Contains(help, "NOT") || !strings.Contains(help, "--candidate-sha") {
 		t.Fatal("help must explicitly correct the invented --candidate-sha name")
 	}
+	for _, required := range []string{
+		"<lane>", "--branch <source-branch>", "--title <title>",
+		"--verdict <FAIL|BLOCKED>", "PASS is rejected", "--allow-unrecorded-provenance",
+	} {
+		if !strings.Contains(help, required) {
+			t.Fatalf("harvest-merge help must explain %s; got %q", required, help)
+		}
+	}
+	if strings.Contains(help, "[--verdict PASS]") {
+		t.Fatal("harvest-merge help must not recommend the veto-only --verdict PASS")
+	}
 }
 
 // A one-line help entry for a command with many flags is the shape that caused
