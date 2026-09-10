@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -962,6 +963,19 @@ func hookReceiptKey(req Request, code harness.HookCode, name string) string {
 	return fmt.Sprintf("hook|%s|%d|%s|%s|%s|%s|%s", req.TaskRef, req.LeaseGeneration, req.HookPolicyRevision, DecisionDigest(req.Decision), name, string(code), req.Scope)
 }
 
+// attemptIdentity distinguishes one launch attempt from another for receipt
+// keys that must not silently collapse two genuinely separate blocked
+// launches (FAC-624 defect 3), while an idempotent retry of the SAME attempt
+// still dedupes as before. Wall-clock time cannot do this: two distinct
+// attempts can land in the same bucket, and one retried attempt can straddle
+// a bucket boundary. A process's own PID is a real, already-existing identity
+// for "this attempt" -- `herd up`/`herd standing` are each a fresh process
+// per invocation, stable for that invocation's lifetime and distinct across
+// separate ones -- not an invented or random receipt ID. Overridden in tests.
+var attemptIdentity = func() string {
+	return strconv.Itoa(os.Getpid())
+}
+
 func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {
 	role, shape, provider, model, effort, digest, argv := fields(req)
 	fd, fa, ff, fs := fleetReceiptFields(req)
@@ -982,9 +996,11 @@ func recordHookFailure(req Request, sink Sink, code harness.HookCode, name strin
 		// historical hit permanently silences every later refusal that
 		// happens to share task/generation/policy-revision/source, which
 		// is exactly how the operator's blocked launches left no receipt
-		// to inspect. Bucket by minute: a noisy retry burst still
-		// collapses, but a new occurrence in a later cycle is recorded.
-		key = fmt.Sprintf("%s|%s", key, time.Now().UTC().Format("200601021504"))
+		// to inspect. Bind to the actual attempt instead of wall-clock
+		// time: two distinct attempts landing in the same instant must
+		// each be observable, while retrying the SAME attempt must still
+		// dedupe (attemptIdentity is stable for one process invocation).
+		key = fmt.Sprintf("%s|%s", key, attemptIdentity())
 	}
 	receipt.ReceiptKey = key
 	if _, err := writeOnce(sink, receipt); err != nil {

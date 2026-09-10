@@ -649,6 +649,14 @@ func TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook(t *testing.T) {
 	}
 }
 
+// withAttemptIdentity fakes attemptIdentity for one test, restored after.
+func withAttemptIdentity(t *testing.T, id string) {
+	t.Helper()
+	previous := attemptIdentity
+	attemptIdentity = func() string { return id }
+	t.Cleanup(func() { attemptIdentity = previous })
+}
+
 // TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated is FAC-624 defect 3:
 // WriteOnce dedupes a ReceiptKey against the sink's entire history forever.
 // That is correct for a stable misconfiguration (a genuinely missing/stale
@@ -657,6 +665,7 @@ func TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook(t *testing.T) {
 // later occurrence would be silently swallowed -- exactly how the operator's
 // blocked launches left no receipt to inspect.
 func TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated(t *testing.T) {
+	withAttemptIdentity(t, "attempt-fresh")
 	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
 	// preflightHooks sets req.HookPolicyRevision from the discovery result's
 	// PolicyRevision, which emptyPolicySetRequest leaves at its zero value.
@@ -675,7 +684,55 @@ func TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated(t *testing.T) {
 		t.Fatalf("fresh occurrence reused the exact stale key instead of a per-occurrence one: %q", fresh.ReceiptKey)
 	}
 	if !strings.HasPrefix(fresh.ReceiptKey, staleKey+"|") {
-		t.Fatalf("fresh key %q is not the stale classification key plus a time bucket (%q)", fresh.ReceiptKey, staleKey)
+		t.Fatalf("fresh key %q is not the stale classification key plus an attempt identity (%q)", fresh.ReceiptKey, staleKey)
+	}
+}
+
+// TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted is the acceptance
+// criterion "every blocked launch is observable": two GENUINELY separate
+// attempts landing in the same instant (a wall-clock bucket would collapse
+// them) must each get their own receipt. attemptIdentity is faked to two
+// different values to simulate two distinct process invocations without
+// needing a real clock boundary or two real OS processes.
+func TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	sink := &MemorySink{}
+
+	withAttemptIdentity(t, "attempt-A")
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	withAttemptIdentity(t, "attempt-B")
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+
+	if len(sink.Receipts) != 2 {
+		t.Fatalf("two distinct attempts did not each get their own receipt: %+v", sink.Receipts)
+	}
+	if sink.Receipts[0].ReceiptKey == sink.Receipts[1].ReceiptKey {
+		t.Fatalf("two distinct attempts collapsed onto the same receipt key: %q", sink.Receipts[0].ReceiptKey)
+	}
+}
+
+// TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated is the
+// other half of the acceptance criterion: an idempotent retry of the SAME
+// attempt (attemptIdentity unchanged -- e.g. the same process re-running
+// preflight) must not spam a new receipt per retry.
+func TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated(t *testing.T) {
+	withAttemptIdentity(t, "attempt-A")
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	sink := &MemorySink{}
+
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("retrying the same attempt was not deduplicated: %+v", sink.Receipts)
 	}
 }
 
