@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/standing"
 )
 
@@ -86,7 +88,7 @@ func standingHookPolicyFixture(t *testing.T, worktreeRel string) (root, targetDi
 // public-caller regression FAC-624's standing defect needs: it drives
 // runStandingConfigMode end to end through the real provider probe and the
 // real launchAdmission/preflightHooks/harness.DefaultDiscovery chain. If
-// AdmitRoute's worktree scoping (standingHookPolicyScope) is removed, this
+// AdmitRoute's worktree scoping (laneHookPolicyScope) is removed, this
 // test goes RED on the production admission's real refusal -- not on a
 // compile error, and not merely on the extracted helper -- because the
 // canonical (coordinator cwd) pin is deliberately malformed while the lane's
@@ -229,5 +231,36 @@ func TestStandingAdmitRouteAttemptIdentityDistinguishesTwoAttemptsInSameProcess(
 	}
 	if policySetMissing[0].ReceiptKey == policySetMissing[1].ReceiptKey {
 		t.Fatalf("two distinct standing admission attempts in one process collapsed onto the same receipt key: %q", policySetMissing[0].ReceiptKey)
+	}
+}
+
+// TestForgeLaunchAdmissionAttemptIdentityDistinguishesTwoAttemptsInSameProcess
+// is the same public-caller regression as standing's, for forgeLaunchAdmission
+// -- called repeatedly for the same lane over the lifetime of a long-lived
+// `herd forge --loop` coordinator process. Reuses standingClaudeAttemptFixture
+// unchanged: the exact same live-condition reproduction, a different real
+// public entrypoint.
+func TestForgeLaunchAdmissionAttemptIdentityDistinguishesTwoAttemptsInSameProcess(t *testing.T) {
+	root, cfg, lane := standingClaudeAttemptFixture(t)
+	noop := func(*router.LaunchDecision) error { return nil }
+
+	if _, err := forgeLaunchAdmission(cfg, lane, context.Background(), noop); err == nil {
+		t.Fatal("empty policy set must fail closed on the first attempt")
+	}
+	if _, err := forgeLaunchAdmission(cfg, lane, context.Background(), noop); err == nil {
+		t.Fatal("empty policy set must fail closed on the second attempt")
+	}
+
+	var policySetMissing []launch.Receipt
+	for _, r := range readReceipts(t, root) {
+		if r.HookCode == "hook.policy_set_missing" {
+			policySetMissing = append(policySetMissing, r)
+		}
+	}
+	if len(policySetMissing) != 2 {
+		t.Fatalf("two genuinely separate forgeLaunchAdmission attempts in the same process did not each get their own receipt: %+v", policySetMissing)
+	}
+	if policySetMissing[0].ReceiptKey == policySetMissing[1].ReceiptKey {
+		t.Fatalf("two distinct forgeLaunchAdmission attempts in one process collapsed onto the same receipt key: %q", policySetMissing[0].ReceiptKey)
 	}
 }

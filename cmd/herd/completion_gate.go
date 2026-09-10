@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -351,14 +352,18 @@ func worktreeExists(path string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// standingHookPolicyScope is useHarnessHooksFromWorktree applied to a
-// standing lane's own configured worktree (FAC-624). `herd standing` admits
-// through the same launchAdmission -> preflightHooks -> harness.DefaultDiscovery
-// chain `herd up` does, and had the identical gap FAC-767/185679cd fixed for
-// `up`: without this, admission resolves .herd/harness-hooks.json relative to
-// the coordinator's own cwd, so a stale canonical pin can strand a lane whose
-// own target worktree already has a fresh one.
-func standingHookPolicyScope(lane *config.LaneDef) func() {
+// laneHookPolicyScope is useHarnessHooksFromWorktree applied to a lane's own
+// configured worktree (FAC-624). Every launchAdmission caller admits through
+// the same launchAdmission -> preflightHooks -> harness.DefaultDiscovery
+// chain `herd up` had the original gap in (FAC-767/185679cd): without this,
+// admission resolves .herd/harness-hooks.json relative to the coordinator's
+// own cwd, so a stale canonical pin can strand a lane whose own target
+// worktree already has a fresh one. A nil lane (defensive only -- every real
+// caller resolves one first) is a no-op, matching "nothing to scope to."
+func laneHookPolicyScope(lane *config.LaneDef) func() {
+	if lane == nil {
+		return func() {}
+	}
 	return useHarnessHooksFromWorktree(filepath.Join(".", lane.Worktree))
 }
 
@@ -368,20 +373,49 @@ func standingHookPolicyScope(lane *config.LaneDef) func() {
 // the duration of one call the same way useHarnessHooksFromWorktree scopes
 // HERD_HARNESS_HOOKS_FILE via an env var: set by useLaunchAttemptID before
 // the admission call, restored after. Empty by default, so every caller
-// that does not opt in (all but `herd standing`'s AdmitRoute today) sees
-// no behavior change -- launch.Request.AttemptID stays "" and
-// recordHookFailure falls back to its own process-identity default. Not
-// safe for concurrent admissions in the same process; today's callers
-// (herd up, herd standing's AdmitRoute, the ForgeLoop rearm path) all
-// admit sequentially, never concurrently, within one process.
-var currentLaunchAttemptID string
+// that does not opt in sees no behavior change -- launch.Request.AttemptID
+// stays "" and recordHookFailure falls back to its own process-identity
+// default.
+//
+// Concurrency audit (FAC-624): every admission caller that scopes this
+// today -- herd up, standing's AdmitRoute, the recovery/pulse daemon
+// cycle, dispatch, forgeLaunchAdmission -- runs on its own single
+// goroutine per process (grep for `go func` across cmd/herd and
+// pkg/daemon/forgeloop.go turns up nothing on any admission path); none
+// of ForgeLoop's tick, the pulse scheduler's tick, or the daemon cycle
+// fan out admissions concurrently. So this global cannot race TODAY. It
+// is still a global, not a per-attempt value, so it is not a durable
+// guarantee against a future concurrent admission path silently
+// cross-contaminating two attempts' identities -- guarded here with a
+// mutex only so a read/write is never torn, not so two truly concurrent
+// admissions get correctly independent values. If a concurrent admission
+// path is ever introduced, the correct fix is threading launch.Request
+// (or an explicit attemptID parameter) through
+// launchAdmission/validateDecisionBeforeSideEffect instead of relying on
+// this var at all.
+var (
+	currentLaunchAttemptIDMu sync.Mutex
+	currentLaunchAttemptID   string
+)
+
+func readLaunchAttemptID() string {
+	currentLaunchAttemptIDMu.Lock()
+	defer currentLaunchAttemptIDMu.Unlock()
+	return currentLaunchAttemptID
+}
 
 // useLaunchAttemptID scopes one caller-minted attempt identity for the
 // duration of a single admission attempt.
 func useLaunchAttemptID(id string) func() {
+	currentLaunchAttemptIDMu.Lock()
 	previous := currentLaunchAttemptID
 	currentLaunchAttemptID = id
-	return func() { currentLaunchAttemptID = previous }
+	currentLaunchAttemptIDMu.Unlock()
+	return func() {
+		currentLaunchAttemptIDMu.Lock()
+		currentLaunchAttemptID = previous
+		currentLaunchAttemptIDMu.Unlock()
+	}
 }
 
 // useHarnessHooksFromWorktree supplies the repository-declared hook policy

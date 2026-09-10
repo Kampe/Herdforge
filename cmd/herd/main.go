@@ -1762,6 +1762,15 @@ func runDaemon() {
 		if lane == nil {
 			return fmt.Errorf("no lane configured for role %q", *role)
 		}
+		// FAC-624: this cycle is re-run on every daemon.RunPulseScheduler
+		// tick for the coordinator's entire uptime (herd daemon, default
+		// unbounded), all in one process -- the same shape standing's
+		// AdmitRoute has. Scope hook policy to the lane's own worktree and
+		// mint one attempt identity per cycle, before admission runs.
+		restoreHooks := laneHookPolicyScope(lane)
+		defer restoreHooks()
+		restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
+		defer restoreAttempt()
 		var tp provider.TaskProvider
 		decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
 			var tpErr error
@@ -2044,7 +2053,7 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			// policy pin even though this lane's own target worktree has a
 			// fresh one -- exactly the gap FAC-767/185679cd closed for
 			// `herd up`. lane.Worktree is already known here, before CreateTab.
-			restoreHooks := standingHookPolicyScope(lane)
+			restoreHooks := laneHookPolicyScope(lane)
 			defer restoreHooks()
 			// FAC-624: a bare PID cannot distinguish repeated admission
 			// attempts within one long-lived process -- exactly this
@@ -5468,6 +5477,15 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 			}
 			return nil, nil, fmt.Errorf("dispatch lane %q is not configured for launch", canonicalLane.Name)
 		}
+		// FAC-624: dispatchTicketDecision is called repeatedly by
+		// pulse.go's sweep over the lifetime of a long-lived `herd
+		// daemon`/`herd pulse` process, same shape as standing's
+		// AdmitRoute. Scope hook policy to the lane's own worktree and
+		// mint one attempt identity per dispatch attempt.
+		restoreHooks := laneHookPolicyScope(launchLane)
+		defer restoreHooks()
+		restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
+		defer restoreAttempt()
 		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, launchLane, true, routedLaneDecision(ctx, nil), func(admitted *router.LaunchDecision) error {
 			if err := admitDispatch(); err != nil {
 				return err
@@ -6520,7 +6538,15 @@ func forgeGitOutput(dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// forgeLaunchAdmission is called repeatedly for the same lane over the
+// lifetime of a long-lived `herd forge --loop` coordinator process (FAC-624):
+// scope hook policy to the lane's own worktree and mint one attempt identity
+// per call, exactly as standing's AdmitRoute does.
 func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
+	restoreHooks := laneHookPolicyScope(lane)
+	defer restoreHooks()
+	restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
+	defer restoreAttempt()
 	return launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(ctx, nil), effect)
 }
 
@@ -7064,7 +7090,7 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 	if decision == nil {
 		return fmt.Errorf("missing routed launch decision")
 	}
-	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, AttemptID: currentLaunchAttemptID}, nil)
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, AttemptID: readLaunchAttemptID()}, nil)
 }
 
 // ensureArtifactToolProbe returns a current tool-probe PASS for decision's

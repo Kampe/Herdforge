@@ -984,7 +984,17 @@ func hookReceiptKey(req Request, code harness.HookCode, name string) string {
 // for "this attempt" -- `herd up`/`herd standing` are each a fresh process
 // per invocation, stable for that invocation's lifetime and distinct across
 // separate ones -- not an invented or random receipt ID. Overridden in tests.
+// attemptIdentity is the fallback attempt identity for callers that have not
+// migrated to NewAttemptID/Request.AttemptID. A fresh one-shot process does
+// NOT by itself eliminate PID reuse (a later, unrelated process can be
+// assigned the same PID once this one exits), so this binds
+// mail.ProcessIncarnationID() (PID + process start time + boot id) rather
+// than the bare PID; falling back to the bare PID only if the incarnation
+// identity is unavailable for some reason.
 var attemptIdentity = func() string {
+	if id, err := mail.ProcessIncarnationID(); err == nil && id != "" {
+		return id
+	}
 	return strconv.Itoa(os.Getpid())
 }
 
@@ -1006,11 +1016,7 @@ var attemptCounter int64
 // one long-lived process are still distinguishable from each other.
 func NewAttemptID() string {
 	n := atomic.AddInt64(&attemptCounter, 1)
-	incarnation, err := mail.ProcessIncarnationID()
-	if err != nil || incarnation == "" {
-		incarnation = attemptIdentity()
-	}
-	return fmt.Sprintf("%s-%d", incarnation, n)
+	return fmt.Sprintf("%s-%d", attemptIdentity(), n)
 }
 
 func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {

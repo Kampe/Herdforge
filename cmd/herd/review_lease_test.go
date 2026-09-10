@@ -453,7 +453,7 @@ func TestStandingHookPolicyScopeUsesLaneWorktreePolicy(t *testing.T) {
 	}
 	t.Setenv("HERD_HARNESS_HOOKS_FILE", "")
 	lane := &config.LaneDef{Name: "chain-indexer", Worktree: worktreeRel}
-	restore := standingHookPolicyScope(lane)
+	restore := laneHookPolicyScope(lane)
 	wantRel := filepath.Join(worktreeRel, ".herd", "harness-hooks.json")
 	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != wantRel {
 		t.Fatalf("standing admission did not scope hook policy to the lane's own worktree: got %q want %q", got, wantRel)
@@ -480,7 +480,7 @@ func TestStandingHookPolicyScopePreservesExplicitOverride(t *testing.T) {
 	}
 	t.Setenv("HERD_HARNESS_HOOKS_FILE", "explicit-policy.json")
 	lane := &config.LaneDef{Name: "chain-indexer", Worktree: worktreeRel}
-	restore := standingHookPolicyScope(lane)
+	restore := laneHookPolicyScope(lane)
 	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "explicit-policy.json" {
 		t.Fatalf("standing scoping clobbered an explicit operator override: %q", got)
 	}
