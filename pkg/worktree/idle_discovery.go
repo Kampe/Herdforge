@@ -397,10 +397,7 @@ func manifestProtectedPools(repoRoot, manifestPath, phaseJournalPath string) (pr
 	// evidence belongs to the repository and pool that exist on disk under
 	// this root, not to a current path spelling that a replacement could
 	// have rewritten.
-	rootIdentity := filepath.Clean(repoRoot)
-	if resolved, resolveErr := filepath.EvalSymlinks(rootIdentity); resolveErr == nil {
-		rootIdentity = filepath.Clean(resolved)
-	}
+	rootIdentity := canonicalIdentity(repoRoot)
 	resolvePoolIdentity := func(recorded string) (string, string) {
 		p := strings.TrimSpace(filepath.ToSlash(recorded))
 		if p == "" {
@@ -509,7 +506,22 @@ type ManifestRetirementAuthority struct {
 // caller (production passes herdr.ReviewRetirementRegistryPath and the
 // retirement phase journal path).
 func NewManifestRetirementAuthority(repoRoot, manifestPath, phaseJournalPath string) *ManifestRetirementAuthority {
-	return &ManifestRetirementAuthority{RepoRoot: repoRoot, ManifestPath: manifestPath, PhaseJournalPath: phaseJournalPath}
+	// Canonicalize once: a relative default root (".") must bind evidence
+	// to the actual repository on disk, never to a spelling.
+	canonical := canonicalIdentity(repoRoot)
+	manifestPath = canonicalManifestPath(manifestPath)
+	phaseJournalPath = canonicalManifestPath(phaseJournalPath)
+	return &ManifestRetirementAuthority{RepoRoot: canonical, ManifestPath: manifestPath, PhaseJournalPath: phaseJournalPath}
+}
+
+// canonicalManifestPath makes an evidence file path absolute (anchored at
+// the process cwd, the repository root for every native invocation) with a
+// best-effort symlink resolution. Empty paths stay empty.
+func canonicalManifestPath(p string) string {
+	if strings.TrimSpace(p) == "" {
+		return p
+	}
+	return canonicalIdentity(p)
 }
 
 // AuthorizePoolRoot refuses when the exact pool root is named by unretired
@@ -519,10 +531,7 @@ func NewManifestRetirementAuthority(repoRoot, manifestPath, phaseJournalPath str
 // identity the evidence resolution uses, so path spellings can never dodge
 // the fence.
 func (a *ManifestRetirementAuthority) AuthorizePoolRoot(poolRootAbs string) error {
-	if resolved, err := filepath.EvalSymlinks(poolRootAbs); err == nil {
-		poolRootAbs = resolved
-	}
-	poolRootAbs = filepath.Clean(poolRootAbs)
+	poolRootAbs = canonicalIdentity(poolRootAbs)
 	protected, known, err := manifestProtectedPools(a.RepoRoot, a.ManifestPath, a.PhaseJournalPath)
 	if err != nil {
 		return err
@@ -578,6 +587,10 @@ func runIdlePoolTickLocked(ctx context.Context, cfg IdlePoolDiscoveryConfig, act
 	if now == nil {
 		now = time.Now
 	}
+	// One canonical repository identity for the whole tick: a relative
+	// default root (".") anchors candidate paths, the protection lookup,
+	// and both authority constructions to the actual repository on disk.
+	cfg.RepoRoot = canonicalIdentity(cfg.RepoRoot)
 	start := now()
 	deadline := start.Add(maxElapsed)
 
@@ -732,10 +745,7 @@ func fairOrder(names []string, cursor string) []string {
 // or still active. Precedence composites use it to give the manifest's own
 // verdict final authority for pools it names.
 func (a *ManifestRetirementAuthority) PoolRootKnown(poolRootAbs string) (bool, error) {
-	if resolved, err := filepath.EvalSymlinks(poolRootAbs); err == nil {
-		poolRootAbs = resolved
-	}
-	poolRootAbs = filepath.Clean(poolRootAbs)
+	poolRootAbs = canonicalIdentity(poolRootAbs)
 	_, known, err := manifestProtectedPools(a.RepoRoot, a.ManifestPath, a.PhaseJournalPath)
 	if err != nil {
 		return false, err

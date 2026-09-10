@@ -39,7 +39,7 @@ func (r *policyCapturingRuntime) Open(_ *router.LaunchDecision, _ launch.Request
 	}
 	return &herdr.TabInfo{ID: "wFAKE:t1", Pane: herdr.PaneInfo{ID: "wFAKE:p1"}}, nil
 }
-func (*policyCapturingRuntime) Ready(*herdr.TabInfo) error { return nil }
+func (*policyCapturingRuntime) Ready(*herdr.TabInfo) error                      { return nil }
 func (*policyCapturingRuntime) Start(_, _, _, _ string, _ launch.Request) error { return nil }
 func (*policyCapturingRuntime) Close(string, *herdr.TabInfo) error {
 	return errors.New("unexpected compensation")

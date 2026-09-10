@@ -688,7 +688,7 @@ func TestDrainAdaptersRetireReviews_OriginMainAdvancedPostReleaseProof(t *testin
 		TerminalID: "term-792", SessionID: "session-792",
 		Reviewer: reviewer, ReviewerFamily: "open-weight", ReviewerModel: "litellm/lazer/claude-haiku-4.5",
 		PromptArtifact: promptRel, PromptDigest: reviewack.ArtifactDigest(promptBody),
-		Surface: ".herd/reviews/fac-792",
+		Surface:          ".herd/reviews/fac-792",
 		ManifestArtifact: manifestRel, Generation: "pool-01-1789037282935664000", Nonce: leaseID,
 	})
 	mBodyA, _ := json.Marshal(mA)
@@ -1017,8 +1017,8 @@ func TestDrainExecuteActions_ReviewRetirementClosePhaseFailureWithFakeOperator(t
 		ack := reviewack.Ack{SHA: m.CandidateSHA, Reviewer: m.Reviewer, LaunchIdentity: m.Reviewer, ArtifactDigest: verdict.ArtifactDigest}
 		return herdr.ReviewRetirementEvidence{
 			Manifest: m, Launch: launch, Verdict: herdr.ReviewRetirementVerdict{Row: verdict, Ack: ack},
-			Live: herdr.ReviewRetirementLive{Status: "idle", Focused: &focused, SessionID: m.SessionID},
-			Worktree: herdr.ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch},
+			Live:         herdr.ReviewRetirementLive{Status: "idle", Focused: &focused, SessionID: m.SessionID},
+			Worktree:     herdr.ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch},
 			WorktreeRoot: ".herd/reviews", PromptRoot: ".herd/review/prompts", Repository: m.Repository,
 		}
 	}

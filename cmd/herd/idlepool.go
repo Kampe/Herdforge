@@ -28,7 +28,7 @@ func reviewRetirementPhaseJournalPath(root string) string {
 // uses for one named pool.
 func runIdlePool() {
 	fs := flag.NewFlagSet("idle-pool", flag.ContinueOnError)
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	root := canonicalRepoRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
 	base := fs.String("base", "origin/main", "base ref a pool slot's HEAD must be reachable from to be reclaimed")
 	maxRoots := fs.Int("max-roots", 10, "maximum pool roots to inspect this tick")
 	act := fs.Bool("act", false, "reclaim eligible idle pool roots; default is a dry-run report")
@@ -95,7 +95,7 @@ func idlePoolConfigFor(root, base string, maxRoots int) worktree.IdlePoolDiscove
 // dispatch cycle -- so this call fires on every daemon tick, not only a
 // manually-run `herd pulse --act`.
 func reclaimIdlePoolsOnPulse(ctx context.Context, errOut *os.File) bool {
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	root := canonicalRepoRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
 	cfg := idlePoolConfigFor(root, "origin/main", 5)
 	result, err := worktree.ReclaimIdlePools(ctx, cfg)
 	if err != nil {
@@ -118,4 +118,20 @@ func reclaimIdlePoolsOnPulse(ctx context.Context, errOut *os.File) bool {
 
 func isIdlePoolTickBusy(err error) bool {
 	return errors.Is(err, worktree.ErrIdlePoolTickBusy)
+}
+
+// canonicalRepoRoot resolves the repository root (whatever spelling the
+// caller or the environment supplied, including the "." default) to one
+// absolute, symlink-resolved identity, so pool state, git registrations,
+// and retirement evidence compare under a single identity regardless of the
+// process cwd.
+func canonicalRepoRoot(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = filepath.Clean(root)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	return filepath.Clean(abs)
 }

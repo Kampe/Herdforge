@@ -16,7 +16,7 @@ import (
 // coordinator owns lease IDs; workers only receive the leased path.
 func runPool() {
 	fs := flag.NewFlagSet("pool", flag.ContinueOnError)
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	root := canonicalRepoRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
 	size := fs.Int("size", 2, "number of warm worktrees")
 	// FAC-577: this flag is the POOL DIRECTORY, but it was named --root, which
 	// reads as "repository root". A caller passing `--root .` pointed the pool

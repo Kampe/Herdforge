@@ -295,3 +295,58 @@ func TestRunIdlePool_RealCLIDispatch(t *testing.T) {
 		t.Fatalf("real CLI --act must persist the cursor: %v", err)
 	}
 }
+
+// TestIdlePool_DefaultRelativeRootRealCLI proves the documented default
+// invocation works end to end: from the repository cwd with BOTH
+// HERD_ROOT and HERD_REPO_ROOT unset (the "." default), `herd idle-pool`
+// must find a natively-created pool eligible. The P1 from
+// review-fac-708-916d80890d78: the native authority rejected its own
+// legitimate pool as unregistered because relative pool.json slot paths
+// never met absolute git registration keys under one identity.
+func TestIdlePool_DefaultRelativeRootRealCLI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a real binary; skipped under -short")
+	}
+	bin := filepath.Join(t.TempDir(), "herd-idlepool-default-root-test")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Env = append(os.Environ(), "GOFLAGS=-p=2")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v (%s)", err, out)
+	}
+
+	root := t.TempDir()
+	idlePoolTestInitRepo(t, root)
+	fakeBin := writeFakeCensusBinaries(t, true)
+
+	// Create the pool through the native primitives under the SAME default
+	// relative spelling the CLI would use -- no absolute HERD_ROOT anywhere.
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	pool := worktree.NewPool(".", filepath.Join(".herd", "pool-fac-default"), 1)
+	pool.DefaultBase = "origin/main"
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure with default relative root: %v", err)
+	}
+
+	// Run the real binary from the repo cwd with both env overrides
+	// stripped -- exactly the documented default path.
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	env := []string{
+		"PATH=" + fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+	}
+	cmd := exec.Command(bin, "idle-pool", "--base", "origin/main")
+	cmd.Dir = root
+	cmd.Env = env
+	out, runErr := cmd.CombinedOutput()
+	output := string(out)
+	if runErr != nil || !strings.Contains(output, "eligible\tpool-fac-default") {
+		t.Fatalf("default-root CLI must report its own native pool eligible: err=%v out=%q", runErr, output)
+	}
+}
