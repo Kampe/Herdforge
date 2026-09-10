@@ -1,0 +1,107 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/standing"
+)
+
+// standingHookPolicyFixture drives the real public `herd standing` entrypoint
+// (runStandingConfigMode -> standing.Run -> AdmitRoute -> launchAdmission ->
+// preflightHooks -> harness.DefaultDiscovery), through a real -- not
+// stubbed -- provider probe, so a removed AdmitRoute scoping wiring shows up
+// as an actual production regression rather than passing on a mocked helper.
+func standingHookPolicyFixture(t *testing.T, worktreeRel string) (root, targetDir string, cfg *config.Config, lane *config.LaneDef) {
+	t.Helper()
+	for _, key := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} {
+		t.Setenv(key, os.Getenv(key))
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root = t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		if out, err := gitCmdForTest(root, args...); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "-q", "-b", "wt/hookpolicy-standing")
+	runGit("commit", "-q", "--allow-empty", "-m", "base")
+
+	t.Setenv("HERD_ROOT", root)
+	t.Setenv("HERD_REPO_ROOT", root)
+	t.Chdir(root)
+
+	installProtocolFakeHerdr(t)
+	if out, err := gitCmdForTest(root, "remote", "add", "origin", "https://example.invalid/fixture/standing-hookpolicy.git"); err != nil {
+		t.Fatalf("fixture remote: %v: %s", err, out)
+	}
+	t.Setenv("HERD_WORKSPACE", "wFAKE")
+	t.Setenv("HERDR_WORKSPACE_ID", "wFAKE")
+	t.Setenv("HERD_MODE", "local")
+
+	dir := t.TempDir()
+	// The real (unstubbed) herdr.ProbeProviderModel execs this. grok's probe
+	// delivers the prompt via --prompt-file and only checks stdout, so a fake
+	// that ignores its args and answers the exact probe token is a faithful,
+	// minimal stand-in for a live grok CLI -- no fake AdmitRoute, no stubbed
+	// probe function.
+	if err := os.WriteFile(filepath.Join(dir, "grok"), []byte("#!/bin/sh\nprintf 'PROBE_OK'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pinHealthyQuota(t, dir, "grok")
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	t.Setenv("HERD_ERA_PROVIDERS", "grok")
+
+	promptRel := filepath.Join(".herd", "prompts", "worker.md")
+	if err := os.MkdirAll(filepath.Dir(promptRel), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(promptRel, []byte("prompt\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir = filepath.Join(root, worktreeRel)
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	lane = &config.LaneDef{
+		Name: "chain-indexer", Role: launch.ScoutPlannerRole, AgentKind: "grok", Harness: "grok",
+		Provider: "grok", Model: "grok-4.6", Effort: "medium", TaskShape: "architecture",
+		Standing: true, Worktree: worktreeRel, Prompt: promptRel,
+		Authority: config.AuthorityWrite, Capabilities: []config.Capability{config.CapabilityGitWrite},
+	}
+	cfg = &config.Config{Lanes: []config.LaneDef{*lane}}
+	return root, targetDir, cfg, lane
+}
+
+// TestStandingAdmitRouteUsesFreshTargetWorktreePolicyOverStaleCanonical is the
+// public-caller regression FAC-624's standing defect needs: it drives
+// runStandingConfigMode end to end through the real provider probe and the
+// real launchAdmission/preflightHooks/harness.DefaultDiscovery chain. If
+// AdmitRoute's worktree scoping (standingHookPolicyScope) is removed, this
+// test goes RED on the production admission's real refusal -- not on a
+// compile error, and not merely on the extracted helper -- because the
+// canonical (coordinator cwd) pin is deliberately malformed while the lane's
+// own target worktree pin is genuinely valid.
+func TestStandingAdmitRouteUsesFreshTargetWorktreePolicyOverStaleCanonical(t *testing.T) {
+	root, targetDir, cfg, lane := standingHookPolicyFixture(t, "target-worktree")
+	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".herd", "harness-hooks.json"), []byte("{not valid json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeHookPolicyFile(t, filepath.Join(targetDir, ".herd", "harness-hooks.json"), "fresh-target-marker")
+
+	if err := runStandingConfigMode(cfg, true, standing.ModeDryRun, []string{lane.Name}, true, false); err != nil {
+		t.Fatalf("standing admission refused a launch against its own freshly pinned target policy (used stale/malformed canonical instead): %v", err)
+	}
+}
