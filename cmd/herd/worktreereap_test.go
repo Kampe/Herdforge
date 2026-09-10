@@ -309,6 +309,121 @@ func TestRetireLandedRefusesBranchThatAdvancedAfterClassification(t *testing.T) 
 	}
 }
 
+func TestSelectReapTargetsBoundsToExactRegisteredPaths(t *testing.T) {
+	root := t.TempDir()
+	entries := []worktreeEntry{
+		{Path: filepath.Join(root, "one"), Branch: "landed-one"},
+		{Path: filepath.Join(root, "two"), Branch: "landed-two"},
+	}
+	selected, err := selectReapTargets(root, entries, reapTargets{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].Branch != "landed-one" {
+		t.Fatalf("exact selection escaped its target: %+v", selected)
+	}
+	if _, err := selectReapTargets(root, entries, reapTargets{"missing"}); err == nil {
+		t.Fatal("an unregistered target must fail closed")
+	}
+	if _, err := selectReapTargets(root, entries, reapTargets{"../two"}); err == nil {
+		t.Fatal("a target escaping the repository must fail closed")
+	}
+}
+
+func TestRetireLandedRefusesDirtyWorktreeAfterClassification(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	injected := false
+	run := func(repo string, args ...string) ([]byte, error) {
+		if !injected && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--verify" {
+			injected = true
+			if err := os.WriteFile(filepath.Join(dir, "new-evidence"), []byte("must survive"), 0644); err != nil {
+				t.Fatalf("dirty fixture: %v", err)
+			}
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run)
+	if err == nil || !strings.Contains(err.Error(), "act-time worktree has") {
+		t.Fatalf("dirty-after-plan must refuse before removal, got %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("dirty worktree was removed")
+	}
+}
+
+func TestRetireLandedRefusesLockedWorktreeAfterClassification(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	injected := false
+	run := func(repo string, args ...string) ([]byte, error) {
+		if !injected && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--verify" {
+			injected = true
+			if out, err := runReapGit(repo, "worktree", "lock", dir); err != nil {
+				t.Fatalf("lock fixture: %v: %s", err, out)
+			}
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run)
+	if err == nil || !strings.Contains(err.Error(), "act-time worktree is locked") {
+		t.Fatalf("locked-after-plan must refuse before removal, got %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("locked worktree was removed")
+	}
+}
+
+func TestRetireLandedDoesNotForceOrRetryRemoval(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	removeCalls := 0
+	run := func(repo string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+			removeCalls++
+			if len(args) > 2 && (args[2] == "--force" || args[2] == "--") {
+				t.Fatalf("removal must not be forced: %v", args)
+			}
+			return []byte("synthetic removal refusal"), fmt.Errorf("synthetic removal refusal")
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run)
+	if err == nil || removeCalls != 1 {
+		t.Fatalf("removal failure must be reported after one safe attempt: err=%v calls=%d", err, removeCalls)
+	}
+}
+
 // A path that cannot be removed must be reported as FAILED, never counted as
 // retired. Nothing is worse here than a silent overcount.
 func TestRetireLandedReportsAFailureRatherThanClaimingSuccess(t *testing.T) {
