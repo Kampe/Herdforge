@@ -348,7 +348,14 @@ func TestRetireLandedRefusesDirtyWorktreeAfterClassification(t *testing.T) {
 	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
 	injected := false
 	run := func(repo string, args ...string) ([]byte, error) {
-		if !injected && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--verify" {
+		verify := false
+		for _, arg := range args {
+			if arg == "--verify" {
+				verify = true
+				break
+			}
+		}
+		if !injected && len(args) >= 1 && args[0] == "rev-parse" && verify {
 			injected = true
 			if err := os.WriteFile(filepath.Join(dir, "new-evidence"), []byte("must survive"), 0644); err != nil {
 				t.Fatalf("dirty fixture: %v", err)
@@ -380,7 +387,14 @@ func TestRetireLandedRefusesLockedWorktreeAfterClassification(t *testing.T) {
 	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
 	injected := false
 	run := func(repo string, args ...string) ([]byte, error) {
-		if !injected && len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--verify" {
+		verify := false
+		for _, arg := range args {
+			if arg == "--verify" {
+				verify = true
+				break
+			}
+		}
+		if !injected && len(args) >= 1 && args[0] == "rev-parse" && verify {
 			injected = true
 			if out, err := runReapGit(repo, "worktree", "lock", dir); err != nil {
 				t.Fatalf("lock fixture: %v: %s", err, out)
