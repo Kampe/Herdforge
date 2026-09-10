@@ -110,3 +110,157 @@ func TestVerificationDigestDoesNotTreatAnyColonLineAsEvidence(t *testing.T) {
 		t.Fatalf("an unrelated labelled line must not open a verification section, got %q", got)
 	}
 }
+
+// FAC-795: actual retained FAC-792 review artifacts contain child Markdown
+// headings under `## Tests run` (e.g. `### Non-Vacuity Guard Regression`).
+// The parser must include nested subsections and terminate only at a sibling
+// or ancestor heading.
+func TestVerificationDigestExtractsNestedHeadingsAndSubsections(t *testing.T) {
+	artifact := `sha: abc
+---
+Verdict: PASS
+
+## Findings and risk
+
+1. Independent review confirmed exact candidate identity.
+
+## Tests run
+
+### Non-Vacuity Guard Regression
+- ` + "`go test ./pkg/harness/opencode -run TestConsumption`" + ` — FAIL (RED 1)
+- ` + "`go test ./pkg/harness/opencode -run TestConsumption`" + ` — PASS (GREEN 0)
+
+### Package Tests
+- ` + "`go test ./pkg/harness/...`" + ` — ok
+
+## Author instructions
+
+Replace every placeholder with your own evidence.
+`
+	a := Parse(artifact)
+	ev := a.VerificationEvidence()
+	if !strings.Contains(ev, "Non-Vacuity Guard Regression") {
+		t.Fatalf("nested subsection heading must be included in evidence, got: %q", ev)
+	}
+	if !strings.Contains(ev, "go test ./pkg/harness/opencode") {
+		t.Fatalf("nested command evidence must be included, got: %q", ev)
+	}
+	if !strings.Contains(ev, "Package Tests") {
+		t.Fatalf("second subsection heading must be included, got: %q", ev)
+	}
+	if !strings.Contains(ev, "go test ./pkg/harness/...") {
+		t.Fatalf("second subsection command evidence must be included, got: %q", ev)
+	}
+	if strings.Contains(ev, "Author instructions") || strings.Contains(ev, "Replace every placeholder") {
+		t.Fatalf("sibling heading and following content must not be included in evidence, got: %q", ev)
+	}
+	if a.VerificationDigest() == "" {
+		t.Fatal("nested verification evidence must produce a nonempty digest")
+	}
+}
+
+func TestVerificationDigestTerminatesAtSiblingAndAncestorHeadings(t *testing.T) {
+	// Level 3 verification section: children (level 4) included; sibling (level 3) and ancestor (level 2, 1) terminate.
+	l3 := `sha: abc
+---
+Verdict: PASS
+
+### Verification Evidence
+
+#### Unit Suite
+- ` + "`go test ./pkg/reviewingest`" + ` — PASS
+
+### Rubric
+correctness: 2
+`
+	a := Parse(l3)
+	ev := a.VerificationEvidence()
+	if !strings.Contains(ev, "Unit Suite") || !strings.Contains(ev, "go test ./pkg/reviewingest") {
+		t.Fatalf("level 4 child heading must be included in level 3 section: %q", ev)
+	}
+	if strings.Contains(ev, "Rubric") || strings.Contains(ev, "correctness") {
+		t.Fatalf("level 3 sibling heading must terminate section: %q", ev)
+	}
+
+	// Level 1 verification section: children (level 2) included; sibling (level 1) terminates.
+	l1 := `sha: abc
+---
+Verdict: PASS
+
+# Verification
+
+## Unit Suite
+- ` + "`go test ./pkg/reviewingest`" + ` — PASS
+
+# Residual risk
+none
+`
+	b := Parse(l1)
+	ev1 := b.VerificationEvidence()
+	if !strings.Contains(ev1, "Unit Suite") {
+		t.Fatalf("level 2 child heading must be included in level 1 section: %q", ev1)
+	}
+	if strings.Contains(ev1, "Residual risk") {
+		t.Fatalf("level 1 sibling heading must terminate section: %q", ev1)
+	}
+}
+
+func TestVerificationDigestPreservesCodeFencesWithHeadingLikeLines(t *testing.T) {
+	artifact := `sha: abc
+---
+Verdict: PASS
+
+## Tests run
+
+` + "```bash" + `
+# Comment inside code fence
+go test ./pkg/reviewingest
+### Another comment
+PASS
+` + "```" + `
+
+## Author instructions
+Instructions here.
+`
+	a := Parse(artifact)
+	ev := a.VerificationEvidence()
+	if !strings.Contains(ev, "# Comment inside code fence") {
+		t.Fatalf("code fence comment must not be treated as a section terminator: %q", ev)
+	}
+	if !strings.Contains(ev, "go test ./pkg/reviewingest") {
+		t.Fatalf("command inside code fence must be captured: %q", ev)
+	}
+	if !strings.Contains(ev, "### Another comment") {
+		t.Fatalf("subheading-like line inside code fence must be captured: %q", ev)
+	}
+	if strings.Contains(ev, "Author instructions") {
+		t.Fatalf("sibling heading after code fence must terminate section: %q", ev)
+	}
+	if a.VerificationDigest() == "" {
+		t.Fatal("code fence evidence must produce a nonempty digest")
+	}
+}
+
+func TestVerificationDigestEmptySubsectionsFailClosed(t *testing.T) {
+	artifact := `sha: abc
+---
+Verdict: PASS
+
+## Tests run
+
+### Non-Vacuity Guard Regression
+
+### Full Unit Suite
+
+## Author instructions
+Replace placeholders.
+`
+	a := Parse(artifact)
+	if got := a.VerificationEvidence(); got != "" {
+		t.Fatalf("empty subsections must produce no evidence, got %q", got)
+	}
+	if got := a.VerificationDigest(); got != "" {
+		t.Fatalf("empty subsections must produce no digest, got %q", got)
+	}
+}
+

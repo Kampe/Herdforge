@@ -55,39 +55,97 @@ func (a Artifact) VerificationEvidence() string {
 	lines := strings.Split(a.Body, "\n")
 	var out []string
 	collecting := false
+	openLevel := 0
+	inFence := false
+	fenceMarker := ""
+	hasSubstantive := false
+
 	for _, raw := range lines {
 		line := strings.TrimRight(raw, " \t\r")
-		trimmed := strings.TrimSpace(strings.TrimLeft(line, "#*- "))
-		lower := strings.ToLower(trimmed)
-		if inline, ok := verificationHeadingContent(trimmed); ok {
-			collecting = true
-			// A heading may carry its evidence on the SAME line. 254 of 726 live
-			// artifacts write `Tests run: <command> — <result>` inline, which a
-			// heading-only matcher silently skipped: it reported 259 artifacts as
-			// recording no verification when they had recorded it all along, and
-			// would have left them permanently inadmissible for a formatting
-			// choice rather than a missing check.
-			if inline != "" {
-				out = append(out, strings.Join(strings.Fields(inline), " "))
+		isFence, marker := isFenceLine(line)
+
+		if inFence {
+			if isFence && marker == fenceMarker {
+				inFence = false
+				fenceMarker = ""
+			}
+			if collecting {
+				if strings.TrimSpace(line) == "" {
+					out = append(out, "")
+				} else {
+					out = append(out, strings.Join(strings.Fields(line), " "))
+					hasSubstantive = true
+				}
 			}
 			continue
 		}
-		_ = lower
-		if !collecting {
+
+		if isFence {
+			inFence = true
+			fenceMarker = marker
+			if collecting {
+				out = append(out, strings.Join(strings.Fields(line), " "))
+				hasSubstantive = true
+			}
 			continue
 		}
-		// A new heading ends the section. Indented or bulleted content belongs
-		// to it; a fresh unindented heading-looking line does not.
+
+		trimmed := strings.TrimSpace(strings.TrimLeft(line, "#*- "))
+		lower := strings.ToLower(trimmed)
+
+		if !collecting {
+			if inline, ok := verificationHeadingContent(trimmed); ok {
+				collecting = true
+				openLevel = headingLevel(line)
+				// A heading may carry its evidence on the SAME line. 254 of 726 live
+				// artifacts write `Tests run: <command> — <result>` inline, which a
+				// heading-only matcher silently skipped: it reported 259 artifacts as
+				// recording no verification when they had recorded it all along, and
+				// would have left them permanently inadmissible for a formatting
+				// choice rather than a missing check.
+				if inline != "" {
+					out = append(out, strings.Join(strings.Fields(inline), " "))
+					hasSubstantive = true
+				}
+			}
+			continue
+		}
+
+		// A new heading ends the section if it is a sibling or ancestor heading
+		// (or a recognised section label). Child headings (e.g. ### under ##)
+		// are included within the section.
 		if trimmed == "" {
 			out = append(out, "")
 			continue
 		}
-		if strings.HasPrefix(line, "#") || (isSectionHeading(lower) && !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") && !strings.HasPrefix(raw, "-")) {
+
+		hLevel := headingLevel(line)
+		if hLevel > 0 {
+			if openLevel > 0 && hLevel <= openLevel {
+				collecting = false
+				continue
+			}
+			if openLevel == 0 {
+				collecting = false
+				continue
+			}
+			out = append(out, strings.Join(strings.Fields(line), " "))
+			continue
+		}
+
+		if isSectionHeading(lower) && !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") && !strings.HasPrefix(raw, "-") {
 			collecting = false
 			continue
 		}
+
 		out = append(out, strings.Join(strings.Fields(line), " "))
+		hasSubstantive = true
 	}
+
+	if !hasSubstantive {
+		return ""
+	}
+
 	// Drop blank padding so reflowed whitespace cannot change the digest.
 	var kept []string
 	for _, l := range out {
@@ -96,6 +154,36 @@ func (a Artifact) VerificationEvidence() string {
 		}
 	}
 	return strings.Join(kept, "\n")
+}
+
+// isFenceLine reports whether a line opens or closes a Markdown code fence.
+func isFenceLine(line string) (bool, string) {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "```") {
+		return true, "```"
+	}
+	if strings.HasPrefix(trimmed, "~~~") {
+		return true, "~~~"
+	}
+	return false, ""
+}
+
+// headingLevel reports the Markdown heading depth (count of leading '#')
+// for an unindented or shallow-indented line. Indented code blocks (4+ spaces
+// or tab) return 0.
+func headingLevel(line string) int {
+	if strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "    ") {
+		return 0
+	}
+	s := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(s, "#") {
+		return 0
+	}
+	count := 0
+	for count < len(s) && s[count] == '#' {
+		count++
+	}
+	return count
 }
 
 // verificationHeadingContent reports whether a line opens the verification
@@ -128,6 +216,8 @@ func isSectionHeading(lower string) bool {
 		"verdict", "rubric", "required findings", "optional findings",
 		"acceptance criteria", "merge recommendation", "residual risk",
 		"invariant and adr result", "skills used", "task id", "model family",
+		"author instructions", "findings and risk", "findings",
+		"identity and optional metadata", "delivery and retention",
 	} {
 		if strings.HasPrefix(lower, h) {
 			return true
