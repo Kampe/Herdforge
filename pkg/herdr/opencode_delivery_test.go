@@ -421,7 +421,7 @@ func TestExportOpenCodeSessionFailsClosedOnTruncation(t *testing.T) {
 func TestExportOpenCodeSessionIncludesStderrDiagnosticsOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	cli := filepath.Join(dir, "opencode")
-	script := "#!/bin/sh\necho 'error: session ses_native is corrupt or locked' >&2\nexit 1\n"
+	script := "#!/bin/sh\necho 'error: failed with Bearer secret_token_12345 and sk-proj-abc12345' >&2\nexit 1\n"
 	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -432,8 +432,71 @@ func TestExportOpenCodeSessionIncludesStderrDiagnosticsOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("export must fail on non-zero exit")
 	}
-	if !strings.Contains(err.Error(), "session ses_native is corrupt or locked") {
-		t.Fatalf("export error missing stderr diagnostics: %v", err)
+	if strings.Contains(err.Error(), "secret_token_12345") || strings.Contains(err.Error(), "sk-proj-abc12345") {
+		t.Fatalf("export error exposed credentials: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Bearer [REDACTED]") {
+		t.Fatalf("export error missing expected redacted diagnostic: %v", err)
+	}
+}
+
+func TestSanitizeExportStderr_RedactsCredentialsAndBoundsLength(t *testing.T) {
+	input := "error Bearer secret_api_key_12345 sk-ant-secret12345 " + strings.Repeat("a", 1000)
+	got := sanitizeExportStderr(input)
+	if strings.Contains(got, "secret_api_key_12345") || strings.Contains(got, "sk-ant-secret12345") {
+		t.Fatalf("credentials leaked: %q", got)
+	}
+	if len(got) > 550 {
+		t.Fatalf("length not bounded: %d", len(got))
+	}
+}
+
+func TestOpenCodeConsumptionProof_MultiStepAssistantTurnAccepted(t *testing.T) {
+	now := time.Now().Add(-100 * time.Millisecond)
+	userMsg := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:        "msg_user_1",
+			SessionID: "ses_cold",
+			Role:      "user",
+			Time:      opencodeMessageTime{Created: now.UnixMilli()},
+			Model:     opencodeModel{ModelID: "gpt-5.6-luna", ProviderID: "litellm"},
+		},
+		Parts: []opencodeMessagePart{
+			{Type: "text", Text: nativeOpenCodePacket},
+		},
+	}
+	astMsg1 := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:         "msg_ast_1",
+			SessionID:  "ses_cold",
+			ParentID:   "msg_user_1",
+			Role:       "assistant",
+			Time:       opencodeMessageTime{Created: now.UnixMilli() + 5},
+			ModelID:    "gpt-5.6-luna",
+			ProviderID: "litellm",
+		},
+	}
+	astMsg2 := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:         "msg_ast_2",
+			SessionID:  "ses_cold",
+			ParentID:   "msg_user_1",
+			Role:       "assistant",
+			Time:       opencodeMessageTime{Created: now.UnixMilli() + 20},
+			ModelID:    "gpt-5.6-luna",
+			ProviderID: "litellm",
+		},
+	}
+	after := opencodeExportData{
+		Info: opencodeSessionInfo{
+			ID:    "ses_cold",
+			Model: opencodeModel{ModelID: "gpt-5.6-luna", ProviderID: "litellm"},
+		},
+		Messages: []opencodeMessage{userMsg, astMsg1, astMsg2},
+	}
+	err := openCodeConsumptionProof(opencodeExportData{}, after, "ses_cold", "/work", nativeOpenCodePacket, now.Add(-500*time.Millisecond), true)
+	if err != nil {
+		t.Fatalf("multi-step assistant turn must prove consumption: %v", err)
 	}
 }
 
