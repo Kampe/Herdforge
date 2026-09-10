@@ -119,6 +119,13 @@ func humanDuration(d time.Duration) string {
 
 func classPace(used float64, windowSeconds int, resetsAt string, exhaustedPct float64, now time.Time) (BurnClass, int, float64) {
 	rin := resetsIn(resetsAt, now)
+	// A provider may truthfully report a fully consumed meter without exposing
+	// its reset instant (Ollama is one such authority). That is still explicit
+	// exhaustion and must refuse routing; only non-exhausted reset-less usage is
+	// untracked because its pacing cannot be established.
+	if rin == nil && used >= exhaustedPct {
+		return BurnExhausted, 100, math.Max(used, 125.0)
+	}
 	if rin == nil || windowSeconds == 0 {
 		return BurnUntracked, 100, math.Max(used, 50.0)
 	}

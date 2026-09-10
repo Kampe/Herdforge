@@ -162,3 +162,24 @@ func TestOllamaCloudBearerPollRejectsUnsafeResponses(t *testing.T) {
 		t.Fatal("redirect response must be rejected")
 	}
 }
+
+func TestOllamaCloudExhaustionPreservesMissingResetAndRefuses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"limits":{"session":{"usage":1.0},"weekly":{"usage":1.0}}}`))
+	}))
+	defer server.Close()
+	got, err := ollamaCloudBearerPollWithURL(server.URL+"/api/usage", "bearer-fixture", time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"session", "weekly"} {
+		resource := got.Resources[name]
+		if resource.Used != 100 || resource.Remaining != 0 || resource.ResetsAt != "" || resource.State != "active" {
+			t.Fatalf("exhausted Ollama resource %s was not represented faithfully: %+v", name, resource)
+		}
+	}
+	binding := computeBinding(got, nil, DefaultExhaustedPct, time.Now())
+	if binding == nil || binding.Class != BurnExhausted {
+		t.Fatalf("exhausted Ollama quota was not refused by burn state: %+v", binding)
+	}
+}
