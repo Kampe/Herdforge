@@ -75,13 +75,16 @@ func TestNativeSourceRetirementPositiveEndToEndPreservingSourceAndBranch(t *test
 	}
 	candidateSHA := strings.TrimSpace(string(candidateSHABytes))
 
+	agentName := "forge-mender-fac794-gem-6774ef2d"
+	sessionID := "session-uuid-1234"
+
 	// Write report artifact
 	reportRel := ".herd/reports/fac-794.md"
 	reportPath := filepath.Join(root, reportRel)
 	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reportData := []byte("## Report for FAC-794\nCandidate: " + candidateSHA + "\nStatus: READY\n")
+	reportData := []byte("## Report for FAC-794\nTask: FAC-794\nAgent: " + agentName + "\nCandidate: " + candidateSHA + "\nStatus: READY\n")
 	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +97,6 @@ func TestNativeSourceRetirementPositiveEndToEndPreservingSourceAndBranch(t *test
 	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	agentName := "forge-mender-fac794-gem-6774ef2d"
-	sessionID := "session-uuid-1234"
 	launchReceipt := launch.Receipt{
 		Accepted:     true,
 		TaskRef:      "FAC-794",
@@ -106,6 +107,8 @@ func TestNativeSourceRetirementPositiveEndToEndPreservingSourceAndBranch(t *test
 		CandidateSHA: candidateSHA,
 		PaneID:       "wK:p17G",
 		TabID:        "wK:t17G",
+		HerdrSession: sessionID,
+		Repository:   "fixture-repo",
 	}
 	launchBytes, _ := json.Marshal(launchReceipt)
 	if err := os.WriteFile(launchReceiptsPath, append(launchBytes, '\n'), 0o600); err != nil {
@@ -257,6 +260,8 @@ func TestNativeSourceRetirementBlocksDirtyOrDriftedWorktree(t *testing.T) {
 		CandidateSHA: baseSHA,
 		PaneID:       "wK:p17G",
 		TabID:        "wK:t17G",
+		HerdrSession: "session-1",
+		Repository:   "fixture-repo",
 	}
 	launchBytes, _ := json.Marshal(launchReceipt)
 	if err := os.WriteFile(launchReceiptsPath, append(launchBytes, '\n'), 0o600); err != nil {
@@ -349,6 +354,8 @@ func TestNativeSourceRetirementBlocksActiveDescendantProcesses(t *testing.T) {
 		CandidateSHA: baseSHA,
 		PaneID:       "wK:p17G",
 		TabID:        "wK:t17G",
+		HerdrSession: "session-1",
+		Repository:   "fixture-repo",
 	}
 	launchBytes, _ := json.Marshal(launchReceipt)
 	if err := os.WriteFile(launchReceiptsPath, append(launchBytes, '\n'), 0o600); err != nil {
@@ -396,5 +403,122 @@ func TestNativeSourceRetirementBlocksActiveDescendantProcesses(t *testing.T) {
 	d := EvaluateSourceRetirement(evidence)
 	if d.Eligible || !strings.Contains(d.Reason, "active processes") {
 		t.Fatalf("expected active processes refusal, got: %+v", d)
+	}
+}
+
+func TestNativeSourceRetirementBlocksNonSourceRoleAndAmbiguousReceipts(t *testing.T) {
+	root := t.TempDir()
+	launchReceiptsPath := filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Reviewer role receipt must be refused
+	rReviewer := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "reviewer",
+		Name:         "forge-reviewer-1",
+		Branch:       "recovery/fac-794",
+		Worktree:     ".worktrees/reviewer-fac794",
+		CandidateSHA: strings.Repeat("a", 40),
+		PaneID:       "wK:p1",
+		TabID:        "wK:t1",
+		HerdrSession: "session-1",
+		Repository:   "fixture-repo",
+	}
+	b, _ := json.Marshal(rReviewer)
+	if err := os.WriteFile(launchReceiptsPath, append(b, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	op := &NativeSourceRetirementOp{Root: root, RepositoryIdentity: "fixture-repo"}
+	m := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+		Repository: "fixture-repo", TaskRef: "FAC-794", TaskID: "task-794",
+		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("a", 40), Branch: "recovery/fac-794",
+		Worktree: ".worktrees/reviewer-fac794", Workspace: "wK", TabID: "wK:t1", PaneID: "wK:p1", TerminalID: "term-1",
+		SessionID: "session-1", AgentName: "forge-reviewer-1", Role: "reviewer",
+		ReportArtifact: ".herd/reports/fac-794.md", ReportDigest: strings.Repeat("d", 64), Generation: "gen-rev", Nonce: "nonce-1",
+	})
+	found := op.findLaunchReceipt(m)
+	if found.Accepted {
+		t.Fatalf("expected empty receipt for non-source role, got %+v", found)
+	}
+
+	// 2. Ambiguous conflicting receipts for same task/name/worktree must fail closed
+	r1 := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         "forge-mender-1",
+		Branch:       "recovery/fac-794",
+		Worktree:     ".worktrees/mender-fac794",
+		CandidateSHA: strings.Repeat("a", 40),
+		PaneID:       "wK:p1",
+		TabID:        "wK:t1",
+		HerdrSession: "session-1",
+		Repository:   "fixture-repo",
+	}
+	r2 := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         "forge-mender-1",
+		Branch:       "recovery/fac-794",
+		Worktree:     ".worktrees/mender-fac794",
+		CandidateSHA: strings.Repeat("b", 40), // Different candidate
+		PaneID:       "wK:p2",
+		TabID:        "wK:t2",
+		HerdrSession: "session-2", // Different session
+		Repository:   "fixture-repo",
+	}
+	b1, _ := json.Marshal(r1)
+	b2, _ := json.Marshal(r2)
+	if err := os.WriteFile(launchReceiptsPath, append(append(b1, '\n'), append(b2, '\n')...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mConflict := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+		Repository: "fixture-repo", TaskRef: "FAC-794", TaskID: "task-794",
+		CandidateSHA: strings.Repeat("c", 40), BaseSHA: strings.Repeat("c", 40), Branch: "recovery/fac-794",
+		Worktree: ".worktrees/mender-fac794", Workspace: "wK", TabID: "wK:t1", PaneID: "wK:p1", TerminalID: "term-1",
+		SessionID: "session-1", AgentName: "forge-mender-1", Role: "mender",
+		ReportArtifact: ".herd/reports/fac-794.md", ReportDigest: strings.Repeat("d", 64), Generation: "gen-conf", Nonce: "nonce-1",
+	})
+	foundConf := op.findLaunchReceipt(mConflict)
+	if foundConf.Accepted {
+		t.Fatalf("expected empty receipt on ambiguous match, got %+v", foundConf)
+	}
+}
+
+func TestCloseSettledSourceTabRejectsActiveProcessesAtCloseTime(t *testing.T) {
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+
+	agent := AgentEntry{
+		Name:       "forge-mender-race",
+		TabID:      "wK:t1",
+		PaneID:     "wK:p1",
+		Workspace:  "wK",
+		TerminalID: "term-1",
+		Status:     "idle",
+		Focused:    new(bool),
+	}
+	agent.Session.Value = "session-1"
+
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"forge-mender-race","agent_status":"idle","pane_id":"wK:p1","tab_id":"wK:t1","workspace_id":"wK","terminal_id":"term-1","focused":false,"agent_session":{"value":"session-1"}}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			// A process was started right before close
+			return `{"result":{"process_info":{"pane_id":"wK:p1","shell_pid":100,"foreground_processes":[{"pid":200,"name":"make","argv":["make","test"]}]}}}`, nil
+		}
+		return "", errors.New("unexpected mock Herdr command")
+	}
+
+	err := CloseSettledSourceTab(agent)
+	if err == nil || !strings.Contains(err.Error(), "active non-idle processes") {
+		t.Fatalf("expected active processes error on close, got: %v", err)
 	}
 }

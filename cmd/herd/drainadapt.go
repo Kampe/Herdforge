@@ -187,12 +187,9 @@ func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
 		standing = configuredStandingAgentNames(cfg)
 	}
 	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: a.repository, StandingLanes: standing}
-	result, err := herdr.RetireSourceLanesContext(ctx, op, manifests, false)
+	_, err = herdr.RetireSourceLanesContext(ctx, op, manifests, false)
 	if err != nil {
 		return err
-	}
-	if result.Blocked > 0 {
-		return fmt.Errorf("%d source retirement lane(s) blocked; retained exact manifests", result.Blocked)
 	}
 	return nil
 }

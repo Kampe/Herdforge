@@ -126,40 +126,64 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 		if err := json.Unmarshal(s.Bytes(), &r); err != nil {
 			continue
 		}
-		if r.TaskRef == m.TaskRef && r.Name == m.AgentName && r.Worktree == m.Worktree {
-			if r.CandidateSHA != "" && m.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA {
-				continue
-			}
-			if r.Branch != "" && m.Branch != "" && r.Branch != m.Branch {
-				continue
-			}
-			if r.HerdrSession != "" && m.SessionID != "" && r.HerdrSession != m.SessionID {
-				continue
-			}
-			matching = append(matching, r)
+		if !r.Accepted || !isSourceRole(r.Role) {
+			continue
 		}
+		if m.Role != "" && !strings.EqualFold(r.Role, m.Role) {
+			continue
+		}
+		if r.Repository != "" && m.Repository != "" && !strings.EqualFold(r.Repository, m.Repository) {
+			continue
+		}
+		if n.RepositoryIdentity != "" && r.Repository != "" && !strings.EqualFold(r.Repository, n.RepositoryIdentity) {
+			continue
+		}
+		if r.TaskRef != m.TaskRef || r.Name != m.AgentName || r.Worktree != m.Worktree {
+			continue
+		}
+		if r.Branch != "" && m.Branch != "" && r.Branch != m.Branch {
+			continue
+		}
+		if r.HerdrSession != "" && m.SessionID != "" && r.HerdrSession != m.SessionID {
+			continue
+		}
+		if r.TabID != "" && m.TabID != "" && r.TabID != m.TabID {
+			continue
+		}
+		if r.PaneID != "" && m.PaneID != "" && r.PaneID != m.PaneID {
+			continue
+		}
+		if r.CandidateSHA != "" && m.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA {
+			continue
+		}
+		matching = append(matching, r)
 	}
 	if len(matching) == 1 {
 		return matching[0]
 	}
 	if len(matching) > 1 {
-		// Prefer the latest accepted receipt matching exact candidate and session
-		for i := len(matching) - 1; i >= 0; i-- {
-			if matching[i].Accepted && matching[i].CandidateSHA == m.CandidateSHA {
-				return matching[i]
+		// If multiple receipts exist, check if there's an exact candidate+session match without ambiguity
+		var exactCandidate []launch.Receipt
+		for _, r := range matching {
+			if r.CandidateSHA == m.CandidateSHA && (m.SessionID == "" || r.HerdrSession == m.SessionID) {
+				exactCandidate = append(exactCandidate, r)
 			}
 		}
-		return matching[len(matching)-1]
+		if len(exactCandidate) == 1 {
+			return exactCandidate[0]
+		}
+		// If ambiguous (multiple conflicting active receipts), fail closed
+		return launch.Receipt{}
 	}
 	return launch.Receipt{}
 }
 
 func (n *NativeSourceRetirementOp) observeHandoff(m SourceRetirementManifest) SourceRetirementHandoff {
 	h := SourceRetirementHandoff{
-		CandidateSHA: m.CandidateSHA,
-		TaskRef:      m.TaskRef,
-		AgentName:    m.AgentName,
-		ReportDigest: m.ReportDigest,
+		CandidateSHA: "",
+		TaskRef:      "",
+		AgentName:    "",
+		ReportDigest: "",
 		Status:       "UNKNOWN",
 	}
 
@@ -194,12 +218,8 @@ func (n *NativeSourceRetirementOp) observeHandoff(m SourceRetirementManifest) So
 				h.CandidateSHA = parsed.CandidateSHA
 				h.ReportDigest = digest
 				h.ArtifactPath = pathRel
-				if parsed.TaskRef != "" {
-					h.TaskRef = parsed.TaskRef
-				}
-				if parsed.AgentName != "" {
-					h.AgentName = parsed.AgentName
-				}
+				h.TaskRef = parsed.TaskRef
+				h.AgentName = parsed.AgentName
 				return h
 			}
 		}

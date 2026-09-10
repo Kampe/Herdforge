@@ -181,6 +181,15 @@ func ValidateSourceRetirementManifest(m SourceRetirementManifest) error {
 	return nil
 }
 
+func isSourceRole(role string) bool {
+	r := strings.ToLower(strings.TrimSpace(role))
+	switch r {
+	case "worker", "forge-smith", "recovery", "mender":
+		return true
+	}
+	return false
+}
+
 // EvaluateSourceRetirement evaluates whether a settled source/mender lane
 // is eligible for automatic terminal retirement.
 func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecision {
@@ -211,17 +220,32 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 	if e.Launch.Name != m.AgentName {
 		return blockSourceRetirement("launch provenance agent name mismatch")
 	}
-	if e.Launch.Worktree != "" && e.Launch.Worktree != m.Worktree {
+	if strings.TrimSpace(e.Launch.Worktree) == "" || e.Launch.Worktree != m.Worktree {
 		return blockSourceRetirement("launch provenance worktree mismatch")
 	}
-	if e.Launch.Branch != "" && e.Launch.Branch != m.Branch {
+	if strings.TrimSpace(e.Launch.Branch) == "" || e.Launch.Branch != m.Branch {
 		return blockSourceRetirement("launch provenance branch mismatch")
+	}
+	if strings.TrimSpace(e.Launch.HerdrSession) == "" || e.Launch.HerdrSession != m.SessionID {
+		return blockSourceRetirement("launch provenance session mismatch")
+	}
+	if !isSourceRole(e.Launch.Role) {
+		return blockSourceRetirement("launch provenance role is not an authorized source role: " + e.Launch.Role)
+	}
+	if m.Role != "" && !strings.EqualFold(e.Launch.Role, m.Role) {
+		return blockSourceRetirement("launch provenance role mismatch")
+	}
+	if e.Launch.Repository != "" && !strings.EqualFold(e.Launch.Repository, m.Repository) {
+		return blockSourceRetirement("launch provenance repository mismatch")
 	}
 	if e.Launch.CandidateSHA != "" && e.Launch.CandidateSHA != m.CandidateSHA {
 		return blockSourceRetirement("launch provenance candidate SHA mismatch")
 	}
-	if e.Launch.HerdrSession != "" && m.SessionID != "" && e.Launch.HerdrSession != m.SessionID {
-		return blockSourceRetirement("launch provenance session mismatch")
+	if e.Launch.TabID != "" && e.Launch.TabID != m.TabID {
+		return blockSourceRetirement("launch provenance tab ID mismatch")
+	}
+	if e.Launch.PaneID != "" && e.Launch.PaneID != m.PaneID {
+		return blockSourceRetirement("launch provenance pane ID mismatch")
 	}
 
 	// Durable handoff / report check
@@ -231,10 +255,10 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 	if e.Handoff.CandidateSHA != m.CandidateSHA {
 		return blockSourceRetirement("handoff candidate SHA does not match manifest")
 	}
-	if e.Handoff.TaskRef != "" && e.Handoff.TaskRef != m.TaskRef {
+	if strings.TrimSpace(e.Handoff.TaskRef) == "" || !strings.EqualFold(e.Handoff.TaskRef, m.TaskRef) {
 		return blockSourceRetirement("handoff task ref does not match manifest")
 	}
-	if e.Handoff.AgentName != "" && e.Handoff.AgentName != m.AgentName {
+	if strings.TrimSpace(e.Handoff.AgentName) == "" || e.Handoff.AgentName != m.AgentName {
 		return blockSourceRetirement("handoff agent name does not match manifest")
 	}
 	status := strings.ToUpper(strings.TrimSpace(e.Handoff.Status))
@@ -409,7 +433,9 @@ func RetireSourceLanesContext(ctx context.Context, op SourceRetirementOp, manife
 		if reader, ok := op.(SourceRetirementPhaseReader); ok {
 			complete, err := reader.Completed(m)
 			if err != nil {
-				return r, fmt.Errorf("read source retirement phase %s: %w", m.Generation, err)
+				r.Failed++
+				r.Candidates = append(r.Candidates, SourceRetirementCandidate{Manifest: m, Decision: blockSourceRetirement("read source retirement phase: " + err.Error())})
+				continue
 			}
 			if complete {
 				r.Candidates = append(r.Candidates, SourceRetirementCandidate{Manifest: m, Completed: true, Decision: SourceRetirementDecision{Eligible: true, Reason: "source lane already completed for exact manifest identity"}})
@@ -428,16 +454,16 @@ func RetireSourceLanesContext(ctx context.Context, op SourceRetirementOp, manife
 			r.Blocked++
 		}
 	}
-	if r.Failed > 0 {
-		return r, fmt.Errorf("source retirement: %d observation failures", r.Failed)
-	}
-	if dryRun || r.Blocked > 0 {
+	if dryRun {
+		if r.Failed > 0 {
+			return r, fmt.Errorf("source retirement: %d observation failures", r.Failed)
+		}
 		return r, nil
 	}
 
 	var opErrs []string
 	for _, c := range r.Candidates {
-		if c.Completed {
+		if c.Completed || !c.Decision.Eligible {
 			continue
 		}
 		m := c.Manifest
@@ -478,8 +504,11 @@ func RetireSourceLanesContext(ctx context.Context, op SourceRetirementOp, manife
 		}
 		r.Retired++
 	}
-	if len(opErrs) > 0 {
-		return r, errors.New(strings.Join(opErrs, "; "))
+	if len(opErrs) > 0 || r.Failed > 0 {
+		if len(opErrs) > 0 {
+			return r, errors.New(strings.Join(opErrs, "; "))
+		}
+		return r, fmt.Errorf("source retirement: %d failure(s)", r.Failed)
 	}
 	return r, nil
 }
@@ -497,15 +526,24 @@ type StructuredHandoffReport struct {
 func ParseStructuredHandoffReport(data []byte) (StructuredHandoffReport, error) {
 	var r StructuredHandoffReport
 	s := bufio.NewScanner(bytes.NewReader(data))
+	inCodeBlock := false
+	seen := make(map[string]string)
+
 	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "//") {
+		rawLine := s.Text()
+		trimmed := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
 			continue
 		}
+		if inCodeBlock || trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, ">") {
+			continue
+		}
+		line := trimmed
 		if strings.HasPrefix(line, "#") {
-			trimmed := strings.TrimLeft(line, "# ")
-			if strings.Contains(trimmed, ":") {
-				line = trimmed
+			headTrim := strings.TrimLeft(line, "# ")
+			if strings.Contains(headTrim, ":") {
+				line = headTrim
 			} else {
 				continue
 			}
@@ -522,20 +560,44 @@ func ParseStructuredHandoffReport(data []byte) (StructuredHandoffReport, error) 
 		val := strings.TrimSpace(line[colonIdx+1:])
 		val = strings.Trim(val, "`\"'")
 
+		var canonicalKey string
 		switch key {
 		case "task", "task_ref", "task-ref", "task_id":
+			canonicalKey = "task"
+		case "candidate", "candidate_sha", "sha", "commit", "candidate-sha":
+			canonicalKey = "candidate"
+		case "status", "verdict", "result":
+			canonicalKey = "status"
+		case "agent", "agent_name", "agent-name", "builder", "mender", "reviewer":
+			canonicalKey = "agent"
+		case "branch":
+			canonicalKey = "branch"
+		default:
+			continue
+		}
+
+		if prevVal, ok := seen[canonicalKey]; ok {
+			if !strings.EqualFold(prevVal, val) {
+				return StructuredHandoffReport{}, fmt.Errorf("conflicting duplicate %s field in handoff report: %q vs %q", canonicalKey, prevVal, val)
+			}
+		} else {
+			seen[canonicalKey] = val
+		}
+
+		switch canonicalKey {
+		case "task":
 			if r.TaskRef == "" {
 				r.TaskRef = val
 			}
-		case "candidate", "candidate_sha", "sha", "commit":
-			if r.CandidateSHA == "" && exactSHA(val) {
+		case "candidate":
+			if r.CandidateSHA == "" {
 				r.CandidateSHA = val
 			}
-		case "status", "verdict", "result":
+		case "status":
 			if r.Status == "" {
 				r.Status = strings.ToUpper(val)
 			}
-		case "agent", "agent_name", "builder", "mender", "reviewer":
+		case "agent":
 			if r.AgentName == "" {
 				r.AgentName = val
 			}
@@ -549,7 +611,13 @@ func ParseStructuredHandoffReport(data []byte) (StructuredHandoffReport, error) 
 		return StructuredHandoffReport{}, fmt.Errorf("scan handoff report: %w", err)
 	}
 
-	if r.Status == "" {
+	if strings.TrimSpace(r.TaskRef) == "" {
+		return StructuredHandoffReport{}, errors.New("report lacks structured task field")
+	}
+	if strings.TrimSpace(r.AgentName) == "" {
+		return StructuredHandoffReport{}, errors.New("report lacks structured agent field")
+	}
+	if strings.TrimSpace(r.Status) == "" {
 		return StructuredHandoffReport{}, errors.New("report lacks structured status/verdict field")
 	}
 	switch r.Status {
@@ -600,10 +668,14 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 
 	var newlyEnrolled []SourceRetirementManifest
 	for _, r := range receipts {
-		if !r.Accepted || r.Role == "reviewer" || r.Role == "review" {
+		if !r.Accepted || !isSourceRole(r.Role) {
 			continue
 		}
-		if strings.TrimSpace(r.TaskRef) == "" || strings.TrimSpace(r.Worktree) == "" || strings.TrimSpace(r.TabID) == "" {
+		if repositoryIdentity != "" && r.Repository != "" && !strings.EqualFold(r.Repository, repositoryIdentity) {
+			continue
+		}
+		if strings.TrimSpace(r.TaskRef) == "" || strings.TrimSpace(r.Worktree) == "" || strings.TrimSpace(r.TabID) == "" ||
+			strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.HerdrSession) == "" {
 			continue
 		}
 		wtAbs := r.Worktree
@@ -631,10 +703,16 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 			}
 			if b, err := os.ReadFile(candAbs); err == nil {
 				if parsed, pErr := ParseStructuredHandoffReport(b); pErr == nil {
-					if parsed.TaskRef != "" && !strings.EqualFold(parsed.TaskRef, r.TaskRef) {
+					if !strings.EqualFold(parsed.TaskRef, r.TaskRef) {
+						continue
+					}
+					if parsed.AgentName != "" && parsed.AgentName != r.Name {
 						continue
 					}
 					if r.CandidateSHA != "" && parsed.CandidateSHA != r.CandidateSHA {
+						continue
+					}
+					if parsed.Branch != "" && r.Branch != "" && !strings.EqualFold(parsed.Branch, r.Branch) {
 						continue
 					}
 					reportPathRel = candRel
@@ -666,6 +744,9 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 			if brOut, err := exec.Command("git", "-C", wtAbs, "symbolic-ref", "--short", "HEAD").Output(); err == nil {
 				branch = strings.TrimSpace(string(brOut))
 			}
+		}
+		if branch == "" {
+			continue
 		}
 
 		workspace := "wK"

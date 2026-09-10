@@ -41,6 +41,8 @@ func sourceRetirementEvidence(m SourceRetirementManifest) SourceRetirementEviden
 		CandidateSHA: m.CandidateSHA,
 		PaneID:       m.PaneID,
 		TabID:        m.TabID,
+		HerdrSession: m.SessionID,
+		Repository:   m.Repository,
 	}
 	handoff := SourceRetirementHandoff{
 		Known:        true,
@@ -214,7 +216,7 @@ func TestRetireSourceLanesPreflightsAllBeforeMutationAndMakesBoundedProgress(t *
 	m2.AgentName = "forge-mender-fac795-gem-12345678"
 	m2.BindingDigest = SourceRetirementBindingDigest(m2)
 
-	// Case 1: One lane blocked, preflight blocks everything before mutation
+	// Case 1: One lane blocked, eligible lane retires while blocked lane remains blocked
 	e1 := sourceRetirementEvidence(m1)
 	e2Blocked := sourceRetirementEvidence(m2)
 	e2Blocked.Worktree.Dirty = true
@@ -229,8 +231,8 @@ func TestRetireSourceLanesPreflightsAllBeforeMutationAndMakesBoundedProgress(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Retired != 0 || r.Blocked != 1 || len(f.events) != 0 {
-		t.Fatalf("expected 0 retired, 1 blocked, 0 mutations; got report=%+v events=%v", r, f.events)
+	if r.Retired != 1 || r.Blocked != 1 {
+		t.Fatalf("expected 1 retired, 1 blocked; got report=%+v events=%v", r, f.events)
 	}
 
 	// Case 2: Both eligible -> both retired in orderly fashion
@@ -345,8 +347,55 @@ func TestParseStructuredHandoffReport_ValidAndInvalid(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "missing agent",
+			content: "Task: FAC-794\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: true,
+		},
+		{
+			name:    "missing task",
+			content: "Agent: forge-mender-1\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: true,
+		},
+		{
+			name:    "conflicting duplicate status",
+			content: "Task: FAC-794\nAgent: forge-mender-1\nCandidate: " + sha + "\nStatus: READY\nStatus: BLOCKED\n",
+			wantErr: true,
+		},
+		{
+			name:    "conflicting duplicate task",
+			content: "Task: FAC-794\nTask: FAC-795\nAgent: forge-mender-1\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: true,
+		},
+		{
+			name:    "conflicting duplicate agent",
+			content: "Task: FAC-794\nAgent: forge-mender-1\nAgent: forge-mender-2\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: true,
+		},
+		{
+			name:    "quoted prose lines ignored",
+			content: "> Task: FAC-999\n> Agent: evil-agent\n> Candidate: 0000000000000000000000000000000000000000\n> Status: READY\nTask: FAC-794\nAgent: forge-mender-1\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: false,
+			want: StructuredHandoffReport{
+				TaskRef:      "FAC-794",
+				AgentName:    "forge-mender-1",
+				CandidateSHA: sha,
+				Status:       "READY",
+			},
+		},
+		{
+			name:    "code block lines ignored",
+			content: "```markdown\nTask: FAC-999\nAgent: evil-agent\nCandidate: 0000000000000000000000000000000000000000\nStatus: READY\n```\nTask: FAC-794\nAgent: forge-mender-1\nCandidate: " + sha + "\nStatus: READY\n",
+			wantErr: false,
+			want: StructuredHandoffReport{
+				TaskRef:      "FAC-794",
+				AgentName:    "forge-mender-1",
+				CandidateSHA: sha,
+				Status:       "READY",
+			},
+		},
+		{
 			name:    "short candidate sha",
-			content: "Task: FAC-794\nCandidate: abc123\nStatus: READY\n",
+			content: "Task: FAC-794\nAgent: forge-mender-1\nCandidate: abc123\nStatus: READY\n",
 			wantErr: true,
 		},
 	}

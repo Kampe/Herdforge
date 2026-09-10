@@ -63,12 +63,15 @@ func TestSourceCleanupNativeCLIDryRunAndActPreservesWorktreeAndBranch(t *testing
 	candidateSHABytes, _ := exec.Command("git", "-C", wtPath, "rev-parse", "HEAD").Output()
 	candidateSHA := strings.TrimSpace(string(candidateSHABytes))
 
+	agentName := "forge-mender-fac794-gem-6774ef2d"
+	sessionID := "session-uuid-1234"
+
 	reportRel := ".herd/reports/fac-794.md"
 	reportPath := filepath.Join(root, reportRel)
 	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reportData := []byte("## Report for FAC-794\nCandidate: " + candidateSHA + "\nStatus: READY\n")
+	reportData := []byte("## Report for FAC-794\nTask: FAC-794\nAgent: " + agentName + "\nCandidate: " + candidateSHA + "\nStatus: READY\n")
 	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -76,8 +79,6 @@ func TestSourceCleanupNativeCLIDryRunAndActPreservesWorktreeAndBranch(t *testing
 	reportDigest := hex.EncodeToString(sum[:])
 
 	// Launch receipt
-	agentName := "forge-mender-fac794-gem-6774ef2d"
-	sessionID := "session-uuid-1234"
 	launchReceipt := launch.Receipt{
 		Accepted:     true,
 		TaskRef:      "FAC-794",
@@ -88,6 +89,8 @@ func TestSourceCleanupNativeCLIDryRunAndActPreservesWorktreeAndBranch(t *testing
 		CandidateSHA: candidateSHA,
 		PaneID:       "wK:p17G",
 		TabID:        "wK:t17G",
+		HerdrSession: sessionID,
+		Repository:   repository,
 	}
 	launchBytes, _ := json.Marshal(launchReceipt)
 	launchReceiptsPath := filepath.Join(root, ".herd/launch-receipts.jsonl")
@@ -236,7 +239,7 @@ func TestSourceCleanupNativeAutomaticEnrollmentFromDurableHandoff(t *testing.T) 
 	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	reportContent := "# FAC-794 Report\nStatus: READY\nCandidate: " + candidateSHA + "\n"
+	reportContent := "# FAC-794 Report\nTask: FAC-794\nAgent: forge-mender-fac794-gem-6774ef2d\nStatus: READY\nCandidate: " + candidateSHA + "\n"
 	if err := os.WriteFile(reportPath, []byte(reportContent), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -362,5 +365,17 @@ func TestDrainSourceRetirementWiredInDrainAdapters(t *testing.T) {
 	err := hooks.retireSources(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "source retirement authority is unavailable") {
 		t.Fatalf("expected authority refusal, got %v", err)
+	}
+}
+
+func TestSourceCleanupNativeWithoutHerdYamlSucceeds(t *testing.T) {
+	root := t.TempDir()
+	// No .herd/herd.yaml file created
+	report, err := runSourceRetirementCleanup(context.Background(), root, true)
+	if err != nil {
+		t.Fatalf("runSourceRetirementCleanup failed without herd.yaml: %v", err)
+	}
+	if report.Retired != 0 || len(report.Candidates) != 0 {
+		t.Fatalf("unexpected report on empty root: %+v", report)
 	}
 }

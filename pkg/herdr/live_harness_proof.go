@@ -225,6 +225,13 @@ func CloseSettledSourceTab(agent AgentEntry) error {
 	if exact.Focused == nil || *exact.Focused || (exact.Status != "idle" && exact.Status != "done") {
 		return fmt.Errorf("settled source close: live status/focus changed")
 	}
+	procs, pErr := paneProcessesForRetirement(exact.PaneID)
+	if pErr != nil {
+		return fmt.Errorf("settled source close pane process read: %w", pErr)
+	}
+	if active := collectActiveDescendants(procs); len(active) > 0 {
+		return fmt.Errorf("settled source close: active non-idle processes running in pane: %s", strings.Join(active, ", "))
+	}
 	snapshot, err := GetHostedPaneIdentity(exact.PaneID)
 	if err != nil {
 		return fmt.Errorf("settled source close process snapshot: %w", err)
