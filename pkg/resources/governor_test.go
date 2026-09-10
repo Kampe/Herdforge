@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -228,6 +229,56 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json")); err != nil {
 		t.Fatalf("bootstrap receipt was removed: %v", err)
 	}
+}
+
+func TestGovernorRefusesOrphanCacheOnOwnershipOrOpenFileUncertainty(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		owner  func(os.FileInfo) (string, bool)
+		usage  ProcessUsage
+	}{
+		{name: "foreign ownership", reason: "derived_target_foreign_uid", owner: func(os.FileInfo) (string, bool) { return "foreign", true }},
+		{name: "open file", reason: "derived_target_active_process", owner: func(os.FileInfo) (string, bool) { return strconv.Itoa(os.Getuid()), true }, usage: ProcessUsage{OpenFile: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, _, _ := governorFor(t, "host", 900000, 900000)
+			g.Processes = staticProcessInspector{usage: tc.usage}
+			g.OwnerID = tc.owner
+			g.Policy.GeneratedDirectories = []string{"unused-generated-cache"}
+			g.Policy.OrphanRoots = []string{filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")}
+			g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+			g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+			orphan := filepath.Join(g.Policy.OrphanRoots[0], "fac-683")
+			if err := os.MkdirAll(orphan, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			graph := filepath.Join(orphan, "graph.db")
+			if err := os.WriteFile(graph, []byte("immutable"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			old := time.Unix(-10000, 0)
+			if err := os.Chtimes(graph, old, old); err != nil {
+				t.Fatal(err)
+			}
+			report, err := g.Run(context.Background(), RunOptions{Apply: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(report.Orphans) != 1 || report.Orphans[0].DerivedTargets[0].Reason != tc.reason {
+				t.Fatalf("refusal report=%+v want=%s", report.Orphans, tc.reason)
+			}
+			if _, err := os.Stat(graph); err != nil {
+				t.Fatalf("protected orphan cache mutated: %v", err)
+			}
+		})
+	}
+}
+
+type staticProcessInspector struct{ usage ProcessUsage }
+
+func (s staticProcessInspector) InUse(context.Context, string) (ProcessUsage, error) {
+	return s.usage, nil
 }
 
 func TestGovernorSafetyReasonsCoverDestructiveAuthority(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -188,6 +189,7 @@ type Governor struct {
 	Locks      LockProvider
 	RemoveTree RemoveTreeFunc
 	Processes  ProcessInspector
+	OwnerID    func(os.FileInfo) (string, bool)
 	Now        func() time.Time
 }
 
@@ -276,6 +278,14 @@ type OrphanDerivedTarget struct {
 	Reason         string `json:"reason"`
 }
 
+func fileOwnerID(info os.FileInfo) (string, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", false
+	}
+	return strconv.FormatUint(uint64(stat.Uid), 10), true
+}
+
 type RunOptions struct {
 	Apply          bool
 	BatchLimit     int
@@ -337,6 +347,9 @@ func (g *Governor) defaults() {
 	}
 	if g.Processes == nil {
 		g.Processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
+	}
+	if g.OwnerID == nil {
+		g.OwnerID = fileOwnerID
 	}
 	if g.Policy.MaxScanEntries <= 0 {
 		g.Policy.MaxScanEntries = 250000
@@ -628,8 +641,8 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if err != nil || rootErr != nil || !containedPath(root, resolved) {
 		return PhysicalUsage{}, false, "derived_target_realpath_escape"
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || uint32(stat.Uid) != uint32(os.Getuid()) {
+	owner, owned := g.OwnerID(info)
+	if !owned || owner != strconv.Itoa(os.Getuid()) {
 		return PhysicalUsage{}, false, "derived_target_foreign_uid"
 	}
 	usage, err := g.Measure.Measure(target, g.Policy.MaxScanEntries)
