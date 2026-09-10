@@ -500,6 +500,57 @@ func TestOpenCodeConsumptionProof_MultiStepAssistantTurnAccepted(t *testing.T) {
 	}
 }
 
+func TestOpenCodeConsumptionProof_MultiStepAssistantTurnRejectsLaterModelMismatch(t *testing.T) {
+	now := time.Now().Add(-100 * time.Millisecond)
+	userMsg := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:        "msg_user_1",
+			SessionID: "ses_cold",
+			Role:      "user",
+			Time:      opencodeMessageTime{Created: now.UnixMilli()},
+			Model:     opencodeModel{ModelID: "gpt-5.6-luna", ProviderID: "litellm"},
+		},
+		Parts: []opencodeMessagePart{
+			{Type: "text", Text: nativeOpenCodePacket},
+		},
+	}
+	// First assistant reply in multi-step turn matches user model.
+	astMsg1 := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:         "msg_ast_1",
+			SessionID:  "ses_cold",
+			ParentID:   "msg_user_1",
+			Role:       "assistant",
+			Time:       opencodeMessageTime{Created: now.UnixMilli() + 5},
+			ModelID:    "gpt-5.6-luna",
+			ProviderID: "litellm",
+		},
+	}
+	// Later assistant reply in same multi-step turn has different model identity.
+	astMsg2 := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:         "msg_ast_2",
+			SessionID:  "ses_cold",
+			ParentID:   "msg_user_1",
+			Role:       "assistant",
+			Time:       opencodeMessageTime{Created: now.UnixMilli() + 20},
+			ModelID:    "claude-3-7-sonnet",
+			ProviderID: "anthropic",
+		},
+	}
+	after := opencodeExportData{
+		Info: opencodeSessionInfo{
+			ID:    "ses_cold",
+			Model: opencodeModel{ModelID: "gpt-5.6-luna", ProviderID: "litellm"},
+		},
+		Messages: []opencodeMessage{userMsg, astMsg1, astMsg2},
+	}
+	err := openCodeConsumptionProof(opencodeExportData{}, after, "ses_cold", "/work", nativeOpenCodePacket, now.Add(-500*time.Millisecond), true)
+	if err == nil || !strings.Contains(err.Error(), "OpenCode user and assistant model identity differs") {
+		t.Fatalf("expected model mismatch error for later assistant reply, got: %v", err)
+	}
+}
+
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
