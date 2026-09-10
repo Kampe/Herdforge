@@ -33,6 +33,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/patterns"
 	"github.com/Kampe/Herdforge/pkg/process"
 )
 
@@ -173,7 +174,7 @@ func ClassifyAgentWithEvidence(a kick.AgentEntry, held bool, heldReason string, 
 		// It is typed UNKNOWN / LevelMedium requiring pane read.
 		item.Level = LevelMedium
 		item.Reason = fmt.Sprintf("native evidence error: %v", evErr)
-	case eval.Reason == "output token limit reached (finish=length)" || process.OutputLimitReason(paneText) != "":
+	case eval.Reason == patterns.OutputLimitMessage || process.OutputLimitReason(paneText) != "":
 		// Output token limit truncation MUST NOT be classified as done or healthy working
 		item.Level = LevelMedium
 		item.Reason = "output limit reached (finish=length) — incomplete, read pane"

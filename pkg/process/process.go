@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/patterns"
 )
 
 // Classification represents the digest class for an agent's output.
@@ -173,13 +175,11 @@ func OutputLimitReason(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return ""
 	}
-	hasReviewMarker := regexp.MustCompile(`(?i)verdict:\s*|merge recommendation:\s*|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
-	if hasReviewMarker.MatchString(text) {
+	if patterns.ReviewMarkerPattern().MatchString(text) {
 		return ""
 	}
-	lengthPat := regexp.MustCompile(`(?i)finish[=_]reason[:=]\s*["']?length["']?|finish=length|output token limit reached|output limit (exceeded|reached|hit)|maximum (context|token|output) length (exceeded|reached)|max(?:imum)? tokens reached|response truncated due to output limit`)
-	if lengthPat.MatchString(text) {
-		return "output token limit reached (finish=length)"
+	if patterns.OutputLimitPattern().MatchString(text) {
+		return patterns.OutputLimitMessage
 	}
 	return ""
 }
@@ -235,8 +235,7 @@ func ProviderExhaustionReason(text string) string {
 		return ""
 	}
 	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|individual quota reached|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)|account (?:has been |is )?suspended|upstream account suspended|account (?:has been |is )?deactivated|insufficient[_\s]quota|credit balance is too low|402\s+payment\s+required|billing (?:not active|account disabled|hard limit reached)|rate_limit_exceeded|resource_exhausted`)
-	hasReviewMarker := regexp.MustCompile(`(?i)verdict:|merge recommendation:|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
-	if quotaPat.MatchString(text) && !hasReviewMarker.MatchString(text) {
+	if quotaPat.MatchString(text) && !patterns.ReviewMarkerPattern().MatchString(text) {
 		return "provider quota or rate limit reported"
 	}
 	return ""
@@ -345,7 +344,7 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 	if strings.EqualFold(ev.FinishReason, "length") || OutputLimitReason(ev.Error) != "" {
 		res.Class = Unknown
 		res.Action = "read_pane"
-		res.Reason = "output token limit reached (finish=length)"
+		res.Reason = patterns.OutputLimitMessage
 		res.Blocked = false
 		res.ProviderDeath = false
 		return res
