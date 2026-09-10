@@ -14,7 +14,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/contextauth"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/launch"
 )
@@ -736,73 +736,11 @@ func ParseStructuredHandoffReport(data []byte) (StructuredHandoffReport, error) 
 	return r, nil
 }
 
-type signedSourceTaskContext struct {
-	ProviderType      string    `json:"provider_type"`
-	ProjectID         string    `json:"project_id"`
-	ProviderWorkspace string    `json:"provider_workspace,omitempty"`
-	ProviderProfile   string    `json:"provider_profile,omitempty"`
-	Repository        string    `json:"repository"`
-	Role              string    `json:"role"`
-	TaskRef           string    `json:"task_ref"`
-	TaskID            string    `json:"task_id"`
-	Branch            string    `json:"branch"`
-	BaseSHA           string    `json:"base_sha"`
-	CandidateSHA      string    `json:"candidate_sha,omitempty"`
-	AuthorityScope    string    `json:"authority_scope,omitempty"`
-	AnchorRef         string    `json:"anchor_ref,omitempty"`
-	HerdrWorkspace    string    `json:"herdr_workspace,omitempty"`
-	LeaseID           string    `json:"lease_id"`
-	LeaseGeneration   int64     `json:"lease_generation"`
-	LeaseTaskRef      string    `json:"lease_task_ref"`
-	SessionID         string    `json:"session_id"`
-	AgentSessionID    string    `json:"agent_session_id,omitempty"`
-	AllowedOps        []string  `json:"allowed_ops"`
-	ExpiresAt         time.Time `json:"expires_at"`
-	Signature         string    `json:"signature,omitempty"`
-}
-
 // readVerifiedSourceTaskContext reads and cryptographically verifies TASK-CONTEXT.json
 // against the repository's published receipt key (.herd/receipt.pub). If the receipt is
 // unsigned, tampered, or the key is missing/corrupt, it fails closed with an error.
-func readVerifiedSourceTaskContext(repoRoot, worktreeAbs string) (signedSourceTaskContext, error) {
-	var tc signedSourceTaskContext
-	data, err := os.ReadFile(filepath.Join(worktreeAbs, "TASK-CONTEXT.json"))
-	if err != nil {
-		return tc, fmt.Errorf("read TASK-CONTEXT.json: %w", err)
-	}
-	if err := json.Unmarshal(data, &tc); err != nil {
-		return tc, fmt.Errorf("unmarshal TASK-CONTEXT.json: %w", err)
-	}
-	if strings.TrimSpace(tc.Signature) == "" {
-		return tc, errors.New("TASK-CONTEXT.json is unsigned (FAC-145: missing authority signature)")
-	}
-
-	pubData, err := os.ReadFile(filepath.Join(repoRoot, ".herd", "receipt.pub"))
-	if err != nil {
-		return tc, fmt.Errorf("no receipt verification key at %s (FAC-145): %w", filepath.Join(repoRoot, ".herd", "receipt.pub"), err)
-	}
-	rawPub, err := hex.DecodeString(strings.TrimSpace(string(pubData)))
-	if err != nil || len(rawPub) != ed25519.PublicKeySize {
-		return tc, errors.New("receipt verification key is corrupt")
-	}
-
-	sigBytes, err := hex.DecodeString(strings.TrimSpace(tc.Signature))
-	if err != nil || len(sigBytes) != ed25519.SignatureSize {
-		return tc, errors.New("TASK-CONTEXT.json carries malformed signature")
-	}
-
-	tcCopy := tc
-	tcCopy.Signature = ""
-	canonical, err := json.Marshal(tcCopy)
-	if err != nil {
-		return tc, fmt.Errorf("canonicalize TASK-CONTEXT: %w", err)
-	}
-
-	if !ed25519.Verify(ed25519.PublicKey(rawPub), canonical, sigBytes) {
-		return tc, errors.New("TASK-CONTEXT.json failed cryptographic signature verification")
-	}
-
-	return tc, nil
+func readVerifiedSourceTaskContext(repoRoot, worktreeAbs string) (contextauth.TaskContext, error) {
+	return contextauth.ReadAndVerifyTaskContext(repoRoot, worktreeAbs)
 }
 
 // EnrollReadySourceManifests discovers accepted source/mender launch receipts that have

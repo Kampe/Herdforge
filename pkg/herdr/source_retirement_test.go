@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/contextauth"
 	"github.com/Kampe/Herdforge/pkg/launch"
 )
 
@@ -849,7 +850,7 @@ func TestEnrollReadySourceManifests_ResolvesNativeLaunchReceiptWithoutWorktreeOr
 	}
 
 	// Write TASK-CONTEXT.json in worktree (authenticates task ref, role, and session)
-	unsignedTC := signedSourceTaskContext{
+	unsignedTC := contextauth.TaskContext{
 		ProviderType:    "kaneo",
 		ProjectID:       "proj-1",
 		Repository:      "fixture-repo",
@@ -865,7 +866,7 @@ func TestEnrollReadySourceManifests_ResolvesNativeLaunchReceiptWithoutWorktreeOr
 		AllowedOps:      []string{"get", "list", "comment"},
 		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
-	canonicalBytes, err := json.Marshal(unsignedTC)
+	canonicalBytes, err := contextauth.CanonicalBytes(unsignedTC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -981,7 +982,7 @@ func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *test
 		t.Fatal(err)
 	}
 
-	baseTC := signedSourceTaskContext{
+	baseTC := contextauth.TaskContext{
 		ProviderType:    "kaneo",
 		ProjectID:       "proj-1",
 		Repository:      "herdforge",
@@ -998,7 +999,7 @@ func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *test
 		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 
-	writeTC := func(tc signedSourceTaskContext) {
+	writeTC := func(tc contextauth.TaskContext) {
 		data, err := json.Marshal(tc)
 		if err != nil {
 			t.Fatal(err)
@@ -1008,9 +1009,9 @@ func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *test
 		}
 	}
 
-	signTC := func(tc signedSourceTaskContext, priv ed25519.PrivateKey) signedSourceTaskContext {
+	signTC := func(tc contextauth.TaskContext, priv ed25519.PrivateKey) contextauth.TaskContext {
 		tc.Signature = ""
-		canon, err := json.Marshal(tc)
+		canon, err := contextauth.CanonicalBytes(tc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1028,7 +1029,7 @@ func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *test
 	// 2. Forged key (signed with Key B while repo expects Key A)
 	forgedKeyTC := signTC(baseTC, privB)
 	writeTC(forgedKeyTC)
-	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed cryptographic signature verification") {
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed signature verification") {
 		t.Fatalf("expected signature verification failure for foreign key, got %v", err)
 	}
 
@@ -1037,7 +1038,7 @@ func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *test
 	tamperedTC := validTC
 	tamperedTC.TaskRef = "FAC-999"
 	writeTC(tamperedTC)
-	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed cryptographic signature verification") {
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed signature verification") {
 		t.Fatalf("expected signature verification failure for tampered task_ref, got %v", err)
 	}
 
@@ -1045,7 +1046,7 @@ func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *test
 	tamperedSessionTC := validTC
 	tamperedSessionTC.SessionID = "session-hijacked"
 	writeTC(tamperedSessionTC)
-	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed cryptographic signature verification") {
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed signature verification") {
 		t.Fatalf("expected signature verification failure for tampered session_id, got %v", err)
 	}
 
@@ -1142,7 +1143,7 @@ func TestEvaluateSourceRetirement_BlocksOnForgedOrTamperedTaskContext(t *testing
 	}
 
 	// Case A: Forged TASK-CONTEXT signed with Key B (foreign key)
-	tcForeign := signedSourceTaskContext{
+	tcForeign := contextauth.TaskContext{
 		ProviderType:    "kaneo",
 		ProjectID:       "proj-1",
 		Repository:      "herdforge",
@@ -1158,7 +1159,7 @@ func TestEvaluateSourceRetirement_BlocksOnForgedOrTamperedTaskContext(t *testing
 		AllowedOps:      []string{"get", "list", "comment"},
 		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
-	canon, _ := json.Marshal(tcForeign)
+	canon, _ := contextauth.CanonicalBytes(tcForeign)
 	sigB := ed25519.Sign(privB, canon)
 	tcForeign.Signature = hex.EncodeToString(sigB)
 	tcData, _ := json.Marshal(tcForeign)
