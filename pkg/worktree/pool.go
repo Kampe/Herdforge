@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -501,7 +502,26 @@ func (p *Pool) repoPath(path string) string {
 // re-verifies each slot right before its own destructive step, since
 // filesystem removal cannot be rolled back and state can change between the
 // two passes.
-func (p *Pool) GC(ctx context.Context) error {
+// SlotRetirementAuthority is the positive-evidence fence the destructive GC
+// primitive requires: before any slot is removed, the authority must affirm
+// that the slot's pool root carries verified retirement evidence. A nil
+// authority or an error answer refuses GC -- the protection lives in the
+// destructive primitive itself, not in any particular caller, so a direct
+// `herd pool gc` can never bypass the retirement-evidence fence the
+// idle-discovery caller enforces.
+type SlotRetirementAuthority interface {
+	// AuthorizePoolRoot answers whether the exact pool root (an absolute
+	// path) is authorized for destructive reclamation. Errors refuse.
+	AuthorizePoolRoot(poolRootAbs string) error
+}
+
+// GC removes every slot the verification proves safe. The authority must be
+// non-nil; absent or ambiguous retirement evidence refuses the whole pass
+// rather than guessing safe.
+func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) error {
+	if authority == nil {
+		return errors.New("worktree pool: gc refused without a retirement-evidence authority")
+	}
 	return p.withLock(func() error {
 		state, err := p.readState()
 		if err != nil {
@@ -517,6 +537,12 @@ func (p *Pool) GC(ctx context.Context) error {
 			if !ok {
 				continue
 			}
+			// The retirement-evidence fence is enforced here, at the single
+			// destructive boundary, for every caller alike.
+			poolRootAbs := filepath.Dir(candidate.path)
+			if err := authority.AuthorizePoolRoot(poolRootAbs); err != nil {
+				return fmt.Errorf("worktree pool: gc refused for slot %s: %w", slot.Name, err)
+			}
 			// Re-verify this one slot immediately before removing it: the
 			// full-set pass above proves nothing about state a moment later.
 			latest, err := p.verifyGCCandidate(ctx, slot)
@@ -526,6 +552,17 @@ func (p *Pool) GC(ctx context.Context) error {
 			if err := candidate.sameIdentity(latest); err != nil {
 				return fmt.Errorf("worktree pool: gc refused for slot %s immediately before removal: %w", slot.Name, err)
 			}
+			// Narrow the destructive-boundary replacement window one last
+			// time against the exact directory identity GC verified: if the
+			// path no longer names the same directory, refuse instead of
+			// letting git act on whatever is there now.
+			preInfo, err := os.Lstat(candidate.path)
+			if err != nil {
+				return fmt.Errorf("worktree pool: gc refused for slot %s at the destructive boundary: %w", slot.Name, err)
+			}
+			if !os.SameFile(candidate.info, preInfo) {
+				return fmt.Errorf("worktree pool: gc refused for slot %s: path was replaced at the destructive boundary", slot.Name)
+			}
 			// Pool slots are tracked by their own slot.LeaseID, verified
 			// above, never by pkg/claim -- the full RefuseRemovalWithLiveLease
 			// would refuse every slot unconditionally. See its doc comment.
@@ -534,8 +571,8 @@ func (p *Pool) GC(ctx context.Context) error {
 			// git's own dirty/HEAD-mismatch refusal is redundant defense-in-
 			// depth, not an obstacle to bypass.
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", candidate.path)
-			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
-				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
+			if out, err := boundedCombinedOutput(cmd, maxGitOutputBytes); err != nil && !strings.Contains(out, "is not a working tree") {
+				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(out))
 			}
 			if info, statErr := os.Lstat(candidate.path); statErr == nil {
 				if !os.SameFile(candidate.info, info) {
@@ -560,8 +597,10 @@ func (p *Pool) GC(ctx context.Context) error {
 
 // GCPlan reports, without deleting anything, which currently-tracked slots
 // GC would remove and which it would refuse, and why. It runs the identical
-// verification GC uses so a dry run cannot diverge from the real decision.
-func (p *Pool) GCPlan(ctx context.Context) ([]GCDecision, error) {
+// verification GC uses -- the retirement-evidence authority included -- so a
+// dry run cannot diverge from the real decision. A nil authority refuses
+// every slot.
+func (p *Pool) GCPlan(ctx context.Context, authority SlotRetirementAuthority) ([]GCDecision, error) {
 	var decisions []GCDecision
 	err := p.withLock(func() error {
 		state, err := p.readState()
@@ -570,12 +609,21 @@ func (p *Pool) GCPlan(ctx context.Context) ([]GCDecision, error) {
 		}
 		for _, slot := range state.Slots {
 			d := GCDecision{Slot: slot.Name, Path: slot.Path}
-			if slot.LeaseID != "" {
+			switch {
+			case authority == nil:
+				d.Refused = true
+				d.Reason = "no retirement-evidence authority provided"
+			case slot.LeaseID != "":
 				d.Refused = true
 				d.Reason = "leased"
-			} else if _, err := p.verifyGCCandidate(ctx, slot); err != nil {
-				d.Refused = true
-				d.Reason = err.Error()
+			default:
+				if err := authority.AuthorizePoolRoot(filepath.Dir(p.repoPath(slot.Path))); err != nil {
+					d.Refused = true
+					d.Reason = err.Error()
+				} else if _, err := p.verifyGCCandidate(ctx, slot); err != nil {
+					d.Refused = true
+					d.Reason = err.Error()
+				}
 			}
 			decisions = append(decisions, d)
 		}
@@ -737,12 +785,48 @@ func (p *Pool) containedRepoPath(path string) (string, error) {
 	return filepath.Clean(realPath), nil
 }
 
+// maxGitOutputBytes bounds the output GC accepts from a single git
+// subprocess. A registered-worktree listing or cleanliness report larger
+// than this is a pathological state the verification refuses rather than
+// silently truncating evidence.
+const maxGitOutputBytes = 4 << 20
+
+// boundedCombinedOutput runs cmd and captures at most maxBytes of combined
+// output; exceeding the bound fails the call closed.
+func boundedCombinedOutput(cmd *exec.Cmd, maxBytes int) (string, error) {
+	var buf limitedBuffer
+	buf.max = maxBytes
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	runErr := cmd.Run()
+	if buf.exceeded {
+		return buf.String(), fmt.Errorf("subprocess output exceeded %d bytes", maxBytes)
+	}
+	return buf.String(), runErr
+}
+
+type limitedBuffer struct {
+	bytes.Buffer
+	max      int
+	exceeded bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.max > 0 && b.Len()+len(p) > b.max {
+		b.exceeded = true
+		b.Buffer.Write(p[:max(0, b.max-b.Len())])
+		return len(p), nil // keep the child's stdout pipe draining, then fail closed
+	}
+	return b.Buffer.Write(p)
+}
+
 // registeredWorktrees returns every worktree git itself has registered for
 // this repository, keyed by its normalized absolute path. GC must never
 // treat a directory as a removable pool slot unless git independently
 // confirms it as an exact, currently-registered worktree.
 func registeredWorktrees(ctx context.Context, repoRoot string) (map[string]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoRoot, "worktree", "list", "--porcelain").Output()
+	cmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "worktree", "list", "--porcelain")
+	out, err := boundedCombinedOutput(cmd, maxGitOutputBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -787,11 +871,11 @@ func verifyReachableFromBase(ctx context.Context, repoRoot, slotPath, base strin
 // reviewer left behind is still that reviewer's content, not the pool's.
 func gitFullyClean(ctx context.Context, path string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
-	out, err := cmd.CombinedOutput()
+	out, err := boundedCombinedOutput(cmd, maxGitOutputBytes)
 	if err != nil {
-		return false, fmt.Errorf("git status %s: %v (%s)", path, err, strings.TrimSpace(string(out)))
+		return false, fmt.Errorf("git status %s: %v (%s)", path, err, strings.TrimSpace(out))
 	}
-	return strings.TrimSpace(string(out)) == "", nil
+	return strings.TrimSpace(out) == "", nil
 }
 
 // Slots returns a snapshot of durable pool inventory.

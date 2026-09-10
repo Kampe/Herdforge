@@ -101,9 +101,17 @@ func TestDiscoverIdlePools_DryRunWritesNoFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range after {
-		if !beforeNames[e.Name()] {
-			t.Fatalf("dry run created a new .herd entry it must not have: %s", e.Name())
+		if beforeNames[e.Name()] {
+			continue
 		}
+		// The tick lock file is the mutex artifact (kernel flock carrier),
+		// not discovery state: it may appear during a dry run exactly as
+		// during an acting pass, and it is never unlinked afterwards. Every
+		// other new entry is a purity violation.
+		if e.Name() == filepath.Base(idlePoolLockPath(root)) {
+			continue
+		}
+		t.Fatalf("dry run created a new .herd entry it must not have: %s", e.Name())
 	}
 	if _, err := os.Stat(idlePoolCursorPath(root)); !os.IsNotExist(err) {
 		t.Fatalf("dry run must never write the cursor file, stat err=%v", err)

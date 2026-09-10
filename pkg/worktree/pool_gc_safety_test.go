@@ -67,7 +67,7 @@ func TestPoolGCRefusesUnregisteredDirectory(t *testing.T) {
 	}
 	writePoolState(t, poolRoot, poolState{Version: 1, Slots: []PoolSlot{{Name: "pool-01", Path: decoy}}})
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "registered git worktree") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "registered git worktree") {
 		t.Fatalf("GC error = %v, want refusal for unregistered directory", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -101,7 +101,7 @@ func TestPoolGCRefusesPathOutsidePoolRoot(t *testing.T) {
 	// un-normalized relative slot.Path could take.
 	writePoolState(t, poolRoot, poolState{Version: 1, Slots: []PoolSlot{{Name: "pool-01", Path: "outside-secret"}}})
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "outside the pool root") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "outside the pool root") {
 		t.Fatalf("GC error = %v, want refusal for path outside pool root", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -133,7 +133,7 @@ func TestPoolGCRefusesSymlinkSlot(t *testing.T) {
 	}
 	writePoolState(t, poolRoot, poolState{Version: 1, Slots: []PoolSlot{{Name: "pool-01", Path: slotPath}}})
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "symlink") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("GC error = %v, want refusal for symlinked slot", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -157,7 +157,7 @@ func TestPoolGCRefusesDirtyUntrackedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "dirty") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "dirty") {
 		t.Fatalf("GC error = %v, want dirty refusal", err)
 	}
 	if _, err := os.Stat(slotPath); err != nil {
@@ -197,7 +197,7 @@ func TestPoolGCRefusesIgnoredContent(t *testing.T) {
 		t.Fatalf("precondition: gitClean should report clean for ignored-only content, clean=%v err=%v", clean, err)
 	}
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "dirty") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "dirty") {
 		t.Fatalf("GC error = %v, want refusal for ignored content", err)
 	}
 	if _, err := os.Stat(slotPath); err != nil {
@@ -227,7 +227,7 @@ func TestPoolGCRefusesHeadNotReachableFromBase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "not reachable from base") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "not reachable from base") {
 		t.Fatalf("GC error = %v, want refusal for HEAD not reachable from base", err)
 	}
 	if _, err := os.Stat(slotPath); err != nil {
@@ -247,7 +247,7 @@ func TestPoolGCRefusesWhileAnySlotLeased(t *testing.T) {
 		t.Fatalf("Lease: %v", err)
 	}
 
-	if err := pool.GC(context.Background()); err == nil || !strings.Contains(err.Error(), "leased") {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "leased") {
 		t.Fatalf("GC error = %v, want refusal while a slot is leased", err)
 	}
 	slots, err := pool.Slots()
@@ -302,7 +302,7 @@ func TestPoolGCRealCensusReclaimsGenuinelyOwnerlessSlot(t *testing.T) {
 	if err != nil || len(slots) != 1 {
 		t.Fatalf("precondition: 1 clean slot, got %d err=%v", len(slots), err)
 	}
-	if err := pool.GC(context.Background()); err != nil {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("genuinely ownerless clean slot must be reclaimable by the real census path: %v", err)
 	}
 	if _, statErr := os.Stat(slots[0].Path); !os.IsNotExist(statErr) {
@@ -324,7 +324,7 @@ func TestPoolGCSucceedsAndLeavesPoolConsistentForEnsure(t *testing.T) {
 		t.Fatalf("precondition: 2 clean slots, got %d err=%v", len(before), err)
 	}
 
-	if err := pool.GC(context.Background()); err != nil {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("GC on clean, unleased, registered slots must succeed: %v", err)
 	}
 	for _, s := range before {
@@ -368,7 +368,7 @@ func TestPoolGCPlanDryRunNeverDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decisions, err := pool.GCPlan(context.Background())
+	decisions, err := pool.GCPlan(context.Background(), allowAllRetirementAuthority{})
 	if err != nil {
 		t.Fatalf("GCPlan: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestPoolGCRefusesUnleasedSlotWithOwnedLiveProcess(t *testing.T) {
 		return resources.ProcessUsage{CWD: true, PIDs: pids}, nil
 	})
 
-	err = pool.GC(context.Background())
+	err = pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "live process") {
 		t.Fatalf("GC error = %v, want live-process refusal", err)
 	}
@@ -477,7 +477,7 @@ func TestPoolGCDefaultCensusRefusesLiveProcessWithOwnerEvidence(t *testing.T) {
 	t.Setenv("FAKE_PS_CHILD_PID", strconv.Itoa(child.Process.Pid))
 	t.Setenv("FAKE_PS_COMMAND_LINE", "sh -c cd-and-sleep "+slotPath)
 
-	err := pool.GC(context.Background())
+	err := pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "live process owns or references") {
 		t.Fatalf("default native census error = %v, want explicit owner refusal", err)
 	}
@@ -498,7 +498,7 @@ func TestPoolGCRefusesUnknownProcessCensus(t *testing.T) {
 		return resources.ProcessUsage{MetadataUnavailable: true}, nil
 	})
 
-	err := pool.GC(context.Background())
+	err := pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "metadata unavailable") {
 		t.Fatalf("GC error = %v, want fail-closed census refusal", err)
 	}
@@ -520,7 +520,7 @@ func TestPoolGCCleanInjectedCensusRemovesAndEnsureRebuilds(t *testing.T) {
 		return resources.ProcessUsage{}, nil
 	})
 
-	if err := pool.GC(context.Background()); err != nil {
+	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("clean ownerless GC: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(pool.Root, "pool-01")); !os.IsNotExist(err) {
@@ -548,7 +548,7 @@ func TestPoolGCRefusesPositiveExitOneWithoutDescriptorName(t *testing.T) {
 	}
 	pool.ProcessInspector = resources.LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
 
-	err := pool.GC(context.Background())
+	err := pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "metadata unavailable") {
 		t.Fatalf("GC error = %v, want fail-closed census refusal on partial positive exit 1", err)
 	}
@@ -558,5 +558,100 @@ func TestPoolGCRefusesPositiveExitOneWithoutDescriptorName(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(pool.Root, "pool-01")); err != nil {
 		t.Fatalf("slot must not be deleted on partial positive exit 1: %v", err)
+	}
+}
+
+// allowAllRetirementAuthority is the test stand-in for verified retirement
+// evidence: it authorizes every pool root, so the pre-existing GC safety
+// tests exercise their own dedicated guards without the fence refusing.
+type allowAllRetirementAuthority struct{}
+
+func (allowAllRetirementAuthority) AuthorizePoolRoot(poolRootAbs string) error { return nil }
+
+// TestPoolGCRefusesNilRetirementAuthority pins that the destructive
+// primitive itself requires the retirement-evidence fence: no authority, no
+// GC, regardless of caller.
+func TestPoolGCRefusesNilRetirementAuthority(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if err := pool.GC(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "retirement-evidence authority") {
+		t.Fatalf("nil authority must refuse GC outright, got err=%v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("refused GC must remove nothing, slots=%d err=%v", len(slots), err)
+	}
+}
+
+// TestPoolGCRefusesPoolUnderUnconfirmedRetirementEvidence pins the direct
+// path to the same evidence the idle-discovery fence reads: a pool named by
+// an unconfirmed manifest generation is refused; once the phase journal
+// records that generation complete, the same pool is reclaimable.
+func TestPoolGCRefusesPoolUnderUnconfirmedRetirementEvidence(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	manifestPath := filepath.Join(root, "retirement-manifests.jsonl")
+	journalPath := filepath.Join(root, "retirement-phases.jsonl")
+	if err := os.WriteFile(manifestPath, []byte(`{"pool":".herd/pool","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authority := NewManifestRetirementAuthority(root, manifestPath, journalPath)
+
+	if err := pool.GC(context.Background(), authority); err == nil || !strings.Contains(err.Error(), "retirement evidence") {
+		t.Fatalf("pool under unconfirmed retirement evidence must be refused, got err=%v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("refused GC must remove nothing, slots=%d err=%v", len(slots), err)
+	}
+
+	// The authoritative completion record clears the fence.
+	if err := os.WriteFile(journalPath, []byte(`{"pool":".herd/pool","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1","phase":"complete"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.GC(context.Background(), authority); err != nil {
+		t.Fatalf("pool with every manifested generation complete must be reclaimable: %v", err)
+	}
+	if _, statErr := os.Stat(slots[0].Path); !os.IsNotExist(statErr) {
+		t.Fatalf("slot must be removed once evidence authorizes, stat err=%v", statErr)
+	}
+}
+
+// TestPoolGCPlanReflectsRetirementEvidenceRefusal keeps the dry run from
+// diverging from the destructive decision: the same authority refuses in
+// both.
+func TestPoolGCPlanReflectsRetirementEvidenceRefusal(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	manifestPath := filepath.Join(root, "retirement-manifests.jsonl")
+	journalPath := filepath.Join(root, "retirement-phases.jsonl")
+	if err := os.WriteFile(manifestPath, []byte(`{"pool":".herd/pool","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authority := NewManifestRetirementAuthority(root, manifestPath, journalPath)
+	decisions, err := pool.GCPlan(context.Background(), authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || !decisions[0].Refused || !strings.Contains(decisions[0].Reason, "retirement evidence") {
+		t.Fatalf("dry run must refuse the protected pool, got %+v", decisions)
 	}
 }

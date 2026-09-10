@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -55,6 +56,13 @@ func runPool() {
 		os.Exit(2)
 	}
 	p := worktree.NewPool(root, resolvedPool, *size)
+	// The direct `herd pool gc` path enforces the SAME retirement-evidence
+	// authority the idle-discovery reclaim path uses: the fence lives in the
+	// destructive primitive, which refuses a nil authority outright, so this
+	// command can never bypass the manifest/phase-evidence protection by
+	// being invoked directly.
+	gcAuthority := worktree.NewManifestRetirementAuthority(root,
+		herdr.ReviewRetirementRegistryPath(root), reviewRetirementPhaseJournalPath(root))
 	ctx := context.Background()
 	switch fs.Arg(0) {
 	case "ensure":
@@ -84,7 +92,7 @@ func runPool() {
 		}
 	case "gc":
 		if *dryRun {
-			decisions, err := p.GCPlan(ctx)
+			decisions, err := p.GCPlan(ctx, gcAuthority)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "herd pool gc --dry-run: %v\n", err)
 				os.Exit(1)
@@ -98,7 +106,7 @@ func runPool() {
 			}
 			return
 		}
-		if err := p.GC(ctx); err != nil {
+		if err := p.GC(ctx, gcAuthority); err != nil {
 			fmt.Fprintf(os.Stderr, "herd pool gc: %v\n", err)
 			os.Exit(1)
 		}
