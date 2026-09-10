@@ -454,7 +454,7 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 		}
 	}
 	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
-		return nil, pollErrf("rate-limited", "%s", persisted.Error)
+		return staleBackoffSnapshot(name, persisted), pollErrf("rate-limited", "%s", persisted.Error)
 	}
 	var snap *UsageSnapshot
 	var err error
@@ -501,7 +501,7 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 		return nil, lockErr
 	}
 	if persistedOK && persisted.BackoffUntil.After(time.Now()) && persisted.AccountKey == accountKey {
-		return nil, pollErrf("rate-limited", "%s", persisted.Error)
+		return staleBackoffSnapshot(name, persisted), pollErrf("rate-limited", "%s", persisted.Error)
 	}
 	if err == nil && snap != nil {
 		quotaCache.Lock()
@@ -519,6 +519,13 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 			err = pollErrf("rate-limited", "%s", record.Error)
 		} else {
 			err = pollErrf("rate-limited", "provider %s is in persisted backoff", name)
+		}
+	}
+	if (snap == nil || len(snap.Providers) == 0) && pollErrorCode(err) == "rate-limited" {
+		if record, ok := readProviderRecord(name); ok && record.AccountKey == accountKey {
+			if stale := staleBackoffSnapshot(name, record); stale != nil {
+				snap = stale
+			}
 		}
 	}
 	if err != nil {
@@ -568,6 +575,25 @@ func rateLimitBackoff(err error) time.Duration {
 		}
 	}
 	return defaultBackoff
+}
+
+// staleBackoffSnapshot surfaces the last known-good reading for a provider
+// currently in 429 backoff, marked Stale so the quota engine reports "stale"
+// rather than dropping the provider to no-quota-data. A telemetry rate limit
+// on the usage endpoint is not proof of exhaustion -- inference can still be
+// working -- so the prior real reading is honest evidence a caller may weigh,
+// while Stale keeps it from being mistaken for a fresh, fabricated headroom
+// number. Returns nil when no prior successful reading exists to surface.
+func staleBackoffSnapshot(name string, record cachedProviderRecord) *UsageSnapshot {
+	if len(record.Provider.Resources) == 0 {
+		return nil
+	}
+	p := record.Provider
+	p.Stale = true
+	return &UsageSnapshot{
+		GeneratedAt: time.Now().UTC(),
+		Providers:   map[string]ProviderUsage{name: p},
+	}
 }
 
 func providerOnlySnapshot(snap *UsageSnapshot, provider string) *UsageSnapshot {
