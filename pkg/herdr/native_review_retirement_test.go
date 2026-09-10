@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 func TestNativeRetirementCorruptJournalFailsClosed(t *testing.T) {
@@ -395,5 +397,245 @@ func TestNativeRetirementWithTaskLaunchProvenanceAndArtifactAck(t *testing.T) {
 	}
 	if d := EvaluateReviewRetirement(evidence); !d.Eligible {
 		t.Fatalf("canonical task-provenance launch and artifact ack should be eligible: %+v", d)
+	}
+}
+
+func TestNativeReviewRetirement_AdvancedOriginMainPostReleaseProof(t *testing.T) {
+	root := t.TempDir()
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s in %s: %v (%s)", strings.Join(args, " "), dir, err, strings.TrimSpace(string(out)))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit(root, "init", "-q")
+	if err := os.WriteFile(filepath.Join(root, "base.txt"), []byte("base v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(root, "add", "base.txt")
+	runGit(root, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "initial base")
+	oldBaseSHA := runGit(root, "rev-parse", "HEAD")
+
+	runGit(root, "remote", "add", "origin", "https://example.invalid/fixture.git")
+	runGit(root, "update-ref", "refs/remotes/origin/main", oldBaseSHA)
+
+	poolDir := filepath.Join(root, ".herd", "pool-fac792")
+	p := worktree.NewPool(root, poolDir, 1)
+	p.DefaultBase = "origin/main"
+	if err := p.Ensure(context.Background()); err != nil {
+		t.Fatalf("pool ensure: %v", err)
+	}
+	slot, err := p.Lease(context.Background(), "review-fac-792")
+	if err != nil {
+		t.Fatalf("pool acquire: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "cand.txt"), []byte("cand commit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(root, "add", "cand.txt")
+	runGit(root, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "candidate commit")
+	candSHA := runGit(root, "rev-parse", "HEAD")
+
+	reviewRef := "refs/herd/reviews/fac-792-branch"
+	runGit(root, "update-ref", reviewRef, candSHA)
+
+	slotPath := slot.Path
+	if !filepath.IsAbs(slotPath) {
+		slotPath = filepath.Join(root, filepath.FromSlash(slotPath))
+	}
+	runGit(slotPath, "reset", "--hard", candSHA)
+
+	relWorktree, _ := filepath.Rel(root, slotPath)
+
+	// Advance origin/main to newMainSHA (simulates concurrent PR merges landing on main)
+	if err := os.WriteFile(filepath.Join(root, "main2.txt"), []byte("main v2 commit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(root, "add", "main2.txt")
+	runGit(root, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "advanced main commit")
+	newMainSHA := runGit(root, "rev-parse", "HEAD")
+	runGit(root, "update-ref", "refs/remotes/origin/main", newMainSHA)
+
+	promptRel := ".herd/review/prompts/fac-792.md"
+	promptBody := []byte("review prompt for FAC-792\n")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, filepath.FromSlash(promptRel))), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(promptRel)), promptBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifestRel := ".herd/review/manifests/fac-792.json"
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, filepath.FromSlash(manifestRel))), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	launchTS := time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339Nano)
+	manifestTS := time.Now().UTC().Format(time.RFC3339Nano)
+
+	reviewer := "review-fac-792-canary"
+	m := NewReviewRetirementManifest(time.Now(), ReviewRetirementManifest{
+		Repository: "example.invalid/fixture", TaskRef: "FAC-792", TaskID: "task-fac-792",
+		CandidateSHA: candSHA, BaseSHA: oldBaseSHA, Branch: reviewRef, ReviewRef: reviewRef,
+		Worktree: filepath.ToSlash(relWorktree), Pool: ".herd/pool-fac792", Slot: slot.Name,
+		LeaseGeneration: slot.LeasedAt.UnixNano(), Nonce: slot.LeaseID,
+		Workspace: "wK", TabID: "wK:t792", PaneID: "wK:p792", TerminalID: "term_792", SessionID: "ses_792",
+		Reviewer: reviewer, ReviewerFamily: "open-weight", ReviewerModel: "litellm/lazer/claude-haiku-4.5",
+		PromptArtifact: promptRel, PromptDigest: reviewack.ArtifactDigest(promptBody),
+		ManifestArtifact: manifestRel, Generation: "gen-fac-792",
+		RecordedAt: manifestTS,
+	})
+	mJSON, _ := json.Marshal(m)
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(manifestRel)), append(mJSON, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ledgerPath := filepath.Join(root, ".herd", "review", "ledger.jsonl")
+	if err := os.MkdirAll(filepath.Dir(ledgerPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifactDigest := strings.Repeat("a", 64)
+	ledgerRows := []string{
+		`{"ts":"` + launchTS + `","event":"record","sha":"` + candSHA + `","reviewer":"` + reviewer + `","branch":"` + reviewRef + `","lease":"` + slot.LeaseID + `"}`,
+		`{"ts":"` + manifestTS + `","event":"verdict","sha":"` + candSHA + `","candidate_sha":"` + candSHA + `","reviewer":"` + reviewer + `","verdict":"PASS","artifact_digest":"` + artifactDigest + `"}`,
+	}
+	if err := os.WriteFile(ledgerPath, []byte(strings.Join(ledgerRows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewack.EmitArtifact(root, reviewack.Ack{SHA: candSHA, Reviewer: reviewer, LaunchIdentity: reviewer, ArtifactDigest: artifactDigest}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("exit status 1")
+		}
+		return `{"result":{}}`, nil
+	}
+
+	ledger, err := reviewledger.NewReadOnlyReviewLedger(root, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &NativeReviewRetirementOp{Root: root, RepositoryIdentity: "example.invalid/fixture", Ledger: ledger}
+
+	res, err := RetireReviewLanesContext(context.Background(), op, []ReviewRetirementManifest{m}, false)
+	if err != nil {
+		t.Fatalf("RetireReviewLanesContext failed: %v", err)
+	}
+	if res.Retired != 1 || res.Failed != 0 || res.Blocked != 0 {
+		t.Fatalf("unexpected retirement report: %+v", res)
+	}
+
+	if _, err := os.Stat(slotPath); !os.IsNotExist(err) {
+		t.Fatalf("expected slotPath removed upon retirement, but exists")
+	}
+
+	cmd := exec.Command("git", "-C", root, "show-ref", "--verify", "--quiet", reviewRef)
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("review ref still exists")
+	}
+
+	// Second tick: verify idempotence
+	res2, err := RetireReviewLanesContext(context.Background(), op, []ReviewRetirementManifest{m}, false)
+	if err != nil {
+		t.Fatalf("second tick RetireReviewLanesContext failed: %v", err)
+	}
+	if res2.Failed != 0 || res2.Blocked != 0 || len(res2.Candidates) != 1 || !res2.Candidates[0].Completed {
+		t.Fatalf("unexpected second tick report: %+v", res2)
+	}
+}
+
+func TestNativeReviewRetirement_NegativeSafetyFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s in %s: %v (%s)", strings.Join(args, " "), dir, err, strings.TrimSpace(string(out)))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit(root, "init", "-q")
+	if err := os.WriteFile(filepath.Join(root, "base.txt"), []byte("base v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(root, "add", "base.txt")
+	runGit(root, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "initial base")
+	baseSHA := runGit(root, "rev-parse", "HEAD")
+
+	poolDir := filepath.Join(root, ".herd", "pool-safety")
+	p := worktree.NewPool(root, poolDir, 1)
+	p.DefaultBase = "HEAD"
+	if err := p.Ensure(context.Background()); err != nil {
+		t.Fatalf("pool ensure: %v", err)
+	}
+	slot, err := p.Lease(context.Background(), "review-safety")
+	if err != nil {
+		t.Fatalf("pool acquire: %v", err)
+	}
+	slotPath := slot.Path
+	if !filepath.IsAbs(slotPath) {
+		slotPath = filepath.Join(root, filepath.FromSlash(slotPath))
+	}
+	relWorktree, _ := filepath.Rel(root, slotPath)
+
+	m := NewReviewRetirementManifest(time.Now(), ReviewRetirementManifest{
+		Repository: "example.invalid/fixture", TaskRef: "FAC-792", TaskID: "task-fac-792",
+		CandidateSHA: baseSHA, BaseSHA: baseSHA, Branch: "refs/herd/reviews/fac-792-safety", ReviewRef: "refs/herd/reviews/fac-792-safety",
+		Worktree: filepath.ToSlash(relWorktree), Pool: ".herd/pool-safety", Slot: slot.Name,
+		LeaseGeneration: slot.LeasedAt.UnixNano(), Nonce: slot.LeaseID,
+		Workspace: "wK", TabID: "wK:t792", PaneID: "wK:p792", TerminalID: "term_792", SessionID: "ses_792",
+		Reviewer: "reviewer-safety", ReviewerFamily: "open-weight", ReviewerModel: "litellm/lazer/claude-haiku-4.5",
+		PromptArtifact: ".herd/review/prompts/fac-792.md", PromptDigest: strings.Repeat("a", 64),
+		Generation: "gen-safety", RecordedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("exit status 1")
+		}
+		return `{"result":{}}`, nil
+	}
+
+	op := &NativeReviewRetirementOp{Root: root, RepositoryIdentity: "example.invalid/fixture"}
+
+	// 1. Negative: dirty worktree before worktree phase fails closed
+	if err := os.WriteFile(filepath.Join(slotPath, "dirty.txt"), []byte("dirty file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Revalidate(m, "worktree"); err == nil || !strings.Contains(err.Error(), "worktree changed before destructive removal") {
+		t.Fatalf("expected dirty worktree to fail revalidation, got %v", err)
+	}
+	_ = os.Remove(filepath.Join(slotPath, "dirty.txt"))
+
+	// 2. Negative: unexpected HEAD fails closed
+	if err := os.WriteFile(filepath.Join(slotPath, "new.txt"), []byte("new commit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(slotPath, "add", "new.txt")
+	runGit(slotPath, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "new commit in slot")
+	if err := op.Revalidate(m, "worktree"); err == nil || !strings.Contains(err.Error(), "worktree changed before destructive removal") {
+		t.Fatalf("expected unexpected HEAD to fail revalidation, got %v", err)
 	}
 }

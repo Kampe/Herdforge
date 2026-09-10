@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/security"
 )
 
 type opencodeExportFunc func(context.Context, string, string) ([]byte, error)
@@ -165,6 +167,14 @@ func parseOpenCodeExport(raw []byte) (opencodeExportData, error) {
 	return data, nil
 }
 
+func sanitizeExportStderr(raw string) string {
+	msg := strings.TrimSpace(raw)
+	if len(msg) > 512 {
+		msg = msg[:512] + "..."
+	}
+	return security.RedactSecrets(msg)
+}
+
 func exportOpenCodeSession(ctx context.Context, sessionID, cwd string) ([]byte, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, errors.New("OpenCode export requires a session id")
@@ -196,6 +206,10 @@ func exportOpenCodeSession(ctx context.Context, sessionID, cwd string) ([]byte, 
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = file.Close()
+		if stderr.Len() > 0 {
+			cleanErr := sanitizeExportStderr(stderr.String())
+			return nil, fmt.Errorf("OpenCode export failed: %w: %s", err, cleanErr)
+		}
 		return nil, fmt.Errorf("OpenCode export failed: %w", err)
 	}
 	if err := file.Close(); err != nil {
@@ -365,12 +379,13 @@ func openCodeConsumptionProof(before, after opencodeExportData, sessionID, cwd, 
 		}
 		assistants = append(assistants, message)
 	}
-	if len(assistants) != 1 {
-		return fmt.Errorf("OpenCode export has %d completed assistant replies parented to current user", len(assistants))
+	if len(assistants) == 0 {
+		return errors.New("OpenCode export has no assistant replies parented to current user")
 	}
-	assistant := assistants[0]
-	if !modelComplete(assistant.Info.model()) || !modelMatches(user.Info.model(), assistant.Info.model()) {
-		return errors.New("OpenCode user and assistant model identity differs")
+	for _, assistant := range assistants {
+		if !modelComplete(assistant.Info.model()) || !modelMatches(user.Info.model(), assistant.Info.model()) {
+			return errors.New("OpenCode user and assistant model identity differs")
+		}
 	}
 	if before.Info.Model.id() != "" && !modelMatches(before.Info.Model, user.Info.model()) {
 		return errors.New("OpenCode current user model differs from the session model")

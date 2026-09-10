@@ -574,7 +574,11 @@ func (n *NativeReviewRetirementOp) Revalidate(m ReviewRetirementManifest, phase 
 		}
 		expectedHead := m.CandidateSHA
 		if slotErr == nil && slot.LeaseID == "" {
-			expectedHead = m.BaseSHA
+			if slot.LastReleaseTargetHead != "" {
+				expectedHead = slot.LastReleaseTargetHead
+			} else {
+				expectedHead = m.BaseSHA
+			}
 		}
 		if !wt.Known || wt.Dirty || wt.Head != expectedHead || wt.Branch != m.Branch {
 			return fmt.Errorf("worktree changed before destructive removal: head=%s want=%s dirty=%t branch=%s want-branch=%s", wt.Head, expectedHead, wt.Dirty, wt.Branch, m.Branch)

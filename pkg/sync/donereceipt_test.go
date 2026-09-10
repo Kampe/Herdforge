@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
@@ -32,8 +32,7 @@ func receiptRepo(t *testing.T) (dir, baseSHA, mergeSHA, emptySHA, otherSHA strin
 
 	run := func(d string, args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = d
+		cmd := testgit.Command(d, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %v in %s: %v\n%s", args, d, err, out)

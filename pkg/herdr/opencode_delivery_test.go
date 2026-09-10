@@ -66,8 +66,12 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		if session != "" {
 			sessionJSON = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, session)
 		}
-		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":"idle","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":1,"state_change_seq":%d%s}]}}`,
-			nativeOpenCodeTarget, terminalID, cwd, fgCwd, f.listCalls, sessionJSON), nil
+		agentStatus := "idle"
+		if f.mode == "cold-busy" && f.listCalls > 1 {
+			agentStatus = "working"
+		}
+		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":%q,"tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":1,"state_change_seq":%d%s}]}}`,
+			nativeOpenCodeTarget, agentStatus, terminalID, cwd, fgCwd, f.listCalls, sessionJSON), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
 		f.promptCalls++
@@ -84,7 +88,7 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		} else if !strings.HasPrefix(f.mode, "cold") {
 			ackSession = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, nativeOpenCodeSession)
 		}
-		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s,"state":"working"}}}`,
+		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s}}}`,
 			nativeOpenCodeTarget, ackSession), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
@@ -247,7 +251,7 @@ func nativeOpenCodeCurrentExport(mode string) []byte {
 		}
 		return body
 	}
-	if mode == "cold-queued-composer" {
+	if mode == "cold-queued-composer" || mode == "cold-permission-prompt" || mode == "cold-busy" {
 		return nativeOpenCodeExport(false, "ses_cold", "")
 	}
 	switch mode {
@@ -366,7 +370,7 @@ func TestPublicSendOpenCodeColdStartedAssistantDoesNotNeedCompletion(t *testing.
 
 func TestExportOpenCodeSessionPreservesCompletePrivateJSON(t *testing.T) {
 	dir := t.TempDir()
-	payload := []byte(`{"info":{"id":"ses_native"},"padding":"` + strings.Repeat("x", 70*1024) + `"}`)
+	payload := []byte(`{"info":{"id":"ses_native"},"padding":"` + strings.Repeat("x", 350*1024) + `"}`)
 	payloadFile := filepath.Join(dir, "export.json")
 	if err := os.WriteFile(payloadFile, payload, 0o600); err != nil {
 		t.Fatal(err)
@@ -385,6 +389,114 @@ func TestExportOpenCodeSessionPreservesCompletePrivateJSON(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("export length = %d, want complete regular-file output length %d", len(got), len(payload))
+	}
+}
+
+func TestExportOpenCodeSessionFailsClosedOnTruncation(t *testing.T) {
+	dir := t.TempDir()
+	// Simulate truncated JSON export near 64KiB boundary.
+	truncated := []byte(`{"info":{"id":"ses_native"},"data":{"messages":[{"role":"user","content":"` + strings.Repeat("a", 60*1024))
+	payloadFile := filepath.Join(dir, "truncated.json")
+	if err := os.WriteFile(payloadFile, truncated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cli := filepath.Join(dir, "opencode")
+	script := "#!/bin/sh\ncat " + shellQuote(payloadFile) + "\n"
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restore := SetOpenCodeExecutableForTest(cli)
+	defer restore()
+
+	got, err := exportOpenCodeSession(context.Background(), nativeOpenCodeSession, dir)
+	if err != nil {
+		t.Fatalf("export returned error: %v", err)
+	}
+	_, parseErr := parseOpenCodeExport(got)
+	if parseErr == nil {
+		t.Fatal("parseOpenCodeExport must fail closed on truncated JSON input")
+	}
+}
+
+func TestExportOpenCodeSessionIncludesStderrDiagnosticsOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	cli := filepath.Join(dir, "opencode")
+	script := "#!/bin/sh\necho 'error: failed with Bearer secret_token_12345 and sk-proj-abc12345' >&2\nexit 1\n"
+	if err := os.WriteFile(cli, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restore := SetOpenCodeExecutableForTest(cli)
+	defer restore()
+
+	_, err := exportOpenCodeSession(context.Background(), nativeOpenCodeSession, dir)
+	if err == nil {
+		t.Fatal("export must fail on non-zero exit")
+	}
+	if strings.Contains(err.Error(), "secret_token_12345") || strings.Contains(err.Error(), "sk-proj-abc12345") {
+		t.Fatalf("export error exposed credentials: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Bearer [REDACTED]") {
+		t.Fatalf("export error missing expected redacted diagnostic: %v", err)
+	}
+}
+
+func TestSanitizeExportStderr_RedactsCredentialsAndBoundsLength(t *testing.T) {
+	input := "error Bearer secret_api_key_12345 sk-ant-secret12345 " + strings.Repeat("a", 1000)
+	got := sanitizeExportStderr(input)
+	if strings.Contains(got, "secret_api_key_12345") || strings.Contains(got, "sk-ant-secret12345") {
+		t.Fatalf("credentials leaked: %q", got)
+	}
+	if len(got) > 550 {
+		t.Fatalf("length not bounded: %d", len(got))
+	}
+}
+
+func TestOpenCodeConsumptionProof_MultiStepAssistantTurnAccepted(t *testing.T) {
+	now := time.Now().Add(-100 * time.Millisecond)
+	userMsg := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:        "msg_user_1",
+			SessionID: "ses_cold",
+			Role:      "user",
+			Time:      opencodeMessageTime{Created: now.UnixMilli()},
+			Model:     opencodeModel{ModelID: "gpt-5.6-luna", ProviderID: "litellm"},
+		},
+		Parts: []opencodeMessagePart{
+			{Type: "text", Text: nativeOpenCodePacket},
+		},
+	}
+	astMsg1 := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:         "msg_ast_1",
+			SessionID:  "ses_cold",
+			ParentID:   "msg_user_1",
+			Role:       "assistant",
+			Time:       opencodeMessageTime{Created: now.UnixMilli() + 5},
+			ModelID:    "gpt-5.6-luna",
+			ProviderID: "litellm",
+		},
+	}
+	astMsg2 := opencodeMessage{
+		Info: opencodeMessageInfo{
+			ID:         "msg_ast_2",
+			SessionID:  "ses_cold",
+			ParentID:   "msg_user_1",
+			Role:       "assistant",
+			Time:       opencodeMessageTime{Created: now.UnixMilli() + 20},
+			ModelID:    "gpt-5.6-luna",
+			ProviderID: "litellm",
+		},
+	}
+	after := opencodeExportData{
+		Info: opencodeSessionInfo{
+			ID:    "ses_cold",
+			Model: opencodeModel{ModelID: "gpt-5.6-luna", ProviderID: "litellm"},
+		},
+		Messages: []opencodeMessage{userMsg, astMsg1, astMsg2},
+	}
+	err := openCodeConsumptionProof(opencodeExportData{}, after, "ses_cold", "/work", nativeOpenCodePacket, now.Add(-500*time.Millisecond), true)
+	if err != nil {
+		t.Fatalf("multi-step assistant turn must prove consumption: %v", err)
 	}
 }
 
@@ -496,4 +608,21 @@ func TestPublicSendOpenCodeProviderErrorAndTimeoutAreBounded(t *testing.T) {
 			t.Fatalf("timeout retried prompt %d times", f.promptCalls)
 		}
 	})
+}
+
+func TestPublicSendOpenCodeNeverSendsPaneKeys(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	f, restore := newOpenCodeSendFixture(t, "cold-session")
+	defer restore()
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
+	if err != nil {
+		t.Fatalf("cold session delivery failed: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
+	}
+	if f.keys != 0 {
+		t.Fatalf("OpenCode delivery must never send keys to the pane: keys=%d", f.keys)
+	}
 }

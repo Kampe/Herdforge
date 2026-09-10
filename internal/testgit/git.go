@@ -23,6 +23,8 @@ func Command(dir string, args ...string) *exec.Cmd {
 		"-c", "user.signingKey=",
 		"-c", "user.name=Herdforge Test",
 		"-c", "user.email=herdforge-test@example.invalid",
+		"-c", "maintenance.auto=false",
+		"-c", "gc.auto=0",
 		// A fixture must never be able to turn an accidentally inherited
 		// GitHub origin into a real network read or push. Local bare remotes
 		// used by tests do not match these URL forms and remain usable.

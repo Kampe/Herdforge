@@ -7713,6 +7713,23 @@ func liveRouteCount(provider, model, pool string) (int, error) {
 }
 
 // runRoute is the herd-route CLI: pick a surface for a task shape.
+// routeComputedQuota is the exact quota read `herd route` uses to rank
+// candidates. FAC-786: this was an inline usage.FetchSnapshot() call, which
+// bypasses the per-provider 429 backoff and single-flight cache entirely --
+// every `herd route` invocation during a provider rate limit re-hit that
+// provider's usage endpoint unbounded and never saw the stale-reading
+// fallback the launch path gets. Named and extracted (rather than left
+// inline in runRoute) so a test can call the identical production line
+// directly -- runRoute itself can't be safely invoked in a test process
+// because its failure path calls os.Exit.
+func routeComputedQuota(e *usage.QuotaEngine) map[string]usage.BurnState {
+	computed := map[string]usage.BurnState{}
+	if snap, _, err := usage.FetchSnapshotCached(); err == nil {
+		computed = e.ComputeAll(snap)
+	}
+	return computed
+}
+
 func runRoute() {
 	fs := flag.NewFlagSet("route", flag.ExitOnError)
 	provider := fs.String("provider", "", "Pin the candidate set to one provider")
@@ -7731,10 +7748,7 @@ func runRoute() {
 	}
 
 	e := usage.NewQuotaEngine()
-	computed := map[string]usage.BurnState{}
-	if snap, err := usage.FetchSnapshot(); err == nil {
-		computed = e.ComputeAll(snap)
-	}
+	computed := routeComputedQuota(e)
 	sr := router.NewRouter(e, computed)
 	// CHA-2451: same advertising probe budget as resolve-lane. Launch Decide
 	// keeps defaultProbes via its own NewRouter path.

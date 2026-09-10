@@ -1,6 +1,7 @@
 package herdr
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os/exec"
@@ -190,5 +191,38 @@ func TestAgentList_DecodesSessionAndCounters(t *testing.T) {
 	}
 	if agents[1].Session.Value != "" || agents[1].StateChangeSeq != 20 {
 		t.Fatalf("grok row: %+v", agents[1])
+	}
+}
+
+func TestAgentList_DecodesAcceptedModelRouteFields(t *testing.T) {
+	restore := SetRunHerdrContextForTest(func(_ context.Context, args ...string) (string, error) {
+		return `{"result":{"agents":[
+			{
+				"name":"forge-worker",
+				"agent":"opencode",
+				"agent_status":"working",
+				"pane_id":"p-1",
+				"tab_id":"t-1",
+				"workspace_id":"w-1",
+				"cwd":"/repo",
+				"revision":12,
+				"state_change_seq":4,
+				"tab_generation":1,
+				"session":{"source":"native","agent":"opencode","kind":"opencode","value":"sess-1"},
+				"model":"claude-3-5-sonnet",
+				"provider":"anthropic"
+			}
+		],"type":"agent_list"}}`, nil
+	})
+	defer restore()
+	agents, err := AgentList()
+	if err != nil || len(agents) != 1 {
+		t.Fatalf("AgentList: %v %#v", err, agents)
+	}
+	if agents[0].ExpectedModel != "claude-3-5-sonnet" {
+		t.Errorf("expected ExpectedModel %q, got %q", "claude-3-5-sonnet", agents[0].ExpectedModel)
+	}
+	if agents[0].ExpectedProvider != "anthropic" {
+		t.Errorf("expected ExpectedProvider %q, got %q", "anthropic", agents[0].ExpectedProvider)
 	}
 }

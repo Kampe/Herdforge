@@ -53,6 +53,23 @@ worktree_bootstrap:
   toolchain: "go"
   command: ["go", "mod", "download"]
 
+# FAC-613: enable the existing governor only for receipt-derived, private
+# bootstrap build caches. Ambient user/foreign GOCACHE remains unmanaged.
+resource_governor:
+  version: "v1"
+  orphan_derived_targets: ["bootstrap-go-build"]
+  orphan_cache_ttl: "24h"
+  orphan_cache_budget_bytes: 8589934592
+  pressure_bytes: 8589934592
+  recovery_bytes: 17179869184
+  task_reserve_bytes: 2147483648
+  max_dispatch_concurrency: 2
+  reap_batch_limit: 4
+  lock_timeout: "5s"
+  lock_retry: "100ms"
+  allow_apply: true
+  apply_before_dispatch: true
+
 # The forge fleet — the complete role roster (FAC-127). Soft model pins below
 # are roster defaults only. FAC-142 SurfaceRouter.Decide owns the live
 # provider/model/effort/pool for every worker and reviewer launch; FAC-139

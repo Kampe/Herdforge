@@ -28,6 +28,15 @@ func TestResourceGovernorValidate(t *testing.T) {
 	if err := orphans.Validate(); err != nil {
 		t.Fatalf("supported orphan derived targets rejected: %v", err)
 	}
+	managedOnly := ResourceGovernor{
+		Version: "v1", OrphanDerivedTargets: []string{"bootstrap-go-build"},
+		OrphanCacheTTL: "24h", OrphanCacheBudgetBytes: 1 << 30,
+		PressureBytes: 10, RecoveryBytes: 20, TaskReserveBytes: 5,
+		MaxDispatchConcurrency: 2, ReapBatchLimit: 2, LockTimeout: "2s", LockRetry: "25ms",
+	}
+	if err := managedOnly.Validate(); err != nil {
+		t.Fatalf("managed-only orphan policy rejected: %v", err)
+	}
 
 	tests := []struct {
 		name string

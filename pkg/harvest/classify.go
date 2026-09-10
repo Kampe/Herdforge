@@ -3,6 +3,8 @@ package harvest
 import (
 	"regexp"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/patterns"
 )
 
 type Classification string
@@ -27,8 +29,6 @@ var (
 	// CHA-281: genuine provider exhaustion, not review content that discusses rate limits.
 	// Requires exhaustion phrasing AND exclusion of text carrying review markers.
 	quotaRE = regexp.MustCompile(`(?i)(out of credits|too many requests|429 too many|(rate\s*limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit)|exceeded your (quota|rate|usage|limit))`)
-	// Exclude review markers — a reviewer analyzing rate-limit code should not match QUOTA.
-	reviewMarkerRE = regexp.MustCompile(`(?i)verdict:\s*|merge recommendation:\s*|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
 	// Unconsumed: prompt prefix ❯ with no status/worked-for marker
 	unconsumedRE   = regexp.MustCompile(`(?m)^❯\s`)
 	statusWorkedRE = regexp.MustCompile(`(?i)Worked for|Status:`)
@@ -53,7 +53,7 @@ func ClassifyText(text string) Classification {
 	// QUOTA: must match exhaustion pattern AND not match review markers.
 	// This prevents false-positives when a reviewer discusses rate-limit/429/quota
 	// code in a code review context.
-	if quotaRE.MatchString(text) && !reviewMarkerRE.MatchString(text) {
+	if quotaRE.MatchString(text) && !patterns.ReviewMarkerPattern().MatchString(text) {
 		return ClassificationQuota
 	}
 	// Unconsumed: pane shows a prompt prefix but no status/work evidence.
