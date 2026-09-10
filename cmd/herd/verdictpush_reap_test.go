@@ -32,7 +32,6 @@ func reapAgent(status string, focused bool) herdr.AgentEntry {
 	}
 }
 
-
 func emitReapAck(t *testing.T, root, artifactPath string) {
 	t.Helper()
 	body, err := os.ReadFile(artifactPath)

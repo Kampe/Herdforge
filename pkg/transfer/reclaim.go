@@ -33,8 +33,11 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +59,13 @@ const (
 	// chunks and enumeration stops once the bundle-name budget is met, so a
 	// directory with unbounded non-bundle evidence is never fully loaded.
 	dirChunkSize = 256
+
+	// reclaimMaxPassDuration is the longest pass the CLI schedules (the
+	// 15-minute bundle-reclaim context). The native lock's stale-age bound
+	// must exceed any supported pass so a LIVE holder is never broken for
+	// age mid-pass; dead holders are still broken immediately by pid.
+	reclaimMaxPassDuration  = 15 * time.Minute
+	bundleReclaimLockMaxAge = 35 * time.Minute
 )
 
 // ReaderStatus is deliberately tri-state. Missing reader inspection never
@@ -98,12 +108,15 @@ type ReclaimOptions struct {
 	LiveReader func(ctx context.Context, path string) (ReaderStatus, error)
 }
 
-// FileDisposition records one scanned bundle file's outcome.
+// FileDisposition records one scanned bundle file's outcome. Digest is the
+// manifest-pinned content identity admitted for deletion, carried into the
+// receipt so every reclaimed name is bound to the exact bytes deleted.
 type FileDisposition struct {
 	Name   string `json:"name"`
 	Bytes  int64  `json:"bytes"`
 	Action string `json:"action"`
 	Reason string `json:"reason,omitempty"`
+	Digest string `json:"digest,omitempty"`
 }
 
 // ReclaimReport is the per-pass receipt. ReclaimedBytes is actual freed
@@ -134,10 +147,6 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 	if err != nil {
 		return report, err
 	}
-	manifest, err := LoadRetentionManifest(dir, opts.Manifest)
-	if err != nil {
-		return report, err
-	}
 	if strings.TrimSpace(opts.LockDir) == "" {
 		opts.LockDir = filepath.Join(opts.RepoRoot, lock.DefaultRelDir)
 	}
@@ -147,6 +156,9 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 	}
 	opts.LockDir = filepath.Join(lockDirAbs, filepath.Base(opts.LockDir))
 	shared := lock.NewDirLock(opts.LockDir)
+	// A reclaim pass may legitimately run for the whole 15-minute CLI window;
+	// the lock's stale-age bound must never fire while this holder is alive.
+	shared.SetMaxAge(bundleReclaimLockMaxAge)
 	var lockOwned bool
 	// Re-entrancy is exclusively the `herd lock with` contract: the env names
 	// THIS lockdir. An existing lock held by anyone else must block/refuse
@@ -165,6 +177,14 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 		defer shared.Release()
 	}
 
+	// The authority snapshot is taken under the native lock, never before
+	// blocking on it, and is revalidated against the file immediately
+	// before every unlink.
+	manifest, err := LoadRetentionManifest(dir, opts.Manifest)
+	if err != nil {
+		return report, err
+	}
+
 	maxFiles := opts.MaxFiles
 	if maxFiles <= 0 {
 		maxFiles = DefaultMaxFiles
@@ -181,43 +201,26 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 	if reader == nil {
 		reader = DefaultLsofReader
 	}
+	// plannedBytes is the ONE cumulative byte counter the budget enforces:
+	// it advances with would-reclaim bytes in dry-run and with actually
+	// reclaimed bytes in act, so --max-bytes bounds destructive work.
+	var plannedBytes int64
 
 	// Bounded, deterministic enumeration: stream directory chunks, collect
 	// only manifest-relevant .bundle names up to the file budget, then sort.
-	var bundleNames []string
+	// Enumeration is fail-closed: a directory-read error fails the whole
+	// pass instead of truncating the census silently.
 	dirFile, err := os.Open(dir)
 	if err != nil {
 		return report, fmt.Errorf("bundle reclaim: read %s: %w", dir, err)
 	}
 	defer dirFile.Close()
-enumerate:
-	for {
-		if ctx.Err() != nil {
-			report.Partial, report.Reason = true, "timeout"
-			break
-		}
-		chunk, readErr := dirFile.ReadDir(dirChunkSize)
-		for _, entry := range chunk {
-			name := entry.Name()
-			if !strings.HasSuffix(name, bundleSuffix) {
-				report.NonBundleEntries++
-				continue
-			}
-			if len(bundleNames) >= maxFiles {
-				report.Partial, report.Reason = true, "file-budget"
-				break enumerate
-			}
-			bundleNames = append(bundleNames, name)
-		}
-		if readErr != nil {
-			if !errors.Is(readErr, context.DeadlineExceeded) {
-				if ctx.Err() != nil {
-					report.Partial, report.Reason = true, "timeout"
-					break
-				}
-			}
-			break
-		}
+	bundleNames, enumErr := enumerateBundleNames(dirFile, dirChunkSize, maxFiles, ctx, &report)
+	if enumErr != nil {
+		return report, fmt.Errorf("bundle reclaim: enumeration failed fail-closed: %w", enumErr)
+	}
+	if report.Partial && report.Reason == "timeout" {
+		return report, nil
 	}
 	sort.Strings(bundleNames)
 
@@ -232,11 +235,18 @@ enumerate:
 			continue
 		}
 		disp.Bytes = st.Size()
-		if manifestGate := !manifestContains(manifest, name); manifestGate {
+		entry, admitted := manifestEntry(manifest, name)
+		if !admitted {
 			disp.Action, disp.Reason = "retained", "not-in-retention-manifest"
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
+		if retain := gate(&disp, "content-identity-mismatch",
+			st.Size() != entry.Size || st.ModTime().UnixNano() != entry.ModTimeUnixNano, ""); retain {
+			report.Dispositions = append(report.Dispositions, disp)
+			continue
+		}
+		disp.Digest = entry.Digest
 		if retain := gate(&disp, "not-regular-file", !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0, ""); retain {
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
@@ -283,13 +293,14 @@ enumerate:
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
-		if report.WouldReclaimBytes+st.Size() > maxBytes {
+		if plannedBytes+st.Size() > maxBytes {
 			report.Partial, report.Reason = true, "byte-budget"
 			break
 		}
 		if !opts.Act {
 			report.Candidates++
 			report.WouldReclaimBytes += st.Size()
+			plannedBytes += st.Size()
 			disp.Action = "eligible-candidate"
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
@@ -300,7 +311,12 @@ enumerate:
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
-		if reason := revalidateBeforeUnlink(ctx, opts, reader, dir, dirFile, dirBefore, path, st, tips); reason != "" {
+		if reason := revalidateBeforeUnlink(ctx, opts, reader, dir, dirFile, dirBefore, path, st, tips, entry.Digest); reason != "" {
+			disp.Action, disp.Reason = "retained", reason
+			report.Dispositions = append(report.Dispositions, disp)
+			continue
+		}
+		if reason := revalidateManifestEntry(opts.Manifest, dir, name, entry); reason != "" {
 			disp.Action, disp.Reason = "retained", reason
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
@@ -320,19 +336,67 @@ enumerate:
 		}
 		report.Reclaimed++
 		report.ReclaimedBytes += st.Size()
+		plannedBytes += st.Size()
 		disp.Action = "reclaimed"
 		report.Dispositions = append(report.Dispositions, disp)
 	}
 	return report, nil
 }
 
-func manifestContains(m RetentionManifest, name string) bool {
-	for _, listed := range m.Bundles {
-		if listed == name {
-			return true
+// revalidateManifestEntry re-reads the coordinator's manifest under the
+// native lock immediately before unlink and requires the same pinned
+// content identity. A withdrawn entry, a rewritten manifest, or any load
+// failure revokes deletion authority.
+func revalidateManifestEntry(manifestPath, root, name string, admitted RetentionEntry) string {
+	current, err := LoadRetentionManifest(root, manifestPath)
+	if err != nil {
+		return fmt.Sprintf("manifest-withdrawn-under-lock: %v", err)
+	}
+	entry, ok := manifestEntry(current, name)
+	if !ok {
+		return "manifest-withdrawn-under-lock: bundle no longer listed by the coordinator manifest"
+	}
+	if entry != admitted {
+		return "manifest-withdrawn-under-lock: admitted identity no longer matches the manifest"
+	}
+	return ""
+}
+
+// enumerateBundleNames streams directory chunks until EOF, budget, or
+// timeout. Any other read error is a hard failure — a truncated census
+// must never look like a complete one.
+func enumerateBundleNames(d dirReader, chunk, maxFiles int, ctx context.Context, report *ReclaimReport) ([]string, error) {
+	var names []string
+	for {
+		if ctx.Err() != nil {
+			report.Partial, report.Reason = true, "timeout"
+			return names, nil
+		}
+		entries, readErr := d.ReadDir(chunk)
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasSuffix(name, bundleSuffix) {
+				report.NonBundleEntries++
+				continue
+			}
+			if len(names) >= maxFiles {
+				report.Partial, report.Reason = true, "file-budget"
+				return names, nil
+			}
+			names = append(names, name)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return names, nil
+			}
+			return nil, readErr
 		}
 	}
-	return false
+}
+
+// dirReader is the slice of *os.File enumeration consumes.
+type dirReader interface {
+	ReadDir(n int) ([]os.DirEntry, error)
 }
 
 func gate(disp *FileDisposition, reason string, cond bool, detail string) bool {
@@ -379,19 +443,21 @@ func resolveScope(ctx context.Context, opts ReclaimOptions) (string, error) {
 	if filepath.Clean(dirCanon) != filepath.Clean(canonAbs) {
 		return "", fmt.Errorf("bundle reclaim: bundle directory belongs to another repository")
 	}
-	if !hasPathComponent(dir, ".herd") {
-		return "", fmt.Errorf("bundle reclaim: bundle directory is not inside owned .herd state")
+	// The bundle directory must live inside the containing worktree's OWN
+	// .herd state — any `.herd` component anywhere above (pool slots, outer
+	// checkouts) does not confer ownership. top is the actual repository
+	// that contains dir; the component-safe relative path from top must
+	// enter .herd first.
+	topReal, err := filepath.EvalSymlinks(strings.TrimSpace(top))
+	if err != nil {
+		return "", fmt.Errorf("bundle reclaim: bundle directory repository root: %w", err)
+	}
+	rel, err := filepath.Rel(topReal, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") ||
+		(rel != ".herd" && !strings.HasPrefix(rel, ".herd/")) {
+		return "", fmt.Errorf("bundle reclaim: bundle directory is not inside the containing repository's owned .herd state")
 	}
 	return dir, nil
-}
-
-func hasPathComponent(path, want string) bool {
-	for component := path; component != filepath.Dir(component); component = filepath.Dir(component) {
-		if filepath.Base(component) == want {
-			return true
-		}
-	}
-	return false
 }
 
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
@@ -511,7 +577,7 @@ func containmentReason(ctx context.Context, repoRoot string, tips []bundleTip) s
 // revalidateBeforeUnlink re-runs scope, parent identity, reader, and
 // containment proof immediately before the directory-relative unlink; any
 // drift retains the bundle.
-func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader func(context.Context, string) (ReaderStatus, error), dir string, dirFile *os.File, dirBefore os.FileInfo, path string, before os.FileInfo, tips []bundleTip) string {
+func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader func(context.Context, string) (ReaderStatus, error), dir string, dirFile *os.File, dirBefore os.FileInfo, path string, before os.FileInfo, tips []bundleTip, pinnedDigest string) string {
 	dirNow, err := os.Lstat(dir)
 	if err != nil || dirBefore == nil || !os.SameFile(dirBefore, dirNow) {
 		return "parent-changed-during-reclaim: bundle directory identity moved between census and unlink"
@@ -533,6 +599,13 @@ func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader fun
 	if status != ReaderAbsent {
 		return fmt.Sprintf("reader-%s-at-unlink", status)
 	}
+	digest, err := fileContentDigest(path, before.Size())
+	if err != nil {
+		return fmt.Sprintf("content-identity-unknown-at-unlink: %v", err)
+	}
+	if digest != pinnedDigest {
+		return fmt.Sprintf("content-identity-mismatch-at-unlink: sha256 %s does not match the manifest-pinned digest", digest)
+	}
 	if !verifyBundle(ctx, opts.RepoRoot, path) {
 		return "bundle-verify-failed-at-unlink"
 	}
@@ -540,6 +613,25 @@ func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader fun
 		return "revalidated-" + reason
 	}
 	return ""
+}
+
+// fileContentDigest streams the file's full content through SHA-256 under a
+// size bound: more than wantSize bytes is a mismatch, never a truncation.
+func fileContentDigest(path string, wantSize int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(f, wantSize+1))
+	if err != nil {
+		return "", err
+	}
+	if n != wantSize {
+		return "", fmt.Errorf("content length %d does not match pinned size %d", n, wantSize)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // DefaultLsofReader is the authoritative no-reader proof. Missing tooling,

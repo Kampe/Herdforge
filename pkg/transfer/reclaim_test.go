@@ -76,15 +76,30 @@ func reclaimFixtureSetup(t *testing.T) reclaimFixture {
 
 func (f reclaimFixture) writeManifest(names ...string) string {
 	f.t.Helper()
-	body, err := json.Marshal(RetentionManifest{Version: 1, Authority: "forge-orchestrator-test", Bundles: names})
+	manifest := RetentionManifest{Version: 2, Authority: "forge-orchestrator-test"}
+	for _, name := range names {
+		path := filepath.Join(f.bundleDir, name)
+		st, err := os.Stat(path)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		digest, err := fileContentDigest(path, st.Size())
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		manifest.Bundles = append(manifest.Bundles, RetentionEntry{
+			Name: name, Digest: digest, Size: st.Size(), ModTimeUnixNano: st.ModTime().UnixNano(),
+		})
+	}
+	body, err := json.Marshal(manifest)
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	path := filepath.Join(f.bundleDir, "retention-manifest.json")
-	if err := os.WriteFile(path, body, 0644); err != nil {
+	writePath := filepath.Join(f.bundleDir, "retention-manifest.json")
+	if err := os.WriteFile(writePath, body, 0644); err != nil {
 		f.t.Fatal(err)
 	}
-	return path
+	return writePath
 }
 
 func absentReader() func(context.Context, string) (ReaderStatus, error) {
@@ -181,12 +196,16 @@ func TestReclaimNestedLockDoesNotReleaseForeignHolder(t *testing.T) {
 // Guard 2: explicit retention-manifest authority.
 func TestReclaimRetainsBundlesOutsideRetentionManifest(t *testing.T) {
 	f := reclaimFixtureSetup(t)
+	other := filepath.Join(f.bundleDir, "some-other.bundle")
+	if out, err := exec.Command("git", "-C", f.repoRoot, "bundle", "create", other, "main").CombinedOutput(); err != nil {
+		t.Fatalf("bundle create: %v\n%s", err, out)
+	}
 	f.writeManifest("some-other.bundle")
 	report, err := Reclaim(context.Background(), opts(f, func(o *ReclaimOptions) { o.Act = true }))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Reclaimed != 0 || report.Candidates != 0 || report.Dispositions[0].Reason != "not-in-retention-manifest" {
+	if len(report.Dispositions) < 1 || report.Dispositions[0].Name != "eligible-transfer.bundle" || report.Dispositions[0].Reason != "not-in-retention-manifest" {
 		t.Fatalf("unmanifested bundle must be retained: %+v", report)
 	}
 	if _, err := os.Lstat(f.bundlePath); err != nil {
@@ -208,7 +227,7 @@ func TestReclaimRequiresValidManifest(t *testing.T) {
 	}
 	outsideDir := t.TempDir()
 	outside := filepath.Join(outsideDir, "elsewhere.json")
-	if err := os.WriteFile(outside, []byte(`{"version":1,"authority":"x","bundles":["eligible-transfer.bundle"]}`), 0644); err != nil {
+	if err := os.WriteFile(outside, []byte(`{"version":2,"authority":"x","bundles":[{"name":"eligible-transfer.bundle","digest":"`+strings.Repeat("a", 64)+`","size":1,"mod_time_unix_nano":1}]}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Reclaim(context.Background(), opts(f, func(o *ReclaimOptions) { o.Manifest = outside })); err == nil || !strings.Contains(err.Error(), "not inside the owned root") {
@@ -502,7 +521,7 @@ func TestReclaimScopeRefusals(t *testing.T) {
 	if err := os.MkdirAll(naked, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Reclaim(context.Background(), ReclaimOptions{RepoRoot: f.repoRoot, Root: naked, Manifest: f.manifest}); err == nil || !strings.Contains(err.Error(), "not inside owned .herd state") {
+	if _, err := Reclaim(context.Background(), ReclaimOptions{RepoRoot: f.repoRoot, Root: naked, Manifest: f.manifest}); err == nil || !strings.Contains(err.Error(), "owned .herd state") {
 		t.Fatalf("root without .herd ownership must refuse: %v", err)
 	}
 	if _, err := Reclaim(context.Background(), ReclaimOptions{RepoRoot: "", Root: f.bundleDir, Manifest: f.manifest}); err == nil {

@@ -14,6 +14,8 @@ package lock
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -50,6 +52,7 @@ const (
 type DirLock struct {
 	dir    string
 	holder string
+	token  string
 	maxAge time.Duration
 }
 
@@ -81,6 +84,9 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 	for {
 		l.breakIfStale()
 		if err := os.Mkdir(l.dir, 0o755); err == nil {
+			// owner token: Release must never remove a lock that a successor
+			// took over in the meantime.
+			l.token = newOwnerToken()
 			// holder write is best-effort (zsh `> "$holder" ... || true`).
 			l.writeHolder(reason)
 			return nil
@@ -97,8 +103,15 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 	}
 }
 
-// Release removes the lock. Advisory-only: ownership is by convention.
+// Release removes the lock — but only when this owner still owns it. If a
+// successor took the lock over (stale break, takeover) and wrote its own
+// holder token, the stale owner's release is a no-op instead of destroying
+// the successor's exclusion. Holder files from before owner tokens existed
+// (no token line) keep the historical remove behavior.
 func (l *DirLock) Release() {
+	if current := holderToken(l.holder); current != "" && current != l.token {
+		return
+	}
 	_ = os.RemoveAll(l.dir)
 }
 
@@ -176,11 +189,36 @@ func (l *DirLock) writeHolder(reason string) {
 	if agent == "" {
 		agent = username()
 	}
-	content := fmt.Sprintf("pid=%d\nagent=%s\nreason=%s\n", os.Getpid(), agent, reason)
+	content := fmt.Sprintf("pid=%d\nagent=%s\nreason=%s\ntoken=%s\n", os.Getpid(), agent, reason, l.token)
 	if f, err := os.OpenFile(l.holder, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err == nil {
 		_, _ = f.WriteString(content)
 		_ = f.Close()
 	}
+}
+
+// holderToken returns the `token=` value in the holder file, or "".
+func holderToken(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "token=") {
+			return strings.TrimPrefix(line, "token=")
+		}
+	}
+	return ""
+}
+
+func newOwnerToken() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("fallback-%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf[:])
 }
 
 func username() string {
