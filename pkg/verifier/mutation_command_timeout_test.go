@@ -163,12 +163,8 @@ func TestRunMutationCheck_CommandDeadlineExcludesPreparation(t *testing.T) {
 		}
 		gate.Do(func() {
 			if _, hasDeadline := ctx.Deadline(); hasDeadline {
-				// OLD placement: preparation consumes the command deadline.
-				close(ready)
-				return
+				t.Errorf("commandCtx has deadline during preparation: preparation must exclude command deadline")
 			}
-			// New placement: preparation is released explicitly before the timer
-			// is armed and the real owned command is handed FD4 cont.
 			close(ready)
 			<-release
 		})
@@ -179,15 +175,16 @@ func TestRunMutationCheck_CommandDeadlineExcludesPreparation(t *testing.T) {
 		result, _ := v.RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
 			CandidateSHA: candidate, EnvironmentPolicy: EnvironmentPolicyInherited,
 			TargetFile: "candidate.txt", OriginalCode: "original\n", MutantCode: "mutant\n",
-			Timeout: 100 * time.Millisecond,
+			Timeout: 2 * time.Second,
 		})
 		done <- result
 	}()
 	<-ready
+	time.Sleep(200 * time.Millisecond)
 	close(release)
 	result := <-done
 	if result == nil || result.Outcome != OutcomePASS || !result.Killed || !result.Restored {
-		t.Fatalf("100ms command deadline must exclude preparation: %+v", result)
+		t.Fatalf("command deadline must exclude preparation: %+v", result)
 	}
 	if result.Baseline.ExitCode != 0 || result.Mutant.ExitCode != 1 || result.Final.ExitCode != 0 {
 		t.Fatalf("expected 0/1/0 exits: baseline=%d mutant=%d final=%d", result.Baseline.ExitCode, result.Mutant.ExitCode, result.Final.ExitCode)
@@ -209,6 +206,9 @@ func TestRunMutationCheck_ParentCancelWhileQueuedStartsNoChild(t *testing.T) {
 	baselineDone := make(chan struct{})
 	slotHeld := make(chan struct{})
 	v := NewVerifierArgs(mutantStartArgv(marker))
+	v.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	v.afterMutationApplied = func() {
 		_ = os.Remove(marker)
 		close(baselineDone)
@@ -270,6 +270,9 @@ func TestRunMutationCheck_SlotWaitExhaustionStartsNoCommand(t *testing.T) {
 	baselineDone := make(chan struct{})
 	slotHeld := make(chan struct{})
 	v := NewVerifierArgs(commandStartArgv(marker))
+	v.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	v.afterMutationApplied = func() {
 		_ = os.Remove(marker)
 		close(baselineDone)
