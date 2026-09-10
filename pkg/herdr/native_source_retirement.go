@@ -153,7 +153,7 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 		if r.PaneID != "" && m.PaneID != "" && r.PaneID != m.PaneID {
 			continue
 		}
-		if r.CandidateSHA != "" && m.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA {
+		if r.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA && r.CandidateSHA != m.BaseSHA {
 			continue
 		}
 		matching = append(matching, r)
@@ -162,15 +162,15 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 		return matching[0]
 	}
 	if len(matching) > 1 {
-		// If multiple receipts exist, check if there's an exact candidate+session match without ambiguity
-		var exactCandidate []launch.Receipt
+		// If multiple receipts exist, check if there's an exact candidate+session or base+session match without ambiguity
+		var exactMatch []launch.Receipt
 		for _, r := range matching {
-			if r.CandidateSHA == m.CandidateSHA && (m.SessionID == "" || r.HerdrSession == m.SessionID) {
-				exactCandidate = append(exactCandidate, r)
+			if (r.CandidateSHA == m.CandidateSHA || r.CandidateSHA == m.BaseSHA || r.CandidateSHA == "") && (m.SessionID == "" || r.HerdrSession == m.SessionID) {
+				exactMatch = append(exactMatch, r)
 			}
 		}
-		if len(exactCandidate) == 1 {
-			return exactCandidate[0]
+		if len(exactMatch) == 1 {
+			return exactMatch[0]
 		}
 		// If ambiguous (multiple conflicting active receipts), fail closed
 		return launch.Receipt{}

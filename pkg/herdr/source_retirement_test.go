@@ -495,3 +495,79 @@ func TestEnrollReadySourceManifests_CorruptRegistryFailsClosed(t *testing.T) {
 		t.Fatal("expected failure on corrupt registry file, but got nil")
 	}
 }
+
+type mixedBatchFake struct {
+	events []string
+}
+
+func (f *mixedBatchFake) Observe(m SourceRetirementManifest) (SourceRetirementEvidence, error) {
+	if m.Generation == "g-fail-obs" {
+		return SourceRetirementEvidence{}, errors.New("simulated observation transport failure")
+	}
+	e := sourceRetirementEvidence(m)
+	if m.Generation == "g-blocked" {
+		e.Worktree.Dirty = true
+	}
+	return e, nil
+}
+func (f *mixedBatchFake) Revalidate(m SourceRetirementManifest, phase string) error {
+	f.events = append(f.events, "revalidate:"+m.Generation)
+	return nil
+}
+func (f *mixedBatchFake) Journal(m SourceRetirementManifest, phase string) error {
+	f.events = append(f.events, "journal-"+phase+":"+m.Generation)
+	return nil
+}
+func (f *mixedBatchFake) Close(m SourceRetirementManifest) error {
+	f.events = append(f.events, "close:"+m.Generation)
+	return nil
+}
+func (f *mixedBatchFake) VerifyAbsence(m SourceRetirementManifest) error {
+	f.events = append(f.events, "verify-absence:"+m.Generation)
+	return nil
+}
+func (f *mixedBatchFake) Receipt(m SourceRetirementManifest, d SourceRetirementDecision) error {
+	f.events = append(f.events, "receipt:"+m.Generation)
+	return nil
+}
+
+func TestRetireSourceLanesContext_MixedBatchFailClosedIsolation(t *testing.T) {
+	mEligible := sourceRetirementManifest(t, "g-eligible")
+	mFailObs := sourceRetirementManifest(t, "g-fail-obs")
+	mBlocked := sourceRetirementManifest(t, "g-blocked")
+
+	f := &mixedBatchFake{}
+	report, err := RetireSourceLanesContext(nil, f, []SourceRetirementManifest{mEligible, mFailObs, mBlocked}, false)
+
+	// 1. Error must be non-zero and aggregated
+	if err == nil {
+		t.Fatal("expected aggregated non-zero error on mixed batch with observation failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "failure") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 2. Report counts: exactly 1 retired, 1 blocked, 1 failed
+	if report.Retired != 1 || report.Blocked != 1 || report.Failed != 1 {
+		t.Fatalf("expected 1 retired, 1 blocked, 1 failed; got %+v", report)
+	}
+
+	// 3. Eligible lane completed all lifecycle phases
+	wantEvents := []string{
+		"revalidate:g-eligible",
+		"journal-close-intent:g-eligible",
+		"close:g-eligible",
+		"verify-absence:g-eligible",
+		"journal-close-done:g-eligible",
+		"receipt:g-eligible",
+		"journal-complete:g-eligible",
+	}
+	if len(f.events) != len(wantEvents) {
+		t.Fatalf("unexpected events: got %v, want %v", f.events, wantEvents)
+	}
+	for i := range wantEvents {
+		if f.events[i] != wantEvents[i] {
+			t.Fatalf("event[%d] got %s want %s", i, f.events[i], wantEvents[i])
+		}
+	}
+}

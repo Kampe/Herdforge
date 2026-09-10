@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -14,9 +16,9 @@ import (
 // runSourceRetirementCleanup is shared by `herd cleanup` and the coordinator
 // lifecycle sweep. Its default is observe-only; callers must explicitly request acting.
 func runSourceRetirementCleanup(ctx context.Context, root string, dryRun bool) (herdr.SourceRetirementReport, error) {
-	var cfg *config.Config
-	if c, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml")); err == nil && c != nil {
-		cfg = c
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return herdr.SourceRetirementReport{}, fmt.Errorf("load herd configuration: %w", err)
 	}
 	repoIdent := ""
 	if id, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil {

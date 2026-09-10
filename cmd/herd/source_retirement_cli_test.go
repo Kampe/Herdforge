@@ -368,14 +368,28 @@ func TestDrainSourceRetirementWiredInDrainAdapters(t *testing.T) {
 	}
 }
 
-func TestSourceCleanupNativeWithoutHerdYamlSucceeds(t *testing.T) {
-	root := t.TempDir()
-	// No .herd/herd.yaml file created
-	report, err := runSourceRetirementCleanup(context.Background(), root, true)
+func TestSourceCleanupNative_HerdYamlAbsenceVsMalformed(t *testing.T) {
+	// 1. Absence is harmless (no configured cleanup authority)
+	rootClean := t.TempDir()
+	report, err := runSourceRetirementCleanup(context.Background(), rootClean, true)
 	if err != nil {
 		t.Fatalf("runSourceRetirementCleanup failed without herd.yaml: %v", err)
 	}
 	if report.Retired != 0 || len(report.Candidates) != 0 {
 		t.Fatalf("unexpected report on empty root: %+v", report)
+	}
+
+	// 2. Malformed configuration must fail closed and never be treated as harmless absence
+	rootMalformed := t.TempDir()
+	herdDir := filepath.Join(rootMalformed, ".herd")
+	if err := os.MkdirAll(herdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(herdDir, "herd.yaml"), []byte("invalid: yaml: [syntax"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, errMalformed := runSourceRetirementCleanup(context.Background(), rootMalformed, true)
+	if errMalformed == nil {
+		t.Fatal("expected malformed herd.yaml to fail closed with error, got nil")
 	}
 }

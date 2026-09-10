@@ -181,6 +181,16 @@ func ValidateSourceRetirementManifest(m SourceRetirementManifest) error {
 	return nil
 }
 
+func isAncestor(dir, ancestor, descendant string) bool {
+	if strings.TrimSpace(ancestor) == "" || strings.TrimSpace(descendant) == "" || strings.TrimSpace(dir) == "" {
+		return false
+	}
+	if ancestor == descendant {
+		return true
+	}
+	return exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
+}
+
 func isSourceRole(role string) bool {
 	r := strings.ToLower(strings.TrimSpace(role))
 	switch r {
@@ -238,7 +248,7 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 	if e.Launch.Repository != "" && !strings.EqualFold(e.Launch.Repository, m.Repository) {
 		return blockSourceRetirement("launch provenance repository mismatch")
 	}
-	if e.Launch.CandidateSHA != "" && e.Launch.CandidateSHA != m.CandidateSHA {
+	if e.Launch.CandidateSHA != "" && e.Launch.CandidateSHA != m.CandidateSHA && e.Launch.CandidateSHA != m.BaseSHA {
 		return blockSourceRetirement("launch provenance candidate SHA mismatch")
 	}
 	if e.Launch.TabID != "" && e.Launch.TabID != m.TabID {
@@ -710,7 +720,9 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 						continue
 					}
 					if r.CandidateSHA != "" && parsed.CandidateSHA != r.CandidateSHA {
-						continue
+						if !isAncestor(wtAbs, r.CandidateSHA, parsed.CandidateSHA) {
+							continue
+						}
 					}
 					if parsed.Branch != "" && r.Branch != "" && !strings.EqualFold(parsed.Branch, r.Branch) {
 						continue
@@ -735,7 +747,9 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 		}
 
 		baseSHA := candidateSHA
-		if baseOut, err := exec.Command("git", "-C", wtAbs, "merge-base", candidateSHA, "HEAD~1").Output(); err == nil && len(strings.TrimSpace(string(baseOut))) == 40 {
+		if r.CandidateSHA != "" && r.CandidateSHA != candidateSHA {
+			baseSHA = r.CandidateSHA
+		} else if baseOut, err := exec.Command("git", "-C", wtAbs, "merge-base", candidateSHA, "HEAD~1").Output(); err == nil && len(strings.TrimSpace(string(baseOut))) == 40 {
 			baseSHA = strings.TrimSpace(string(baseOut))
 		}
 
