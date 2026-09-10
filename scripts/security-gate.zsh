@@ -114,22 +114,50 @@ run_gosec() {
 	typeset -a subreports
 	subreports=()
 	local mdir subrep
+	typeset -i gosec_failures=0
+	local gosec_last_status=0
 	for gomod in go.mod **/go.mod; do
 		[[ -f "$gomod" ]] || continue
 		mdir="${gomod:h}"
 		subrep=$(mktemp)
 		subreports+=( "$subrep" )
 		cd "$scan_root/$mdir"
-		gosec -fmt=json -out="$subrep" --no-fail -exclude=G701,G702,G703,G704,G705,G706,G707,G708,G709,G710 ./... >/dev/null 2>&1 || true
+		# A module failure is recorded, not immediately fatal: remaining
+		# modules are still scanned. The recorded failure fails the gate
+		# below, so an operational gosec failure can never be evaluated
+		# as zero findings.
+		gosec -fmt=json -out="$subrep" --no-fail -exclude=G701,G702,G703,G704,G705,G706,G707,G708,G709,G710 ./... >/dev/null 2>&1 || { gosec_last_status=$?; gosec_failures=1; }
 		cd "$scan_root"
 	done
-	jq -s '{Issues: (map(.Issues // []) | add)}' "${subreports[@]}" > "$report"
+	# The per-module `|| true` intentionally keeps the scan running when
+	# individual modules fail, so a crashed gosec surfaces only as an
+	# empty, truncated, or malformed subreport. jq -s succeeds on zero
+	# input documents and yields {"Issues": null}, and a findings pipeline
+	# over that or over an empty report evaluates no findings — so every
+	# subreport must be validated as a complete JSON object with an
+	# Issues array before aggregation, and any scanner status other than
+	# success or timeout must fail the gate below.
+	for subrep in "${subreports[@]}"; do
+		if [[ ! -s "$subrep" ]] || ! jq -e 'type == "object" and (.Issues | type == "array")' "$subrep" >/dev/null 2>&1; then
+			print -u2 'error: gosec produced no complete JSON report'
+			return 1
+		fi
+	done
+	if (( gosec_failures )); then
+		print -u2 "error: gosec scanner failed with exit status $gosec_last_status"
+		return 1
+	fi
+	jq -s '{Issues: ((map(.Issues // []) | add) // [])}' "${subreports[@]}" > "$report"
 	rm -f "${subreports[@]}"
 }
 
 gosec_status=0
 run_with_timeout "$gosec_timeout" "gosec" run_gosec || gosec_status=$?
 if (( gosec_status == 124 )); then
+	exit 1
+fi
+if (( gosec_status != 0 )); then
+	print -u2 "error: gosec scanner failed with exit status $gosec_status"
 	exit 1
 fi
 

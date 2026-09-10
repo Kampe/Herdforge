@@ -102,6 +102,74 @@ grep -F -- "error: gosec timed out after 1s" "$gosec_precedence_out" >/dev/null 
 	exit 1
 }
 
+# A gosec crash that leaves an EMPTY subreport must fail closed with a
+# diagnostic naming gosec's report, not pass with zero findings, and not
+# surface as an unrelated jq iteration error.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		: > "${arg#-out=}"
+	fi
+done
+exit 2
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_crash_empty_out="$tmp/gosec-crash-empty.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_crash_empty_out" 2>&1; then
+	print -u2 "error: empty crashed gosec report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete JSON report' "$gosec_crash_empty_out" >/dev/null || {
+	print -u2 "error: missing empty gosec report diagnostic"
+	exit 1
+}
+
+# A gosec crash that leaves a MALFORMED subreport must fail closed; the
+# aggregation must not swallow the parse failure and evaluate zero findings.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print 'garbage{' > "${arg#-out=}"
+	fi
+done
+exit 2
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_crash_malformed_out="$tmp/gosec-crash-malformed.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_crash_malformed_out" 2>&1; then
+	print -u2 "error: malformed gosec report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete JSON report' "$gosec_crash_malformed_out" >/dev/null || {
+	print -u2 "error: missing malformed gosec report diagnostic"
+	exit 1
+}
+
+# An operational gosec failure (exit status 2) with a COMPLETE report must
+# fail closed: a status other than 0 or 124 is a scanner failure even when
+# the report looks usable.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Issues":[]}' > "${arg#-out=}"
+	fi
+done
+exit 2
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_status2_out="$tmp/gosec-status2.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_status2_out" 2>&1; then
+	print -u2 "error: gosec operational failure with complete report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec scanner failed with exit status 2' "$gosec_status2_out" >/dev/null || {
+	print -u2 "error: missing gosec scanner failure diagnostic"
+	exit 1
+}
+
 # 2. Test gitleaks timeout enforcement and child process cleanup
 cat << 'EOF' > "$mock_bin/gosec"
 #!/usr/bin/env zsh
