@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 type LaneCategory string
@@ -596,7 +598,7 @@ func orphanTargetPath(orphan, policyTarget string) (string, string, error) {
 	case "graph.db":
 		return filepath.Join(orphan, "graph.db"), "graph.db", nil
 	case "bootstrap-go-mod":
-		data, err := os.ReadFile(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json"))
+		data, err := os.ReadFile(filepath.Join(orphan, filepath.FromSlash(gitroot.BootstrapReceiptPath)))
 		if err != nil {
 			return "", "", errors.New("bootstrap_receipt_unavailable")
 		}

@@ -67,6 +67,7 @@ const (
 	ManagedWorktreePathFragment = "/.herd/worktrees/"
 	LegacyWorktreePathFragment  = "/.worktrees/"
 	TaskContextFile             = "TASK-CONTEXT.json"
+	BootstrapReceiptPath        = ".herd/bootstrap/receipt.json"
 	ReviewQueueLeaf             = "harvest-queue.jsonl"
 )
 

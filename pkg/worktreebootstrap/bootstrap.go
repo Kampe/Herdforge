@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 const receiptVersion = 1
@@ -137,7 +138,7 @@ func (e Executor) Execute(ctx context.Context, worktreePath string, contract con
 	runtimeRel := filepath.ToSlash(filepath.Join(".herd", "bootstrap", "runtime", toolchainDigest))
 	want := Receipt{Version: receiptVersion, ContractDigest: contractDigest, ToolchainDigest: toolchainDigest, CacheDir: cacheRel, RuntimeDir: runtimeRel}
 
-	receiptPath := filepath.Join(root, ".herd", "bootstrap", "receipt.json")
+	receiptPath := filepath.Join(root, filepath.FromSlash(gitroot.BootstrapReceiptPath))
 	if current, exists, err := readReceipt(receiptPath); err != nil {
 		return nil, err
 	} else if exists && current == want && directoriesExist(root, want) {
