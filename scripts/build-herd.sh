@@ -21,6 +21,9 @@ if [ "$top" != "$root" ]; then
   exit 1
 fi
 
+cd "$root"
+
+
 mkdir -p "$root/bin"
 rev=$(git -C "$root" rev-parse HEAD)
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
