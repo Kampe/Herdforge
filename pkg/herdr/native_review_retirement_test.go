@@ -603,6 +603,21 @@ func TestNativeReviewRetirement_NegativeSafetyFailsClosed(t *testing.T) {
 		Generation: "gen-safety", RecordedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	})
 
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("exit status 1")
+		}
+		return `{"result":{}}`, nil
+	}
+
 	op := &NativeReviewRetirementOp{Root: root, RepositoryIdentity: "example.invalid/fixture"}
 
 	// 1. Negative: dirty worktree before worktree phase fails closed
