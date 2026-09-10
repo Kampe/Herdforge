@@ -444,6 +444,67 @@ func TestFenceOpStatusMalformedBodyFailsClosed(t *testing.T) {
 	}
 }
 
+func TestFenceOpTaskBindingMismatchRefusesAppliedAttribution(t *testing.T) {
+	// FAIL1947 reproduction: local store holds an ambiguous receipt for
+	// task "board-fixture-1", but the broker returns an applied receipt for
+	// "foreign-task" under the same operation ID. The system must refuse
+	// applied attribution, fail closed (exit 1 on status), and refuse to settle.
+	f := seedFenceOpFixture(t, fenceOpFixtureAmbiguous, true)
+	before := snapshotFenceOpFixture(t, f)
+	rb, srv := newRecordingBroker(t, func(opID string) (int, string) {
+		return 200, fmt.Sprintf(`{"applied":true,"ambiguous":false,"op_id":%q,"task_id":"foreign-task","expected_status":"done"}`, opID)
+	})
+
+	// 1. herd fence-op status <opID>: must refuse with non-zero exit (1) and not attribute applied.
+	exit, stdout, stderr := runFenceOpCLI(t, f, srv.URL, "fence-op", "status", f.opID, "--json")
+	if exit != 1 {
+		t.Fatalf("task binding mismatch on status must exit 1, got %d (stdout=%s stderr=%s)", exit, stdout, stderr)
+	}
+	m := decodeFenceOpJSON(t, stdout)
+	if m["applied"] == true {
+		t.Fatalf("task binding mismatch must never be attributed applied: %v", m)
+	}
+	if state, _ := m["state"].(string); state != "unknown" {
+		t.Fatalf("expected state=unknown on mismatch refusal, got %v", m["state"])
+	}
+	refusals, _ := m["refusals"].([]any)
+	if len(refusals) == 0 {
+		t.Fatalf("expected refusals in status JSON output, got %v", m)
+	}
+	if !strings.Contains(stdout+stderr, "task binding mismatch") {
+		t.Fatalf("expected output/stderr to name task binding mismatch, stdout=%s stderr=%s", stdout, stderr)
+	}
+
+	// 2. herd fence-op reconcile: must report verdict=not-proven with reason=task-binding-mismatch.
+	exit, stdout, stderr = runFenceOpCLI(t, f, srv.URL, "fence-op", "reconcile", "--json")
+	if exit == 0 {
+		t.Fatalf("reconcile with mismatched task binding must exit non-zero, got 0")
+	}
+	rm := decodeFenceOpJSON(t, stdout)
+	if got, _ := rm["would_settle"].(float64); got != 0 {
+		t.Fatalf("mismatched task receipt must not be counted as would_settle, got %v", rm["would_settle"])
+	}
+	records, _ := rm["records"].([]any)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record in reconcile report, got %v", records)
+	}
+	rec0, _ := records[0].(map[string]any)
+	if rec0["verdict"] != "not-proven" {
+		t.Fatalf("expected verdict=not-proven on task mismatch, got %v", rec0["verdict"])
+	}
+	if rec0["reason"] != "task-binding-mismatch" {
+		t.Fatalf("expected reason=task-binding-mismatch on task mismatch, got %v", rec0["reason"])
+	}
+
+	if len(rb.allRequests()) == 0 {
+		t.Fatalf("expected broker to be consulted")
+	}
+	after := snapshotFenceOpFixture(t, f)
+	if after != before {
+		t.Fatalf("mismatch queries mutated local bookkeeping: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestFenceOpStatusNeverMintsNewOps(t *testing.T) {
 	f := seedFenceOpFixture(t, fenceOpFixtureAmbiguous, true)
 	before := snapshotFenceOpFixture(t, f)

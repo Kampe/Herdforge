@@ -271,11 +271,36 @@ func findOutboxRecord(ctx context.Context, outbox *claim.SQLiteOutbox, opID stri
 	return view, nil
 }
 
-// fenceOpBindingRefusals checks caller-asserted bindings against evidence.
-// An asserted binding that the evidence cannot confirm is a refusal (fail
-// closed), never a silent pass.
+// checkReceiptConsistency verifies that all available receipts for an operation
+// agree on task identity, op identity, status, and fence token. Any contradiction
+// is a hard refusal (fail-closed).
+func checkReceiptConsistency(local, broker *provider.FenceOpReadback) []string {
+	if local == nil || broker == nil {
+		return nil
+	}
+	var refusals []string
+	if local.TaskID != "" && broker.TaskID != "" && local.TaskID != broker.TaskID {
+		refusals = append(refusals, fmt.Sprintf("task binding mismatch: local receipt task %q != broker receipt task %q", local.TaskID, broker.TaskID))
+	}
+	if local.OpID != "" && broker.OpID != "" && !strings.EqualFold(local.OpID, broker.OpID) {
+		refusals = append(refusals, fmt.Sprintf("op binding mismatch: local receipt op %q != broker receipt op %q", local.OpID, broker.OpID))
+	}
+	if local.ExpectedStatus != "" && broker.ExpectedStatus != "" && provider.NormalizeStatus(local.ExpectedStatus) != provider.NormalizeStatus(broker.ExpectedStatus) {
+		refusals = append(refusals, fmt.Sprintf("expected-status binding mismatch: local %q != broker %q", local.ExpectedStatus, broker.ExpectedStatus))
+	}
+	if local.FenceToken > 0 && broker.FenceToken > 0 && local.FenceToken != broker.FenceToken {
+		refusals = append(refusals, fmt.Sprintf("fence-token binding mismatch: local %d != broker %d", local.FenceToken, broker.FenceToken))
+	}
+	return refusals
+}
+
+// fenceOpBindingRefusals checks caller-asserted bindings against evidence and
+// verifies that all local/broker receipts and outbox identity bindings are consistent.
+// Any mismatch or unconfirmed assertion is a refusal (fail closed), never a silent pass.
 func fenceOpBindingRefusals(ev *fenceOpEvidence, wantRepo, wantProject, wantTaskRef, wantTask string) []string {
 	var refusals []string
+	refusals = append(refusals, checkReceiptConsistency(ev.Local, ev.Broker)...)
+
 	id := (*parsedIntentKey)(nil)
 	if ev.Outbox != nil {
 		id = ev.Outbox.Identity
@@ -290,24 +315,29 @@ func fenceOpBindingRefusals(ev *fenceOpEvidence, wantRepo, wantProject, wantTask
 		refusals = append(refusals, "task-ref binding mismatch")
 	}
 	if wantTask != "" {
-		matched := false
+		hasReceipt := false
 		for _, rc := range []*provider.FenceOpReadback{ev.Local, ev.Broker} {
-			if rc != nil && rc.TaskID == wantTask {
-				matched = true
+			if rc != nil {
+				hasReceipt = true
+				if rc.TaskID != wantTask {
+					refusals = append(refusals, fmt.Sprintf("task binding mismatch: receipt task %q != %q", rc.TaskID, wantTask))
+				}
 			}
 		}
-		if !matched {
-			refusals = append(refusals, "task binding mismatch")
+		if !hasReceipt {
+			refusals = append(refusals, "task binding mismatch: no receipt available to confirm task")
 		}
 	}
 	return refusals
 }
 
 // combineFenceOpEvidence resolves the honest overall state. Applied wins
-// over ambiguous (receipts are monotonic); everything else is unknown.
-// Any caller binding refusal overrides to a refusal (handled by caller).
+// over ambiguous (receipts are monotonic) only when all available evidence is
+// consistent. Any inconsistency forces the state to unknown.
 func combineFenceOpEvidence(local, broker *provider.FenceOpReadback) (state string) {
-	state = "unknown"
+	if len(checkReceiptConsistency(local, broker)) > 0 {
+		return "unknown"
+	}
 	for _, rc := range []*provider.FenceOpReadback{local, broker} {
 		if rc == nil {
 			continue
@@ -321,7 +351,7 @@ func combineFenceOpEvidence(local, broker *provider.FenceOpReadback) (state stri
 			return "ambiguous"
 		}
 	}
-	return state
+	return "unknown"
 }
 
 // fenceOpFlags is a tiny args scanner for fence-op subcommands. Go's flag
@@ -488,6 +518,11 @@ func runFenceOpStatus() {
 	refusals := fenceOpBindingRefusals(ev, wantRepo, wantProject, wantTaskRef, wantTask)
 	if len(refusals) > 0 {
 		ev.Refusals = refusals
+		ev.State = "unknown"
+		ev.Applied = false
+		ev.Ambiguous = false
+		ev.Receipt = nil
+		ev.TaskID = ""
 		emitFenceOp(ev, asJSON)
 		for _, r := range refusals {
 			fmt.Fprintf(os.Stderr, "herd fence-op status: %s: %s\n", opID, r)
@@ -606,6 +641,7 @@ func runFenceOpReconcile() {
 		}
 
 		localApplied, localAmbiguous := false, false
+		var localRC *provider.OpReceipt
 		if opID != "" {
 			rc, lerr := fences.LookupApplied(ctx, opID)
 			if lerr != nil {
@@ -613,6 +649,7 @@ func runFenceOpReconcile() {
 				v.Verdict = "not-proven"
 				sawLocalStoreError = true // degrade exit, do not silently pass
 			} else if rc != nil {
+				localRC = rc
 				localApplied, localAmbiguous = !rc.Ambiguous, rc.Ambiguous
 				v.TaskID, v.ExpectedStatus = rc.TaskID, rc.ExpectedStatus
 				v.Ambiguous = rc.Ambiguous
@@ -629,9 +666,21 @@ func runFenceOpReconcile() {
 				os.Exit(fenceOpExitError)
 			}
 			if brc != nil {
+				if localRC != nil {
+					localReadback := localReceiptAsReadback(localRC)
+					if inconsistencies := checkReceiptConsistency(localReadback, brc); len(inconsistencies) > 0 {
+						v.Verdict = "not-proven"
+						v.Reason = "task-binding-mismatch"
+						v.Ambiguous = false
+						localApplied = false
+						localAmbiguous = false
+						goto recordEvaluated
+					}
+				}
 				v.TaskID, v.ExpectedStatus, v.Ambiguous = brc.TaskID, brc.ExpectedStatus, brc.Ambiguous
 				if brc.Applied && !brc.Ambiguous {
 					localApplied = true
+					localAmbiguous = false
 				} else if brc.Ambiguous {
 					localAmbiguous = true
 				} else if !localApplied && !localAmbiguous {
@@ -640,6 +689,7 @@ func runFenceOpReconcile() {
 			}
 		}
 
+	recordEvaluated:
 		switch {
 		case localApplied:
 			v.Verdict = "proven-applied"
