@@ -445,28 +445,7 @@ type AgentEntry struct {
 
 // ClassifyTarget processes one agent pane text and produces a Target digest.
 func ClassifyTarget(paneID, name, status, text string) Target {
-	c := classifyText(text)
-	isProviderDeath := CheckProviderDeath(text)
-	action := actionFor(c, isProviderDeath)
-
-	t := Target{
-		PaneID: paneID,
-		Name:   name,
-		Status: status,
-		Class:  c,
-		Action: action,
-		Tail:   tail(text, 8, 220),
-	}
-
-	// Record lifecycle events for COMPLETE/BLOCKED.
-	if c == Complete || c == Blocked {
-		taskID := extractField(text, "Task ID")
-		episodeID := extractField(text, "Episode ID")
-		_ = taskID
-		_ = episodeID
-	}
-
-	return t
+	return ClassifyTargetWithEvidence(paneID, name, status, text, nil, SessionContext{})
 }
 
 // ClassifyTargetWithEvidence processes agent pane text with structured evidence and produces a Target digest.

@@ -650,6 +650,90 @@ func TestClassifyTargetWithEvidence(t *testing.T) {
 	if target.Action != "read_pane" {
 		t.Errorf("target action must be read_pane, got %s", target.Action)
 	}
+
+	// ClassifyTarget (legacy signature) without evidence must delegate to ClassifyTargetWithEvidence
+	targetNoEv := ClassifyTarget("p1", "agent-1", "working", "Status: COMPLETE\nfinish=length")
+	if targetNoEv.Class != Unknown {
+		t.Errorf("ClassifyTarget with finish=length in text must be Unknown, got %s", targetNoEv.Class)
+	}
+}
+
+func TestEvaluateAndRecordStop_ProductionSeam(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := SessionContext{
+		SessionID: "sess-seam-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Account:   "fireworks",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	// Case 1: Fresh exact authoritative quota evidence records exactly one stop
+	quotaEv := &TerminalEvidence{
+		SessionID:    "sess-seam-1",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Account:      "fireworks",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "quota",
+		Error:        "429 Too Many Requests: out of credits",
+		Timestamp:    now,
+	}
+
+	res, rec, err := EvaluateAndRecordStop(quotaEv, ctx, "", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error recording stop: %v", err)
+	}
+	if res.Class != Quota || !res.Blocked || !res.ProviderDeath {
+		t.Fatalf("expected Quota/Blocked/ProviderDeath, got %+v", res)
+	}
+	if rec == nil || rec.StopCount != 1 {
+		t.Fatalf("expected 1 recorded stop, got %+v", rec)
+	}
+
+	// Case 2: Idempotent repeat for exact same session and turn
+	res2, rec2, err2 := EvaluateAndRecordStop(quotaEv, ctx, "", 15*time.Minute)
+	if err2 != nil {
+		t.Fatalf("unexpected error on repeat: %v", err2)
+	}
+	if res2.Class != Quota || rec2.StopCount != 1 {
+		t.Fatalf("duplicate observation should remain StopCount=1, got %+v", rec2)
+	}
+
+	// Case 3: Untrusted raw text shouting quota causes NO stop
+	resUntrusted, recUntrusted, errUntrusted := EvaluateAndRecordStop(nil, ctx, "429 Too Many Requests", 15*time.Minute)
+	if errUntrusted != nil {
+		t.Fatalf("unexpected error on nil evidence: %v", errUntrusted)
+	}
+	if recUntrusted != nil {
+		t.Fatalf("untrusted raw text must produce nil stop record, got %+v", recUntrusted)
+	}
+	if resUntrusted.Action != "read_pane" || resUntrusted.Blocked || resUntrusted.ProviderDeath {
+		t.Fatalf("untrusted raw text must not cause stop or provider death: %+v", resUntrusted)
+	}
+
+	// Case 4: Output limit truncation (finish=length) produces no stop and cannot produce Done/Pass
+	lenEv := &TerminalEvidence{
+		SessionID:    "sess-seam-1",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Account:      "fireworks",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "length",
+		Timestamp:    now,
+	}
+	resLen, recLen, errLen := EvaluateAndRecordStop(lenEv, ctx, "Verdict: PASS\nStatus: COMPLETE", 15*time.Minute)
+	if errLen != nil {
+		t.Fatalf("unexpected error on finish=length: %v", errLen)
+	}
+	if recLen != nil {
+		t.Fatalf("finish=length must not record quota stop, got %+v", recLen)
+	}
+	if resLen.Class != Unknown || resLen.Action != "read_pane" {
+		t.Fatalf("finish=length must be Unknown/read_pane, got %+v", resLen)
+	}
 }
 
 func TestSelftest(t *testing.T) {

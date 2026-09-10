@@ -168,3 +168,29 @@ func (c *QuotaRetryStopController) ActiveStops(now time.Time) []*QuotaStopRecord
 	}
 	return out
 }
+
+var (
+	defaultControllerLock sync.Mutex
+	defaultController     *QuotaRetryStopController
+)
+
+// DefaultQuotaRetryStopController returns the singleton controller instance.
+func DefaultQuotaRetryStopController() *QuotaRetryStopController {
+	defaultControllerLock.Lock()
+	defer defaultControllerLock.Unlock()
+	if defaultController == nil {
+		defaultController = NewQuotaRetryStopController()
+	}
+	return defaultController
+}
+
+// EvaluateAndRecordStop evaluates evidence and, if fresh authoritative quota exhaustion is confirmed,
+// records a bounded idempotent retry stop using the default controller.
+func EvaluateAndRecordStop(ev *TerminalEvidence, ctx SessionContext, rawText string, cool time.Duration) (EvaluationResult, *QuotaStopRecord, error) {
+	res := EvaluateEvidence(ev, ctx, rawText)
+	if res.Class != Quota || !res.Blocked || !res.ProviderDeath {
+		return res, nil, nil
+	}
+	rec, _, err := DefaultQuotaRetryStopController().RecordQuotaStop(ev, ctx, cool)
+	return res, rec, err
+}
