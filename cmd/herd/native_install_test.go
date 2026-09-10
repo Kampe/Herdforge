@@ -5,8 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestParseNativeInstallRequiresExplicitIdentity(t *testing.T) {
@@ -75,4 +78,46 @@ func runNativeInstallGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %q: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func TestBuildNativeRuntimeKillsProcessGroupOnCancel(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "scripts"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho $$ > pgid.txt\n/bin/sleep 120 &\necho $! > child.txt\n/bin/sleep 120\n"
+	if err := os.WriteFile(filepath.Join(dir, "scripts", "build-herd.sh"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	err := buildNativeRuntime(ctx, dir)
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("timed-out build must report the deadline: %v", err)
+	}
+	childBody, err := os.ReadFile(filepath.Join(dir, "child.txt"))
+	if err != nil {
+		t.Skipf("script never reached the descendant spawn: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(childBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The descendant must be reaped with its process group; poll briefly.
+	alive := false
+	for i := 0; i < 40; i++ {
+		if err := syscall.Kill(pid, 0); err == nil {
+			alive = true
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		alive = false
+		break
+	}
+	if alive {
+		// Own spawned process: terminate it before failing so the fixture
+		// never leaks a sleeper.
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Fatalf("build descendant %d survived the process-group teardown", pid)
+	}
 }

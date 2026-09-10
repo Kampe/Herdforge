@@ -143,7 +143,6 @@ func patchEquivalenceFor(cherryOutput, sha string) (equivalent, present bool) {
 	return false, false
 }
 
-
 // IsAncestor reports whether sha is reachable from ref.
 //
 // One definition on purpose. This exact git invocation is written in eight

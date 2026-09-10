@@ -1,6 +1,7 @@
 package harvest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -72,6 +73,11 @@ type RuntimeRetentionManifest struct {
 	Version  int                       `json:"version"`
 	Current  RuntimeRetentionBinding   `json:"current"`
 	Previous []RuntimeRetentionBinding `json:"previous"`
+	// Displaced records prior-chain bindings this rebind removed from the
+	// Previous list, with their full recorded identity. This is the ONLY
+	// positive allowlist a retention pass may remove against; a candidate
+	// that matches no displaced binding is held as unknown, never deleted.
+	Displaced []RuntimeRetentionBinding `json:"displaced,omitempty"`
 }
 
 type RuntimeRetentionEvent struct {
@@ -234,21 +240,51 @@ func (r HerdRuntimeInstaller) inspectPrior(path string) (*RuntimeBinding, error)
 var nativeRuntimeAliases = []struct{ path, target string }{{"herd", provenance.NativeExecutableRel}, {"bin/herdforge", "herd"}}
 
 func (r HerdRuntimeInstaller) aliases(create bool) error {
+	_, err := r.aliasesCreate(create)
+	return err
+}
+
+// aliasesCreate validates (and optionally creates) the consumer alias set.
+// It reports the alias paths THIS invocation created so a failed install can
+// roll them back; an alias that already existed is never listed.
+func (r HerdRuntimeInstaller) aliasesCreate(create bool) ([]string, error) {
+	var created []string
 	for _, a := range nativeRuntimeAliases {
 		path := filepath.Join(r.Root, filepath.FromSlash(a.path))
 		target, err := os.Readlink(path)
 		if os.IsNotExist(err) && create {
 			err = os.Symlink(a.target, path)
 			if err == nil {
+				created = append(created, path)
 				continue
 			}
 			target, err = os.Readlink(path)
 		}
 		if err != nil || target != a.target {
-			return fmt.Errorf("runtime bind: consumer alias %s is absent or does not select the canonical executable", a.path)
+			// Roll back aliases created earlier in this pass; a partially
+			// created alias set must never outlive a failed validation.
+			r.removeCreatedAliases(created)
+			return nil, fmt.Errorf("runtime bind: consumer alias %s is absent or does not select the canonical executable", a.path)
 		}
 	}
-	return nil
+	return created, nil
+}
+
+// removeCreatedAliases removes only symlinks this invocation created that
+// still select the canonical executable. Any drift leaves the alias in place
+// as evidence rather than deleting something this pass no longer owns.
+func (r HerdRuntimeInstaller) removeCreatedAliases(created []string) {
+	for _, path := range created {
+		target, err := os.Readlink(path)
+		if err != nil {
+			continue
+		}
+		for _, a := range nativeRuntimeAliases {
+			if filepath.Join(r.Root, filepath.FromSlash(a.path)) == path && target == a.target {
+				_ = os.Remove(path)
+			}
+		}
+	}
 }
 
 // ObserveInstallation distinguishes an unapplied install from unknown state.
@@ -401,9 +437,20 @@ func (r HerdRuntimeInstaller) Install(ctx context.Context) (*RuntimeBinding, err
 	if _, err := r.inspect(name); err != nil {
 		return nil, err
 	}
-	if err := r.aliases(true); err != nil {
+	// Alias creation is the first visible mutation of this install. Every
+	// failure from here until the rename lands and is synced must roll the
+	// created aliases back so a failed or cancelled install leaves the
+	// consumer alias set exactly as it found it.
+	createdAliases, err := r.aliasesCreate(true)
+	if err != nil {
 		return nil, err
 	}
+	rollbackAliases := true
+	defer func() {
+		if rollbackAliases {
+			r.removeCreatedAliases(createdAliases)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -422,6 +469,9 @@ func (r HerdRuntimeInstaller) Install(ctx context.Context) (*RuntimeBinding, err
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	// The rename is durable: the installation transition is committed and
+	// the created aliases are now part of the installed state.
+	rollbackAliases = false
 	binding, err := r.Observe(ctx)
 	if err != nil {
 		return nil, err
@@ -644,7 +694,25 @@ func (r HerdRuntimeInstaller) retireRuntimeBackups(ctx context.Context, current,
 			}
 		}
 	}
-	newManifest := RuntimeRetentionManifest{Version: runtimeRetentionManifestVersion, Current: currentEntry, Previous: previous}
+	// Prior-chain bindings that no longer fit the kept Previous list are
+	// recorded as displaced with their full identity: the retention pass may
+	// remove exactly these, and nothing else.
+	var displaced []RuntimeRetentionBinding
+	if manifest != nil {
+		for _, old := range manifest.Previous {
+			carried := false
+			for _, kept := range previous {
+				if runtimeRetentionSameIdentity(kept, old) {
+					carried = true
+					break
+				}
+			}
+			if !carried && old.Path != "" && old.Digest != "" && old.Revision != "" {
+				displaced = append(displaced, old)
+			}
+		}
+	}
+	newManifest := RuntimeRetentionManifest{Version: runtimeRetentionManifestVersion, Current: currentEntry, Previous: previous, Displaced: displaced}
 	if err := writeRuntimeRetentionManifest(manifestPath, newManifest); err != nil {
 		return fmt.Errorf("runtime bind: installed binding preserved; retention manifest write: %w", err)
 	}
@@ -727,15 +795,30 @@ func (r HerdRuntimeInstaller) retireRuntimeBackupsWith(ctx context.Context, mani
 			hold("digest-unknown", false)
 			continue
 		}
-		protected := false
-		for _, binding := range manifest.Previous {
-			if binding.Digest == digest {
-				protected = true
-				break
+		// Positive exact allowlist before any deletion. A candidate is
+		// classified only by positively matching a manifest-recorded binding:
+		// the repository-relative path plus the full recorded identity
+		// (digest, size, and modification time). Digest equality alone never
+		// proves a binding, and an unbound same-owner regular file is always
+		// held as unknown, never removed.
+		rootRel := runtimeRetentionRelativePath(r.Root, path)
+		matchBinding := func(bindings []RuntimeRetentionBinding) bool {
+			for _, binding := range bindings {
+				if binding.Path == rootRel &&
+					binding.Digest == digest &&
+					binding.Size == info.Size() &&
+					binding.ModTimeUnixNano == info.ModTime().UnixNano() {
+					return true
+				}
 			}
+			return false
 		}
-		if protected {
+		if matchBinding(manifest.Previous) {
 			hold("protected-receipt-bound-version", true)
+			continue
+		}
+		if !matchBinding(manifest.Displaced) {
+			hold("unbound-candidate-not-in-retention-manifest", false)
 			continue
 		}
 		ownerStatus, ownerErr := runtimeOwnerStatus(ctx, path, owner)
@@ -791,7 +874,12 @@ func (r HerdRuntimeInstaller) retireRuntimeBackupsWith(ctx context.Context, mani
 	return report, nil
 }
 
-func runtimeOwnerStatus(ctx context.Context, path string, owner func(context.Context, string) (RuntimeOwnerStatus, error)) (RuntimeOwnerStatus, error) {
+// runtimeOwnerStatusClassified is the production lsof reader: bounded
+// output, structured -Fpcfn record parsing, and fail-closed classification.
+// Present requires at least one process record (p) AND a file-name record
+// (n) matching the candidate path; non-empty but unstructured or
+// contradictory output is unknown, never presence.
+func runtimeOwnerStatusClassified(ctx context.Context, path string, owner func(context.Context, string) (RuntimeOwnerStatus, error)) (RuntimeOwnerStatus, error) {
 	if owner != nil {
 		return owner(ctx, path)
 	}
@@ -800,17 +888,77 @@ func runtimeOwnerStatus(ctx context.Context, path string, owner func(context.Con
 		return RuntimeOwnerUnknown, err
 	}
 	cmd := exec.CommandContext(ctx, lsof, "-nP", "-Fpcfn", "--", path)
-	out, err := cmd.CombinedOutput()
-	if err == nil && len(out) > 0 {
-		return RuntimeOwnerPresent, nil
+	var out boundedOutput
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	runErr := cmd.Run()
+	if ctx.Err() != nil {
+		return RuntimeOwnerUnknown, fmt.Errorf("lsof: %w", ctx.Err())
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && len(out) == 0 {
-		return RuntimeOwnerAbsent, nil
+	if out.overflow {
+		return RuntimeOwnerUnknown, fmt.Errorf("lsof: output exceeded %d bytes", lsofOutputLimit)
 	}
-	if err == nil && len(out) == 0 {
+	if runErr != nil {
+		exitErr, ok := runErr.(*exec.ExitError)
+		if ok && exitErr.ExitCode() == 1 && out.Len() == 0 {
+			return RuntimeOwnerAbsent, nil
+		}
+		return RuntimeOwnerUnknown, fmt.Errorf("lsof: %w", runErr)
+	}
+	if out.Len() == 0 {
 		return RuntimeOwnerUnknown, fmt.Errorf("lsof returned empty success")
 	}
-	return RuntimeOwnerUnknown, fmt.Errorf("lsof: %w", err)
+	present, parseErr := lsofRecordsNamePath(out.String(), path)
+	if parseErr != nil {
+		return RuntimeOwnerUnknown, fmt.Errorf("lsof: %w", parseErr)
+	}
+	if !present {
+		return RuntimeOwnerUnknown, fmt.Errorf("lsof output does not identify the candidate as an open file")
+	}
+	return RuntimeOwnerPresent, nil
+}
+
+// lsofRecordsNamePath parses lsof -Fpcfn field output. It reports whether at
+// least one process has an open file record naming exactly path. Any record
+// shape that cannot be interpreted is a contradiction and fails closed.
+func lsofRecordsNamePath(data, path string) (bool, error) {
+	sawProcess, sawOpenName := false, false
+	for _, line := range strings.Split(data, "\n") {
+		if line == "" {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			if len(line) < 2 {
+				return false, fmt.Errorf("contradictory record %q", line)
+			}
+			for _, r := range line[1:] {
+				if r < '0' || r > '9' {
+					return false, fmt.Errorf("contradictory record %q", line)
+				}
+			}
+			sawProcess = true
+		case 'n':
+			if len(line) < 2 {
+				return false, fmt.Errorf("contradictory record %q", line)
+			}
+			if line[1:] == path {
+				sawOpenName = true
+			}
+		case 'c', 'f':
+			// command and file-descriptor descriptors carry no decision here
+		default:
+			return false, fmt.Errorf("contradictory record %q", line)
+		}
+	}
+	if !sawProcess || !sawOpenName {
+		return false, fmt.Errorf("no process holds %s open", path)
+	}
+	return true, nil
+}
+
+func runtimeOwnerStatus(ctx context.Context, path string, owner func(context.Context, string) (RuntimeOwnerStatus, error)) (RuntimeOwnerStatus, error) {
+	return runtimeOwnerStatusClassified(ctx, path, owner)
 }
 
 func runtimeFileDigest(path string) (string, error) {
@@ -829,3 +977,23 @@ func runtimeFileDigest(path string) (string, error) {
 func runtimeFileMetadata(info os.FileInfo) (runtimeFileMeta, bool) {
 	return runtimeFileMetaFromInfo(info)
 }
+
+// boundedOutput caps lsof output capture; overflow is flagged, never
+// silently absorbed beyond the bound.
+const lsofOutputLimit = int64(1) << 20
+
+type boundedOutput struct {
+	buf      bytes.Buffer
+	overflow bool
+}
+
+func (b *boundedOutput) Write(p []byte) (int, error) {
+	if int64(b.buf.Len())+int64(len(p)) > lsofOutputLimit {
+		b.overflow = true
+		return len(p), nil
+	}
+	return b.buf.Write(p)
+}
+
+func (b *boundedOutput) Len() int       { return b.buf.Len() }
+func (b *boundedOutput) String() string { return b.buf.String() }

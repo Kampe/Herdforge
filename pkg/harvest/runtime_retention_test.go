@@ -305,6 +305,20 @@ func TestRuntimeRetentionRefusesRemovalWhenCurrentInstallChangedSinceCensus(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The current-install recheck fires on the destructive path, which under
+	// the positive allowlist requires the candidate to match a displaced
+	// binding with full recorded identity. A stray unbound file is held long
+	// before the recheck, so register the candidate as displaced.
+	candidateDigest, err := runtimeFileDigest(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleManifest.Displaced = append(staleManifest.Displaced, RuntimeRetentionBinding{
+		RuntimeBinding:  RuntimeBinding{Revision: "displaced-test", Digest: candidateDigest, Executable: "bin/herd"},
+		Path:            ".herd/runtime-previous/jit-guard-candidate",
+		Size:            before.Size(),
+		ModTimeUnixNano: before.ModTime().UnixNano(),
+	})
 
 	journalPath := filepath.Join(f.root, ".herd", runtimeRetentionJournalName)
 	report, err := f.installer.retireRuntimeBackupsWith(context.Background(), *staleManifest, journalPath, 16, defaultRuntimeRetentionBytes,
@@ -333,5 +347,93 @@ func TestRuntimeRetentionRefusesRemovalWhenCurrentInstallChangedSinceCensus(t *t
 	}
 	if strings.Contains(string(journal), `"path":"jit-guard-candidate","logical_bytes"`) || strings.Contains(string(journal), `"event":"removed","path":"jit-guard-candidate"`) {
 		t.Fatalf("journal must not record a destructive success for the held candidate: %s", journal)
+	}
+}
+
+func TestRuntimeRetentionHoldsUnboundCleanCandidate(t *testing.T) {
+	f := retentionFixture(t)
+	advanceRetentionRuntime(t, &f, "second")
+	manifestPath, journalPath := f.installer.retentionPaths()
+	manifest, err := f.installer.loadRetentionManifest(manifestPath)
+	if err != nil || manifest == nil {
+		t.Fatalf("manifest load: %v", err)
+	}
+	// A same-owner, single-link, regular, digest-clean file that matches no
+	// manifest binding must be held as unknown — never removed.
+	dir := filepath.Join(f.root, ".herd", "runtime-previous")
+	stray := filepath.Join(dir, "stray-clean")
+	if err := os.WriteFile(stray, []byte("unbound clean candidate body"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(stray)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := f.installer.retireRuntimeBackupsWith(context.Background(), *manifest, journalPath, 16, defaultRuntimeRetentionBytes,
+		func(context.Context, string) (RuntimeOwnerStatus, error) { return RuntimeOwnerAbsent, nil })
+	if err != nil {
+		t.Fatalf("retireRuntimeBackupsWith: %v", err)
+	}
+	if report.Removed != 0 {
+		t.Fatalf("unbound candidate must never be removed: %+v", report)
+	}
+	if report.Held != 1 {
+		t.Fatalf("unbound candidate must be held exactly once: %+v", report)
+	}
+	found := false
+	for _, event := range report.Events {
+		if event.Path == "stray-clean" && event.Reason == "unbound-candidate-not-in-retention-manifest" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing unbound-candidate hold event: %+v", report.Events)
+	}
+	after, err := os.Lstat(stray)
+	if err != nil {
+		t.Fatalf("unbound candidate must remain on disk: %v", err)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		t.Fatalf("unbound candidate identity changed across the pass")
+	}
+}
+
+func TestRuntimeRetentionRemovesOnlyDisplacedAllowlistedBinding(t *testing.T) {
+	f := retentionFixture(t)
+	advanceRetentionRuntime(t, &f, "second")
+	advanceRetentionRuntime(t, &f, "third")
+	manifestPath, journalPath := f.installer.retentionPaths()
+	manifest, err := f.installer.loadRetentionManifest(manifestPath)
+	if err != nil || manifest == nil {
+		t.Fatalf("manifest load: %v", err)
+	}
+	if len(manifest.Previous) != 2 {
+		t.Fatalf("setup: expected two kept priors, got %+v", manifest)
+	}
+	// Simulate the rebind that displaces the oldest kept binding: the
+	// Previous list shrinks to its newest entry and the displaced binding
+	// moves to the removal allowlist with its full recorded identity.
+	displaced := manifest.Previous[1]
+	manifest.Previous = manifest.Previous[:1]
+	manifest.Displaced = []RuntimeRetentionBinding{displaced}
+	dir := filepath.Join(f.root, ".herd", "runtime-previous")
+	report, err := f.installer.retireRuntimeBackupsWith(context.Background(), *manifest, journalPath, 16, defaultRuntimeRetentionBytes,
+		func(context.Context, string) (RuntimeOwnerStatus, error) { return RuntimeOwnerAbsent, nil })
+	if err != nil {
+		t.Fatalf("retireRuntimeBackupsWith: %v", err)
+	}
+	if report.Removed != 1 || report.Protected != 1 || report.Held != 0 {
+		t.Fatalf("exactly the displaced binding must be removed: report=%+v", report)
+	}
+	removed := filepath.Join(f.root, displaced.Path)
+	if _, err := os.Lstat(removed); !os.IsNotExist(err) {
+		t.Fatalf("displaced binding must be removed: %v", err)
+	}
+	remaining, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("kept chain must survive: remaining=%d", len(remaining))
 	}
 }

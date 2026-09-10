@@ -125,8 +125,29 @@ func buildNativeRuntime(ctx context.Context, source string) error {
 	cmd.Dir = source
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	// The build runs in its own process group so a timeout or cancellation
+	// can terminate the shell AND every toolchain descendant; without this a
+	// stuck child survives the deadline and keeps writing under the source
+	// worktree.
+	if err := startProcessGroup(cmd); err != nil {
 		return err
 	}
-	return nil
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// Kill the whole group (negative pid), then reap the direct child so
+		// no zombie or descendant outlives the deadline cleanup claim.
+		_ = killProcessGroup(cmd.Process.Pid)
+		waitErr := <-done
+		if err := ctx.Err(); err != nil && waitErr == nil {
+			return err
+		}
+		return ctx.Err()
+	}
 }
