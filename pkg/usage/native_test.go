@@ -2,10 +2,16 @@ package usage
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Fixtures are the SHAPE of real responses, captured from live calls to each
@@ -75,6 +81,49 @@ func TestClaudePollNormalisesPercentToFraction(t *testing.T) {
 	}
 }
 
+func TestClaudeAuthenticatedPollBindsProfileToConfigHint(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	writeJSONFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"acct-1","organizationUuid":"org-1"}}`)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/profile" {
+			_, _ = w.Write([]byte(`{"account":{"uuid":"acct-1"},"organization":{"uuid":"org-1"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":2,"resets_at":"2099-01-01T00:00:00Z"}}`))
+	}))
+	defer s.Close()
+	p, err := claudePollAuthenticated(s.URL+"/usage", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account == nil || p.Account.Key != opaqueAccountKey("claude", "acct-1|org-1") {
+		t.Fatalf("profile account was not preserved opaquely: %+v", p.Account)
+	}
+	if p.Resources["session"].State != "active" || p.Resources["session"].Pool != "session" {
+		t.Fatalf("resource hints missing: %+v", p.Resources["session"])
+	}
+}
+
+func TestClaudeAuthenticatedPollRejectsStaleConfigHint(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	writeJSONFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"stale"}}`)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/profile" {
+			_, _ = w.Write([]byte(`{"account":{"uuid":"other"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":2}}`))
+	}))
+	defer s.Close()
+	if _, err := claudePollAuthenticated(s.URL+"/usage", "tok"); pollErrorCode(err) != "auth-ambiguous" {
+		t.Fatalf("stale local identity must fail closed, got %v", err)
+	}
+}
+
 func TestCodexPollMapsPrimaryWindowToWeekly(t *testing.T) {
 	s := serve(t, 200, codexFixture)
 	p, err := codexPollWithURL(s.URL, "tok")
@@ -102,6 +151,19 @@ func TestCodexPollMapsPrimaryWindowToWeekly(t *testing.T) {
 	}
 }
 
+func TestCodexPollBindsAuthenticatedAccountHeader(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("ChatGPT-Account-Id"); got != "acct-1" {
+			t.Errorf("account header = %q, want acct-1", got)
+		}
+		_, _ = w.Write([]byte(codexFixture))
+	}))
+	defer s.Close()
+	if _, err := codexPollWithURLAndAccount(s.URL, "tok", "acct-1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGeminiPollKeepsEveryNamedQuota(t *testing.T) {
 	s := serve(t, 200, geminiFixture)
 	p, err := geminiPollWithURL(s.URL, "tok")
@@ -116,6 +178,295 @@ func TestGeminiPollKeepsEveryNamedQuota(t *testing.T) {
 	}
 	if got := p.Resources["geminiSession"].Remaining; got != 60 {
 		t.Errorf("geminiSession remaining = %v, want 60", got)
+	}
+}
+
+func TestGeminiPollRejectsOmittedNumericFields(t *testing.T) {
+	s := serve(t, 200, `{"quotas":[{"name":"geminiSession","limit":100,"usage":40}]}`)
+	if _, err := geminiPollWithURL(s.URL, "tok"); err == nil {
+		t.Fatal("missing remainingCount must not become a zero quota")
+	} else if code := pollErrorCode(err); code != "no-windows" {
+		t.Fatalf("error code = %q, want no-windows", code)
+	}
+}
+
+func TestAntigravityMapsOnlyExactFractionBuckets(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-codeium-csrf-token") != "csrf" {
+			t.Errorf("missing csrf")
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.25,"resetTime":"2099-01-01T00:00:00Z"},{"bucketId":"unknown","remainingFraction":1},{"bucketId":"3p-5h","remainingFraction":0.5}]}]}`))
+	}))
+	defer s.Close()
+	p, err := antigravityPollWithURL(s.URL, "csrf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Resources) != 2 || p.Resources["geminiWeekly"].Remaining != 25 || p.Resources["nonGeminiSession"].Used != 50 {
+		t.Fatalf("exact buckets/fractions not preserved: %+v", p.Resources)
+	}
+}
+
+func TestRegisteredAntigravityPollUsesInjectedDiscovery(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary" {
+			t.Fatalf("path=%q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.75}]}]}`))
+	}))
+	defer s.Close()
+	port, err := strconv.Atoi(strings.TrimPrefix(s.URL, "http://127.0.0.1:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := discoverAntigravity
+	discoverAntigravity = func() (antigravityDiscovery, error) {
+		return antigravityDiscovery{Ports: []int{port}, CSRF: "fixture-csrf"}, nil
+	}
+	t.Cleanup(func() { discoverAntigravity = old })
+	poll := nativePollers["antigravity"]
+	p, err := poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["geminiSession"].Remaining != 75 {
+		t.Fatalf("registered poller did not use discovered service: %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMWithoutEnforceableBudgetIsUntracked(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","budget_max":null,"budget_spent":null}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != "untracked" || len(p.Resources) != 0 {
+		t.Fatalf("missing budget must be untracked, got %+v", p)
+	}
+}
+
+func TestLiteLLMExplicitNullBudgetIsAuthenticatedUnmetered(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","max_budget":null,"spend":0}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Status != "unmetered" || len(p.Resources) != 0 || p.Account == nil {
+		t.Fatalf("explicit unlimited budget must retain authenticated unmetered state: %+v", p)
+	}
+}
+
+func TestLiteLLMResponseFlowsThroughQuotaEngineAsUnmetered(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","max_budget":null,"spend":0}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{"opencode": p}}
+	state, ok := NewQuotaEngine().ComputeAll(snap)["opencode"]
+	if !ok || !state.Available || state.Reason != "unmetered-authenticated" || state.Account == nil {
+		t.Fatalf("native response did not flow to authenticated unmetered quota: ok=%v state=%+v provider=%+v", ok, state, p)
+	}
+}
+
+func TestLiteLLMMapsEnforcedBudget(t *testing.T) {
+	s := serve(t, 200, `{"key_name":"lazer","budget_max":100,"budget_spent":40}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account == nil || p.Account.Key != opaqueAccountKey("litellm", "lazer") {
+		t.Fatalf("provider account claim was not preserved: %+v", p.Account)
+	}
+	if p.Resources["budget"].Remaining != 60 || p.Resources["budget"].Utilization != 0.4 || p.Resources["budget"].Unit != "usd" {
+		t.Fatalf("budget mapping wrong: %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMRejectsJSONErrorAtHTTP200(t *testing.T) {
+	s := serve(t, 200, `{"error":"upstream unavailable"}`)
+	if _, err := litellmPollWithURL(s.URL, "tok"); err == nil || pollErrorCode(err) != "provider-error" {
+		t.Fatalf("HTTP 200 JSON error must be provider-error, got %v", err)
+	}
+}
+
+func TestLiteLLMMapsNestedIdentityAndBudget(t *testing.T) {
+	s := serve(t, 200, `{"info":{"key_name":"lazer-account","max_budget":10,"spend":12}}`)
+	p, err := litellmPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := p.Resources["budget"]
+	if p.Account == nil || p.Account.Key != opaqueAccountKey("litellm", "lazer-account") {
+		t.Fatalf("nested account claim was not preserved: %+v", p.Account)
+	}
+	if w.State != "exhausted" || w.Unit != "usd" || w.Remaining != 0 || w.Used != 12 || w.Limit != 10 {
+		t.Fatalf("over-budget semantics wrong: %+v", w)
+	}
+}
+
+func TestLiteLLMConfiguredEndpointBindsAuthToProvider(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, "data"))
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_OC_KEY", "")
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "data", "auth.json"), `{"lazer":{"key":"lazer-key"}}`)
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"http://lazer.test/v1"}}}}`)
+	key, base, err := litellmConfiguredEndpoint()
+	if err != nil || key != "lazer-key" || base != "http://lazer.test/v1" {
+		t.Fatalf("LiteLLM endpoint binding = key %q base %q err %v", key, base, err)
+	}
+}
+
+func TestLiteLLMRejectsMismatchedConfiguredAuthWithoutHTTP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, "data"))
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("LITELLM_OC_KEY", "")
+	t.Setenv("LITELLM_BASE_URL", "")
+	if err := os.MkdirAll(filepath.Join(home, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "data", "auth.json"), `{"litellm":{"key":"wrong-endpoint-key"}}`)
+	serverCalls := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverCalls++
+		http.Error(w, "must not receive mismatched credential", http.StatusInternalServerError)
+	}))
+	t.Cleanup(s.Close)
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"`+s.URL+`/v1"}}}}`)
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "auth-mismatch" {
+		t.Fatalf("mismatched provider binding error = %v, want auth-mismatch", err)
+	}
+	if serverCalls != 0 {
+		t.Fatalf("mismatched provider made %d HTTP requests", serverCalls)
+	}
+}
+
+func TestLiteLLMCollectorUsesManagementPathOutsideInferenceV1(t *testing.T) {
+	var gotPath string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"lazer","budget_max":100,"budget_spent":40}`)
+	}))
+	t.Cleanup(s.Close)
+
+	managementURL, err := litellmManagementURL(s.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := litellmPollWithURL(managementURL, "tok")
+	if err != nil {
+		t.Fatalf("LiteLLM management endpoint failed: %v (path=%q)", err, gotPath)
+	}
+	if gotPath != "/key/info" || p.Resources["budget"].Remaining != 60 {
+		t.Fatalf("LiteLLM management request = path %q usage %+v", gotPath, p.Resources)
+	}
+}
+
+func TestOpenCodeGoPollMapsAvailableWindows(t *testing.T) {
+	s := serve(t, 200, `{"rolling":{"percent":12,"resetsAt":"2099-01-01T00:00:00Z"},"weekly":{"percent":34,"resetsAt":"2099-01-02T00:00:00Z"},"monthly":{"percent":56,"resetsAt":"2099-02-01T00:00:00Z"}}`)
+	p, err := opencodePollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["weekly"].Utilization != 0.34 || p.Resources["monthly"].WindowSeconds != 30*24*3600 {
+		t.Fatalf("OpenCode windows were not preserved: %+v", p.Resources)
+	}
+}
+
+func TestKimiQuotaIsTruthfullyUnsupported(t *testing.T) {
+	if _, err := kimiPoll(); err == nil || pollErrorCode(err) != "unsupported" {
+		t.Fatalf("Kimi without a supported endpoint must remain unsupported, got %v", err)
+	}
+}
+
+func TestKimiCodePollMapsUsageAndLimitsWithoutIdentity(t *testing.T) {
+	s := serve(t, 200, `{"usage":{"used":25,"limit":100,"remaining":75,"reset_at":"2099-01-01T00:00:00Z"},"limits":[{"detail":{"used":4,"limit":10,"remaining":6},"window":{"duration":5,"timeUnit":"HOUR"}}]}`)
+	p, err := kimiPollWithURL(s.URL, "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account != nil {
+		t.Fatal("missing Kimi account claim must remain direct-only")
+	}
+	if p.Resources["weekly"].Unit != "requests" || p.Resources["limit1"].WindowSeconds != Window5h {
+		t.Fatalf("Kimi Code usage mapping lost semantics: %+v", p.Resources)
+	}
+}
+
+func TestKimiCodeConfiguredProductionPathUsesLocalCredentials(t *testing.T) {
+	s := serve(t, 200, `{"usage":{"used":1,"limit":10,"remaining":9,"reset_at":"2099-01-01T00:00:00Z"}}`)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".kimi", "credentials"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".kimi", "config.toml"), []byte("provider = \"kimi-code\"\nbase_url = \""+s.URL+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".kimi", "credentials", "kimi-code.json"), []byte(`{"access_token":"tok"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := kimiPoll()
+	if err != nil || p.Resources["weekly"].Remaining != 9 {
+		t.Fatalf("configured Kimi Code path failed: err=%v usage=%+v", err, p.Resources)
+	}
+}
+
+func TestNative429PreservesRetryAfter(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer s.Close()
+	_, err := opencodePollWithURL(s.URL, "tok")
+	if err == nil || pollErrorCode(err) != "rate-limited" || !strings.Contains(err.Error(), "retry-after=17") {
+		t.Fatalf("429 provenance missing: %v", err)
+	}
+}
+
+func TestGrokPollHonoursBoundedClientTimeout(t *testing.T) {
+	started := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	old := pollClientFactory
+	pollClientFactory = func() *http.Client { return &http.Client{Timeout: 25 * time.Millisecond} }
+	t.Cleanup(func() { pollClientFactory = old })
+	done := make(chan error, 1)
+	go func() { _, err := grokPollWithURL(s.URL, "tok"); done <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach fixture")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("hung Grok fixture must return a timeout error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Grok poll exceeded injected bounded timeout")
 	}
 }
 
@@ -146,7 +497,7 @@ func TestPollersErrorRatherThanReportZeroQuota(t *testing.T) {
 // The whole point of FAC-229: these providers are pollable WITHOUT the
 // OpenUsage macOS helper.
 func TestNativePollersCoverEveryHarness(t *testing.T) {
-	for _, want := range []string{"grok", "claude", "codex", "gemini"} {
+	for _, want := range []string{"grok", "claude", "codex", "gemini", "antigravity", "litellm", "opencode", "ollama", "kimi"} {
 		if _, ok := nativePollers[want]; !ok {
 			t.Errorf("%s has no native poller; it would still need the OpenUsage binary", want)
 		}
@@ -268,4 +619,201 @@ func TestCredentialDiscoveryHonoursConfigDirEnv(t *testing.T) {
 		}
 	}
 	t.Error("~/.claude/.credentials.json must be a candidate; keychain-only fails on Linux")
+}
+
+// --- FAC-786: grok upstream config shape (proto3-as-JSON) ---
+
+// The upstream credits response reports config.creditUsagePercent with a
+// currentPeriod; only a WEEKLY period maps to the weekly pool, and a proto3
+// zero percent is OMITTED (a genuine 0%, not absent data).
+func TestGrokConfigShapeWeeklyWindow(t *testing.T) {
+	s := serve(t, 200, `{
+      "config": {
+        "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "start": "2026-09-07T00:00:00Z", "end": "2026-09-14T00:00:00Z"}
+      }
+    }`)
+	p, err := grokPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, ok := p.Resources["weekly"]
+	if !ok {
+		t.Fatalf("weekly pool missing: %+v", p.Resources)
+	}
+	if w.Used != 0 || w.Utilization != 0 || w.Remaining != 100 {
+		t.Errorf("omitted creditUsagePercent is a genuine zero: used/util/remaining = %v/%v/%v", w.Used, w.Utilization, w.Remaining)
+	}
+	if w.ResetsAt != "2026-09-14T00:00:00Z" {
+		t.Errorf("resetsAt must be the period end, got %q", w.ResetsAt)
+	}
+	if w.WindowSeconds != 604800 {
+		t.Errorf("windowSeconds = %d, want 604800", w.WindowSeconds)
+	}
+	if p.Plan != "" {
+		t.Errorf("plan must be omitted when the response carries none, got %q", p.Plan)
+	}
+}
+
+func TestGrokConfigShapeNonZeroPercent(t *testing.T) {
+	s := serve(t, 200, `{
+      "config": {
+        "creditUsagePercent": 87.5,
+        "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-09-14T00:00:00Z"},
+        "onDemandCap": {"val": 0}
+      }
+    }`)
+	p, err := grokPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := p.Resources["weekly"]
+	if w.Used != 87.5 || w.Utilization != 0.875 || w.Remaining != 12.5 {
+		t.Errorf("weekly used/util/remaining = %v/%v/%v, want 87.5/0.875/12.5", w.Used, w.Utilization, w.Remaining)
+	}
+}
+
+// An account still on a monthly-only period has NO weekly pool; that is an
+// honest blank, never a mislabeled weekly window.
+func TestGrokMonthlyOnlyPeriodIsNotWeekly(t *testing.T) {
+	s := serve(t, 200, `{
+      "config": {
+        "creditUsagePercent": 42,
+        "currentPeriod": {"type": "USAGE_PERIOD_TYPE_MONTHLY", "end": "2026-09-30T00:00:00Z"}
+      }
+    }`)
+	_, err := grokPollWithURL(s.URL, "tok")
+	if err == nil {
+		t.Fatal("a monthly-only account must not report a weekly window")
+	}
+	if code := pollErrorCode(err); code != "no-windows" {
+		t.Errorf("error code = %q, want no-windows", code)
+	}
+}
+
+// Multiple grok auth entries are ambiguous: arbitrary map order must not pick
+// which account's quota gets reported.
+func TestGrokPollRefusesAmbiguousAuthEntries(t *testing.T) {
+	tmp := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmp)
+	defer os.Setenv("HOME", oldHome)
+	if err := os.MkdirAll(filepath.Join(tmp, ".grok"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".grok", "auth.json"),
+		[]byte(`{"a":{"key":"t1"},"b":{"key":"t2"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := grokPoll()
+	if err == nil {
+		t.Fatal("multiple auth entries must be refused")
+	}
+	if code := pollErrorCode(err); code != "auth-ambiguous" {
+		t.Errorf("error code = %q, want auth-ambiguous", code)
+	}
+}
+
+// --- FAC-786: plan honesty ---
+
+func TestClaudePlanFromResponseWhenPresent(t *testing.T) {
+	s := serve(t, 200, `{
+      "five_hour": {"utilization": 2.0, "resets_at": "2026-08-08T19:00:00Z"},
+      "subscriptionType": "Max 20x"
+    }`)
+	p, err := claudePollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Plan != "Max 20x" {
+		t.Errorf("plan = %q, want the response's subscriptionType", p.Plan)
+	}
+}
+
+func TestClaudePlanOmittedWhenAbsent(t *testing.T) {
+	s := serve(t, 200, claudeFixture)
+	p, err := claudePollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Plan != "" {
+		t.Errorf("plan = %q; a hardcoded plan is a fabricated subscription fact", p.Plan)
+	}
+}
+
+func TestGeminiPlanNotHardcoded(t *testing.T) {
+	s := serve(t, 200, geminiFixture)
+	p, err := geminiPollWithURL(s.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Plan != "" {
+		t.Errorf("plan = %q; the quota response carries no plan and none may be invented", p.Plan)
+	}
+}
+
+// --- FAC-786: bounded optional keychain ---
+
+// With keychain access disabled there must be no exec at all: a hostile
+// `security` stub first on PATH proves it never ran.
+func TestClaudeKeychainDisabledNeverExecs(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "security-ran")
+	stub := "#!/bin/sh\nprintf ran > " + marker + "\nprintf '{\"claudeAiOauth\":{\"accessToken\":\"stub\"}}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "security"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldHome := os.Getenv("HOME")
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	os.MkdirAll(filepath.Join(dir, "home"), 0o700)
+	defer os.Setenv("HOME", oldHome)
+	for _, key := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERD_QUOTA_KEYCHAIN", "0")
+
+	_, err := claudeToken()
+	if err == nil {
+		t.Fatal("no credentials anywhere: claudeToken must fail")
+	}
+	if code := pollErrorCode(err); code != "auth-missing" {
+		t.Errorf("error code = %q, want auth-missing", code)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("security was executed despite HERD_QUOTA_KEYCHAIN=0")
+	}
+}
+
+// On darwin, the keychain source is a bounded noninteractive fallback after the
+// credential files; the stub stands in for the real `security` tool so the
+// parse path is exercised without touching any real keychain. Non-darwin
+// platforms never attempt it.
+func TestClaudeKeychainFallbackParsesStubOutput(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("keychain fallback is darwin-only")
+	}
+	dir := t.TempDir()
+	creds := `{"claudeAiOauth":{"accessToken":"keychain-token","expiresAt":9999999999999.5}}`
+	stub := "#!/bin/sh\nprintf '%s' '" + creds + "'\n"
+	if err := os.WriteFile(filepath.Join(dir, "security"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldHome := os.Getenv("HOME")
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	os.MkdirAll(filepath.Join(dir, "home"), 0o700)
+	defer os.Setenv("HOME", oldHome)
+	for _, key := range []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("HERD_QUOTA_KEYCHAIN", "")
+
+	tok, err := claudeToken()
+	if err != nil {
+		t.Fatalf("keychain fallback must resolve credentials: %v", err)
+	}
+	if tok != "keychain-token" {
+		t.Errorf("token = %q, want the stub's keychain payload", tok)
+	}
 }

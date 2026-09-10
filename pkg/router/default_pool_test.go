@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/credits"
 	"github.com/Kampe/Herdforge/pkg/usage"
 )
 
@@ -92,6 +93,43 @@ func TestNoPoolScopeReadsTheAggregate(t *testing.T) {
 	if st.Available {
 		t.Fatal("an unscoped lookup ignored the exhausted aggregate")
 	}
+}
+
+func TestLiteLLMFiniteBudgetRoutesOpenCodeDefaultPool(t *testing.T) {
+	snap := &usage.UsageSnapshot{Providers: map[string]usage.ProviderUsage{
+		"opencode": {
+			Account: usageTestIdentity("lazer-gemini"),
+			Resources: map[string]usage.ResourceUsage{
+				"budget": {Kind: "consumption", State: "active", Pool: "default", Unit: "usd", Limit: 100, Remaining: 100},
+			},
+		},
+	}}
+	r := &SurfaceRouter{Computed: usage.NewQuotaEngine().ComputeAll(snap)}
+	state, ok := r.quotaState("opencode", "default")
+	if !ok || !state.Available || state.Reason != "ok" {
+		t.Fatalf("native finite LiteLLM budget did not reach opencode/default: ok=%v state=%+v", ok, state)
+	}
+}
+
+func TestAuthenticatedLiteLLMUnmeteredRoutesWithBoundedConcurrency(t *testing.T) {
+	snap := &usage.UsageSnapshot{Providers: map[string]usage.ProviderUsage{
+		"opencode": {
+			Status:  "unmetered",
+			Account: usageTestIdentity("lazer-unmetered"),
+		},
+	}}
+	r := &SurfaceRouter{Computed: usage.NewQuotaEngine().ComputeAll(snap)}
+	state, ok := r.quotaState("opencode", "default")
+	if !ok || !state.Available || state.Reason != "unmetered-authenticated" {
+		t.Fatalf("authenticated unmetered LiteLLM state did not reach opencode/default: ok=%v state=%+v", ok, state)
+	}
+	if got := credits.ClassConcurrency(credits.PaceClass(state.Class)); got <= 0 || got > 2 {
+		t.Fatalf("unmetered state lost bounded concurrency: %d", got)
+	}
+}
+
+func usageTestIdentity(key string) *usage.AccountIdentity {
+	return &usage.AccountIdentity{Key: key, Provenance: "litellm:key-info:key_name"}
 }
 
 // The end-to-end consequence: with claude, grok and agy exhausted and codex's

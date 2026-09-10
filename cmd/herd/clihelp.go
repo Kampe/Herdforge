@@ -82,8 +82,8 @@ var subcommandUsage = map[string]string{
 	"standing":         "Usage: herd standing [--dry-run|--status|--shutdown] [--only id,...] [id ...]\n  Raise, report, or shut down declarative standing control roles (not ephemeral workers).",
 	"wave":             "Usage: herd wave [--standing|--up] [--json]\n  Pre-wave readiness report; optional standing raise after gates pass.",
 	"daemon":           "Usage: herd daemon [flags]\n  Run the orchestration daemon.",
-	"usage":            "Usage: herd usage\n  Show harness quota usage from OpenUsage CLI.",
-	"quota":            "Usage: herd quota [flags]\n  Quota inspection helpers.",
+	"usage":            "Usage: herd usage\n  Show harness quota usage from native provider pollers.",
+	"quota":            "Usage: herd quota [flags]\n  Quota inspection helpers. --limits emits the raw native limits snapshot (herd.quota.limits.v1) for external consumers.",
 	"review":           "Usage: herd review [ref] [--spawn|--pool]\n  Signed review admission, or warm-pool review surface dispatch when signer admission is unavailable.",
 	"review-ledger": "Usage: herd review-ledger list|queued|pending|tier <sha>|readiness <sha>...|drift|evidence-gap|host-ingest [--with-board]\n" +
 		"  Append-only review ledger operations; drift reports live standing builder-family mismatches.\n" +

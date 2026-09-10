@@ -662,8 +662,8 @@ func printUsage() {
 	fmt.Println("  legacy-receipts  Audit/tombstone receiptless legacy in-progress tasks (fail-closed)")
 	fmt.Println("  standing   Raise/status/shutdown declarative standing control roles")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
-	fmt.Println("  usage      Show harness quota usage from OpenUsage CLI")
-	fmt.Println("  quota      Show binding headroom, pace/pressure, pool breakdown")
+	fmt.Println("  usage      Show harness quota usage from native provider pollers")
+	fmt.Println("  quota      Show binding headroom, pace/pressure, pool breakdown (--limits: raw native limits JSON)")
 	fmt.Println("  up         Start a single agent lane (herd up <lane-name>)")
 	fmt.Println("  activate   Bring up all deployables + health-check gate (compose + /v1/status)")
 	fmt.Println("  validate-config  Validate .herd/herd.yaml configuration")
@@ -1477,6 +1477,7 @@ func runUsage() {
 func runQuota() {
 	fs := flag.NewFlagSet("quota", flag.ExitOnError)
 	wantJSON := fs.Bool("json", false, "Output JSON")
+	limitsMode := fs.Bool("limits", false, "Emit the raw native limits snapshot as JSON (schema herd.quota.limits.v1) for external consumers")
 	pickMode := fs.Bool("pick", false, "Pick best provider")
 	among := fs.String("among", "", "Comma-separated providers for --pick (default: codex,claude)")
 	oneProvider := fs.String("provider", "", "Query one provider")
@@ -1485,9 +1486,17 @@ func runQuota() {
 	// discarded and pkg/usage exposes no bypass, so the flag never did anything.
 	// Accepted for compatibility with existing call sites, and now says so
 	// rather than promising a behaviour that does not exist.
-	_ = fs.Bool("force", false, "Accepted for compatibility; IGNORED (no openusage cache bypass exists)")
+	force := fs.Bool("force", false, "Bypass persistent and in-process quota caches for this request")
 	exhaustedPct := fs.Float64("exhausted-at", usage.DefaultExhaustedPct, "Exhausted threshold percent")
 	fs.Parse(os.Args[2:])
+
+	// --limits is the portable raw-quota surface (FAC-786): what was read, from
+	// which native endpoint, for which opaque account, how old, and exactly why
+	// any attempted provider failed. The BurnState output below is unchanged.
+	if *limitsMode {
+		runQuotaLimits(*oneProvider, *force)
+		return
+	}
 
 	e := usage.NewQuotaEngine()
 	e.ExhaustedPct = *exhaustedPct
@@ -1666,6 +1675,40 @@ func orEmpty(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// runQuotaLimits emits the portable limits document (herd.quota.limits.v1) for
+// external consumers such as the dotfiles quota wrappers. Exit codes are part
+// of the contract: 0 = at least one provider reading; 1 = no provider could be
+// polled (the JSON still carries per-provider reasons); 4 = --provider named a
+// provider with no reading.
+func runQuotaLimits(oneProvider string, force bool) {
+	var snap *usage.UsageSnapshot
+	var age time.Duration
+	var err error
+	if p := strings.TrimSpace(oneProvider); p != "" {
+		snap, err = usage.FetchProviderForce(p, force)
+	} else {
+		snap, age, err = usage.FetchSnapshotCachedForce(force)
+	}
+	if snap == nil {
+		// The snapshot itself was unobtainable (e.g. an unreadable fixture
+		// file); there is no provider attribution to report.
+		fmt.Fprintf(os.Stderr, "quota: %v\n", err)
+		os.Exit(1)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(snap.LimitsReport(age)); err != nil {
+		fmt.Fprintf(os.Stderr, "quota: encode limits: %v\n", err)
+		os.Exit(1)
+	}
+	switch {
+	case err == nil:
+		return
+	case strings.TrimSpace(oneProvider) != "":
+		os.Exit(4)
+	default:
+		os.Exit(1)
+	}
 }
 
 func runDaemon() {
@@ -6522,6 +6565,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		}
 	}
 	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
+	hardPin := pinnedBuilder && !lane.Standing
 	request := router.LaunchRequest{LaneName: strings.TrimSpace(lane.Name), Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	request.Standing = lane.Standing
 	if pinnedBuilder {
@@ -6563,9 +6607,18 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	// made codex unreachable from every lane whose configured model was not
 	// itself the probe-gated one.
 	if productionMode() {
-		candidates, wfErr := router.Waterfall(shape)
-		if wfErr != nil {
-			return nil, wfErr
+		var candidates []string
+		if hardPin {
+			// A hard provider pin is an acquisition boundary as well as a
+			// routing constraint: do not poll or probe unrelated providers while
+			// preparing this launch.
+			candidates = []string{provider}
+		} else {
+			var wfErr error
+			candidates, wfErr = router.Waterfall(shape)
+			if wfErr != nil {
+				return nil, wfErr
+			}
 		}
 		probes := map[string]bool{}
 		for _, cp := range candidates {
@@ -6580,14 +6633,18 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 			probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
 		}
 		if router.ModelRequiresProbe(model) {
-			probe := probeModel(ctx, provider, model, lane.Effort)
-			probes[router.ProbeKey(provider, model)] = probe.Available
-			if pinnedBuilder && !probe.Available {
-				reason := strings.TrimSpace(probe.Reason)
-				if reason == "" {
-					reason = "unknown probe failure"
+			if alreadyProbed, ok := probes[router.ProbeKey(provider, model)]; !ok {
+				probe := probeModel(ctx, provider, model, lane.Effort)
+				probes[router.ProbeKey(provider, model)] = probe.Available
+				if pinnedBuilder && !probe.Available {
+					reason := strings.TrimSpace(probe.Reason)
+					if reason == "" {
+						reason = "unknown probe failure"
+					}
+					return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
 				}
-				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			} else if pinnedBuilder && !alreadyProbed {
+				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: no exact probe output", lane.Name, provider, model)
 			}
 		}
 		if len(probes) > 0 {
@@ -6609,10 +6666,16 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	//
 	// Quota is read best-effort. An unavailable snapshot warns and routes on
 	// availability alone, exactly as liveScorer does -- degraded routing beats
-	// refusing every launch because openusage is down.
+	// refusing every launch because the quota snapshot is unavailable.
 	engine := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
-	if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
+	if hardPin {
+		if snap, err := usage.FetchProviderForce(provider, false); err == nil && snap != nil {
+			computed = engine.ComputeAll(snap)
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "herd: WARN lane %q native quota unavailable for pinned provider %s (%v); routing on availability only\n", lane.Name, provider, err)
+		}
+	} else if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
 		computed = engine.ComputeAll(snap)
 	} else if err != nil {
 		fmt.Fprintf(os.Stderr, "herd: WARN lane %q live quota unavailable (%v); routing on availability only\n", lane.Name, err)
@@ -6674,7 +6737,6 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	//
 	// observed live after provider, model and bind fallthrough were all working.
 	// A non-standing pinned builder keeps every one of these checks.
-	hardPin := pinnedBuilder && !lane.Standing
 	if hardPin && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
 		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}
@@ -7511,7 +7573,7 @@ func runProcess() {
 }
 
 // liveScorer backs lane resolution with the real herd-route port over live
-// openusage quota — the same decision core the zsh fleet uses.
+// native quota — the same decision core the zsh fleet uses.
 //
 // CHA-2451: install read-path probes that skip live generation (CLI + quota
 // only). A stuck defaultProviderProbe (45s, e.g. codex spark) previously made

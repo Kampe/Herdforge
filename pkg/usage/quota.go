@@ -43,6 +43,9 @@ type BurnState struct {
 	RunwayResource      string               `json:"runwayResource,omitempty"`
 	Available           bool                 `json:"available"`
 	Reason              string               `json:"reason"`
+	Unit                string               `json:"unit,omitempty"`
+	Pool                string               `json:"pool,omitempty"`
+	Account             *AccountIdentity     `json:"account,omitempty"`
 	Stale               bool                 `json:"stale"`
 	Plan                string               `json:"plan,omitempty"`
 	Windows             []BurnState          `json:"windows,omitempty"`
@@ -116,6 +119,13 @@ func humanDuration(d time.Duration) string {
 
 func classPace(used float64, windowSeconds int, resetsAt string, exhaustedPct float64, now time.Time) (BurnClass, int, float64) {
 	rin := resetsIn(resetsAt, now)
+	// A provider may truthfully report a fully consumed meter without exposing
+	// its reset instant (Ollama is one such authority). That is still explicit
+	// exhaustion and must refuse routing; only non-exhausted reset-less usage is
+	// untracked because its pacing cannot be established.
+	if rin == nil && used >= exhaustedPct {
+		return BurnExhausted, 100, math.Max(used, 125.0)
+	}
 	if rin == nil || windowSeconds == 0 {
 		return BurnUntracked, 100, math.Max(used, 50.0)
 	}
@@ -149,10 +159,17 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		if resourceNames != nil && !resourceNames[rk] {
 			continue
 		}
+		originalUnit := r.Unit
 		ws := r.WindowSeconds
 		wn, ok := realWindows[ws]
 		if !ok {
-			continue
+			if originalUnit == "usd" && r.State == "active" && r.Limit > 0 {
+				// LiteLLM's key budget is a finite ledger rather than a
+				// reset-based window. Preserve it as a pool-level budget.
+				wn = "budget"
+			} else {
+				continue
+			}
 		}
 		// FAC-596: zero usage IS data, and the most useful kind. Skipping it
 		// conflated "this resource reports nothing" with "this resource reports
@@ -173,11 +190,16 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		// 0%-used resource with no reset timestamp stays skipped: that is
 		// indistinguishable from absent data, which is the case the original
 		// guard was protecting against.
-		if r.Unit != "percent" {
+		if !normalizeResourcePercent(&r) {
 			continue
 		}
 		rin := resetsIn(r.ResetsAt, now)
-		if r.Used == 0 && rin == nil {
+		// LiteLLM key budgets are finite authenticated ledgers, not rolling
+		// windows, so a valid active USD budget may truthfully be untouched and
+		// omit a reset. Keep that capacity observable while continuing to reject
+		// reset-less zero readings from providers that have not proven a window.
+		finiteLiteLLMBudget := originalUnit == "usd" && r.State == "active" && r.Limit > 0
+		if r.Used == 0 && rin == nil && !finiteLiteLLMBudget {
 			continue
 		}
 		cls, pace, pressure := classPace(r.Used, ws, r.ResetsAt, exhaustedPct, now)
@@ -222,6 +244,9 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 			Pressure:            pressure,
 			RunwayMinutes:       runwayMinutes,
 			ExhaustsBeforeReset: exhaustsBeforeReset,
+			Unit:                originalUnit,
+			Pool:                r.Pool,
+			Account:             prov.Account,
 		})
 	}
 	if len(windows) == 0 {
@@ -285,6 +310,26 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		result.RunwayResource = runwayState.Resource
 	}
 	return &result
+}
+
+func normalizeResourcePercent(r *ResourceUsage) bool {
+	if r == nil || math.IsNaN(r.Used) || math.IsInf(r.Used, 0) || math.IsNaN(r.Limit) || math.IsInf(r.Limit, 0) {
+		return false
+	}
+	if r.Unit == "percent" {
+		return r.Limit >= 0 && r.Used >= 0 && r.Used <= 100
+	}
+	if r.Limit <= 0 || r.Used < 0 || r.Used > r.Limit {
+		return false
+	}
+	if r.Unit != "usd" && r.Unit != "requests" {
+		return false
+	}
+	r.Used = r.Used / r.Limit * 100
+	r.Remaining = math.Max(100-r.Used, 0)
+	r.Limit = 100
+	r.Unit = "percent"
+	return true
 }
 
 func poolResources(name string, prov ProviderUsage) map[string]map[string]bool {
@@ -390,6 +435,16 @@ func (e *QuotaEngine) ComputeAll(snap *UsageSnapshot) map[string]BurnState {
 		plan := prov.Plan
 		pools := make(map[string]BurnState)
 		providerError := false
+		if prov.Status == "unmetered" && prov.Account != nil && !stale {
+			computed[name] = BurnState{
+				Class:     BurnUntracked,
+				Available: true,
+				Reason:    "unmetered-authenticated",
+				Account:   prov.Account,
+				Plan:      plan,
+			}
+			continue
+		}
 
 		for pool, resources := range poolResources(name, prov) {
 			bs := computeBinding(prov, resources, e.ExhaustedPct, now)

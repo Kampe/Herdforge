@@ -25,6 +25,59 @@ const (
 	testWorkerEffort   = "medium"
 )
 
+func TestHardPinnedLaunchScopesNativeQuotaAndModelProbe(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HERD_MODE", "production")
+	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HOME", t.TempDir())
+	var calls = map[string]int{}
+	providers := map[string]func() (usage.ProviderUsage, error){
+		"codex": func() (usage.ProviderUsage, error) {
+			calls["codex"]++
+			return usage.ProviderUsage{DisplayName: "Codex", Resources: map[string]usage.ResourceUsage{
+				"weekly": {Kind: "consumption", Unit: "percent", Limit: 100, Remaining: 90, WindowSeconds: 604800},
+			}}, nil
+		},
+		"grok": func() (usage.ProviderUsage, error) {
+			calls["grok"]++
+			return usage.ProviderUsage{}, errors.New("unexpected grok poll")
+		},
+		"antigravity": func() (usage.ProviderUsage, error) {
+			calls["antigravity"]++
+			return usage.ProviderUsage{}, errors.New("unexpected agy poll")
+		},
+	}
+	restore := usage.SetNativePollersForTest(providers)
+	t.Cleanup(restore)
+	usage.InvalidateSnapshotCache()
+	t.Cleanup(usage.InvalidateSnapshotCache)
+	probes := map[string]int{}
+	lane := &config.LaneDef{Name: "pinned-recovery", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex", Provider: "codex", Model: "gpt-5.6-luna", Effort: "medium", TaskShape: launch.Implementation}
+	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, provider, model, _ string) herdr.ProbeResult {
+		probes[provider+"/"+model]++
+		return herdr.ProbeResult{Model: model, Available: true}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Provider != "codex" {
+		t.Fatalf("hard pin rerouted to %q", decision.Provider)
+	}
+	if calls["codex"] != 1 || calls["grok"] != 0 || calls["antigravity"] != 0 {
+		t.Fatalf("native acquisition crossed hard-pin boundary: %+v", calls)
+	}
+	for key := range probes {
+		if !strings.HasPrefix(key, "codex/") {
+			t.Fatalf("unrelated model probe %q crossed hard-pin boundary", key)
+		}
+	}
+}
+
 func testLaunchRouter(t *testing.T) *router.SurfaceRouter {
 	t.Helper()
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
@@ -1023,28 +1076,23 @@ func seedHealthyQuotaCache(t *testing.T, provider string) {
 // pinQuota pins each named provider's weekly window to an exact used percent.
 func pinQuota(t *testing.T, dir string, used map[string]float64) {
 	t.Helper()
-	res := func(used float64) map[string]any {
-		return map[string]any{"kind": "consumption", "limit": 100, "remaining": 100 - used,
-			"resetsAt": "2099-01-01T00:00:00Z", "unit": "percent", "used": used,
-			"utilization": used / 100, "windowSeconds": 604800}
-	}
-	entries := map[string]any{}
+	fixtures := map[string]func() (usage.ProviderUsage, error){}
 	for name, pct := range used {
-		entries[name] = map[string]any{"displayName": name, "stale": false,
-			"resources": map[string]any{"weekly": res(pct)}}
+		canonical := name
+		if canonical == "agy" {
+			canonical = "antigravity"
+		}
+		if canonical == "lazer" {
+			canonical = "litellm"
+		}
+		fixtures[canonical] = func() (usage.ProviderUsage, error) {
+			return usage.ProviderUsage{DisplayName: name, Resources: map[string]usage.ResourceUsage{
+				"weekly": {Kind: "consumption", State: "active", Unit: "percent", Limit: 100, Used: pct, Remaining: 100 - pct, Utilization: pct / 100, WindowSeconds: 604800},
+			}}, nil
+		}
 	}
-	body, err := json.Marshal(map[string]any{
-		"generatedAt": "2026-08-26T00:00:00.000Z", "schema": "openusage.limits.v1",
-		"providers": entries,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	stub := filepath.Join(dir, "openusage")
-	if err := os.WriteFile(stub, []byte("#!/bin/sh\ncat <<'JSON'\n"+string(body)+"\nJSON\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HERD_OPENUSAGE_BIN", stub)
+	restore := usage.SetNativePollersForTest(fixtures)
+	t.Cleanup(restore)
 	// The snapshot cache is per-USER and persisted to disk (FAC-679), so a stub
 	// binary alone does not isolate anything: the real machine's cached quota
 	// is served before the stub is ever run. Point the cache somewhere empty.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,14 +64,9 @@ func TestExactReviewModelOverrideUsesItsOwnHealthyPool(t *testing.T) {
 	if err := os.WriteFile(agy, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_PROBE_LOG\"\nprintf 'HERD_PROVIDER_PROBE_OK\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	openusage := filepath.Join(dir, "openusage")
 	quota := `{"generatedAt":"2026-08-29T20:00:00Z","providers":{"antigravity":{"displayName":"antigravity","stale":false,"resources":{"nonGeminiWeekly":{"kind":"consumption","limit":100,"remaining":0,"used":100,"utilization":1,"unit":"percent","resetsAt":"2099-01-01T00:00:00Z","windowSeconds":604800},"geminiWeekly":{"kind":"consumption","limit":100,"remaining":90,"used":10,"utilization":0.1,"unit":"percent","resetsAt":"2099-01-01T00:00:00Z","windowSeconds":604800}}}}}`
-	if err := os.WriteFile(openusage, []byte("#!/bin/sh\nprintf '%s\\n' '"+quota+"'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	t.Setenv("PATH", dir)
 	t.Setenv("HERD_USE_PI", "0")
-	t.Setenv("HERD_OPENUSAGE_BIN", openusage)
 	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota-cache.json"))
 	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "0")
 	t.Setenv("HERD_TEST_PROBE_LOG", probeLog)
@@ -78,6 +74,15 @@ func TestExactReviewModelOverrideUsesItsOwnHealthyPool(t *testing.T) {
 	t.Setenv("HERD_AVAILABLE_PROVIDERS", "")
 	t.Setenv("HERD_UNAVAILABLE_PROVIDERS", "")
 	t.Setenv("HERD_FAMILY_POSTURE", "")
+	var fixtureSnapshot usage.UsageSnapshot
+	if err := json.Unmarshal([]byte(quota), &fixtureSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	fixture := fixtureSnapshot.Providers["antigravity"]
+	restore := usage.SetNativePollersForTest(map[string]func() (usage.ProviderUsage, error){
+		"antigravity": func() (usage.ProviderUsage, error) { return fixture, nil },
+	})
+	t.Cleanup(restore)
 
 	got, err := resolvePoolReviewer("agy", "gemini-3.7-flash", "")
 	if err != nil {
@@ -160,9 +165,9 @@ func TestExactReviewModelOverrideRefreshesStaleQuotaCache(t *testing.T) {
 	if got.Pool != "gemini" || got.QuotaAge != 0 {
 		t.Fatalf("route used pool=%q cache_age=%s, want fresh gemini evidence", got.Pool, got.QuotaAge)
 	}
-	if _, err := os.Stat(fixture.quotaFetchLog); err != nil {
-		t.Fatalf("aged cache was used instead of a fresh quota read: %v", err)
-	}
+	// The native fixture is injected at the production poller boundary. A
+	// successful fresh result proves the aged cache was not used; no subprocess
+	// fetch log is involved.
 }
 
 type exactReviewRouteFixture struct {
@@ -185,11 +190,6 @@ func installExactReviewRouteFixture(t *testing.T, quota, providerProbe string) e
 		t.Fatal(err)
 	}
 	quotaFetchLog := filepath.Join(dir, "quota-fetch.log")
-	openusage := filepath.Join(dir, "openusage")
-	openusageScript := "#!/bin/sh\nprintf 'fetch\\n' >> \"$HERD_TEST_QUOTA_LOG\"\nprintf '%s\\n' '" + quota + "'\n"
-	if err := os.WriteFile(openusage, []byte(openusageScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	tabLog := filepath.Join(dir, "tabs.log")
 	fakeHerdr := filepath.Join(dir, "herdr")
 	if err := os.WriteFile(fakeHerdr, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_TAB_LOG\"\n"), 0o755); err != nil {
@@ -198,7 +198,6 @@ func installExactReviewRouteFixture(t *testing.T, quota, providerProbe string) e
 	quotaCache := filepath.Join(dir, "quota-cache.json")
 	t.Setenv("PATH", dir)
 	t.Setenv("HERD_USE_PI", "0")
-	t.Setenv("HERD_OPENUSAGE_BIN", openusage)
 	t.Setenv("HERD_QUOTA_CACHE_PATH", quotaCache)
 	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "0")
 	t.Setenv("HERD_TEST_PROBE_LOG", probeLog)
@@ -211,6 +210,21 @@ func installExactReviewRouteFixture(t *testing.T, quota, providerProbe string) e
 	}
 	usage.InvalidateSnapshotCache()
 	t.Cleanup(usage.InvalidateSnapshotCache)
+	var fixtureSnapshot usage.UsageSnapshot
+	if err := json.Unmarshal([]byte(quota), &fixtureSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if fixture, ok := fixtureSnapshot.Providers["antigravity"]; ok {
+		restore := usage.SetNativePollersForTest(map[string]func() (usage.ProviderUsage, error){
+			"antigravity": func() (usage.ProviderUsage, error) { return fixture, nil },
+		})
+		t.Cleanup(restore)
+	} else {
+		restore := usage.SetNativePollersForTest(map[string]func() (usage.ProviderUsage, error){
+			"antigravity": func() (usage.ProviderUsage, error) { return usage.ProviderUsage{}, os.ErrNotExist },
+		})
+		t.Cleanup(restore)
+	}
 	return exactReviewRouteFixture{dir: dir, tabLog: tabLog, quotaCache: quotaCache, quotaFetchLog: quotaFetchLog}
 }
 
