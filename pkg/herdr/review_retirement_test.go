@@ -131,6 +131,7 @@ type retirementFake struct {
 	evidence   map[string]ReviewRetirementEvidence
 	observeErr map[string]error
 	fail       string
+	failGen    string
 }
 
 func (f *retirementFake) Observe(m ReviewRetirementManifest) (ReviewRetirementEvidence, error) {
@@ -145,7 +146,7 @@ func (f *retirementFake) Journal(m ReviewRetirementManifest, phase string) error
 }
 func (f *retirementFake) step(name string, m ReviewRetirementManifest) error {
 	f.events = append(f.events, name)
-	if f.fail == name {
+	if f.fail == name && (f.failGen == "" || f.failGen == m.Generation) {
 		return errors.New("injected failure")
 	}
 	return nil
@@ -241,5 +242,55 @@ func TestRetireReviewLanesDryRunNeverMutates(t *testing.T) {
 	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{m}, true)
 	if err != nil || !r.DryRun || r.Retired != 0 || len(f.events) != 0 {
 		t.Fatalf("report=%+v events=%v err=%v", r, f.events, err)
+	}
+}
+
+func TestRetireReviewLanesCloseFailurePopulatesCandidateStateAndLeavesLaterUnattempted(t *testing.T) {
+	m1 := retirementManifest(t, "g1")
+	m2 := retirementManifest(t, "g2")
+	m3 := retirementManifest(t, "g3")
+	f := &retirementFake{
+		evidence: map[string]ReviewRetirementEvidence{
+			"g1": retirementEvidence(m1),
+			"g2": retirementEvidence(m2),
+			"g3": retirementEvidence(m3),
+		},
+		fail:    "close",
+		failGen: "g2",
+	}
+
+	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{m1, m2, m3}, false)
+	if err == nil {
+		t.Fatalf("expected close failure error, got nil")
+	}
+	if r.Retired != 1 {
+		t.Fatalf("expected 1 retired lane, got %d", r.Retired)
+	}
+	if r.Failed != 1 {
+		t.Fatalf("expected 1 failed lane, got %d", r.Failed)
+	}
+	if len(r.Candidates) != 3 {
+		t.Fatalf("expected 3 candidates, got %d", len(r.Candidates))
+	}
+
+	// First candidate: retired cleanly
+	if !r.Candidates[0].Retired || !r.Candidates[0].Completed || r.Candidates[0].Failed {
+		t.Fatalf("candidate 0 should be retired: %+v", r.Candidates[0])
+	}
+
+	// Second candidate: close failed during mutation
+	if r.Candidates[1].Retired || !r.Candidates[1].Failed || !strings.Contains(r.Candidates[1].Error, "close") {
+		t.Fatalf("candidate 1 should have Failed=true and close error, got: %+v", r.Candidates[1])
+	}
+	if !r.Candidates[1].Decision.Eligible {
+		t.Fatalf("candidate 1 had Eligible=true during observation, should remain eligible: %+v", r.Candidates[1])
+	}
+
+	// Third candidate: unattempted due to prior failure
+	if r.Candidates[2].Retired || r.Candidates[2].Failed || r.Candidates[2].Completed {
+		t.Fatalf("candidate 2 should be unattempted (not retired, not failed): %+v", r.Candidates[2])
+	}
+	if !r.Candidates[2].Decision.Eligible {
+		t.Fatalf("candidate 2 should remain Eligible=true: %+v", r.Candidates[2])
 	}
 }

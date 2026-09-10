@@ -817,6 +817,7 @@ func TestDrainExecuteActions_ReviewRetirementBlockedObservabilityPreservedWithou
 			{
 				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-retired"},
 				Decision: herdr.ReviewRetirementDecision{Eligible: true, Reason: "cleanly retired"},
+				Retired:  true,
 			},
 			{
 				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-blocked"},
@@ -874,6 +875,7 @@ func TestDrainExecuteActions_ReviewRetirementMixedBatchSurfacesDispositionsAndFa
 			{
 				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-retired"},
 				Decision: herdr.ReviewRetirementDecision{Eligible: true, Reason: "cleanly retired"},
+				Retired:  true,
 			},
 			{
 				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-blocked"},
@@ -882,6 +884,8 @@ func TestDrainExecuteActions_ReviewRetirementMixedBatchSurfacesDispositionsAndFa
 			{
 				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-failed"},
 				Decision: herdr.ReviewRetirementDecision{Eligible: false, Reason: "BLOCKED: observation failed: i/o timeout"},
+				Failed:   true,
+				Error:    "observation failed: i/o timeout",
 			},
 		},
 	}
@@ -928,5 +932,158 @@ func TestDrainExecuteActions_ReviewRetirementMixedBatchSurfacesDispositionsAndFa
 	}
 	if !strings.Contains(outStr, "review_retired=1 review_blocked=1 refusals=1") {
 		t.Errorf("expected summary line to carry review_retired=1 review_blocked=1 refusals=1, got:\n%s", outStr)
+	}
+}
+
+type fakeDrainReviewRetirementOp struct {
+	evidence map[string]herdr.ReviewRetirementEvidence
+	failGen  string
+	failOp   string
+}
+
+func (f *fakeDrainReviewRetirementOp) Observe(m herdr.ReviewRetirementManifest) (herdr.ReviewRetirementEvidence, error) {
+	if f.failOp == "observe" && m.Generation == f.failGen {
+		return herdr.ReviewRetirementEvidence{}, errors.New("simulated observation failure")
+	}
+	return f.evidence[m.Generation], nil
+}
+func (f *fakeDrainReviewRetirementOp) Revalidate(m herdr.ReviewRetirementManifest, phase string) error {
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) Journal(m herdr.ReviewRetirementManifest, phase string) error {
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) Close(m herdr.ReviewRetirementManifest) error {
+	if f.failOp == "close" && m.Generation == f.failGen {
+		return errors.New("simulated close failure")
+	}
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) LeaseReleased(m herdr.ReviewRetirementManifest) (bool, error) {
+	return true, nil
+}
+func (f *fakeDrainReviewRetirementOp) ReleaseLease(_ context.Context, m herdr.ReviewRetirementManifest) error {
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) RemoveWorktree(m herdr.ReviewRetirementManifest) error {
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) RemoveBranch(m herdr.ReviewRetirementManifest) error {
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) RemoveArtifact(m herdr.ReviewRetirementManifest) error {
+	return nil
+}
+func (f *fakeDrainReviewRetirementOp) Receipt(m herdr.ReviewRetirementManifest, d herdr.ReviewRetirementDecision) error {
+	return nil
+}
+
+// TestDrainExecuteActions_ReviewRetirementClosePhaseFailureWithFakeOperator asserts that
+// when a real operator encounters a failure during mutation (Close phase) on an eligible lane:
+// 1. Succeeded lanes report RETIRED
+// 2. The close-failed lane reports FAILED with the actual error, rather than falsely claiming RETIRED
+// 3. Subsequent eligible lanes not attempted do not falsely claim RETIRED
+// 4. REFUSED review-retirement and non-zero refusals/failure are preserved.
+func TestDrainExecuteActions_ReviewRetirementClosePhaseFailureWithFakeOperator(t *testing.T) {
+	m1 := herdr.NewReviewRetirementManifest(time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC), herdr.ReviewRetirementManifest{
+		Repository: "herdforge", TaskRef: "FAC-708", TaskID: "task-708",
+		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Branch: "review/FAC-708",
+		Worktree: ".herd/reviews/fac-708-1", Pool: ".herd/pool", Slot: "pool-01", LeaseGeneration: 7,
+		Workspace: "wK", TabID: "wK:t15T", PaneID: "wK:p15T", TerminalID: "term-1", SessionID: "session-1",
+		Reviewer: "forge-mender-fac708-nat-d4b3b8dc", ReviewerFamily: "openai", ReviewerModel: "gpt-5.6-luna",
+		PromptArtifact: ".herd/review/prompts/fac-708-1.md", Generation: "gen-1", Nonce: "nonce-1",
+	})
+	m2 := herdr.NewReviewRetirementManifest(time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC), herdr.ReviewRetirementManifest{
+		Repository: "herdforge", TaskRef: "FAC-708", TaskID: "task-708",
+		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Branch: "review/FAC-708",
+		Worktree: ".herd/reviews/fac-708-2", Pool: ".herd/pool", Slot: "pool-02", LeaseGeneration: 8,
+		Workspace: "wK", TabID: "wK:t16T", PaneID: "wK:p16T", TerminalID: "term-2", SessionID: "session-2",
+		Reviewer: "forge-mender-fac708-nat-d4b3b8dc", ReviewerFamily: "openai", ReviewerModel: "gpt-5.6-luna",
+		PromptArtifact: ".herd/review/prompts/fac-708-2.md", Generation: "gen-2", Nonce: "nonce-2",
+	})
+	m3 := herdr.NewReviewRetirementManifest(time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC), herdr.ReviewRetirementManifest{
+		Repository: "herdforge", TaskRef: "FAC-708", TaskID: "task-708",
+		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Branch: "review/FAC-708",
+		Worktree: ".herd/reviews/fac-708-3", Pool: ".herd/pool", Slot: "pool-03", LeaseGeneration: 9,
+		Workspace: "wK", TabID: "wK:t17T", PaneID: "wK:p17T", TerminalID: "term-3", SessionID: "session-3",
+		Reviewer: "forge-mender-fac708-nat-d4b3b8dc", ReviewerFamily: "openai", ReviewerModel: "gpt-5.6-luna",
+		PromptArtifact: ".herd/review/prompts/fac-708-3.md", Generation: "gen-3", Nonce: "nonce-3",
+	})
+
+	focused := false
+	evidence := func(m herdr.ReviewRetirementManifest) herdr.ReviewRetirementEvidence {
+		launch := reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Branch: m.TaskRef}
+		verdict := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: m.CandidateSHA, CandidateSHA: m.CandidateSHA, Reviewer: m.Reviewer, Verdict: string(reviewledger.VerdictPASS), ArtifactDigest: "artifact"}
+		ack := reviewack.Ack{SHA: m.CandidateSHA, Reviewer: m.Reviewer, LaunchIdentity: m.Reviewer, ArtifactDigest: verdict.ArtifactDigest}
+		return herdr.ReviewRetirementEvidence{
+			Manifest: m, Launch: launch, Verdict: herdr.ReviewRetirementVerdict{Row: verdict, Ack: ack},
+			Live: herdr.ReviewRetirementLive{Status: "idle", Focused: &focused, SessionID: m.SessionID},
+			Worktree: herdr.ReviewRetirementWorktree{Known: true, Head: m.CandidateSHA, Branch: m.Branch},
+			WorktreeRoot: ".herd/reviews", PromptRoot: ".herd/review/prompts", Repository: m.Repository,
+		}
+	}
+
+	op := &fakeDrainReviewRetirementOp{
+		evidence: map[string]herdr.ReviewRetirementEvidence{
+			"gen-1": evidence(m1),
+			"gen-2": evidence(m2),
+			"gen-3": evidence(m3),
+		},
+		failGen: "gen-2",
+		failOp:  "close",
+	}
+
+	rep, retireErr := herdr.RetireReviewLanesContext(context.Background(), op, []herdr.ReviewRetirementManifest{m1, m2, m3}, false)
+	if retireErr == nil {
+		t.Fatalf("expected error from RetireReviewLanesContext, got nil")
+	}
+
+	hooks := drainActionHooks{
+		launchReview: func(context.Context, drainActionEvidence) error { return nil },
+		harvest:      func(context.Context, drainActionEvidence) error { return nil },
+		retireReviews: func(context.Context) (herdr.ReviewRetirementReport, error) {
+			return rep, retireErr
+		},
+	}
+
+	var out strings.Builder
+	result := executeDrainActions(context.Background(), drainTestReport(), nil, 0, 0, 0, "", &out, hooks)
+
+	if !result.Failed {
+		t.Fatalf("drain action result must fail when a review close fails, got failed=false")
+	}
+	if result.Refusals != 1 {
+		t.Fatalf("expected 1 refusal for close failure, got %d", result.Refusals)
+	}
+	if result.ReviewRetirements.Retired != 1 {
+		t.Fatalf("expected 1 retired review in result, got %d", result.ReviewRetirements.Retired)
+	}
+	if result.ReviewRetirements.Failed != 1 {
+		t.Fatalf("expected 1 failed review in result, got %d", result.ReviewRetirements.Failed)
+	}
+
+	outStr := out.String()
+	// gen-1 completed retirement successfully
+	if !strings.Contains(outStr, "RETIRED review generation=gen-1") {
+		t.Errorf("expected human output to report retired review for gen-1, got:\n%s", outStr)
+	}
+	// gen-2 close failed: must report FAILED with error, NEVER falsely report RETIRED
+	if strings.Contains(outStr, "RETIRED review generation=gen-2") {
+		t.Errorf("human output falsely reported RETIRED for close-failed gen-2:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "FAILED review-retirement generation=gen-2: close wK:t16T: simulated close failure") {
+		t.Errorf("expected human output to report FAILED for gen-2, got:\n%s", outStr)
+	}
+	// gen-3 was not attempted due to prior failure: must NEVER falsely report RETIRED
+	if strings.Contains(outStr, "RETIRED review generation=gen-3") {
+		t.Errorf("human output falsely reported RETIRED for unattempted gen-3:\n%s", outStr)
+	}
+	// Error refusal is surfaced
+	if !strings.Contains(outStr, "REFUSED review-retirement: close wK:t16T: simulated close failure") {
+		t.Errorf("expected human output to report refusal for close failure, got:\n%s", outStr)
+	}
+	// Summary line reflects true counts
+	if !strings.Contains(outStr, "review_retired=1 review_blocked=0 refusals=1") {
+		t.Errorf("expected summary line to carry review_retired=1 review_blocked=0 refusals=1, got:\n%s", outStr)
 	}
 }
