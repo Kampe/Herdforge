@@ -351,12 +351,6 @@ func worktreeExists(path string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// useHarnessHooksFromWorktree supplies the repository-declared hook policy
-// when a coordinator is reviewing a candidate before that candidate has
-// landed on the coordinator's checkout. The candidate worktree is already
-// authenticated by review admission; using its .herd/harness-hooks.json
-// keeps native Herdr launches independent of an operator-set environment
-// variable while preserving an explicit override when one is present.
 // standingHookPolicyScope is useHarnessHooksFromWorktree applied to a
 // standing lane's own configured worktree (FAC-624). `herd standing` admits
 // through the same launchAdmission -> preflightHooks -> harness.DefaultDiscovery
@@ -368,6 +362,34 @@ func standingHookPolicyScope(lane *config.LaneDef) func() {
 	return useHarnessHooksFromWorktree(filepath.Join(".", lane.Worktree))
 }
 
+// currentLaunchAttemptID is the caller-minted identity (FAC-624,
+// launch.NewAttemptID) of the admission attempt in progress, read by
+// validateDecisionBeforeSideEffect when it builds its Request. Scoped for
+// the duration of one call the same way useHarnessHooksFromWorktree scopes
+// HERD_HARNESS_HOOKS_FILE via an env var: set by useLaunchAttemptID before
+// the admission call, restored after. Empty by default, so every caller
+// that does not opt in (all but `herd standing`'s AdmitRoute today) sees
+// no behavior change -- launch.Request.AttemptID stays "" and
+// recordHookFailure falls back to its own process-identity default. Not
+// safe for concurrent admissions in the same process; today's callers
+// (herd up, herd standing's AdmitRoute, the ForgeLoop rearm path) all
+// admit sequentially, never concurrently, within one process.
+var currentLaunchAttemptID string
+
+// useLaunchAttemptID scopes one caller-minted attempt identity for the
+// duration of a single admission attempt.
+func useLaunchAttemptID(id string) func() {
+	previous := currentLaunchAttemptID
+	currentLaunchAttemptID = id
+	return func() { currentLaunchAttemptID = previous }
+}
+
+// useHarnessHooksFromWorktree supplies the repository-declared hook policy
+// when a coordinator is reviewing a candidate before that candidate has
+// landed on the coordinator's checkout. The candidate worktree is already
+// authenticated by review admission; using its .herd/harness-hooks.json
+// keeps native Herdr launches independent of an operator-set environment
+// variable while preserving an explicit override when one is present.
 func useHarnessHooksFromWorktree(wt string) func() {
 	if strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE")) != "" {
 		return func() {}

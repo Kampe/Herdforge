@@ -649,14 +649,6 @@ func TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook(t *testing.T) {
 	}
 }
 
-// withAttemptIdentity fakes attemptIdentity for one test, restored after.
-func withAttemptIdentity(t *testing.T, id string) {
-	t.Helper()
-	previous := attemptIdentity
-	attemptIdentity = func() string { return id }
-	t.Cleanup(func() { attemptIdentity = previous })
-}
-
 // TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated is FAC-624 defect 3:
 // WriteOnce dedupes a ReceiptKey against the sink's entire history forever.
 // That is correct for a stable misconfiguration (a genuinely missing/stale
@@ -665,8 +657,8 @@ func withAttemptIdentity(t *testing.T, id string) {
 // later occurrence would be silently swallowed -- exactly how the operator's
 // blocked launches left no receipt to inspect.
 func TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated(t *testing.T) {
-	withAttemptIdentity(t, "attempt-fresh")
 	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	req.AttemptID = "attempt-fresh"
 	// preflightHooks sets req.HookPolicyRevision from the discovery result's
 	// PolicyRevision, which emptyPolicySetRequest leaves at its zero value.
 	name := fmt.Sprintf("no policy set loaded; source=%q", "/fake/.herd/harness-hooks.json")
@@ -691,18 +683,19 @@ func TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated(t *testing.T) {
 // TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted is the acceptance
 // criterion "every blocked launch is observable": two GENUINELY separate
 // attempts landing in the same instant (a wall-clock bucket would collapse
-// them) must each get their own receipt. attemptIdentity is faked to two
-// different values to simulate two distinct process invocations without
-// needing a real clock boundary or two real OS processes.
+// them, and so would a bare PID within one long-lived process) must each
+// get their own receipt. req.AttemptID is set to two different caller-minted
+// values, exactly as a real caller (see cmd/herd's standing AdmitRoute) mints
+// one per attempt via launch.NewAttemptID before calling Validate.
 func TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted(t *testing.T) {
 	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
 	sink := &MemorySink{}
 
-	withAttemptIdentity(t, "attempt-A")
+	req.AttemptID = "attempt-A"
 	if err := Validate(req, sink); err == nil {
 		t.Fatal("an empty required policy set must fail closed")
 	}
-	withAttemptIdentity(t, "attempt-B")
+	req.AttemptID = "attempt-B"
 	if err := Validate(req, sink); err == nil {
 		t.Fatal("an empty required policy set must fail closed")
 	}
@@ -717,11 +710,11 @@ func TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted(t *testing.T) {
 
 // TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated is the
 // other half of the acceptance criterion: an idempotent retry of the SAME
-// attempt (attemptIdentity unchanged -- e.g. the same process re-running
-// preflight) must not spam a new receipt per retry.
+// attempt (req.AttemptID unchanged -- the caller did not mint a new one)
+// must not spam a new receipt per retry.
 func TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated(t *testing.T) {
-	withAttemptIdentity(t, "attempt-A")
 	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	req.AttemptID = "attempt-A"
 	sink := &MemorySink{}
 
 	if err := Validate(req, sink); err == nil {
@@ -733,6 +726,32 @@ func TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated(t *testing.
 
 	if len(sink.Receipts) != 1 {
 		t.Fatalf("retrying the same attempt was not deduplicated: %+v", sink.Receipts)
+	}
+}
+
+// TestEmptyPolicySetFallsBackToProcessIdentityWhenCallerSetsNoAttemptID
+// covers every OTHER caller of Validate today (up, dispatch, the
+// recovery/pulse cycle, forgeLaunchAdmission) -- none of them mint
+// req.AttemptID yet (only standing's AdmitRoute does). They must keep
+// exactly their prior behavior: attemptIdentity() (this process's PID).
+func TestEmptyPolicySetFallsBackToProcessIdentityWhenCallerSetsNoAttemptID(t *testing.T) {
+	previous := attemptIdentity
+	attemptIdentity = func() string { return "fallback-pid" }
+	t.Cleanup(func() { attemptIdentity = previous })
+
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	if req.AttemptID != "" {
+		t.Fatalf("fixture unexpectedly set AttemptID: %q", req.AttemptID)
+	}
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("receipts = %+v", sink.Receipts)
+	}
+	if !strings.HasSuffix(sink.Receipts[0].ReceiptKey, "|fallback-pid") {
+		t.Fatalf("caller with no AttemptID did not fall back to attemptIdentity(): %q", sink.Receipts[0].ReceiptKey)
 	}
 }
 

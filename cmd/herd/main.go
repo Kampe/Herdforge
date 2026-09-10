@@ -2046,6 +2046,13 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			// `herd up`. lane.Worktree is already known here, before CreateTab.
 			restoreHooks := standingHookPolicyScope(lane)
 			defer restoreHooks()
+			// FAC-624: a bare PID cannot distinguish repeated admission
+			// attempts within one long-lived process -- exactly this
+			// AdmitRoute, rearmed on every ForgeLoop tick for the
+			// coordinator's entire uptime. Mint one identity per attempt,
+			// here, once, before admission runs.
+			restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
+			defer restoreAttempt()
 			// The launch decision is the sole standing admission authority. Do
 			// not run a separate quota-only pre-gate here: it reads a different
 			// snapshot from the router and cannot account for live concurrency,
@@ -7057,7 +7064,7 @@ func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef s
 	if decision == nil {
 		return fmt.Errorf("missing routed launch decision")
 	}
-	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope}, nil)
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, AttemptID: currentLaunchAttemptID}, nil)
 }
 
 // ensureArtifactToolProbe returns a current tool-probe PASS for decision's
