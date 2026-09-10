@@ -94,8 +94,9 @@ var subcommandUsage = map[string]string{
 	"feedback":        "Usage: herd feedback [flags]\n  Census fleet-wide control-plane feedback.",
 	"fence-broker":    "Usage: herd fence-broker [flags]\n  Inspect or enforce the broker authority fence.",
 	"fence-provision": "Usage: herd fence-provision [flags]\n  Provision the coordinator fence authority.",
-	"harvest-merge": "Usage: herd harvest-merge <branch> [flags]\n" +
-		"  Cherry-pick reviewed commits onto a fresh base, or prove an existing landing.\n" +
+	"harvest-merge": "Usage: herd harvest-merge <lane> --branch <source-branch> --title <title> [flags]\n" +
+		"  Positional <lane> names the harvest lane; --branch names the source branch.\n" +
+		"  --title is required for a harvest; use --verify-landed for landing proof.\n" +
 		"\n" +
 		"  Candidate selection:\n" +
 		"    --candidate <sha>        exact reviewed candidate to harvest. Required when the\n" +
@@ -103,7 +104,8 @@ var subcommandUsage = map[string]string{
 		"                             --candidate-sha.\n" +
 		"    --candidate-range <a>..<b>  scope a standing-lane harvest to one range\n" +
 		"    --base <ref>             base to cherry-pick onto\n" +
-		"    --branch <name>          branch whose worktree holds the candidate\n" +
+		"    --branch <name>          source branch whose worktree holds the candidate\n" +
+		"    --title <text>           required title for the harvested change\n" +
 		"\n" +
 		"  Landing proof:\n" +
 		"    --verify-landed          prove the branch content is already on origin/main\n" +
@@ -116,7 +118,10 @@ var subcommandUsage = map[string]string{
 		"    --task-id --base-sha --lease --lease-generation --patch-id\n" +
 		"    --acceptance-digest --author-family --author-identity --provider-revision\n" +
 		"\n" +
-		"  Other: --verdict --reconstructed-from --content-proof --dry-run --allow-markers",
+		"  Operator stop (never merge consent): --verdict <FAIL|BLOCKED>\n" +
+		"    PASS is rejected; review-ledger PASS is the merge consent.\n" +
+		"  Other: --reconstructed-from --content-proof --dry-run --allow-markers\n" +
+		"    --allow-unrecorded-provenance  explicit per-candidate reduced-provenance admission",
 	"hostcreds":        "Usage: herd hostcreds <diagnose|session|selftest> [flags]\n  Query the host credentials oracle (native auth diagnose; no OpenCode broker session).",
 	"labels":           "Usage: herd labels [flags]\n  Reconcile drifted Herdforge tab labels in place.",
 	"merge-admit":      "Usage: herd merge-admit [flags]\n  Admit a reviewed candidate to the coordinator merge path.",
