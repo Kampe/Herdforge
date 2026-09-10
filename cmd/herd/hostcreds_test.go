@@ -45,46 +45,61 @@ func TestHostCredsCLI_Selftest(t *testing.T) {
 // worth keeping, so it is asserted rather than dropped.
 func TestHostCredsCLI_HarnessKindIsNativeAuthWithoutEnvKeys(t *testing.T) {
 	bin := buildHerdForHostCreds(t)
-	cmd := exec.Command(bin, "hostcreds", "diagnose", "--kind", "grok")
-	cmd.Env = filterEnv(os.Environ(), "XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HERD_HOST_CREDS")
-	out, err := cmd.CombinedOutput()
-	s := string(out)
+	for _, kind := range []string{"grok", "opencode"} {
+		cmd := exec.Command(bin, "hostcreds", "diagnose", "--kind", kind)
+		cmd.Env = filterEnv(os.Environ(), "XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HERD_HOST_CREDS")
+		out, err := cmd.CombinedOutput()
+		s := string(out)
 
-	// A logged-out harness is a genuine blocker and this host may legitimately be
-	// in that state, so accept it explicitly rather than letting it fail as a
-	// surprise.
-	if err != nil {
-		if !strings.Contains(s, "BLOCKED") {
-			t.Fatalf("non-zero exit must carry a BLOCKED packet: %s", s)
+		// A logged-out harness is a genuine blocker and this host may legitimately be
+		// in that state, so accept it explicitly rather than letting it fail as a
+		// surprise.
+		if err != nil {
+			if !strings.Contains(s, "BLOCKED") {
+				t.Fatalf("non-zero exit for %s must carry a BLOCKED packet: %s", kind, s)
+			}
+			if !strings.Contains(s, "logged") && !strings.Contains(s, "login") {
+				t.Fatalf("the only legitimate blocker for a harness kind is a logged-out harness: %s", s)
+			}
+		} else if !strings.Contains(s, "native_auth") {
+			t.Fatalf("a harness-authenticated kind (%s) without env keys must report native_auth, got: %s", kind, s)
 		}
-		if !strings.Contains(s, "logged") && !strings.Contains(s, "login") {
-			t.Fatalf("the only legitimate blocker for a harness kind is a logged-out harness: %s", s)
-		}
-	} else if !strings.Contains(s, "native_auth") {
-		t.Fatalf("a harness-authenticated kind without env keys must report native_auth, got: %s", s)
-	}
 
-	if strings.Contains(s, "sk-") {
-		t.Fatal("secret shape in diagnose output")
+		if strings.Contains(s, "sk-") {
+			t.Fatalf("secret shape in diagnose output for %s", kind)
+		}
 	}
 }
 
-func TestHostCredsCLI_OpenCodeRejected(t *testing.T) {
+func TestHostCredsCLI_UnknownKindRejected(t *testing.T) {
 	bin := buildHerdForHostCreds(t)
-	cmd := exec.Command(bin, "hostcreds", "diagnose", "--kind", "opencode")
+	cmd := exec.Command(bin, "hostcreds", "diagnose", "--kind", "unknown-kind")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatal("expected reject")
 	}
-	// diagnose --kind opencode reports BLOCKED via DiagnoseKindAuthReadiness
-	// (class config) or an explicit out-of-scope reject. This was a t.Logf, so
-	// the wording was unguarded and the branch could never fail the test.
-	if !strings.Contains(string(out), "out of scope") && !strings.Contains(string(out), "BLOCKED") {
-		t.Fatalf("opencode rejection must say BLOCKED or out of scope; got:\n%s", out)
+	if !strings.Contains(string(out), "BLOCKED") {
+		t.Fatalf("unknown kind rejection must say BLOCKED; got:\n%s", out)
 	}
 	// The rejection must not leak credential material.
 	if security.RedactSecrets(string(out)) != string(out) {
-		t.Fatalf("opencode rejection carries secret-shaped material:\n%s", out)
+		t.Fatalf("unknown kind rejection carries secret-shaped material:\n%s", out)
+	}
+}
+
+func TestHostCredsCLI_UsageIncludesOpenCodeDiagnose(t *testing.T) {
+	bin := buildHerdForHostCreds(t)
+	cmd := exec.Command(bin, "hostcreds", "help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hostcreds help failed: %v\n%s", err, out)
+	}
+	s := string(out)
+	if !strings.Contains(s, "opencode") {
+		t.Errorf("hostcreds help must mention opencode under diagnose: %s", s)
+	}
+	if !strings.Contains(s, "raw HostCreds session/live broker remains unsupported for OpenCode") {
+		t.Errorf("hostcreds help must clarify raw broker unsupported for OpenCode: %s", s)
 	}
 }
 

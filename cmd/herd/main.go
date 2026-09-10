@@ -694,7 +694,7 @@ func printUsage() {
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
 	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
 	fmt.Println("  command         Run a root-authorized command under a durable attempt budget")
-	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; no OpenCode)")
+	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; native auth diagnose, no OpenCode broker)")
 	fmt.Println("  control        Issue/drain authenticated control envelopes (FAC-133)")
 	fmt.Println("  netbroker-serve Durable network allowlist broker process (FAC-133)")
 	fmt.Println("  transcript      Read a lane's recent output and final handoff (read-only)")
