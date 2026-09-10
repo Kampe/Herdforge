@@ -143,12 +143,21 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
 	op := &herdr.NativeReviewRetirementOp{Root: a.root, RepositoryIdentity: a.repository, Ledger: a.ledger}
-	result, err := herdr.RetireReviewLanesContext(ctx, op, manifests, false)
-	if err != nil {
-		return err
+
+	var opErrs []string
+	for _, m := range manifests {
+		subResult, subErr := herdr.RetireReviewLanesContext(ctx, op, []herdr.ReviewRetirementManifest{m}, false)
+		if subErr != nil {
+			opErrs = append(opErrs, fmt.Sprintf("retire review %s: %v", m.Generation, subErr))
+			continue
+		}
+		if subResult.Failed > 0 {
+			opErrs = append(opErrs, fmt.Sprintf("retire review %s: %d operation failure(s)", m.Generation, subResult.Failed))
+			continue
+		}
 	}
-	if result.Blocked > 0 {
-		return fmt.Errorf("%d review retirement lane(s) blocked; retained exact manifests", result.Blocked)
+	if len(opErrs) > 0 {
+		return errors.New(strings.Join(opErrs, "; "))
 	}
 	return nil
 }
