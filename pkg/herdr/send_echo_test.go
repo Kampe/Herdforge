@@ -12,11 +12,15 @@ import "testing"
 // just started, so the review backlog could not move: 43 candidates queued, 0
 // reviewed, every launch discarded at the last step.
 func TestNonEchoingHarnessCanProveConsumption(t *testing.T) {
-	// Codex echoes, so it keeps the strong proof.
-	for _, kind := range []string{"codex", "opencode", "ollama", "lazer", "pi"} {
+	// Codex echoes, so it keeps the strong proof. OpenCode uses its native
+	// session export instead of decorative pane text.
+	for _, kind := range []string{"codex", "ollama", "lazer", "pi"} {
 		if !harnessEchoesPrompt(kind) {
 			t.Errorf("%s echoes its prompt and must keep echo-based proof", kind)
 		}
+	}
+	if harnessEchoesPrompt("opencode") {
+		t.Error("OpenCode must use structured native evidence, not pane echo proof")
 	}
 	// Claude does not, and neither does anything unrecognised — the default is
 	// the strong path, so a new harness is not silently granted the fallback...

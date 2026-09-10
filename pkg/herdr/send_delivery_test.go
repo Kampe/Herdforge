@@ -27,7 +27,7 @@ func (r *sendRecorder) run(args ...string) (string, error) {
 	switch {
 	case len(args) > 1 && args[0] == "agent" && args[1] == "list":
 		return `{"result":{"type":"agents","agents":[{"name":"lane","agent_status":"` +
-			r.status + `","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","kind":"opencode"}]}}`, nil
+			r.status + `","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","kind":"codex"}]}}`, nil
 	case len(args) > 1 && args[0] == "pane" && args[1] == "read":
 		body := r.baselinePane
 		r.mu.Lock()
