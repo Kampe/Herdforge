@@ -4609,15 +4609,39 @@ func runHerdrDeliver() {
 // and unnamed panes are never touched. FAC-302: mutation mode executes
 // fenced compare-and-close via TabCloseCAS with absence readback and
 // deterministic receipts/counts. Dry-run is report-only.
+// FAC-708: --only-reviewers and exact reviewer/lease/generation selectors
+// run only manifest-bound reviewer retirement, sparing general terminal panes,
+// source lanes, and verify reaper stacks.
 func runCleanup() {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", true, "List what would be closed without closing (default)")
 	act := fs.Bool("act", false, "Apply bounded exact cleanup mutations")
 	asJSON := fs.Bool("json", false, "Output JSON")
 	applyVerifyStacks := fs.Bool("reap-verify-stacks", false, "Actually reap eligible verify-harness Compose stacks (default is report-only)")
+	onlyReviewers := fs.Bool("only-reviewers", false, "Retire only review lanes; skip general terminal, source lane, and verify reaper cleanup")
+	reviewer := fs.String("reviewer", "", "Exact reviewer name to retire")
+	lease := fs.String("lease", "", "Exact lease ID / nonce to retire")
+	generation := fs.String("generation", "", "Exact review generation ID to retire")
+	taskRef := fs.String("task", "", "Exact task ref to retire")
 	fs.Parse(os.Args[2:])
 	if *act {
 		*dryRun = false
+	}
+
+	reviewerVal := strings.TrimSpace(*reviewer)
+	leaseVal := strings.TrimSpace(*lease)
+	genVal := strings.TrimSpace(*generation)
+	taskVal := strings.TrimSpace(*taskRef)
+	selector := ReviewRetirementSelector{
+		Reviewer:   reviewerVal,
+		Lease:      leaseVal,
+		Generation: genVal,
+		TaskRef:    taskVal,
+	}
+	isReviewerScoped := *onlyReviewers || selector.IsActive()
+	if isReviewerScoped && *applyVerifyStacks {
+		fmt.Fprintf(os.Stderr, "herd cleanup: --reap-verify-stacks cannot be combined with --only-reviewers or reviewer selectors\n")
+		os.Exit(2)
 	}
 
 	if !herdr.IsAvailable() {
@@ -4625,34 +4649,53 @@ func runCleanup() {
 		os.Exit(1)
 	}
 
-	standing := map[string]bool{}
-	if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
-		standing = configuredStandingAgentNames(cfg)
-	}
-
-	workspace, workspaceErr := herdr.RequireCleanupWorkspace(".")
-	if workspaceErr != nil {
-		fmt.Fprintf(os.Stderr, "herd cleanup: %v\n", workspaceErr)
-		os.Exit(1)
-	}
 	repository, repositoryErr := filepath.Abs(".")
 	if repositoryErr != nil {
 		fmt.Fprintf(os.Stderr, "herd cleanup: resolve repository: %v\n", repositoryErr)
 		os.Exit(1)
 	}
-	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
-	res.Repository = repository
-	reviewReport, reviewErr := runReviewRetirementCleanup(context.Background(), repository, *dryRun)
+
+	var res herdr.CleanupResult
+	var reviewReport herdr.ReviewRetirementReport
+	var sourceReport herdr.SourceRetirementReport
+	var stackReport verifyReaperReport
+	var err error
+
+	if !isReviewerScoped {
+		standing := map[string]bool{}
+		if cfg, err := config.LoadConfig(".herd/herd.yaml"); err == nil {
+			standing = configuredStandingAgentNames(cfg)
+		}
+
+		workspace, workspaceErr := herdr.RequireCleanupWorkspace(".")
+		if workspaceErr != nil {
+			fmt.Fprintf(os.Stderr, "herd cleanup: %v\n", workspaceErr)
+			os.Exit(1)
+		}
+		res, err = herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
+		res.Repository = repository
+	} else {
+		res.DryRun = *dryRun
+		res.Repository = repository
+	}
+
+	var reviewErr error
+	reviewReport, reviewErr = runReviewRetirementCleanup(context.Background(), repository, *dryRun, selector)
 	if err == nil {
 		err = reviewErr
 	}
-	sourceReport, sourceErr := runSourceRetirementCleanup(context.Background(), repository, *dryRun)
-	if err == nil {
-		err = sourceErr
-	}
-	stackReport, stackErr := runRepoVerifyReaper(context.Background(), repository, *applyVerifyStacks && !*dryRun)
-	if err == nil {
-		err = stackErr
+
+	if !isReviewerScoped {
+		var sourceErr error
+		sourceReport, sourceErr = runSourceRetirementCleanup(context.Background(), repository, *dryRun)
+		if err == nil {
+			err = sourceErr
+		}
+		var stackErr error
+		stackReport, stackErr = runRepoVerifyReaper(context.Background(), repository, *applyVerifyStacks && !*dryRun)
+		if err == nil {
+			err = stackErr
+		}
 	}
 	if *asJSON {
 		out := map[string]interface{}{
@@ -4714,11 +4757,14 @@ func runCleanup() {
 		}
 		if stackReport.Output != "" {
 			fmt.Printf("herd cleanup: verify reaper: %s\n", stackReport.Output)
-		} else if !stackReport.Present {
+		} else if !stackReport.Present && !isReviewerScoped {
 			fmt.Println("herd cleanup: no repo reaper")
 		}
 	}
 	if err != nil {
+		if !*asJSON {
+			fmt.Fprintf(os.Stderr, "herd cleanup: %v\n", err)
+		}
 		os.Exit(1)
 	}
 }
