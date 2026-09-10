@@ -406,6 +406,12 @@ func probeHostVolumeCapacity(ctx context.Context, mountPath string) (Capacity, e
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Bound the CALLER, not just the child: Run waits for stdout/stderr pipe
+	// I/O, so a stat wedged in an uninterruptible 9p D-state wait (SIGKILL
+	// pending but undeliverable) — or any descendant inheriting the pipes —
+	// would block past ctx despite the kill. WaitDelay abandons the pipes
+	// shortly after ctx expiry so the probe returns on the deadline.
+	cmd.WaitDelay = time.Second
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {

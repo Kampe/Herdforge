@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const sampleWSLProcVersion = "Linux version 6.18.33.2-microsoft-standard-WSL2 (oe-user@oe-host) (x86_64-msft-linux-gcc (GCC) 11.2.0, GNU ld (GNU Binutils) 2.37) #1 SMP PREEMPT Thu Jun 11 04:14:48 UTC 2026\n"
@@ -468,17 +470,16 @@ func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
 		t.Fatalf("expected 'total bytes overflow' in error, got %q", err.Error())
 	}
 
-	// Case 2: Free bytes multiplication overflow
-	createFakeStatBinary(t, "10000000000000000000 3 2 100 100")
-	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
-	if err == nil {
-		t.Fatal("expected probeHostVolumeCapacity to fail on free bytes multiplication overflow")
-	}
-	if !strings.Contains(err.Error(), "total bytes overflow") && !strings.Contains(err.Error(), "free bytes overflow") {
-		t.Fatalf("expected overflow in error, got %q", err.Error())
-	}
+	// There is deliberately NO "free bytes overflow" case. That branch is
+	// defensively unreachable through this parser: freeBlocks > totalBlocks is
+	// rejected first, so whenever blockSize*totalBlocks fits in uint64,
+	// blockSize*freeBlocks fits too. Any input that would overflow the
+	// free-bytes product trips the total-bytes guard above first. The former
+	// Case 2 here ("10000000000000000000 3 2 ...") overflowed BOTH products,
+	// only ever exercised the total-bytes guard, and claimed branch coverage
+	// it could not have (review finding F1).
 
-	// Case 3: Free blocks > total blocks
+	// Case 2: Free blocks > total blocks
 	createFakeStatBinary(t, "4096 100 200 100 100")
 	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
 	if err == nil {
@@ -488,7 +489,7 @@ func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
 		t.Fatalf("expected 'free blocks' in error, got %q", err.Error())
 	}
 
-	// Case 4: Zero block size
+	// Case 3: Zero block size
 	createFakeStatBinary(t, "0 100 50 100 100")
 	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
 	if err == nil {
@@ -496,6 +497,136 @@ func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "zero block size") {
 		t.Fatalf("expected 'zero block size' in error, got %q", err.Error())
+	}
+}
+
+// createStallingFakeStatBinary installs a fake `stat` on PATH whose foreground
+// sleep child inherits the probe's stdout/stderr pipes — the hermetic stand-in
+// for a stat wedged in an uninterruptible 9p wait, where SIGKILL on the direct
+// child is not enough to unblock the caller's pipe reads. The stall is
+// bounded: the fixture always exits on its own after stallSeconds even if
+// nothing kills it, so no mutant can deadlock the suite. The script records
+// the shell's PID so cleanup can kill only this test's own child.
+func createStallingFakeStatBinary(t *testing.T, stallSeconds int) {
+	t.Helper()
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "stat.pid")
+	statPath := filepath.Join(dir, "stat")
+	script := fmt.Sprintf("#!/bin/sh\necho $$ > %q\nsleep %d\necho '4096 100 50 100 100'\n", pidFile, stallSeconds)
+	if err := os.WriteFile(statPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write stalling fake stat binary: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	t.Cleanup(func() {
+		data, err := os.ReadFile(pidFile)
+		if err != nil {
+			return // fixture never ran
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid <= 1 {
+			return
+		}
+		// Own-child cleanup only: this pidfile is written solely by the script
+		// this test installed, and cleanup runs moments after the spawn, so
+		// PID reuse is not a realistic hazard. Best-effort — the stall is
+		// bounded regardless.
+		if proc, findErr := os.FindProcess(pid); findErr == nil {
+			_ = proc.Kill()
+		}
+	})
+}
+
+func TestWSLProbeHostVolumeSubprocessTimeoutBounded(t *testing.T) {
+	// F2 repair: proves acceptance criterion 2 (bounded subprocess probe) at
+	// the production seam. The fake stat stalls far past the context deadline;
+	// the real probeHostVolumeCapacity must return a classified timeout error
+	// and a zero Capacity near the deadline, not after the stall.
+	//
+	// Verified-RED mutants (each watched failing before this landed):
+	//  - exec.CommandContext -> exec.Command: the probe blocks until the child
+	//    exits on its own; the OUTER watchdog below fails the test explicitly.
+	//  - cmd.WaitDelay removed (the pre-repair production shape): the killed
+	//    shell's descendant keeps the stdout pipe open, Run blocks the caller
+	//    for the full stall despite the deadline; the watchdog fails the test.
+	//  - ctx.Err() classification branch removed: the error loses "timed out"
+	//    and the assertion below fails.
+	const (
+		probeDeadline = 300 * time.Millisecond
+		stallSeconds  = 10 // bounded child fixture: always exits on its own
+		watchdog      = 5 * time.Second
+	)
+	createStallingFakeStatBinary(t, stallSeconds)
+
+	ctx, cancel := context.WithTimeout(context.Background(), probeDeadline)
+	defer cancel()
+
+	type probeResult struct {
+		cap Capacity
+		err error
+	}
+	// Buffered so the probe goroutine can never block after a watchdog failure.
+	done := make(chan probeResult, 1)
+	go func() {
+		c, err := probeHostVolumeCapacity(ctx, ".")
+		done <- probeResult{cap: c, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatalf("expected timeout error from stalled probe, got capacity %+v", r.cap)
+		}
+		if !strings.Contains(r.err.Error(), "timed out") {
+			t.Fatalf("expected classified 'timed out' probe error, got %q", r.err.Error())
+		}
+		if r.cap != (Capacity{}) {
+			t.Fatalf("expected zero Capacity on timeout, got %+v", r.cap)
+		}
+	case <-time.After(watchdog):
+		t.Fatalf("WATCHDOG: probeHostVolumeCapacity did not return within %v (deadline %v, child stall bounded at %ds) — the subprocess bound does not bound the caller", watchdog, probeDeadline, stallSeconds)
+	}
+}
+
+func TestOSBackendWSLZeroHostCapacityFailsClosed(t *testing.T) {
+	// F3: hostCap.TotalBytes == 0 is unreachable through the real probe — it
+	// rejects zero block size and zero total blocks before multiplying — so
+	// the guard in boundWSLCapacity is seam-level defensive depth. Exercise it
+	// at the production OSBackend entry point via an injected host statfs, so
+	// removing the guard (which would silently cap capacity to 0/0 with a nil
+	// error) fails this test instead of surviving.
+	oldOverride := wslDetectionOverride
+	oldMounts := wslProcMountsReader
+	oldReg := wslRegistryQueryExecutor
+	oldStatFS := wslDriveStatFS
+	defer func() {
+		wslDetectionOverride = oldOverride
+		wslProcMountsReader = oldMounts
+		wslRegistryQueryExecutor = oldReg
+		wslDriveStatFS = oldStatFS
+	}()
+
+	isWSL := true
+	wslDetectionOverride = &isWSL
+
+	wslProcMountsReader = func() ([]byte, error) {
+		return []byte(sampleProcMounts), nil
+	}
+	wslRegistryQueryExecutor = func(ctx context.Context) ([]byte, error) {
+		return []byte(sampleLxssRegistryOutput), nil
+	}
+	t.Setenv("WSL_DISTRO_NAME", "Debian")
+
+	wslDriveStatFS = func(ctx context.Context, mountPath string) (Capacity, error) {
+		return Capacity{FilesystemID: "host:c"}, nil // zero TotalBytes, nil error
+	}
+
+	_, err := (OSBackend{}).StatFS(".")
+	if err == nil {
+		t.Fatal("expected zero host capacity to fail closed")
+	}
+	if !strings.Contains(err.Error(), "invalid zero capacity") {
+		t.Fatalf("expected 'invalid zero capacity' error, got %q", err.Error())
 	}
 }
 
