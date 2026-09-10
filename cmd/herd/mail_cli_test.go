@@ -367,6 +367,7 @@ func TestMailCLIOrdinaryPendingImportAndStatusAreIdempotent(t *testing.T) {
 }
 
 func TestFAC773RelayFakeSSHSafeBoundaryAndRetry(t *testing.T) {
+	requireZsh(t)
 	repo := queuedSendRepo(t)
 	localMail := filepath.Join(repo, ".herd", "local-mail.jsonl")
 	remotePending := filepath.Join(repo, "remote-pending.json")
@@ -421,7 +422,7 @@ esac
 				"FAKE_RELAY_LOG="+logPath,
 				"FAKE_RELAY_FAIL_ACK="+failAck,
 			)
-			run := func() (int, []byte) {
+			run := func() (int, []byte, error) {
 				cmd := exec.Command("zsh", filepath.Join(repoRootForTest(t), "scripts", "fac773-mail-relay.zsh"),
 					"--host", "wsl-box", "--remote-binary", "/wsl/bin/herd", "--remote-mail", "/wsl/.herd/control-mail.jsonl",
 					"--local-binary", buildHerd(t), "--local-mail", localMail, "--recipient", "worker", "--workspace", "wK",
@@ -429,11 +430,11 @@ esac
 				cmd.Dir = repo
 				cmd.Env = append(os.Environ(), env...)
 				out, runErr := cmd.CombinedOutput()
-				return exitCode(runErr), out
+				return exitCode(runErr), out, runErr
 			}
-			firstExit, firstOut := run()
+			firstExit, firstOut, firstSpawnErr := run()
 			if firstExit != tt.wantFirst {
-				t.Fatalf("first relay exit=%d want %d: %s", firstExit, tt.wantFirst, firstOut)
+				t.Fatalf("first relay exit=%d want %d: %s (spawn error: %v)", firstExit, tt.wantFirst, firstOut, firstSpawnErr)
 			}
 			box := mail.NewMailbox(localMail)
 			local, err := box.ReadInbox("worker")
@@ -458,9 +459,9 @@ esac
 				}
 				env[len(env)-1] = "FAKE_RELAY_FAIL_ACK=0"
 			}
-			secondExit, secondOut := run()
+			secondExit, secondOut, secondSpawnErr := run()
 			if secondExit != tt.wantSecond {
-				t.Fatalf("second relay exit=%d want %d: %s", secondExit, tt.wantSecond, secondOut)
+				t.Fatalf("second relay exit=%d want %d: %s (spawn error: %v)", secondExit, tt.wantSecond, secondOut, secondSpawnErr)
 			}
 			local, err = box.ReadInbox("worker")
 			if err != nil || len(local) != 1 {
@@ -486,7 +487,22 @@ func repoRootForTest(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }
 
+// requireZsh skips explicitly when zsh — the interpreter the FAC773 relay
+// script is executed with — is absent from the environment. A missing
+// optional binary is an environment difference, not a test failure (FAC-215):
+// without this guard the spawn fails with exec's not-found error, which
+// exitCode reports as -1 with empty output, and the assertion is reported as
+// a remote-logic failure instead of a missing prerequisite. Normal CI
+// installs zsh (gate and coverage jobs), so the guard never trips there.
+func requireZsh(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("zsh"); err != nil {
+		t.Skipf("zsh not found in PATH; skipping FAC773 relay test: %v", err)
+	}
+}
+
 func TestFAC773RelayFailsLoudlyOnUnavailableRemoteState(t *testing.T) {
+	requireZsh(t)
 	sshDir := t.TempDir()
 	fakeSSH := filepath.Join(sshDir, "ssh")
 	if err := os.WriteFile(fakeSSH, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
@@ -500,7 +516,7 @@ func TestFAC773RelayFailsLoudlyOnUnavailableRemoteState(t *testing.T) {
 	cmd.Env = append(os.Environ(), "PATH="+sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if exitCode(err) == 0 || !strings.Contains(string(out), "remote pending collection failed") {
-		t.Fatalf("unavailable remote state exit=%d output=%s", exitCode(err), out)
+		t.Fatalf("unavailable remote state exit=%d output=%s (spawn error: %v)", exitCode(err), out, err)
 	}
 }
 
