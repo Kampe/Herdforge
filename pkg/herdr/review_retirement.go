@@ -372,8 +372,14 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 		}
 		e, err := op.Observe(m)
 		if err != nil {
-			r.Failed++
-			r.Candidates = append(r.Candidates, ReviewRetirementCandidate{Manifest: m, Decision: blockReviewRetirement("observation failed: " + err.Error())})
+			decision := blockReviewRetirement("observation failed: " + err.Error())
+			if errors.Is(err, errRetirementSuperseded) {
+				decision = blockReviewRetirement("retained superseded manifest: old proof no longer authorizes cleanup")
+				r.Blocked++
+			} else {
+				r.Failed++
+			}
+			r.Candidates = append(r.Candidates, ReviewRetirementCandidate{Manifest: m, Decision: decision})
 			continue
 		}
 		d := EvaluateReviewRetirement(e)
@@ -385,11 +391,20 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 	if r.Failed > 0 {
 		return r, fmt.Errorf("review retirement: %d observation failures", r.Failed)
 	}
-	if dryRun || r.Blocked > 0 {
+	eligibleCount := 0
+	unsafeBlocked := false
+	for _, c := range r.Candidates {
+		if c.Decision.Eligible && !c.Completed {
+			eligibleCount++
+		} else if !c.Completed && c.Decision.Reason != "BLOCKED: retained superseded manifest: old proof no longer authorizes cleanup" {
+			unsafeBlocked = true
+		}
+	}
+	if dryRun || unsafeBlocked || eligibleCount == 0 {
 		return r, nil
 	}
 	for _, c := range r.Candidates {
-		if c.Completed {
+		if c.Completed || !c.Decision.Eligible {
 			continue
 		}
 		m := c.Manifest

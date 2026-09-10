@@ -87,12 +87,16 @@ func TestReviewRetirementManifestDigestAndRegistryAreBoundAndAppendOnly(t *testi
 }
 
 type retirementFake struct {
-	events   []string
-	evidence map[string]ReviewRetirementEvidence
-	fail     string
+	events     []string
+	evidence   map[string]ReviewRetirementEvidence
+	observeErr map[string]error
+	fail       string
 }
 
 func (f *retirementFake) Observe(m ReviewRetirementManifest) (ReviewRetirementEvidence, error) {
+	if err := f.observeErr[m.Generation]; err != nil {
+		return ReviewRetirementEvidence{}, err
+	}
 	return f.evidence[m.Generation], nil
 }
 func (f *retirementFake) Revalidate(m ReviewRetirementManifest, phase string) error { return nil }

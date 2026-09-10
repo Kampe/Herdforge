@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -88,6 +89,11 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	poolGone := false
 	if _, err := n.exactPoolSlot(m, true); err != nil {
 		if !errors.Is(err, errRetirementPoolAlreadyRemoved) {
+			if superseded, supersededErr := n.reviewerSuperseded(m); supersededErr != nil {
+				return ReviewRetirementEvidence{}, supersededErr
+			} else if superseded {
+				return ReviewRetirementEvidence{}, fmt.Errorf("%w: %v", errRetirementSuperseded, err)
+			}
 			return ReviewRetirementEvidence{}, err
 		}
 		poolGone = true
@@ -100,6 +106,9 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	launchFound := false
 	for _, row := range rows {
 		if row.Event == string(reviewledger.EventRecord) && row.SHA == m.CandidateSHA && row.Reviewer == m.Reviewer && row.Lease == m.Nonce {
+			if !launchBeforeManifest(row, m.RecordedAt) {
+				continue
+			}
 			if launchFound && !reflect.DeepEqual(launch, row) {
 				return ReviewRetirementEvidence{}, errors.New("ambiguous matching launch provenance")
 			}
@@ -180,6 +189,32 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 }
 
 var errRetirementPoolAlreadyRemoved = errors.New("review retirement pool already removed under authenticated phase intent")
+var errRetirementSuperseded = errors.New("review retirement manifest is superseded by a later pool incarnation")
+
+func launchBeforeManifest(row reviewledger.LedgerRow, recordedAt string) bool {
+	if strings.TrimSpace(row.Timestamp) == "" {
+		return true
+	}
+	launchAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(row.Timestamp))
+	if err != nil {
+		return false
+	}
+	manifestAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(recordedAt))
+	return err == nil && !launchAt.After(manifestAt)
+}
+
+func (n *NativeReviewRetirementOp) reviewerSuperseded(m ReviewRetirementManifest) (bool, error) {
+	agents, err := AgentList()
+	if err != nil {
+		return false, err
+	}
+	for _, a := range agents {
+		if a.Name == m.Reviewer {
+			return false, nil
+		}
+	}
+	return true, nil
+}
 
 func (n *NativeReviewRetirementOp) phasePath() string {
 	if n.JournalPath != "" {
