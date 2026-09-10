@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -857,5 +858,75 @@ func TestDrainExecuteActions_ReviewRetirementBlockedObservabilityPreservedWithou
 	}
 	if !strings.Contains(outStr, "review_retired=1 review_blocked=1 refusals=0") {
 		t.Errorf("expected summary line to carry review_retired=1 review_blocked=1 refusals=0, got:\n%s", outStr)
+	}
+}
+
+// TestDrainExecuteActions_ReviewRetirementMixedBatchSurfacesDispositionsAndFailure asserts
+// that in a mixed batch containing retired, safely blocked, and failed review retirement lanes,
+// executeDrainActions emits per-lane dispositions for all candidates and propagates genuine failure
+// with non-zero refusal count.
+func TestDrainExecuteActions_ReviewRetirementMixedBatchSurfacesDispositionsAndFailure(t *testing.T) {
+	mockReport := herdr.ReviewRetirementReport{
+		Retired: 1,
+		Blocked: 1,
+		Failed:  1,
+		Candidates: []herdr.ReviewRetirementCandidate{
+			{
+				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-retired"},
+				Decision: herdr.ReviewRetirementDecision{Eligible: true, Reason: "cleanly retired"},
+			},
+			{
+				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-blocked"},
+				Decision: herdr.ReviewRetirementDecision{Eligible: false, Reason: "BLOCKED: review pane still active"},
+			},
+			{
+				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-failed"},
+				Decision: herdr.ReviewRetirementDecision{Eligible: false, Reason: "BLOCKED: observation failed: i/o timeout"},
+			},
+		},
+	}
+
+	hooks := drainActionHooks{
+		launchReview: func(context.Context, drainActionEvidence) error { return nil },
+		harvest:      func(context.Context, drainActionEvidence) error { return nil },
+		retireReviews: func(context.Context) (herdr.ReviewRetirementReport, error) {
+			return mockReport, errors.New("retire review gen-failed: observation failed: i/o timeout")
+		},
+	}
+
+	var out strings.Builder
+	result := executeDrainActions(context.Background(), drainTestReport(), nil, 0, 0, 0, "", &out, hooks)
+
+	if !result.Failed {
+		t.Fatalf("drain action result must fail when a retirement member fails, got failed=false")
+	}
+	if result.Refusals != 1 {
+		t.Fatalf("expected 1 refusal for failed retirement member, got %d", result.Refusals)
+	}
+	if result.ReviewRetirements.Retired != 1 {
+		t.Fatalf("expected 1 retired review in result, got %d", result.ReviewRetirements.Retired)
+	}
+	if result.ReviewRetirements.Blocked != 1 {
+		t.Fatalf("expected 1 blocked review in result, got %d", result.ReviewRetirements.Blocked)
+	}
+	if result.ReviewRetirements.Failed != 1 {
+		t.Fatalf("expected 1 failed review in result, got %d", result.ReviewRetirements.Failed)
+	}
+
+	outStr := out.String()
+	if !strings.Contains(outStr, "RETIRED review generation=gen-retired") {
+		t.Errorf("expected human output to report retired review, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "BLOCKED review-retirement generation=gen-blocked: BLOCKED: review pane still active") {
+		t.Errorf("expected human output to report blocked review with reason, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "BLOCKED review-retirement generation=gen-failed: BLOCKED: observation failed: i/o timeout") {
+		t.Errorf("expected human output to report failed candidate disposition with reason, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "REFUSED review-retirement: retire review gen-failed: observation failed: i/o timeout") {
+		t.Errorf("expected human output to report refusal for failed review, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "review_retired=1 review_blocked=1 refusals=1") {
+		t.Errorf("expected summary line to carry review_retired=1 review_blocked=1 refusals=1, got:\n%s", outStr)
 	}
 }

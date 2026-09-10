@@ -9096,21 +9096,20 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 	if hooks.retireReviews != nil {
 		rep, err := hooks.retireReviews(ctx)
 		result.ReviewRetirements = rep
+		for _, c := range rep.Candidates {
+			if c.Completed {
+				continue
+			}
+			if !c.Decision.Eligible {
+				fmt.Fprintf(out, "BLOCKED review-retirement generation=%s: %s\n", c.Manifest.Generation, c.Decision.Reason)
+			} else {
+				fmt.Fprintf(out, "RETIRED review generation=%s\n", c.Manifest.Generation)
+			}
+		}
 		if err != nil {
 			fmt.Fprintf(out, "REFUSED review-retirement: %v\n", err)
 			result.Failed = true
 			result.Refusals++
-		} else {
-			for _, c := range rep.Candidates {
-				if c.Completed {
-					continue
-				}
-				if !c.Decision.Eligible {
-					fmt.Fprintf(out, "BLOCKED review-retirement generation=%s: %s\n", c.Manifest.Generation, c.Decision.Reason)
-				} else {
-					fmt.Fprintf(out, "RETIRED review generation=%s\n", c.Manifest.Generation)
-				}
-			}
 		}
 	}
 	if hooks.retireSources != nil {
