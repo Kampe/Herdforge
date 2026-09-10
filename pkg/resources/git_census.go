@@ -664,9 +664,9 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 	defer cancel()
 	psArgs := []string{"-ww", "-p", strconv.Itoa(pid), "-o", "command="}
 	if runtime.GOOS == "darwin" {
-		// BSD ps requires each of -E and -ww to be an option. The old `e ww`
-		// spelling is accepted by some Linux ps builds but is invalid on macOS.
-		psArgs = []string{"-E", "-ww", "-p", strconv.Itoa(pid), "-o", "command="}
+		// BSD ps requires each of -E and -ww to be an option. Do not add -o:
+		// custom output fields suppress the environment that -E displays.
+		psArgs = []string{"-E", "-ww", "-p", strconv.Itoa(pid)}
 	}
 	out, err := exec.CommandContext(probeCtx, ps, psArgs...).Output()
 	if err != nil {
@@ -677,6 +677,18 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 	}
 	if bytes.Contains(out, needle) {
 		return true, nil
+	}
+	if runtime.GOOS == "darwin" {
+		// kern.procargs2 is the unprivileged same-user Darwin process surface
+		// that includes the environment; ps -E is not reliable with custom
+		// output and launchctl procinfo is root-only.
+		if args, argsErr := readDarwinProcessArgs(pid); argsErr == nil {
+			return bytes.Contains(args, needle), nil
+		} else if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr == nil && (foreign || gone) {
+			return false, nil
+		} else {
+			return false, fmt.Errorf("read process argv/environment for pid %d: %w", pid, argsErr)
+		}
 	}
 	// lsof's `+D` census above includes mapped files (the `mem` descriptor),
 	// so a second Darwin vmmap walk would duplicate that proof while turning

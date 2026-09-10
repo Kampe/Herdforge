@@ -192,6 +192,11 @@ func TestGovernorReclaimsProofBackedOrphanCachesAfterTTL(t *testing.T) {
 	if err := os.MkdirAll(cache, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The producer owns the private digest ancestor, while the package tool
+	// creates its leaf with normal 0755 directory permissions.
+	if err := os.Chmod(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	graph := filepath.Join(orphan, "graph.db")
 	if err := os.WriteFile(graph, []byte("graph-index"), 0o600); err != nil {
 		t.Fatal(err)

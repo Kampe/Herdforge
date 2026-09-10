@@ -644,12 +644,6 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if policyTarget == "graph.db" && !info.Mode().IsRegular() {
 		return PhysicalUsage{}, false, "graph_index_not_regular_file"
 	}
-	// Foreign processes whose metadata is inaccessible cannot reference an
-	// owner-only target. Shared permissions would remove that proof, so retain
-	// the target instead of treating an incomplete census as harmless.
-	if info.Mode().Perm()&0o077 != 0 {
-		return PhysicalUsage{}, false, "derived_target_shared_permissions"
-	}
 	resolved, err := filepath.EvalSymlinks(target)
 	root, rootErr := filepath.EvalSymlinks(orphan)
 	if err != nil || rootErr != nil || !containedPath(root, resolved) {
@@ -658,6 +652,15 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	owner, owned := g.OwnerID(info)
 	if !owned || owner != strconv.Itoa(os.Getuid()) {
 		return PhysicalUsage{}, false, "derived_target_foreign_uid"
+	}
+	// Foreign processes whose metadata is inaccessible cannot reference a
+	// target behind an owner-only ancestor. Bootstrap producers create the
+	// digest cache privately, then tools may create its child (including go-mod)
+	// as 0755. Require that private provenance rather than imposing 0700 on the
+	// producer's leaf mode; shared/unknown ancestry remains blocked.
+	private, privacyReason := privateTargetProvenance(orphan, target, owner)
+	if !private {
+		return PhysicalUsage{}, false, privacyReason
 	}
 	usage, err := g.Measure.Measure(target, g.Policy.MaxScanEntries)
 	if err != nil || usage.Truncated {
@@ -678,6 +681,36 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 		return usage, false, "orphan_cache_ttl_not_reached"
 	}
 	return usage, true, "proof_backed_regenerable_cache"
+}
+
+func privateTargetProvenance(orphan, target, owner string) (bool, string) {
+	current := filepath.Clean(target)
+	root := filepath.Clean(orphan)
+	privateAncestor := false
+	for {
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return false, "derived_target_shared_permissions"
+		}
+		actualOwner, owned := fileOwnerID(info)
+		if !owned || actualOwner != owner {
+			return false, "derived_target_foreign_uid"
+		}
+		if info.Mode().Perm()&0o077 == 0 {
+			privateAncestor = true
+		}
+		if current == root {
+			if privateAncestor {
+				return true, ""
+			}
+			return false, "derived_target_shared_permissions"
+		}
+		parent := filepath.Dir(current)
+		if parent == current || !containedPath(root, parent) {
+			return false, "derived_target_shared_permissions"
+		}
+		current = parent
+	}
 }
 
 func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorReport, limit int) error {
