@@ -20,7 +20,7 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "goal.json")
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
-	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-308", "--owner", "coordinator", "--generation", "4", "--max", "1"}
+	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-308", "--owner", "coordinator", "--generation", "4", "--max", "1", "--grantor", "coordinator", "--packet", "packet.md", "--autonomy", "bounded", "--mutations", "worktree", "--forbidden", "merge", "--stop-conditions", "stop"}
 	if err := runGoalGuard(); err != nil {
 		t.Fatal(err)
 	}
@@ -46,12 +46,44 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	os.Args = []string{"herd", "goal-guard", "--clear", "--state", state}
+	os.Args = []string{"herd", "goal-guard", "--clear", "--state", state, "--grantor", "coordinator", "--generation", "4"}
 	if err := runGoalGuard(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(state); !os.IsNotExist(err) {
 		t.Fatalf("clear left state behind: %v", err)
+	}
+}
+
+func TestGoalGuardClearRefusesAgentAndStaleGrantorWithoutMutation(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "goal.json")
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "coordinator", Generation: 9,
+		CreatedAt: now, UpdatedAt: now,
+		Authority: &goalguard.AuthorityEnvelope{Grantor: "coordinator", PacketPath: "packet.md", BoundedAutonomy: "bounded", MutationLimits: "worktree", ForbiddenActions: []string{"merge"}, StopConditions: []string{"stop"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clearGoal(s, "", 0, ""); err == nil || !strings.Contains(err.Error(), "agent-only clear") {
+		t.Fatalf("agent clear error = %v, want refusal naming supported route", err)
+	}
+	if got, _ := os.ReadFile(state); string(got) != string(original) {
+		t.Fatal("agent refusal mutated goal state")
+	}
+	if err := clearGoal(s, "coordinator", 8, ""); err == nil || !strings.Contains(err.Error(), "stale generation") {
+		t.Fatalf("stale clear error = %v, want stale generation refusal", err)
+	}
+	if got, _ := os.ReadFile(state); string(got) != string(original) {
+		t.Fatal("stale refusal mutated goal state")
 	}
 }
 

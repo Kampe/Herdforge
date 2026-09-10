@@ -119,6 +119,19 @@ type Decision struct {
 	Continuations int    `json:"continuations"`
 }
 
+// Retirement is the durable audit record written before an authorized goal
+// retirement. It is deliberately separate from Goal so an authorized clear
+// cannot be replayed after the goal file is removed.
+type Retirement struct {
+	Lane       string    `json:"lane"`
+	Task       string    `json:"task"`
+	Owner      string    `json:"owner"`
+	Generation int64     `json:"generation"`
+	Grantor    string    `json:"grantor,omitempty"`
+	Receipt    string    `json:"receipt,omitempty"`
+	RetiredAt  time.Time `json:"retired_at"`
+}
+
 // Store is a small atomic JSON authority. Rename gives readers either the
 // previous complete contract or the next complete contract, never a partial
 // write. The path is intentionally injectable for hermetic tests.
@@ -143,6 +156,64 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("goalguard: state path is required")
 	}
 	return &Store{path: path}, nil
+}
+
+// RetirementPath is adjacent to the goal and therefore remains worktree
+// relative. It is not used as a source of authority; it only prevents replay.
+func (s *Store) RetirementPath() string {
+	if s == nil {
+		return ""
+	}
+	return s.path + ".retired"
+}
+
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+// RecordRetirement atomically records an accepted retirement. Callers must
+// validate authority before invoking it.
+func (s *Store) RecordRetirement(r Retirement) error {
+	if s == nil || s.path == "" || r.Lane == "" || r.Task == "" || r.Owner == "" || r.Generation < 1 || r.RetiredAt.IsZero() {
+		return fmt.Errorf("%w: incomplete retirement", ErrCorrupt)
+	}
+	b, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("goalguard: encode retirement: %w", err)
+	}
+	if dir := filepath.Dir(s.RetirementPath()); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("goalguard: create retirement directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(s.RetirementPath(), b, 0o600); err != nil {
+		return fmt.Errorf("goalguard: record retirement: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) HasRetirement() (bool, error) {
+	if s == nil || s.path == "" {
+		return false, fmt.Errorf("%w: store is nil", ErrCorrupt)
+	}
+	_, err := os.Stat(s.RetirementPath())
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("goalguard: inspect retirement: %w", err)
+}
+
+func (s *Store) Remove() error {
+	if s == nil || s.path == "" {
+		return fmt.Errorf("%w: store is nil", ErrCorrupt)
+	}
+	return os.Remove(s.path)
 }
 
 func (s *Store) Load() (Goal, error) {

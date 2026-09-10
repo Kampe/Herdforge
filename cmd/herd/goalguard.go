@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/progress"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"io"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
+	"github.com/Kampe/Herdforge/pkg/lock"
 )
 
 func runGoalGuard() error {
@@ -23,7 +25,7 @@ func runGoalGuard() error {
 	set := fs.Bool("set", false, "create or replace a standing goal")
 	check := fs.Bool("check", false, "evaluate evidence JSON from stdin")
 	stopHook := fs.Bool("stop-hook", false, "Claude Stop hook mode: silent when no goal, block stop while goal is active")
-	clear := fs.Bool("clear", false, "remove the durable goal")
+	clear := fs.Bool("clear", false, "retire the durable goal with grantor or completion evidence")
 	lane := fs.String("lane", "", "standing lane identity")
 	task := fs.String("task", "", "task identity")
 	owner := fs.String("owner", "", "goal owner")
@@ -36,6 +38,7 @@ func runGoalGuard() error {
 	mutations := fs.String("mutations", "", "standing mutation limits")
 	forbidden := fs.String("forbidden", "", "comma-separated forbidden actions")
 	stopConditions := fs.String("stop-conditions", "", "comma-separated stop conditions")
+	receipt := fs.String("receipt", "", "task-bound completion receipt proving native Done readback")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -53,11 +56,7 @@ func runGoalGuard() error {
 		return err
 	}
 	if *clear {
-		if err := os.Remove(*state); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("clear: %w", err)
-		}
-		fmt.Fprintln(os.Stdout, `{"cleared":true}`)
-		return nil
+		return clearGoal(s, *grantor, *generation, *receipt)
 	}
 	if *set {
 		now := time.Now().UTC()
@@ -105,6 +104,98 @@ func runGoalGuard() error {
 		return err
 	}
 	return writeGoalJSON(os.Stdout, decision)
+}
+
+func clearGoal(s *goalguard.Store, grantor string, generation int64, receiptPath string) error {
+	fence := lock.NewDirLock(s.Path() + ".lock.d")
+	if err := fence.Acquire(context.Background(), 0, "goalguard clear"); err != nil {
+		return fmt.Errorf("clear: acquire lock: %w", err)
+	}
+	defer fence.Release()
+	g, err := s.Load()
+	if errors.Is(err, goalguard.ErrMissing) {
+		// An unqualified clear preserves the historical quiet no-op. Supplying
+		// proof against an absent goal, however, is a replay or stale request.
+		if strings.TrimSpace(grantor) == "" && strings.TrimSpace(receiptPath) == "" && generation == 0 {
+			fmt.Fprintln(os.Stdout, `{"cleared":false,"reason":"no_goal"}`)
+			return nil
+		}
+		return errors.New("goal-guard: clear refused: goal is missing; authorization is stale or replayed")
+	}
+	if err != nil {
+		return fmt.Errorf("clear: %w", err)
+	}
+	if retired, checkErr := s.HasRetirement(); checkErr != nil {
+		return checkErr
+	} else if retired {
+		return errors.New("goal-guard: clear refused: retirement already recorded (replay)")
+	}
+
+	grantor = strings.TrimSpace(grantor)
+	receiptPath = strings.TrimSpace(receiptPath)
+	if grantor != "" || generation != 0 {
+		if grantor == "" || generation <= 0 {
+			return errors.New("goal-guard: clear refused: grantor and positive current generation are required")
+		}
+		if g.Authority == nil {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: no recorded grantor; use coordinator retirement or a valid completion receipt", g.Owner)
+		}
+		if err := g.Authority.Validate(); err != nil {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: recorded authority invalid: %w", g.Owner, err)
+		}
+		if grantor != g.Authority.Grantor {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: grantor %q is not the recorded grantor %q", g.Owner, grantor, g.Authority.Grantor)
+		}
+		if generation != g.Generation {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: stale generation %d (current generation %d)", g.Owner, generation, g.Generation)
+		}
+		return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Grantor: grantor, RetiredAt: time.Now().UTC()})
+	}
+	if receiptPath == "" {
+		return fmt.Errorf("goal-guard: clear refused for owner %q: agent-only clear is not supported; coordinator must provide --grantor/--generation or --receipt", g.Owner)
+	}
+	receipt, err := hsync.LoadReceipt(receiptPath)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: load completion receipt: %w", err)
+	}
+	if err := validateGoalCompletionReceipt(g, receipt); err != nil {
+		return err
+	}
+	return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Receipt: receipt.Digest, RetiredAt: time.Now().UTC()})
+}
+
+func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionReceipt) error {
+	if receipt == nil || receipt.Digest == "" || receipt.Digest != receipt.ComputeDigest() {
+		return errors.New("goal-guard: clear refused: completion receipt is missing or has an invalid digest")
+	}
+	if !strings.EqualFold(hsync.NormalizeRef(receipt.TaskRef), hsync.NormalizeRef(g.Task)) {
+		return fmt.Errorf("goal-guard: clear refused: receipt task %q does not match goal task %q", receipt.TaskRef, g.Task)
+	}
+	if receipt.Verdict != "PASS" || receipt.IntegrationResult != hsync.IntegrationMerged {
+		return errors.New("goal-guard: clear refused: completion receipt is not a merged PASS")
+	}
+	log, err := hsync.ReadDoneLog(".")
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: native Done readback unavailable: %w", err)
+	}
+	for _, record := range log {
+		if strings.EqualFold(hsync.NormalizeRef(record.Ref), hsync.NormalizeRef(g.Task)) && record.ReceiptDigest == receipt.Digest && strings.EqualFold(record.ProviderReadback, "done") {
+			return nil
+		}
+	}
+	return fmt.Errorf("goal-guard: clear refused: receipt %s has no native Done readback", receipt.Digest)
+}
+
+func retireGoal(s *goalguard.Store, g goalguard.Goal, retirement goalguard.Retirement) error {
+	if err := s.RecordRetirement(retirement); err != nil {
+		return err
+	}
+	if err := s.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// The retirement marker remains evidence if this final unlink fails.
+		return fmt.Errorf("clear: remove goal after retirement: %w", err)
+	}
+	fmt.Fprintln(os.Stdout, `{"cleared":true}`)
+	return nil
 }
 
 // runGoalGuardStopHook adapts the guard to Claude Code's Stop hook contract:
@@ -247,14 +338,14 @@ const goalGuardPlateauAfter = progress.PlateauAfter
 func goalGuardContinueReason(task, lane string, continuations int) string {
 	const preamble = "AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT. goal-guard: "
 	if continuations < goalGuardPlateauAfter {
-		return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.",
+		return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete and the coordinator retires it.",
 			task, lane, continuations)
 	}
 	return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). "+
 		"You have continued %d times. If you produced NO new artifact since the last continuation, you are PLATEAUED, and repeating the same probe is not work: it spends quota to re-observe unchanged state. "+
 		"Do this instead: (1) say ONCE what you are waiting on, with the counts that prove there is nothing claimable right now; (2) do NOT repeat that report on later continuations; (3) WAIT for a real transition -- a verdict callback, a freed pool slot, a dependency card closing, or new claimable work -- rather than re-running the probe that just returned unchanged. "+
 		"Waiting on an event IS valid progress for a standing lane; a lane with genuinely nothing to claim is correctly idle, not failing. "+
-		"If you DID produce an artifact since the last continuation, ignore all of the above and keep going. Stop only when the goal is complete, then run `herd goal-guard --clear`.",
+		"If you DID produce an artifact since the last continuation, ignore all of the above and keep going. Stop only when the goal is complete and the coordinator retires it.",
 		task, lane, continuations, continuations)
 }
 
