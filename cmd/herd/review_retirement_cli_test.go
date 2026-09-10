@@ -644,4 +644,3 @@ esac
 		t.Fatalf("error must explain missing selector match: %s", out)
 	}
 }
-
