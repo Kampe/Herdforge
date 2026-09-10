@@ -670,6 +670,32 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	return usage, nil
 }
 
+func lsofPositiveExitOne(err error, stdout, stderr []byte) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || len(bytes.TrimSpace(stderr)) != 0 {
+		return false
+	}
+	currentPID := 0
+	for _, line := range strings.Split(string(stdout), "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(line[1:]))
+			if parseErr == nil {
+				currentPID = pid
+			}
+		case 'f':
+			descriptor := strings.TrimSpace(line[1:])
+			if currentPID != 0 && descriptor != "rtd" && descriptor != "txt" && descriptor != "mem" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // InUseMany keeps the expensive process population and metadata walk shared
 // across a bounded orphan batch. lsof remains target-scoped, so open handles
 // and cwd evidence cannot be confused between targets.
@@ -798,7 +824,14 @@ func (p LSOFProcessInspector) lsofPaths(ctx context.Context, executable string, 
 		return nil, errors.New("lsof output exceeded bound")
 	}
 	if err != nil && !lsofNoMatch(err, stdout.Bytes(), stderr.Bytes()) {
-		return nil, err
+		// macOS lsof can return status 1 after emitting a useful positive
+		// record when a process exits during the recursive +D walk. That is
+		// not an idle result: preserve the positive owner evidence and let the
+		// caller refuse removal. Output with diagnostics, or output without a
+		// positive slot descriptor, remains an unavailable/failed census.
+		if !lsofPositiveExitOne(err, stdout.Bytes(), stderr.Bytes()) {
+			return nil, err
+		}
 	}
 	usage := make(map[string]ProcessUsage, len(paths))
 	for _, path := range paths {

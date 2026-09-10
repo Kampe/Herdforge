@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // PoolSlot is the durable lease record for one warm worktree.
@@ -53,13 +55,19 @@ type Pool struct {
 	// zero live reviewers and reported itself saturated. That happened
 	// repeatedly and each time needed a human to unstick it.
 	HolderLive func(purpose string) bool
+	// ProcessInspector is the native process/cwd/open-handle census used before
+	// removing an unleased slot. Unsupported or incomplete inspection is a
+	// refusal, never evidence that the slot is idle. Tests may inject a
+	// deterministic fixture; production defaults to the bounded native census.
+	ProcessInspector resources.ProcessInspector
 }
 
 func NewPool(repoRoot, root string, size int) *Pool {
 	if size < 0 {
 		size = 0
 	}
-	return &Pool{RepoRoot: repoRoot, Root: root, Size: size, DefaultBase: "origin/main", Now: time.Now}
+	return &Pool{RepoRoot: repoRoot, Root: root, Size: size, DefaultBase: "origin/main", Now: time.Now,
+		ProcessInspector: resources.LSOFProcessInspector{Timeout: 2 * time.Second}}
 }
 
 func (p *Pool) statePath() string { return filepath.Join(p.Root, "pool.json") }
@@ -474,40 +482,316 @@ func (p *Pool) repoPath(path string) string {
 	return filepath.Clean(filepath.Join(p.RepoRoot, path))
 }
 
-// GC tears down every unleased slot so the next Ensure rebuilds the pool.
-// Leased slots are preserved and make the operation fail closed.
+// GC tears down every unleased, verified-safe slot so the next Ensure
+// rebuilds the pool. Leased slots are preserved and make the operation fail
+// closed.
+//
+// FAC-717: the previous version force-removed and os.RemoveAll'd every
+// unleased slot.Path exactly as recorded, without normalizing it through
+// repoPath, without confirming it was still the exact worktree git itself
+// has registered, without checking for a symlink swap, and without checking
+// for untracked/ignored user work or that the slot's HEAD was still fully
+// contained in the pool's history. A relative slot.Path loaded from a
+// corrupt or hand-edited state file resolved against the process's own
+// working directory rather than the repository root, and --force bypassed
+// git's own dirty-tree refusal entirely. GC now verifies the complete
+// selected set (path containment, exact registered worktree identity, no
+// symlink, full cleanliness including ignored files, and commit
+// reachability from base) before removing anything, and immediately
+// re-verifies each slot right before its own destructive step, since
+// filesystem removal cannot be rolled back and state can change between the
+// two passes.
 func (p *Pool) GC(ctx context.Context) error {
 	return p.withLock(func() error {
 		state, err := p.readState()
 		if err != nil {
 			return err
 		}
-		// FAC-708: validate the complete selected set before removing the first
-		// slot. A later leased/unsafe slot must not be discovered after earlier
-		// pool worktrees were already deleted; filesystem removal is not
-		// transactionally rollbackable.
-		for _, slot := range state.Slots {
-			if slot.LeaseID != "" {
-				return fmt.Errorf("worktree pool: gc refused while slot %s is leased", slot.Name)
-			}
-			if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, slot.Path); err != nil {
-				return fmt.Errorf("worktree pool: gc lease fence for %s: %w", slot.Name, err)
-			}
+		verifiedCandidates, err := p.verifyGCSet(ctx, state)
+		if err != nil {
+			return err
 		}
-		for _, slot := range state.Slots {
-			// Pool slots are tracked by their own slot.LeaseID above, never
-			// by pkg/claim -- the full RefuseRemovalWithLiveLease would
-			// refuse every slot unconditionally. See its doc comment.
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slot.Path)
+		removed := make(map[int]bool, len(verifiedCandidates))
+		for i, slot := range state.Slots {
+			candidate, ok := verifiedCandidates[i]
+			if !ok {
+				continue
+			}
+			// Re-verify this one slot immediately before removing it: the
+			// full-set pass above proves nothing about state a moment later.
+			latest, err := p.verifyGCCandidate(ctx, slot)
+			if err != nil {
+				return fmt.Errorf("worktree pool: gc refused for slot %s immediately before removal: %w", slot.Name, err)
+			}
+			if err := candidate.sameIdentity(latest); err != nil {
+				return fmt.Errorf("worktree pool: gc refused for slot %s immediately before removal: %w", slot.Name, err)
+			}
+			// Pool slots are tracked by their own slot.LeaseID, verified
+			// above, never by pkg/claim -- the full RefuseRemovalWithLiveLease
+			// would refuse every slot unconditionally. See its doc comment.
+			// No --force: verifyGCCandidate already proved this exact,
+			// symlink-free, contained path is a clean registered worktree, so
+			// git's own dirty/HEAD-mismatch refusal is redundant defense-in-
+			// depth, not an obstacle to bypass.
+			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", candidate.path)
 			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			if err := os.RemoveAll(slot.Path); err != nil {
-				return fmt.Errorf("worktree pool: remove slot %s: %w", slot.Name, err)
+			if info, statErr := os.Lstat(candidate.path); statErr == nil {
+				if !os.SameFile(candidate.info, info) {
+					return fmt.Errorf("worktree pool: slot %s path was replaced after git removal; preserving it", slot.Name)
+				}
+				return fmt.Errorf("worktree pool: slot %s remained after git removal; preserving it", slot.Name)
+			} else if !errors.Is(statErr, fs.ErrNotExist) {
+				return fmt.Errorf("worktree pool: inspect slot %s after git removal: %w", slot.Name, statErr)
+			}
+			removed[i] = true
+		}
+		kept := state.Slots[:0]
+		for i, slot := range state.Slots {
+			if !removed[i] {
+				kept = append(kept, slot)
 			}
 		}
+		state.Slots = kept
 		return p.writeState(state)
 	})
+}
+
+// GCPlan reports, without deleting anything, which currently-tracked slots
+// GC would remove and which it would refuse, and why. It runs the identical
+// verification GC uses so a dry run cannot diverge from the real decision.
+func (p *Pool) GCPlan(ctx context.Context) ([]GCDecision, error) {
+	var decisions []GCDecision
+	err := p.withLock(func() error {
+		state, err := p.readState()
+		if err != nil {
+			return err
+		}
+		for _, slot := range state.Slots {
+			d := GCDecision{Slot: slot.Name, Path: slot.Path}
+			if slot.LeaseID != "" {
+				d.Refused = true
+				d.Reason = "leased"
+			} else if _, err := p.verifyGCCandidate(ctx, slot); err != nil {
+				d.Refused = true
+				d.Reason = err.Error()
+			}
+			decisions = append(decisions, d)
+		}
+		return nil
+	})
+	return decisions, err
+}
+
+// GCDecision is one slot's read-only GC disposition, for --dry-run reporting.
+type GCDecision struct {
+	Slot    string
+	Path    string
+	Refused bool
+	Reason  string
+}
+
+// verifyGCSet validates every unleased slot in state before GC removes the
+// first one, so a later leased/unsafe slot is never discovered only after
+// earlier pool worktrees were already deleted. It returns the verified,
+// normalized removal path for each slot index that passed.
+type gcCandidate struct {
+	path string
+	info os.FileInfo
+	head string
+}
+
+func (c gcCandidate) sameIdentity(other gcCandidate) error {
+	if c.path != other.path {
+		return fmt.Errorf("slot path changed from %s to %s", c.path, other.path)
+	}
+	if c.head != other.head {
+		return fmt.Errorf("registered Git HEAD changed from %s to %s", c.head, other.head)
+	}
+	if !os.SameFile(c.info, other.info) {
+		return errors.New("slot directory identity changed")
+	}
+	return nil
+}
+
+func (p *Pool) verifyGCSet(ctx context.Context, state poolState) (map[int]gcCandidate, error) {
+	verified := make(map[int]gcCandidate, len(state.Slots))
+	for i, slot := range state.Slots {
+		if slot.LeaseID != "" {
+			return nil, fmt.Errorf("worktree pool: gc refused while slot %s is leased", slot.Name)
+		}
+		candidate, err := p.verifyGCCandidate(ctx, slot)
+		if err != nil {
+			return nil, fmt.Errorf("worktree pool: gc refused for slot %s: %w", slot.Name, err)
+		}
+		verified[i] = candidate
+	}
+	return verified, nil
+}
+
+// verifyGCCandidate proves a single pool slot is safe to destroy. It refuses
+// (never guesses safe) on: an empty or unresolvable path; a path that
+// normalizes outside the pool root; a symlinked leaf; a path with no
+// lease-history fence clearance; a path git does not report as an exact
+// registered worktree of this repository; a working tree that is not fully
+// clean, including untracked and git-ignored content; and a HEAD that is
+// not fully reachable from the pool's base ref, since destroying it could
+// discard commits that exist nowhere else. It returns the normalized,
+// contained path to remove.
+func (p *Pool) verifyGCCandidate(ctx context.Context, slot PoolSlot) (gcCandidate, error) {
+	if strings.TrimSpace(slot.Path) == "" {
+		return gcCandidate{}, errors.New("slot has no recorded path")
+	}
+	resolved, err := p.containedRepoPath(slot.Path)
+	if err != nil {
+		return gcCandidate{}, err
+	}
+	if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, resolved); err != nil {
+		return gcCandidate{}, err
+	}
+	registered, err := registeredWorktrees(ctx, p.RepoRoot)
+	if err != nil {
+		return gcCandidate{}, fmt.Errorf("list registered worktrees: %w", err)
+	}
+	head, ok := registered[resolved]
+	if !ok {
+		return gcCandidate{}, fmt.Errorf("path is not a registered git worktree of this repository: %s", resolved)
+	}
+	clean, err := gitFullyClean(ctx, resolved)
+	if err != nil {
+		return gcCandidate{}, fmt.Errorf("inspect cleanliness: %w", err)
+	}
+	if !clean {
+		return gcCandidate{}, fmt.Errorf("slot is dirty (including untracked or ignored content), refusing")
+	}
+	if err := p.inspectSlotUse(ctx, resolved); err != nil {
+		return gcCandidate{}, err
+	}
+	base := p.DefaultBase
+	if base == "" {
+		base = "origin/main"
+	}
+	if err := verifyReachableFromBase(ctx, p.RepoRoot, resolved, base); err != nil {
+		return gcCandidate{}, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return gcCandidate{}, fmt.Errorf("inspect slot identity: %w", err)
+	}
+	return gcCandidate{path: resolved, info: info, head: head}, nil
+}
+
+func (p *Pool) inspectSlotUse(ctx context.Context, path string) error {
+	if p.ProcessInspector == nil {
+		return errors.New("worktree pool: process census unavailable; refusing GC")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	usage, err := p.ProcessInspector.InUse(probeCtx, path)
+	if err != nil {
+		return fmt.Errorf("worktree pool: process census unavailable for %s: %w", path, err)
+	}
+	if usage.MetadataUnavailable {
+		return fmt.Errorf("worktree pool: process census metadata unavailable for %s", path)
+	}
+	if usage.CWD || usage.OpenFile || usage.ReferencedPath {
+		return fmt.Errorf("worktree pool: live process owns or references %s, refusing", path)
+	}
+	return nil
+}
+
+// containedRepoPath normalizes a possibly-relative slot path against the
+// repository root (never the process's own working directory), then proves
+// the resolved path is neither a symlink itself nor reachable only through
+// one that escapes the pool root. It returns the normalized, non-symlink-
+// resolved absolute path, which is what git's own worktree registry keys on.
+func (p *Pool) containedRepoPath(path string) (string, error) {
+	resolved := p.repoPath(path)
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("slot path does not exist: %s", resolved)
+		}
+		return "", fmt.Errorf("inspect slot path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("slot path is a symlink, refusing: %s", resolved)
+	}
+	realPath, err := filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return "", fmt.Errorf("resolve slot path: %w", err)
+	}
+	realRoot, err := filepath.EvalSymlinks(p.Root)
+	if err != nil {
+		return "", fmt.Errorf("resolve pool root: %w", err)
+	}
+	rel, err := filepath.Rel(filepath.Clean(realRoot), filepath.Clean(realPath))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("slot path resolves outside the pool root: %s", resolved)
+	}
+	// Return the symlink-resolved path, not the as-recorded one: a tmpdir or
+	// other ancestor symlink (e.g. macOS /var -> /private/var) means git's
+	// own worktree registry and this process can disagree on which string
+	// names the same directory unless both compare post-resolution.
+	return filepath.Clean(realPath), nil
+}
+
+// registeredWorktrees returns every worktree git itself has registered for
+// this repository, keyed by its normalized absolute path. GC must never
+// treat a directory as a removable pool slot unless git independently
+// confirms it as an exact, currently-registered worktree.
+func registeredWorktrees(ctx context.Context, repoRoot string) (map[string]string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repoRoot, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	current := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			current = filepath.Clean(strings.TrimPrefix(line, "worktree "))
+		case strings.HasPrefix(line, "HEAD ") && current != "":
+			result[current] = strings.TrimPrefix(line, "HEAD ")
+		}
+	}
+	return result, nil
+}
+
+// verifyReachableFromBase refuses to treat a slot as safe to destroy unless
+// its exact current HEAD is an ancestor of the pool's base ref. A slot whose
+// HEAD diverged from base carries commits that may exist nowhere else once
+// the worktree is gone; deleting the checkout does not by itself delete
+// shared objects, but an unreachable commit becomes unreachable garbage the
+// next real gc collects, which is indistinguishable from data loss to
+// whoever made it.
+func verifyReachableFromBase(ctx context.Context, repoRoot, slotPath, base string) error {
+	headOut, err := exec.CommandContext(ctx, "git", "-C", slotPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return fmt.Errorf("resolve slot HEAD: %w", err)
+	}
+	head := strings.TrimSpace(string(headOut))
+	if head == "" {
+		return errors.New("slot HEAD is empty")
+	}
+	if err := exec.CommandContext(ctx, "git", "-C", repoRoot, "merge-base", "--is-ancestor", head, base).Run(); err != nil {
+		return fmt.Errorf("slot HEAD %s is not reachable from base %s, refusing to discard possibly-unique work", head, base)
+	}
+	return nil
+}
+
+// gitFullyClean checks working-tree cleanliness including untracked and
+// git-ignored content, unlike gitClean's tracked-and-untracked-only check
+// used by Lease/Release. GC's bar is stricter: an ignored build artifact a
+// reviewer left behind is still that reviewer's content, not the pool's.
+func gitFullyClean(ctx context.Context, path string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain", "--ignored")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("git status %s: %v (%s)", path, err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)) == "", nil
 }
 
 // Slots returns a snapshot of durable pool inventory.

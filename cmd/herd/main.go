@@ -470,6 +470,9 @@ func main() {
 	case "pool":
 		runPool()
 
+	case "idle-pool":
+		runIdlePool()
+
 	case "containers":
 		runContainers()
 
@@ -655,6 +658,7 @@ func printUsage() {
 	fmt.Println("              --pool <ref> leases a warm worktree, creates a repo-relative surface symlink, and launches persistent OpenCode")
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
+	fmt.Println("  idle-pool  Bounded, non-current pool-root discovery via Pool.GC (dry-run default; --act reclaims)")
 	fmt.Println("  board-done Move one card to done ONLY from a task-bound completion receipt")
 	fmt.Println("  receipt    Issue, recover, or release signed task receipts")
 	fmt.Println("  board-audit Report Done cards that no completion receipt closed (read-only)")

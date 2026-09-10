@@ -32,6 +32,7 @@ func runPool() {
 	poolDefault := filepath.Join(root, ".herd", "pool")
 	poolRoot := fs.String("pool-root", poolDefault, "pool DIRECTORY (not the repository root)")
 	poolRootAlias := fs.String("root", "", "alias for --pool-root (pool directory, not the repository root)")
+	dryRun := fs.Bool("dry-run", false, "gc only: report what would be removed and why, without deleting anything")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		fmt.Fprintf(os.Stderr, "herd pool: %v\n", err)
 		os.Exit(2)
@@ -82,6 +83,21 @@ func runPool() {
 			os.Exit(1)
 		}
 	case "gc":
+		if *dryRun {
+			decisions, err := p.GCPlan(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "herd pool gc --dry-run: %v\n", err)
+				os.Exit(1)
+			}
+			for _, d := range decisions {
+				if d.Refused {
+					fmt.Printf("RETAIN\t%s\t%s\t%s\n", d.Slot, d.Path, d.Reason)
+					continue
+				}
+				fmt.Printf("REMOVE\t%s\t%s\n", d.Slot, d.Path)
+			}
+			return
+		}
 		if err := p.GC(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "herd pool gc: %v\n", err)
 			os.Exit(1)

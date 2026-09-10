@@ -129,6 +129,9 @@ func TestLSOFProcessInspectorUnusedPrivateDirectory(t *testing.T) {
 	if _, err := exec.LookPath("ps"); err != nil {
 		t.Skipf("ps unavailable: %v", err)
 	}
+	if _, err := exec.LookPath("lsof"); err != nil {
+		t.Skipf("lsof unavailable: %v", err)
+	}
 	root := t.TempDir()
 	inspector := LSOFProcessInspector{Timeout: 8 * time.Second, MaxOutputBytes: 1 << 20}
 	usage, err := inspector.InUse(context.Background(), root)
@@ -140,6 +143,22 @@ func TestLSOFProcessInspectorUnusedPrivateDirectory(t *testing.T) {
 	}
 	if usage.CWD || usage.OpenFile || usage.ReferencedPath || usage.MetadataUnavailable {
 		t.Fatalf("unused private directory was treated as referenced: %+v", usage)
+	}
+}
+
+func TestLSOFProcessInspectorPreservesPositiveExitOneOwnerEvidence(t *testing.T) {
+	root := t.TempDir()
+	lsof := filepath.Join(root, "lsof")
+	if err := os.WriteFile(lsof, []byte("#!/bin/sh\nprintf 'p99999\\nfcwd\\nn%s\\n' \"$4\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
+	usage, err := inspector.InUse(context.Background(), root)
+	if err != nil {
+		t.Fatalf("positive lsof exit 1 should remain usable owner evidence: %v", err)
+	}
+	if !usage.CWD {
+		t.Fatalf("positive lsof evidence=%+v", usage)
 	}
 }
 
