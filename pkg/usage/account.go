@@ -116,7 +116,7 @@ func ollamaCloudCredential() string {
 			Key   string `json:"key"`
 			Token string `json:"token"`
 		}
-		if json.Unmarshal(raw, &auth) != nil {
+		if json.Unmarshal(stripJSONC(raw), &auth) != nil {
 			continue
 		}
 		entry, ok := auth["ollama-cloud"]
@@ -145,7 +145,7 @@ func opencodeAccountIdentity() *AccountIdentity {
 			AccountID string `json:"account_id"`
 			AccountId string `json:"accountId"`
 		}
-		if json.Unmarshal(raw, &auth) != nil {
+		if json.Unmarshal(stripJSONC(raw), &auth) != nil {
 			continue
 		}
 		entry, ok := auth["opencode-go"]
