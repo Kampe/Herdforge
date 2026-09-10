@@ -325,16 +325,27 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 		if interleaveHook != nil {
 			interleaveHook("reclaim-pre-unlink")
 		}
-		if err := removeDirRelative(dirFile, name); err != nil {
-			disp.Action, disp.Reason = "retained", fmt.Sprintf("unlink-failed: %v", err)
+		// removeReviewedEntry is a package variable so interleaving tests can
+		// observe this exact boundary; production uses the
+		// rename-into-quarantine, verify-then-unlink primitive that proves
+		// the moved object's identity before destruction.
+		reclaimed, deleteReason := removeReviewedEntry(dirFile, dir, name, st, entry.Digest)
+		if !reclaimed {
+			disp.Action, disp.Reason = "retained", deleteReason
 			report.Dispositions = append(report.Dispositions, disp)
 			report.Candidates--
 			continue
 		}
 		if _, readbackErr := os.Lstat(path); !os.IsNotExist(readbackErr) {
-			disp.Action, disp.Reason = "retained", "unlink-readback-unknown"
+			// The reviewed object was deleted from its quarantine path, but
+			// the origin name resolves again: a writer installed a
+			// replacement in the residual window. The replacement is
+			// preserved and the reclaim is reported truthfully.
+			disp.Action, disp.Reason = "reclaimed", "name-replaced-after-quarantine-unlink: replacement preserved"
 			report.Dispositions = append(report.Dispositions, disp)
-			report.Candidates--
+			report.Reclaimed++
+			report.ReclaimedBytes += st.Size()
+			plannedBytes += st.Size()
 			continue
 		}
 		report.Reclaimed++
@@ -662,3 +673,10 @@ func DefaultLsofReader(ctx context.Context, path string) (ReaderStatus, error) {
 	}
 	return ReaderUnknown, fmt.Errorf("lsof returned empty success")
 }
+
+// removeReviewedEntry is the deletion primitive invoked after every
+// revalidation has passed. It is a package variable so interleaving tests
+// can observe the exact proof/deletion boundary; production binds it to
+// quarantineAndRemove, which proves the moved object's identity before
+// destroying it and restores any foreign replacement.
+var removeReviewedEntry = quarantineAndRemove

@@ -3,6 +3,7 @@ package transfer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"os"
 	"os/exec"
@@ -223,16 +224,33 @@ func TestDirLockReleaseSkipsSuccessorLock(t *testing.T) {
 	if !strings.Contains(string(body), "token=") {
 		t.Fatalf("holder file must carry an owner token: %s", body)
 	}
-	// Simulate successor takeover: same dir, fresh owner token.
-	b := lock.NewDirLock(dir)
-	if err := os.RemoveAll(dir); err == nil {
-		if err := b.Acquire(context.Background(), time.Second, "successor"); err != nil {
-			t.Fatal(err)
-		}
+	// Simulate successor takeover: same dir name, fresh owner token. While
+	// the stale owner holds the kernel flock, a compliant acquirer cannot
+	// exist, so the takeover is exercised the way a raw (non-compliant)
+	// writer would do it — directory replacement with a distinct holder
+	// token. The stale owner's release must skip it.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	successorBody := fmt.Sprintf("pid=%d\nagent=successor\nreason=successor takeover\ntoken=successor-token\n", os.Getpid())
+	if err := os.WriteFile(holder, []byte(successorBody), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	a.Release() // stale owner must not remove the successor's lock
+	b := lock.NewDirLock(dir)
 	if held, holderStr := b.Status(); !held {
 		t.Fatalf("successor lock must survive stale owner release (holder=%s)", holderStr)
+	}
+	// The raw successor is torn down by its own writer; a compliant
+	// acquirer then takes a fresh lock and releases it cleanly.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Acquire(context.Background(), time.Second, "successor"); err != nil {
+		t.Fatalf("successor must acquire once the stale owner dropped the flock: %v", err)
 	}
 	b.Release()
 	if held, _ := b.Status(); held {

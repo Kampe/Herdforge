@@ -3,6 +3,7 @@ package transfer
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +60,7 @@ func LoadRetentionManifest(root, manifestPath string) (RetentionManifest, error)
 	if interleaveHook != nil {
 		interleaveHook("manifest-pre-read")
 	}
-	body, err := os.ReadFile(manifestPath)
+	body, err := readBoundFile(manifestPath, st)
 	if err != nil {
 		return m, fmt.Errorf("bundle reclaim: retention manifest: %w", err)
 	}
@@ -123,3 +124,24 @@ func manifestEntry(m RetentionManifest, name string) (RetentionEntry, bool) {
 // the content read. It is a deterministic test seam for interleaving
 // reproduction (bundle-interleaving-repair-2306); production leaves it nil.
 var interleaveHook func(stage string)
+
+// readBoundFile opens path, binds the open descriptor to the inode that was
+// validated (same inode, via SameFile), and reads the content from that
+// descriptor. Bytes can therefore never come from a replacement installed
+// between path validation and the read: a swapped inode is refused instead
+// of being parsed as manifest authority.
+func readBoundFile(path string, validated os.FileInfo) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	bound, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(validated, bound) {
+		return nil, fmt.Errorf("retention manifest replaced between validation and read")
+	}
+	return io.ReadAll(f)
+}
