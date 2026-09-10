@@ -452,16 +452,17 @@ func TestGovernorApplyIsBoundedIdempotentAndReadsPhysicalBytes(t *testing.T) {
 
 func TestLifecycleApplyRequiresBothPolicySwitches(t *testing.T) {
 	g, _, _ := governorFor(t, "host", 900000)
+	g.Policy.AllowApply = false
 	if g.LifecycleApply() {
 		t.Fatal("observe-by-default governor admitted lifecycle mutation")
 	}
 	g.Policy.AllowApply = true
-	if g.LifecycleApply() {
-		t.Fatal("AllowApply alone admitted lifecycle mutation")
+	if !g.LifecycleApply() {
+		t.Fatal("lifecycle apply authority did not admit apply independently of dispatch")
 	}
 	g.Policy.ApplyBeforeDispatch = true
 	if !g.LifecycleApply() {
-		t.Fatal("enabled lifecycle policy did not admit apply")
+		t.Fatal("dispatch admission flag changed lifecycle authority")
 	}
 }
 
@@ -522,6 +523,56 @@ func TestSafeRemoveGeneratedTreeDefaultAndRollbackFailures(t *testing.T) {
 			t.Fatalf("recovery record=%q", data)
 		}
 	})
+}
+
+func TestGovernorRecoversInterruptedQuarantineFromDurableIntent(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 900000)
+	canonical, err := filepath.EvalSymlinks(g.Policy.RepositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Policy.RepositoryRoot = canonical
+	g.Policy.GeneratedDirectories = []string{"unused-generated-cache"}
+	g.Processes = idleProcessInspector{}
+	target := filepath.Join(g.Policy.RepositoryRoot, "interrupted-cache")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "artifact"), []byte("recover-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantine, err := os.MkdirTemp(g.Policy.RepositoryRoot, ".herd-resource-reap-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(g.Policy.RepositoryRoot, ".herd", "resource-reap-recovery.jsonl")
+	if err := appendRecoveryIntent(journal, g.Policy.RepositoryRoot, target, quarantine, info); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(target, filepath.Join(quarantine, filepath.Base(target))); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{Apply: true, BatchLimit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Reaped != 1 || report.ReclaimedBytes == 0 {
+		t.Fatalf("recovery report=%+v", report)
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted target restored or retained: %v", err)
+	}
+	if _, err := os.Stat(quarantine); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("quarantine remains after recovery: %v", err)
+	}
+	data, err := os.ReadFile(journal)
+	if err != nil || !strings.Contains(string(data), `"phase":"complete"`) {
+		t.Fatalf("recovery completion journal err=%v data=%q", err, data)
+	}
 }
 
 func TestGovernorMixedCensusAndCrossMachineIndependence(t *testing.T) {

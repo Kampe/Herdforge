@@ -319,10 +319,10 @@ func (g *Governor) Sweep(ctx context.Context, trigger SweepTrigger, apply bool) 
 }
 
 // LifecycleApply reports whether repository policy permits lifecycle seams to
-// act. Observe is the safe default; both switches are required before a
-// daemon-triggered sweep can mutate generated data.
+// act. ApplyBeforeDispatch controls only the dispatch admission path; startup,
+// periodic, verdict, harvest, and review seams use this independent authority.
 func (g *Governor) LifecycleApply() bool {
-	return g != nil && g.Policy.AllowApply && g.Policy.ApplyBeforeDispatch
+	return g != nil && g.Policy.AllowApply
 }
 
 func (g *Governor) defaults() {
@@ -395,6 +395,12 @@ func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorR
 		limit = g.Policy.ReapBatchLimit
 	}
 	if options.Apply {
+		recovered, recoveredBytes, recoverErr := g.recoverInterruptedQuarantines(ctx, &report, limit)
+		if recoverErr != nil {
+			return report, recoverErr
+		}
+		report.Reaped += recovered
+		report.ReclaimedBytes += recoveredBytes
 		if err := g.applyTargets(ctx, &report, limit); err != nil {
 			return report, err
 		}
@@ -920,6 +926,10 @@ func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) err
 	if err != nil || !containedPath(root, resolved) || filepath.Clean(resolved) != filepath.Clean(expected) {
 		return errors.New("generated target realpath changed before removal")
 	}
+	info, err := os.Lstat(targetAbs)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("generated target identity unavailable before removal")
+	}
 	parentInfo, err := os.Stat(parent)
 	if err != nil {
 		return fmt.Errorf("stat generated target parent before removal: %w", err)
@@ -929,8 +939,15 @@ func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) err
 		return fmt.Errorf("create removal quarantine: %w", err)
 	}
 	quarantined := filepath.Join(quarantine, filepath.Base(resolved))
+	recovery := filepath.Join(root, ".herd", "resource-reap-recovery.jsonl")
+	if err := appendRecoveryIntent(recovery, root, resolved, quarantine, info); err != nil {
+		_ = os.Remove(quarantine)
+		return fmt.Errorf("record generated target removal intent: %w", err)
+	}
 	if err := os.Rename(resolved, quarantined); err != nil {
-		return fmt.Errorf("quarantine generated target: %w", err)
+		cleanupErr := os.Remove(quarantine)
+		journalErr := appendRecoveryRecord(recovery, root, resolved, quarantine, err)
+		return errors.Join(fmt.Errorf("quarantine generated target: %w", err), cleanupErr, journalErr)
 	}
 	currentParent, statErr := os.Stat(parent)
 	if statErr != nil || !os.SameFile(parentInfo, currentParent) {
@@ -940,11 +957,10 @@ func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) err
 		if cleanupErr := os.Remove(quarantine); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
 			return fmt.Errorf("generated target parent changed during removal; quarantine cleanup: %w", cleanupErr)
 		}
-		return errors.New("generated target parent changed during removal")
+		return errors.Join(errors.New("generated target parent changed during removal"), appendRecoveryRecord(recovery, root, resolved, quarantine, errors.New("parent changed")))
 	}
 	if err := remove(quarantine); err != nil {
 		if rollbackErr := os.Rename(quarantined, resolved); rollbackErr != nil {
-			recovery := filepath.Join(root, ".herd", "resource-reap-recovery.jsonl")
 			recordErr := appendRecoveryRecord(recovery, root, resolved, quarantine, err)
 			if recordErr != nil {
 				return fmt.Errorf("remove quarantined generated target: %v; rollback failed: %v; recovery record failed: %v; quarantine retained at %s", err, rollbackErr, recordErr, quarantine)
@@ -954,28 +970,165 @@ func safeRemoveGeneratedTree(repoRoot, target string, remove RemoveTreeFunc) err
 		if cleanupErr := os.Remove(quarantine); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
 			return fmt.Errorf("remove quarantined generated target: %v; rollback cleanup failed: %w", err, cleanupErr)
 		}
-		return fmt.Errorf("remove quarantined generated target: %w", err)
+		return errors.Join(fmt.Errorf("remove quarantined generated target: %w", err), appendRecoveryRecord(recovery, root, resolved, quarantine, err))
 	}
 	if err := os.Remove(quarantine); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove empty quarantine: %w", err)
 	}
+	if err := appendRecoveryCompletion(recovery, root, resolved, quarantine); err != nil {
+		return fmt.Errorf("record generated target removal completion: %w", err)
+	}
 	return nil
 }
 
-func appendRecoveryRecord(path, root, target, quarantine string, reason error) error {
+type recoveryRecord struct {
+	Phase      string `json:"phase"`
+	Target     string `json:"target"`
+	Quarantine string `json:"quarantine"`
+	Identity   string `json:"identity,omitempty"`
+	Owner      string `json:"owner,omitempty"`
+}
+
+func appendRecoveryIntent(path, root, target, quarantine string, info os.FileInfo) error {
+	owner, owned := fileOwnerID(info)
+	if !owned {
+		return errors.New("generated target owner identity unavailable")
+	}
+	return appendRecoveryLine(path, recoveryRecord{Phase: "intent", Target: reportPath(root, target), Quarantine: reportPath(root, quarantine), Identity: fileIdentity(info), Owner: owner})
+}
+
+func appendRecoveryCompletion(path, root, target, quarantine string) error {
+	return appendRecoveryLine(path, recoveryRecord{Phase: "complete", Target: reportPath(root, target), Quarantine: reportPath(root, quarantine)})
+}
+
+func appendRecoveryLine(path string, record recoveryRecord) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create recovery record directory: %w", err)
 	}
-	record, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open recovery record: %w", err)
 	}
-	_, writeErr := fmt.Fprintf(record, "{\"target\":%q,\"quarantine\":%q,\"reason\":%q}\n", reportPath(root, target), reportPath(root, quarantine), reason.Error())
-	if writeErr == nil {
-		writeErr = record.Sync()
+	data, marshalErr := json.Marshal(record)
+	if marshalErr == nil {
+		_, marshalErr = file.Write(append(data, '\n'))
 	}
-	closeErr := record.Close()
-	return errors.Join(writeErr, closeErr)
+	if marshalErr == nil {
+		marshalErr = file.Sync()
+	}
+	return errors.Join(marshalErr, file.Close())
+}
+
+func fileIdentity(info os.FileInfo) string {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return fmt.Sprintf("%T:%v:%v", stat, stat.Dev, stat.Ino)
+	}
+	return fmt.Sprintf("%T:%v:%s:%d:%d", info.Sys(), info.Sys(), info.Mode(), info.Size(), info.ModTime().UTC().UnixNano())
+}
+
+func (g *Governor) recoverInterruptedQuarantines(ctx context.Context, report *GovernorReport, limit int) (int, uint64, error) {
+	path := filepath.Join(g.Policy.RepositoryRoot, ".herd", "resource-reap-recovery.jsonl")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("read recovery journal: %w", err)
+	}
+	latest := make(map[string]recoveryRecord)
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record recoveryRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil || record.Target == "" || record.Quarantine == "" {
+			return 0, 0, errors.New("recovery journal contains invalid proof")
+		}
+		latest[record.Target+"\x00"+record.Quarantine] = record
+	}
+	keys := make([]string, 0, len(latest))
+	for key := range latest {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var count int
+	var reclaimed uint64
+	for _, key := range keys {
+		record := latest[key]
+		if record.Phase != "intent" {
+			continue
+		}
+		if count >= limit {
+			break
+		}
+		target, quarantine, resolveErr := recoveryPaths(g.Policy.RepositoryRoot, record)
+		if resolveErr != nil {
+			return count, reclaimed, resolveErr
+		}
+		if _, statErr := os.Lstat(target); statErr == nil {
+			return count, reclaimed, errors.New("recovery intent target was recreated; refusing quarantine cleanup")
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return count, reclaimed, fmt.Errorf("inspect recovery target: %w", statErr)
+		}
+		entries, readErr := os.ReadDir(quarantine)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				if err := appendRecoveryCompletion(path, g.Policy.RepositoryRoot, target, quarantine); err != nil {
+					return count, reclaimed, err
+				}
+				continue
+			}
+			return count, reclaimed, fmt.Errorf("inspect recovery quarantine: %w", readErr)
+		}
+		if len(entries) != 1 || entries[0].Name() != filepath.Base(target) {
+			return count, reclaimed, errors.New("recovery quarantine contents are not exact")
+		}
+		child := filepath.Join(quarantine, entries[0].Name())
+		info, statErr := os.Lstat(child)
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || fileIdentity(info) != record.Identity {
+			return count, reclaimed, errors.New("recovery quarantine identity proof failed")
+		}
+		owner, owned := fileOwnerID(info)
+		if !owned || owner != record.Owner {
+			return count, reclaimed, errors.New("recovery quarantine owner proof failed")
+		}
+		usage, measureErr := g.Measure.Measure(child, g.Policy.MaxScanEntries)
+		if measureErr != nil || usage.Truncated {
+			return count, reclaimed, errors.New("recovery quarantine allocation proof unavailable")
+		}
+		process, processErr := g.Processes.InUse(ctx, child)
+		if processErr != nil || process.CWD || process.OpenFile {
+			return count, reclaimed, errors.New("recovery quarantine active process proof unavailable")
+		}
+		if err := g.RemoveTree(quarantine); err != nil {
+			return count, reclaimed, fmt.Errorf("recover interrupted quarantine: %w", err)
+		}
+		if err := appendRecoveryCompletion(path, g.Policy.RepositoryRoot, target, quarantine); err != nil {
+			return count, reclaimed, err
+		}
+		count++
+		reclaimed += usage.Bytes
+	}
+	return count, uint64(reclaimed), nil
+}
+
+func recoveryPaths(root string, record recoveryRecord) (string, string, error) {
+	paths := make([]string, 2)
+	for i, reported := range []string{record.Target, record.Quarantine} {
+		if !strings.HasPrefix(reported, "./") || strings.Contains(reported, "..") {
+			return "", "", errors.New("recovery journal path is not repository-relative")
+		}
+		paths[i] = filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(reported, "./")))
+		resolved, err := filepath.EvalSymlinks(filepath.Dir(paths[i]))
+		if err != nil || !containedPath(root, resolved) {
+			return "", "", errors.New("recovery journal path escapes repository")
+		}
+	}
+	return paths[0], paths[1], nil
+}
+
+func appendRecoveryRecord(path, root, target, quarantine string, reason error) error {
+	return appendRecoveryLine(path, recoveryRecord{Phase: "failed", Target: reportPath(root, target), Quarantine: reportPath(root, quarantine), Identity: reason.Error()})
 }
 
 func exactLane(lanes []RegisteredWorktree, path string) (RegisteredWorktree, bool) {
