@@ -6,7 +6,17 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
+
+// stableVolumeBackend feeds the DiskAdmission seam a deterministic volume
+// with ample headroom so the fixture exercises unmerged logic, not the
+// operator's actual disk pressure. Production reserves are untouched.
+type stableVolumeBackend struct{}
+
+func (stableVolumeBackend) StatFS(string) (resources.Capacity, error) {
+	return resources.Capacity{FilesystemID: "test-volume", TotalBytes: 1 << 40, FreeBytes: 1 << 40, TotalInodes: 1 << 30, FreeInodes: 1 << 30}, nil
+}
 
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
@@ -32,6 +42,7 @@ func TestUnmergedFor(t *testing.T) {
 	gitIn(t, wt, "commit", "--allow-empty", "-q", "-m", "feat: unique work")
 
 	h := NewHarvester(root)
+	h.DiskAdmission = resources.NewCapacityGate(stableVolumeBackend{}, resources.DiskPolicy{ReserveBytes: 1, ReserveInodes: 1})
 
 	t.Run("branch with unique commit reports it", func(t *testing.T) {
 		u, err := h.UnmergedFor(ctx, wt)
