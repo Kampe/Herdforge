@@ -1421,12 +1421,21 @@ func (r poolReviewer) LaunchFlags() []string {
 	if len(r.Argv) == 0 {
 		return nil
 	}
+	var flags []string
 	if strings.EqualFold(strings.TrimSpace(r.Argv[0]), strings.TrimSpace(r.Kind)) {
-		return r.Argv[1:]
+		flags = r.Argv[1:]
+	} else {
+		// A harness whose argv[0] is not the kind (a wrapper, for example) is
+		// passed through whole rather than silently truncated.
+		flags = r.Argv
 	}
-	// A harness whose argv[0] is not the kind (a wrapper, for example) is passed
-	// through whole rather than silently truncated.
-	return r.Argv
+	if strings.EqualFold(strings.TrimSpace(r.Kind), "codex") {
+		// Codex 0.153.4 blocks interactive startup on its update-choice prompt.
+		// Review launches cannot answer that unrelated UI prompt: disable only
+		// the supported startup update check through Codex's config override.
+		flags = append(append([]string(nil), flags...), "-c", "check_for_update_on_startup=false")
+	}
+	return flags
 }
 
 // poolReviewer is the resolved launch identity for one exact-SHA review.
