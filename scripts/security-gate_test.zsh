@@ -178,6 +178,35 @@ chmod +x "$mock_bin/gitleaks"
 
 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >/dev/null
 
+# FAC-660 compatibility: a complete JSON null is a valid no-finding report.
+cat << 'EOF' > "$mock_bin/gitleaks"
+#!/usr/bin/env zsh
+for ((i=1; i<=$#; i++)); do
+	if [[ "${@[i]}" == "--report-path" ]]; then
+		print 'null' > "${@[i+1]}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gitleaks"
+null_report_out="$tmp/gitleaks-null.out"
+if ! PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$null_report_out" 2>&1; then
+	print -u2 "error: FAC-660 JSON null no-finding report was rejected"
+	exit 1
+fi
+
+# A null no-finding report is inconsistent with a findings exit and must not
+# be promoted to a successful scan.
+sed -i '' 's/^exit 0$/exit 1/' "$mock_bin/gitleaks"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$null_report_out" 2>&1; then
+	print -u2 "error: gitleaks exit1 with JSON null report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gitleaks returned 1 without findings' "$null_report_out" >/dev/null || {
+	print -u2 "error: missing JSON null exit consistency diagnostic"
+	exit 1
+}
+
 # Operational exit2 with an empty report must fail closed even when the
 # baseline contains only unreachable/empty entries.
 cat << 'EOF' > "$mock_bin/gitleaks"
@@ -230,7 +259,7 @@ if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$malformed_out" 2>&1; th
 	print -u2 "error: malformed gitleaks report was accepted"
 	exit 1
 fi
-grep -F -- 'error: gitleaks produced no complete JSON array report' "$malformed_out" >/dev/null || {
+grep -F -- 'error: gitleaks produced no complete JSON null/array report' "$malformed_out" >/dev/null || {
 	print -u2 "error: missing malformed-report diagnostic"
 	exit 1
 }

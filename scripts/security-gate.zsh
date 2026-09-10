@@ -187,13 +187,16 @@ if (( gitleaks_status != 0 && gitleaks_status != 1 )); then
 fi
 if [[ ! -s "$leaks_report" ]] || ! jq -e -s '
 	length == 1 and
-	(.[0] | type == "array") and
-	(.[0] | all(.[]; type == "object" and (.Fingerprint | type == "string") and (.Fingerprint | length > 0)))
+	(.[0] | type == "null" or
+		(type == "array" and all(.[]; type == "object" and (.Fingerprint | type == "string") and (.Fingerprint | length > 0))))
 ' "$leaks_report" >/dev/null; then
-	print -u2 'error: gitleaks produced no complete JSON array report'
+	print -u2 'error: gitleaks produced no complete JSON null/array report'
 	exit 1
 fi
-report_count=$(jq -r 'length' "$leaks_report")
+# FAC-660 permits a complete JSON null as the scanner's no-finding result.
+# Normalize that representation only after the complete-report check; empty,
+# malformed, and multi-document output remains a hard error above.
+report_count=$(jq -r 'if type == "null" then 0 else length end' "$leaks_report")
 if (( gitleaks_status == 0 && report_count != 0 )); then
 	print -u2 "error: gitleaks returned 0 with $report_count finding(s)"
 	exit 1
@@ -210,7 +213,7 @@ while IFS=$'\t' read -r fingerprint classification owner expiry; do
 done < "$leaks_baseline"
 
 leaks_findings=$(mktemp)
-if ! jq -r '.[].Fingerprint' "$leaks_report" | LC_ALL=C sort > "$leaks_findings"; then
+if ! jq -r 'if type == "null" then [] else . end | .[].Fingerprint' "$leaks_report" | LC_ALL=C sort > "$leaks_findings"; then
 	print -u2 'error: could not parse gitleaks finding fingerprints'
 	exit 1
 fi
