@@ -7732,7 +7732,12 @@ func runRoute() {
 
 	e := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
-	if snap, err := usage.FetchSnapshot(); err == nil {
+	// FAC-786: this was usage.FetchSnapshot(), which bypasses the per-provider
+	// 429 backoff and single-flight cache entirely -- every `herd route` call
+	// during a provider rate limit re-hit that provider's usage endpoint with
+	// no bound. FetchSnapshotCached shares the same persisted backoff and
+	// stale-reading fallback the launch path already uses.
+	if snap, _, err := usage.FetchSnapshotCached(); err == nil {
 		computed = e.ComputeAll(snap)
 	}
 	sr := router.NewRouter(e, computed)

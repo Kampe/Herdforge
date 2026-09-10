@@ -129,6 +129,67 @@ func TestProviderBackoff429SurfacesStalePriorReadingNotAbsence(t *testing.T) {
 	}
 }
 
+// TestFetchSnapshotCachedBoundsRepeatedCallsAcrossRouteInvocations is the
+// FAC-786 regression for `herd route`: it used the uncached usage.FetchSnapshot,
+// which hits every provider directly with no persisted backoff, so repeated
+// route calls during a 429 hammered the provider endpoint unbounded and lost
+// the prior stale reading each time. usage.FetchSnapshotCached shares the same
+// per-provider backoff and stale fallback as the launch path.
+func TestFetchSnapshotCachedBoundsRepeatedCallsAcrossRouteInvocations(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "0")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"route-429-acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	rateLimited := false
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
+		atomic.AddInt32(&calls, 1)
+		if rateLimited {
+			return ProviderUsage{}, pollErrf("rate-limited", "HTTP 429; retry-after=300")
+		}
+		return ProviderUsage{DisplayName: "Codex", Account: codexAccountIdentity(), Resources: map[string]ResourceUsage{
+			"primary": {Kind: "consumption", Unit: "percent", Limit: 100, Remaining: 80, WindowSeconds: 18000},
+		}}, nil
+	}})
+	defer restore()
+	InvalidateSnapshotCache()
+	defer InvalidateSnapshotCache()
+
+	// First route call: healthy, cached to disk.
+	if snap, _, err := FetchSnapshotCached(); err != nil || len(snap.Providers["codex"].Resources) == 0 {
+		t.Fatalf("expected a healthy first snapshot, got snap=%+v err=%v", snap, err)
+	}
+
+	rateLimited = true
+
+	// Three more "herd route" invocations in a row while the provider is
+	// rate-limited must not each re-poll: the persisted backoff must bound
+	// them to at most one additional live call, and the stale reading must
+	// still be visible rather than the provider disappearing.
+	for i := 0; i < 3; i++ {
+		snap, _, err := FetchSnapshotCached()
+		if snap == nil {
+			t.Fatalf("route call %d: lost the snapshot entirely under backoff", i)
+		}
+		provider, ok := snap.Providers["codex"]
+		if !ok {
+			t.Fatalf("route call %d: provider dropped from snapshot under backoff (err=%v)", i, err)
+		}
+		if !provider.Stale {
+			t.Fatalf("route call %d: provider surfaced under backoff must be marked stale", i)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected exactly 2 live polls (1 success + 1 429) across 4 route calls, got %d -- backoff did not bound repeated calls", got)
+	}
+}
+
 func TestProviderCacheAcrossProcessesShares429Backoff(t *testing.T) {
 	dir := t.TempDir()
 	home := t.TempDir()
