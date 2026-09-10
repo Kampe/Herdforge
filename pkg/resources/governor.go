@@ -63,12 +63,17 @@ type RegisteredWorktree struct {
 }
 
 type GovernorPolicy struct {
-	HostID                 string
-	RepositoryID           string
-	RepositoryRoot         string
-	BaseRef                string
-	LockPath               string
-	GeneratedDirectories   []string
+	HostID               string
+	RepositoryID         string
+	RepositoryRoot       string
+	BaseRef              string
+	LockPath             string
+	GeneratedDirectories []string
+	// OrphanRoots are known repository-local lane roots whose children may no
+	// longer be registered with Git. They are census-only: no orphan is ever a
+	// deletion target without canonical claim, ownership, and handle proof.
+	OrphanRoots            []string
+	OrphanDerivedTargets   []string
 	PressureBytes          uint64
 	RecoveryBytes          uint64
 	TaskReserveBytes       uint64
@@ -228,10 +233,33 @@ type GovernorReport struct {
 	CapacityAwareConcurrency     int                  `json:"capacity_aware_concurrency"`
 	AvailableDispatchConcurrency int                  `json:"available_dispatch_concurrency"`
 	Worktrees                    []RegisteredWorktree `json:"worktrees"`
+	Orphans                      []OrphanWorktree     `json:"unregistered_orphans,omitempty"`
 	Targets                      []TargetReport       `json:"targets"`
 	Foreign                      []ForeignTelemetry   `json:"foreign,omitempty"`
 	Reaped                       int                  `json:"reaped"`
 	ReclaimedBytes               uint64               `json:"reclaimed_bytes"`
+}
+
+// OrphanWorktree is an unregistered child of a repository-declared known lane
+// root. Its bytes are reported to make disk pressure actionable, while the
+// complete checkout remains preserved because absence from Git is not proof
+// of retirement.
+type OrphanWorktree struct {
+	Path                string                `json:"-"`
+	ReportPath          string                `json:"path"`
+	AllocatedBytes      uint64                `json:"allocated_bytes"`
+	Entries             int                   `json:"entries"`
+	AllocationTruncated bool                  `json:"allocation_truncated,omitempty"`
+	DerivedTargets      []OrphanDerivedTarget `json:"derived_targets,omitempty"`
+	PreserveReason      string                `json:"preserve_reason"`
+}
+
+type OrphanDerivedTarget struct {
+	Path           string `json:"-"`
+	ReportPath     string `json:"report_path"`
+	AllocatedBytes uint64 `json:"allocated_bytes"`
+	Decision       string `json:"decision"`
+	Reason         string `json:"reason"`
 }
 
 type RunOptions struct {
@@ -401,6 +429,11 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	for i := range report.Worktrees {
 		report.Worktrees[i].ReportPath = reportPath(g.Policy.RepositoryRoot, report.Worktrees[i].Path)
 	}
+	orphans, orphanErr := g.censusOrphans(ctx, report.Worktrees)
+	if orphanErr != nil {
+		return GovernorReport{}, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
+	}
+	report.Orphans = orphans
 	for _, lane := range lanes {
 		for _, rel := range g.Policy.GeneratedDirectories {
 			target := g.inspectTarget(ctx, lane, rel)
@@ -423,6 +456,84 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	})
 	g.setConcurrency(&report)
 	return report, nil
+}
+
+func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree) ([]OrphanWorktree, error) {
+	if len(g.Policy.OrphanRoots) == 0 {
+		return nil, nil
+	}
+	known := make(map[string]struct{}, len(registered))
+	for _, lane := range registered {
+		resolved, err := filepath.EvalSymlinks(lane.Path)
+		if err == nil {
+			known[filepath.Clean(resolved)] = struct{}{}
+		}
+	}
+	repoRoot, err := filepath.EvalSymlinks(g.Policy.RepositoryRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repository root for orphan census: %w", err)
+	}
+	var out []OrphanWorktree
+	seenRoots := make(map[string]struct{}, len(g.Policy.OrphanRoots))
+	for _, rawRoot := range g.Policy.OrphanRoots {
+		root, err := filepath.EvalSymlinks(rawRoot)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("resolve known orphan root: %w", err)
+		}
+		root = filepath.Clean(root)
+		if !containedPath(repoRoot, root) {
+			return nil, errors.New("known orphan root escapes repository root")
+		}
+		if _, duplicate := seenRoots[root]; duplicate {
+			continue
+		}
+		seenRoots[root] = struct{}{}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return nil, fmt.Errorf("read known orphan root: %w", err)
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			path := filepath.Join(root, entry.Name())
+			resolved, resolveErr := filepath.EvalSymlinks(path)
+			if resolveErr != nil {
+				continue
+			}
+			resolved = filepath.Clean(resolved)
+			if _, ok := known[resolved]; ok {
+				continue
+			}
+			info, statErr := os.Stat(path)
+			if statErr != nil || !info.IsDir() {
+				continue
+			}
+			usage, measureErr := g.Measure.Measure(path, g.Policy.MaxScanEntries)
+			if measureErr != nil {
+				out = append(out, OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), PreserveReason: "orphan_allocation_unavailable"})
+				continue
+			}
+			orphan := OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), AllocatedBytes: usage.Bytes, Entries: usage.Entries, AllocationTruncated: usage.Truncated, PreserveReason: "unregistered_worktree_authority_unavailable"}
+			for _, rel := range g.Policy.OrphanDerivedTargets {
+				target := filepath.Join(path, filepath.FromSlash(rel))
+				usage, targetErr := g.Measure.Measure(target, g.Policy.MaxScanEntries)
+				row := OrphanDerivedTarget{Path: target, ReportPath: reportPath(g.Policy.RepositoryRoot, target), Decision: "blocked", Reason: "orphan_claim_ownership_and_handle_proof_unavailable"}
+				if targetErr == nil {
+					row.AllocatedBytes = usage.Bytes
+				} else if !errors.Is(targetErr, os.ErrNotExist) {
+					row.Reason = "orphan_derived_target_evidence_unavailable"
+				}
+				orphan.DerivedTargets = append(orphan.DerivedTargets, row)
+			}
+			out = append(out, orphan)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
 }
 
 func reportPath(root, path string) string {

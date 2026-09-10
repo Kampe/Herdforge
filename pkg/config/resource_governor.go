@@ -15,6 +15,7 @@ import (
 type ResourceGovernor struct {
 	Version                string   `yaml:"version,omitempty"`
 	GeneratedDirectories   []string `yaml:"generated_directories,omitempty"`
+	OrphanDerivedTargets   []string `yaml:"orphan_derived_targets,omitempty"`
 	PressureBytes          uint64   `yaml:"pressure_bytes,omitempty"`
 	RecoveryBytes          uint64   `yaml:"recovery_bytes,omitempty"`
 	TaskReserveBytes       uint64   `yaml:"task_reserve_bytes,omitempty"`
@@ -27,7 +28,7 @@ type ResourceGovernor struct {
 }
 
 func (g ResourceGovernor) Enabled() bool {
-	return g.Version != "" || len(g.GeneratedDirectories) != 0 || g.PressureBytes != 0 ||
+	return g.Version != "" || len(g.GeneratedDirectories) != 0 || len(g.OrphanDerivedTargets) != 0 || g.PressureBytes != 0 ||
 		g.RecoveryBytes != 0 || g.TaskReserveBytes != 0 || g.MaxDispatchConcurrency != 0 ||
 		g.ReapBatchLimit != 0 || g.LockTimeout != "" || g.LockRetry != "" ||
 		g.AllowApply || g.ApplyBeforeDispatch
@@ -55,6 +56,20 @@ func (g ResourceGovernor) Validate() error {
 	}
 	if len(g.GeneratedDirectories) == 0 {
 		return fmt.Errorf("resource_governor.generated_directories: at least one exact repository-relative directory is required")
+	}
+	seenOrphan := make(map[string]struct{}, len(g.OrphanDerivedTargets))
+	for i, raw := range g.OrphanDerivedTargets {
+		clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(raw)))
+		if clean != raw || clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
+			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: must be an exact orphan-relative path", i)
+		}
+		if clean != "graph.db" && clean != ".herd/bootstrap/cache" {
+			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: unsupported derived target %q", i, raw)
+		}
+		if _, ok := seenOrphan[clean]; ok {
+			return fmt.Errorf("resource_governor.orphan_derived_targets[%d]: duplicate target %q", i, raw)
+		}
+		seenOrphan[clean] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(g.GeneratedDirectories))
 	for i, raw := range g.GeneratedDirectories {

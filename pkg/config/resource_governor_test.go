@@ -21,6 +21,11 @@ func TestResourceGovernorValidate(t *testing.T) {
 	if err := validResourceGovernor().Validate(); err != nil {
 		t.Fatalf("valid policy: %v", err)
 	}
+	orphans := validResourceGovernor()
+	orphans.OrphanDerivedTargets = []string{"graph.db", ".herd/bootstrap/cache"}
+	if err := orphans.Validate(); err != nil {
+		t.Fatalf("supported orphan derived targets rejected: %v", err)
+	}
 
 	tests := []struct {
 		name string
@@ -41,6 +46,8 @@ func TestResourceGovernorValidate(t *testing.T) {
 		{name: "batch", edit: func(g *ResourceGovernor) { g.ReapBatchLimit = 0 }, want: "reap_batch_limit"},
 		{name: "timeout", edit: func(g *ResourceGovernor) { g.LockTimeout = "31s" }, want: "lock_timeout"},
 		{name: "apply", edit: func(g *ResourceGovernor) { g.ApplyBeforeDispatch = true }, want: "allow_apply"},
+		{name: "orphan absolute", edit: func(g *ResourceGovernor) { g.OrphanDerivedTargets = []string{"/tmp/cache"} }, want: "orphan-relative"},
+		{name: "orphan unsupported", edit: func(g *ResourceGovernor) { g.OrphanDerivedTargets = []string{"node_modules"} }, want: "unsupported"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

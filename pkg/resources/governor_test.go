@@ -136,6 +136,44 @@ func TestGovernorNeverReapsTrackedSource(t *testing.T) {
 	}
 }
 
+func TestGovernorCensusReportsUnregisteredLaneWithoutMutation(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 900000)
+	orphanRoot := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	orphan := filepath.Join(orphanRoot, "fac-683")
+	if err := os.MkdirAll(filepath.Join(orphan, ".herd", "bootstrap", "cache", "digest"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, "graph.db"), []byte("graph"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json"), []byte("receipt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g.Policy.OrphanRoots = []string{orphanRoot}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db", ".herd/bootstrap/cache"}
+	report, err := g.Run(context.Background(), RunOptions{Apply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Orphans) != 1 || report.Orphans[0].AllocatedBytes == 0 {
+		t.Fatalf("orphan census=%+v", report.Orphans)
+	}
+	if report.Orphans[0].PreserveReason != "unregistered_worktree_authority_unavailable" || len(report.Orphans[0].DerivedTargets) != 2 {
+		t.Fatalf("orphan authority=%+v", report.Orphans[0])
+	}
+	for _, target := range report.Orphans[0].DerivedTargets {
+		if target.Decision != "blocked" || target.Reason != "orphan_claim_ownership_and_handle_proof_unavailable" {
+			t.Fatalf("orphan derived target=%+v", target)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(orphan, "graph.db")); err != nil {
+		t.Fatalf("orphan source/derived evidence mutated: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(orphan, ".herd", "bootstrap", "receipt.json")); err != nil {
+		t.Fatalf("orphan bootstrap receipt mutated: %v", err)
+	}
+}
+
 func TestGovernorSafetyReasonsCoverDestructiveAuthority(t *testing.T) {
 	tests := []struct {
 		name string
