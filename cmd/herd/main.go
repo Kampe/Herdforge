@@ -2040,6 +2040,12 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			if err := validateLaneLaunchConfig(lane); err != nil {
 				return standing.Route{}, err
 			}
+			// FAC-624: admission below can run against a stale canonical hook
+			// policy pin even though this lane's own target worktree has a
+			// fresh one -- exactly the gap FAC-767/185679cd closed for
+			// `herd up`. lane.Worktree is already known here, before CreateTab.
+			restoreHooks := standingHookPolicyScope(lane)
+			defer restoreHooks()
 			// The launch decision is the sole standing admission authority. Do
 			// not run a separate quota-only pre-gate here: it reads a different
 			// snapshot from the router and cannot account for live concurrency,

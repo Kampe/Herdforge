@@ -357,6 +357,17 @@ func worktreeExists(path string) bool {
 // authenticated by review admission; using its .herd/harness-hooks.json
 // keeps native Herdr launches independent of an operator-set environment
 // variable while preserving an explicit override when one is present.
+// standingHookPolicyScope is useHarnessHooksFromWorktree applied to a
+// standing lane's own configured worktree (FAC-624). `herd standing` admits
+// through the same launchAdmission -> preflightHooks -> harness.DefaultDiscovery
+// chain `herd up` does, and had the identical gap FAC-767/185679cd fixed for
+// `up`: without this, admission resolves .herd/harness-hooks.json relative to
+// the coordinator's own cwd, so a stale canonical pin can strand a lane whose
+// own target worktree already has a fresh one.
+func standingHookPolicyScope(lane *config.LaneDef) func() {
+	return useHarnessHooksFromWorktree(filepath.Join(".", lane.Worktree))
+}
+
 func useHarnessHooksFromWorktree(wt string) func() {
 	if strings.TrimSpace(os.Getenv("HERD_HARNESS_HOOKS_FILE")) != "" {
 		return func() {}
