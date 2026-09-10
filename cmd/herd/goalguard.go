@@ -17,8 +17,11 @@ import (
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/security"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 func runGoalGuard() error {
@@ -170,14 +173,18 @@ func clearGoal(s *goalguard.Store, grantor string, generation int64, receiptPath
 }
 
 func validateNativeGrantor(g goalguard.Goal, grantor string, generation int64) error {
-	path := security.CanonicalLeaseDBPath(".")
+	root, err := worktree.ResolveCanonicalRoot(context.Background(), ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: resolve canonical repository: %w", err)
+	}
+	path := security.CanonicalLeaseDBPath(root)
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("goal-guard: clear refused for owner %q: native claim authority is missing; coordinator must present the live claim", g.Owner)
 		}
 		return fmt.Errorf("goal-guard: clear refused: inspect native claim authority: %w", err)
 	}
-	if err := security.WireCanonicalClaimAuthority("."); err != nil {
+	if err := security.WireCanonicalClaimAuthority(root); err != nil {
 		return fmt.Errorf("goal-guard: clear refused: open native claim authority: %w", err)
 	}
 	lookup, err := security.RequireClaimAuthority()
@@ -224,7 +231,61 @@ func resolveGoalGuardCallerIdentity() (string, error) {
 	if match == nil {
 		return "", fmt.Errorf("no live agent is bound to pane %q", pane)
 	}
+	paneInfo, err := herdr.GetHostedPaneIdentity(pane)
+	if err != nil {
+		return "", fmt.Errorf("verify caller process ancestry for pane %q: %w", pane, err)
+	}
+	if err := verifyCallerPIDInHostedTree(os.Getpid(), paneInfo); err != nil {
+		return "", fmt.Errorf("caller process is not in pane %q tree: %w", pane, err)
+	}
 	return match.Name, nil
+}
+
+func verifyCallerPIDInHostedTree(callerPID int, paneInfo *herdr.HostedPaneIdentity) error {
+	if paneInfo == nil {
+		return errors.New("missing pane process info")
+	}
+	if callerPID <= 1 {
+		return fmt.Errorf("invalid caller pid %d", callerPID)
+	}
+	allowedPIDs := map[int]bool{}
+	if paneInfo.ShellPID > 1 {
+		allowedPIDs[paneInfo.ShellPID] = true
+	}
+	for _, p := range paneInfo.Foreground {
+		if p.PID > 1 {
+			allowedPIDs[p.PID] = true
+		}
+	}
+	for _, p := range paneInfo.Tree {
+		if p.PID > 1 {
+			allowedPIDs[p.PID] = true
+		}
+	}
+	// Direct PID check
+	if allowedPIDs[callerPID] {
+		return nil
+	}
+	// Walk caller ancestry up to init/root
+	tree := toolchild.SystemTree{}
+	cur := callerPID
+	seen := map[int]bool{cur: true}
+	for depth := 0; depth < 64; depth++ {
+		node, ok, err := tree.Lookup(cur)
+		if err != nil || !ok {
+			break
+		}
+		parent := node.ParentPID
+		if parent <= 1 || seen[parent] {
+			break
+		}
+		seen[parent] = true
+		if allowedPIDs[parent] {
+			return nil
+		}
+		cur = parent
+	}
+	return fmt.Errorf("caller pid %d and its process ancestors are not members of pane %s process tree", callerPID, paneInfo.PaneID)
 }
 
 func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionReceipt) error {
@@ -237,7 +298,27 @@ func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionRe
 	if receipt.Verdict != "PASS" || receipt.IntegrationResult != hsync.IntegrationMerged {
 		return errors.New("goal-guard: clear refused: completion receipt is not a merged PASS")
 	}
-	log, err := hsync.ReadDoneLog(".")
+	root, err := worktree.ResolveCanonicalRoot(context.Background(), ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: resolve canonical repository: %w", err)
+	}
+	authority, closer, err := openLifecycleAuthority(root)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: open canonical lifecycle authority: %w", err)
+	}
+	defer closer()
+	var st *lifecycle.TaskState
+	if receipt.ProvenanceMode != hsync.ProvenanceReduced {
+		cur, err := authority.CurrentState(g.Task)
+		if err != nil {
+			return fmt.Errorf("goal-guard: clear refused: query lifecycle state for task %q: %w", g.Task, err)
+		}
+		st = cur
+	}
+	if err := receipt.Validate(root, g.Task, st); err != nil {
+		return fmt.Errorf("goal-guard: clear refused: completion receipt validation failed: %w", err)
+	}
+	log, err := hsync.ReadDoneLog(root)
 	if err != nil {
 		return fmt.Errorf("goal-guard: clear refused: native Done readback unavailable: %w", err)
 	}
