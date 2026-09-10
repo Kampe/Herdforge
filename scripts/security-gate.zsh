@@ -181,6 +181,27 @@ run_with_timeout "$gitleaks_timeout" "gitleaks" run_gitleaks || gitleaks_status=
 if (( gitleaks_status == 124 )); then
 	exit 1
 fi
+if (( gitleaks_status != 0 && gitleaks_status != 1 )); then
+	print -u2 "error: gitleaks scanner failed with exit status $gitleaks_status"
+	exit 1
+fi
+if [[ ! -s "$leaks_report" ]] || ! jq -e -s '
+	length == 1 and
+	(.[0] | type == "array") and
+	(.[0] | all(.[]; type == "object" and (.Fingerprint | type == "string") and (.Fingerprint | length > 0)))
+' "$leaks_report" >/dev/null; then
+	print -u2 'error: gitleaks produced no complete JSON array report'
+	exit 1
+fi
+report_count=$(jq -r 'length' "$leaks_report")
+if (( gitleaks_status == 0 && report_count != 0 )); then
+	print -u2 "error: gitleaks returned 0 with $report_count finding(s)"
+	exit 1
+fi
+if (( gitleaks_status == 1 && report_count == 0 )); then
+	print -u2 'error: gitleaks returned 1 without findings'
+	exit 1
+fi
 typeset -A leak_expected leak_seen
 while IFS=$'\t' read -r fingerprint classification owner expiry; do
 	[[ "$fingerprint" == \#* || -z "$fingerprint" ]] && continue
@@ -189,7 +210,10 @@ while IFS=$'\t' read -r fingerprint classification owner expiry; do
 done < "$leaks_baseline"
 
 leaks_findings=$(mktemp)
-jq -r '.[].Fingerprint' "$leaks_report" | LC_ALL=C sort > "$leaks_findings"
+if ! jq -r '.[].Fingerprint' "$leaks_report" | LC_ALL=C sort > "$leaks_findings"; then
+	print -u2 'error: could not parse gitleaks finding fingerprints'
+	exit 1
+fi
 while IFS= read -r fingerprint; do
 	[[ -n ${leak_expected[$fingerprint]-} ]] || { print -u2 "error: unreviewed gitleaks finding $fingerprint"; exit 1; }
 	leak_seen[$fingerprint]=1
