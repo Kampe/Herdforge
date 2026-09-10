@@ -151,6 +151,8 @@ func TestCommandUsesSafeGitArguments(t *testing.T) {
 		"-c", "user.signingKey=",
 		"-c", "user.name=Herdforge Test",
 		"-c", "user.email=herdforge-test@example.invalid",
+		"-c", "maintenance.auto=false",
+		"-c", "gc.auto=0",
 		"-c", "url.file:///dev/null.insteadOf=https://github.com/",
 		"-c", "url.file:///dev/null.insteadOf=ssh://git@github.com/",
 		"-c", "url.file:///dev/null.insteadOf=git@github.com:",
