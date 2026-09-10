@@ -94,6 +94,26 @@ func TestNoPoolScopeReadsTheAggregate(t *testing.T) {
 	}
 }
 
+func TestLiteLLMFiniteBudgetRoutesOpenCodeDefaultPool(t *testing.T) {
+	snap := &usage.UsageSnapshot{Providers: map[string]usage.ProviderUsage{
+		"opencode": {
+			Account: usageTestIdentity("lazer-gemini"),
+			Resources: map[string]usage.ResourceUsage{
+				"budget": {Kind: "consumption", State: "active", Pool: "default", Unit: "usd", Limit: 100, Remaining: 100},
+			},
+		},
+	}}
+	r := &SurfaceRouter{Computed: usage.NewQuotaEngine().ComputeAll(snap)}
+	state, ok := r.quotaState("opencode", "default")
+	if !ok || !state.Available || state.Reason != "ok" {
+		t.Fatalf("native finite LiteLLM budget did not reach opencode/default: ok=%v state=%+v", ok, state)
+	}
+}
+
+func usageTestIdentity(key string) *usage.AccountIdentity {
+	return &usage.AccountIdentity{Key: key, Provenance: "litellm:key-info:key_name"}
+}
+
 // The end-to-end consequence: with claude, grok and agy exhausted and codex's
 // default pool healthy, a review-shaped pick must land on codex rather than
 // refusing with "no healthy launch candidate".

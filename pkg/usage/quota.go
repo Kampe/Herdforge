@@ -159,10 +159,17 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		if resourceNames != nil && !resourceNames[rk] {
 			continue
 		}
+		originalUnit := r.Unit
 		ws := r.WindowSeconds
 		wn, ok := realWindows[ws]
 		if !ok {
-			continue
+			if originalUnit == "usd" && r.State == "active" && r.Limit > 0 {
+				// LiteLLM's key budget is a finite ledger rather than a
+				// reset-based window. Preserve it as a pool-level budget.
+				wn = "budget"
+			} else {
+				continue
+			}
 		}
 		// FAC-596: zero usage IS data, and the most useful kind. Skipping it
 		// conflated "this resource reports nothing" with "this resource reports
@@ -183,12 +190,16 @@ func computeBinding(prov ProviderUsage, resourceNames map[string]bool, exhausted
 		// 0%-used resource with no reset timestamp stays skipped: that is
 		// indistinguishable from absent data, which is the case the original
 		// guard was protecting against.
-		originalUnit := r.Unit
 		if !normalizeResourcePercent(&r) {
 			continue
 		}
 		rin := resetsIn(r.ResetsAt, now)
-		if r.Used == 0 && rin == nil {
+		// LiteLLM key budgets are finite authenticated ledgers, not rolling
+		// windows, so a valid active USD budget may truthfully be untouched and
+		// omit a reset. Keep that capacity observable while continuing to reject
+		// reset-less zero readings from providers that have not proven a window.
+		finiteLiteLLMBudget := originalUnit == "usd" && r.State == "active" && r.Limit > 0
+		if r.Used == 0 && rin == nil && !finiteLiteLLMBudget {
 			continue
 		}
 		cls, pace, pressure := classPace(r.Used, ws, r.ResetsAt, exhaustedPct, now)

@@ -481,6 +481,25 @@ func TestComputeAllPublicFixtureCoversEveryNativeProvider(t *testing.T) {
 	}
 }
 
+func TestComputeAllKeepsFiniteLiteLLMBudgetWithoutReset(t *testing.T) {
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{
+		"opencode": {
+			Account: identity("litellm", "lazer-gemini", "litellm:key-info:key_name"),
+			Resources: map[string]ResourceUsage{
+				"budget": {Kind: "consumption", State: "active", Pool: "default", Unit: "usd", Limit: 100, Used: 0, Remaining: 100},
+			},
+		},
+	}}
+	computed := newTestEngine().ComputeAll(snap)
+	state, ok := computed["opencode"]
+	if !ok || !state.Available {
+		t.Fatalf("finite authenticated budget without reset must remain routable: ok=%v state=%+v", ok, state)
+	}
+	if state.Reason != "ok" || state.Remaining != 100 || len(state.Windows) != 1 || state.Windows[0].Account == nil {
+		t.Fatalf("finite LiteLLM budget lost binding or capacity: %+v", state)
+	}
+}
+
 func TestComputeBinding_NoWindows(t *testing.T) {
 	prov := ProviderUsage{
 		Resources: map[string]ResourceUsage{
