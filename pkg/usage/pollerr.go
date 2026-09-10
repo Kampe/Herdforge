@@ -39,6 +39,14 @@ func httpStatusPollError(surface string, status int) error {
 	}
 }
 
+// RateLimitedPollError builds the same classified error a native poller
+// returns on HTTP 429. Exported so a fixture poller registered from another
+// package (e.g. a cmd/herd test exercising routeComputedQuota) can simulate a
+// 429 without a real HTTP round trip; production pollers never call this.
+func RateLimitedPollError(detail string) error {
+	return pollErrf("rate-limited", "%s", detail)
+}
+
 func httpRateLimitPollError(surface string, resp *http.Response) error {
 	retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After"))
 	if retryAfter == "" {
