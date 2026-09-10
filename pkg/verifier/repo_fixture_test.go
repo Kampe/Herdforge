@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 type cachedRepoFixture struct {
@@ -38,7 +40,16 @@ func TestMain(m *testing.M) {
 		fixtures: make(map[string]cachedRepoFixture),
 	}
 
+	// FAC-613: mutation-check tests run the real OSBackend disk gate, so they
+	// inherited whatever capacity the host reported — make ci at a8cd39e1
+	// failed them on a real WSL host (probe fails closed, drive below the
+	// 15 GiB reserve), and any macOS host under the 2% reserve fails
+	// identically (FAC-215). Pin a hermetic reading; disk_gate_test.go covers
+	// gate behavior with injected fakes.
+	restoreStatFS := resources.SetOSBackendStatFSForTest(resources.HermeticStatFSForTest)
+
 	code := m.Run()
+	restoreStatFS()
 	if err := os.RemoveAll(root); err != nil {
 		fmt.Fprintf(os.Stderr, "remove verifier fixture root: %v\n", err)
 		code = 1

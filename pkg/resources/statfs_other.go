@@ -8,6 +8,13 @@ import "fmt"
 // deterministic fail-closed decision through Evaluate.
 type OSBackend struct{}
 
-func (OSBackend) StatFS(string) (Capacity, error) {
+func (OSBackend) StatFS(path string) (Capacity, error) {
+	if osBackendStatFSOverride != nil {
+		return osBackendStatFSOverride(path)
+	}
+	return Capacity{}, fmt.Errorf("statfs unsupported")
+}
+
+func statFSUnix(string) (Capacity, error) {
 	return Capacity{}, fmt.Errorf("statfs unsupported")
 }
