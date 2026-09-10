@@ -18,6 +18,7 @@ func runReviewTaskBind(ledger *reviewledger.Ledger) {
 	fs := flag.NewFlagSet("review-ledger task-bind", flag.ExitOnError)
 	artifactPath := fs.String("artifact", "", "correction artifact containing the exact sha, reviewer, task, and reassesses digest")
 	previousTask := fs.String("previous-task", "", "task ref recorded by the prior verdict")
+	dryRun := fs.Bool("dry-run", false, "validate without appending the correction")
 	fs.Parse(os.Args[3:])
 	if *artifactPath == "" || *previousTask == "" {
 		fmt.Fprintln(os.Stderr, "Usage: herd review-ledger task-bind --artifact FILE --previous-task FAC-N")
@@ -38,7 +39,7 @@ func runReviewTaskBind(ledger *reviewledger.Ledger) {
 		os.Exit(1)
 	}
 	digest := sha256.Sum256(body)
-	if err := ledger.BindTask(reviewledger.TaskBindingOpts{
+	opts := reviewledger.TaskBindingOpts{
 		SHA:              a.SHA,
 		Reviewer:         a.Reviewer,
 		PreviousTask:     *previousTask,
@@ -46,9 +47,28 @@ func runReviewTaskBind(ledger *reviewledger.Ledger) {
 		PriorEventDigest: a.Reassesses,
 		Artifact:         *artifactPath,
 		ArtifactDigest:   hex.EncodeToString(digest[:]),
-	}); err != nil {
+	}
+	if *dryRun {
+		existing, err := ledger.CheckTaskBinding(opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "review-ledger task-bind: %v\n", err)
+			os.Exit(1)
+		}
+		if existing {
+			fmt.Printf("task-binding would_skip reason=already-bound sha=%s reviewer=%s effective_task=%s\n", a.SHA, a.Reviewer, a.TaskRef)
+			return
+		}
+		fmt.Printf("task-binding would_append sha=%s reviewer=%s task=%s\n", a.SHA, a.Reviewer, a.TaskRef)
+		return
+	}
+	if err := ledger.BindTask(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "review-ledger task-bind: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("task-binding appended sha=%s reviewer=%s task=%s\n", a.SHA, a.Reviewer, a.TaskRef)
+	row, found, err := ledger.VerdictForReviewer(a.SHA, a.Reviewer)
+	if err != nil || !found || row.Task != a.TaskRef {
+		fmt.Fprintf(os.Stderr, "review-ledger task-bind: effective-task readback failed: found=%v err=%v task=%q\n", found, err, row.Task)
+		os.Exit(1)
+	}
+	fmt.Printf("task-binding verified sha=%s reviewer=%s effective_task=%s\n", a.SHA, a.Reviewer, row.Task)
 }

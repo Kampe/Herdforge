@@ -3,7 +3,6 @@ package reviewledger
 import (
 	"encoding/hex"
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -24,6 +23,67 @@ type TaskBindingOpts struct {
 // record or verdict. It is intentionally narrower than reassessment: no new
 // verification is asserted, and the exact prior verdict event must be named.
 func (l *Ledger) BindTask(opts TaskBindingOpts) error {
+	if err := validateTaskBindingOpts(opts); err != nil {
+		return err
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	release, err := lockVerdictMutation(l.Path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return err
+	}
+	existing, err := taskBindingDecision(rows, opts)
+	if err != nil {
+		return err
+	}
+	if existing {
+		return nil
+	}
+	row := &LedgerRow{
+		Event:          string(EventTaskBinding),
+		SHA:            opts.SHA,
+		Reviewer:       opts.Reviewer,
+		Task:           CloseableCardRef(opts.Task),
+		PreviousTask:   CloseableCardRef(opts.PreviousTask),
+		Reassesses:     strings.TrimSpace(opts.PriorEventDigest),
+		Artifact:       opts.Artifact,
+		ArtifactDigest: opts.ArtifactDigest,
+		CandidateSHA:   opts.SHA,
+		Reason:         "authenticated append-only correction of verdict task binding",
+	}
+	if err := l.appendRow(l.Path, row); err != nil {
+		return err
+	}
+	check, err := readRows(l.Path)
+	if err != nil {
+		return fmt.Errorf("task binding readback: %w", err)
+	}
+	if len(check) == 0 || check[len(check)-1].Event != string(EventTaskBinding) || check[len(check)-1].Reassesses != row.Reassesses {
+		return fmt.Errorf("task binding readback did not observe the appended event")
+	}
+	return nil
+}
+
+// CheckTaskBinding validates the same authenticated append-only correction as
+// BindTask, but performs no mutation. It is the native dry-run/readiness path.
+func (l *Ledger) CheckTaskBinding(opts TaskBindingOpts) (bool, error) {
+	if err := validateTaskBindingOpts(opts); err != nil {
+		return false, err
+	}
+	rows, err := readRows(l.Path)
+	if err != nil {
+		return false, err
+	}
+	return taskBindingDecision(rows, opts)
+}
+
+func validateTaskBindingOpts(opts TaskBindingOpts) error {
 	if strings.TrimSpace(opts.SHA) == "" || strings.TrimSpace(opts.Reviewer) == "" ||
 		strings.TrimSpace(opts.PriorEventDigest) == "" {
 		return fmt.Errorf("task binding requires sha, reviewer, and prior event digest")
@@ -52,18 +112,10 @@ func (l *Ledger) BindTask(opts TaskBindingOpts) error {
 	if _, err := hex.DecodeString(strings.TrimSpace(opts.ArtifactDigest)); err != nil {
 		return fmt.Errorf("task binding artifact digest is not hexadecimal")
 	}
+	return nil
+}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	release, err := lockVerdictMutation(l.Path)
-	if err != nil {
-		return err
-	}
-	defer release()
-	rows, err := readRows(l.Path)
-	if err != nil {
-		return err
-	}
+func taskBindingDecision(rows []LedgerRow, opts TaskBindingOpts) (bool, error) {
 	var prior *LedgerRow
 	for i := range rows {
 		r := &rows[i]
@@ -73,42 +125,24 @@ func (l *Ledger) BindTask(opts TaskBindingOpts) error {
 		}
 	}
 	if prior == nil {
-		return fmt.Errorf("task binding prior verdict not found")
+		return false, fmt.Errorf("task binding prior verdict not found")
 	}
 	if VerdictEventDigest(*prior) != strings.TrimSpace(opts.PriorEventDigest) {
-		return fmt.Errorf("task binding prior event digest is stale or unbound")
+		return false, fmt.Errorf("task binding prior event digest is stale or unbound")
 	}
 	if CloseableCardRef(prior.Task) != CloseableCardRef(opts.PreviousTask) {
-		return fmt.Errorf("task binding previous task does not match the prior verdict")
+		return false, fmt.Errorf("task binding previous task does not match the prior verdict")
 	}
 	for _, row := range rows {
 		if row.Event != string(EventTaskBinding) || row.SHA != opts.SHA || row.Reviewer != opts.Reviewer {
 			continue
 		}
 		if row.Reassesses == opts.PriorEventDigest && row.PreviousTask == opts.PreviousTask && row.Task == opts.Task && row.ArtifactDigest == opts.ArtifactDigest {
-			return nil
+			return true, nil
 		}
-		return fmt.Errorf("conflicting task binding already exists for sha %s reviewer %q", opts.SHA, opts.Reviewer)
+		return false, fmt.Errorf("conflicting task binding already exists for sha %s reviewer %q", opts.SHA, opts.Reviewer)
 	}
-	row := &LedgerRow{
-		Event:          string(EventTaskBinding),
-		SHA:            opts.SHA,
-		Reviewer:       opts.Reviewer,
-		Task:           CloseableCardRef(opts.Task),
-		PreviousTask:   CloseableCardRef(opts.PreviousTask),
-		Reassesses:     strings.TrimSpace(opts.PriorEventDigest),
-		Artifact:       opts.Artifact,
-		ArtifactDigest: opts.ArtifactDigest,
-		CandidateSHA:   opts.SHA,
-		Reason:         "authenticated append-only correction of verdict task binding",
-	}
-	if err := l.appendRow(l.Path, row); err != nil {
-		return err
-	}
-	if _, err := os.Stat(l.Path); err != nil {
-		return fmt.Errorf("task binding readback: %w", err)
-	}
-	return nil
+	return false, nil
 }
 
 // EffectiveTask applies only valid, chained task-binding events to a verdict.
