@@ -669,11 +669,19 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 		}
 		return usage, nil
 	}
+	owners, ownerErr := snapshotProcessOwners(processCtx)
+	if ownerErr != nil {
+		for path, entry := range usage {
+			entry.MetadataUnavailable = true
+			usage[path] = entry
+		}
+		return usage, ownerErr
+	}
 	for _, pid := range allPIDs {
 		if processCtx.Err() != nil {
 			return nil, processCtx.Err()
 		}
-		references, referenceErr := processReferencesMany(processCtx, pid, resolvedPaths)
+		references, referenceErr := processReferencesManyWithOwners(processCtx, pid, resolvedPaths, owners)
 		if referenceErr != nil {
 			for path := range usage {
 				usage[path] = markMetadataUnavailable(usage[path], pid)
@@ -834,6 +842,42 @@ func listProcessIDs(ctx context.Context) ([]int, error) {
 	return pids, nil
 }
 
+func snapshotProcessOwners(ctx context.Context) (map[int]int, error) {
+	ps, err := exec.LookPath("ps")
+	if err != nil {
+		return nil, fmt.Errorf("process owner snapshot unavailable: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	// Darwin and Linux both support this exact BSD ps field contract. The
+	// complete pid/uid table avoids one ps process per PID and does not use a
+	// truncated command column as ownership evidence.
+	out, err := exec.CommandContext(probeCtx, ps, "-axo", "pid=,uid=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("read process owner snapshot: %w", err)
+	}
+	owners := make(map[int]int)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 {
+			return nil, errors.New("process owner snapshot has malformed row")
+		}
+		pid, pidErr := strconv.Atoi(fields[0])
+		uid, uidErr := strconv.Atoi(fields[1])
+		if pidErr != nil || uidErr != nil || pid <= 0 || uid < 0 {
+			return nil, errors.New("process owner snapshot has invalid pid or uid")
+		}
+		owners[pid] = uid
+	}
+	if len(owners) == 0 {
+		return nil, errors.New("process owner snapshot is empty")
+	}
+	return owners, nil
+}
+
 // processReferences closes the gap between filesystem handles and a process
 // that intends to recreate/use a cache through GOCACHE, argv, or a mapped
 // executable/database. Metadata for a foreign process is not deletion
@@ -846,6 +890,10 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 }
 
 func processReferencesMany(ctx context.Context, pid int, paths []string) (map[string]bool, error) {
+	return processReferencesManyWithOwners(ctx, pid, paths, nil)
+}
+
+func processReferencesManyWithOwners(ctx context.Context, pid int, paths []string, owners map[int]int) (map[string]bool, error) {
 	references := make(map[string]bool, len(paths))
 	for _, path := range paths {
 		references[path] = false
@@ -863,6 +911,29 @@ func processReferencesMany(ctx context.Context, pid int, paths []string) (map[st
 		return references, nil
 	} else if os.IsNotExist(procErr) && runtime.GOOS != "darwin" {
 		return references, nil
+	} else if owner, ok := owners[pid]; ok {
+		if owner != os.Getuid() {
+			return references, nil
+		}
+		if runtime.GOOS == "darwin" {
+			args, argsErr := readDarwinProcessArgs(pid)
+			if argsErr != nil {
+				if errors.Is(argsErr, os.ErrProcessDone) {
+					return references, nil
+				}
+				return references, fmt.Errorf("read process argv/environment for pid %d: %w", pid, argsErr)
+			}
+			for path := range references {
+				references[path] = bytes.Contains(args, []byte(path))
+			}
+			return references, nil
+		}
+		return references, fmt.Errorf("read same-owner process metadata for pid %d: %w", pid, procErr)
+	} else if owners != nil {
+		if killErr := syscall.Kill(pid, 0); errors.Is(killErr, syscall.ESRCH) {
+			return references, nil
+		}
+		return references, fmt.Errorf("process owner missing from snapshot for pid %d", pid)
 	} else if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr != nil {
 		return references, ownerErr
 	} else if gone || foreign {

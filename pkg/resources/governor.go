@@ -573,6 +573,9 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			batchPaths := orphanBatchPaths(entries, root, known, limit, g.Policy.OrphanDerivedTargets)
 			if len(batchPaths) > 0 {
 				rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
+				if rootProcessUsage == nil {
+					rootProcessUsage = make(map[string]ProcessUsage)
+				}
 				if err := ctx.Err(); err != nil {
 					return result, err
 				}

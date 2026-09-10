@@ -385,6 +385,17 @@ func (cancelingBatchProcessInspector) InUse(context.Context, string) (ProcessUsa
 	return ProcessUsage{}, errors.New("unexpected per-target process census")
 }
 
+type failedBatchProcessInspector struct{ perTargetCalls int }
+
+func (s *failedBatchProcessInspector) InUse(context.Context, string) (ProcessUsage, error) {
+	s.perTargetCalls++
+	return ProcessUsage{}, errors.New("per-target fallback must not run")
+}
+
+func (*failedBatchProcessInspector) InUseMany(context.Context, []string) (map[string]ProcessUsage, error) {
+	return nil, errors.New("batch process census failed")
+}
+
 func (s cancelingBatchProcessInspector) InUseMany(context.Context, []string) (map[string]ProcessUsage, error) {
 	s.cancel()
 	return map[string]ProcessUsage{}, nil
@@ -429,6 +440,41 @@ func TestGovernorUsesBoundedBatchProcessCensusForOrphans(t *testing.T) {
 	}
 	if got := report.Orphans[0].DerivedTargets[0].Decision; got != string(TargetWouldReap) {
 		t.Fatalf("batch process census decision=%q reason=%q", got, report.Orphans[0].DerivedTargets[0].Reason)
+	}
+}
+
+func TestGovernorFailedBatchCensusDoesNotFanOutFallback(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 900000)
+	inspector := &failedBatchProcessInspector{}
+	g.Processes = inspector
+	g.Policy.OrphanRoots = []string{filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	orphan := filepath.Join(g.Policy.OrphanRoots[0], "fac-failed-batch")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	graph := filepath.Join(orphan, "graph.db")
+	if err := os.WriteFile(graph, []byte("immutable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Unix(-10000, 0)
+	if err := os.Chtimes(graph, old, old); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspector.perTargetCalls != 0 {
+		t.Fatalf("failed batch fanned out to %d per-target calls", inspector.perTargetCalls)
+	}
+	for _, orphan := range report.Orphans {
+		for _, target := range orphan.DerivedTargets {
+			if strings.HasSuffix(target.Path, "fac-failed-batch/graph.db") && target.Reason != "derived_target_process_evidence_unavailable" {
+				t.Fatalf("failed batch reason=%q", target.Reason)
+			}
+		}
 	}
 }
 
