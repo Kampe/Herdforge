@@ -143,6 +143,47 @@ func TestLSOFProcessInspectorUnusedPrivateDirectory(t *testing.T) {
 	}
 }
 
+func TestProcessOwnerViaPSClassifiesOwnerEvidence(t *testing.T) {
+	foreignUID := 0
+	if os.Getuid() == 0 {
+		foreignUID = 1
+	}
+	tests := []struct {
+		name        string
+		output      string
+		exit        string
+		wantForeign bool
+		wantGone    bool
+		wantErr     bool
+	}{
+		{name: "foreign uid", output: strconv.Itoa(foreignUID) + "\n", wantForeign: true},
+		{name: "same uid", output: strconv.Itoa(os.Getuid()) + "\n"},
+		{name: "unknown uid", output: "not-a-uid\n", wantErr: true},
+		{name: "ps failure", exit: "1", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := filepath.Join(dir, "ps")
+			body := "#!/bin/sh\n"
+			if tc.output != "" {
+				body += "printf '%s' '" + tc.output + "'\n"
+			}
+			if tc.exit != "" {
+				body += "exit " + tc.exit + "\n"
+			}
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			foreign, gone, err := processOwnerViaPS(context.Background(), os.Getpid())
+			if foreign != tc.wantForeign || gone != tc.wantGone || (err != nil) != tc.wantErr {
+				t.Fatalf("processOwnerViaPS()=(foreign=%t,gone=%t,err=%v), want (%t,%t,%t)", foreign, gone, err, tc.wantForeign, tc.wantGone, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestLsofNoMatchDistinguishesNamespaceDiagnostics(t *testing.T) {
 	noMatch := func(t *testing.T, script string, stdout, stderr []byte, want bool) {
 		t.Helper()
