@@ -45,7 +45,8 @@ func SetOpenCodeExecutableForTest(path string) func() {
 
 type opencodePromptAck struct {
 	PaneID       string
-	Agent        string
+	Name         string
+	Kind         string
 	Session      AgentSession
 	SessionID    string
 	SessionKnown bool
@@ -57,7 +58,8 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 			Type  string `json:"type"`
 			Agent struct {
 				PaneID  string        `json:"pane_id"`
-				Agent   string        `json:"agent"`
+				Name    string        `json:"name"`
+				Kind    string        `json:"agent"`
 				Session *AgentSession `json:"agent_session"`
 			} `json:"agent"`
 		} `json:"result"`
@@ -70,14 +72,15 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 	}
 	ack := opencodePromptAck{
 		PaneID: envelope.Result.Agent.PaneID,
-		Agent:  envelope.Result.Agent.Agent,
+		Name:   envelope.Result.Agent.Name,
+		Kind:   envelope.Result.Agent.Kind,
 	}
 	if envelope.Result.Agent.Session != nil {
 		ack.Session = *envelope.Result.Agent.Session
 		ack.SessionID = strings.TrimSpace(ack.Session.Value)
 		ack.SessionKnown = true
 	}
-	if ack.PaneID == "" || ack.Agent == "" {
+	if ack.PaneID == "" || ack.Name == "" || ack.Kind == "" {
 		return opencodePromptAck{}, errors.New("native prompt acknowledgement omitted pane, agent, or session identity")
 	}
 	if ack.SessionKnown && (!RealModelSessionID(ack.SessionID) || ack.Session.Kind != "id") {
@@ -416,8 +419,8 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 	if err != nil {
 		return SendResult{}, err
 	}
-	if ack.Agent != before.Name || ack.PaneID != before.PaneID {
-		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact target")
+	if ack.Name != before.Name || ack.Kind != before.Kind || ack.PaneID != before.PaneID {
+		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact target or harness")
 	}
 	if !cold && (!ack.SessionKnown || ack.SessionID != sessionID) {
 		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact warm session")

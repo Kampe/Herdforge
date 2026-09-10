@@ -61,7 +61,7 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 			return "provider unavailable", errors.New("provider unavailable")
 		}
 		if f.mode == "cold-missing-ack" {
-			return `{"result":{"type":"agent_prompted","agent":{"agent":"reviewer"}}}`, nil
+			return `{"result":{"type":"agent_prompted","agent":{"name":"reviewer"}}}`, nil
 		}
 		ackSession := ""
 		if f.mode == "cold-wrong-ack-session" {
@@ -69,7 +69,7 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		} else if !strings.HasPrefix(f.mode, "cold") {
 			ackSession = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, nativeOpenCodeSession)
 		}
-		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"pane_id":"wK:p1","agent":%q%s,"state":"working"}}}`,
+		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s,"state":"working"}}}`,
 			nativeOpenCodeTarget, ackSession), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
