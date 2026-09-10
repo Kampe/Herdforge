@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -241,11 +243,15 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{11111111-2222-
 }
 
 func TestWSLFindDriveMountPathRejectsMountSpoof(t *testing.T) {
-	// Mounts table contains spoofed ext4/tmpfs entries ending in /c,
-	// and one authentic 9p DrvFS mount at /media/c.
+	// Mounts table contains:
+	// 1. spoofed ext4 entry at /mnt/c
+	// 2. ambiguous 9p DrvFS mount at /mnt/c backed by D: without path option
+	// 3. tmpfs mount at /var/log/c
+	// 4. authentic 9p DrvFS mount at /media/c with path=C:\
 	spoofedMounts := `
 rootfs / rootfs rw 0 0
 /dev/sdb /mnt/c ext4 rw,relatime 0 0
+D:\134 /mnt/c 9p rw,noatime,aname=drvfs;uid=1000;gid=1000 0 0
 tmpfs /var/log/c tmpfs rw,relatime 0 0
 C:\134 /media/c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000,access=client 0 0
 `
@@ -253,9 +259,30 @@ C:\134 /media/c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000,access=clie
 	if err != nil {
 		t.Fatalf("unexpected error finding mount for C:: %v", err)
 	}
-	// Must reject ext4 /mnt/c and choose genuine 9p /media/c
+	// Must reject ext4 /mnt/c AND ambiguous 9p D: at /mnt/c, choosing genuine 9p /media/c
 	if mountC != "/media/c" {
 		t.Fatalf("expected authentic 9p mount /media/c, got spoofed %q", mountC)
+	}
+}
+
+func TestWSLFindDriveMountPathRejectsAmbiguous9pDeviceDMountedAtMountCWithoutPathOption(t *testing.T) {
+	// Ambiguous 9p mount at /mnt/c where device is D: and no path= option is present.
+	ambiguousMounts := `
+D:\134 /mnt/c 9p rw,noatime,aname=drvfs;uid=1000;gid=1000 0 0
+`
+	// Searching for C: must fail closed because /mnt/c is backed by D:, not C:.
+	_, err := findDriveMountPath("C:", []byte(ambiguousMounts))
+	if err == nil {
+		t.Fatal("expected 9p mount at /mnt/c backed by device D: (without path option) to be rejected for drive C:")
+	}
+
+	// Searching for D: must resolve to /mnt/c.
+	mountD, err := findDriveMountPath("D:", []byte(ambiguousMounts))
+	if err != nil {
+		t.Fatalf("unexpected error resolving drive D:: %v", err)
+	}
+	if mountD != "/mnt/c" {
+		t.Fatalf("expected /mnt/c for drive D:, got %q", mountD)
 	}
 }
 
@@ -377,17 +404,28 @@ func TestWSLRegistryInvalidByteEncodingFailsClosed(t *testing.T) {
 	}
 }
 
+func createFakeStatBinary(t *testing.T, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	statPath := filepath.Join(dir, "stat")
+	script := fmt.Sprintf("#!/bin/sh\necho %q\n", output)
+	if err := os.WriteFile(statPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake stat binary: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestWSLProbeHostVolumeMultiplicationOverflowFailsClosed(t *testing.T) {
-	// stat binary produces enormous block size causing checked multiplication overflow
+	// stat binary produces enormous block size causing checked multiplication overflow in actual probe
+	createFakeStatBinary(t, "18446744073709551615 2 1 100 100")
+
 	oldOverride := wslDetectionOverride
 	oldMounts := wslProcMountsReader
 	oldReg := wslRegistryQueryExecutor
-	oldStatFS := wslDriveStatFS
 	defer func() {
 		wslDetectionOverride = oldOverride
 		wslProcMountsReader = oldMounts
 		wslRegistryQueryExecutor = oldReg
-		wslDriveStatFS = oldStatFS
 	}()
 
 	isWSL := true
@@ -401,23 +439,63 @@ func TestWSLProbeHostVolumeMultiplicationOverflowFailsClosed(t *testing.T) {
 	}
 	t.Setenv("WSL_DISTRO_NAME", "Debian")
 
-	// StatFS returns overflow error directly through probe seam
-	wslDriveStatFS = func(ctx context.Context, mountPath string) (Capacity, error) {
-		return Capacity{}, errors.New("host volume probe total bytes overflow (18446744073709551615 * 2)")
-	}
-
 	guestCap := Capacity{
 		FilesystemID: "guest:ext4",
 		TotalBytes:   1073741824000,
 		FreeBytes:    776875823104,
 	}
 
+	// Uses real default wslDriveStatFS calling probeHostVolumeCapacity
 	_, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
 	if err == nil {
 		t.Fatal("expected overflow probe error to fail closed")
 	}
 	if !strings.Contains(err.Error(), "overflow") {
 		t.Fatalf("expected overflow in error, got %q", err.Error())
+	}
+}
+
+func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
+	ctx := context.Background()
+
+	// Case 1: Total bytes multiplication overflow
+	createFakeStatBinary(t, "18446744073709551615 2 1 100 100")
+	_, err := probeHostVolumeCapacity(ctx, "/mnt/c")
+	if err == nil {
+		t.Fatal("expected probeHostVolumeCapacity to fail on total bytes multiplication overflow")
+	}
+	if !strings.Contains(err.Error(), "total bytes overflow") {
+		t.Fatalf("expected 'total bytes overflow' in error, got %q", err.Error())
+	}
+
+	// Case 2: Free bytes multiplication overflow
+	createFakeStatBinary(t, "10000000000000000000 3 2 100 100")
+	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
+	if err == nil {
+		t.Fatal("expected probeHostVolumeCapacity to fail on free bytes multiplication overflow")
+	}
+	if !strings.Contains(err.Error(), "total bytes overflow") && !strings.Contains(err.Error(), "free bytes overflow") {
+		t.Fatalf("expected overflow in error, got %q", err.Error())
+	}
+
+	// Case 3: Free blocks > total blocks
+	createFakeStatBinary(t, "4096 100 200 100 100")
+	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
+	if err == nil {
+		t.Fatal("expected probeHostVolumeCapacity to fail when freeBlocks > totalBlocks")
+	}
+	if !strings.Contains(err.Error(), "free blocks") {
+		t.Fatalf("expected 'free blocks' in error, got %q", err.Error())
+	}
+
+	// Case 4: Zero block size
+	createFakeStatBinary(t, "0 100 50 100 100")
+	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
+	if err == nil {
+		t.Fatal("expected probeHostVolumeCapacity to fail when blockSize == 0")
+	}
+	if !strings.Contains(err.Error(), "zero block size") {
+		t.Fatalf("expected 'zero block size' in error, got %q", err.Error())
 	}
 }
 
