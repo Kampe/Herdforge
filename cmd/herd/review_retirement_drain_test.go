@@ -562,3 +562,222 @@ esac
 		t.Fatalf("expected observable cleanup error, got %v", err)
 	}
 }
+
+func TestDrainAdaptersRetireReviews_OriginMainAdvancedPostReleaseProof(t *testing.T) {
+	root := t.TempDir()
+	ownedChild := exec.Command("tail", "-f", "/dev/null")
+	if err := ownedChild.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = ownedChild.Process.Kill()
+		_ = ownedChild.Wait()
+	})
+
+	if err := os.MkdirAll(filepath.Join(root, ".herd", "review", "prompts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".herd", "review", "manifests"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".herd", "reviews"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfgContent := "version: \"1\"\nproject:\n  name: fixture\ntask_provider:\n  type: memory\n"
+	if err := os.WriteFile(filepath.Join(root, ".herd", "herd.yaml"), []byte(cfgContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-q")
+	if err := os.WriteFile(filepath.Join(root, "source.txt"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "source.txt")
+	runGit("-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "initial base")
+	oldBaseSHA := runGit("rev-parse", "HEAD")
+
+	runGit("remote", "add", "origin", "https://example.invalid/fixture.git")
+	runGit("update-ref", "refs/remotes/origin/main", oldBaseSHA)
+
+	repository, err := dispatch.AuthenticatedRepositoryIdentity(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create real pool
+	poolRoot := filepath.Join(root, ".herd", "pool-fac792-drain")
+	slotPath := filepath.Join(poolRoot, "pool-01")
+	if err := os.MkdirAll(poolRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "--detach", slotPath, "HEAD").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	leaseID := "pool-01-1789037282935664000"
+	poolState := []byte(`{"version":1,"slots":[{"name":"pool-01","path":".herd/pool-fac792-drain/pool-01","lease_id":"` + leaseID + `","leased_at":"2026-09-10T10:48:02.935664000Z","base":"origin/main"}]}` + "\n")
+	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), poolState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Candidate commit & review branch
+	if err := os.WriteFile(filepath.Join(root, "cand.txt"), []byte("cand\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "cand.txt")
+	runGit("-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "cand commit")
+	candSHA := runGit("rev-parse", "HEAD")
+
+	ref := "refs/herd/reviews/fac-792-41c2c7cb-pool-01"
+	runGit("update-ref", ref, candSHA)
+
+	// Set worktree to candSHA
+	if out, err := exec.Command("git", "-C", slotPath, "reset", "--hard", candSHA).CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+
+	// Now advance origin/main to newMainSHA
+	if err := os.WriteFile(filepath.Join(root, "newmain.txt"), []byte("new main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "newmain.txt")
+	runGit("-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "new main commit")
+	newMainSHA := runGit("rev-parse", "HEAD")
+	runGit("update-ref", "refs/remotes/origin/main", newMainSHA)
+
+	promptRel := ".herd/review/prompts/fac-792.md"
+	promptBody := []byte("review prompt for fac-792\n")
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(promptRel)), promptBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(slotPath, filepath.Join(root, ".herd", "reviews", "fac-792")); err != nil {
+		t.Fatal(err)
+	}
+
+	reviewer := "review-fac-792-41c2c7cb"
+	manifestRel := ".herd/review/manifests/pool-01-1789037282935664000.json"
+	mA := herdr.NewReviewRetirementManifest(time.Now(), herdr.ReviewRetirementManifest{
+		Repository: repository, TaskRef: "FAC-792", TaskID: "task-792",
+		CandidateSHA: candSHA, BaseSHA: oldBaseSHA, Branch: ref, ReviewRef: ref,
+		Worktree: ".herd/pool-fac792-drain/pool-01", Pool: ".herd/pool-fac792-drain", Slot: "pool-01",
+		LeaseGeneration: 1789037282935664000, Workspace: "wK", TabID: "wK:t792", PaneID: "wK:p792",
+		TerminalID: "term-792", SessionID: "session-792",
+		Reviewer: reviewer, ReviewerFamily: "open-weight", ReviewerModel: "litellm/lazer/claude-haiku-4.5",
+		PromptArtifact: promptRel, PromptDigest: reviewack.ArtifactDigest(promptBody),
+		Surface: ".herd/reviews/fac-792",
+		ManifestArtifact: manifestRel, Generation: "pool-01-1789037282935664000", Nonce: leaseID,
+	})
+	mBodyA, _ := json.Marshal(mA)
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(manifestRel)), append(mBodyA, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ledger & Ack
+	ledgerPath := filepath.Join(root, ".herd", "review", "ledger.jsonl")
+	artifactDigest := "digest-fac-792-drain-test"
+	rows := []string{
+		`{"event":"record","sha":"` + candSHA + `","reviewer":"` + reviewer + `","lease":"` + leaseID + `","branch":"FAC-792"}`,
+		`{"event":"verdict","sha":"` + candSHA + `","candidate_sha":"` + candSHA + `","reviewer":"` + reviewer + `","verdict":"PASS","artifact_digest":"` + artifactDigest + `"}`,
+	}
+	if err := os.WriteFile(ledgerPath, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewack.Emit(root, reviewack.Ack{SHA: candSHA, Reviewer: reviewer, LaunchIdentity: reviewer, ArtifactDigest: artifactDigest}); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := herdr.ReviewRetirementRegistry{Path: filepath.Join(root, ".herd", "review", "retirement-manifests.jsonl")}
+	if err := registry.Record(mA); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeDir := t.TempDir()
+	fake := filepath.Join(fakeDir, "herdr")
+	herdrState := filepath.Join(fakeDir, "herdr-state")
+	closeCount := filepath.Join(fakeDir, "close-count")
+	if err := os.WriteFile(herdrState, []byte("0\n0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(closeCount, []byte("0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pidStr := fmt.Sprint(ownedChild.Process.Pid)
+	script := `#!/bin/sh
+state="${FAC708_FAKE_STATE:?missing state file}"
+closed="$(sed -n '1p' "$state")"
+case "$1 $2" in
+  "agent list")
+    if [ "$closed" = "1" ]; then
+      printf '%s\n' '{"result":{"agents":[]}}'
+    else
+      printf '%s\n' '{"result":{"agents":[{"name":"review-fac-792-41c2c7cb","agent_status":"idle","pane_id":"wK:p792","tab_id":"wK:t792","workspace_id":"wK","terminal_id":"term-792","focused":false,"agent_session":{"value":"session-792"}}]}}'
+    fi ;;
+  "workspace list") printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"wK","label":"fixture"}]}}' ;;
+  "tab list")
+    if [ "$closed" = "1" ]; then
+      printf '%s\n' '{"result":{"tabs":[]}}'
+    else
+      printf '%s\n' '{"result":{"tabs":[{"tab_id":"wK:t792","workspace_id":"wK","number":19,"pane_count":1,"focused":false}]}}'
+    fi ;;
+  "pane process-info")
+    if [ "$closed" = "1" ]; then
+      printf '%s\n' '{"error":{"code":"pane_not_found","message":"pane not found"}}'; exit 1
+    fi
+    printf '{"result":{"process_info":{"pane_id":"wK:p792","shell_pid":%s,"foreground_processes":[]}}}\n' "${FAC708_FAKE_PID}" ;;
+  "tab close")
+    closes="$(sed -n '1p' "${FAC708_FAKE_CLOSE_COUNT}")"
+    closes=$((closes + 1))
+    printf '%s\n' "$closes" > "${FAC708_FAKE_CLOSE_COUNT}"
+    printf '1\nclose\n' > "$state"
+    printf '%s\n' '{"result":{}}' ;;
+  *) printf '%s\n' '{"result":{}}' ;;
+esac
+`
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(herdr.BinaryEnv, fake)
+	t.Setenv(herdr.NoLiveEnv, "1")
+	t.Setenv("HERD_ROOT", root)
+	t.Setenv("HERD_REVIEW_LEDGER", ledgerPath)
+	t.Setenv("HERD_WORKSPACE", "wK")
+	t.Setenv("FAC708_FAKE_STATE", herdrState)
+	t.Setenv("FAC708_FAKE_CLOSE_COUNT", closeCount)
+	t.Setenv("FAC708_FAKE_PID", pidStr)
+
+	ledger, err := reviewledger.NewReviewLedger(root, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapters := &drainAdapters{
+		root:       root,
+		repository: repository,
+		ledger:     ledger,
+	}
+
+	// First drain tick
+	if err := adapters.retireReviews(context.Background()); err != nil {
+		t.Fatalf("first drain tick retireReviews failed: %v", err)
+	}
+
+	// Assert worktree retired
+	if _, err := os.Stat(slotPath); !os.IsNotExist(err) {
+		t.Fatalf("expected slotPath removed upon retirement, but exists")
+	}
+
+	// Second drain tick (idempotent replay)
+	if err := adapters.retireReviews(context.Background()); err != nil {
+		t.Fatalf("second drain tick retireReviews failed: %v", err)
+	}
+}

@@ -26,6 +26,7 @@ type PoolSlot struct {
 	LastReleaseLeaseID    string    `json:"last_release_lease_id,omitempty"`
 	LastReleaseGeneration int64     `json:"last_release_generation,omitempty"`
 	LastReleasePath       string    `json:"last_release_path,omitempty"`
+	LastReleaseTargetHead string    `json:"last_release_target_head,omitempty"`
 }
 
 type poolState struct {
@@ -268,7 +269,12 @@ func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string
 		if !clean {
 			continue
 		}
+		headOut, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "rev-parse", "HEAD").Output()
+		if err != nil {
+			return freed, fmt.Errorf("worktree pool: reclaim rev-parse %s: %w", slot.Name, err)
+		}
 		slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
+		slot.LastReleaseTargetHead = strings.TrimSpace(string(headOut))
 		slot.Purpose, slot.LeaseID = "", ""
 		slot.LeasedAt = time.Time{}
 		freed = append(freed, slot.Name)
@@ -333,7 +339,12 @@ func (p *Pool) Release(ctx context.Context, leaseID string) error {
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
+			headOut, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "rev-parse", "HEAD").Output()
+			if err != nil {
+				return fmt.Errorf("worktree pool: rev-parse %s: %w", slot.Name, err)
+			}
 			slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
+			slot.LastReleaseTargetHead = strings.TrimSpace(string(headOut))
 			slot.Purpose, slot.LeaseID = "", ""
 			slot.LeasedAt = time.Time{}
 			return p.writeState(state)
@@ -391,7 +402,12 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
+			headOut, err := exec.CommandContext(ctx, "git", "-C", slotPath, "rev-parse", "HEAD").Output()
+			if err != nil {
+				return fmt.Errorf("worktree pool: rev-parse %s: %w", slot.Name, err)
+			}
 			slot.LastReleaseLeaseID, slot.LastReleaseGeneration, slot.LastReleasePath = slot.LeaseID, slot.LeasedAt.UnixNano(), slot.Path
+			slot.LastReleaseTargetHead = strings.TrimSpace(string(headOut))
 			slot.Purpose, slot.LeaseID, slot.LeasedAt = "", "", time.Time{}
 			return p.writeState(state)
 		}
