@@ -738,6 +738,13 @@ func foreignOrGoneProcess(ctx context.Context, pid int) (foreign, gone bool, err
 			return false, true, nil
 		}
 		if readErr != nil {
+			// Linux may deny /proc metadata for root or otherwise foreign
+			// processes even when the public ps owner field is readable. That
+			// owner result is sufficient to classify a foreign process, but it
+			// never authorizes ignoring an inaccessible same-owner process.
+			if foreign, gone, ownerErr := processOwnerViaPS(ctx, pid); ownerErr == nil {
+				return foreign, gone, nil
+			}
 			return false, false, fmt.Errorf("read process owner for pid %d: %w", pid, readErr)
 		}
 		for _, line := range strings.Split(string(data), "\n") {
@@ -756,6 +763,10 @@ func foreignOrGoneProcess(ctx context.Context, pid int) (foreign, gone bool, err
 		}
 		return false, false, fmt.Errorf("process owner unavailable for pid %d", pid)
 	}
+	return processOwnerViaPS(ctx, pid)
+}
+
+func processOwnerViaPS(ctx context.Context, pid int) (foreign, gone bool, err error) {
 	ps, lookErr := exec.LookPath("ps")
 	if lookErr != nil {
 		return false, false, fmt.Errorf("process owner unavailable for pid %d: %w", pid, lookErr)
