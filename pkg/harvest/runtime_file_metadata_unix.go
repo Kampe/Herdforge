@@ -23,6 +23,12 @@ func runtimeFileMetaFromInfo(info os.FileInfo) (runtimeFileMeta, bool) {
 	return runtimeFileMeta{Owner: uint64(st.Uid), Links: uint64(st.Nlink), Blocks: int64(st.Blocks), ID: fmt.Sprintf("%d:%d", st.Dev, st.Ino)}, true
 }
 
-func runtimeCurrentUID() (uint64, bool) { return uint64(os.Getuid()), true }
+func runtimeCurrentUID() (uint64, bool) {
+	uid := os.Getuid()
+	if uid < 0 {
+		return 0, false
+	}
+	return uint64(uid), true
+}
 
 func runtimeInstallSupported() bool { return true }
