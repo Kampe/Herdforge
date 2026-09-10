@@ -305,16 +305,53 @@ func TestLiteLLMMapsNestedIdentityAndBudget(t *testing.T) {
 	}
 }
 
-func TestLiteLLMBaseURLReadsOpenCodeConfig(t *testing.T) {
+func TestLiteLLMConfiguredEndpointBindsAuthToProvider(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, "data"))
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
 	t.Setenv("LITELLM_BASE_URL", "")
-	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700); err != nil {
+	t.Setenv("LITELLM_OC_KEY", "")
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeJSONFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"http://lazer.test/v1"}}}}`)
-	if got := litellmBaseURL(); got != "http://lazer.test/v1" {
-		t.Fatalf("LiteLLM base URL = %q, want configured provider URL", got)
+	if err := os.MkdirAll(filepath.Join(home, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "data", "auth.json"), `{"lazer":{"key":"lazer-key"}}`)
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"http://lazer.test/v1"}}}}`)
+	key, base, err := litellmConfiguredEndpoint()
+	if err != nil || key != "lazer-key" || base != "http://lazer.test/v1" {
+		t.Fatalf("LiteLLM endpoint binding = key %q base %q err %v", key, base, err)
+	}
+}
+
+func TestLiteLLMRejectsMismatchedConfiguredAuthWithoutHTTP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, "data"))
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("LITELLM_OC_KEY", "")
+	t.Setenv("LITELLM_BASE_URL", "")
+	if err := os.MkdirAll(filepath.Join(home, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "data", "auth.json"), `{"litellm":{"key":"wrong-endpoint-key"}}`)
+	serverCalls := 0
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverCalls++
+		http.Error(w, "must not receive mismatched credential", http.StatusInternalServerError)
+	}))
+	t.Cleanup(s.Close)
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"`+s.URL+`/v1"}}}}`)
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "auth-mismatch" {
+		t.Fatalf("mismatched provider binding error = %v, want auth-mismatch", err)
+	}
+	if serverCalls != 0 {
+		t.Fatalf("mismatched provider made %d HTTP requests", serverCalls)
 	}
 }
 

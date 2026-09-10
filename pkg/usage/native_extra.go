@@ -463,13 +463,22 @@ func litellmExplicitlyUnmetered(raw map[string]json.RawMessage, spend *float64) 
 }
 
 func litellmPoll() (ProviderUsage, error) {
-	key := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
-	if key == "" {
-		key = litellmConfiguredKey()
-	}
-	base := litellmBaseURL()
-	if key == "" || base == "" {
-		return ProviderUsage{}, pollErrf("auth-missing", "litellm self-key or configured base URL is unavailable")
+	envKey := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
+	envBase := strings.TrimSpace(os.Getenv("LITELLM_BASE_URL"))
+	var key, base string
+	if envKey != "" || envBase != "" {
+		// An explicit override is one atomic pair. Never combine an environment
+		// key with an unrelated configured endpoint.
+		if envKey == "" || envBase == "" {
+			return ProviderUsage{}, pollErrf("config-invalid", "LITELLM_OC_KEY and LITELLM_BASE_URL must be provided together")
+		}
+		key, base = envKey, envBase
+	} else {
+		var err error
+		key, base, err = litellmConfiguredEndpoint()
+		if err != nil {
+			return ProviderUsage{}, err
+		}
 	}
 	managementURL, err := litellmManagementURL(base)
 	if err != nil {
@@ -478,7 +487,32 @@ func litellmPoll() (ProviderUsage, error) {
 	return litellmPollWithURL(managementURL, key)
 }
 
-func litellmConfiguredKey() string {
+type litellmProviderConfig struct {
+	name string
+	base string
+}
+
+var litellmProviderNames = map[string]struct{}{"lazer": {}, "litellm": {}}
+
+// litellmConfiguredEndpoint selects one provider object and its matching auth
+// entry as a unit. Independent selection can disclose one provider's
+// credential to another provider.
+func litellmConfiguredEndpoint() (string, string, error) {
+	key, keyProvider, err := litellmConfiguredKeyForProvider()
+	if err != nil {
+		return "", "", err
+	}
+	config, err := litellmConfiguredProvider()
+	if err != nil {
+		return "", "", err
+	}
+	if keyProvider != config.name {
+		return "", "", pollErrf("auth-mismatch", "LiteLLM credential and provider endpoint are not from the same configured provider")
+	}
+	return key, config.base, nil
+}
+
+func litellmConfiguredKeyForProvider() (string, string, error) {
 	for _, path := range opencodeAuthFiles() {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -491,33 +525,36 @@ func litellmConfiguredKey() string {
 		if json.Unmarshal(raw, &auth) != nil {
 			continue
 		}
-		keys := make([]string, 0, len(auth))
+		providers := make(map[string]string)
 		for name := range auth {
-			if name != "opencode-go" {
-				keys = append(keys, name)
+			canonical := strings.ToLower(name)
+			if _, ok := litellmProviderNames[canonical]; ok {
+				providers[canonical] = name
 			}
 		}
-		sort.Strings(keys)
-		for _, name := range keys {
-			entry := auth[name]
+		names := make([]string, 0, len(providers))
+		for name := range providers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if len(names) > 1 {
+			return "", "", pollErrf("auth-ambiguous", "multiple LiteLLM credentials are configured")
+		}
+		for _, name := range names {
+			entry := auth[providers[name]]
 			if key := strings.TrimSpace(entry.Key); key != "" {
-				return key
+				return key, name, nil
 			}
 			if token := strings.TrimSpace(entry.Token); token != "" {
-				return token
+				return token, name, nil
 			}
+			return "", "", pollErrf("auth-missing", "configured LiteLLM provider has no usable credential")
 		}
 	}
-	return ""
+	return "", "", pollErrf("auth-missing", "configured LiteLLM provider credential is unavailable")
 }
 
-// litellmBaseURL follows the existing OpenCode provider configuration before
-// considering the explicit compatibility override. This keeps the native
-// collector aligned with the CLI actually selected by the fleet.
-func litellmBaseURL() string {
-	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("LITELLM_BASE_URL")), "/"); base != "" {
-		return base
-	}
+func litellmConfiguredProvider() (litellmProviderConfig, error) {
 	for _, path := range opencodeConfigFiles() {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -527,11 +564,71 @@ func litellmBaseURL() string {
 		if json.Unmarshal(raw, &document) != nil {
 			continue
 		}
-		if base := findProviderBaseURL(document); base != "" {
-			return strings.TrimRight(base, "/")
+		obj, ok := document.(map[string]any)
+		if !ok {
+			continue
+		}
+		providers, ok := findObjectField(obj, "provider")
+		if !ok {
+			continue
+		}
+		providerMap, ok := providers.(map[string]any)
+		if !ok {
+			return litellmProviderConfig{}, pollErrf("config-invalid", "OpenCode provider configuration is not an object")
+		}
+		var matches []litellmProviderConfig
+		for name, value := range providerMap {
+			canonical := strings.ToLower(name)
+			if _, supported := litellmProviderNames[canonical]; !supported {
+				continue
+			}
+			base, ok := providerBaseURL(value)
+			if !ok {
+				return litellmProviderConfig{}, pollErrf("config-invalid", "configured LiteLLM provider has no usable base URL")
+			}
+			matches = append(matches, litellmProviderConfig{name: canonical, base: strings.TrimRight(base, "/")})
+		}
+		if len(matches) > 1 {
+			return litellmProviderConfig{}, pollErrf("config-ambiguous", "multiple LiteLLM provider endpoints are configured")
+		}
+		if len(matches) == 1 {
+			return matches[0], nil
 		}
 	}
-	return ""
+	return litellmProviderConfig{}, pollErrf("config-missing", "configured LiteLLM provider endpoint is unavailable")
+}
+
+func findObjectField(obj map[string]any, name string) (any, bool) {
+	for key, value := range obj {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func providerBaseURL(value any) (string, bool) {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	options, ok := findObjectField(obj, "options")
+	if !ok {
+		options = obj
+	}
+	optionsObj, ok := options.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	for _, key := range []string{"baseURL", "base_url", "api_base"} {
+		if value, ok := findObjectField(optionsObj, key); ok {
+			base, ok := value.(string)
+			if ok && strings.TrimSpace(base) != "" {
+				return base, true
+			}
+		}
+	}
+	return "", false
 }
 
 // litellmManagementURL converts the configured OpenAI-compatible inference
@@ -551,30 +648,6 @@ func litellmManagementURL(base string) (string, error) {
 	}
 	u.Path = strings.TrimRight(path, "/") + "/key/info"
 	return u.String(), nil
-}
-
-func findProviderBaseURL(value any) string {
-	obj, ok := value.(map[string]any)
-	if !ok {
-		return ""
-	}
-	keys := make([]string, 0, len(obj))
-	for key := range obj {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		child := obj[key]
-		if strings.EqualFold(key, "baseURL") || strings.EqualFold(key, "base_url") || strings.EqualFold(key, "api_base") {
-			if base, ok := child.(string); ok && strings.TrimSpace(base) != "" {
-				return base
-			}
-		}
-		if base := findProviderBaseURL(child); base != "" {
-			return base
-		}
-	}
-	return ""
 }
 
 func opencodeConfigFiles() []string {
