@@ -18,6 +18,9 @@ import (
 )
 
 func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
+	previousCaller := goalGuardCallerIdentity
+	goalGuardCallerIdentity = func() (string, error) { return "coordinator", nil }
+	defer func() { goalGuardCallerIdentity = previousCaller }()
 	state := filepath.Join(t.TempDir(), "goal.json")
 	claims := filepath.Join(t.TempDir(), "leases.db")
 	t.Setenv("HERD_CLAIMS_DB", claims)
@@ -68,6 +71,9 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 }
 
 func TestGoalGuardClearRefusesAgentAndStaleGrantorWithoutMutation(t *testing.T) {
+	previousCaller := goalGuardCallerIdentity
+	goalGuardCallerIdentity = func() (string, error) { return "coordinator", nil }
+	defer func() { goalGuardCallerIdentity = previousCaller }()
 	state := filepath.Join(t.TempDir(), "goal.json")
 	claims := filepath.Join(t.TempDir(), "leases.db")
 	t.Setenv("HERD_CLAIMS_DB", claims)
@@ -113,6 +119,42 @@ func TestGoalGuardClearRefusesAgentAndStaleGrantorWithoutMutation(t *testing.T) 
 	}
 	if got, _ := os.ReadFile(state); string(got) != string(original) {
 		t.Fatal("native-owner refusal mutated goal state")
+	}
+}
+
+func TestGoalGuardClearRefusesMatchingClaimFromWrongNativeCaller(t *testing.T) {
+	previousCaller := goalGuardCallerIdentity
+	goalGuardCallerIdentity = func() (string, error) { return "different-native-agent", nil }
+	defer func() { goalGuardCallerIdentity = previousCaller }()
+	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-768"}, "coordinator", "coordinator", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{Lane: "standing", Task: "FAC-768", Owner: "coordinator", Generation: lease.Generation, CreatedAt: now, UpdatedAt: now, Authority: &goalguard.AuthorityEnvelope{Grantor: "coordinator", PacketPath: "packet.md", BoundedAutonomy: "bounded", MutationLimits: "worktree", ForbiddenActions: []string{"merge"}, StopConditions: []string{"stop"}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clearGoal(s, "coordinator", lease.Generation, ""); err == nil || !strings.Contains(err.Error(), "verified native caller") {
+		t.Fatalf("wrong native caller error = %v", err)
+	}
+	if after, _ := os.ReadFile(state); string(after) != string(before) {
+		t.Fatal("wrong native caller refusal mutated goal state")
 	}
 }
 

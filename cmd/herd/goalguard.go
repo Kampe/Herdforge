@@ -16,6 +16,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/security"
 )
@@ -190,7 +191,40 @@ func validateNativeGrantor(g goalguard.Goal, grantor string, generation int64) e
 	if current == nil || current.TaskRef != g.Task || current.OwnerID != grantor || current.Generation != generation {
 		return fmt.Errorf("goal-guard: clear refused: native claim owner/generation mismatch (want owner=%q generation=%d)", grantor, generation)
 	}
+	caller, err := goalGuardCallerIdentity()
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: caller is not a verified native coordinator session: %w", err)
+	}
+	if caller != grantor {
+		return fmt.Errorf("goal-guard: clear refused: grantor %q does not match verified native caller %q", grantor, caller)
+	}
 	return nil
+}
+
+var goalGuardCallerIdentity = resolveGoalGuardCallerIdentity
+
+func resolveGoalGuardCallerIdentity() (string, error) {
+	pane := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
+	if pane == "" {
+		return "", errors.New("HERDR_PANE_ID is missing")
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return "", fmt.Errorf("herdr agent list: %w", err)
+	}
+	var match *herdr.AgentEntry
+	for i := range agents {
+		if strings.TrimSpace(agents[i].PaneID) == pane {
+			if match != nil || strings.TrimSpace(agents[i].Name) == "" || !herdr.RealModelSessionID(agents[i].Session.Value) {
+				return "", errors.New("pane has no unique real model session")
+			}
+			match = &agents[i]
+		}
+	}
+	if match == nil {
+		return "", fmt.Errorf("no live agent is bound to pane %q", pane)
+	}
+	return match.Name, nil
 }
 
 func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionReceipt) error {
