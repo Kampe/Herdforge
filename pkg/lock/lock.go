@@ -112,7 +112,10 @@ func (l *DirLock) Release() {
 	if current := holderToken(l.holder); current != "" && current != l.token {
 		return
 	}
-	_ = os.RemoveAll(l.dir)
+	if interleaveHook != nil {
+		interleaveHook("release-pre-remove")
+	}
+	_ = removeLockDir(l.dir)
 }
 
 // Status reports whether the lock is held and, if so, the holder string.
@@ -137,14 +140,20 @@ func (l *DirLock) breakIfStale() (removed bool) {
 		if n, err := strconv.Atoi(pid); err == nil {
 			kerr := syscall.Kill(n, 0)
 			if !(kerr == nil || errors.Is(kerr, syscall.EPERM)) {
-				_ = os.RemoveAll(l.dir)
+				if interleaveHook != nil {
+					interleaveHook("stale-pre-remove")
+				}
+				_ = removeLockDir(l.dir)
 				return true
 			}
 		}
 	}
 	// too old -> stale
 	if time.Since(info.ModTime()) > l.maxAge {
-		_ = os.RemoveAll(l.dir)
+		if interleaveHook != nil {
+			interleaveHook("stale-pre-remove")
+		}
+		_ = removeLockDir(l.dir)
 		return true
 	}
 	return false
@@ -230,3 +239,13 @@ func username() string {
 	}
 	return "unknown"
 }
+
+// interleaveHook, when non-nil, fires at the exact check-then-remove
+// boundaries of Release and breakIfStale. It is a deterministic test seam
+// for interleaving reproduction (bundle-interleaving-repair-2306);
+// production leaves it nil.
+var interleaveHook func(stage string)
+
+// removeLockDir is the removal primitive for the lock directory, a package
+// variable so tests can observe the check/remove boundary.
+var removeLockDir = os.RemoveAll

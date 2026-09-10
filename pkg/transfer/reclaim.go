@@ -322,6 +322,9 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 			continue
 		}
 		report.Candidates++
+		if interleaveHook != nil {
+			interleaveHook("reclaim-pre-unlink")
+		}
 		if err := removeDirRelative(dirFile, name); err != nil {
 			disp.Action, disp.Reason = "retained", fmt.Sprintf("unlink-failed: %v", err)
 			report.Dispositions = append(report.Dispositions, disp)

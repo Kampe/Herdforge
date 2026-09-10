@@ -56,6 +56,9 @@ func LoadRetentionManifest(root, manifestPath string) (RetentionManifest, error)
 	if err != nil || !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
 		return m, fmt.Errorf("bundle reclaim: retention manifest must be a regular non-symlink file")
 	}
+	if interleaveHook != nil {
+		interleaveHook("manifest-pre-read")
+	}
 	body, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return m, fmt.Errorf("bundle reclaim: retention manifest: %w", err)
@@ -115,3 +118,8 @@ func manifestEntry(m RetentionManifest, name string) (RetentionEntry, bool) {
 	}
 	return RetentionEntry{}, false
 }
+
+// interleaveHook, when non-nil, fires between manifest path validation and
+// the content read. It is a deterministic test seam for interleaving
+// reproduction (bundle-interleaving-repair-2306); production leaves it nil.
+var interleaveHook func(stage string)
