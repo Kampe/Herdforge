@@ -540,12 +540,18 @@ func validateEnvironmentPolicy(policy EnvironmentPolicy) error {
 }
 
 func hermeticEnvironment() []string {
-	return []string{
+	env := []string{
 		"PATH=" + hermeticPathValue,
 		"LC_ALL=C",
 		"LANG=C",
 		"TZ=UTC",
 	}
+	// Propagate only the already-established trusted outer containment marker;
+	// never manufacture it or inherit arbitrary HERD_* state.
+	if os.Getenv(hermeticContainerEnv) == "1" {
+		env = append(env, hermeticContainerEnv+"=1")
+	}
+	return env
 }
 
 const hermeticPathValue = "/opt/homebrew/bin:/usr/local/go/bin:/go/bin:/usr/local/bin:/usr/bin:/bin"
