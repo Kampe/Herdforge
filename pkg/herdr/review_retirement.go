@@ -126,6 +126,29 @@ func pathUnder(root, path string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
+func launchBindsTask(launch reviewledger.LedgerRow, taskRef, branch string) bool {
+	taskRef = strings.TrimSpace(taskRef)
+	branch = strings.TrimSpace(branch)
+	if taskRef == "" {
+		return false
+	}
+	launchTask := reviewledger.CloseableCardRef(launch.Task)
+	if launchTask == "" && strings.EqualFold(strings.TrimSpace(launch.Task), taskRef) {
+		launchTask = taskRef
+	}
+	if launchTask != "" {
+		return launchTask == taskRef
+	}
+	if launch.Branch != "" {
+		if strings.EqualFold(strings.TrimSpace(launch.Branch), taskRef) ||
+			reviewledger.CloseableCardRef(launch.Branch) == taskRef ||
+			(branch != "" && strings.TrimSpace(launch.Branch) == branch) {
+			return true
+		}
+	}
+	return false
+}
+
 // EvaluateReviewRetirement is read-only and is shared by dry-run and acting
 // callers.  Every refusal is specific so a retained manifest can be retried
 // without guessing which newer lane incarnation it belongs to.
@@ -152,7 +175,7 @@ func EvaluateReviewRetirement(e ReviewRetirementEvidence) ReviewRetirementDecisi
 	if e.Repository == "" || filepath.Clean(e.Repository) != filepath.Clean(m.Repository) {
 		return blockReviewRetirement("repository identity differs from the bound manifest")
 	}
-	if e.Launch.Event != string(reviewledger.EventRecord) || e.Launch.SHA != m.CandidateSHA || e.Launch.Reviewer != m.Reviewer || e.Launch.Lease != m.Nonce || e.Launch.Branch != m.TaskRef {
+	if e.Launch.Event != string(reviewledger.EventRecord) || e.Launch.SHA != m.CandidateSHA || e.Launch.Reviewer != m.Reviewer || e.Launch.Lease != m.Nonce || !launchBindsTask(e.Launch, m.TaskRef, m.Branch) {
 		return blockReviewRetirement("verified launch provenance does not bind the exact candidate, reviewer, branch, and lease")
 	}
 	if e.Verdict.Row.Event != string(reviewledger.EventVerdict) || e.Verdict.Row.SHA != m.CandidateSHA || e.Verdict.Row.CandidateSHA != m.CandidateSHA || e.Verdict.Row.Reviewer != m.Reviewer ||

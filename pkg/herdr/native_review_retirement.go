@@ -120,7 +120,7 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	if err != nil {
 		return ReviewRetirementEvidence{}, err
 	}
-	ack, ackErr := reviewack.Read(n.Root, m.CandidateSHA, m.Reviewer)
+	ack, ackErr := reviewack.ReadArtifact(n.Root, m.CandidateSHA, m.Reviewer, verdict.ArtifactDigest)
 	if ackErr != nil {
 		return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict}, Repository: n.RepositoryIdentity}, nil
 	}
