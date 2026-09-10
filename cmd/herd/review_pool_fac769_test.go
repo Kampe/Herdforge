@@ -107,7 +107,7 @@ func TestFac769PacketCarriesExactReviewedBase(t *testing.T) {
 // fails closed on an unresolved or invalid base.
 func TestFac769ResolveReviewBaseResolvesExactMergeBase(t *testing.T) {
 	root, base, candidate := fac769Fixture(t)
-	got, err := resolveReviewBase(root, candidate)
+	got, err := resolveReviewBase(root, "", "FAC-769", candidate, base)
 	if err != nil {
 		t.Fatalf("resolveReviewBase failed: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestFac769ResolveReviewBaseResolvesExactMergeBase(t *testing.T) {
 
 // A3: an unresolved base (no origin/main) must refuse generation, never invent
 // a base from the latest parent.
-func TestFac769ResolveReviewBaseFailsClosedWithoutOriginMain(t *testing.T) {
+func TestFac769ResolveReviewBaseFailsClosedWithoutAuthenticatedOrExplicitBase(t *testing.T) {
 	root := t.TempDir()
 	gitIn(t, root, "init", "-q", "-b", "main")
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
@@ -128,8 +128,26 @@ func TestFac769ResolveReviewBaseFailsClosedWithoutOriginMain(t *testing.T) {
 	gitIn(t, root, "commit", "-qm", "base")
 	candidate := gitIn(t, root, "rev-parse", "HEAD")
 
-	if _, err := resolveReviewBase(root, candidate); err == nil {
-		t.Fatal("an unresolved base (no origin/main) must refuse generation, never invent a base from the latest parent")
+	if _, err := resolveReviewBase(root, root, "FAC-769", candidate, ""); err == nil {
+		t.Fatal("an unresolved base (no authenticated task context or explicit base) must refuse generation")
+	}
+}
+
+func TestFac769ExplicitBaseSurvivesOriginMainAdvance(t *testing.T) {
+	root, base, candidate := fac769Fixture(t)
+	gitIn(t, root, "checkout", "-q", "main")
+	if err := os.WriteFile(filepath.Join(root, "main.txt"), []byte("advanced"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, root, "add", ".")
+	gitIn(t, root, "commit", "-qm", "advance main")
+	gitIn(t, root, "update-ref", "refs/heads/origin/main", candidate)
+	got, err := resolveReviewBase(root, "", "FAC-769", candidate, base)
+	if err != nil {
+		t.Fatalf("resolveReviewBase failed after origin/main advance: %v", err)
+	}
+	if got != base {
+		t.Fatalf("resolveReviewBase = %q after origin/main advance, want pinned %q", got, base)
 	}
 }
 
@@ -145,7 +163,7 @@ func TestFac769BaseResolutionPrecedesPacketAndThreadsSlot(t *testing.T) {
 	if !ok {
 		t.Fatal("cannot locate runPoolReview")
 	}
-	baseIdx := strings.Index(body, "resolveReviewBase(root, sha)")
+	baseIdx := strings.Index(body, "resolveReviewBase(root, candidateDir, ref, sha, strings.TrimSpace(*opts.Base))")
 	packetIdx := strings.Index(body, "reviewPacketBody(ref, sha, base, surface, lease.Path")
 	if baseIdx < 0 {
 		t.Fatal("runPoolReview never resolves the review base; the packet cannot carry the exact pin")

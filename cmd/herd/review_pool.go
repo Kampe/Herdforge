@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -115,7 +116,7 @@ func runPoolReview(ref string) error {
 	// must refuse generation before any packet/provenance/launch effect. We never
 	// invent a base from the latest parent when the launcher has not resolved a
 	// valid review base.
-	base, err := resolveReviewBase(root, sha)
+	base, err := resolveReviewBase(root, candidateDir, ref, sha, strings.TrimSpace(*opts.Base))
 	if err != nil {
 		return err
 	}
@@ -1311,6 +1312,7 @@ type poolReviewOptions struct {
 	SurfaceRoot          *string
 	PacketRoot           *string
 	NoLaunch             *bool
+	Base                 *string
 	AllowUnprovenBuilder *bool
 	BuilderFamily        *string
 }
@@ -1338,6 +1340,7 @@ func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 		SurfaceRoot: fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root"),
 		PacketRoot:  fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root"),
 		NoLaunch:    fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr"),
+		Base:        fs.String("base", "", "Exact reviewed base commit; required when the candidate has no authenticated task context"),
 		BuilderFamily: fs.String("builder-family", "",
 			"Assert the candidate's builder family and RECORD it, so the resulting verdict is admissible."),
 		// Retained as an accepted no-op: FAC-627 made unprovable candidates
@@ -1743,22 +1746,50 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID, packetTask string) 
 
 // resolveReviewBase resolves the exact base the candidate is reviewed against.
 //
-// FAC-769: the packet must carry the exact reviewed-base/head from the validated
-// launch pin, never a base invented from the latest parent. The base is the
-// merge-base of the candidate against origin/main, which is the same anchor the
-// admission binding and risk classification use. An unresolved or invalid base
-// fails closed so generation refuses before any packet/provenance/launch effect.
-func resolveReviewBase(root, sha string) (string, error) {
-	out, err := exec.Command("git", "-C", root, "merge-base", sha, "origin/main").Output()
-	if err != nil {
-		return "", fmt.Errorf("resolve review base for %s: %w", shortSHA(sha), err)
+// FAC-769: the packet must carry the exact reviewed-base/head from the
+// authenticated launch pin, never a base invented from ambient origin/main.
+// An authenticated candidate task context is preferred; an explicit base is
+// the only fallback. An unresolved or invalid base fails closed before any
+// packet/provenance/launch effect.
+func resolveReviewBase(root, candidateDir, ref, sha, explicitBase string) (string, error) {
+	authenticatedBase := ""
+	if strings.TrimSpace(candidateDir) != "" {
+		tc, err := dispatch.ReadTaskContext(candidateDir)
+		if err == nil {
+			verifier, verifyErr := dispatch.LoadVerifier(root)
+			if verifyErr != nil {
+				return "", fmt.Errorf("resolve review base for %s: load candidate receipt verifier: %w", shortSHA(sha), verifyErr)
+			}
+			if verifyErr := verifier.Verify(tc); verifyErr != nil {
+				return "", fmt.Errorf("resolve review base for %s: authenticate candidate task context: %w", shortSHA(sha), verifyErr)
+			}
+			if !strings.EqualFold(strings.TrimSpace(tc.TaskRef), strings.TrimSpace(ref)) {
+				return "", fmt.Errorf("resolve review base for %s: authenticated task context ref %q does not match %q", shortSHA(sha), tc.TaskRef, ref)
+			}
+			if tc.CandidateSHA != "" && !strings.EqualFold(strings.TrimSpace(tc.CandidateSHA), strings.TrimSpace(sha)) {
+				return "", fmt.Errorf("resolve review base for %s: authenticated task context candidate %q does not match", shortSHA(sha), tc.CandidateSHA)
+			}
+			authenticatedBase = strings.TrimSpace(tc.BaseSHA)
+		} else if !errors.Is(err, os.ErrNotExist) || strings.TrimSpace(explicitBase) == "" {
+			return "", fmt.Errorf("resolve review base for %s: candidate has no authenticated task context: %w", shortSHA(sha), err)
+		}
 	}
-	base := strings.TrimSpace(string(out))
-	if len(base) < 12 {
+
+	base := authenticatedBase
+	if strings.TrimSpace(explicitBase) != "" {
+		if base != "" && !strings.EqualFold(base, strings.TrimSpace(explicitBase)) {
+			return "", fmt.Errorf("resolve review base for %s: explicit base %s contradicts authenticated base %s", shortSHA(sha), shortSHA(explicitBase), shortSHA(base))
+		}
+		base = strings.TrimSpace(explicitBase)
+	}
+	if len(base) != 40 {
 		return "", fmt.Errorf("resolve review base for %s: unresolved or invalid base %q", shortSHA(sha), base)
 	}
 	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", base+"^{commit}").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("resolve review base for %s: base %s is not a commit: %s", shortSHA(sha), shortSHA(base), strings.TrimSpace(string(out)))
+	}
+	if err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", base, sha).Run(); err != nil {
+		return "", fmt.Errorf("resolve review base for %s: base %s is not an ancestor of the candidate", shortSHA(sha), shortSHA(base))
 	}
 	return base, nil
 }
