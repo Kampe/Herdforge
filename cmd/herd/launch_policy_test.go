@@ -727,13 +727,21 @@ func TestLaneLaunchDecisionSucceedsWithHarnessBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("HERD_MODE", "local")
 	t.Setenv("HERDR_ROUTE_STATE_DIR", t.TempDir())
+	// Keep this launch-policy regression hermetic and bounded: pinHealthyQuota
+	// injects a fake OpenUsage-compatible binary and temporary cache path, while
+	// the long TTL prevents an unrelated refresh from reaching real pollers.
+	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "3600")
 	pinHealthyQuota(t, dir, "codex")
+	seedHealthyQuotaCache(t, "codex")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
 	lane := &config.LaneDef{
 		Name: "smith", Role: launch.WorkerRole, AgentKind: "codex", Harness: "codex",
 		Provider: launch.WorkerProvider, Model: launch.WorkerModel, Effort: launch.WorkerEffort, TaskShape: launch.Implementation,
 	}
-	decision, err := laneLaunchDecisionWithProbe(context.Background(), lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
+	decision, err := laneLaunchDecisionWithProbe(ctx, lane, nil, func(_ context.Context, _, model, _ string) herdr.ProbeResult {
 		return herdr.ProbeResult{Model: model, Available: true}
 	})
 	if err != nil {
@@ -967,6 +975,49 @@ func pinHealthyQuota(t *testing.T, dir string, providers ...string) {
 		used[name] = 10
 	}
 	pinQuota(t, dir, used)
+}
+
+// seedHealthyQuotaCache makes the public launch-path regression independent of
+// an external process scheduler. The fake OpenUsage binary remains installed as
+// a guard against accidental ambient acquisition, but a fresh isolated cache
+// means this call cannot reach OpenUsage or native pollers even when the whole
+// package is running beside other environment-sensitive tests.
+func seedHealthyQuotaCache(t *testing.T, provider string) {
+	t.Helper()
+	path := os.Getenv("HERD_QUOTA_CACHE_PATH")
+	if path == "" {
+		t.Fatal("quota cache path was not isolated")
+	}
+	body, err := json.Marshal(map[string]any{
+		"fetched_at": time.Now().UTC(),
+		"snapshot": map[string]any{
+			"generatedAt": time.Now().UTC(),
+			"providers": map[string]any{
+				provider: map[string]any{
+					"displayName": provider,
+					"stale":       false,
+					"resources": map[string]any{
+						"weekly": map[string]any{
+							"kind":          "consumption",
+							"limit":         100,
+							"remaining":     90,
+							"resetsAt":      "2099-01-01T00:00:00Z",
+							"unit":          "percent",
+							"used":          10,
+							"utilization":   0.1,
+							"windowSeconds": 604800,
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("seed isolated quota cache: %v", err)
+	}
 }
 
 // pinQuota pins each named provider's weekly window to an exact used percent.

@@ -6921,6 +6921,13 @@ func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecisio
 	// they start. Avoid launching a second headless model session here: local
 	// hooks and authentication can block the forge before a pane exists. The
 	// production path below remains the strict artifact-write probe.
+	//
+	// The synthetic local-harness receipt is invocation-local evidence
+	// (FAC-679): persisting it through the durable file cache wrote
+	// .herd/toolprobe-cache.json into the process working directory, leaving
+	// untracked files that BLOCKED managed verification of an otherwise clean
+	// candidate. Keep the admission validation a durable write enforces
+	// (identity + signature) by storing it in a per-call memory cache.
 	if strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE"))) != "production" &&
 		strings.ToLower(strings.TrimSpace(os.Getenv("HERD_LOCAL_TOOL_PROBE"))) != "strict" {
 		harness := strings.TrimSpace(decision.Harness)
@@ -6938,8 +6945,10 @@ func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecisio
 		if receiptErr != nil {
 			return nil, receiptErr
 		}
-		cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
-		_ = cache.Put(receipt)
+		cache := toolprobe.NewMemoryCache()
+		if err := cache.Put(receipt); err != nil {
+			return nil, fmt.Errorf("local tool-probe receipt not admissible: %w", err)
+		}
 		return &receipt, nil
 	}
 	cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
