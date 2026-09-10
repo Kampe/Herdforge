@@ -915,7 +915,14 @@ func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
 	if result.PolicyRequired {
 		bound, code, digest := harness.ApplyHookPolicies(result.Hooks, result.Policies, result.PolicyRevision)
 		if code != harness.HookCodeHealthy {
-			return report, recordHookFailure(req, sink, code, digest, harness.EndpointInvalid, "")
+			name := digest
+			if code == harness.HookCodePolicySetMissing {
+				// FAC-624: name the discovery source, never a hook -- an
+				// empty policy set is a resolution failure, not evidence
+				// against whichever hook happened to be first in the list.
+				name = fmt.Sprintf("no policy set loaded; source=%q", result.SourcePath)
+			}
+			return report, recordHookFailure(req, sink, code, name, harness.EndpointInvalid, "")
 		}
 		result.Hooks = bound
 	}
@@ -965,7 +972,21 @@ func recordHookFailure(req Request, sink Sink, code harness.HookCode, name strin
 	receipt.HookName = name
 	receipt.EndpointClass = string(endpoint)
 	receipt.RedactedAuthority = authority
-	receipt.ReceiptKey = hookReceiptKey(req, code, name)
+	key := hookReceiptKey(req, code, name)
+	if code == harness.HookCodePolicySetMissing {
+		// FAC-624 defect 3: WriteOnce dedupes a ReceiptKey against the
+		// receipt log's ENTIRE history, forever -- fine for a stable
+		// misconfiguration fact (a genuinely missing/stale/mismatched
+		// policy always deserves the same key), but an empty-policy read
+		// is a per-occurrence discovery failure. Without this, one
+		// historical hit permanently silences every later refusal that
+		// happens to share task/generation/policy-revision/source, which
+		// is exactly how the operator's blocked launches left no receipt
+		// to inspect. Bucket by minute: a noisy retry burst still
+		// collapses, but a new occurrence in a later cycle is recorded.
+		key = fmt.Sprintf("%s|%s", key, time.Now().UTC().Format("200601021504"))
+	}
+	receipt.ReceiptKey = key
 	if _, err := writeOnce(sink, receipt); err != nil {
 		return fmt.Errorf("launch hook preflight failed: %s", code)
 	}

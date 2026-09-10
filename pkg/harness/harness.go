@@ -195,6 +195,11 @@ type HookDiscoveryResult struct {
 	PolicyRequired         bool
 	PolicyRevision         string
 	ExpectedPolicyRevision string
+	// SourcePath names where the policy set that PolicyRequired/Policies
+	// describes was resolved from (FAC-624). Best-effort: set whenever a
+	// discovery path knows its own source; a refusal built from this result
+	// can then name the path instead of guessing at a hook.
+	SourcePath string
 }
 
 type HookDiscovery interface {
@@ -254,7 +259,7 @@ func (d FileDiscovery) Discover(provider string) (HookDiscoveryResult, error) {
 	if entry.Revision != "" && entry.Revision != revision {
 		return HookDiscoveryResult{State: DiscoveryFailed}, fmt.Errorf("hook discovery failed")
 	}
-	return HookDiscoveryResult{State: state, Hooks: entry.Hooks, ApprovedAuthorities: entry.ApprovedAuthorities, Policies: entry.Policies, PolicyRequired: len(entry.Policies) > 0, PolicyRevision: revision, ExpectedPolicyRevision: entry.Revision}, nil
+	return HookDiscoveryResult{State: state, Hooks: entry.Hooks, ApprovedAuthorities: entry.ApprovedAuthorities, Policies: entry.Policies, PolicyRequired: len(entry.Policies) > 0, PolicyRevision: revision, ExpectedPolicyRevision: entry.Revision, SourcePath: path}, nil
 }
 
 // DefaultDiscovery resolves a repo policy override when present and otherwise
@@ -293,6 +298,7 @@ func (d DefaultDiscovery) Discover(provider string) (HookDiscoveryResult, error)
 		result.Policies = override.Policies
 		result.PolicyRevision = override.PolicyRevision
 		result.ExpectedPolicyRevision = override.PolicyRevision
+		result.SourcePath = override.SourcePath
 		return result, nil
 	}
 	if hasOverride {
@@ -614,6 +620,13 @@ const (
 	HookCodeDegraded           HookCode = "hook.degraded"
 	HookCodeHealthMalformed    HookCode = "hook.health_malformed"
 	HookCodePolicyMissing      HookCode = "hook.policy_missing"
+	// HookCodePolicySetMissing is FAC-624's distinct condition: discovery
+	// required a policy set (PolicyRequired) but the set itself is empty
+	// -- no policy set was loaded at all -- which is a discovery/resolution
+	// failure, not any one hook lacking a policy. Reporting it as
+	// HookCodePolicyMissing against firstHookDigest(hooks) blamed an
+	// innocent hook and sent every investigation after the wrong object.
+	HookCodePolicySetMissing   HookCode = "hook.policy_set_missing"
 	HookCodePolicyStale        HookCode = "hook.policy_stale"
 	HookCodePolicyDuplicate    HookCode = "hook.policy_duplicate"
 	HookCodePolicyMismatch     HookCode = "hook.policy_mismatch"
@@ -692,7 +705,7 @@ func IsPolicyCode(code HookCode) bool {
 	switch code {
 	case HookCodeMalformed, HookCodeAuthority, HookCodeRedirect, HookCodeDuplicate,
 		HookCodeUnknownRequirement, HookCodeTimeoutLimit, HookCodePolicyMissing,
-		HookCodePolicyStale, HookCodePolicyDuplicate, HookCodePolicyMismatch:
+		HookCodePolicySetMissing, HookCodePolicyStale, HookCodePolicyDuplicate, HookCodePolicyMismatch:
 		return true
 	default:
 		return false
@@ -746,7 +759,13 @@ func (d DefaultDiscovery) PolicyInventory(provider string) (HookPolicyInventory,
 // policy-required should call this function.
 func ApplyHookPolicies(hooks []Hook, policies []HookPolicy, revision string) ([]Hook, HookCode, string) {
 	if len(policies) == 0 {
-		return nil, HookCodePolicyMissing, firstHookDigest(hooks)
+		// FAC-624: "no policy set was loaded at all" is a discovery/resolution
+		// condition, not any one hook lacking a policy -- naming
+		// firstHookDigest(hooks) here blames an innocent hook and sends
+		// every investigation after the wrong object. Callers with a
+		// resolved source path (see HookDiscoveryResult.SourcePath) attach
+		// it when recording this failure; this function has no path to name.
+		return nil, HookCodePolicySetMissing, ""
 	}
 	if strings.TrimSpace(revision) == "" || revision != policyRevision(policies) {
 		return nil, HookCodePolicyStale, firstHookDigest(hooks)

@@ -606,6 +606,79 @@ func TestHookReceiptRedactsAuthorityAndIsStable(t *testing.T) {
 	}
 }
 
+// emptyPolicySetRequest builds a request whose discovery reports a required
+// policy set that is intermittently empty (FAC-624's live incident: 29 live
+// hooks, PolicyRequired=true, zero policies actually read back).
+func emptyPolicySetRequest(t *testing.T, sourcePath string) Request {
+	t.Helper()
+	req := good(t)
+	req.HookDiscovery = harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) {
+		return harness.HookDiscoveryResult{
+			State:          harness.DiscoveryHooks,
+			Hooks:          []harness.Hook{{Name: "innocent-hook", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}},
+			PolicyRequired: true,
+			SourcePath:     sourcePath,
+		}, nil
+	})
+	return req
+}
+
+// TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook is FAC-624 defect 2:
+// discovery finding hooks with PolicyRequired but zero policies is a
+// resolution failure, not evidence against whichever hook happened to be
+// first in the list. Every historical policy_missing receipt in the FAC-624
+// incident named the same innocent digest.
+func TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("receipts = %+v", sink.Receipts)
+	}
+	r := sink.Receipts[0]
+	if r.HookCode != string(harness.HookCodePolicySetMissing) {
+		t.Fatalf("hook code = %q, want %q", r.HookCode, harness.HookCodePolicySetMissing)
+	}
+	if strings.Contains(r.HookName, "innocent-hook") {
+		t.Fatalf("empty-policy-set refusal still blamed a specific hook: %+v", r)
+	}
+	if !strings.Contains(r.HookName, "/fake/.herd/harness-hooks.json") {
+		t.Fatalf("empty-policy-set refusal did not name its resolved source path: %+v", r)
+	}
+}
+
+// TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated is FAC-624 defect 3:
+// WriteOnce dedupes a ReceiptKey against the sink's entire history forever.
+// That is correct for a stable misconfiguration (a genuinely missing/stale
+// policy is the same fact every time) but wrong for an intermittent empty
+// read: once any prior cycle recorded the naive classification key, every
+// later occurrence would be silently swallowed -- exactly how the operator's
+// blocked launches left no receipt to inspect.
+func TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	// preflightHooks sets req.HookPolicyRevision from the discovery result's
+	// PolicyRevision, which emptyPolicySetRequest leaves at its zero value.
+	name := fmt.Sprintf("no policy set loaded; source=%q", "/fake/.herd/harness-hooks.json")
+	staleKey := hookReceiptKey(req, harness.HookCodePolicySetMissing, name)
+	sink := &MemorySink{Receipts: []Receipt{{ReceiptKey: staleKey, Kind: "launch_rejected", HookCode: string(harness.HookCodePolicySetMissing)}}}
+
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if len(sink.Receipts) != 2 {
+		t.Fatalf("a historical hit on the naive classification key silenced this occurrence's receipt: %+v", sink.Receipts)
+	}
+	fresh := sink.Receipts[1]
+	if fresh.ReceiptKey == staleKey {
+		t.Fatalf("fresh occurrence reused the exact stale key instead of a per-occurrence one: %q", fresh.ReceiptKey)
+	}
+	if !strings.HasPrefix(fresh.ReceiptKey, staleKey+"|") {
+		t.Fatalf("fresh key %q is not the stale classification key plus a time bucket (%q)", fresh.ReceiptKey, staleKey)
+	}
+}
+
 func TestOptionalDegradedReceiptIsDurablyDeduplicated(t *testing.T) {
 	req := good(t)
 	withHooks(&req, []harness.Hook{{Name: "telemetry", URL: "http://127.0.0.1:1", Requirement: harness.HookOptional}})
