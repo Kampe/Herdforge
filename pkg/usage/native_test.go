@@ -817,3 +817,396 @@ func TestClaudeKeychainFallbackParsesStubOutput(t *testing.T) {
 		t.Errorf("token = %q, want the stub's keychain payload", tok)
 	}
 }
+
+func TestLiteLLMStandardShellConfiguredOpenCodeWithoutBaseURLEnv(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"litellm-user","budget_max":100,"budget_spent":25}`)
+	}))
+	t.Cleanup(s.Close)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, ".config", "opencode"))
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, ".local", "share", "opencode"))
+	t.Setenv("LITELLM_OC_KEY", "test-key")
+	t.Setenv("LITELLM_BASE_URL", "")
+
+	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {
+					"baseURL": "`+s.URL+`/v1",
+					"apiKey": "{env:LITELLM_OC_KEY}"
+				}
+			}
+		}
+	}`)
+
+	p, err := litellmPoll()
+	if err != nil {
+		t.Fatalf("litellmPoll failed: %v", err)
+	}
+	if p.Resources["budget"].Remaining != 75 {
+		t.Fatalf("usage budget = %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMStandardShellMatchingEnvKeyWithoutApiKeyInOptions(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer env-match-key" {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"litellm-user","budget_max":100,"budget_spent":30}`)
+	}))
+	t.Cleanup(s.Close)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, ".config", "opencode"))
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, ".local", "share", "opencode"))
+	t.Setenv("LITELLM_OC_KEY", "env-match-key")
+	t.Setenv("LITELLM_BASE_URL", "")
+
+	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {
+					"baseURL": "`+s.URL+`/v1"
+				}
+			}
+		}
+	}`)
+
+	p, err := litellmPoll()
+	if err != nil {
+		t.Fatalf("litellmPoll failed: %v", err)
+	}
+	if p.Resources["budget"].Remaining != 70 {
+		t.Fatalf("usage budget = %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMJSONCWithCommentsAndTrailingCommas(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer jsonc-key" {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"jsonc-user","budget_max":50,"budget_spent":10}`)
+	}))
+	t.Cleanup(s.Close)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, ".config", "opencode"))
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, ".local", "share", "opencode"))
+	t.Setenv("LITELLM_OC_KEY", "")
+	t.Setenv("LITELLM_BASE_URL", "")
+
+	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// JSONC with single line comments, block comments, and trailing commas
+	writeJSONFile(t, filepath.Join(home, ".config", "opencode", "opencode.jsonc"), `// OpenCode root configuration
+	{
+		/* Provider block definition */
+		"provider": {
+			"litellm": {
+				"name": "LiteLLM Gateway",
+				"options": {
+					"baseURL": "`+s.URL+`/v1", // Inference base
+					"apiKey": "jsonc-key", // Literal key
+				},
+			},
+		},
+	}`)
+
+	p, err := litellmPoll()
+	if err != nil {
+		t.Fatalf("litellmPoll failed on JSONC: %v", err)
+	}
+	if p.Resources["budget"].Remaining != 40 {
+		t.Fatalf("usage budget = %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMTildePathExpansion(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tilde-key" {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"tilde-user","budget_max":80,"budget_spent":20}`)
+	}))
+	t.Cleanup(s.Close)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", "~/my_custom_config")
+	t.Setenv("OPENCODE_DATA_DIR", "~/my_custom_data")
+	t.Setenv("LITELLM_OC_KEY", "")
+	t.Setenv("LITELLM_BASE_URL", "")
+
+	configDir := filepath.Join(home, "my_custom_config")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(configDir, "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {
+					"baseURL": "`+s.URL+`/v1",
+					"apiKey": "tilde-key"
+				}
+			}
+		}
+	}`)
+
+	p, err := litellmPoll()
+	if err != nil {
+		t.Fatalf("litellmPoll failed with tilde paths: %v", err)
+	}
+	if p.Resources["budget"].Remaining != 60 {
+		t.Fatalf("usage budget = %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMXDGPaths(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer xdg-auth-key" {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"xdg-user","budget_max":100,"budget_spent":50}`)
+	}))
+	t.Cleanup(s.Close)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", "")
+	t.Setenv("OPENCODE_DATA_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg_config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "xdg_data"))
+	t.Setenv("LITELLM_OC_KEY", "")
+	t.Setenv("LITELLM_BASE_URL", "")
+
+	cfgDir := filepath.Join(home, "xdg_config", "opencode")
+	dataDir := filepath.Join(home, "xdg_data", "opencode")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(cfgDir, "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {
+					"baseURL": "`+s.URL+`/v1"
+				}
+			}
+		}
+	}`)
+	writeJSONFile(t, filepath.Join(dataDir, "auth.json"), `{"litellm":{"key":"xdg-auth-key"}}`)
+
+	p, err := litellmPoll()
+	if err != nil {
+		t.Fatalf("litellmPoll failed with XDG paths: %v", err)
+	}
+	if p.Resources["budget"].Remaining != 50 {
+		t.Fatalf("usage budget = %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMExplicitOverridePair(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer override-key" {
+			http.Error(w, "bad auth", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"override-user","budget_max":200,"budget_spent":50}`)
+	}))
+	t.Cleanup(s.Close)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("LITELLM_BASE_URL", s.URL+"/v1")
+	t.Setenv("LITELLM_OC_KEY", "override-key")
+
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Config file has a different URL that should be overridden
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {
+					"baseURL": "http://wrong.invalid/v1",
+					"apiKey": "wrong-key"
+				}
+			}
+		}
+	}`)
+
+	p, err := litellmPoll()
+	if err != nil {
+		t.Fatalf("litellmPoll failed on explicit override: %v", err)
+	}
+	if p.Resources["budget"].Remaining != 150 {
+		t.Fatalf("usage budget = %+v", p.Resources)
+	}
+}
+
+func TestLiteLLMMalformedConfigFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_OC_KEY", "key")
+
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{not valid json at all`)
+
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "config-invalid" {
+		t.Fatalf("malformed config error = %v, want config-invalid", err)
+	}
+}
+
+func TestLiteLLMWrongProviderEnvIsolation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, "data"))
+	t.Setenv("LITELLM_BASE_URL", "")
+	// Shell has LITELLM_OC_KEY, but config is for lazer without lazer credentials
+	t.Setenv("LITELLM_OC_KEY", "litellm-key")
+	t.Setenv("LAZER_API_KEY", "")
+
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{
+		"provider": {
+			"lazer": {
+				"options": {
+					"baseURL": "http://lazer.test/v1"
+				}
+			}
+		}
+	}`)
+
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "auth-missing" {
+		t.Fatalf("lazer provider borrowing litellm env key error = %v, want auth-missing", err)
+	}
+}
+
+func TestLiteLLMAmbiguousConfigFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_OC_KEY", "")
+
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {"baseURL": "http://litellm.test/v1"}
+			},
+			"lazer": {
+				"options": {"baseURL": "http://lazer.test/v1"}
+			}
+		}
+	}`)
+
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "config-ambiguous" {
+		t.Fatalf("ambiguous provider config error = %v, want config-ambiguous", err)
+	}
+}
+
+func TestLiteLLMAmbiguousAuthFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "config"))
+	t.Setenv("OPENCODE_DATA_DIR", filepath.Join(home, "data"))
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_OC_KEY", "")
+
+	if err := os.MkdirAll(filepath.Join(home, "config"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFile(t, filepath.Join(home, "config", "opencode.json"), `{
+		"provider": {
+			"litellm": {
+				"options": {"baseURL": "http://litellm.test/v1"}
+			}
+		}
+	}`)
+	writeJSONFile(t, filepath.Join(home, "data", "auth.json"), `{
+		"litellm": {"key": "key-1"},
+		"lazer": {"key": "key-2"}
+	}`)
+
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "auth-ambiguous" {
+		t.Fatalf("ambiguous auth credentials error = %v, want auth-ambiguous", err)
+	}
+}
+
+func TestLiteLLMMissingConfigFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENCODE_CONFIG_DIR", filepath.Join(home, "nonexistent"))
+	t.Setenv("LITELLM_BASE_URL", "")
+	t.Setenv("LITELLM_OC_KEY", "")
+
+	if _, err := litellmPoll(); err == nil || pollErrorCode(err) != "config-missing" {
+		t.Fatalf("missing config error = %v, want config-missing", err)
+	}
+}
+
+

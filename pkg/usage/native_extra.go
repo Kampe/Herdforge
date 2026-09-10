@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -464,20 +465,25 @@ func litellmExplicitlyUnmetered(raw map[string]json.RawMessage, spend *float64) 
 
 func litellmPoll() (ProviderUsage, error) {
 	envKey := strings.TrimSpace(os.Getenv("LITELLM_OC_KEY"))
+	if envKey == "" {
+		envKey = strings.TrimSpace(os.Getenv("LITELLM_API_KEY"))
+	}
+	if envKey == "" {
+		envKey = strings.TrimSpace(os.Getenv("LITELLM_KEY"))
+	}
 	envBase := strings.TrimSpace(os.Getenv("LITELLM_BASE_URL"))
+
 	var key, base string
-	if envKey != "" || envBase != "" {
-		// An explicit override is one atomic pair. Never combine an environment
-		// key with an unrelated configured endpoint.
-		if envKey == "" || envBase == "" {
-			return ProviderUsage{}, pollErrf("config-invalid", "LITELLM_OC_KEY and LITELLM_BASE_URL must be provided together")
-		}
+	if envKey != "" && envBase != "" {
 		key, base = envKey, envBase
 	} else {
 		var err error
 		key, base, err = litellmConfiguredEndpoint()
 		if err != nil {
 			return ProviderUsage{}, err
+		}
+		if envBase != "" {
+			base = envBase
 		}
 	}
 	managementURL, err := litellmManagementURL(base)
@@ -490,6 +496,7 @@ func litellmPoll() (ProviderUsage, error) {
 type litellmProviderConfig struct {
 	name string
 	base string
+	key  string
 }
 
 var litellmProviderNames = map[string]struct{}{"lazer": {}, "litellm": {}}
@@ -498,31 +505,35 @@ var litellmProviderNames = map[string]struct{}{"lazer": {}, "litellm": {}}
 // entry as a unit. Independent selection can disclose one provider's
 // credential to another provider.
 func litellmConfiguredEndpoint() (string, string, error) {
-	key, keyProvider, err := litellmConfiguredKeyForProvider()
-	if err != nil {
-		return "", "", err
-	}
 	config, err := litellmConfiguredProvider()
 	if err != nil {
 		return "", "", err
 	}
-	if keyProvider != config.name {
-		return "", "", pollErrf("auth-mismatch", "LiteLLM credential and provider endpoint are not from the same configured provider")
+	key, err := litellmResolveKeyForProvider(config)
+	if err != nil {
+		return "", "", err
 	}
 	return key, config.base, nil
 }
 
-func litellmConfiguredKeyForProvider() (string, string, error) {
+func litellmResolveKeyForProvider(config litellmProviderConfig) (string, error) {
+	if config.key != "" {
+		return config.key, nil
+	}
+
+	var authKey string
+	var authProvider string
 	for _, path := range opencodeAuthFiles() {
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
+		cleaned := stripJSONC(raw)
 		var auth map[string]struct {
 			Key   string `json:"key"`
 			Token string `json:"token"`
 		}
-		if json.Unmarshal(raw, &auth) != nil {
+		if json.Unmarshal(cleaned, &auth) != nil {
 			continue
 		}
 		providers := make(map[string]string)
@@ -538,20 +549,44 @@ func litellmConfiguredKeyForProvider() (string, string, error) {
 		}
 		sort.Strings(names)
 		if len(names) > 1 {
-			return "", "", pollErrf("auth-ambiguous", "multiple LiteLLM credentials are configured")
+			return "", pollErrf("auth-ambiguous", "multiple LiteLLM credentials are configured")
 		}
-		for _, name := range names {
-			entry := auth[providers[name]]
-			if key := strings.TrimSpace(entry.Key); key != "" {
-				return key, name, nil
+		if len(names) == 1 {
+			authProvider = names[0]
+			entry := auth[providers[authProvider]]
+			if k := strings.TrimSpace(entry.Key); k != "" {
+				authKey = k
+			} else if t := strings.TrimSpace(entry.Token); t != "" {
+				authKey = t
+			} else {
+				return "", pollErrf("auth-missing", "configured LiteLLM provider has no usable credential")
 			}
-			if token := strings.TrimSpace(entry.Token); token != "" {
-				return token, name, nil
-			}
-			return "", "", pollErrf("auth-missing", "configured LiteLLM provider has no usable credential")
+			break
 		}
 	}
-	return "", "", pollErrf("auth-missing", "configured LiteLLM provider credential is unavailable")
+
+	if authKey != "" {
+		if authProvider != config.name {
+			return "", pollErrf("auth-mismatch", "LiteLLM credential and provider endpoint are not from the same configured provider")
+		}
+		return authKey, nil
+	}
+
+	if config.name == "litellm" {
+		for _, envVar := range []string{"LITELLM_OC_KEY", "LITELLM_API_KEY", "LITELLM_KEY"} {
+			if v := strings.TrimSpace(os.Getenv(envVar)); v != "" {
+				return v, nil
+			}
+		}
+	} else if config.name == "lazer" {
+		for _, envVar := range []string{"LAZER_API_KEY", "LAZER_KEY"} {
+			if v := strings.TrimSpace(os.Getenv(envVar)); v != "" {
+				return v, nil
+			}
+		}
+	}
+
+	return "", pollErrf("auth-missing", "configured LiteLLM provider credential is unavailable")
 }
 
 func litellmConfiguredProvider() (litellmProviderConfig, error) {
@@ -560,13 +595,14 @@ func litellmConfiguredProvider() (litellmProviderConfig, error) {
 		if err != nil {
 			continue
 		}
+		cleaned := stripJSONC(raw)
 		var document any
-		if json.Unmarshal(raw, &document) != nil {
-			continue
+		if err := json.Unmarshal(cleaned, &document); err != nil {
+			return litellmProviderConfig{}, pollErrf("config-invalid", "OpenCode configuration is malformed: %v", err)
 		}
 		obj, ok := document.(map[string]any)
 		if !ok {
-			continue
+			return litellmProviderConfig{}, pollErrf("config-invalid", "OpenCode configuration root is not an object")
 		}
 		providers, ok := findObjectField(obj, "provider")
 		if !ok {
@@ -586,7 +622,12 @@ func litellmConfiguredProvider() (litellmProviderConfig, error) {
 			if !ok {
 				return litellmProviderConfig{}, pollErrf("config-invalid", "configured LiteLLM provider has no usable base URL")
 			}
-			matches = append(matches, litellmProviderConfig{name: canonical, base: strings.TrimRight(base, "/")})
+			cfgKey := providerConfigKey(value)
+			matches = append(matches, litellmProviderConfig{
+				name: canonical,
+				base: strings.TrimRight(base, "/"),
+				key:  cfgKey,
+			})
 		}
 		if len(matches) > 1 {
 			return litellmProviderConfig{}, pollErrf("config-ambiguous", "multiple LiteLLM provider endpoints are configured")
@@ -596,6 +637,40 @@ func litellmConfiguredProvider() (litellmProviderConfig, error) {
 		}
 	}
 	return litellmProviderConfig{}, pollErrf("config-missing", "configured LiteLLM provider endpoint is unavailable")
+}
+
+func providerConfigKey(value any) string {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	options, ok := findObjectField(obj, "options")
+	if !ok {
+		options = obj
+	}
+	optionsObj, ok := options.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"apiKey", "api_key", "key", "token"} {
+		if val, ok := findObjectField(optionsObj, key); ok {
+			if s, ok := val.(string); ok {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				if strings.HasPrefix(s, "{env:") && strings.HasSuffix(s, "}") {
+					envVar := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(s, "{env:"), "}"))
+					if envVar != "" {
+						return strings.TrimSpace(os.Getenv(envVar))
+					}
+					return ""
+				}
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func findObjectField(obj map[string]any, name string) (any, bool) {
@@ -650,16 +725,136 @@ func litellmManagementURL(base string) (string, error) {
 	return u.String(), nil
 }
 
+func expandPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	} else if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
+func stripJSONC(data []byte) []byte {
+	var out bytes.Buffer
+	inString := false
+	escaped := false
+	n := len(data)
+	for i := 0; i < n; i++ {
+		c := data[i]
+		if inString {
+			out.WriteByte(c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			escaped = false
+			out.WriteByte(c)
+			continue
+		}
+		if c == '/' && i+1 < n {
+			if data[i+1] == '/' {
+				i += 2
+				for i < n && data[i] != '\n' {
+					i++
+				}
+				if i < n {
+					out.WriteByte('\n')
+				}
+				continue
+			}
+			if data[i+1] == '*' {
+				i += 2
+				for i+1 < n && !(data[i] == '*' && data[i+1] == '/') {
+					if data[i] == '\n' {
+						out.WriteByte('\n')
+					}
+					i++
+				}
+				i++
+				continue
+			}
+		}
+		out.WriteByte(c)
+	}
+
+	raw := out.Bytes()
+	out.Reset()
+	inString = false
+	escaped = false
+	m := len(raw)
+	for i := 0; i < m; i++ {
+		c := raw[i]
+		if inString {
+			out.WriteByte(c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			escaped = false
+			out.WriteByte(c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < m && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\n' || raw[j] == '\r') {
+				j++
+			}
+			if j < m && (raw[j] == '}' || raw[j] == ']') {
+				continue
+			}
+		}
+		out.WriteByte(c)
+	}
+	return out.Bytes()
+}
+
 func opencodeConfigFiles() []string {
 	var paths []string
-	if dir := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG_DIR")); dir != "" {
-		paths = append(paths, filepath.Join(dir, "opencode.json"), filepath.Join(dir, "config.json"))
+	if dir := expandPath(os.Getenv("OPENCODE_CONFIG_DIR")); dir != "" {
+		paths = append(paths,
+			filepath.Join(dir, "opencode.json"),
+			filepath.Join(dir, "opencode.jsonc"),
+			filepath.Join(dir, "config.json"),
+		)
 	}
-	if dir := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); dir != "" {
-		paths = append(paths, filepath.Join(dir, "opencode", "opencode.json"), filepath.Join(dir, "opencode", "config.json"))
+	if dir := expandPath(os.Getenv("XDG_CONFIG_HOME")); dir != "" {
+		paths = append(paths,
+			filepath.Join(dir, "opencode", "opencode.json"),
+			filepath.Join(dir, "opencode", "opencode.jsonc"),
+			filepath.Join(dir, "opencode", "config.json"),
+		)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".config", "opencode", "opencode.json"), filepath.Join(home, ".config", "opencode", "config.json"))
+		paths = append(paths,
+			filepath.Join(home, ".config", "opencode", "opencode.json"),
+			filepath.Join(home, ".config", "opencode", "opencode.jsonc"),
+			filepath.Join(home, ".config", "opencode", "config.json"),
+			filepath.Join(home, ".opencode", "opencode.json"),
+			filepath.Join(home, ".opencode", "opencode.jsonc"),
+			filepath.Join(home, ".opencode", "config.json"),
+		)
 	}
 	return paths
 }
@@ -691,11 +886,12 @@ func opencodeGoKey() (string, error) {
 		if err != nil {
 			continue
 		}
+		cleaned := stripJSONC(raw)
 		var auth map[string]struct {
 			Key   string `json:"key"`
 			Token string `json:"token"`
 		}
-		if json.Unmarshal(raw, &auth) != nil {
+		if json.Unmarshal(cleaned, &auth) != nil {
 			return "", pollErrf("decode-failed", "opencode auth decode failed")
 		}
 		entry, ok := auth["opencode-go"]
@@ -715,14 +911,25 @@ func opencodeGoKey() (string, error) {
 
 func opencodeAuthFiles() []string {
 	var paths []string
-	if dir := strings.TrimSpace(os.Getenv("OPENCODE_DATA_DIR")); dir != "" {
-		paths = append(paths, filepath.Join(dir, "auth.json"))
+	if dir := expandPath(os.Getenv("OPENCODE_DATA_DIR")); dir != "" {
+		paths = append(paths,
+			filepath.Join(dir, "auth.json"),
+			filepath.Join(dir, "auth.jsonc"),
+		)
 	}
-	if dir := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); dir != "" {
-		paths = append(paths, filepath.Join(dir, "opencode", "auth.json"))
+	if dir := expandPath(os.Getenv("XDG_DATA_HOME")); dir != "" {
+		paths = append(paths,
+			filepath.Join(dir, "opencode", "auth.json"),
+			filepath.Join(dir, "opencode", "auth.jsonc"),
+		)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".local", "share", "opencode", "auth.json"))
+		paths = append(paths,
+			filepath.Join(home, ".local", "share", "opencode", "auth.json"),
+			filepath.Join(home, ".local", "share", "opencode", "auth.jsonc"),
+			filepath.Join(home, ".opencode", "auth.json"),
+			filepath.Join(home, ".opencode", "auth.jsonc"),
+		)
 	}
 	return paths
 }
