@@ -546,20 +546,19 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, executable, "-nP", "-Ffnp", "+D", resolved)
-	var output limitedOutput
-	output.remaining = maxOutput
-	cmd.Stdout, cmd.Stderr = &output, &output
+	var stdout, stderr limitedOutput
+	stdout.remaining, stderr.remaining = maxOutput, maxOutput
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
-	if output.overflow {
+	if stdout.overflow || stderr.overflow {
 		return ProcessUsage{}, errors.New("lsof output exceeded bound")
 	}
-	var exitErr *exec.ExitError
-	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(output.Bytes()) == 0) {
+	if err != nil && !lsofNoMatch(err, stdout.Bytes(), stderr.Bytes(), resolved) {
 		return ProcessUsage{}, err
 	}
 	seen := make(map[int]struct{})
 	currentPID := 0
-	for _, line := range strings.Split(string(output.Bytes()), "\n") {
+	for _, line := range strings.Split(string(stdout.Bytes()), "\n") {
 		if len(line) < 2 {
 			continue
 		}
@@ -605,6 +604,17 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	}
 	sortInts(usage.PIDs)
 	return usage, nil
+}
+
+// lsof uses exit status 1 for both "no matching open files" and diagnostics
+// from unrelated namespaces/processes. Only the former is an empty census:
+// target-specific diagnostics and every other exit remain observation errors.
+func lsofNoMatch(err error, stdout, stderr []byte, target string) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || len(bytes.TrimSpace(stdout)) != 0 {
+		return false
+	}
+	return !bytes.Contains(stderr, []byte(target))
 }
 
 func listProcessIDs(ctx context.Context) ([]int, error) {

@@ -139,3 +139,19 @@ func TestLSOFProcessInspectorUnusedPrivateDirectory(t *testing.T) {
 		t.Fatalf("unused private directory was treated as referenced: %+v", usage)
 	}
 }
+
+func TestLsofNoMatchDistinguishesNamespaceDiagnostics(t *testing.T) {
+	target := "/private/cache"
+	noMatch := func(t *testing.T, script string, stdout, stderr []byte, want bool) {
+		t.Helper()
+		err := exec.Command("sh", "-c", script).Run()
+		if got := lsofNoMatch(err, stdout, stderr, target); got != want {
+			t.Fatalf("lsofNoMatch(%q, stdout=%q, stderr=%q)=%v, want %v", script, stdout, stderr, got, want)
+		}
+	}
+	noMatch(t, "exit 1", nil, nil, true)
+	noMatch(t, "exit 1", nil, []byte("can't stat unrelated /proc path"), true)
+	noMatch(t, "exit 1", nil, []byte("can't stat /private/cache"), false)
+	noMatch(t, "exit 1", []byte("p123\nf1\n"), nil, false)
+	noMatch(t, "exit 2", nil, nil, false)
+}
