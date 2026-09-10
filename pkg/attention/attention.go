@@ -420,7 +420,7 @@ func RunWithHoldReader(reader lifecycle.HoldReader, repository string) (*Result,
 }
 
 func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
-	return runWithFleet(kick.FetchAgentList, reader, repository, resolver, registry)
+	return runWithFleet(kick.FetchAgentListContext, reader, repository, resolver, registry)
 }
 
 // runWithFleet is the whole body of the scan, with the fleet census injected.
@@ -434,7 +434,7 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 // pkg/kick ALREADY injects exactly this dependency as Options.FetchAgents; a
 // second convention for one rule is the duplicate-rule defect pkg/invariant
 // fails the build on.
-func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
+func runWithFleet(fetchAgents any, reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
 	if reader == nil || strings.TrimSpace(repository) == "" {
 		return nil, fmt.Errorf("herd-attention: durable hold authority and repository identity are required")
 	}
@@ -442,29 +442,38 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 		return nil, fmt.Errorf("herd-attention: a fleet census source is required")
 	}
 
+	var fetchContext func(context.Context) ([]kick.AgentEntry, error)
+	switch fn := fetchAgents.(type) {
+	case func(context.Context) ([]kick.AgentEntry, error):
+		fetchContext = fn
+	case func() ([]kick.AgentEntry, error):
+		fetchContext = func(ctx context.Context) ([]kick.AgentEntry, error) {
+			type fetchResult struct {
+				agents []kick.AgentEntry
+				err    error
+			}
+			ch := make(chan fetchResult, 1)
+			go func() {
+				ag, err := fn()
+				ch <- fetchResult{agents: ag, err: err}
+			}()
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("fleet census timed out: %w", ctx.Err())
+			case res := <-ch:
+				return res.agents, res.err
+			}
+		}
+	default:
+		return nil, fmt.Errorf("herd-attention: invalid census function type: %T", fetchAgents)
+	}
+
 	fleetCtx, fleetCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer fleetCancel()
 
-	// Perform initial census within the aggregate fleet deadline
-	type fetchResult struct {
-		agents []kick.AgentEntry
-		err    error
-	}
-	fetchDone := make(chan fetchResult, 1)
-	go func() {
-		ag, err := fetchAgents()
-		fetchDone <- fetchResult{agents: ag, err: err}
-	}()
-
-	var agents []kick.AgentEntry
-	select {
-	case <-fleetCtx.Done():
-		return nil, fmt.Errorf("herd-attention: fleet census timed out: %w", fleetCtx.Err())
-	case res := <-fetchDone:
-		if res.err != nil {
-			return nil, fmt.Errorf("herd-attention: %w", res.err)
-		}
-		agents = res.agents
+	agents, err := fetchContext(fleetCtx)
+	if err != nil {
+		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
 
 	heldFacts := map[string]string{}
@@ -540,24 +549,15 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 				return nil, fleetCtx.Err()
 			default:
 			}
-			afterDone := make(chan fetchResult, 1)
-			go func() {
-				ag, err := fetchAgents()
-				afterDone <- fetchResult{agents: ag, err: err}
-			}()
-			select {
-			case <-fleetCtx.Done():
-				return nil, fmt.Errorf("fetch agent after export timed out: %w", fleetCtx.Err())
-			case res := <-afterDone:
-				if res.err != nil {
-					return nil, res.err
-				}
-				cur, ok := findAttentionAgent(res.agents, agentName)
-				if !ok {
-					return nil, errors.New("agent not found in current fleet")
-				}
-				return &cur, nil
+			resAgents, err := fetchContext(fleetCtx)
+			if err != nil {
+				return nil, err
 			}
+			cur, ok := findAttentionAgent(resAgents, agentName)
+			if !ok {
+				return nil, errors.New("agent not found in current fleet")
+			}
+			return &cur, nil
 		}
 		ev, sctx, paneText, err := process.ResolveNativeAgentEvidenceWithFence(fleetCtx, fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
 		return ev, sctx, paneText, err

@@ -94,7 +94,6 @@ func runSpin() {
 		if a.PaneID == "" {
 			continue
 		}
-		laneNow := time.Now().UTC()
 		tail, _ := herdr.PaneRead(a.PaneID, *tailLines)
 		pid, procCwd, alive := paneProcessState(a.PaneID)
 
@@ -141,24 +140,26 @@ func runSpin() {
 				return nil, spinCtx.Err()
 			default:
 			}
-			currentAgents, err := herdr.AgentList()
+			currentAgents, err := herdr.AgentListContext(spinCtx)
 			if err != nil {
 				return nil, err
 			}
 			for _, cur := range currentAgents {
 				if cur.Name == name {
 					return &kick.AgentEntry{
-						Name:           cur.Name,
-						Kind:           cur.Kind,
-						Status:         cur.Status,
-						PaneID:         cur.PaneID,
-						TabID:          cur.TabID,
-						TerminalID:     cur.TerminalID,
-						Workspace:      cur.Workspace,
-						Cwd:            cur.Cwd,
-						Revision:       cur.Revision,
-						StateChangeSeq: cur.StateChangeSeq,
-						TabGeneration:  cur.TabGeneration,
+						Name:             cur.Name,
+						Kind:             cur.Kind,
+						Status:           cur.Status,
+						PaneID:           cur.PaneID,
+						TabID:            cur.TabID,
+						TerminalID:       cur.TerminalID,
+						Workspace:        cur.Workspace,
+						Cwd:              cur.Cwd,
+						Revision:         cur.Revision,
+						StateChangeSeq:   cur.StateChangeSeq,
+						TabGeneration:    cur.TabGeneration,
+						ExpectedModel:    cur.ExpectedModel,
+						ExpectedProvider: cur.ExpectedProvider,
 						Session: kick.AgentSession{
 							Value:  cur.Session.Value,
 							Kind:   cur.Session.Kind,
@@ -169,7 +170,7 @@ func runSpin() {
 			}
 			return nil, errors.New("agent not found after export")
 		}
-		ev, sctx, _, _ := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, laneNow, 5*time.Minute)
+		ev, sctx, _, _ := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, time.Time{}, 5*time.Minute)
 		spinCancel()
 
 		target := process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)

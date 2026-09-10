@@ -2,6 +2,7 @@ package attention
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -58,17 +59,19 @@ func TestAttention_RunWithFleet_OpencodeExportFinishLength(t *testing.T) {
 
 	fleet := []kick.AgentEntry{
 		{
-			Name:           "forge-ux-comber",
-			Label:          "ux-comber",
-			Kind:           "opencode",
-			Status:         "done", // Agent status claimed "done", but native export has finish=length
-			PaneID:         "p-ux",
-			TabID:          "t-ux",
-			TerminalID:     "term-ux",
-			Workspace:      "ws-1",
-			Cwd:            worktreeDir,
-			StateChangeSeq: 5,
-			Session:        kick.AgentSession{Value: sessionID},
+			Name:             "forge-ux-comber",
+			Label:            "ux-comber",
+			Kind:             "opencode",
+			Status:           "done", // Agent status claimed "done", but native export has finish=length
+			PaneID:           "p-ux",
+			TabID:            "t-ux",
+			TerminalID:       "term-ux",
+			Workspace:        "ws-1",
+			Cwd:              worktreeDir,
+			StateChangeSeq:   5,
+			ExpectedModel:    model,
+			ExpectedProvider: "litellm",
+			Session:          kick.AgentSession{Value: sessionID},
 		},
 	}
 
@@ -319,13 +322,15 @@ func TestAttention_RunWithFleet_BlockingAfterCensus_ReturnsAtDeadline(t *testing
 		if callCount == 1 {
 			return []kick.AgentEntry{
 				{
-					Name:       "forge-lane-1",
-					Label:      "lane-1",
-					Kind:       "opencode",
-					Status:     "working",
-					PaneID:     "p-1",
-					Session:    kick.AgentSession{Value: sessionID},
-					TerminalID: "term-1",
+					Name:             "forge-lane-1",
+					Label:            "lane-1",
+					Kind:             "opencode",
+					Status:           "working",
+					PaneID:           "p-1",
+					Session:          kick.AgentSession{Value: sessionID},
+					TerminalID:       "term-1",
+					ExpectedModel:    "model",
+					ExpectedProvider: "litellm",
 				},
 			}, nil
 		}
@@ -412,6 +417,112 @@ func TestAttention_RunWithFleet_ModelRouteMismatch_RefusesEvidence(t *testing.T)
 		}
 		if !strings.Contains(item.Reason, "native evidence error") || !strings.Contains(item.Reason, "model mismatch") {
 			t.Errorf("expected reason to contain 'model mismatch', got: %q", item.Reason)
+		}
+	}
+}
+
+func TestAttention_RunWithFleet_ContextCensusCancellation_PropagatesToUnderlyingOperation(t *testing.T) {
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	censusCancelled := make(chan struct{})
+	censusContextAware := func(ctx context.Context) ([]kick.AgentEntry, error) {
+		select {
+		case <-ctx.Done():
+			close(censusCancelled)
+			return nil, ctx.Err()
+		case <-time.After(30 * time.Second):
+			return nil, errors.New("timeout not observed by census")
+		}
+	}
+
+	start := time.Now()
+	_, err = runWithFleet(censusContextAware, callPathReader{}, "repo", resolver, registry)
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "timed out") && !strings.Contains(err.Error(), "cancelled") && !strings.Contains(err.Error(), "context") {
+		t.Fatalf("expected timeout/cancellation error, got: %v", err)
+	}
+
+	// Must unblock within aggregate deadline (~15s)
+	if elapsed > 18*time.Second {
+		t.Errorf("runWithFleet with context-aware census took too long: %v (expected <= 18s)", elapsed)
+	}
+
+	// Ensure census observed cancellation
+	select {
+	case <-censusCancelled:
+		// cancellation was observed directly by the underlying census operation
+	case <-time.After(1 * time.Second):
+		t.Errorf("underlying census did not observe context cancellation")
+	}
+}
+
+func TestAttention_RunWithFleet_UnboundRoute_RefusesEvidence(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":"model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	// Herdr row omits model and provider -> Unbound route
+	fleet := []kick.AgentEntry{
+		{
+			Name:       "forge-lane-1",
+			Label:      "lane-1",
+			Kind:       "opencode",
+			Status:     "working",
+			PaneID:     "p-1",
+			Session:    kick.AgentSession{Value: sessionID},
+			TerminalID: "term-1",
+		},
+	}
+
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	for _, item := range result.Items {
+		if item.Level != LevelMedium {
+			t.Errorf("unbound route must classify as LevelMedium, got: %s", item.Level)
+		}
+		if !strings.Contains(item.Reason, "native evidence error") || !strings.Contains(item.Reason, "unbound model route") {
+			t.Errorf("expected reason to contain 'unbound model route', got: %q", item.Reason)
 		}
 	}
 }

@@ -236,8 +236,9 @@ func TestResolveNativeAgentEvidenceWithFence_BeforeAfterFencing(t *testing.T) {
 		TerminalID:     "term-100",
 		Workspace:      "ws-main",
 		Cwd:            worktreeDir,
-		StateChangeSeq: 10,
-		ExpectedModel:  model,
+		StateChangeSeq:   10,
+		ExpectedModel:    model,
+		ExpectedProvider: "litellm",
 	}
 
 	// 1. Success case: after matches before fence exactly
@@ -534,18 +535,22 @@ func TestResolveNativeAgentEvidenceWithFence_PerLanePostCaptureTimestamp(t *test
 	defer func() { defaultExportRunner = prevRunner }()
 
 	fence := IdentityFence{
-		Name:      "worker",
-		Kind:      "opencode",
-		SessionID: sessionID,
-		Cwd:       "/path/to/worktree",
+		Name:             "worker",
+		Kind:             "opencode",
+		SessionID:        sessionID,
+		Cwd:              "/path/to/worktree",
+		ExpectedModel:    "model",
+		ExpectedProvider: "litellm",
 	}
 
 	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
 		return &kick.AgentEntry{
-			Name:    "worker",
-			Kind:    "opencode",
-			Cwd:     "/path/to/worktree",
-			Session: kick.AgentSession{Value: sessionID},
+			Name:             "worker",
+			Kind:             "opencode",
+			Cwd:              "/path/to/worktree",
+			Session:          kick.AgentSession{Value: sessionID},
+			ExpectedModel:    "model",
+			ExpectedProvider: "litellm",
 		}, nil
 	}
 
@@ -571,6 +576,93 @@ func TestResolveNativeAgentEvidenceWithFence_PerLanePostCaptureTimestamp(t *test
 	}
 }
 
+func TestResolveNativeAgentEvidenceWithFence_UnboundRoute_Rejected(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree","title":"test"},"messages":[
+		{"info":{"id":"u1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a1","sessionID":%q,"role":"assistant","parentID":"u1","providerID":"litellm","modelID":"model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	prevRunner := defaultExportRunner
+	defaultExportRunner = func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	}
+	defer func() { defaultExportRunner = prevRunner }()
+
+	fence := IdentityFence{
+		Name:      "worker",
+		Kind:      "opencode",
+		SessionID: sessionID,
+		Cwd:       "/path/to/worktree",
+		// Omit ExpectedModel and ExpectedProvider -> Unbound route
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:    "worker",
+			Kind:    "opencode",
+			Cwd:     "/path/to/worktree",
+			Session: kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	_, _, _, err := ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "unbound model route") {
+		t.Fatalf("expected unbound model route error, got: %v", err)
+	}
+}
+
+func TestResolveNativeAgentEvidenceWithFence_DelayedExport_CapturedAtAfterFileRead(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree","title":"delayed"},"messages":[
+		{"info":{"id":"u1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a1","sessionID":%q,"role":"assistant","parentID":"u1","providerID":"litellm","modelID":"model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.UnixMilli(), sessionID, now.UnixMilli(), now.Add(100*time.Millisecond).UnixMilli())
+
+	startTime := time.Now().UTC()
+	prevRunner := defaultExportRunner
+	defaultExportRunner = func(_ context.Context, _ string, _ string) ([]byte, error) {
+		time.Sleep(150 * time.Millisecond)
+		return []byte(exportJSON), nil
+	}
+	defer func() { defaultExportRunner = prevRunner }()
+
+	fence := IdentityFence{
+		Name:             "worker",
+		Kind:             "opencode",
+		SessionID:        sessionID,
+		Cwd:              "/path/to/worktree",
+		ExpectedModel:    "model",
+		ExpectedProvider: "litellm",
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:             "worker",
+			Kind:             "opencode",
+			Cwd:              "/path/to/worktree",
+			Session:          kick.AgentSession{Value: sessionID},
+			ExpectedModel:    "model",
+			ExpectedProvider: "litellm",
+		}, nil
+	}
+
+	ev, sctx, _, err := ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, time.Time{}, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ResolveNativeAgentEvidenceWithFence failed: %v", err)
+	}
+
+	// CapturedAt must be after the start time plus delay
+	if ev.CapturedAt.Before(startTime.Add(100 * time.Millisecond)) {
+		t.Errorf("CapturedAt %v was before expected post-export timestamp (startTime %v + 100ms)", ev.CapturedAt, startTime)
+	}
+	if sctx.CapturedAt.Before(startTime.Add(100 * time.Millisecond)) {
+		t.Errorf("sctx.CapturedAt %v was before expected post-export timestamp", sctx.CapturedAt)
+	}
+}
+
 func TestCaptureOpencodeExportLive_OwnedProcessGroupTeardown_NoOrphanDescendants(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "fake-opencode-owned-*")
 	if err != nil {
@@ -578,9 +670,12 @@ func TestCaptureOpencodeExportLive_OwnedProcessGroupTeardown_NoOrphanDescendants
 	}
 	defer os.RemoveAll(tmpDir)
 
-	pidFile := filepath.Join(tmpDir, "child.pid")
+	childPIDFile := filepath.Join(tmpDir, "child.pid")
+	grandchildPIDFile := filepath.Join(tmpDir, "grandchild.pid")
 	fakeBin := filepath.Join(tmpDir, "opencode")
-	scriptContent := fmt.Sprintf("#!/bin/sh\nsleep 60 &\nCHILD_PID=$!\necho $CHILD_PID > %s\nwait\n", pidFile)
+
+	// Script spawns a background child which itself spawns a background grandchild (sleep 60 &)
+	scriptContent := fmt.Sprintf("#!/bin/sh\n(sleep 60 & echo $! > %s; wait) &\nCHILD_PID=$!\necho $CHILD_PID > %s\nwait\n", grandchildPIDFile, childPIDFile)
 	if err := os.WriteFile(fakeBin, []byte(scriptContent), 0755); err != nil {
 		t.Fatalf("write fake opencode script: %v", err)
 	}
@@ -598,7 +693,7 @@ func TestCaptureOpencodeExportLive_OwnedProcessGroupTeardown_NoOrphanDescendants
 	}
 
 	// Read child PID
-	pidBytes, err := os.ReadFile(pidFile)
+	pidBytes, err := os.ReadFile(childPIDFile)
 	if err != nil {
 		t.Fatalf("failed to read child PID file: %v", err)
 	}
@@ -608,21 +703,40 @@ func TestCaptureOpencodeExportLive_OwnedProcessGroupTeardown_NoOrphanDescendants
 		t.Fatalf("invalid child PID %q: %v", childPIDStr, err)
 	}
 
+	// Read grandchild PID
+	gcPIDBytes, err := os.ReadFile(grandchildPIDFile)
+	if err != nil {
+		t.Fatalf("failed to read grandchild PID file: %v", err)
+	}
+	gcPIDStr := strings.TrimSpace(string(gcPIDBytes))
+	gcPID, err := strconv.Atoi(gcPIDStr)
+	if err != nil {
+		t.Fatalf("invalid grandchild PID %q: %v", gcPIDStr, err)
+	}
+
 	// Give a brief window (up to 500ms) to ensure process group SIGKILL completes
 	deadline := time.Now().Add(500 * time.Millisecond)
-	alive := true
+	childAlive := true
+	gcAlive := true
 	for time.Now().Before(deadline) {
-		err := syscall.Kill(childPID, 0)
-		if err != nil {
-			// ESRCH: process does not exist
-			alive = false
+		if childAlive && syscall.Kill(childPID, 0) != nil {
+			childAlive = false
+		}
+		if gcAlive && syscall.Kill(gcPID, 0) != nil {
+			gcAlive = false
+		}
+		if !childAlive && !gcAlive {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	if alive {
+	if childAlive {
 		t.Errorf("child process PID %d is still alive after process group cancellation (orphaned)", childPID)
 		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	}
+	if gcAlive {
+		t.Errorf("grandchild process PID %d is still alive after process group cancellation (orphaned)", gcPID)
+		_ = syscall.Kill(gcPID, syscall.SIGKILL)
 	}
 }

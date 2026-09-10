@@ -445,11 +445,15 @@ func ResolveNativeAgentEvidenceWithFence(ctx context.Context, fence IdentityFenc
 	sctx.CapturedAt = now
 	sctx.Now = now
 
-	// Verify model against expected model if provided
-	if fence.ExpectedModel != "" && ev.Model != fence.ExpectedModel {
+	// Verify model against expected model and provider from trusted authority.
+	// If trusted census omits model/provider route, route is unbound and cannot be accepted.
+	if strings.TrimSpace(fence.ExpectedModel) == "" || strings.TrimSpace(fence.ExpectedProvider) == "" {
+		return nil, sctx, "", errors.New("unbound model route: expected model and provider required from trusted authority")
+	}
+	if ev.Model != fence.ExpectedModel {
 		return nil, sctx, "", fmt.Errorf("model mismatch: expected %q, export has %q", fence.ExpectedModel, ev.Model)
 	}
-	if fence.ExpectedProvider != "" && ev.Provider != fence.ExpectedProvider {
+	if ev.Provider != fence.ExpectedProvider {
 		return nil, sctx, "", fmt.Errorf("provider mismatch: expected %q, export has %q", fence.ExpectedProvider, ev.Provider)
 	}
 

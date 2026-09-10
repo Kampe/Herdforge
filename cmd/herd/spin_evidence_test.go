@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
@@ -41,28 +43,32 @@ func TestSpin_ClassifyTargetWithNativeOpencodeEvidence(t *testing.T) {
 	defer restore()
 
 	fence := process.IdentityFence{
-		Name:           "forge-ux-comber",
-		Kind:           "opencode",
-		SessionID:      sessionID,
-		PaneID:         "pane-1",
-		TabID:          "tab-1",
-		TerminalID:     "term-1",
-		Workspace:      "ws-1",
-		Cwd:            worktreeDir,
-		StateChangeSeq: 10,
+		Name:             "forge-ux-comber",
+		Kind:             "opencode",
+		SessionID:        sessionID,
+		PaneID:           "pane-1",
+		TabID:            "tab-1",
+		TerminalID:       "term-1",
+		Workspace:        "ws-1",
+		Cwd:              worktreeDir,
+		StateChangeSeq:   10,
+		ExpectedModel:    model,
+		ExpectedProvider: "litellm",
 	}
 
 	fetchAfter := func(name string) (*kick.AgentEntry, error) {
 		return &kick.AgentEntry{
-			Name:           "forge-ux-comber",
-			Kind:           "opencode",
-			PaneID:         "pane-1",
-			TabID:          "tab-1",
-			TerminalID:     "term-1",
-			Workspace:      "ws-1",
-			Cwd:            worktreeDir,
-			StateChangeSeq: 10,
-			Session:        kick.AgentSession{Value: sessionID},
+			Name:             "forge-ux-comber",
+			Kind:             "opencode",
+			PaneID:           "pane-1",
+			TabID:            "tab-1",
+			TerminalID:       "term-1",
+			Workspace:        "ws-1",
+			Cwd:              worktreeDir,
+			StateChangeSeq:   10,
+			ExpectedModel:    model,
+			ExpectedProvider: "litellm",
+			Session:          kick.AgentSession{Value: sessionID},
 		}, nil
 	}
 
@@ -166,5 +172,77 @@ func TestSpin_ModelRouteMismatch_RefusesEvidence(t *testing.T) {
 	target := process.ClassifyTargetWithEvidence("p-1", "forge-worker", "working", "some pane text", ev, sctx)
 	if target.Class != process.Unknown {
 		t.Errorf("model mismatch must classify as Unknown, got: %s", target.Class)
+	}
+}
+
+func TestSpin_UnboundRoute_RefusesEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":"model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	// Omit ExpectedModel and ExpectedProvider -> Unbound route
+	fence := process.IdentityFence{
+		Name:      "forge-worker",
+		Kind:      "opencode",
+		SessionID: sessionID,
+		PaneID:    "p-1",
+		Cwd:       "/path/to/worktree",
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:    "forge-worker",
+			Kind:    "opencode",
+			PaneID:  "p-1",
+			Cwd:     "/path/to/worktree",
+			Session: kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	ev, sctx, _, err := process.ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "unbound model route") {
+		t.Fatalf("expected unbound model route error, got: %v", err)
+	}
+
+	target := process.ClassifyTargetWithEvidence("p-1", "forge-worker", "working", "some pane text", ev, sctx)
+	if target.Class != process.Unknown {
+		t.Errorf("unbound route must classify as Unknown, got: %s", target.Class)
+	}
+}
+
+func TestSpin_ContextCancellation_PropagatesToHerdrCensus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled context
+
+	censusCancelled := make(chan struct{})
+	restore := herdr.SetRunHerdrContextForTest(func(c context.Context, args ...string) (string, error) {
+		select {
+		case <-c.Done():
+			close(censusCancelled)
+			return "", c.Err()
+		case <-time.After(5 * time.Second):
+			return "", errors.New("timeout not observed by census runner")
+		}
+	})
+	defer restore()
+
+	_, err := herdr.AgentListContext(ctx)
+	if err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context canceled error, got: %v", err)
+	}
+
+	select {
+	case <-censusCancelled:
+		// cancellation was observed directly by the underlying census runner
+	case <-time.After(1 * time.Second):
+		t.Errorf("underlying herdr runner did not observe context cancellation")
 	}
 }
