@@ -2,10 +2,12 @@ package process
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Classification represents the digest class for an agent's output.
@@ -39,6 +41,58 @@ type Digest struct {
 	MultiPaneTabs []string `json:"multi_pane_tabs,omitempty"`
 }
 
+// TerminalEvidence represents structured current-session provider terminal evidence.
+type TerminalEvidence struct {
+	SessionID    string    `json:"session_id,omitempty"`
+	TurnID       string    `json:"turn_id,omitempty"`
+	Provider     string    `json:"provider,omitempty"`
+	Account      string    `json:"account,omitempty"`
+	Model        string    `json:"model,omitempty"`
+	FinishReason string    `json:"finish_reason,omitempty"`
+	Error        string    `json:"error,omitempty"`
+	Status       string    `json:"status,omitempty"`
+	Timestamp    time.Time `json:"timestamp,omitempty"`
+}
+
+// SessionContext provides the expected session identity and bounded time window.
+type SessionContext struct {
+	SessionID string
+	Now       time.Time
+	MaxAge    time.Duration
+}
+
+// EvaluationResult represents the evaluated state of an agent's terminal output.
+type EvaluationResult struct {
+	Class          Classification `json:"class"`
+	Action         string         `json:"action"`
+	Reason         string         `json:"reason,omitempty"`
+	Blocked        bool           `json:"blocked"`
+	ProviderDeath  bool           `json:"provider_death"`
+	Fresh          bool           `json:"fresh"`
+	SessionMatched bool           `json:"session_matched"`
+	Provider       string         `json:"provider,omitempty"`
+	Account        string         `json:"account,omitempty"`
+	Model          string         `json:"model,omitempty"`
+}
+
+// OutputLimitReason reports whether terminal output indicates the response was
+// cut off due to an output token/length limit (e.g. OpenCode finish=length).
+// Review prose discussing output limits is excluded.
+func OutputLimitReason(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	hasReviewMarker := regexp.MustCompile(`(?i)verdict:\s*|merge recommendation:\s*|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
+	if hasReviewMarker.MatchString(text) {
+		return ""
+	}
+	lengthPat := regexp.MustCompile(`(?i)finish[=_]reason[:=]\s*["']?length["']?|finish=length|output token limit reached|output limit (exceeded|reached|hit)|maximum (context|token|output) length (exceeded|reached)|max(?:imum)? tokens reached|response truncated due to output limit`)
+	if lengthPat.MatchString(text) {
+		return "output token limit reached (finish=length)"
+	}
+	return ""
+}
+
 // classifyText matches herd-process classify_text logic.
 // First-match wins; order encodes priority.
 func classifyText(text string) Classification {
@@ -46,12 +100,20 @@ func classifyText(text string) Classification {
 		return Unknown
 	}
 
-	// QUOTA is a PROVIDER-EXHAUSTION runner signal, NOT review content
+	// 1. QUOTA is a PROVIDER-EXHAUSTION runner signal, NOT review content
 	// that merely discusses rate limiting (CHA-281). Require genuine
 	// exhaustion phrasing AND exclude text carrying review markers.
-	// MUST check QUOTA exclusions before NEEDS_REVIEW/PASS/FAIL, because a
-	// reviewer quoting 429/quota text must NOT match the QUOTA pattern.
-	isQuota := ProviderExhaustionReason(text) != ""
+	// Checked first so an agent that died with a quota failure is not falsely
+	// reported as NEEDS_REVIEW/COMPLETE/PASS from prior turn text.
+	if isQuota := ProviderExhaustionReason(text) != ""; isQuota {
+		return Quota
+	}
+
+	// 2. Output limit truncation (finish=length) must NEVER appear as Complete,
+	// Pass, or NeedsReview. It is incomplete/unknown.
+	if isTruncated := OutputLimitReason(text) != ""; isTruncated {
+		return Unknown
+	}
 
 	if regexp.MustCompile(`(?i)NEEDS_REVIEW|Status:\s*NEEDS_REVIEW`).MatchString(text) {
 		return NeedsReview
@@ -68,9 +130,6 @@ func classifyText(text string) Classification {
 	if regexp.MustCompile(`(?i)Status:\s*BLOCKED|BLOCKED:`).MatchString(text) {
 		return Blocked
 	}
-	if isQuota {
-		return Quota
-	}
 	if regexp.MustCompile(`(?m)^❯\s`).MatchString(text) && !regexp.MustCompile(`(?i)Worked for|Status:`).MatchString(text) {
 		return Unconsumed
 	}
@@ -84,7 +143,7 @@ func ProviderExhaustionReason(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return ""
 	}
-	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|individual quota reached|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)`)
+	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|individual quota reached|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)|account (?:has been |is )?suspended|upstream account suspended|account (?:has been |is )?deactivated|insufficient[_\s]quota|credit balance is too low|402\s+payment\s+required|billing (?:not active|account disabled|hard limit reached)|rate_limit_exceeded|resource_exhausted`)
 	hasReviewMarker := regexp.MustCompile(`(?i)verdict:|merge recommendation:|\bconfirmed\b|\bfindings?\b|reviewing|pass/fail`)
 	if quotaPat.MatchString(text) && !hasReviewMarker.MatchString(text) {
 		return "provider quota or rate limit reported"
@@ -113,6 +172,155 @@ func actionFor(c Classification, isProviderDeath bool) string {
 	default:
 		return "read_pane"
 	}
+}
+
+// EvaluateEvidence evaluates structured terminal evidence alongside pane text.
+func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) EvaluationResult {
+	if ev == nil {
+		c := classifyText(rawText)
+		isPD := CheckProviderDeath(rawText)
+		return EvaluationResult{
+			Class:          c,
+			Action:         actionFor(c, isPD),
+			Blocked:        c == Blocked || c == Quota,
+			ProviderDeath:  isPD || c == Quota,
+			Fresh:          true,
+			SessionMatched: true,
+		}
+	}
+
+	res := EvaluationResult{
+		Provider: ev.Provider,
+		Account:  ev.Account,
+		Model:    ev.Model,
+		Fresh:    true,
+	}
+
+	// 1. Session identity validation
+	if ctx.SessionID != "" && ev.SessionID != "" && ev.SessionID != ctx.SessionID {
+		// Session mismatch: evidence belongs to a different or recycled session.
+		// Unrelated sessions must not cool a provider or interrupt a lane.
+		res.SessionMatched = false
+		c := classifyText(rawText)
+		isPD := CheckProviderDeath(rawText)
+		res.Class = c
+		res.Action = actionFor(c, isPD)
+		res.Reason = fmt.Sprintf("session mismatch: expected %s, got %s", ctx.SessionID, ev.SessionID)
+		return res
+	}
+	res.SessionMatched = true
+
+	// 2. Freshness and bounded lookback validation
+	if !ev.Timestamp.IsZero() && !ctx.Now.IsZero() {
+		maxAge := ctx.MaxAge
+		if maxAge <= 0 {
+			maxAge = 5 * time.Minute
+		}
+		if ctx.Now.Sub(ev.Timestamp) > maxAge || ev.Timestamp.After(ctx.Now.Add(1*time.Minute)) {
+			// Stale history: outside bounded lookback window.
+			res.Fresh = false
+			c := classifyText(rawText)
+			isPD := CheckProviderDeath(rawText)
+			res.Class = c
+			res.Action = actionFor(c, isPD)
+			res.Reason = "stale evidence: outside bounded lookback window"
+			return res
+		}
+	}
+
+	// 3. Evaluate finish_reason: length (output token limit truncation)
+	if strings.EqualFold(ev.FinishReason, "length") || OutputLimitReason(ev.Error) != "" || OutputLimitReason(rawText) != "" {
+		res.Class = Unknown
+		res.Action = "read_pane"
+		res.Reason = "output token limit reached (finish=length)"
+		res.Blocked = false
+		res.ProviderDeath = false
+		return res
+	}
+
+	// 4. Evaluate explicit provider quota/rate-limit/suspension errors
+	exhaustionReason := ""
+	if ev.Error != "" {
+		exhaustionReason = ProviderExhaustionReason(ev.Error)
+		if exhaustionReason == "" && (strings.Contains(strings.ToLower(ev.Error), "quota") || strings.Contains(strings.ToLower(ev.Error), "suspended") || strings.Contains(strings.ToLower(ev.Error), "429")) {
+			exhaustionReason = ev.Error
+		}
+	}
+	if exhaustionReason == "" {
+		exhaustionReason = ProviderExhaustionReason(rawText)
+	}
+
+	if exhaustionReason != "" || strings.EqualFold(ev.FinishReason, "quota") {
+		res.Class = Quota
+		res.Blocked = true
+		res.ProviderDeath = true
+		res.Action = "mark_unavailable_and_reroute"
+		res.Reason = exhaustionReason
+		if res.Reason == "" {
+			res.Reason = "provider quota or rate limit reported"
+		}
+		return res
+	}
+
+	// 5. Check other provider death errors (auth, connection lost, etc.)
+	if CheckProviderDeath(ev.Error) || CheckProviderDeath(rawText) {
+		res.Class = Blocked
+		res.Blocked = true
+		res.ProviderDeath = true
+		res.Action = "provider_death_cooled_reset_aware"
+		res.Reason = "provider death reported"
+		return res
+	}
+
+	// 6. In-flight tool execution vs completion
+	if strings.EqualFold(ev.FinishReason, "tool_use") || strings.EqualFold(ev.FinishReason, "tool_calls") {
+		res.Class = Unknown
+		res.Action = "read_pane"
+		res.Reason = "live tool execution in progress"
+		return res
+	}
+
+	// 7. Successful / normal response evaluation
+	c := classifyText(rawText)
+	if ev.Status != "" && (c == Unknown || c == Unconsumed) {
+		c = classifyText("Status: " + ev.Status)
+	}
+	isPD := CheckProviderDeath(rawText)
+	res.Class = c
+	res.Action = actionFor(c, isPD)
+	return res
+}
+
+// ParseTerminalEvidence attempts to extract structured TerminalEvidence from text.
+// If valid JSON is present with terminal evidence fields, it is parsed and returned.
+func ParseTerminalEvidence(text string) (*TerminalEvidence, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil, errors.New("empty text")
+	}
+
+	// Look for JSON block or object
+	var candidate string
+	if start := strings.Index(trimmed, "{"); start >= 0 {
+		if end := strings.LastIndex(trimmed, "}"); end > start {
+			candidate = trimmed[start : end+1]
+		}
+	}
+
+	if candidate == "" {
+		return nil, errors.New("no JSON object found")
+	}
+
+	var ev TerminalEvidence
+	if err := json.Unmarshal([]byte(candidate), &ev); err != nil {
+		return nil, fmt.Errorf("invalid terminal evidence JSON: %w", err)
+	}
+
+	if ev.SessionID == "" && ev.FinishReason == "" && ev.Error == "" && ev.Provider == "" && ev.Model == "" {
+		return nil, errors.New("JSON does not contain terminal evidence fields")
+	}
+
+	return &ev, nil
 }
 
 // tail extracts the last N lines, collapsed, truncated for display.
@@ -174,6 +382,19 @@ func ClassifyTarget(paneID, name, status, text string) Target {
 	return t
 }
 
+// ClassifyTargetWithEvidence processes agent pane text with structured evidence and produces a Target digest.
+func ClassifyTargetWithEvidence(paneID, name, status, text string, ev *TerminalEvidence, ctx SessionContext) Target {
+	res := EvaluateEvidence(ev, ctx, text)
+	return Target{
+		PaneID: paneID,
+		Name:   name,
+		Status: status,
+		Class:  res.Class,
+		Action: res.Action,
+		Tail:   tail(text, 8, 220),
+	}
+}
+
 // CheckProviderDeath checks if pane text indicates a provider death scenario.
 // Mirrors herd_pane_provider_death from herd-lib.zsh.
 func CheckProviderDeath(text string) bool {
@@ -181,13 +402,14 @@ func CheckProviderDeath(text string) bool {
 		return false
 	}
 	// Provider death signatures: connection lost, auth expired, provider error,
-	// model unavailable, API key invalid, etc.
+	// model unavailable, API key invalid, upstream account suspended, etc.
 	patterns := []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(connection|session).{0,20}(lost|closed|reset|timed out|terminated|refused)`),
 		regexp.MustCompile(`(?i)(auth|token|api.key|credential).{0,20}(expired|invalid|revoked|unauthorized|denied)`),
 		regexp.MustCompile(`(?i)provider.{0,20}(error|unavailable|not.?found|decommissioned|removed)`),
 		regexp.MustCompile(`(?i)model.{0,20}(unavailable|not.?found|deprecated|removed)`),
 		regexp.MustCompile(`(?i)(herdr|harness).{0,20}(exit|crash|fatal|panic|segfault)`),
+		regexp.MustCompile(`(?i)(upstream\s+account\s+suspended|account\s+suspended|account\s+deactivated)`),
 	}
 	for _, p := range patterns {
 		if p.MatchString(text) {
@@ -210,6 +432,9 @@ func Selftest() error {
 		{"Status: COMPLETE", Complete},
 		{"weekly quota exceeded", Quota},
 		{"Error: usage limit reached; resets in 3h", Quota},
+		{"OpenCode finish=length", Unknown},
+		{"Status: COMPLETE\nfinish_reason: length", Unknown},
+		{"Fireworks upstream account suspended", Quota},
 		// CHA-281: review content quoting rate-limit/429 must NOT match QUOTA
 		{"CONFIRMED: the rate limit exceeded path returns 429; quota bucket exceeded branch is covered", Unknown},
 		{"The endpoint enforces a rate limit of 100/s and returns 429 on quota bucket overflow; capacity envelope holds", Unknown},
@@ -230,6 +455,7 @@ func Selftest() error {
 		{"connection lost to provider", true},
 		{"auth token expired", true},
 		{"model unavailable for deployment", true},
+		{"Fireworks upstream account suspended", true},
 		{"Verdict: PASS", false},
 		{"normal agent output here", false},
 	}
