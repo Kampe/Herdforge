@@ -3,6 +3,7 @@ package worktree
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -69,7 +70,7 @@ func TestPoolGCRefusesUnregisteredDirectory(t *testing.T) {
 	}
 	writePoolState(t, poolRoot, poolState{Version: 1, Slots: []PoolSlot{{Name: "pool-01", Path: decoy}}})
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "registered git worktree") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "registered git worktree") {
 		t.Fatalf("GC error = %v, want refusal for unregistered directory", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -103,7 +104,7 @@ func TestPoolGCRefusesPathOutsidePoolRoot(t *testing.T) {
 	// un-normalized relative slot.Path could take.
 	writePoolState(t, poolRoot, poolState{Version: 1, Slots: []PoolSlot{{Name: "pool-01", Path: "outside-secret"}}})
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "outside the pool root") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "outside the pool root") {
 		t.Fatalf("GC error = %v, want refusal for path outside pool root", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -135,7 +136,7 @@ func TestPoolGCRefusesSymlinkSlot(t *testing.T) {
 	}
 	writePoolState(t, poolRoot, poolState{Version: 1, Slots: []PoolSlot{{Name: "pool-01", Path: slotPath}}})
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "symlink") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("GC error = %v, want refusal for symlinked slot", err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
@@ -159,7 +160,7 @@ func TestPoolGCRefusesDirtyUntrackedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "dirty") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "dirty") {
 		t.Fatalf("GC error = %v, want dirty refusal", err)
 	}
 	if _, err := os.Stat(slotPath); err != nil {
@@ -199,7 +200,7 @@ func TestPoolGCRefusesIgnoredContent(t *testing.T) {
 		t.Fatalf("precondition: gitClean should report clean for ignored-only content, clean=%v err=%v", clean, err)
 	}
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "dirty") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "dirty") {
 		t.Fatalf("GC error = %v, want refusal for ignored content", err)
 	}
 	if _, err := os.Stat(slotPath); err != nil {
@@ -229,7 +230,7 @@ func TestPoolGCRefusesHeadNotReachableFromBase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "not reachable from base") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "not reachable from base") {
 		t.Fatalf("GC error = %v, want refusal for HEAD not reachable from base", err)
 	}
 	if _, err := os.Stat(slotPath); err != nil {
@@ -249,7 +250,7 @@ func TestPoolGCRefusesWhileAnySlotLeased(t *testing.T) {
 		t.Fatalf("Lease: %v", err)
 	}
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "leased") {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err == nil || !strings.Contains(err.Error(), "leased") {
 		t.Fatalf("GC error = %v, want refusal while a slot is leased", err)
 	}
 	slots, err := pool.Slots()
@@ -304,7 +305,7 @@ func TestPoolGCRealCensusReclaimsGenuinelyOwnerlessSlot(t *testing.T) {
 	if err != nil || len(slots) != 1 {
 		t.Fatalf("precondition: 1 clean slot, got %d err=%v", len(slots), err)
 	}
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("genuinely ownerless clean slot must be reclaimable by the real census path: %v", err)
 	}
 	if _, statErr := os.Stat(slots[0].Path); !os.IsNotExist(statErr) {
@@ -326,7 +327,7 @@ func TestPoolGCSucceedsAndLeavesPoolConsistentForEnsure(t *testing.T) {
 		t.Fatalf("precondition: 2 clean slots, got %d err=%v", len(before), err)
 	}
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("GC on clean, unleased, registered slots must succeed: %v", err)
 	}
 	for _, s := range before {
@@ -427,7 +428,7 @@ func TestPoolGCRefusesUnleasedSlotWithOwnedLiveProcess(t *testing.T) {
 		return resources.ProcessUsage{CWD: true, PIDs: pids}, nil
 	})
 
-	err = pool.GC(context.Background(), allowAllRetirementAuthority{})
+	_, err = pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "live process") {
 		t.Fatalf("GC error = %v, want live-process refusal", err)
 	}
@@ -479,7 +480,7 @@ func TestPoolGCDefaultCensusRefusesLiveProcessWithOwnerEvidence(t *testing.T) {
 	t.Setenv("FAKE_PS_CHILD_PID", strconv.Itoa(child.Process.Pid))
 	t.Setenv("FAKE_PS_COMMAND_LINE", "sh -c cd-and-sleep "+slotPath)
 
-	err := pool.GC(context.Background(), allowAllRetirementAuthority{})
+	_, err := pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "live process owns or references") {
 		t.Fatalf("default native census error = %v, want explicit owner refusal", err)
 	}
@@ -500,7 +501,7 @@ func TestPoolGCRefusesUnknownProcessCensus(t *testing.T) {
 		return resources.ProcessUsage{MetadataUnavailable: true}, nil
 	})
 
-	err := pool.GC(context.Background(), allowAllRetirementAuthority{})
+	_, err := pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "metadata unavailable") {
 		t.Fatalf("GC error = %v, want fail-closed census refusal", err)
 	}
@@ -522,7 +523,7 @@ func TestPoolGCCleanInjectedCensusRemovesAndEnsureRebuilds(t *testing.T) {
 		return resources.ProcessUsage{}, nil
 	})
 
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("clean ownerless GC: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(pool.Root, "pool-01")); !os.IsNotExist(err) {
@@ -550,7 +551,7 @@ func TestPoolGCRefusesPositiveExitOneWithoutDescriptorName(t *testing.T) {
 	}
 	pool.ProcessInspector = resources.LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
 
-	err := pool.GC(context.Background(), allowAllRetirementAuthority{})
+	_, err := pool.GC(context.Background(), allowAllRetirementAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "metadata unavailable") {
 		t.Fatalf("GC error = %v, want fail-closed census refusal on partial positive exit 1", err)
 	}
@@ -582,7 +583,7 @@ func TestPoolGCRefusesNilRetirementAuthority(t *testing.T) {
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if err := pool.GC(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "retirement-evidence authority") {
+	if _, err := pool.GC(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "retirement-evidence authority") {
 		t.Fatalf("nil authority must refuse GC outright, got err=%v", err)
 	}
 	slots, err := pool.Slots()
@@ -611,7 +612,7 @@ func TestPoolGCRefusesPoolUnderUnconfirmedRetirementEvidence(t *testing.T) {
 	}
 	authority := NewManifestRetirementAuthority(root, manifestPath, journalPath)
 
-	if err := pool.GC(context.Background(), authority); err == nil || !strings.Contains(err.Error(), "retirement evidence") {
+	if _, err := pool.GC(context.Background(), authority); err == nil || !strings.Contains(err.Error(), "retirement evidence") {
 		t.Fatalf("pool under unconfirmed retirement evidence must be refused, got err=%v", err)
 	}
 	slots, err := pool.Slots()
@@ -623,7 +624,7 @@ func TestPoolGCRefusesPoolUnderUnconfirmedRetirementEvidence(t *testing.T) {
 	if err := os.WriteFile(journalPath, []byte(`{"pool":".herd/pool","generation":"g1","candidate_sha":"c1","reviewer":"r1","binding_digest":"b1","phase":"complete"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.GC(context.Background(), authority); err != nil {
+	if _, err := pool.GC(context.Background(), authority); err != nil {
 		t.Fatalf("pool with every manifested generation complete must be reclaimable: %v", err)
 	}
 	if _, statErr := os.Stat(slots[0].Path); !os.IsNotExist(statErr) {
@@ -680,7 +681,7 @@ func TestPoolGCRefusesPoolAbsentFromManifest(t *testing.T) {
 	}
 	authority := NewManifestRetirementAuthority(root, manifestPath, journalPath)
 
-	if err := pool.GC(context.Background(), authority); err == nil || !strings.Contains(err.Error(), "not automatically disposable") {
+	if _, err := pool.GC(context.Background(), authority); err == nil || !strings.Contains(err.Error(), "not automatically disposable") {
 		t.Fatalf("pool absent from the manifest must refuse GC, got err=%v", err)
 	}
 	slots, err := pool.Slots()
@@ -754,7 +755,7 @@ func TestPoolGCReplacementAtDestructiveBoundarySurvives(t *testing.T) {
 		return nil
 	}
 
-	gcErr := pool.GC(context.Background(), allowAllRetirementAuthority{})
+	_, gcErr := pool.GC(context.Background(), allowAllRetirementAuthority{})
 
 	// No removal may be claimed for a pass that met a replacement at the
 	// destructive boundary.
@@ -791,5 +792,172 @@ func TestPoolGCReplacementAtDestructiveBoundarySurvives(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".gc-quarantine-") {
 			t.Fatalf("refused pass must not park a quarantine dir: %s", e.Name())
 		}
+	}
+}
+
+// writeTrackedPayload commits a tracked payload file of at least sizeKiB
+// into the repository's main branch BEFORE the slot is ensured, so the
+// seeded slot carries real on-disk bytes that are clean and reachable (a
+// commit made inside the detached slot would be unreachable and correctly
+// refused as unique work).
+func writeTrackedPayload(t *testing.T, repoRoot string, sizeKiB int) {
+	t.Helper()
+	payload := filepath.Join(repoRoot, "payload.bin")
+	buf := make([]byte, sizeKiB*1024)
+	for i := range buf {
+		buf[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(payload, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "payload.bin"}, {"commit", "-m", "payload"}} {
+		cmd := exec.Command("git", append([]string{"-C", repoRoot}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, strings.TrimSpace(string(out)))
+		}
+	}
+}
+
+// TestPoolGCDestructiveReclaimDeletesPayloadAndReportsBytes is the permanent
+// positive reclaim proof: a successful GC must ACTUALLY delete the
+// authorized owned payload from disk, verify the deletion by readback, and
+// report the measured byte count -- never claim success over bytes that are
+// merely parked.
+func TestPoolGCDestructiveReclaimDeletesPayloadAndReportsBytes(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	writeTrackedPayload(t, root, 100)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("precondition: 1 clean slot, got %d err=%v", len(slots), err)
+	}
+
+	reports, gcErr := pool.GC(context.Background(), allowAllRetirementAuthority{})
+	if gcErr != nil {
+		t.Fatalf("authorized clean slot must be reclaimable: %v", gcErr)
+	}
+	if len(reports) != 1 || !reports[0].Removed {
+		t.Fatalf("reclaim must report Removed, got %+v", reports)
+	}
+	if reports[0].ReclaimedBytes < 100*1024 {
+		t.Fatalf("reclaim must report the measured payload bytes, got %d", reports[0].ReclaimedBytes)
+	}
+	// Readback: the payload is gone from disk -- no quarantine parking, no
+	// slot directory, no stale registration.
+	if _, statErr := os.Lstat(slots[0].Path); !os.IsNotExist(statErr) {
+		t.Fatalf("slot payload must be deleted from disk, stat err=%v", statErr)
+	}
+	matches, readErr := filepath.Glob(filepath.Join(root, ".herd", "pool", ".gc-quarantine-*"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("successful reclaim must leave no parked payload: %v", matches)
+	}
+	listed, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").CombinedOutput()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if strings.Contains(string(listed), slots[0].Path) {
+		t.Fatalf("successful reclaim must remove the registration: %s", string(listed))
+	}
+	if after, err := pool.Slots(); err != nil || len(after) != 0 {
+		t.Fatalf("pool state must record the removal, slots=%d err=%v", len(after), err)
+	}
+}
+
+// TestPoolGCDisposalFailureRetainsBytesAndReports pins the failure path: a
+// disposal failure after quarantine must report a RETAINED slot with its
+// measured bytes preserved on disk and git metadata rolled back -- never a
+// success over parked bytes.
+func TestPoolGCDisposalFailureRetainsBytesAndReports(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	writeTrackedPayload(t, root, 50)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("precondition: 1 clean slot, got %d err=%v", len(slots), err)
+	}
+	before, statErr := os.Stat(slots[0].Path)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+
+	pool.OnQuarantined = func(string) error { return errors.New("injected disposal failure") }
+	reports, gcErr := pool.GC(context.Background(), allowAllRetirementAuthority{})
+	if gcErr == nil || !strings.Contains(gcErr.Error(), "retained slot") || !strings.Contains(gcErr.Error(), "bytes on disk") {
+		t.Fatalf("disposal failure must report retained-with-bytes, got reports=%+v err=%v", reports, gcErr)
+	}
+	if len(reports) != 1 || reports[0].Removed {
+		t.Fatalf("failed disposal must report Removed=false, got %+v", reports)
+	}
+	if reports[0].ReclaimedBytes < 50*1024 {
+		t.Fatalf("retained report must carry the measured preserved bytes, got %d", reports[0].ReclaimedBytes)
+	}
+	// Readback: the payload is still on disk at the original path, same
+	// directory identity (atomic rollback), registration intact.
+	after, statErr := os.Stat(slots[0].Path)
+	if statErr != nil {
+		t.Fatalf("retained slot payload must survive on disk, stat err=%v", statErr)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("retained slot must be the same directory (rolled back, not rebuilt)")
+	}
+	if _, statErr := os.Lstat(filepath.Join(slots[0].Path, "payload.bin")); statErr != nil {
+		t.Fatalf("retained payload file must be intact, stat err=%v", statErr)
+	}
+	listed, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").CombinedOutput()
+	if listErr != nil || !strings.Contains(string(listed), slots[0].Path) {
+		t.Fatalf("retained slot registration must stay consistent: %v (%s)", listErr, strings.TrimSpace(string(listed)))
+	}
+	if afterSlots, err := pool.Slots(); err != nil || len(afterSlots) != 1 {
+		t.Fatalf("retained slot must stay in pool state, slots=%d err=%v", len(afterSlots), err)
+	}
+}
+
+// TestPoolGCPreservesUnrelatedStaleRegistration pins that GC never runs a
+// repository-wide prune: a stale registration belonging to an unrelated,
+// already-deleted worktree must survive a pool GC untouched.
+func TestPoolGCPreservesUnrelatedStaleRegistration(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	// An unrelated worktree whose directory is deleted behind git's back:
+	// exactly the stale metadata a repository-wide prune would sweep away.
+	unrelated := filepath.Join(root, "unrelated-lane")
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "--detach", unrelated, "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if err := os.RemoveAll(unrelated); err != nil {
+		t.Fatal(err)
+	}
+
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if reports, gcErr := pool.GC(context.Background(), allowAllRetirementAuthority{}); gcErr != nil || len(reports) != 1 || !reports[0].Removed {
+		t.Fatalf("precondition: clean slot must reclaim, reports=%+v err=%v", reports, gcErr)
+	}
+
+	listed, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").CombinedOutput()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if !strings.Contains(string(listed), unrelated) {
+		t.Fatalf("GC must not sweep unrelated stale registrations (no repository-wide prune): %s", string(listed))
 	}
 }

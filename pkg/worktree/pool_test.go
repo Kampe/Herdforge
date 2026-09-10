@@ -129,7 +129,7 @@ func TestPoolGCSucceedsWithoutClaimLeaseHistory(t *testing.T) {
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
+	if _, err := pool.GC(context.Background(), allowAllRetirementAuthority{}); err != nil {
 		t.Fatalf("GC on an unleased, never-pkg/claim-tracked pool slot must succeed, got: %v", err)
 	}
 }

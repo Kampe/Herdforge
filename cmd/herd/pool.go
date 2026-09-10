@@ -106,8 +106,20 @@ func runPool() {
 			}
 			return
 		}
-		if err := p.GC(ctx, gcAuthority); err != nil {
-			fmt.Fprintf(os.Stderr, "herd pool gc: %v\n", err)
+		reports, gcErr := p.GC(ctx, gcAuthority)
+		for _, r := range reports {
+			if r.Removed {
+				fmt.Printf("RECLAIMED\t%s\t%d\n", r.Slot, r.ReclaimedBytes)
+				continue
+			}
+			if r.ParkedAt != "" {
+				fmt.Printf("PENDING\t%s\t%d\t%s\n", r.Slot, r.ReclaimedBytes, r.ParkedAt)
+				continue
+			}
+			fmt.Printf("RETAINED\t%s\t%d\t%s\n", r.Slot, r.ReclaimedBytes, r.Reason)
+		}
+		if gcErr != nil {
+			fmt.Fprintf(os.Stderr, "herd pool gc: %v\n", gcErr)
 			os.Exit(1)
 		}
 	case "list":

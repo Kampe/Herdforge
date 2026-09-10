@@ -71,6 +71,12 @@ type Pool struct {
 	// be watched RED against the previous direct-removal behavior and GREEN
 	// after the fix, instead of trusting a microscopic timing window.
 	OnDestructiveBoundary func(slotPath string) error
+	// OnQuarantined is a test seam fired after the verified directory has
+	// been moved into quarantine and its identity proven, but before git's
+	// repair-and-disposal steps. Production leaves it nil. It deterministically
+	// injects disposal failure so the retained-with-bytes reporting path is
+	// exercisable without depending on git faults.
+	OnQuarantined func(quarantinePath string) error
 }
 
 func NewPool(repoRoot, root string, size int) *Pool {
@@ -525,14 +531,62 @@ type SlotRetirementAuthority interface {
 	AuthorizePoolRoot(poolRootAbs string) error
 }
 
-// GC removes every slot the verification proves safe. The authority must be
-// non-nil; absent or ambiguous retirement evidence refuses the whole pass
-// rather than guessing safe.
-func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) error {
+// GCReclaimReport is the per-slot readback of one destructive GC pass. A
+// successful reclaim carries the payload bytes actually measured and
+// verified gone from disk; a retained or pending slot carries the bytes
+// preserved on disk and where they are parked, never a silent success.
+type GCReclaimReport struct {
+	Slot           string
+	Path           string
+	Removed        bool
+	ReclaimedBytes int64
+	ParkedAt       string
+	Reason         string
+}
+
+// maxPayloadWalkBytes bounds the payload measurement walk. A slot whose
+// payload exceeds it is retained (refused) rather than reclaimed
+// unmeasured.
+const maxPayloadWalkBytes = 1 << 30
+
+// walkPayload measures the on-disk payload of a slot directory with a hard
+// budget. The measurement is what the reclaim readback is held against:
+// success must prove exactly this many bytes were actually deleted.
+func walkPayload(root string, maxBytes int64) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		if total > maxBytes {
+			return fmt.Errorf("payload exceeds the %d-byte measurement bound, refusing to reclaim unmeasured", maxBytes)
+		}
+		return nil
+	})
+	return total, err
+}
+
+// GC removes every slot the verification proves safe and returns the
+// per-slot reclaim readback. The authority must be non-nil; absent or
+// ambiguous retirement evidence refuses the whole pass rather than guessing
+// safe. A nil error never hides retained bytes: every slot whose payload
+// was not verifiably deleted reports Removed=false with its bytes and
+// parking location preserved.
+func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) ([]GCReclaimReport, error) {
 	if authority == nil {
-		return errors.New("worktree pool: gc refused without a retirement-evidence authority")
+		return nil, errors.New("worktree pool: gc refused without a retirement-evidence authority")
 	}
-	return p.withLock(func() error {
+	var reports []GCReclaimReport
+	err := p.withLock(func() error {
+		reports = nil
 		state, err := p.readState()
 		if err != nil {
 			return err
@@ -547,19 +601,25 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) error 
 			if !ok {
 				continue
 			}
+			report := GCReclaimReport{Slot: slot.Name, Path: candidate.path}
+			reports = append(reports, report)
+			reportIndex := len(reports) - 1
 			// The retirement-evidence fence is enforced here, at the single
 			// destructive boundary, for every caller alike.
 			poolRootAbs := filepath.Dir(candidate.path)
 			if err := authority.AuthorizePoolRoot(poolRootAbs); err != nil {
+				reports[reportIndex].Reason = err.Error()
 				return fmt.Errorf("worktree pool: gc refused for slot %s: %w", slot.Name, err)
 			}
 			// Re-verify this one slot immediately before removing it: the
 			// full-set pass above proves nothing about state a moment later.
 			latest, err := p.verifyGCCandidate(ctx, slot)
 			if err != nil {
+				reports[reportIndex].Reason = err.Error()
 				return fmt.Errorf("worktree pool: gc refused for slot %s immediately before removal: %w", slot.Name, err)
 			}
 			if err := candidate.sameIdentity(latest); err != nil {
+				reports[reportIndex].Reason = err.Error()
 				return fmt.Errorf("worktree pool: gc refused for slot %s immediately before removal: %w", slot.Name, err)
 			}
 			// Test seam at the destructive boundary: production leaves it
@@ -567,67 +627,143 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) error 
 			// verification and destruction is deterministically exercisable.
 			if p.OnDestructiveBoundary != nil {
 				if err := p.OnDestructiveBoundary(candidate.path); err != nil {
+					reports[reportIndex].Reason = err.Error()
 					return fmt.Errorf("worktree pool: gc refused for slot %s at the destructive boundary: %w", slot.Name, err)
 				}
 			}
-			// Destructive protocol: git never acts on a path a replacement
-			// could occupy. The verified directory itself is atomically
-			// renamed into a private quarantine under the same pool
-			// directory (same filesystem, one syscall -- exclusive ownership
-			// of the exact inode just verified), the quarantine entry is
-			// proven to be that same inode, and only then is the now-vacant
-			// registration cleaned up through git. If the quarantined
-			// identity does not match -- the path was replaced between the
-			// gate and the move, so the racer's directory was moved instead
-			// -- the move is rolled back atomically and the pass refuses:
-			// the replacement's content survives untouched and git metadata
-			// stays consistent. The protocol never deletes content directly
-			// and has no RemoveAll fallback: the atomic move is the
-			// destruction boundary, and a crash parks the directory in
-			// quarantine instead of losing it (the next pass refuses the
-			// missing path; recovery of parked quarantine dirs is a
-			// root-owned action).
+			// Measure the payload before anything moves: the reclaim
+			// readback is held against exactly this many bytes, and every
+			// retained/pending report names the bytes it preserved.
+			payloadBytes, measureErr := walkPayload(candidate.path, maxPayloadWalkBytes)
+			if measureErr != nil {
+				reports[reportIndex].Reason = measureErr.Error()
+				return fmt.Errorf("worktree pool: gc refused for slot %s: %w", slot.Name, measureErr)
+			}
+			reports[reportIndex].ReclaimedBytes = payloadBytes
+			// Destructive protocol, using git's own exact move/removal
+			// contract -- never a repository-wide prune, never a direct
+			// RemoveAll: the verified directory is atomically renamed into
+			// a private quarantine under the same pool directory (one
+			// syscall, same filesystem -- exclusive ownership of the exact
+			// inode just verified and measured), the quarantine entry is
+			// proven to be that same inode, and then the registration is
+			// moved to the quarantine path with `git worktree repair` and
+			// the payload deleted by `git worktree remove` itself, which
+			// removes the registered directory it just accepted. If the
+			// quarantined identity does not match -- the path was replaced
+			// between the gate and the move, so the racer's directory was
+			// moved instead -- the move is rolled back atomically and the
+			// pass refuses: the replacement's content survives untouched
+			// and git metadata stays consistent. A crash at any point
+			// leaves the payload parked in quarantine and the slot path
+			// absent, which the next pass refuses (retained, bytes
+			// preserved); recovery of parked quarantine dirs is a
+			// root-owned action.
 			quarantine := filepath.Join(p.Root, fmt.Sprintf(".gc-quarantine-%s-%d", slot.Name, p.Now().UnixNano()))
 			if err := os.Rename(candidate.path, quarantine); err != nil {
+				reports[reportIndex].Reason = fmt.Sprintf("quarantine move failed: %v", err)
 				return fmt.Errorf("worktree pool: gc refused for slot %s: quarantine move failed: %w", slot.Name, err)
+			}
+			rollback := func() error {
+				if restoreErr := os.Rename(quarantine, candidate.path); restoreErr != nil {
+					reports[reportIndex].ParkedAt = quarantine
+					reports[reportIndex].Reason = fmt.Sprintf("rollback failed (%v); %d bytes parked at %s", restoreErr, payloadBytes, quarantine)
+					return fmt.Errorf("worktree pool: slot %s rollback failed (%v); %d bytes parked at %s for root recovery", slot.Name, restoreErr, payloadBytes, quarantine)
+				}
+				return nil
 			}
 			quarantined, statErr := os.Lstat(quarantine)
 			if statErr != nil || !os.SameFile(candidate.info, quarantined) {
 				// The verified directory was replaced between the gate and
 				// the move; give the replacement its directory back, byte
-				// for byte, and refuse. The rename back is atomic; if the
-				// path is meanwhile re-occupied, park the quarantine dir
-				// and fail loudly rather than deleting anything.
-				if restoreErr := os.Rename(quarantine, candidate.path); restoreErr != nil {
-					return fmt.Errorf("worktree pool: slot %s identity changed inside quarantine and rollback failed (%v); directory parked at %s for root recovery", slot.Name, restoreErr, quarantine)
+				// for byte, and refuse.
+				if err := rollback(); err != nil {
+					return err
 				}
+				reports[reportIndex].Reason = "path was replaced at the destructive boundary; replacement preserved in place"
 				return fmt.Errorf("worktree pool: gc refused for slot %s: path was replaced at the destructive boundary; replacement preserved in place", slot.Name)
 			}
-			// The slot path is now vacant and git's registration for it is
-			// stale. git answers "no longer exists"/"is not a working tree"
-			// for the registered-but-gone path; `worktree prune` then
-			// removes the stale registration -- metadata only, never
-			// content, and only for directories that are already gone.
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", candidate.path)
-			out, removeErr := boundedCombinedOutput(cmd, maxGitOutputBytes)
-			if removeErr != nil && !strings.Contains(out, "is not a working tree") && !strings.Contains(out, "no longer exists") {
-				// Preserve the quarantined content and report the git
-				// failure: nothing is deleted, the directory stays parked.
-				return fmt.Errorf("worktree pool: remove %s: %v (%s); content parked at %s", slot.Name, removeErr, strings.TrimSpace(out), quarantine)
-			}
-			prune := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "prune")
-			if out, pruneErr := boundedCombinedOutput(prune, maxGitOutputBytes); pruneErr != nil {
-				return fmt.Errorf("worktree pool: prune registration for %s: %v (%s); content parked at %s", slot.Name, pruneErr, strings.TrimSpace(out), quarantine)
-			}
-			if info, statErr := os.Lstat(candidate.path); statErr == nil {
-				if !os.SameFile(candidate.info, info) {
-					return fmt.Errorf("worktree pool: slot %s path was replaced after git removal; preserving it", slot.Name)
+			// Test seam inside quarantine, after identity verification and
+			// before git disposal: the deterministic injection point for
+			// disposal failure (production leaves it nil).
+			if p.OnQuarantined != nil {
+				if err := p.OnQuarantined(quarantine); err != nil {
+					if rbErr := rollback(); rbErr != nil {
+						return rbErr
+					}
+					reports[reportIndex].Reason = fmt.Sprintf("quarantine disposal failed: %v", err)
+					return fmt.Errorf("worktree pool: gc retained slot %s with %d bytes on disk: quarantine disposal failed: %w", slot.Name, payloadBytes, err)
 				}
-				return fmt.Errorf("worktree pool: slot %s remained after git removal; preserving it", slot.Name)
+			}
+			// Adopt the moved registration: git re-points its own metadata
+			// at the quarantine path -- an exact, scoped operation on this
+			// one worktree, never repository-wide.
+			repair := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "repair", quarantine)
+			out, repairErr := boundedCombinedOutput(repair, maxGitOutputBytes)
+			if repairErr != nil {
+				if err := rollback(); err != nil {
+					return err
+				}
+				// The repair moved git's pointer; moving the directory back
+				// left it stale again -- re-point it at the original path.
+				back := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "repair", candidate.path)
+				if _, backErr := boundedCombinedOutput(back, maxGitOutputBytes); backErr != nil {
+					reports[reportIndex].ParkedAt = quarantine
+					reports[reportIndex].Reason = fmt.Sprintf("registration re-point failed: %v; %d bytes at %s", backErr, payloadBytes, quarantine)
+					return fmt.Errorf("worktree pool: slot %s registration re-point failed (%v); %d bytes parked at %s", slot.Name, backErr, payloadBytes, quarantine)
+				}
+				reports[reportIndex].Reason = fmt.Sprintf("worktree repair failed: %v (%s)", repairErr, strings.TrimSpace(out))
+				return fmt.Errorf("worktree pool: gc retained slot %s with %d bytes on disk: worktree repair failed: %v (%s)", slot.Name, payloadBytes, repairErr, strings.TrimSpace(out))
+			}
+			// git's own removal contract deletes the registered directory
+			// it just accepted -- the destructive step is git's, on the
+			// quarantine path this pass exclusively owns.
+			dispose := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", quarantine)
+			out, disposeErr := boundedCombinedOutput(dispose, maxGitOutputBytes)
+			if disposeErr != nil {
+				// Roll the registration back to the original path, restore
+				// the directory, and report a retained slot -- bytes
+				// preserved, never a silent success.
+				if err := rollback(); err != nil {
+					return err
+				}
+				back := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "repair", candidate.path)
+				if _, backErr := boundedCombinedOutput(back, maxGitOutputBytes); backErr != nil {
+					reports[reportIndex].ParkedAt = quarantine
+					reports[reportIndex].Reason = fmt.Sprintf("disposal failed (%v) and registration re-point failed (%v); %d bytes at %s", disposeErr, backErr, payloadBytes, quarantine)
+					return fmt.Errorf("worktree pool: slot %s disposal failed (%v) and re-point failed (%v); %d bytes parked at %s", slot.Name, disposeErr, backErr, payloadBytes, quarantine)
+				}
+				reports[reportIndex].Reason = fmt.Sprintf("payload disposal failed: %v (%s)", disposeErr, strings.TrimSpace(out))
+				return fmt.Errorf("worktree pool: gc retained slot %s with %d bytes on disk: payload disposal failed: %v (%s)", slot.Name, payloadBytes, disposeErr, strings.TrimSpace(out))
+			}
+			// Readback: success requires the quarantined payload to be
+			// verifiably gone from disk. Anything else is a pending state,
+			// reported as such -- never success.
+			if _, statErr := os.Lstat(quarantine); statErr == nil {
+				reports[reportIndex].ParkedAt = quarantine
+				reports[reportIndex].Reason = fmt.Sprintf("payload still on disk after git removal; %d bytes parked at %s", payloadBytes, quarantine)
+				return fmt.Errorf("worktree pool: slot %s payload still on disk after git removal; %d bytes parked at %s", slot.Name, payloadBytes, quarantine)
 			} else if !errors.Is(statErr, fs.ErrNotExist) {
+				reports[reportIndex].ParkedAt = quarantine
+				reports[reportIndex].Reason = fmt.Sprintf("inspect quarantined payload after git removal: %v", statErr)
 				return fmt.Errorf("worktree pool: inspect slot %s after git removal: %w", slot.Name, statErr)
 			}
+			// The original path must not have been re-occupied by a
+			// replacement mid-pass; if it was, preserve it and fail closed
+			// rather than recording a clean reclaim over foreign content.
+			if info, statErr := os.Lstat(candidate.path); statErr == nil {
+				if !os.SameFile(candidate.info, info) {
+					reports[reportIndex].Reason = "a replacement occupied the original path after payload disposal; preserved"
+					return fmt.Errorf("worktree pool: slot %s path was replaced after payload disposal; preserving it", slot.Name)
+				}
+				reports[reportIndex].Reason = "slot path remained after payload disposal; preserving it"
+				return fmt.Errorf("worktree pool: slot %s remained after payload disposal; preserving it", slot.Name)
+			} else if !errors.Is(statErr, fs.ErrNotExist) {
+				reports[reportIndex].Reason = fmt.Sprintf("inspect slot path after disposal: %v", statErr)
+				return fmt.Errorf("worktree pool: inspect slot %s after payload disposal: %w", slot.Name, statErr)
+			}
 			removed[i] = true
+			reports[reportIndex].Removed = true
 		}
 		kept := state.Slots[:0]
 		for i, slot := range state.Slots {
@@ -638,6 +774,7 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) error 
 		state.Slots = kept
 		return p.writeState(state)
 	})
+	return reports, err
 }
 
 // GCPlan reports, without deleting anything, which currently-tracked slots

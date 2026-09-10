@@ -663,7 +663,7 @@ func runIdlePoolTickLocked(ctx context.Context, cfg IdlePoolDiscoveryConfig, act
 		}
 
 		actCtx, actCancel := context.WithDeadline(ctx, deadline)
-		gcErr := pool.GC(actCtx, authority)
+		_, gcErr := pool.GC(actCtx, authority)
 		actCancel()
 		if gcErr != nil {
 			// GCPlan just certified every slot here clear; a GC failure now
