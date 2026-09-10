@@ -16,6 +16,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/provider"
@@ -110,6 +111,13 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
+	// FAC-668: validate the candidate's repository-owned review contract
+	// before resolving any candidate-owned task context. Contract refusal must
+	// name the missing/unowned path and remain ahead of pool/provenance effects.
+	if err := verifyCandidateTreeContract(root, sha); err != nil {
+		return err
+	}
+
 	// FAC-769: resolve the exact review base from the validated launch pin and
 	// fail closed if it cannot be resolved. The packet must carry the exact
 	// base/head the reviewer is expected to read; an unresolved or invalid base
@@ -118,19 +126,6 @@ func runPoolReview(ref string) error {
 	// valid review base.
 	base, err := resolveReviewBase(root, candidateDir, ref, sha, strings.TrimSpace(*opts.Base))
 	if err != nil {
-		return err
-	}
-
-	// FAC-668 correction finding 1: validate the candidate's review contract
-	// against the EXACT candidate tree BEFORE any provenance or pool state
-	// changes. Below this point the launch may record an operator-asserted
-	// builder family (a ledger write), resolve the reviewer route, lease a
-	// slot, EVICT stale occupants, reset the slot --hard and create the
-	// surface symlink. Neither the lease-release defer nor any later cleanup
-	// can un-write a provenance row or undo an eviction. A candidate whose
-	// tree cannot prove the reviewer contract must be refused while every one
-	// of those mutations is still ahead of us.
-	if err := verifyCandidateTreeContract(root, sha); err != nil {
 		return err
 	}
 
@@ -1788,8 +1783,8 @@ func resolveReviewBase(root, candidateDir, ref, sha, explicitBase string) (strin
 	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", base+"^{commit}").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("resolve review base for %s: base %s is not a commit: %s", shortSHA(sha), shortSHA(base), strings.TrimSpace(string(out)))
 	}
-	if err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", base, sha).Run(); err != nil {
-		return "", fmt.Errorf("resolve review base for %s: base %s is not an ancestor of the candidate", shortSHA(sha), shortSHA(base))
+	if err := gitroot.RequireAncestor(root, base, sha); err != nil {
+		return "", fmt.Errorf("resolve review base for %s: base %s is not an ancestor of the candidate: %w", shortSHA(sha), shortSHA(base), err)
 	}
 	return base, nil
 }

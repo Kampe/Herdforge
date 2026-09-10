@@ -26,6 +26,34 @@ func grGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+func TestIsAncestorContextDistinguishesFalseFromGitFailure(t *testing.T) {
+	repo := t.TempDir()
+	grGit(t, repo, "init", "-q", "-b", "main")
+	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "base")
+	base, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := strings.TrimSpace(string(base))
+	ok, err := IsAncestorContext(context.Background(), repo, baseSHA, baseSHA)
+	if err != nil || !ok {
+		t.Fatalf("equal commit must be its own ancestor: ok=%v err=%v", ok, err)
+	}
+	grGit(t, repo, "checkout", "-q", "--orphan", "other")
+	grGit(t, repo, "commit", "-q", "--allow-empty", "-m", "other")
+	other, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err = IsAncestorContext(context.Background(), repo, baseSHA, strings.TrimSpace(string(other)))
+	if err != nil || ok {
+		t.Fatalf("a valid but unrelated commit query must return false without error: ok=%v err=%v", ok, err)
+	}
+	if _, err := IsAncestorContext(context.Background(), repo, "not-a-commit", baseSHA); err == nil {
+		t.Fatal("an unreadable ancestry query must remain an error")
+	}
+}
+
 // TestCommonDirIsSharedAcrossWorktrees is the property that makes this the one
 // definition worth having: every worktree of a repository must agree.
 //
