@@ -63,7 +63,7 @@ resource_governor:
   pressure_bytes: 8589934592
   recovery_bytes: 17179869184
   task_reserve_bytes: 2147483648
-  max_dispatch_concurrency: 2
+  max_dispatch_concurrency: 16
   reap_batch_limit: 4
   lock_timeout: "5s"
   lock_retry: "100ms"

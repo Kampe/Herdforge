@@ -184,6 +184,31 @@ func TestProcessOwnerViaPSClassifiesOwnerEvidence(t *testing.T) {
 	}
 }
 
+func TestSnapshotProcessOwnersUsesBulkPIDUIDFields(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	psPath := filepath.Join(dir, "ps")
+	script := "#!/bin/sh\nprintf '%s' \"$*\" > '" + argsPath + "'\nprintf '123 456\\n'\n"
+	if err := os.WriteFile(psPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	owners, err := snapshotProcessOwners(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owners[123] != 456 {
+		t.Fatalf("owner snapshot=%v", owners)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(args); got != "-axo pid=,uid=" {
+		t.Fatalf("ps argv=%q", got)
+	}
+}
+
 func TestLsofNoMatchDistinguishesNamespaceDiagnostics(t *testing.T) {
 	noMatch := func(t *testing.T, script string, stdout, stderr []byte, want bool) {
 		t.Helper()

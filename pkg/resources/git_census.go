@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,12 @@ type ProcessUsage struct {
 
 type ProcessInspector interface {
 	InUse(context.Context, string) (ProcessUsage, error)
+}
+
+// BatchProcessInspector performs one process-population census for several
+// targets. Implementations must retain the same fail-closed evidence as InUse.
+type BatchProcessInspector interface {
+	InUseMany(context.Context, []string) (map[string]ProcessUsage, error)
 }
 
 // LifecycleEvidence is read from canonical claim/review records. It is not
@@ -256,6 +263,63 @@ type GitWorktreeEnumerator struct {
 
 type GitTrackedSourceInspector struct{}
 
+type gitStatusResult struct {
+	dirty, untracked bool
+	err              error
+}
+
+func batchGitStatus(ctx context.Context, lanes []RegisteredWorktree) map[string]gitStatusResult {
+	results := make(map[string]gitStatusResult, len(lanes))
+	paths := make([]string, 0, len(lanes))
+	for _, lane := range lanes {
+		resolved, err := filepath.EvalSymlinks(lane.Path)
+		if err == nil {
+			paths = append(paths, filepath.Clean(resolved))
+		}
+	}
+	if len(paths) == 0 {
+		return results
+	}
+	jobs := make(chan string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	workers := 8
+	if len(paths) < workers {
+		workers = len(paths)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case path, ok := <-jobs:
+					if !ok {
+						return
+					}
+					dirty, untracked, err := gitStatus(ctx, path)
+					mu.Lock()
+					results[path] = gitStatusResult{dirty: dirty, untracked: untracked, err: err}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+sendJobs:
+	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			break sendJobs
+		case jobs <- path:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
 func (GitTrackedSourceInspector) HasTrackedSource(ctx context.Context, worktree, relative string) (bool, error) {
 	out, err := gitOutput(ctx, worktree, "--literal-pathspecs", "ls-files", "-z", "--", filepath.ToSlash(relative))
 	if err != nil {
@@ -283,6 +347,21 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 	if processes == nil {
 		processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
 	}
+	statusResults := batchGitStatus(ctx, lanes)
+	var batchUsage map[string]ProcessUsage
+	var batchErr error
+	batchAttempted := false
+	if batch, ok := processes.(BatchProcessInspector); ok {
+		batchAttempted = true
+		paths := make([]string, 0, len(lanes))
+		for i := range lanes {
+			resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
+			if resolveErr == nil {
+				paths = append(paths, filepath.Clean(resolved))
+			}
+		}
+		batchUsage, batchErr = batch.InUseMany(ctx, paths)
+	}
 	for i := range lanes {
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
@@ -297,7 +376,12 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "worktree_stat_unavailable"
 			continue
 		}
-		dirty, untracked, statusErr := gitStatus(ctx, lanes[i].Path)
+		statusResult, statusFound := statusResults[filepath.Clean(lanes[i].Path)]
+		if !statusFound {
+			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "git_status_unavailable"
+			continue
+		}
+		dirty, untracked, statusErr := statusResult.dirty, statusResult.untracked, statusResult.err
 		if statusErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "git_status_unavailable"
 			continue
@@ -313,7 +397,17 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "lease_evidence_unavailable"
 			continue
 		}
-		usage, processErr := processes.InUse(ctx, lanes[i].Path)
+		var usage ProcessUsage
+		var processErr error
+		if batchAttempted {
+			var found bool
+			usage, found = batchUsage[filepath.Clean(lanes[i].Path)]
+			if !found || batchErr != nil {
+				processErr = errors.New("batched process evidence unavailable")
+			}
+		} else {
+			usage, processErr = processes.InUse(ctx, lanes[i].Path)
+		}
 		if processErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "process_evidence_unavailable"
 			continue
@@ -515,6 +609,8 @@ type LSOFProcessInspector struct {
 	MaxOutputBytes int
 }
 
+const maxBatchProcessTargets = 64
+
 func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUsage, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -543,44 +639,12 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	if maxOutput <= 0 {
 		maxOutput = 1 << 20
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	cmd := exec.CommandContext(probeCtx, executable, "-nP", "-Ffnp", "+D", resolved)
-	var stdout, stderr limitedOutput
-	stdout.remaining, stderr.remaining = maxOutput, maxOutput
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err = cmd.Run()
-	if stdout.overflow || stderr.overflow {
-		return ProcessUsage{}, errors.New("lsof output exceeded bound")
-	}
-	if err != nil && !lsofNoMatch(err, stdout.Bytes(), stderr.Bytes()) {
+	openUsage, seen, err := p.lsofPath(ctx, executable, timeout, maxOutput, resolved)
+	if err != nil {
 		return ProcessUsage{}, err
 	}
-	seen := make(map[int]struct{})
-	currentPID := 0
-	for _, line := range strings.Split(string(stdout.Bytes()), "\n") {
-		if len(line) < 2 {
-			continue
-		}
-		switch line[0] {
-		case 'p':
-			pid, parseErr := strconv.Atoi(strings.TrimSpace(line[1:]))
-			if parseErr == nil {
-				currentPID = pid
-				seen[pid] = struct{}{}
-			}
-		case 'f':
-			descriptor := strings.TrimSpace(line[1:])
-			if descriptor == "cwd" {
-				usage.CWD = true
-			} else if currentPID != 0 && descriptor != "rtd" && descriptor != "txt" && descriptor != "mem" {
-				usage.OpenFile = true
-			}
-		}
-	}
-	for pid := range seen {
-		usage.PIDs = append(usage.PIDs, pid)
-	}
+	usage.CWD, usage.OpenFile = openUsage.CWD, openUsage.OpenFile
+	usage.PIDs = append(usage.PIDs, openUsage.PIDs...)
 	sortInts(usage.PIDs)
 	processCtx, cancelProcesses := context.WithTimeout(ctx, timeout)
 	defer cancelProcesses()
@@ -604,6 +668,187 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	}
 	sortInts(usage.PIDs)
 	return usage, nil
+}
+
+// InUseMany keeps the expensive process population and metadata walk shared
+// across a bounded orphan batch. lsof remains target-scoped, so open handles
+// and cwd evidence cannot be confused between targets.
+func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (map[string]ProcessUsage, error) {
+	if len(paths) == 0 {
+		return map[string]ProcessUsage{}, nil
+	}
+	executable := strings.TrimSpace(p.Executable)
+	if executable == "" {
+		var err error
+		executable, err = exec.LookPath("lsof")
+		if err != nil {
+			return nil, err
+		}
+	}
+	timeout := p.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	maxOutput := p.MaxOutputBytes
+	if maxOutput <= 0 {
+		maxOutput = 1 << 20
+	}
+	usage := make(map[string]ProcessUsage, len(paths))
+	resolvedPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, err
+		}
+		resolved = filepath.Clean(resolved)
+		if _, seen := usage[resolved]; seen {
+			continue
+		}
+		resolvedPaths = append(resolvedPaths, resolved)
+	}
+	probePaths := resolvedPaths
+	if len(probePaths) > maxBatchProcessTargets {
+		probePaths = probePaths[:maxBatchProcessTargets]
+	}
+	openUsage, err := p.lsofPaths(ctx, executable, timeout, maxOutput, probePaths)
+	if err != nil {
+		for _, path := range probePaths {
+			usage[path] = ProcessUsage{MetadataUnavailable: true}
+		}
+		for _, path := range resolvedPaths[len(probePaths):] {
+			usage[path] = ProcessUsage{MetadataUnavailable: true}
+		}
+	} else {
+		for path, entry := range openUsage {
+			usage[path] = entry
+		}
+	}
+	processCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	allPIDs, err := listProcessIDs(processCtx)
+	if err != nil {
+		for path, entry := range usage {
+			entry.MetadataUnavailable = true
+			usage[path] = entry
+		}
+		return usage, nil
+	}
+	owners, ownerErr := snapshotProcessOwners(processCtx)
+	if ownerErr != nil {
+		for path, entry := range usage {
+			entry.MetadataUnavailable = true
+			usage[path] = entry
+		}
+		return usage, ownerErr
+	}
+	for _, pid := range allPIDs {
+		if processCtx.Err() != nil {
+			return nil, processCtx.Err()
+		}
+		references, referenceErr := processReferencesManyWithOwners(processCtx, pid, resolvedPaths, owners)
+		if referenceErr != nil {
+			for path := range usage {
+				usage[path] = markMetadataUnavailable(usage[path], pid)
+			}
+			continue
+		}
+		for path, referenced := range references {
+			entry := usage[path]
+			entry.ReferencedPath = entry.ReferencedPath || referenced
+			entry.PIDs = append(entry.PIDs, pid)
+			usage[path] = entry
+		}
+	}
+	for path, entry := range usage {
+		sortInts(entry.PIDs)
+		usage[path] = entry
+	}
+	return usage, nil
+}
+
+func (p LSOFProcessInspector) lsofPath(ctx context.Context, executable string, timeout time.Duration, maxOutput int, resolved string) (ProcessUsage, map[int]struct{}, error) {
+	all, err := p.lsofPaths(ctx, executable, timeout, maxOutput, []string{resolved})
+	if err != nil {
+		return ProcessUsage{}, nil, err
+	}
+	usage := all[resolved]
+	seen := make(map[int]struct{}, len(usage.PIDs))
+	for _, pid := range usage.PIDs {
+		seen[pid] = struct{}{}
+	}
+	return usage, seen, nil
+}
+
+func (p LSOFProcessInspector) lsofPaths(ctx context.Context, executable string, timeout time.Duration, maxOutput int, paths []string) (map[string]ProcessUsage, error) {
+	if len(paths) == 0 {
+		return map[string]ProcessUsage{}, nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	args := []string{"-nP", "-Ffnp"}
+	for _, path := range paths {
+		args = append(args, "+D", path)
+	}
+	cmd := exec.CommandContext(probeCtx, executable, args...)
+	var stdout, stderr limitedOutput
+	stdout.remaining, stderr.remaining = maxOutput, maxOutput
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if stdout.overflow || stderr.overflow {
+		return nil, errors.New("lsof output exceeded bound")
+	}
+	if err != nil && !lsofNoMatch(err, stdout.Bytes(), stderr.Bytes()) {
+		return nil, err
+	}
+	usage := make(map[string]ProcessUsage, len(paths))
+	for _, path := range paths {
+		usage[path] = ProcessUsage{}
+	}
+	seen := make(map[int]struct{})
+	currentPID := 0
+	currentDescriptor := ""
+	for _, line := range strings.Split(string(stdout.Bytes()), "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(line[1:]))
+			if parseErr == nil {
+				currentPID = pid
+				seen[pid] = struct{}{}
+			}
+		case 'f':
+			currentDescriptor = strings.TrimSpace(line[1:])
+		case 'n':
+			name := filepath.Clean(strings.TrimSpace(line[1:]))
+			for path, entry := range usage {
+				if !containedPath(path, name) {
+					continue
+				}
+				if currentDescriptor == "cwd" {
+					entry.CWD = true
+				} else if currentPID != 0 && currentDescriptor != "rtd" && currentDescriptor != "txt" && currentDescriptor != "mem" {
+					entry.OpenFile = true
+				}
+				usage[path] = entry
+			}
+		}
+	}
+	for path, entry := range usage {
+		for pid := range seen {
+			entry.PIDs = append(entry.PIDs, pid)
+		}
+		sortInts(entry.PIDs)
+		usage[path] = entry
+	}
+	return usage, nil
+}
+
+func markMetadataUnavailable(usage ProcessUsage, pid int) ProcessUsage {
+	usage.MetadataUnavailable = true
+	usage.PIDs = append(usage.PIDs, pid)
+	return usage
 }
 
 // lsof uses exit status 1 for both "no matching open files" and diagnostics
@@ -661,6 +906,42 @@ func listProcessIDs(ctx context.Context) ([]int, error) {
 	return pids, nil
 }
 
+func snapshotProcessOwners(ctx context.Context) (map[int]int, error) {
+	ps, err := exec.LookPath("ps")
+	if err != nil {
+		return nil, fmt.Errorf("process owner snapshot unavailable: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	// Darwin and Linux both support this exact BSD ps field contract. The
+	// complete pid/uid table avoids one ps process per PID and does not use a
+	// truncated command column as ownership evidence.
+	out, err := exec.CommandContext(probeCtx, ps, "-axo", "pid=,uid=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("read process owner snapshot: %w", err)
+	}
+	owners := make(map[int]int)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 {
+			return nil, errors.New("process owner snapshot has malformed row")
+		}
+		pid, pidErr := strconv.Atoi(fields[0])
+		uid, uidErr := strconv.Atoi(fields[1])
+		if pidErr != nil || uidErr != nil || pid <= 0 || uid < 0 {
+			return nil, errors.New("process owner snapshot has invalid pid or uid")
+		}
+		owners[pid] = uid
+	}
+	if len(owners) == 0 {
+		return nil, errors.New("process owner snapshot is empty")
+	}
+	return owners, nil
+}
+
 // processReferences closes the gap between filesystem handles and a process
 // that intends to recreate/use a cache through GOCACHE, argv, or a mapped
 // executable/database. Metadata for a foreign process is not deletion
@@ -668,24 +949,63 @@ func listProcessIDs(ctx context.Context) ([]int, error) {
 // whose owner-only permissions have already been proved by the governor. A
 // same-owner or owner-unknown failure remains an error and is fail-closed.
 func processReferences(ctx context.Context, pid int, path string) (bool, error) {
-	needle := []byte(path)
+	references, err := processReferencesMany(ctx, pid, []string{path})
+	return references[path], err
+}
+
+func processReferencesMany(ctx context.Context, pid int, paths []string) (map[string]bool, error) {
+	return processReferencesManyWithOwners(ctx, pid, paths, nil)
+}
+
+func processReferencesManyWithOwners(ctx context.Context, pid int, paths []string, owners map[int]int) (map[string]bool, error) {
+	references := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		references[path] = false
+	}
 	if procData, procErr := readProcessProc(pid); procErr == nil {
-		for _, data := range procData {
-			if bytes.Contains(data, needle) {
-				return true, nil
+		for path := range references {
+			needle := []byte(path)
+			for _, data := range procData {
+				if bytes.Contains(data, needle) {
+					references[path] = true
+					break
+				}
 			}
 		}
-		return false, nil
+		return references, nil
 	} else if os.IsNotExist(procErr) && runtime.GOOS != "darwin" {
-		return false, nil
+		return references, nil
+	} else if owner, ok := owners[pid]; ok {
+		if owner != os.Getuid() {
+			return references, nil
+		}
+		if runtime.GOOS == "darwin" {
+			args, argsErr := readDarwinProcessArgs(pid)
+			if argsErr != nil {
+				if errors.Is(argsErr, os.ErrProcessDone) {
+					return references, nil
+				}
+				return references, fmt.Errorf("read process argv/environment for pid %d: %w", pid, argsErr)
+			}
+			for path := range references {
+				references[path] = bytes.Contains(args, []byte(path))
+			}
+			return references, nil
+		}
+		return references, fmt.Errorf("read same-owner process metadata for pid %d: %w", pid, procErr)
+	} else if owners != nil {
+		if killErr := syscall.Kill(pid, 0); errors.Is(killErr, syscall.ESRCH) {
+			return references, nil
+		}
+		return references, fmt.Errorf("process owner missing from snapshot for pid %d", pid)
 	} else if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr != nil {
-		return false, ownerErr
+		return references, ownerErr
 	} else if gone || foreign {
-		return false, nil
+		return references, nil
 	}
 	ps, err := exec.LookPath("ps")
 	if err != nil {
-		return false, fmt.Errorf("process metadata unavailable for pid %d: %w", pid, err)
+		return references, fmt.Errorf("process metadata unavailable for pid %d: %w", pid, err)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -698,23 +1018,28 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 	out, err := exec.CommandContext(probeCtx, ps, psArgs...).Output()
 	if err != nil {
 		if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr == nil && (foreign || gone) {
-			return false, nil
+			return references, nil
 		}
-		return false, fmt.Errorf("read process argv/environment for pid %d: %w", pid, err)
+		return references, fmt.Errorf("read process argv/environment for pid %d: %w", pid, err)
 	}
-	if bytes.Contains(out, needle) {
-		return true, nil
+	for path := range references {
+		if bytes.Contains(out, []byte(path)) {
+			references[path] = true
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		// kern.procargs2 is the unprivileged same-user Darwin process surface
 		// that includes the environment; ps -E is not reliable with custom
 		// output and launchctl procinfo is root-only.
 		if args, argsErr := readDarwinProcessArgs(pid); argsErr == nil {
-			return bytes.Contains(args, needle), nil
+			for path := range references {
+				references[path] = bytes.Contains(args, []byte(path))
+			}
+			return references, nil
 		} else if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr == nil && (foreign || gone) {
-			return false, nil
+			return references, nil
 		} else {
-			return false, fmt.Errorf("read process argv/environment for pid %d: %w", pid, argsErr)
+			return references, fmt.Errorf("read process argv/environment for pid %d: %w", pid, argsErr)
 		}
 	}
 	// lsof's `+D` census above includes mapped files (the `mem` descriptor),
@@ -722,7 +1047,7 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 	// unrelated same-user processes into false metadata failures. Keep vmmap
 	// out of the per-PID path: relevant mapped references are already in
 	// usage.OpenFile and remain a hard guard.
-	return false, nil
+	return references, nil
 }
 
 // foreignOrGoneProcess distinguishes an inaccessible unrelated process from
