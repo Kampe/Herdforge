@@ -57,6 +57,78 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 	}
 }
 
+// TestProviderBackoff429SurfacesStalePriorReadingNotAbsence is the FAC-786
+// regression: a usage-endpoint 429 on a provider that previously had a good
+// reading must degrade to an explicit stale reading (routing can still see
+// the provider and its last known state), not vanish from the snapshot
+// entirely and read as a fully unknown/absent provider. It also asserts the
+// backoff bounds the poller to exactly one live call across repeated
+// fetchProviderCached calls within the backoff window (no retry storm).
+func TestProviderBackoff429SurfacesStalePriorReadingNotAbsence(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "0")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"stale-429-acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	rateLimited := false
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
+		atomic.AddInt32(&calls, 1)
+		if rateLimited {
+			return ProviderUsage{}, pollErrf("rate-limited", "HTTP 429; retry-after=300")
+		}
+		return ProviderUsage{DisplayName: "Codex", Account: codexAccountIdentity(), Resources: map[string]ResourceUsage{
+			"primary": {Kind: "consumption", Unit: "percent", Limit: 100, Remaining: 80, WindowSeconds: 18000},
+		}}, nil
+	}})
+	defer restore()
+	InvalidateSnapshotCache()
+	defer InvalidateSnapshotCache()
+
+	// First call: healthy reading, persisted to disk.
+	snap, err := fetchProviderCached("codex", false)
+	if err != nil || snap == nil || len(snap.Providers["codex"].Resources) == 0 {
+		t.Fatalf("expected a healthy first reading, got snap=%+v err=%v", snap, err)
+	}
+
+	// ttl=0 already forces the next call to re-poll upstream (no
+	// InvalidateSnapshotCache: that helper drops non-backoff records
+	// entirely, which would erase the prior good reading this test needs).
+	rateLimited = true
+
+	snap, err = fetchProviderCached("codex", false)
+	if err == nil || pollErrorCode(err) != "rate-limited" {
+		t.Fatalf("expected a rate-limited error on the 429 call, got snap=%+v err=%v", snap, err)
+	}
+	if snap == nil {
+		t.Fatal("429 with a prior good reading must surface a stale snapshot, not nil")
+	}
+	provider, ok := snap.Providers["codex"]
+	if !ok {
+		t.Fatal("429 with a prior good reading dropped the provider entirely instead of degrading to stale")
+	}
+	if !provider.Stale {
+		t.Fatal("provider surfaced during backoff must be marked Stale, never presented as a fresh reading")
+	}
+	if len(provider.Resources) == 0 {
+		t.Fatal("stale provider lost its last known resource data")
+	}
+
+	// A second call still inside the backoff window must not hit the poller
+	// again -- this is the bounded/single-flight guarantee.
+	if _, err := fetchProviderCached("codex", false); err == nil || pollErrorCode(err) != "rate-limited" {
+		t.Fatalf("expected the persisted backoff to still apply, got %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected exactly 2 live polls (1 success + 1 429), got %d -- backoff did not bound repeated calls", got)
+	}
+}
+
 func TestProviderCacheAcrossProcessesShares429Backoff(t *testing.T) {
 	dir := t.TempDir()
 	home := t.TempDir()

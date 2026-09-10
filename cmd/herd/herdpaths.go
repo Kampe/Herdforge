@@ -1,5 +1,7 @@
 package main
 
+import "github.com/Kampe/Herdforge/pkg/gitroot"
+
 // Shared .herd path fragments and leaf names.
 //
 // FAC-613: pkg/invariant's duplicate-rule gate caught the same two decisions
@@ -15,7 +17,7 @@ package main
 const (
 	// managedWorktreeFrag identifies a path inside the fleet's managed worktree
 	// namespace. Kept slash-normalised: callers compare against filepath.ToSlash.
-	managedWorktreeFrag = "/.herd/worktrees/"
+	managedWorktreeFrag = gitroot.ManagedWorktreePathFragment
 
 	// harnessHooksLeaf is the harness hook pin file, always resolved under .herd.
 	harnessHooksLeaf = "harness-hooks.json"

@@ -18,13 +18,123 @@ func (r fakeResolver) Resolve(context.Context, string) (string, error) { return 
 type recordingRunner struct {
 	calls int
 	env   []string
+	dirs  []string
+	envs  [][]string
 	err   error
 }
 
-func (r *recordingRunner) Run(_ context.Context, _ string, _ []string, env []string) error {
+type managedChildRunner struct {
+	leasePath string
+	observed  bool
+}
+
+func (r *managedChildRunner) Run(_ context.Context, _ string, _ []string, _ []string) error {
+	return errors.New("legacy runner path used")
+}
+
+func (r *managedChildRunner) RunManaged(ctx context.Context, dir string, argv, env []string, enroll func(ProcessIdentity) error) error {
+	return (execRunner{}).RunManaged(ctx, dir, argv, env, func(identity ProcessIdentity) error {
+		if err := enroll(identity); err != nil {
+			return err
+		}
+		_, err := os.Stat(r.leasePath)
+		r.observed = err == nil
+		return err
+	})
+}
+
+func TestExecuteManagedProtectsRealChildEnvOnlyUseUntilCompletion(t *testing.T) {
+	root := t.TempDir()
+	contract := testContract()
+	contract.Command = []string{"sh", "-c", `test -n "$GOCACHE" -a -n "$GOMODCACHE"; sleep 0.1`}
+	runner := &managedChildRunner{leasePath: filepath.Join(root, ".herd", "bootstrap", "cache-use.json")}
+	executor := Executor{Resolver: fakeResolver{identity: strings.Repeat("a", 64)}, Runner: runner}
+	consumer := ConsumerIdentity{Repository: "repo-id", TaskRef: "FAC-613", LeaseGeneration: 7, Worktree: ".herd/worktrees/fac-613"}
+	if _, err := executor.ExecuteManaged(context.Background(), root, contract, consumer); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.observed {
+		t.Fatal("managed child completed without an observable active cache-use lease")
+	}
+	if _, err := os.Stat(runner.leasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache-use lease remained after child completion: %v", err)
+	}
+}
+
+func (r *recordingRunner) Run(_ context.Context, dir string, _ []string, env []string) error {
 	r.calls++
 	r.env = append([]string(nil), env...)
+	r.dirs = append(r.dirs, dir)
+	r.envs = append(r.envs, append([]string(nil), env...))
 	return r.err
+}
+
+func TestExecuteHydratesOnlyDeclaredScopes(t *testing.T) {
+	root := t.TempDir()
+	for _, scope := range []string{"api", "web"} {
+		if err := os.Mkdir(filepath.Join(root, scope), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	contract := testContract()
+	contract.Scopes = []string{"api", "web"}
+	runner := &recordingRunner{}
+	executor := Executor{Resolver: fakeResolver{identity: "go1"}, Runner: runner}
+	if _, err := executor.Execute(context.Background(), root, contract); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 2 || runner.dirs[0] != filepath.Join(resolvedRoot, "api") || runner.dirs[1] != filepath.Join(resolvedRoot, "web") {
+		t.Fatalf("scoped hydration calls=%d dirs=%v", runner.calls, runner.dirs)
+	}
+	for i, scope := range contract.Scopes {
+		if !containsEnv(runner.envs[i], "HERD_BOOTSTRAP_SCOPE="+scope) {
+			t.Fatalf("scope %q missing from environment %v", scope, runner.envs[i])
+		}
+	}
+}
+
+func TestExecuteRejectsSymlinkedDependencyScope(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "web")); err != nil {
+		t.Fatal(err)
+	}
+	contract := testContract()
+	contract.Scopes = []string{"web"}
+	runner := &recordingRunner{}
+	executor := Executor{Resolver: fakeResolver{identity: "go1"}, Runner: runner}
+	if _, err := executor.Execute(context.Background(), root, contract); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlink scope err=%v", err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("symlink scope reached dependency command: calls=%d", runner.calls)
+	}
+}
+
+func TestEmptyScopesPreserveLegacyReceiptDigest(t *testing.T) {
+	contract := testContract()
+	want := digest(contract.Version + "\x00" + contract.Toolchain + "\x00" + strings.Join(contract.Command, "\x00"))
+	root := t.TempDir()
+	result, err := (Executor{Resolver: fakeResolver{identity: "go1"}, Runner: &recordingRunner{}}).Execute(context.Background(), root, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Receipt.ContractDigest != want {
+		t.Fatalf("empty scope digest=%s want legacy=%s", result.Receipt.ContractDigest, want)
+	}
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, value := range env {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func testContract() config.WorktreeBootstrap {

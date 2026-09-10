@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/Kampe/Herdforge/pkg/contextauth"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
@@ -31,7 +32,7 @@ var randRead = rand.Read
 const KeyDirEnv = "HERD_KEY_DIR"
 
 // ReceiptPubFile is the published verification key, relative to repo root.
-const ReceiptPubFile = ".herd/receipt.pub"
+const ReceiptPubFile = contextauth.ReceiptPubFile
 
 // resolveKeyDir returns the private-key directory for this user.
 func resolveKeyDir() (string, error) {
@@ -531,15 +532,11 @@ func NewVerifier(pub ed25519.PublicKey) *Verifier { return &Verifier{pub: pub} }
 // LoadVerifier reads the repo's published verification key. Missing key =
 // no authority anchor = error; consumers fail closed.
 func LoadVerifier(repoRoot string) (*Verifier, error) {
-	data, err := os.ReadFile(filepath.Join(repoRoot, ReceiptPubFile))
+	pub, err := contextauth.LoadReceiptPublicKey(repoRoot)
 	if err != nil {
 		return nil, fmt.Errorf("no receipt verification key at %s (FAC-145: cannot authenticate receipts): %w", filepath.Join(repoRoot, ReceiptPubFile), err)
 	}
-	raw, decErr := hex.DecodeString(strings.TrimSpace(string(data)))
-	if decErr != nil || len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("receipt verification key is corrupt")
-	}
-	return &Verifier{pub: ed25519.PublicKey(raw)}, nil
+	return &Verifier{pub: pub}, nil
 }
 
 // Verify fails closed on an unsigned, forged, or tampered receipt.
@@ -551,26 +548,63 @@ func (v *Verifier) Verify(tc TaskContext) error {
 	if sigHex == "" {
 		return fmt.Errorf("receipt for %s is unsigned (FAC-145: only coordinator-issued receipts carry authority)", tc.TaskRef)
 	}
-	sig, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return fmt.Errorf("receipt for %s carries a malformed signature", tc.TaskRef)
+	authTC := contextauth.TaskContext{
+		ProviderType:      tc.ProviderType,
+		ProjectID:         tc.ProjectID,
+		ProviderWorkspace: tc.ProviderWorkspace,
+		ProviderProfile:   tc.ProviderProfile,
+		Repository:        tc.Repository,
+		Role:              tc.Role,
+		TaskRef:           tc.TaskRef,
+		TaskID:            tc.TaskID,
+		Branch:            tc.Branch,
+		BaseSHA:           tc.BaseSHA,
+		CandidateSHA:      tc.CandidateSHA,
+		AuthorityScope:    tc.AuthorityScope,
+		AnchorRef:         tc.AnchorRef,
+		HerdrWorkspace:    tc.HerdrWorkspace,
+		LeaseID:           tc.LeaseID,
+		LeaseGeneration:   tc.LeaseGeneration,
+		LeaseTaskRef:      tc.LeaseTaskRef,
+		SessionID:         tc.SessionID,
+		AgentSessionID:    tc.AgentSessionID,
+		AllowedOps:        tc.AllowedOps,
+		ExpiresAt:         tc.ExpiresAt,
+		Signature:         tc.Signature,
 	}
-	tc.Signature = ""
-	canonical, err := canonicalReceipt(tc)
-	if err != nil {
-		return err
-	}
-	if !ed25519.Verify(v.pub, canonical, sig) {
+	if err := contextauth.VerifyTaskContext(v.pub, authTC); err != nil {
+		if strings.Contains(err.Error(), "malformed") {
+			return fmt.Errorf("receipt for %s carries a malformed signature", tc.TaskRef)
+		}
 		return fmt.Errorf("receipt for %s failed signature verification — tampered or foreign receipt rejected (FAC-145)", tc.TaskRef)
 	}
 	return nil
 }
 
 func canonicalReceipt(tc TaskContext) ([]byte, error) {
-	tc.Signature = ""
-	data, err := json.Marshal(tc)
-	if err != nil {
-		return nil, fmt.Errorf("canonicalize receipt: %w", err)
+	authTC := contextauth.TaskContext{
+		ProviderType:      tc.ProviderType,
+		ProjectID:         tc.ProjectID,
+		ProviderWorkspace: tc.ProviderWorkspace,
+		ProviderProfile:   tc.ProviderProfile,
+		Repository:        tc.Repository,
+		Role:              tc.Role,
+		TaskRef:           tc.TaskRef,
+		TaskID:            tc.TaskID,
+		Branch:            tc.Branch,
+		BaseSHA:           tc.BaseSHA,
+		CandidateSHA:      tc.CandidateSHA,
+		AuthorityScope:    tc.AuthorityScope,
+		AnchorRef:         tc.AnchorRef,
+		HerdrWorkspace:    tc.HerdrWorkspace,
+		LeaseID:           tc.LeaseID,
+		LeaseGeneration:   tc.LeaseGeneration,
+		LeaseTaskRef:      tc.LeaseTaskRef,
+		SessionID:         tc.SessionID,
+		AgentSessionID:    tc.AgentSessionID,
+		AllowedOps:        tc.AllowedOps,
+		ExpiresAt:         tc.ExpiresAt,
+		Signature:         tc.Signature,
 	}
-	return data, nil
+	return contextauth.CanonicalBytes(authTC)
 }

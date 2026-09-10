@@ -78,6 +78,15 @@ func runUpCommand(laneName string, runtime upRuntime, out io.Writer) error {
 	}
 	cwd := filepath.Join(".", lane.Worktree)
 	name := standing.AgentNameForRepository(lane.Name, repository)
+	// FAC-767: hook policy discovery resolves .herd/harness-hooks.json
+	// relative to the process's own cwd unless scoped here. Without this,
+	// `up` validates the lane's launch against the coordinator's own
+	// (canonical) pin file instead of the exact target worktree's, so a
+	// stale canonical pin can reject a launch even when the target
+	// worktree already has a freshly refreshed one. `herd review` has
+	// scoped this the same way since FAC-onboarding; `up` never did.
+	restoreHooks := useHarnessHooksFromWorktree(cwd)
+	defer restoreHooks()
 	var tab *herdr.TabInfo
 	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, runtime.Route, func(d *router.LaunchDecision) error {
 		var e error

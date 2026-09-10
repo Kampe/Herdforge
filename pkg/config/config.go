@@ -90,6 +90,7 @@ type Config struct {
 	MergePolicy       *MergePolicy      `yaml:"merge_policy,omitempty"`
 	Fleet             FleetConfig       `yaml:"fleet,omitempty"`
 	WorktreeBootstrap WorktreeBootstrap `yaml:"worktree_bootstrap,omitempty"`
+	ResourceGovernor  ResourceGovernor  `yaml:"resource_governor,omitempty"`
 	WorktreeBoundary  WorktreeBoundary  `yaml:"worktree_boundary,omitempty"`
 	Lanes             []LaneDef         `yaml:"lanes"`
 	Verification      Verification      `yaml:"verification,omitempty"`
@@ -205,10 +206,12 @@ type WorktreeBootstrap struct {
 	Version   string   `yaml:"version,omitempty"`
 	Toolchain string   `yaml:"toolchain,omitempty"`
 	Command   []string `yaml:"command,omitempty"`
+	// Scopes limits dependency hydration to exact worktree-relative project directories.
+	Scopes []string `yaml:"scopes,omitempty"`
 }
 
 func (b WorktreeBootstrap) Enabled() bool {
-	return b.Version != "" || b.Toolchain != "" || len(b.Command) != 0
+	return b.Version != "" || b.Toolchain != "" || len(b.Command) != 0 || len(b.Scopes) != 0
 }
 
 func (b WorktreeBootstrap) Validate() error {
@@ -237,6 +240,29 @@ func (b WorktreeBootstrap) Validate() error {
 				return fmt.Errorf("worktree_bootstrap.command[0]: must remain within the worktree")
 			}
 		}
+	}
+	seenScopes := make(map[string]struct{}, len(b.Scopes))
+	for i, raw := range b.Scopes {
+		trimmed := strings.TrimSpace(raw)
+		scope := filepath.Clean(trimmed)
+		if scope == "." || filepath.IsAbs(scope) || scope == ".." || strings.HasPrefix(scope, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("worktree_bootstrap.scopes[%d]: must be an exact worktree-relative directory", i)
+		}
+		if raw != filepath.ToSlash(scope) {
+			return fmt.Errorf("worktree_bootstrap.scopes[%d]: path must be canonical", i)
+		}
+		if strings.ContainsAny(raw, "*?[]{}") {
+			return fmt.Errorf("worktree_bootstrap.scopes[%d]: globs are not allowed", i)
+		}
+		for _, component := range strings.Split(filepath.ToSlash(scope), "/") {
+			if component == ".git" || component == ".herd" {
+				return fmt.Errorf("worktree_bootstrap.scopes[%d]: canonical %s state is not a dependency scope", i, component)
+			}
+		}
+		if _, ok := seenScopes[scope]; ok {
+			return fmt.Errorf("worktree_bootstrap.scopes[%d]: duplicate directory %q", i, scope)
+		}
+		seenScopes[scope] = struct{}{}
 	}
 	return nil
 }
@@ -436,6 +462,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if err := c.WorktreeBootstrap.Validate(); err != nil {
+		return err
+	}
+	if err := c.ResourceGovernor.Validate(); err != nil {
 		return err
 	}
 	if err := c.WorktreeBoundary.Validate(); err != nil {

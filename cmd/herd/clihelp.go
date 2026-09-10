@@ -177,7 +177,7 @@ Prefer herdr-deliver for durable digests.`,
 	"herdr-deliver": `Usage: herd herdr-deliver --key <op> --generation <n> --target <name> [--session <id>] [--file path] [--wait] [--timeout s] [--state path]
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,
-	"cleanup":         "Usage: herd cleanup [flags]\n  One-shot tab / worktree cleanup sweep.",
+	"cleanup":         "Usage: herd cleanup [--dry-run|--act] [--json] [--only-reviewers] [--reviewer NAME] [--lease ID] [--generation ID] [--task REF] [--reap-verify-stacks]\n  One-shot tab / worktree cleanup sweep. Use --only-reviewers or exact selector flags to retire manifest-bound reviewers while sparing general terminal and foreign panes.",
 	"forge":           "Usage: herd forge [--loop] [--retry-approve <ref>] [flags]\n  Forge orchestration entrypoints. Legacy receiptless approvals are suppressed durably; --retry-approve explicitly re-attempts one.",
 	"legacy-receipts": "Usage: herd legacy-receipts [--json] [--tombstone <ref> --reason <text>]\n  Audit or tombstone receiptless legacy in-progress tasks (fail-closed).",
 	"up":              "Usage: herd up <lane-name>\n  Bring up a configured lane.",
@@ -269,6 +269,8 @@ Commands:
 		"  census (herdr server, agent list, memory) rather than configured slots.\n" +
 		"  Exits 3 on a refusal so a shell caller cannot ignore it by not parsing output.\n" +
 		"  Memory it cannot measure is reported unknown, never as a refusal.",
+	"resource-governor": "Usage: herd resource-governor [--json] [--apply] [--max-reaps N] [--foreign owner:kind:path]\n" +
+		"  Inventory host-local registered worktrees and safely reap declared generated data.",
 	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main]\n" +
 		"  Retire worktrees whose work has LANDED: no unique commits against base, so\n" +
 		"  removal is provably lossless. Never touches unmerged, dirty, locked or\n" +

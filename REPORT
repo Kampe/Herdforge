@@ -1,8 +1,8 @@
 # FAC-794: Source Lane Retirement Hardening & Provenance Safety Report
 
 Task: FAC-794
-Agent: forge-mender-fac794-anc-01722e3b
-Candidate: 3720b5c2dfdb2f6c0133c9daaa5b0d5c8ebfcb87
+Agent: forge-mender-fac794-gem-6774ef2d
+Candidate: ac7086c5d0da1fe8a6659c57b5bd9e35eaf04698
 Status: READY
 Branch: recovery/fac-794-source-retirement
 Builder-Family: google
@@ -107,6 +107,20 @@ Builder-Family: google
 - **Restored GREEN Evidence (`pkg/herdr/source_retirement_test.go`)**:
   - `TestEvaluateSourceRetirementAncestryAuthentication` -> PASS (unrelated start pin / base SHA blocked with ancestry error; legitimate descendant allowed).
   - `TestEnrollReadySourceManifestsAncestryAuthentication` -> PASS (unrelated launch pin skipped; legitimate descendant enrolled).
+
+## Safety Fix 8: Native Launch Receipt Worktree & Signed TASK-CONTEXT Cryptographic Verification
+- **Vulnerability / Flaw**: Production launch receipts written at `herd up` time contain `CWD` rather than `Worktree` and lack `CandidateSHA` or `HerdrSession`. `EnrollReadySourceManifests` and `EvaluateSourceRetirement` previously failed to enroll or evaluate these valid producer receipts, or if loosely parsed, risked accepting unverified/fabricated session identifiers or unmanaged untracked dirt in worktrees.
+- **Production Guard (`pkg/herdr/source_retirement.go` & `pkg/herdr/native_source_retirement.go`)**:
+  - Resolves worktree path from launch receipt `CWD` when `Worktree` is blank.
+  - Implemented `readVerifiedSourceTaskContext` in `pkg/herdr/source_retirement.go` which cryptographically validates `TASK-CONTEXT.json` against the repository's `.herd/receipt.pub` key using ed25519 signature verification.
+  - Requires authentic cryptographic verification of `TASK-CONTEXT.json` before adopting `task_ref`, `role`, or `session_id`.
+  - Prohibits borrowing current `AgentList` sessions for historical launch receipts without exact launch incarnation matching (`Name`, `TabID`, `PaneID`).
+  - Preserves strict fail-closed Git dirty status checks via `git status --porcelain` without skipping arbitrary basename files.
+- **RED Evidence**:
+  - Launch receipt with CWD-only worktree path and unsigned/tampered `TASK-CONTEXT.json` -> previously accepted unverified task attributes or failed with false zero-candidate enrollment.
+- **Restored GREEN Evidence (`pkg/herdr/source_retirement_test.go` & `cmd/herd/source_retirement_cli_test.go`)**:
+  - `TestEnrollReadySourceManifests_ResolvesNativeLaunchReceiptWithoutWorktreeOrSession` -> PASS (verifies signed `TASK-CONTEXT.json` and authenticates native receipt).
+  - `TestSourceCleanupNative_ProductionNativeLaunchReceiptEnrollmentAndRetirement` -> PASS (end-to-end native production launch receipt enrollment and retirement).
 
 ## Verification Matrix
 - Invariant Gate: `GOMAXPROCS=2 GOFLAGS=-p=2 go test ./pkg/invariant -run TestNoNewDuplicatedRules` (PASS)

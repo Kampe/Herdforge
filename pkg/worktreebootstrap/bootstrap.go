@@ -15,8 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 const receiptVersion = 1
@@ -40,6 +43,10 @@ type ToolchainResolver interface {
 
 type CommandRunner interface {
 	Run(context.Context, string, []string, []string) error
+}
+
+type managedCommandRunner interface {
+	RunManaged(context.Context, string, []string, []string, func(ProcessIdentity) error) error
 }
 
 type Executor struct {
@@ -89,7 +96,56 @@ func (execRunner) Run(ctx context.Context, dir string, argv, env []string) error
 	return nil
 }
 
+func (execRunner) RunManaged(ctx context.Context, dir string, argv, env []string, enroll func(ProcessIdentity) error) error {
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
+		return errors.New("bootstrap command is empty")
+	}
+	command := argv[0]
+	if strings.ContainsRune(command, filepath.Separator) {
+		var err error
+		command, err = safeChild(dir, command)
+		if err != nil {
+			return fmt.Errorf("bootstrap command path: %w", err)
+		}
+	}
+	cmd := exec.CommandContext(ctx, command, argv[1:]...)
+	cmd.Dir, cmd.Env = dir, env
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("bootstrap command %q: %w", argv[0], err)
+	}
+	node, ok, err := (toolchild.SystemTree{}).Lookup(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("bootstrap child identity: %w", err)
+	}
+	if !ok {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return errors.New("bootstrap child identity disappeared before enrollment")
+	}
+	if err := enroll(ProcessIdentity{PID: node.Identity.PID, ParentPID: node.Identity.ParentPID, StartToken: node.Identity.StartToken}); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("bootstrap command %q: %w", argv[0], err)
+	}
+	return nil
+}
+
 func (e Executor) Execute(ctx context.Context, worktreePath string, contract config.WorktreeBootstrap) (*Result, error) {
+	return e.execute(ctx, worktreePath, contract, nil)
+}
+
+// ExecuteManaged enrolls the actual started bootstrap child before it can
+// consume the cache and releases the lease only after Wait confirms exit.
+func (e Executor) ExecuteManaged(ctx context.Context, worktreePath string, contract config.WorktreeBootstrap, consumer ConsumerIdentity) (*Result, error) {
+	return e.execute(ctx, worktreePath, contract, &consumer)
+}
+
+func (e Executor) execute(ctx context.Context, worktreePath string, contract config.WorktreeBootstrap, consumer *ConsumerIdentity) (*Result, error) {
 	if !contract.Enabled() {
 		return &Result{}, nil
 	}
@@ -125,12 +181,19 @@ func (e Executor) Execute(ctx context.Context, worktreePath string, contract con
 		return nil, fmt.Errorf("resolve bootstrap toolchain %q: empty identity", contract.Toolchain)
 	}
 	contractDigest := digest(contract.Version + "\x00" + contract.Toolchain + "\x00" + strings.Join(contract.Command, "\x00"))
+	if len(contract.Scopes) != 0 {
+		scopePayload, marshalErr := json.Marshal(contract.Scopes)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("encode bootstrap scopes: %w", marshalErr)
+		}
+		contractDigest = digest("scoped-v1\x00" + contractDigest + "\x00" + string(scopePayload))
+	}
 	toolchainDigest := digest(identity)
 	cacheRel := filepath.ToSlash(filepath.Join(".herd", "bootstrap", "cache", toolchainDigest))
 	runtimeRel := filepath.ToSlash(filepath.Join(".herd", "bootstrap", "runtime", toolchainDigest))
 	want := Receipt{Version: receiptVersion, ContractDigest: contractDigest, ToolchainDigest: toolchainDigest, CacheDir: cacheRel, RuntimeDir: runtimeRel}
 
-	receiptPath := filepath.Join(root, ".herd", "bootstrap", "receipt.json")
+	receiptPath := filepath.Join(root, filepath.FromSlash(gitroot.BootstrapReceiptPath))
 	if current, exists, err := readReceipt(receiptPath); err != nil {
 		return nil, err
 	} else if exists && current == want && directoriesExist(root, want) {
@@ -162,8 +225,69 @@ func (e Executor) Execute(ctx context.Context, worktreePath string, contract con
 	if runner == nil {
 		runner = execRunner{}
 	}
-	if err := runner.Run(ctx, root, append([]string(nil), contract.Command...), bootstrapEnv(cachePath, runtimePath)); err != nil {
-		return nil, err
+	scopes := append([]string(nil), contract.Scopes...)
+	if len(scopes) == 0 {
+		scopes = []string{"."}
+	}
+	for _, scope := range scopes {
+		scopeDir := root
+		if scope != "." {
+			scopeDir, err = safeChild(root, scope)
+			if err != nil {
+				return nil, fmt.Errorf("bootstrap scope: %w", err)
+			}
+			info, statErr := os.Lstat(scopeDir)
+			if statErr != nil {
+				return nil, fmt.Errorf("bootstrap scope %q is unavailable or not a directory", scope)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("bootstrap scope %q is a symlink", scope)
+			}
+			if !info.IsDir() {
+				return nil, fmt.Errorf("bootstrap scope %q is unavailable or not a directory", scope)
+			}
+			resolvedScope, resolveErr := filepath.EvalSymlinks(scopeDir)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("bootstrap scope %q realpath: %w", scope, resolveErr)
+			}
+			rel, relErr := filepath.Rel(root, resolvedScope)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return nil, fmt.Errorf("bootstrap scope %q escapes worktree", scope)
+			}
+			scopeDir = resolvedScope
+		}
+		run := func() error {
+			return runner.Run(ctx, scopeDir, append([]string(nil), contract.Command...), bootstrapEnv(cachePath, runtimePath, scope))
+		}
+		if consumer != nil {
+			managed, ok := runner.(managedCommandRunner)
+			if !ok {
+				return nil, errors.New("managed bootstrap requires a managed command runner")
+			}
+			unlockRegistry, lockErr := acquireCacheUseFileLock(worktreePath)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			var release func()
+			started := false
+			err := managed.RunManaged(ctx, scopeDir, append([]string(nil), contract.Command...), bootstrapEnv(cachePath, runtimePath, scope), func(process ProcessIdentity) error {
+				var leaseErr error
+				release, leaseErr = acquireCacheUseLease(worktreePath, want, *consumer, process, 30*time.Minute)
+				started = leaseErr == nil
+				return leaseErr
+			})
+			if started {
+				release()
+			}
+			unlockRegistry()
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := run(); err != nil {
+			return nil, err
+		}
 	}
 	if err := writeReceipt(receiptPath, want); err != nil {
 		return nil, err
@@ -176,11 +300,12 @@ func digest(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func bootstrapEnv(cachePath, runtimePath string) []string {
+func bootstrapEnv(cachePath, runtimePath, scope string) []string {
 	env := append([]string(nil), os.Environ()...)
 	return append(env,
 		"HERD_BOOTSTRAP_CACHE="+cachePath,
 		"HERD_BOOTSTRAP_RUNTIME="+runtimePath,
+		"HERD_BOOTSTRAP_SCOPE="+filepath.ToSlash(scope),
 		"GOCACHE="+filepath.Join(cachePath, "go-build"),
 		"GOMODCACHE="+filepath.Join(cachePath, "go-mod"),
 		"TMPDIR="+filepath.Join(runtimePath, "tmp"),

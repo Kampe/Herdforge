@@ -7,14 +7,22 @@ import (
 	"flag"
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/progress"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
+	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/lock"
+	"github.com/Kampe/Herdforge/pkg/security"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 func runGoalGuard() error {
@@ -23,7 +31,7 @@ func runGoalGuard() error {
 	set := fs.Bool("set", false, "create or replace a standing goal")
 	check := fs.Bool("check", false, "evaluate evidence JSON from stdin")
 	stopHook := fs.Bool("stop-hook", false, "Claude Stop hook mode: silent when no goal, block stop while goal is active")
-	clear := fs.Bool("clear", false, "remove the durable goal")
+	clear := fs.Bool("clear", false, "retire the durable goal with grantor or completion evidence")
 	lane := fs.String("lane", "", "standing lane identity")
 	task := fs.String("task", "", "task identity")
 	owner := fs.String("owner", "", "goal owner")
@@ -36,6 +44,7 @@ func runGoalGuard() error {
 	mutations := fs.String("mutations", "", "standing mutation limits")
 	forbidden := fs.String("forbidden", "", "comma-separated forbidden actions")
 	stopConditions := fs.String("stop-conditions", "", "comma-separated stop conditions")
+	receipt := fs.String("receipt", "", "task-bound completion receipt proving native Done readback")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -53,11 +62,7 @@ func runGoalGuard() error {
 		return err
 	}
 	if *clear {
-		if err := os.Remove(*state); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("clear: %w", err)
-		}
-		fmt.Fprintln(os.Stdout, `{"cleared":true}`)
-		return nil
+		return clearGoal(s, *grantor, *generation, *receipt)
 	}
 	if *set {
 		now := time.Now().UTC()
@@ -105,6 +110,274 @@ func runGoalGuard() error {
 		return err
 	}
 	return writeGoalJSON(os.Stdout, decision)
+}
+
+func clearGoal(s *goalguard.Store, grantor string, generation int64, receiptPath string) error {
+	fence := lock.NewDirLock(s.Path() + ".lock.d")
+	if err := fence.Acquire(context.Background(), 0, "goalguard clear"); err != nil {
+		return fmt.Errorf("clear: acquire lock: %w", err)
+	}
+	defer fence.Release()
+	g, err := s.Load()
+	if errors.Is(err, goalguard.ErrMissing) {
+		// An unqualified clear preserves the historical quiet no-op. Supplying
+		// proof against an absent goal, however, is a replay or stale request.
+		if strings.TrimSpace(grantor) == "" && strings.TrimSpace(receiptPath) == "" && generation == 0 {
+			fmt.Fprintln(os.Stdout, `{"cleared":false,"reason":"no_goal"}`)
+			return nil
+		}
+		return errors.New("goal-guard: clear refused: goal is missing; authorization is stale or replayed")
+	}
+	if err != nil {
+		return fmt.Errorf("clear: %w", err)
+	}
+	if retired, checkErr := s.HasRetirement(); checkErr != nil {
+		return checkErr
+	} else if retired {
+		return errors.New("goal-guard: clear refused: retirement already recorded (replay)")
+	}
+
+	grantor = strings.TrimSpace(grantor)
+	receiptPath = strings.TrimSpace(receiptPath)
+	if grantor != "" || generation != 0 {
+		if grantor == "" || generation <= 0 {
+			return errors.New("goal-guard: clear refused: grantor and positive current generation are required")
+		}
+		if g.Authority == nil {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: no recorded grantor; use coordinator retirement or a valid completion receipt", g.Owner)
+		}
+		if err := g.Authority.Validate(); err != nil {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: recorded authority invalid: %w", g.Owner, err)
+		}
+		if grantor != g.Authority.Grantor {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: grantor %q is not the recorded grantor %q", g.Owner, grantor, g.Authority.Grantor)
+		}
+		if generation != g.Generation {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: stale generation %d (goal generation %d)", g.Owner, generation, g.Generation)
+		}
+		if err := validateNativeGrantor(g, grantor, generation); err != nil {
+			return err
+		}
+		return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Grantor: grantor, RetiredAt: time.Now().UTC()})
+	}
+	if receiptPath == "" {
+		return fmt.Errorf("goal-guard: clear refused for owner %q: agent-only clear is not supported; coordinator must provide --grantor/--generation or --receipt", g.Owner)
+	}
+	receipt, err := hsync.LoadReceipt(receiptPath)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: load completion receipt: %w", err)
+	}
+	if err := validateGoalCompletionReceipt(g, receipt); err != nil {
+		return err
+	}
+	return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Receipt: receipt.Digest, RetiredAt: time.Now().UTC()})
+}
+
+// resolveTrustedCanonicalRoot resolves the canonical repository root for
+// goal-clear authority checks. HERD_ROOT/HERD_REPO_ROOT short-circuit git
+// discovery elsewhere in the codebase, but a goal-clear caller controls its
+// own environment: an untrusted process can point that override at a
+// throwaway repository it fully controls, fabricate a self-consistent
+// receipt/Done log inside it, and pass every check below against fictional
+// "canonical" state. A genuine caller's override always agrees with the
+// repository git actually discovers from its real process cwd (a linked
+// worktree of the same shared .git), so refuse whenever it doesn't.
+func resolveTrustedCanonicalRoot(ctx context.Context) (string, error) {
+	override := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "")
+	root, err := worktree.ResolveCanonicalRoot(ctx, ".", override)
+	if err != nil {
+		return "", err
+	}
+	if override == "" {
+		return root, nil
+	}
+	discoveredCommon, err := worktree.GitCommonDir(ctx, ".")
+	if err != nil {
+		return "", fmt.Errorf("verify HERD_ROOT override: git-discovered repository is unavailable: %w", err)
+	}
+	discoveredRoot := filepath.Dir(discoveredCommon)
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("verify HERD_ROOT override: stat %q: %w", root, err)
+	}
+	discoveredInfo, err := os.Stat(discoveredRoot)
+	if err != nil {
+		return "", fmt.Errorf("verify HERD_ROOT override: stat git-discovered root %q: %w", discoveredRoot, err)
+	}
+	if !os.SameFile(rootInfo, discoveredInfo) {
+		return "", fmt.Errorf("goal-guard: HERD_ROOT override %q does not match the git-discovered repository %q", root, discoveredRoot)
+	}
+	return root, nil
+}
+
+func validateNativeGrantor(g goalguard.Goal, grantor string, generation int64) error {
+	root, err := resolveTrustedCanonicalRoot(context.Background())
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: resolve canonical repository: %w", err)
+	}
+	path := security.CanonicalLeaseDBPath(root)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: native claim authority is missing; coordinator must present the live claim", g.Owner)
+		}
+		return fmt.Errorf("goal-guard: clear refused: inspect native claim authority: %w", err)
+	}
+	if err := security.WireCanonicalClaimAuthority(root); err != nil {
+		return fmt.Errorf("goal-guard: clear refused: open native claim authority: %w", err)
+	}
+	lookup, err := security.RequireClaimAuthority()
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: %w", err)
+	}
+	current, err := lookup.LookupActiveClaim(context.Background(), g.Task)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused for task %q: native claim is not active: %w", g.Task, err)
+	}
+	if current == nil || current.TaskRef != g.Task || current.OwnerID != grantor || current.Generation != generation {
+		return fmt.Errorf("goal-guard: clear refused: native claim owner/generation mismatch (want owner=%q generation=%d)", grantor, generation)
+	}
+	caller, err := goalGuardCallerIdentity()
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: caller is not a verified native coordinator session: %w", err)
+	}
+	if caller != grantor {
+		return fmt.Errorf("goal-guard: clear refused: grantor %q does not match verified native caller %q", grantor, caller)
+	}
+	return nil
+}
+
+var goalGuardCallerIdentity = resolveGoalGuardCallerIdentity
+
+func resolveGoalGuardCallerIdentity() (string, error) {
+	pane := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
+	if pane == "" {
+		return "", errors.New("HERDR_PANE_ID is missing")
+	}
+	agents, err := herdr.AgentList()
+	if err != nil {
+		return "", fmt.Errorf("herdr agent list: %w", err)
+	}
+	var match *herdr.AgentEntry
+	for i := range agents {
+		if strings.TrimSpace(agents[i].PaneID) == pane {
+			if match != nil || strings.TrimSpace(agents[i].Name) == "" || !herdr.RealModelSessionID(agents[i].Session.Value) {
+				return "", errors.New("pane has no unique real model session")
+			}
+			match = &agents[i]
+		}
+	}
+	if match == nil {
+		return "", fmt.Errorf("no live agent is bound to pane %q", pane)
+	}
+	paneInfo, err := herdr.GetHostedPaneIdentity(pane)
+	if err != nil {
+		return "", fmt.Errorf("verify caller process ancestry for pane %q: %w", pane, err)
+	}
+	if err := verifyCallerPIDInHostedTree(os.Getpid(), paneInfo); err != nil {
+		return "", fmt.Errorf("caller process is not in pane %q tree: %w", pane, err)
+	}
+	return match.Name, nil
+}
+
+func verifyCallerPIDInHostedTree(callerPID int, paneInfo *herdr.HostedPaneIdentity) error {
+	if paneInfo == nil {
+		return errors.New("missing pane process info")
+	}
+	if callerPID <= 1 {
+		return fmt.Errorf("invalid caller pid %d", callerPID)
+	}
+	allowedPIDs := map[int]bool{}
+	if paneInfo.ShellPID > 1 {
+		allowedPIDs[paneInfo.ShellPID] = true
+	}
+	for _, p := range paneInfo.Foreground {
+		if p.PID > 1 {
+			allowedPIDs[p.PID] = true
+		}
+	}
+	for _, p := range paneInfo.Tree {
+		if p.PID > 1 {
+			allowedPIDs[p.PID] = true
+		}
+	}
+	// Direct PID check
+	if allowedPIDs[callerPID] {
+		return nil
+	}
+	// Walk caller ancestry up to init/root
+	tree := toolchild.SystemTree{}
+	cur := callerPID
+	seen := map[int]bool{cur: true}
+	for depth := 0; depth < 64; depth++ {
+		node, ok, err := tree.Lookup(cur)
+		if err != nil || !ok {
+			break
+		}
+		parent := node.ParentPID
+		if parent <= 1 || seen[parent] {
+			break
+		}
+		seen[parent] = true
+		if allowedPIDs[parent] {
+			return nil
+		}
+		cur = parent
+	}
+	return fmt.Errorf("caller pid %d and its process ancestors are not members of pane %s process tree", callerPID, paneInfo.PaneID)
+}
+
+func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionReceipt) error {
+	if receipt == nil || receipt.Digest == "" || receipt.Digest != receipt.ComputeDigest() {
+		return errors.New("goal-guard: clear refused: completion receipt is missing or has an invalid digest")
+	}
+	if !strings.EqualFold(hsync.NormalizeRef(receipt.TaskRef), hsync.NormalizeRef(g.Task)) {
+		return fmt.Errorf("goal-guard: clear refused: receipt task %q does not match goal task %q", receipt.TaskRef, g.Task)
+	}
+	if receipt.Verdict != "PASS" || receipt.IntegrationResult != hsync.IntegrationMerged {
+		return errors.New("goal-guard: clear refused: completion receipt is not a merged PASS")
+	}
+	root, err := resolveTrustedCanonicalRoot(context.Background())
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: resolve canonical repository: %w", err)
+	}
+	authority, closer, err := openLifecycleAuthority(root)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: open canonical lifecycle authority: %w", err)
+	}
+	defer closer()
+	var st *lifecycle.TaskState
+	if receipt.ProvenanceMode != hsync.ProvenanceReduced {
+		cur, err := authority.CurrentState(g.Task)
+		if err != nil {
+			return fmt.Errorf("goal-guard: clear refused: query lifecycle state for task %q: %w", g.Task, err)
+		}
+		st = cur
+	}
+	if err := receipt.Validate(root, g.Task, st); err != nil {
+		return fmt.Errorf("goal-guard: clear refused: completion receipt validation failed: %w", err)
+	}
+	log, err := hsync.ReadDoneLog(root)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: native Done readback unavailable: %w", err)
+	}
+	for _, record := range log {
+		if strings.EqualFold(hsync.NormalizeRef(record.Ref), hsync.NormalizeRef(g.Task)) && record.ReceiptDigest == receipt.Digest && strings.EqualFold(record.ProviderReadback, "done") {
+			return nil
+		}
+	}
+	return fmt.Errorf("goal-guard: clear refused: receipt %s has no native Done readback", receipt.Digest)
+}
+
+func retireGoal(s *goalguard.Store, g goalguard.Goal, retirement goalguard.Retirement) error {
+	if err := s.RecordRetirement(retirement); err != nil {
+		return err
+	}
+	if err := s.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// The retirement marker remains evidence if this final unlink fails.
+		return fmt.Errorf("clear: remove goal after retirement: %w", err)
+	}
+	fmt.Fprintln(os.Stdout, `{"cleared":true}`)
+	return nil
 }
 
 // runGoalGuardStopHook adapts the guard to Claude Code's Stop hook contract:
@@ -247,14 +520,14 @@ const goalGuardPlateauAfter = progress.PlateauAfter
 func goalGuardContinueReason(task, lane string, continuations int) string {
 	const preamble = "AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT. goal-guard: "
 	if continuations < goalGuardPlateauAfter {
-		return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete, then run `herd goal-guard --clear`.",
+		return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). Keep working toward the goal; stop only when it is complete and the coordinator retires it.",
 			task, lane, continuations)
 	}
 	return fmt.Sprintf(preamble+"goal %q on lane %q is not met (continuation %d). "+
 		"You have continued %d times. If you produced NO new artifact since the last continuation, you are PLATEAUED, and repeating the same probe is not work: it spends quota to re-observe unchanged state. "+
 		"Do this instead: (1) say ONCE what you are waiting on, with the counts that prove there is nothing claimable right now; (2) do NOT repeat that report on later continuations; (3) WAIT for a real transition -- a verdict callback, a freed pool slot, a dependency card closing, or new claimable work -- rather than re-running the probe that just returned unchanged. "+
 		"Waiting on an event IS valid progress for a standing lane; a lane with genuinely nothing to claim is correctly idle, not failing. "+
-		"If you DID produce an artifact since the last continuation, ignore all of the above and keep going. Stop only when the goal is complete, then run `herd goal-guard --clear`.",
+		"If you DID produce an artifact since the last continuation, ignore all of the above and keep going. Stop only when the goal is complete and the coordinator retires it.",
 		task, lane, continuations, continuations)
 }
 

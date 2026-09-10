@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/contextauth"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
@@ -24,7 +26,7 @@ import (
 // worktree; no provider-native context file is seeded (a .kaneo.json
 // convenience file was an unguarded ambient-mutation affordance and a
 // crash-consistency hazard).
-const TaskContextFile = "TASK-CONTEXT.json"
+const TaskContextFile = gitroot.TaskContextFile
 
 // AuthorityScopeCandidateSupersession distinguishes the explicit coordinator
 // recovery packet that may replace a Recovering lifecycle candidate from the
@@ -280,7 +282,7 @@ func (tc TaskContext) BoundCallback(kind mail.CallbackKind, sha, detail string) 
 // Completion receipts deliberately remain in .herd/receipts/<REF>.json. The
 // schemas must not share a directory: a task context proves authorization to
 // work, while a completion receipt proves that reviewed work landed.
-const CanonicalTaskContextDir = ".herd/task-context-receipts"
+const CanonicalTaskContextDir = contextauth.CanonicalTaskContextDir
 
 // safeRefComponent rejects any task ref that cannot be used as a single
 // path component: untrusted provider refs must never traverse out of the

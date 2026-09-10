@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // Leaf is the review ledger's filename under .herd.
@@ -48,7 +50,7 @@ func PathFor(root string) string {
 }
 
 // QueueLeaf is the harvest queue's filename, which lives beside the ledger.
-const QueueLeaf = "harvest-queue.jsonl"
+const QueueLeaf = gitroot.ReviewQueueLeaf
 
 // QueuePathFor derives the harvest queue path from a ledger path.
 //

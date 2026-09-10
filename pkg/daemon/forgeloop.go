@@ -10,6 +10,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/budget"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
@@ -62,6 +63,13 @@ type ForgeDriver interface {
 // but must not close tabs; FAC-180 owns atomic compare-and-close.
 type ReconciliationObserver interface {
 	ObserveReconciliation(ctx context.Context) error
+}
+
+// CapacitySweeper is the native capacity-governor lifecycle contract. The
+// production driver implements it with the repository-local governor; tests
+// may record triggers without touching host state.
+type CapacitySweeper interface {
+	SweepCapacity(context.Context, resources.SweepTrigger) error
 }
 
 // ForgeLoopOptions tunes the loop.
@@ -167,7 +175,16 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			}
 		}
 	}
+	sweepCapacity := func(trigger resources.SweepTrigger) error {
+		if s, ok := d.(CapacitySweeper); ok {
+			return s.SweepCapacity(ctx, trigger)
+		}
+		return nil
+	}
 	// Startup recovery is observe-only and fail-visible.
+	if err := sweepCapacity(resources.SweepStartup); err != nil {
+		return fmt.Errorf("forge: capacity startup sweep: %w", err)
+	}
 	observe()
 
 	for tick := 0; opts.MaxTicks == 0 || tick < opts.MaxTicks; tick++ {
@@ -224,6 +241,12 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 		if opts.IntegrationWakes != nil {
 			act("integration-wake", "", func() error { return opts.IntegrationWakes(ctx) })
 		}
+		// Periodic capacity census is the safety net for lost lifecycle callbacks.
+		if err := sweepCapacity(resources.SweepPeriodic); err != nil {
+			fail("capacity-periodic", fmt.Sprintf("BLOCKED(resource_capacity): periodic sweep failed: %v", err))
+			sleep(ctx, interval)
+			continue
+		}
 		// Periodic reconciliation is the safety net for lost callbacks.
 		observe()
 
@@ -270,6 +293,11 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 			continue
 		}
 		delete(failures, "rejections")
+		if err := sweepCapacity(resources.SweepPostVerdict); err != nil {
+			fail("capacity-post-verdict", fmt.Sprintf("BLOCKED(resource_capacity): post-verdict sweep failed: %v", err))
+			sleep(ctx, interval)
+			continue
+		}
 
 		action, err := e.ForgeStep(ctx, lanes, completed, verified, rejections)
 		if err != nil {
@@ -332,6 +360,9 @@ func (e *Engine) ForgeLoop(ctx context.Context, d ForgeDriver, opts ForgeLoopOpt
 				// Post-merge board/session/worktree truth is observed before the
 				// next capacity decision; no cleanup mutation occurs here.
 				observe()
+				if sweepErr := sweepCapacity(resources.SweepPostHarvest); sweepErr != nil {
+					fail("capacity-post-harvest", fmt.Sprintf("BLOCKED(resource_capacity): post-harvest sweep failed: %v", sweepErr))
+				}
 				break
 			}
 			if errors.Is(approveErr, hsync.ErrNoEvidence) {

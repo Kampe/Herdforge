@@ -10,6 +10,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/control"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // fakeDriver records the actions the loop drives and lets a test script the
@@ -29,6 +30,12 @@ type fakeDriver struct {
 	onReview     func(ref string)
 	approveErr   func(ref string) error
 	rejectErr    func(ref string) error
+	sweeps       []resources.SweepTrigger
+}
+
+func (f *fakeDriver) SweepCapacity(_ context.Context, trigger resources.SweepTrigger) error {
+	f.sweeps = append(f.sweeps, trigger)
+	return nil
 }
 
 type observingDriver struct {
@@ -40,7 +47,6 @@ func (d *observingDriver) ObserveReconciliation(context.Context) error {
 	d.observations++
 	return nil
 }
-
 
 func TestForgeLoop_ReconciliationFailureStopsBeforeDriverActions(t *testing.T) {
 	e := forgeEngine(t)
@@ -136,6 +142,20 @@ func TestForgeLoop_DrivesActionsPerStep(t *testing.T) {
 	}
 }
 
+func TestForgeLoopRunsNativeCapacityLifecycleSeams(t *testing.T) {
+	e := forgeEngine(t,
+		&provider.Task{ID: "1", Ref: "FAC-1", Status: "to-do", Priority: provider.PriorityUrgent, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
+	)
+	d := &fakeDriver{lanes: LaneState{Busy: 0, Max: 2}, completed: map[string]bool{}, verified: map[string]bool{}}
+	if err := e.ForgeLoop(context.Background(), d, ForgeLoopOptions{Interval: time.Millisecond, MaxTicks: 1}); err != nil {
+		t.Fatal(err)
+	}
+	want := []resources.SweepTrigger{resources.SweepStartup, resources.SweepPeriodic, resources.SweepPostVerdict}
+	if fmt.Sprint(d.sweeps) != fmt.Sprint(want) {
+		t.Fatalf("capacity sweep triggers=%v, want %v", d.sweeps, want)
+	}
+}
+
 func TestForgeLoop_RenudgesUnverified(t *testing.T) {
 	e := forgeEngine(t,
 		&provider.Task{ID: "1", Ref: "FAC-1", Status: "in-progress", Priority: provider.PriorityHigh, Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-1\",\"task_id\":\"1\",\"edges\":[]}\n```\n"},
@@ -177,7 +197,7 @@ func TestForgeLoop_HappyPathReachesDoneOnce(t *testing.T) {
 	mp := provider.NewMemoryProvider()
 	task := &provider.Task{
 		ID: "1", Ref: "FAC-9001", Status: "to-do", Priority: provider.PriorityUrgent,
-		ProjectID: "p1",
+		ProjectID:   "p1",
 		Description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-9001\",\"task_id\":\"1\",\"edges\":[]}\n```\n",
 	}
 	mp.AddTask(task)
@@ -218,6 +238,16 @@ func TestForgeLoop_HappyPathReachesDoneOnce(t *testing.T) {
 	}
 	if counts["renudge:FAC-9001"] != 0 {
 		t.Fatalf("unexpected renudge: %v", hd.actions)
+	}
+	seenPostHarvest := false
+	for _, trigger := range hd.sweeps {
+		if trigger == resources.SweepPostHarvest {
+			seenPostHarvest = true
+			break
+		}
+	}
+	if !seenPostHarvest {
+		t.Fatalf("post-harvest capacity sweep was not invoked: %v", hd.sweeps)
 	}
 	got, err := mp.GetTask(context.Background(), "1")
 	if err != nil {

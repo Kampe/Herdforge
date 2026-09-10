@@ -1,6 +1,8 @@
 package herdr
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/contextauth"
 	"github.com/Kampe/Herdforge/pkg/launch"
 )
 
@@ -786,5 +789,386 @@ func TestEnrollReadySourceManifestsAncestryAuthentication(t *testing.T) {
 	if enrolledPos[0].BaseSHA != baseSHA || enrolledPos[0].CandidateSHA != descendantSHA {
 		t.Fatalf("enrolled manifest base/candidate mismatch: got base=%s candidate=%s, want base=%s candidate=%s",
 			enrolledPos[0].BaseSHA, enrolledPos[0].CandidateSHA, baseSHA, descendantSHA)
+	}
+}
+
+func TestEnrollReadySourceManifests_ResolvesNativeLaunchReceiptWithoutWorktreeOrSession(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatalf("base commit: %v (%s)", err, out)
+	}
+	baseBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := strings.TrimSpace(string(baseBytes))
+
+	agentName := "forge-mender-fac786-nat-b5e8985e"
+	laneName := "mender-fac786-native-endpoint"
+	wtRel := ".worktrees/mender-fac786-native-endpoint"
+	wtAbs := filepath.Join(root, wtRel)
+	if err := os.MkdirAll(wtAbs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create branch in worktree
+	branch := "recovery/fac-786-native-endpoint"
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "-q", "-b", branch, wtAbs, "main").CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %v (%s)", err, out)
+	}
+
+	// Write work commit
+	if err := os.WriteFile(filepath.Join(wtAbs, "fix.txt"), []byte("native endpoint fix\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", wtAbs, "add", "fix.txt").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", wtAbs, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "-m", "fix: native endpoint").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	candidateBytes, err := exec.Command("git", "-C", wtAbs, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateSHA := strings.TrimSpace(string(candidateBytes))
+
+	// Generate receipt signing key and write published verification key to .herd/receipt.pub
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	herdDir := filepath.Join(root, ".herd")
+	if err := os.MkdirAll(herdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(herdDir, "receipt.pub"), []byte(hex.EncodeToString(pub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write TASK-CONTEXT.json in worktree (authenticates task ref, role, and session)
+	unsignedTC := contextauth.TaskContext{
+		ProviderType:    "kaneo",
+		ProjectID:       "proj-1",
+		Repository:      "fixture-repo",
+		Role:            "mender",
+		TaskRef:         "FAC-786",
+		TaskID:          "task-fac-786",
+		Branch:          branch,
+		BaseSHA:         baseSHA,
+		LeaseID:         "lease-1",
+		LeaseGeneration: 1,
+		LeaseTaskRef:    "FAC-786",
+		SessionID:       "session-live-nat-1234",
+		AllowedOps:      []string{"get", "list", "comment"},
+		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	canonicalBytes, err := contextauth.CanonicalBytes(unsignedTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(priv, canonicalBytes)
+	unsignedTC.Signature = hex.EncodeToString(sig)
+
+	taskContextData, err := json.Marshal(unsignedTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtAbs, "TASK-CONTEXT.json"), taskContextData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write durable handoff report in .herd/reports/
+	reportRel := ".herd/reports/fac-786.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportData := []byte("## Report for FAC-786\nTask: FAC-786\nAgent: " + agentName + "\nCandidate: " + candidateSHA + "\nStatus: READY\n")
+	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Production launch receipt produced by herd up / recordResolvedLaunchReceipt:
+	// Notice: TaskRef is the lane name "mender-fac786-native-endpoint"
+	// Worktree is empty
+	// HerdrSession is empty
+	// CandidateSHA is empty
+	// CWD is set
+	launchReceiptsPath := filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lr := launch.Receipt{
+		Accepted:       true,
+		TaskRef:        laneName,
+		Lane:           laneName,
+		Name:           agentName,
+		Role:           "mender",
+		TaskShape:      "mender",
+		Provider:       "litellm",
+		Model:          "gpt-5.6-luna",
+		Effort:         "high",
+		DecisionDigest: "digest-1",
+		PaneID:         "wK:p17G",
+		TabID:          "wK:t17G",
+		Repository:     "fixture-repo",
+		BuilderFamily:  "openai",
+		Branch:         branch,
+		CWD:            wtAbs,
+	}
+	lrBytes, _ := json.Marshal(lr)
+	if err := os.WriteFile(launchReceiptsPath, append(lrBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock runHerdr for live AgentList resolving session
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"` + agentName + `","agent_status":"idle","pane_id":"wK:p17G","tab_id":"wK:t17G","workspace_id":"wK","terminal_id":"term-1","cwd":"` + wtAbs + `","focused":false,"agent_session":{"value":"session-live-nat-1234"}}]}}`, nil
+		}
+		return "", errors.New("unsupported mock Herdr command")
+	}
+
+	manifests, err := EnrollReadySourceManifests(root, "fixture-repo", true)
+	if err != nil {
+		t.Fatalf("EnrollReadySourceManifests failed: %v", err)
+	}
+	if len(manifests) != 1 {
+		t.Fatalf("expected 1 enrolled manifest, got %d", len(manifests))
+	}
+	m := manifests[0]
+	if m.TaskRef != "FAC-786" {
+		t.Errorf("manifest TaskRef = %q, want %q", m.TaskRef, "FAC-786")
+	}
+	if m.Worktree != wtRel {
+		t.Errorf("manifest Worktree = %q, want %q", m.Worktree, wtRel)
+	}
+	if m.SessionID != "session-live-nat-1234" {
+		t.Errorf("manifest SessionID = %q, want %q", m.SessionID, "session-live-nat-1234")
+	}
+	if m.CandidateSHA != candidateSHA {
+		t.Errorf("manifest CandidateSHA = %q, want %q", m.CandidateSHA, candidateSHA)
+	}
+}
+
+func TestReadVerifiedSourceTaskContext_CryptographicAdversarialRejection(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, ".worktrees", "worker-1")
+	if err := os.MkdirAll(wt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	herdDir := filepath.Join(root, ".herd")
+	if err := os.MkdirAll(herdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	pubA, privA, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, privB, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write repo's published key from Key A
+	if err := os.WriteFile(filepath.Join(herdDir, "receipt.pub"), []byte(hex.EncodeToString(pubA)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTC := contextauth.TaskContext{
+		ProviderType:    "kaneo",
+		ProjectID:       "proj-1",
+		Repository:      "herdforge",
+		Role:            "mender",
+		TaskRef:         "FAC-794",
+		TaskID:          "task-fac-794",
+		Branch:          "recovery/fac-794",
+		BaseSHA:         strings.Repeat("a", 40),
+		LeaseID:         "lease-1",
+		LeaseGeneration: 1,
+		LeaseTaskRef:    "FAC-794",
+		SessionID:       "session-legit-1",
+		AllowedOps:      []string{"get", "list", "comment"},
+		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	writeTC := func(tc contextauth.TaskContext) {
+		data, err := json.Marshal(tc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, "TASK-CONTEXT.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	signTC := func(tc contextauth.TaskContext, priv ed25519.PrivateKey) contextauth.TaskContext {
+		tc.Signature = ""
+		canon, err := contextauth.CanonicalBytes(tc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig := ed25519.Sign(priv, canon)
+		tc.Signature = hex.EncodeToString(sig)
+		return tc
+	}
+
+	// 1. Unsigned context
+	writeTC(baseTC)
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "unsigned") {
+		t.Fatalf("expected unsigned error, got %v", err)
+	}
+
+	// 2. Forged key (signed with Key B while repo expects Key A)
+	forgedKeyTC := signTC(baseTC, privB)
+	writeTC(forgedKeyTC)
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed signature verification") {
+		t.Fatalf("expected signature verification failure for foreign key, got %v", err)
+	}
+
+	// 3. Mutated field after signing (signed under Key A for task FAC-794, but TaskRef mutated to FAC-999)
+	validTC := signTC(baseTC, privA)
+	tamperedTC := validTC
+	tamperedTC.TaskRef = "FAC-999"
+	writeTC(tamperedTC)
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed signature verification") {
+		t.Fatalf("expected signature verification failure for tampered task_ref, got %v", err)
+	}
+
+	// 4. Mutated session_id after signing
+	tamperedSessionTC := validTC
+	tamperedSessionTC.SessionID = "session-hijacked"
+	writeTC(tamperedSessionTC)
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "failed signature verification") {
+		t.Fatalf("expected signature verification failure for tampered session_id, got %v", err)
+	}
+
+	// 5. Corrupt / short receipt.pub
+	if err := os.WriteFile(filepath.Join(herdDir, "receipt.pub"), []byte("corrupt-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeTC(validTC)
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "receipt verification key is corrupt") {
+		t.Fatalf("expected corrupt key error, got %v", err)
+	}
+
+	// 6. Missing receipt.pub
+	if err := os.Remove(filepath.Join(herdDir, "receipt.pub")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readVerifiedSourceTaskContext(root, wt); err == nil || !strings.Contains(err.Error(), "no receipt verification key") {
+		t.Fatalf("expected missing key error, got %v", err)
+	}
+}
+
+func TestEvaluateSourceRetirement_BlocksOnForgedOrTamperedTaskContext(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, ".worktrees", "mender-1")
+	if err := os.MkdirAll(wt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	baseBytes, _ := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	baseSHA := strings.TrimSpace(string(baseBytes))
+
+	herdDir := filepath.Join(root, ".herd")
+	if err := os.MkdirAll(herdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pubA, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, privB, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(herdDir, "receipt.pub"), []byte(hex.EncodeToString(pubA)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Launch receipt matches CWD but has lane name "mender-lane-1" instead of TaskRef "FAC-794"
+	// and lacks HerdrSession
+	lr := launch.Receipt{
+		Accepted:   true,
+		TaskRef:    "mender-lane-1",
+		Name:       "forge-mender-fac794-x",
+		Role:       "mender",
+		Repository: "herdforge",
+		Branch:     "recovery/fac-794",
+		CWD:        wt,
+	}
+
+	m := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+		Repository:     "herdforge",
+		TaskRef:        "FAC-794",
+		TaskID:         "task-fac-794",
+		CandidateSHA:   baseSHA,
+		BaseSHA:        baseSHA,
+		Branch:         "recovery/fac-794",
+		Worktree:       ".worktrees/mender-1",
+		Workspace:      "wK",
+		TabID:          "wK:t1",
+		PaneID:         "wK:p1",
+		TerminalID:     "term-1",
+		SessionID:      "session-1",
+		AgentName:      "forge-mender-fac794-x",
+		Role:           "mender",
+		ReportArtifact: ".herd/reports/fac-794.md",
+		ReportDigest:   strings.Repeat("d", 64),
+		Generation:     "gen-1",
+		Nonce:          "nonce-1",
+	})
+
+	focused := false
+	evidence := SourceRetirementEvidence{
+		Manifest:   m,
+		Launch:     lr,
+		Handoff:    SourceRetirementHandoff{Known: true, TaskRef: "FAC-794", AgentName: "forge-mender-fac794-x", CandidateSHA: baseSHA, Status: "READY", ReportDigest: strings.Repeat("d", 64)},
+		Live:       SourceRetirementLive{TabPresent: true, Focused: &focused, Status: "idle", SessionID: "session-1", TabID: "wK:t1", PaneID: "wK:p1", TerminalID: "term-1", Workspace: "wK"},
+		Worktree:   SourceRetirementWorktree{Known: true, Dirty: false, Head: baseSHA, Branch: "recovery/fac-794", Path: wt},
+		Repository: "herdforge",
+	}
+
+	// Case A: Forged TASK-CONTEXT signed with Key B (foreign key)
+	tcForeign := contextauth.TaskContext{
+		ProviderType:    "kaneo",
+		ProjectID:       "proj-1",
+		Repository:      "herdforge",
+		Role:            "mender",
+		TaskRef:         "FAC-794",
+		TaskID:          "task-fac-794",
+		Branch:          "recovery/fac-794",
+		BaseSHA:         baseSHA,
+		LeaseID:         "lease-1",
+		LeaseGeneration: 1,
+		LeaseTaskRef:    "FAC-794",
+		SessionID:       "session-1",
+		AllowedOps:      []string{"get", "list", "comment"},
+		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	canon, _ := contextauth.CanonicalBytes(tcForeign)
+	sigB := ed25519.Sign(privB, canon)
+	tcForeign.Signature = hex.EncodeToString(sigB)
+	tcData, _ := json.Marshal(tcForeign)
+	if err := os.WriteFile(filepath.Join(wt, "TASK-CONTEXT.json"), tcData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := EvaluateSourceRetirement(evidence)
+	if dec.Eligible || !strings.Contains(dec.Reason, "launch provenance task ref mismatch") {
+		t.Fatalf("expected blocked due to task ref mismatch when TASK-CONTEXT signature fails verification, got decision: %+v", dec)
 	}
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -14,13 +16,40 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
+	"github.com/Kampe/Herdforge/pkg/herdr"
+	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
+	// Positive genuine coordinator clear with verified caller process ancestry
 	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-308"}, "coordinator", "coordinator", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERDR_PANE_ID", "%42")
+	restoreHerdr := herdr.SetRunHerdrForTest(func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"type":"agent_list","agents":[{"name":"coordinator","agent":"codex","agent_status":"working","pane_id":"%42","tab_id":"t1","agent_session":{"value":"01a072e0-7206-71b1-9f12-706158a4c4a6"}}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return fmt.Sprintf(`{"result":{"process_info":{"pane_id":"%%42","shell_pid":%d,"foreground_process_group_id":%d,"foreground_processes":[{"pid":%d,"name":"go","argv":["go"]}]}}}`, os.Getpid(), os.Getpid(), os.Getpid()), nil
+		}
+		return "", errors.New("unexpected herdr command")
+	})
+	defer restoreHerdr()
+
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
-	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-308", "--owner", "coordinator", "--generation", "4", "--max", "1"}
+	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-308", "--owner", "coordinator", "--generation", strconv.FormatInt(lease.Generation, 10), "--max", "1", "--grantor", "coordinator", "--packet", "packet.md", "--autonomy", "bounded", "--mutations", "worktree", "--forbidden", "merge", "--stop-conditions", "stop"}
 	if err := runGoalGuard(); err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +60,7 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := input.WriteString(`{"lane":"forge-worker","task":"FAC-308","owner":"coordinator","generation":4,"lease_held":true,"now":"2026-08-16T02:00:00Z"}`); err != nil {
+	if _, err := input.WriteString(fmt.Sprintf(`{"lane":"forge-worker","task":"FAC-308","owner":"coordinator","generation":%d,"lease_held":true,"now":"2026-08-16T02:00:00Z"}`, lease.Generation)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := input.Seek(0, 0); err != nil {
@@ -46,12 +75,461 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	os.Args = []string{"herd", "goal-guard", "--clear", "--state", state}
+	os.Args = []string{"herd", "goal-guard", "--clear", "--state", state, "--grantor", "coordinator", "--generation", strconv.FormatInt(lease.Generation, 10)}
 	if err := runGoalGuard(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(state); !os.IsNotExist(err) {
 		t.Fatalf("clear left state behind: %v", err)
+	}
+}
+
+func TestGoalGuardClearRefusesAgentAndStaleGrantorWithoutMutation(t *testing.T) {
+	previousCaller := goalGuardCallerIdentity
+	goalGuardCallerIdentity = func() (string, error) { return "coordinator", nil }
+	defer func() { goalGuardCallerIdentity = previousCaller }()
+	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-767"}, "native-owner", "worker", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "coordinator", Generation: lease.Generation,
+		CreatedAt: now, UpdatedAt: now,
+		Authority: &goalguard.AuthorityEnvelope{Grantor: "coordinator", PacketPath: "packet.md", BoundedAutonomy: "bounded", MutationLimits: "worktree", ForbiddenActions: []string{"merge"}, StopConditions: []string{"stop"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clearGoal(s, "", 0, ""); err == nil || !strings.Contains(err.Error(), "agent-only clear") {
+		t.Fatalf("agent clear error = %v, want refusal naming supported route", err)
+	}
+	if got, _ := os.ReadFile(state); string(got) != string(original) {
+		t.Fatal("agent refusal mutated goal state")
+	}
+	if err := clearGoal(s, "coordinator", 8, ""); err == nil || !strings.Contains(err.Error(), "stale generation") {
+		t.Fatalf("stale clear error = %v, want stale generation refusal", err)
+	}
+	if got, _ := os.ReadFile(state); string(got) != string(original) {
+		t.Fatal("stale refusal mutated goal state")
+	}
+	if err := clearGoal(s, "coordinator", lease.Generation, ""); err == nil || !strings.Contains(err.Error(), "native claim owner/generation mismatch") {
+		t.Fatalf("forged envelope clear error = %v, want native owner refusal", err)
+	}
+	if got, _ := os.ReadFile(state); string(got) != string(original) {
+		t.Fatal("native-owner refusal mutated goal state")
+	}
+}
+
+func TestGoalGuardClearRefusesMatchingClaimFromWrongNativeCaller(t *testing.T) {
+	previousCaller := goalGuardCallerIdentity
+	goalGuardCallerIdentity = func() (string, error) { return "different-native-agent", nil }
+	defer func() { goalGuardCallerIdentity = previousCaller }()
+	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-768"}, "coordinator", "coordinator", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{Lane: "standing", Task: "FAC-768", Owner: "coordinator", Generation: lease.Generation, CreatedAt: now, UpdatedAt: now, Authority: &goalguard.AuthorityEnvelope{Grantor: "coordinator", PacketPath: "packet.md", BoundedAutonomy: "bounded", MutationLimits: "worktree", ForbiddenActions: []string{"merge"}, StopConditions: []string{"stop"}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clearGoal(s, "coordinator", lease.Generation, ""); err == nil || !strings.Contains(err.Error(), "verified native caller") {
+		t.Fatalf("wrong native caller error = %v", err)
+	}
+	if after, _ := os.ReadFile(state); string(after) != string(before) {
+		t.Fatal("wrong native caller refusal mutated goal state")
+	}
+}
+
+func TestPaneSpoofingAllowsUnauthorizedRetirement(t *testing.T) {
+	// Unauthorized caller A attempts to spoof genuine coordinator B's HERDR_PANE_ID
+	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-767"}, "coordinatorB", "coordinator", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "coordinatorB", Generation: lease.Generation,
+		CreatedAt: now, UpdatedAt: now,
+		Authority: &goalguard.AuthorityEnvelope{Grantor: "coordinatorB", PacketPath: "packet.md", BoundedAutonomy: "bounded", MutationLimits: "worktree", ForbiddenActions: []string{"merge"}, StopConditions: []string{"stop"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Caller sets HERDR_PANE_ID=%10 (spoofing coordinatorB's pane), but caller's process PID is NOT in pane %10
+	t.Setenv("HERDR_PANE_ID", "%10")
+	restoreHerdr := herdr.SetRunHerdrForTest(func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"type":"agent_list","agents":[{"name":"coordinatorB","agent":"codex","agent_status":"working","pane_id":"%10","tab_id":"t1","agent_session":{"value":"01a072e0-7206-71b1-9f12-706158a4c4a6"}}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			// Genuine pane %10 has shell PID 99999 and foreground PID 99998 (unrelated to caller process)
+			return `{"result":{"process_info":{"pane_id":"%10","shell_pid":99999,"foreground_process_group_id":99998,"foreground_processes":[{"pid":99998,"name":"codex","argv":["codex"]}]}}}`, nil
+		}
+		return "", errors.New("unexpected herdr command")
+	})
+	defer restoreHerdr()
+
+	err = clearGoal(s, "coordinatorB", lease.Generation, "")
+	if err == nil {
+		t.Fatal("spoofed HERDR_PANE_ID was accepted without verifying caller process ancestry")
+	}
+	if !strings.Contains(err.Error(), "caller process is not in pane") && !strings.Contains(err.Error(), "process ancestry") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if after, _ := os.ReadFile(state); string(after) != string(before) {
+		t.Fatal("unauthorized retirement mutated or deleted goal file")
+	}
+	if retired, _ := s.HasRetirement(); retired {
+		t.Fatal("unauthorized retirement recorded retirement evidence")
+	}
+}
+
+func TestLocalCwdFabricatedReceiptAllowsGoalRetirement(t *testing.T) {
+	// An agent operating inside its own writable worktree creates a synthetic completion receipt
+	// and appends a synthetic entry to its local ./.herd/board-done.jsonl
+	tmp := t.TempDir()
+	state := filepath.Join(tmp, "goal.json")
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "worker", Generation: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create synthetic receipt in tmp
+	receiptPath := filepath.Join(tmp, "fake-receipt.json")
+	fakeReceipt := hsync.CompletionReceipt{
+		Version:           1,
+		TaskRef:           "FAC-767",
+		Verdict:           "PASS",
+		IntegrationResult: hsync.IntegrationMerged,
+		RepoID:            "file" + tmp,
+		BaseSHA:           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		CandidateSHA:      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		MergeSHA:          "cccccccccccccccccccccccccccccccccccccccc",
+		PatchID:           "dddddddddddddddddddddddddddddddddddddddd",
+		AcceptanceDigest:  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		TaskID:            "task-1",
+		ProviderRevision:  "rev-1",
+		VerificationDigest: "ffffffffffffffffffffffffffffffffffffffff",
+		RiskTier:          "R1",
+		AuthorFamily:      "openai",
+		ReviewerFamily:    "google",
+		LeaseGeneration:   1,
+	}
+	fakeReceipt.Digest = fakeReceipt.ComputeDigest()
+	rb, err := json.Marshal(fakeReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, rb, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create local .herd/board-done.jsonl in tmp
+	localDoneDir := filepath.Join(tmp, ".herd")
+	if err := os.MkdirAll(localDoneDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	localDoneRecord := hsync.DoneRecord{
+		Ref:              "FAC-767",
+		ReceiptDigest:    fakeReceipt.Digest,
+		ProviderReadback: "done",
+	}
+	ldb, err := json.Marshal(localDoneRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDoneDir, "board-done.jsonl"), append(ldb, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = clearGoal(s, "", 0, receiptPath)
+	if err == nil {
+		t.Fatal("locally fabricated receipt and board-done.jsonl bypassed goal retirement protection")
+	}
+	if after, _ := os.ReadFile(state); string(after) != string(before) {
+		t.Fatal("fabricated receipt mutated or deleted goal file")
+	}
+	if retired, _ := s.HasRetirement(); retired {
+		t.Fatal("fabricated receipt recorded retirement evidence")
+	}
+}
+
+func TestGenuineCanonicalCompletionReceiptRetiresGoal(t *testing.T) {
+	// A genuine merged PASS completion receipt against canonical repository state retires the goal
+	repoDir := t.TempDir()
+	state := filepath.Join(repoDir, "goal.json")
+	t.Setenv("HERD_ROOT", repoDir)
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "worker", Generation: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initialize genuine Git repo with an origin/main commit
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", repoDir, "init").Run()
+	exec.Command("git", "-C", repoDir, "config", "user.name", "Herd Test").Run()
+	exec.Command("git", "-C", repoDir, "config", "user.email", "test@herd.local").Run()
+	testFile := filepath.Join(repoDir, "file.txt")
+	os.WriteFile(testFile, []byte("hello\n"), 0600)
+	exec.Command("git", "-C", repoDir, "add", ".").Run()
+	exec.Command("git", "-C", repoDir, "commit", "-m", "initial commit").Run()
+	baseOut, _ := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	baseSHA := strings.TrimSpace(string(baseOut))
+
+	os.WriteFile(testFile, []byte("hello world\n"), 0600)
+	exec.Command("git", "-C", repoDir, "add", ".").Run()
+	exec.Command("git", "-C", repoDir, "commit", "-m", "feature commit").Run()
+	mergeOut, _ := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output()
+	mergeSHA := strings.TrimSpace(string(mergeOut))
+	patchID, err := hsync.PatchID(repoDir, mergeSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", repoDir, "branch", "origin/main", "HEAD").Run()
+	exec.Command("git", "-C", repoDir, "config", "remote.origin.url", "file://"+repoDir).Run()
+	repoID, err := toolchild.RepositoryIdentity(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create reduced completion receipt (proven post-merge)
+	fakeReceipt := hsync.CompletionReceipt{
+		Version:           1,
+		ProvenanceMode:    hsync.ProvenanceReduced,
+		PullRequest:       42,
+		TaskRef:           "FAC-767",
+		Verdict:           "PASS",
+		IntegrationResult: hsync.IntegrationMerged,
+		RepoID:            repoID,
+		BaseSHA:           baseSHA,
+		CandidateSHA:      mergeSHA,
+		MergeSHA:          mergeSHA,
+		PatchID:           patchID,
+		VerificationDigest: "ffffffffffffffffffffffffffffffffffffffff",
+		RiskTier:          "R1",
+		AuthorFamily:      "openai",
+		ReviewerFamily:    "google",
+	}
+	fakeReceipt.Digest = fakeReceipt.ComputeDigest()
+	receiptPath := filepath.Join(repoDir, "receipt.json")
+	rb, err := json.Marshal(fakeReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, rb, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create canonical Done record in repoDir/.herd/board-done.jsonl
+	doneDir := filepath.Join(repoDir, ".herd")
+	if err := os.MkdirAll(doneDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	doneRecord := hsync.DoneRecord{
+		Ref:              "FAC-767",
+		ReceiptDigest:    fakeReceipt.Digest,
+		ProviderReadback: "done",
+	}
+	db, err := json.Marshal(doneRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doneDir, "board-done.jsonl"), append(db, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := clearGoal(s, "", 0, receiptPath); err != nil {
+		t.Fatalf("genuine canonical completion receipt clear failed: %v", err)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatal("goal file was not removed after genuine completion retirement")
+	}
+	if retired, err := s.HasRetirement(); err != nil || !retired {
+		t.Fatalf("retirement record was not written: err=%v, retired=%v", err, retired)
+	}
+}
+
+func TestHostileHerdRootOverrideRefusesGoalRetirement(t *testing.T) {
+	// A hostile caller sets HERD_ROOT to a fully self-controlled repository
+	// distinct from the real, cwd-discovered canonical repository, and
+	// fabricates a self-consistent receipt and Done log inside it. Being a
+	// genuine git repo with real commits/patch-id makes the receipt
+	// internally valid; the goal-guard must still refuse it because the
+	// override does not match where the caller's process actually lives.
+	fake := t.TempDir()
+	state := filepath.Join(t.TempDir(), "goal.json")
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "worker", Generation: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HERD_ROOT", fake)
+
+	exec.Command("git", "-C", fake, "init").Run()
+	exec.Command("git", "-C", fake, "config", "user.name", "Hostile Test").Run()
+	exec.Command("git", "-C", fake, "config", "user.email", "hostile@herd.local").Run()
+	fakeFile := filepath.Join(fake, "file.txt")
+	os.WriteFile(fakeFile, []byte("hello\n"), 0600)
+	exec.Command("git", "-C", fake, "add", ".").Run()
+	exec.Command("git", "-C", fake, "commit", "-m", "initial commit").Run()
+	baseOut, _ := exec.Command("git", "-C", fake, "rev-parse", "HEAD").Output()
+	baseSHA := strings.TrimSpace(string(baseOut))
+	os.WriteFile(fakeFile, []byte("hello world\n"), 0600)
+	exec.Command("git", "-C", fake, "add", ".").Run()
+	exec.Command("git", "-C", fake, "commit", "-m", "feature commit").Run()
+	mergeOut, _ := exec.Command("git", "-C", fake, "rev-parse", "HEAD").Output()
+	mergeSHA := strings.TrimSpace(string(mergeOut))
+	patchID, err := hsync.PatchID(fake, mergeSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", fake, "branch", "origin/main", "HEAD").Run()
+	exec.Command("git", "-C", fake, "config", "remote.origin.url", "file://"+fake).Run()
+	repoID, err := toolchild.RepositoryIdentity(fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fakeReceipt := hsync.CompletionReceipt{
+		Version:            1,
+		ProvenanceMode:     hsync.ProvenanceReduced,
+		PullRequest:        42,
+		TaskRef:            "FAC-767",
+		Verdict:            "PASS",
+		IntegrationResult:  hsync.IntegrationMerged,
+		RepoID:             repoID,
+		BaseSHA:            baseSHA,
+		CandidateSHA:       mergeSHA,
+		MergeSHA:           mergeSHA,
+		PatchID:            patchID,
+		VerificationDigest: "ffffffffffffffffffffffffffffffffffffffff",
+		RiskTier:           "R1",
+		AuthorFamily:       "openai",
+		ReviewerFamily:     "google",
+	}
+	fakeReceipt.Digest = fakeReceipt.ComputeDigest()
+	receiptPath := filepath.Join(fake, "receipt.json")
+	rb, err := json.Marshal(fakeReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, rb, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	doneDir := filepath.Join(fake, ".herd")
+	if err := os.MkdirAll(doneDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	doneRecord := hsync.DoneRecord{
+		Ref:              "FAC-767",
+		ReceiptDigest:    fakeReceipt.Digest,
+		ProviderReadback: "done",
+	}
+	db, err := json.Marshal(doneRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doneDir, "board-done.jsonl"), append(db, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = clearGoal(s, "", 0, receiptPath)
+	if err == nil {
+		t.Fatal("HERD_ROOT override to a self-controlled, self-consistent fabricated repository bypassed goal retirement protection")
+	}
+	if after, _ := os.ReadFile(state); string(after) != string(before) {
+		t.Fatal("hostile HERD_ROOT override mutated or deleted goal file")
+	}
+	if retired, _ := s.HasRetirement(); retired {
+		t.Fatal("hostile HERD_ROOT override recorded retirement evidence")
 	}
 }
 
