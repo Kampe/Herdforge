@@ -118,6 +118,12 @@ func (f IdentityFence) Verify(after kick.AgentEntry) error {
 	if f.TabGeneration != 0 && after.TabGeneration != f.TabGeneration {
 		return fmt.Errorf("identity fence mismatch: tab_generation changed from %d to %d", f.TabGeneration, after.TabGeneration)
 	}
+	if f.ExpectedModel != "" && after.ExpectedModel != f.ExpectedModel {
+		return fmt.Errorf("identity fence mismatch: expected_model changed from %q to %q", f.ExpectedModel, after.ExpectedModel)
+	}
+	if f.ExpectedProvider != "" && after.ExpectedProvider != f.ExpectedProvider {
+		return fmt.Errorf("identity fence mismatch: expected_provider changed from %q to %q", f.ExpectedProvider, after.ExpectedProvider)
+	}
 	return nil
 }
 

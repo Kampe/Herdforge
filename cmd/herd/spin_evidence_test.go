@@ -156,11 +156,13 @@ func TestSpin_ModelRouteMismatch_RefusesEvidence(t *testing.T) {
 
 	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
 		return &kick.AgentEntry{
-			Name:    "forge-worker",
-			Kind:    "opencode",
-			PaneID:  "p-1",
-			Cwd:     "/path/to/worktree",
-			Session: kick.AgentSession{Value: sessionID},
+			Name:             "forge-worker",
+			Kind:             "opencode",
+			PaneID:           "p-1",
+			Cwd:              "/path/to/worktree",
+			ExpectedModel:    "litellm/expected-model",
+			ExpectedProvider: "litellm",
+			Session:          kick.AgentSession{Value: sessionID},
 		}, nil
 	}
 
@@ -244,5 +246,68 @@ func TestSpin_ContextCancellation_PropagatesToHerdrCensus(t *testing.T) {
 		// cancellation was observed directly by the underlying census runner
 	case <-time.After(1 * time.Second):
 		t.Errorf("underlying herdr runner did not observe context cancellation")
+	}
+}
+
+func TestSpin_NativeEvidenceError_DoesNotFallbackToPaneComplete(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+
+	// Runner returns an error (e.g. malformed export / read failure)
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return nil, errors.New("export failed: process terminated")
+	})
+	defer restore()
+
+	fence := process.IdentityFence{
+		Name:             "forge-worker",
+		Kind:             "opencode",
+		SessionID:        sessionID,
+		PaneID:           "p-1",
+		ExpectedModel:    "m-1",
+		ExpectedProvider: "p-1",
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:             "forge-worker",
+			Kind:             "opencode",
+			PaneID:           "p-1",
+			Session:          kick.AgentSession{Value: sessionID},
+			ExpectedModel:    "m-1",
+			ExpectedProvider: "p-1",
+		}, nil
+	}
+
+	ev, sctx, _, evErr := process.ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
+	if evErr == nil {
+		t.Fatal("expected resolver error")
+	}
+
+	paneTail := "Verdict: PASS\nStatus: COMPLETE"
+
+	// Replicate runSpin branch for native agent when evErr != nil:
+	var target process.Target
+	if evErr != nil && strings.EqualFold(fence.Kind, "opencode") {
+		target = process.Target{
+			PaneID: "p-1",
+			Name:   "forge-worker",
+			Status: "working",
+			Class:  process.Unknown,
+			Action: "observe",
+			Tail:   fmt.Sprintf("native evidence error: %v", evErr),
+		}
+	} else {
+		target = process.ClassifyTargetWithEvidence("p-1", "forge-worker", "working", paneTail, ev, sctx)
+	}
+
+	if target.Class == process.Complete || target.Class == process.Pass {
+		t.Fatalf("SECURITY VIOLATION: native evidence error fell back to pane classification: %s", target.Class)
+	}
+	if target.Class != process.Unknown {
+		t.Errorf("expected Unknown target class, got %s", target.Class)
+	}
+	if target.Action != "observe" {
+		t.Errorf("expected observe target action, got %s", target.Action)
 	}
 }

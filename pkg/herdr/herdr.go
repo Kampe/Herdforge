@@ -1649,6 +1649,38 @@ type AgentEntry struct {
 	ExpectedProvider string `json:"provider,omitempty"`
 }
 
+// UnmarshalJSON implements custom unmarshaling to accept both native Herdr tags (model, provider)
+// and legacy/explicit tags (expected_model, expected_provider).
+func (a *AgentEntry) UnmarshalJSON(data []byte) error {
+	type rawEntry AgentEntry
+	var aux struct {
+		rawEntry
+		Model            string `json:"model,omitempty"`
+		Provider         string `json:"provider,omitempty"`
+		ExpectedModel    string `json:"expected_model,omitempty"`
+		ExpectedProvider string `json:"expected_provider,omitempty"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*a = AgentEntry(aux.rawEntry)
+	if a.ExpectedModel == "" {
+		if aux.Model != "" {
+			a.ExpectedModel = aux.Model
+		} else if aux.ExpectedModel != "" {
+			a.ExpectedModel = aux.ExpectedModel
+		}
+	}
+	if a.ExpectedProvider == "" {
+		if aux.Provider != "" {
+			a.ExpectedProvider = aux.Provider
+		} else if aux.ExpectedProvider != "" {
+			a.ExpectedProvider = aux.ExpectedProvider
+		}
+	}
+	return nil
+}
+
 // SessionID renders the launch-time pane identity a receipt binds to.
 // tab/pane alone name a reusable slot, so the incarnation token is part of
 // the identity (FAC-145).

@@ -170,12 +170,24 @@ func runSpin() {
 			}
 			return nil, errors.New("agent not found after export")
 		}
-		ev, sctx, _, _ := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, time.Time{}, 5*time.Minute)
+		ev, sctx, _, evErr := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, time.Time{}, 5*time.Minute)
 		spinCancel()
 
-		target := process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)
-		if target.Class == process.Quota && ev != nil {
-			process.EvaluateAndRecordStop(ev, sctx, tail, 15*time.Minute)
+		var target process.Target
+		if evErr != nil && strings.EqualFold(a.Kind, "opencode") {
+			target = process.Target{
+				PaneID: a.PaneID,
+				Name:   a.Name,
+				Status: a.Status,
+				Class:  process.Unknown,
+				Action: "observe",
+				Tail:   fmt.Sprintf("native evidence error: %v", evErr),
+			}
+		} else {
+			target = process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)
+			if target.Class == process.Quota && ev != nil {
+				process.EvaluateAndRecordStop(ev, sctx, tail, 15*time.Minute)
+			}
 		}
 
 		obs := spin.Observation{

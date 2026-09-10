@@ -342,7 +342,7 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 
 	// 2. Evaluate finish_reason: length (output token limit truncation).
 	// Must NEVER produce Done, Pass, or NeedsReview.
-	if strings.EqualFold(ev.FinishReason, "length") || OutputLimitReason(ev.Error) != "" || OutputLimitReason(rawText) != "" {
+	if strings.EqualFold(ev.FinishReason, "length") || OutputLimitReason(ev.Error) != "" {
 		res.Class = Unknown
 		res.Action = "read_pane"
 		res.Reason = "output token limit reached (finish=length)"
@@ -362,9 +362,6 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 	if exhaustionReason == "" && strings.EqualFold(ev.FinishReason, "quota") {
 		exhaustionReason = "provider quota or rate limit reported"
 	}
-	if exhaustionReason == "" {
-		exhaustionReason = ProviderExhaustionReason(rawText)
-	}
 
 	if exhaustionReason != "" || strings.EqualFold(ev.FinishReason, "quota") {
 		res.Class = Quota
@@ -378,8 +375,8 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		return res
 	}
 
-	// 4. Check other provider death errors (auth, connection lost, etc.)
-	if CheckProviderDeath(ev.Error) || CheckProviderDeath(rawText) {
+	// 4. Check other provider death errors (auth, connection lost, etc.) from validated evidence.
+	if CheckProviderDeath(ev.Error) {
 		res.Class = Blocked
 		res.Blocked = true
 		res.ProviderDeath = true
@@ -401,13 +398,12 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 	}
 
 	// 6. Successful / normal response evaluation
-	c := classifyText(rawText)
+	c := classifyTextNoQuota(rawText)
 	if ev.Status != "" && (c == Unknown || c == Unconsumed) {
-		c = classifyText("Status: " + ev.Status)
+		c = classifyTextNoQuota("Status: " + ev.Status)
 	}
-	isPD := CheckProviderDeath(rawText)
 	res.Class = c
-	res.Action = actionFor(c, isPD)
+	res.Action = actionFor(c, false)
 	return res
 }
 

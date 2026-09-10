@@ -244,15 +244,17 @@ func TestResolveNativeAgentEvidenceWithFence_BeforeAfterFencing(t *testing.T) {
 	// 1. Success case: after matches before fence exactly
 	fetchMatching := func(name string) (*kick.AgentEntry, error) {
 		return &kick.AgentEntry{
-			Name:           "forge-worker-1",
-			Kind:           "opencode",
-			PaneID:         "p-100",
-			TabID:          "t-100",
-			TerminalID:     "term-100",
-			Workspace:      "ws-main",
-			Cwd:            worktreeDir,
-			StateChangeSeq: 10,
-			Session:        kick.AgentSession{Value: sessionID},
+			Name:             "forge-worker-1",
+			Kind:             "opencode",
+			PaneID:           "p-100",
+			TabID:            "t-100",
+			TerminalID:       "term-100",
+			Workspace:        "ws-main",
+			Cwd:              worktreeDir,
+			StateChangeSeq:   10,
+			ExpectedModel:    model,
+			ExpectedProvider: "litellm",
+			Session:          kick.AgentSession{Value: sessionID},
 		}, nil
 	}
 
@@ -484,6 +486,39 @@ func TestIdentityFence_BlankAfterSessionSource_RejectsWhenExpectedNonEmpty(t *te
 	}
 }
 
+func TestIdentityFence_AfterRouteMutation_Rejects(t *testing.T) {
+	fence := IdentityFence{
+		Name:             "worker",
+		Kind:             "opencode",
+		SessionID:        "sess-1",
+		ExpectedModel:    "claude-3-5-sonnet",
+		ExpectedProvider: "anthropic",
+	}
+	afterModelMutated := kick.AgentEntry{
+		Name:             "worker",
+		Kind:             "opencode",
+		Session:          kick.AgentSession{Value: "sess-1"},
+		ExpectedModel:    "claude-3-haiku",
+		ExpectedProvider: "anthropic",
+	}
+	err := fence.Verify(afterModelMutated)
+	if err == nil || !strings.Contains(err.Error(), "expected_model changed") {
+		t.Fatalf("expected model route change to be rejected by fence, got: %v", err)
+	}
+
+	afterProviderMutated := kick.AgentEntry{
+		Name:             "worker",
+		Kind:             "opencode",
+		Session:          kick.AgentSession{Value: "sess-1"},
+		ExpectedModel:    "claude-3-5-sonnet",
+		ExpectedProvider: "bedrock",
+	}
+	err = fence.Verify(afterProviderMutated)
+	if err == nil || !strings.Contains(err.Error(), "expected_provider changed") {
+		t.Fatalf("expected provider route change to be rejected by fence, got: %v", err)
+	}
+}
+
 func TestResolveNativeAgentEvidenceWithFence_ExpectedModelAndProviderMismatch(t *testing.T) {
 	now := time.Now().UTC()
 	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
@@ -506,10 +541,12 @@ func TestResolveNativeAgentEvidenceWithFence_ExpectedModelAndProviderMismatch(t 
 
 	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
 		return &kick.AgentEntry{
-			Name:    "worker",
-			Kind:    "opencode",
-			Cwd:     "/path/to/worktree",
-			Session: kick.AgentSession{Value: sessionID},
+			Name:             "worker",
+			Kind:             "opencode",
+			Cwd:              "/path/to/worktree",
+			ExpectedModel:    "litellm/expected-model",
+			ExpectedProvider: "litellm",
+			Session:          kick.AgentSession{Value: sessionID},
 		}, nil
 	}
 

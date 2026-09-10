@@ -658,6 +658,41 @@ func TestClassifyTargetWithEvidence(t *testing.T) {
 	}
 }
 
+func TestEvaluateEvidence_ValidatedNormalTurn_StalePaneQuotaMustNotTriggerCooldown(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := SessionContext{
+		SessionID: "sess-valid-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	ev := &TerminalEvidence{
+		SessionID:    "sess-valid-1",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "stop",
+		Timestamp:    now,
+	}
+
+	// Pane contains old/stale 429 quota text or quoted text
+	stalePaneText := "Status: COMPLETE\n429 Too Many Requests: quota exceeded\nupstream account suspended"
+	res := EvaluateEvidence(ev, ctx, stalePaneText)
+
+	if res.Class == Quota || res.Blocked || res.ProviderDeath || res.Action == "mark_unavailable_and_reroute" {
+		t.Fatalf("SECURITY VIOLATION: valid finish=stop turn with stale pane text triggered quota/cooldown: %+v", res)
+	}
+	if res.Class != Complete {
+		t.Errorf("expected Complete, got %s", res.Class)
+	}
+	if res.Action != "close_or_activate" {
+		t.Errorf("expected close_or_activate, got %s", res.Action)
+	}
+}
+
 func TestEvaluateAndRecordStop_ProductionSeam(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	ctx := SessionContext{

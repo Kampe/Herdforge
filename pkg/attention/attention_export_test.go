@@ -2,6 +2,7 @@ package attention
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -524,5 +525,92 @@ func TestAttention_RunWithFleet_UnboundRoute_RefusesEvidence(t *testing.T) {
 		if !strings.Contains(item.Reason, "native evidence error") || !strings.Contains(item.Reason, "unbound model route") {
 			t.Errorf("expected reason to contain 'unbound model route', got: %q", item.Reason)
 		}
+	}
+}
+
+func TestAttention_RunWithFleet_UnmarshaledNativeHerdrTransport_AcceptsEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	model := "lazer/gemini-3.7-flash"
+	provider := "litellm"
+
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/repo"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":%q,"modelID":%q,"finish":"length","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, provider, model, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	// Unmarshal native Herdr JSON into kick.AgentEntry
+	nativeJSON := fmt.Sprintf(`{"result":{"agents":[
+		{
+			"name":"forge-lane-1",
+			"label":"lane-1",
+			"agent":"opencode",
+			"agent_status":"working",
+			"pane_id":"p-1",
+			"tab_id":"t-1",
+			"terminal_id":"term-1",
+			"workspace_id":"ws-1",
+			"cwd":"/repo",
+			"revision":10,
+			"state_change_seq":3,
+			"tab_generation":1,
+			"agent_session":{"source":"native","agent":"opencode","kind":"opencode","value":%q},
+			"model":%q,
+			"provider":%q
+		}
+	]}}`, sessionID, model, provider)
+
+	var listRes kick.AgentListResult
+	if err := json.Unmarshal([]byte(nativeJSON), &listRes); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	fleet := listRes.Result.Agents
+	if len(fleet) != 1 || fleet[0].ExpectedModel != model || fleet[0].ExpectedProvider != provider {
+		t.Fatalf("unmarshaled fleet invalid: %#v", fleet)
+	}
+
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	// Native evidence with finish=length is successfully accepted and classified as LevelMedium (finish=length needs attention)
+	found := false
+	for _, item := range result.Items {
+		if item.Name == "forge-lane-1" || item.Name == "lane-1" {
+			found = true
+			if item.Level != LevelMedium {
+				t.Errorf("expected finish=length to classify as LevelMedium, got %s (reason: %s)", item.Level, item.Reason)
+			}
+			if strings.Contains(item.Reason, "unbound model route") {
+				t.Errorf("evidence was incorrectly rejected as unbound model route: %s", item.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected lane in attention result items: %#v", result.Items)
 	}
 }
