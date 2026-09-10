@@ -72,11 +72,21 @@ func runWorktreeReap(args []string) error {
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 
-	entries, err := listWorktreeEntries(root)
-	if err != nil {
-		return err
+	var entries []worktreeEntry
+	var err error
+	if len(targets) > 0 {
+		registrations, listErr := reapRegistrationLister(root)
+		if listErr != nil {
+			return listErr
+		}
+		selected, selectErr := selectReapTargets(root, registrations, targets)
+		if selectErr != nil {
+			return selectErr
+		}
+		entries, err = reapEntryInspector(selected)
+	} else {
+		entries, err = listWorktreeEntries(root)
 	}
-	entries, err = selectReapTargets(root, entries, targets)
 	if err != nil {
 		return err
 	}
@@ -563,6 +573,17 @@ type worktreeEntry struct {
 }
 
 func listWorktreeEntries(root string) ([]worktreeEntry, error) {
+	entries, err := listWorktreeRegistrations(root)
+	if err != nil {
+		return nil, err
+	}
+	return inspectWorktreeEntries(entries), nil
+}
+
+// listWorktreeRegistrations reads only Git's registration metadata. It does
+// not inspect any registered worktree, so target-bounded reaping can validate
+// selectors before touching unselected paths.
+func listWorktreeRegistrations(root string) ([]worktreeEntry, error) {
 	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return nil, fmt.Errorf("list worktrees: %w", err)
@@ -576,16 +597,6 @@ func listWorktreeEntries(root string) ([]worktreeEntry, error) {
 		}
 		if abs, err := filepath.Abs(cur.Path); err == nil && abs == absRoot {
 			cur.IsMain = true
-		}
-		if !cur.IsMain && !cur.Detached {
-			// Include ignored files: generated evidence/cache content is part of
-			// the safety boundary even when ordinary status hides it.
-			status, statusErr := gitOutIn(cur.Path, "status", "--porcelain", "--untracked-files=all", "--ignored")
-			if statusErr != nil {
-				cur.StatusError = statusErr.Error()
-			} else {
-				cur.Dirty = len(strings.TrimSpace(status)) > 0
-			}
 		}
 		entries = append(entries, *cur)
 		cur = nil
@@ -611,6 +622,35 @@ func listWorktreeEntries(root string) ([]worktreeEntry, error) {
 	flush()
 	return entries, nil
 }
+
+// inspectWorktreeEntries performs the expensive status inspection for the
+// already-selected registrations. Main and detached surfaces never required
+// status for classification, matching the historical full-sweep behavior.
+func inspectWorktreeEntries(entries []worktreeEntry) []worktreeEntry {
+	for index := range entries {
+		entry := &entries[index]
+		if entry.IsMain || entry.Detached {
+			continue
+		}
+		// Include ignored files: generated evidence/cache content is part of
+		// the safety boundary even when ordinary status hides it.
+		status, statusErr := reapStatusRunner(entry.Path, "status", "--porcelain", "--untracked-files=all", "--ignored")
+		if statusErr != nil {
+			entry.StatusError = statusErr.Error()
+		} else {
+			entry.Dirty = len(strings.TrimSpace(status)) > 0
+		}
+	}
+	return entries
+}
+
+var (
+	reapRegistrationLister = listWorktreeRegistrations
+	reapEntryInspector     = func(entries []worktreeEntry) ([]worktreeEntry, error) {
+		return inspectWorktreeEntries(entries), nil
+	}
+	reapStatusRunner = gitOutIn
+)
 
 func gitOutIn(dir string, args ...string) (string, error) {
 	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
