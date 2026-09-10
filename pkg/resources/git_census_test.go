@@ -141,17 +141,18 @@ func TestLSOFProcessInspectorUnusedPrivateDirectory(t *testing.T) {
 }
 
 func TestLsofNoMatchDistinguishesNamespaceDiagnostics(t *testing.T) {
-	target := "/private/cache"
 	noMatch := func(t *testing.T, script string, stdout, stderr []byte, want bool) {
 		t.Helper()
 		err := exec.Command("sh", "-c", script).Run()
-		if got := lsofNoMatch(err, stdout, stderr, target); got != want {
+		if got := lsofNoMatch(err, stdout, stderr); got != want {
 			t.Fatalf("lsofNoMatch(%q, stdout=%q, stderr=%q)=%v, want %v", script, stdout, stderr, got, want)
 		}
 	}
 	noMatch(t, "exit 1", nil, nil, true)
-	noMatch(t, "exit 1", nil, []byte("can't stat unrelated /proc path"), true)
-	noMatch(t, "exit 1", nil, []byte("can't stat /private/cache"), false)
+	noMatch(t, "exit 1", nil, []byte("lsof: WARNING: can't stat() hugetlbfs file system /dev/hugepages\n      Output information may be incomplete.\nlsof: WARNING: can't stat() mqueue file system /dev/mqueue\n      Output information may be incomplete."), true)
+	noMatch(t, "exit 1", nil, []byte("lsof: cannot open /proc: Permission denied"), false)
+	noMatch(t, "exit 1", nil, []byte("lsof: WARNING: can't stat() unexpectedfs file system /run\n      Output information may be incomplete."), false)
+	noMatch(t, "exit 1", nil, []byte("lsof: WARNING: can't stat() mqueue file system /dev/mqueue"), false)
 	noMatch(t, "exit 1", []byte("p123\nf1\n"), nil, false)
 	noMatch(t, "exit 2", nil, nil, false)
 }

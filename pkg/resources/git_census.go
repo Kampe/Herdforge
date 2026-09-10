@@ -553,7 +553,7 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	if stdout.overflow || stderr.overflow {
 		return ProcessUsage{}, errors.New("lsof output exceeded bound")
 	}
-	if err != nil && !lsofNoMatch(err, stdout.Bytes(), stderr.Bytes(), resolved) {
+	if err != nil && !lsofNoMatch(err, stdout.Bytes(), stderr.Bytes()) {
 		return ProcessUsage{}, err
 	}
 	seen := make(map[int]struct{})
@@ -607,14 +607,31 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 }
 
 // lsof uses exit status 1 for both "no matching open files" and diagnostics
-// from unrelated namespaces/processes. Only the former is an empty census:
-// target-specific diagnostics and every other exit remain observation errors.
-func lsofNoMatch(err error, stdout, stderr []byte, target string) bool {
+// from unrelated namespaces/processes. Only its two known WSL filesystem
+// warnings, including their continuation lines, are ignorable. Permission,
+// target, incomplete, and unknown diagnostics remain observation errors.
+func lsofNoMatch(err error, stdout, stderr []byte) bool {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || len(bytes.TrimSpace(stdout)) != 0 {
 		return false
 	}
-	return !bytes.Contains(stderr, []byte(target))
+	lines := strings.Split(strings.TrimSpace(string(stderr)), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return true
+	}
+	warnings := map[string]bool{
+		"lsof: WARNING: can't stat() hugetlbfs file system /dev/hugepages": true,
+		"lsof: WARNING: can't stat() mqueue file system /dev/mqueue":       true,
+	}
+	const continuation = "Output information may be incomplete."
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if !warnings[line] || i+1 >= len(lines) || strings.TrimSpace(lines[i+1]) != continuation {
+			return false
+		}
+		i++
+	}
+	return true
 }
 
 func listProcessIDs(ctx context.Context) ([]int, error) {
