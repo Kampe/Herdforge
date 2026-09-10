@@ -355,6 +355,9 @@ func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, ins
 	if current.Head != l.Head || current.Branch != l.Branch || current.Detached || current.IsMain {
 		return fmt.Errorf("retire %s: act-time worktree identity changed (head=%q branch=%q)", l.Path, current.Head, current.Branch)
 	}
+	if current.StatusError != "" {
+		return fmt.Errorf("retire %s: act-time worktree status is unknown: %s", l.Path, current.StatusError)
+	}
 	if current.Locked {
 		return fmt.Errorf("retire %s: act-time worktree is locked: %s", l.Path, current.LockReason)
 	}

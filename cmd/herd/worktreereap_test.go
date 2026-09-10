@@ -194,7 +194,10 @@ func TestRetireLandedReportsOnlyWhatItActuallyRemoved(t *testing.T) {
 	run("worktree", "add", "-q", "-b", "landed-branch", dir)
 	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 
-	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "landed-branch", Head: strings.TrimSpace(string(head)), Class: "landed"}})
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	retired, failed := retireLandedWithInspector(root, []reapRow{{Path: dir, Branch: "landed-branch", Head: strings.TrimSpace(string(head)), Class: "landed"}}, clean)
 	if len(retired) != 1 || len(failed) != 0 {
 		t.Fatalf("a real removal must be reported as retired: retired=%v failed=%v", retired, failed)
 	}
@@ -236,7 +239,10 @@ func TestRetireLandedDeletesPatchLandedNonAncestorBranch(t *testing.T) {
 	run("cherry-pick", "patch-landed")
 	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 
-	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "patch-landed", Head: strings.TrimSpace(string(head)), Class: "landed"}})
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	retired, failed := retireLandedWithInspector(root, []reapRow{{Path: dir, Branch: "patch-landed", Head: strings.TrimSpace(string(head)), Class: "landed"}}, clean)
 	if len(retired) != 1 || len(failed) != 0 {
 		t.Fatalf("patch-landed branch must retire transactionally: retired=%v failed=%v", retired, failed)
 	}
@@ -521,6 +527,8 @@ func TestIgnoredOnlyWorktreeContentIsNotClean(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored-cache\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	runGitT(t, dir, "add", ".gitignore")
+	runGitT(t, dir, "commit", "-qm", "fixture ignore rules")
 	if err := os.WriteFile(filepath.Join(dir, "ignored-cache"), []byte("evidence"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -537,6 +545,58 @@ func TestIgnoredOnlyWorktreeContentIsNotClean(t *testing.T) {
 func TestGitStatusErrorsAreReturned(t *testing.T) {
 	if _, err := gitOutIn(filepath.Join(t.TempDir(), "missing"), "status", "--porcelain"); err == nil {
 		t.Fatal("git status failure must not become an empty clean result")
+	}
+}
+
+func TestRetireLandedRefusesStatusErrorAtActFence(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(filepath.Dir(root), "wt-status-error")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	payload := filepath.Join(dir, "must-survive")
+	if err := os.WriteFile(payload, []byte("evidence"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	removeCalls := 0
+	run := func(repo string, args ...string) ([]byte, error) {
+		verify := false
+		for _, arg := range args {
+			if arg == "--verify" {
+				verify = true
+				break
+			}
+		}
+		if len(args) >= 1 && args[0] == "rev-parse" && verify {
+			if err := os.Remove(filepath.Join(dir, ".git")); err != nil {
+				t.Fatalf("break status fixture: %v", err)
+			}
+		}
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+			removeCalls++
+			return []byte("must not reach removal"), nil
+		}
+		return runReapGit(repo, args...)
+	}
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	err := retireLandedOneWithInspector(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run, clean)
+	if err == nil || !strings.Contains(err.Error(), "status is unknown") {
+		t.Fatalf("act-time status error must refuse: %v", err)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("status error reached removal: calls=%d", removeCalls)
+	}
+	if _, statErr := os.Stat(payload); statErr != nil {
+		t.Fatalf("status refusal lost payload: %v", statErr)
 	}
 }
 
