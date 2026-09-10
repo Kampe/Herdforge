@@ -10,9 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewack"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // TestReviewRetirementCLIActingDrainTwice exercises the public cleanup command
@@ -239,5 +242,63 @@ esac
 	}
 	if out, err := exec.Command("git", "-C", root, "show-ref", "--verify", "--quiet", ref).CombinedOutput(); err == nil {
 		t.Fatalf("owned ref remains: %s", out)
+	}
+}
+
+func TestRecordReviewRetirementManifest_RerunSameCandidateNewLeaseDoesNotCollide(t *testing.T) {
+	root := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.invalid", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.invalid")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(root, "source.txt"), []byte("seed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "source.txt")
+	run("commit", "-m", "initial")
+	shaBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(string(shaBytes))
+	run("branch", "origin/main", "main")
+
+	cfg := &config.Config{
+		Project: config.ProjectConfig{Name: "test-project"},
+	}
+	task := &provider.Task{ID: "task-767", Ref: "FAC-767"}
+	reviewer := poolReviewer{Family: "openai", Model: "gpt-5.6-luna"}
+	agent := &herdr.AgentEntry{Session: herdr.AgentSession{Value: "ses_1"}}
+	tab1 := herdr.TabInfo{ID: "wK:t1", Generation: "gen-1", Pane: herdr.PaneInfo{ID: "wK:p1", TerminalID: "term_1"}}
+	packetPath := filepath.Join(root, ".herd", "review-packets", "p.md")
+	_ = os.MkdirAll(filepath.Dir(packetPath), 0o700)
+	_ = os.WriteFile(packetPath, []byte("prompt"), 0o600)
+	surfacePath := filepath.Join(root, ".herd", "review-surfaces", "fac-767")
+	_ = os.MkdirAll(filepath.Dir(surfacePath), 0o700)
+	_ = os.WriteFile(surfacePath, []byte("surface"), 0o600)
+
+	lease1 := &worktree.PoolSlot{
+		Name: "pool-01", LeaseID: "pool-01-1000", LeasedAt: time.Now(),
+		Path: filepath.Join(root, ".herd", "pool", "pool-01"),
+	}
+	err1 := recordReviewRetirementManifest(root, cfg, task, "FAC-767", sha, lease1, "wK", tab1, "review-fac-767-1", reviewer, packetPath, surfacePath, agent)
+	if err1 != nil {
+		t.Fatalf("first manifest record failed: %v", err1)
+	}
+
+	// Second review run on the same candidate SHA with a new lease (e.g. after rerun / retry)
+	lease2 := &worktree.PoolSlot{
+		Name: "pool-01", LeaseID: "pool-01-2000", LeasedAt: time.Now().Add(time.Second),
+		Path: filepath.Join(root, ".herd", "pool", "pool-01"),
+	}
+	tab2 := herdr.TabInfo{ID: "wK:t2", Generation: "gen-2", Pane: herdr.PaneInfo{ID: "wK:p2", TerminalID: "term_2"}}
+	err2 := recordReviewRetirementManifest(root, cfg, task, "FAC-767", sha, lease2, "wK", tab2, "review-fac-767-2", reviewer, packetPath, surfacePath, agent)
+	if err2 != nil {
+		t.Fatalf("second manifest record for same candidate with new lease must succeed without ref collision: %v", err2)
 	}
 }

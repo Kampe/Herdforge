@@ -63,6 +63,46 @@ func TestEvaluateReviewRetirementAllowsExactCleanSettledLane(t *testing.T) {
 	}
 }
 
+func TestEvaluateReviewRetirementTaskAndBranchBindings(t *testing.T) {
+	m := retirementManifest(t, "g-bind")
+	baseEvidence := retirementEvidence(m)
+
+	// Canonical launch row with Task set and empty Branch (production pattern)
+	eTaskOnly := baseEvidence
+	eTaskOnly.Launch = reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Task: m.TaskRef}
+	if d := EvaluateReviewRetirement(eTaskOnly); !d.Eligible {
+		t.Fatalf("launch with Task only should be eligible: %+v", d)
+	}
+
+	// Launch row with matching Task and feature Branch
+	eTaskAndBranch := baseEvidence
+	eTaskAndBranch.Launch = reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Task: m.TaskRef, Branch: "recovery/fac-708-review-retirement"}
+	if d := EvaluateReviewRetirement(eTaskAndBranch); !d.Eligible {
+		t.Fatalf("launch with matching Task and branch should be eligible: %+v", d)
+	}
+
+	// Launch row with wrong Task
+	eWrongTask := baseEvidence
+	eWrongTask.Launch = reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Task: "FAC-999"}
+	if d := EvaluateReviewRetirement(eWrongTask); d.Eligible || !strings.Contains(d.Reason, "verified launch provenance does not bind") {
+		t.Fatalf("wrong task must be blocked: %+v", d)
+	}
+
+	// Launch row with wrong legacy Branch task
+	eWrongBranch := baseEvidence
+	eWrongBranch.Launch = reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Branch: "FAC-999"}
+	if d := EvaluateReviewRetirement(eWrongBranch); d.Eligible || !strings.Contains(d.Reason, "verified launch provenance does not bind") {
+		t.Fatalf("wrong legacy branch task must be blocked: %+v", d)
+	}
+
+	// Unbound launch row (no Task, no Branch)
+	eUnbound := baseEvidence
+	eUnbound.Launch = reviewledger.LedgerRow{Event: string(reviewledger.EventRecord), SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce}
+	if d := EvaluateReviewRetirement(eUnbound); d.Eligible || !strings.Contains(d.Reason, "verified launch provenance does not bind") {
+		t.Fatalf("unbound launch must be blocked: %+v", d)
+	}
+}
+
 func TestReviewRetirementManifestDigestAndRegistryAreBoundAndAppendOnly(t *testing.T) {
 	m := retirementManifest(t, "g1")
 	if m.BindingDigest != ReviewRetirementBindingDigest(m) {

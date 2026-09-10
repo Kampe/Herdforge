@@ -313,3 +313,87 @@ func TestNativeRetirementClosesLiveSettledReviewerAndProvesAbsence(t *testing.T)
 		t.Fatalf("agent absence readback: %v", err)
 	}
 }
+
+func TestNativeRetirementWithTaskLaunchProvenanceAndArtifactAck(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(root, "source.txt"), []byte("source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "add", "source.txt").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "source").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	shaBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.TrimSpace(string(shaBytes))
+	poolRoot := filepath.Join(root, ".herd", "pool-fac790")
+	slotPath := filepath.Join(poolRoot, "pool-01")
+	if err := os.MkdirAll(poolRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "--detach", slotPath, "HEAD").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	nonce := "pool-01-1789024038488630000"
+	state := []byte(`{"version":1,"slots":[{"name":"pool-01","path":".herd/pool-fac790/pool-01","lease_id":"` + nonce + `","leased_at":"2026-09-10T07:07:18.488630000Z","base":"HEAD"}]}` + "\n")
+	if err := os.WriteFile(filepath.Join(poolRoot, "pool.json"), state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ledgerPath := filepath.Join(root, ".herd", "review", "ledger.jsonl")
+	if err := os.MkdirAll(filepath.Dir(ledgerPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reviewer := "review-fac-790-df7a47623fb2"
+	digest := "271b6c2e9cc5ddf5808d75464cca32a2e8f742cbec88589d7582181809b8c8e9"
+	rows := []string{
+		`{"ts":"2026-09-10T07:07:18.960880Z","event":"record","sha":"` + sha + `","reviewer":"` + reviewer + `","gate":"provenance-unrecorded","task":"FAC-790","lease":"` + nonce + `"}`,
+		`{"ts":"2026-09-10T07:36:30.926981Z","event":"verdict","sha":"` + sha + `","candidate_sha":"` + sha + `","reviewer":"` + reviewer + `","verdict":"PASS","artifact_digest":"` + digest + `","task":"FAC-790"}`,
+	}
+	if err := os.WriteFile(ledgerPath, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Emit schema version 2 artifact ack
+	if err := reviewack.EmitArtifact(root, reviewack.Ack{SHA: sha, Reviewer: reviewer, LaunchIdentity: reviewer, ArtifactDigest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	m := NewReviewRetirementManifest(time.Now(), ReviewRetirementManifest{
+		Repository: "github.com/Kampe/Herdforge", TaskRef: "FAC-790", TaskID: "task-790", CandidateSHA: sha, BaseSHA: sha, Branch: "master",
+		Worktree: ".herd/pool-fac790/pool-01", Pool: ".herd/pool-fac790", Slot: "pool-01", LeaseGeneration: 1789024038488630000,
+		Workspace: "wK", TabID: "wK:t18N", PaneID: "wK:p18N", TerminalID: "term_fixture", SessionID: "ses_fixture",
+		Reviewer: reviewer, ReviewerFamily: "open-weight", ReviewerModel: "litellm/lazer/claude-haiku-4.5", PromptArtifact: ".herd/review/prompts/p.md", Generation: "pool-01-1789024038488630000", Nonce: nonce,
+		RecordedAt: "2026-09-10T07:07:26.919588Z",
+	})
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
+			return `{"result":{"tabs":[]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("exit status 1")
+		}
+		return "", errors.New("unexpected fake Herdr command")
+	}
+	ledger, err := reviewledger.NewReadOnlyReviewLedger(root, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &NativeReviewRetirementOp{Root: root, RepositoryIdentity: "github.com/Kampe/Herdforge", Ledger: ledger}
+	evidence, err := op.Observe(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := EvaluateReviewRetirement(evidence); !d.Eligible {
+		t.Fatalf("canonical task-provenance launch and artifact ack should be eligible: %+v", d)
+	}
+}

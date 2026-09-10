@@ -70,19 +70,65 @@ func Path(root, sha, reviewer string) string {
 // this read-only form during dry-run and preflight; only canonical ingest may
 // create the consumed receipt.
 func Read(root, sha, reviewer string) (Ack, error) {
-	root, sha, reviewer = strings.TrimSpace(root), strings.TrimSpace(sha), strings.TrimSpace(reviewer)
+	return ReadArtifact(root, sha, reviewer, "")
+}
+
+// ReadArtifact returns the durable acknowledgment for an exact artifact digest
+// or legacy unversioned acknowledgment without consuming it.
+func ReadArtifact(root, sha, reviewer, digest string) (Ack, error) {
+	root, sha, reviewer, digest = strings.TrimSpace(root), strings.TrimSpace(sha), strings.TrimSpace(reviewer), strings.ToLower(strings.TrimSpace(digest))
 	if root == "" || len(sha) != 40 || reviewer == "" {
 		return Ack{}, fmt.Errorf("reviewack: read requires root, 40-char sha, and reviewer")
 	}
-	body, err := os.ReadFile(Path(root, sha, reviewer))
+	var body []byte
+	var err error
+	if digest != "" {
+		body, err = os.ReadFile(ArtifactPath(root, sha, reviewer, digest))
+	}
+	if digest == "" || os.IsNotExist(err) {
+		body, err = os.ReadFile(Path(root, sha, reviewer))
+	}
 	if err != nil {
-		return Ack{}, err
+		if !os.IsNotExist(err) || digest != "" {
+			return Ack{}, err
+		}
+		matches, globErr := filepath.Glob(filepath.Join(root, DirRel, "artifacts", "*.json"))
+		if globErr != nil {
+			return Ack{}, globErr
+		}
+		var matched Ack
+		found := false
+		for _, m := range matches {
+			content, rErr := os.ReadFile(m)
+			if rErr != nil {
+				continue
+			}
+			var candidate Ack
+			if json.Unmarshal(content, &candidate) == nil &&
+				strings.EqualFold(candidate.SHA, sha) &&
+				candidate.Reviewer == reviewer &&
+				candidate.LaunchIdentity == reviewer &&
+				candidate.ArtifactDigest != "" {
+				if found && !strings.EqualFold(matched.ArtifactDigest, candidate.ArtifactDigest) {
+					return Ack{}, ErrAmbiguous
+				}
+				matched = candidate
+				found = true
+			}
+		}
+		if found {
+			return matched, nil
+		}
+		return Ack{}, os.ErrNotExist
 	}
 	var ack Ack
 	if err := json.Unmarshal(body, &ack); err != nil {
 		return Ack{}, fmt.Errorf("reviewack: decode: %w", err)
 	}
-	if ack.SHA != sha || ack.Reviewer != reviewer || ack.LaunchIdentity != reviewer || ack.ArtifactDigest == "" {
+	if !strings.EqualFold(ack.SHA, sha) || ack.Reviewer != reviewer || ack.LaunchIdentity != reviewer || ack.ArtifactDigest == "" {
+		return Ack{}, ErrMismatch
+	}
+	if digest != "" && !strings.EqualFold(ack.ArtifactDigest, digest) {
 		return Ack{}, ErrMismatch
 	}
 	return ack, nil
