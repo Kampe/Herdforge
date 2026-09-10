@@ -185,6 +185,10 @@ func reviewTestEnv() []string {
 		}
 		env = append(env, entry)
 	}
+	// Unit tests provide their own private filesystem, lifecycle, and fake
+	// broker boundary. Mark verifier children as already inside that boundary;
+	// the production Linux path must still require bwrap outside this fixture.
+	env = append(env, "HERD_HERMETIC_CONTAINER=1")
 	return env
 }
 
