@@ -12,13 +12,10 @@ import (
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
-// reviewRetirementPhaseJournalPath mirrors NativeReviewRetirementOp's own
-// default (pkg/herdr/native_review_retirement.go, unexported phasePath())
-// -- the authoritative record of whether a manifested retirement generation
-// actually completed. Duplicated here rather than exported from pkg/herdr,
-// which is out of this repair's scope.
+// reviewRetirementPhaseJournalPath resolves the native review retirement
+// phase journal through the single authoritative helper in pkg/herdr.
 func reviewRetirementPhaseJournalPath(root string) string {
-	return filepath.Join(root, ".herd", "review", "retirement-phases.jsonl")
+	return herdr.ReviewRetirementPhasesPath(root)
 }
 
 // runIdlePool is the small operational surface for bounded, non-current
