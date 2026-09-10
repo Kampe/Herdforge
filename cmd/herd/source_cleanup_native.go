@@ -14,6 +14,22 @@ import (
 // runSourceRetirementCleanup is shared by `herd cleanup` and the coordinator
 // lifecycle sweep. Its default is observe-only; callers must explicitly request acting.
 func runSourceRetirementCleanup(ctx context.Context, root string, dryRun bool) (herdr.SourceRetirementReport, error) {
+	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	if err != nil {
+		return herdr.SourceRetirementReport{}, err
+	}
+	repoIdent := ""
+	if id, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil {
+		repoIdent = id
+	} else if cfg != nil {
+		repoIdent = repositoryIdentityForLaunch(cfg)
+	}
+
+	// Automatic enrollment from durable ready handoff reports
+	if _, err := herdr.EnrollReadySourceManifests(root, repoIdent); err != nil {
+		return herdr.SourceRetirementReport{}, fmt.Errorf("enroll ready source manifests: %w", err)
+	}
+
 	registry := herdr.SourceRetirementRegistry{Path: herdr.SourceRetirementRegistryPath(root)}
 	rows, err := registry.Latest()
 	if err != nil {
@@ -34,17 +50,7 @@ func runSourceRetirementCleanup(ctx context.Context, root string, dryRun bool) (
 	if len(manifests) == 0 {
 		return herdr.SourceRetirementReport{DryRun: dryRun, Candidates: []herdr.SourceRetirementCandidate{}}, nil
 	}
-	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
-	if err != nil {
-		return herdr.SourceRetirementReport{}, err
-	}
 	standing := configuredStandingAgentNames(cfg)
-	repoIdent := ""
-	if id, err := dispatch.AuthenticatedRepositoryIdentity(root); err == nil {
-		repoIdent = id
-	} else if cfg != nil {
-		repoIdent = repositoryIdentityForLaunch(cfg)
-	}
 	op := &herdr.NativeSourceRetirementOp{
 		Root:               root,
 		RepositoryIdentity: repoIdent,

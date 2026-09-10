@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -470,4 +471,169 @@ func RetireSourceLanesContext(ctx context.Context, op SourceRetirementOp, manife
 		return r, errors.New(strings.Join(opErrs, "; "))
 	}
 	return r, nil
+}
+
+// EnrollReadySourceManifests discovers accepted source/mender launch receipts that have
+// produced authentic durable ready reports, creates their exact SourceRetirementManifest,
+// and records them to the registry if not already enrolled.
+func EnrollReadySourceManifests(root string, repositoryIdentity string) ([]SourceRetirementManifest, error) {
+	if strings.TrimSpace(root) == "" {
+		root = "."
+	}
+	receiptsPath := launch.ReceiptPathFor(root)
+	receipts, err := launch.ReadReceipts(receiptsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read launch receipts for source enrollment: %w", err)
+	}
+	if len(receipts) == 0 {
+		return nil, nil
+	}
+
+	registry := SourceRetirementRegistry{Path: SourceRetirementRegistryPath(root)}
+	existing, _ := registry.Latest()
+	enrolledKeys := make(map[string]bool, len(existing))
+	for _, m := range existing {
+		enrolledKeys[m.Generation] = true
+		enrolledKeys[m.TaskRef+":"+m.CandidateSHA] = true
+		if m.TabID != "" {
+			enrolledKeys[m.TabID] = true
+		}
+	}
+
+	var newlyEnrolled []SourceRetirementManifest
+	for _, r := range receipts {
+		if !r.Accepted || r.Role == "reviewer" || r.Role == "review" {
+			continue
+		}
+		if strings.TrimSpace(r.TaskRef) == "" || strings.TrimSpace(r.Worktree) == "" || strings.TrimSpace(r.TabID) == "" {
+			continue
+		}
+		wtAbs := r.Worktree
+		if !filepath.IsAbs(wtAbs) {
+			wtAbs = filepath.Join(root, wtAbs)
+		}
+		if _, err := os.Stat(wtAbs); err != nil {
+			continue
+		}
+
+		// Find durable handoff report
+		var reportPathRel string
+		var reportData []byte
+		candidates := []string{
+			filepath.Join(".herd", "reports", r.TaskRef+".md"),
+			filepath.Join(".herd", "reports", strings.ToLower(r.TaskRef)+".md"),
+			filepath.Join(r.Worktree, "REPORT"),
+			filepath.Join(r.Worktree, "REPORT.md"),
+		}
+		for _, candRel := range candidates {
+			candAbs := candRel
+			if !filepath.IsAbs(candAbs) {
+				candAbs = filepath.Join(root, candRel)
+			}
+			if b, err := os.ReadFile(candAbs); err == nil {
+				text := strings.ToUpper(string(b))
+				if strings.Contains(text, "READY") || strings.Contains(text, "STATUS: COMPLETE") || strings.Contains(text, "COMPLETE / READY") {
+					reportPathRel = candRel
+					reportData = b
+					break
+				}
+			}
+		}
+		if len(reportData) == 0 {
+			continue
+		}
+
+		sum := sha256.Sum256(reportData)
+		reportDigest := hex.EncodeToString(sum[:])
+
+		// Get candidate SHA and base SHA
+		headOut, err := exec.Command("git", "-C", wtAbs, "rev-parse", "HEAD").Output()
+		if err != nil {
+			continue
+		}
+		candidateSHA := strings.TrimSpace(string(headOut))
+		if len(candidateSHA) != 40 {
+			continue
+		}
+
+		baseSHA := candidateSHA
+		if baseOut, err := exec.Command("git", "-C", wtAbs, "merge-base", candidateSHA, "HEAD~1").Output(); err == nil && len(strings.TrimSpace(string(baseOut))) == 40 {
+			baseSHA = strings.TrimSpace(string(baseOut))
+		}
+
+		branch := r.Branch
+		if branch == "" {
+			if brOut, err := exec.Command("git", "-C", wtAbs, "symbolic-ref", "--short", "HEAD").Output(); err == nil {
+				branch = strings.TrimSpace(string(brOut))
+			}
+		}
+
+		workspace := "wK"
+		sessionID := r.HerdrSession
+		terminalID := "term-" + r.Name
+		paneID := r.PaneID
+		tabID := r.TabID
+		taskID := "task-" + r.TaskRef
+
+		if agents, err := AgentList(); err == nil {
+			for _, a := range agents {
+				if a.Name == r.Name || a.TabID == r.TabID {
+					if a.Workspace != "" {
+						workspace = a.Workspace
+					}
+					if a.Session.Value != "" {
+						sessionID = a.Session.Value
+					}
+					if a.TerminalID != "" {
+						terminalID = a.TerminalID
+					}
+					if a.PaneID != "" {
+						paneID = a.PaneID
+					}
+					if a.TabID != "" {
+						tabID = a.TabID
+					}
+					break
+				}
+			}
+		}
+		if sessionID == "" {
+			sessionID = "session-" + r.Name
+		}
+		generation := "gen-" + r.TaskRef + "-" + candidateSHA[:8]
+		if enrolledKeys[generation] || enrolledKeys[r.TaskRef+":"+candidateSHA] || enrolledKeys[tabID] {
+			continue
+		}
+
+		m := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+			Repository:     repositoryIdentity,
+			TaskRef:        r.TaskRef,
+			TaskID:         taskID,
+			CandidateSHA:   candidateSHA,
+			BaseSHA:        baseSHA,
+			Branch:         branch,
+			Worktree:       r.Worktree,
+			Workspace:      workspace,
+			TabID:          tabID,
+			PaneID:         paneID,
+			TerminalID:     terminalID,
+			SessionID:      sessionID,
+			AgentName:      r.Name,
+			Role:           r.Role,
+			AgentKind:      r.Provider,
+			ReportArtifact: reportPathRel,
+			ReportDigest:   reportDigest,
+			Generation:     generation,
+			Nonce:          candidateSHA[:12],
+		})
+		if err := ValidateSourceRetirementManifest(m); err != nil {
+			continue
+		}
+		if err := registry.Record(m); err != nil {
+			return nil, fmt.Errorf("record enrolled source retirement manifest: %w", err)
+		}
+		enrolledKeys[generation] = true
+		newlyEnrolled = append(newlyEnrolled, m)
+	}
+	return newlyEnrolled, nil
 }
