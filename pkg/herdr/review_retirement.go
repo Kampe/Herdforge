@@ -349,9 +349,12 @@ type ReviewRetirementPhaseReader interface {
 }
 
 type ReviewRetirementCandidate struct {
-	Manifest  ReviewRetirementManifest
+	Manifest  ReviewRetirementManifest `json:"manifest"`
 	Decision  ReviewRetirementDecision `json:"decision"`
 	Completed bool                     `json:"completed,omitempty"`
+	Retired   bool                     `json:"retired,omitempty"`
+	Failed    bool                     `json:"failed,omitempty"`
+	Error     string                   `json:"error,omitempty"`
 }
 type ReviewRetirementReport struct {
 	DryRun     bool                        `json:"dry_run"`
@@ -380,7 +383,12 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 	for _, m := range manifests {
 		if err := ValidateReviewRetirementManifest(m); err != nil {
 			r.Failed++
-			r.Candidates = append(r.Candidates, ReviewRetirementCandidate{Manifest: m, Decision: blockReviewRetirement("manifest validation failed: " + err.Error())})
+			r.Candidates = append(r.Candidates, ReviewRetirementCandidate{
+				Manifest: m,
+				Failed:   true,
+				Error:    "manifest validation failed: " + err.Error(),
+				Decision: blockReviewRetirement("manifest validation failed: " + err.Error()),
+			})
 			continue
 		}
 		if reader, ok := op.(ReviewRetirementPhaseReader); ok {
@@ -396,13 +404,17 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 		e, err := op.Observe(m)
 		if err != nil {
 			decision := blockReviewRetirement("observation failed: " + err.Error())
+			cand := ReviewRetirementCandidate{Manifest: m, Decision: decision}
 			if errors.Is(err, errRetirementSuperseded) {
 				decision = blockReviewRetirement("retained superseded manifest: old proof no longer authorizes cleanup")
+				cand.Decision = decision
 				r.Blocked++
 			} else {
+				cand.Failed = true
+				cand.Error = "observation failed: " + err.Error()
 				r.Failed++
 			}
-			r.Candidates = append(r.Candidates, ReviewRetirementCandidate{Manifest: m, Decision: decision})
+			r.Candidates = append(r.Candidates, cand)
 			continue
 		}
 		d := EvaluateReviewRetirement(e)
@@ -426,86 +438,125 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 	if dryRun || unsafeBlocked || eligibleCount == 0 {
 		return r, nil
 	}
-	for _, c := range r.Candidates {
+	for i := range r.Candidates {
+		c := &r.Candidates[i]
 		if c.Completed || !c.Decision.Eligible {
 			continue
 		}
 		m := c.Manifest
 		if err := op.Revalidate(m, "close"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("revalidate before close %s: %v", m.TabID, err)
 			return r, fmt.Errorf("revalidate before close %s: %w", m.TabID, err)
 		}
 		if err := op.Close(m); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("close %s: %v", m.TabID, err)
 			return r, fmt.Errorf("close %s: %w", m.TabID, err)
 		}
 		released, err := op.LeaseReleased(m)
 		if err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("lease readback %s: %v", m.Slot, err)
 			return r, fmt.Errorf("lease readback %s: %w", m.Slot, err)
 		}
 		if !released {
 			if err := op.Revalidate(m, "lease-release"); err != nil {
 				r.Failed++
+				c.Failed = true
+				c.Error = fmt.Sprintf("revalidate before lease release %s: %v", m.Slot, err)
 				return r, fmt.Errorf("revalidate before lease release %s: %w", m.Slot, err)
 			}
 			if err := op.ReleaseLease(ctx, m); err != nil {
 				r.Failed++
+				c.Failed = true
+				c.Error = fmt.Sprintf("release lease %s: %v", m.Slot, err)
 				return r, fmt.Errorf("release lease %s: %w", m.Slot, err)
 			}
 		}
 		if err := op.Revalidate(m, "worktree"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("revalidate before worktree removal %s: %v", m.Worktree, err)
 			return r, fmt.Errorf("revalidate before worktree removal %s: %w", m.Worktree, err)
 		}
 		if err := op.Journal(m, "worktree-intent"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("journal worktree phase %s: %v", m.Generation, err)
 			return r, fmt.Errorf("journal worktree phase %s: %w", m.Generation, err)
 		}
 		if err := op.RemoveWorktree(m); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("remove worktree %s: %v", m.Worktree, err)
 			return r, fmt.Errorf("remove worktree %s: %w", m.Worktree, err)
 		}
 		if err := op.Journal(m, "worktree-done"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("journal worktree completion %s: %v", m.Generation, err)
 			return r, fmt.Errorf("journal worktree completion %s: %w", m.Generation, err)
 		}
 		if err := op.Revalidate(m, "branch"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("revalidate before branch removal %s: %v", m.Branch, err)
 			return r, fmt.Errorf("revalidate before branch removal %s: %w", m.Branch, err)
 		}
 		if err := op.Journal(m, "ref-intent"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("journal ref phase %s: %v", m.Generation, err)
 			return r, fmt.Errorf("journal ref phase %s: %w", m.Generation, err)
 		}
 		if err := op.RemoveBranch(m); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("remove branch %s: %v", m.Branch, err)
 			return r, fmt.Errorf("remove branch %s: %w", m.Branch, err)
 		}
 		if err := op.Journal(m, "ref-done"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("journal ref completion %s: %v", m.Generation, err)
 			return r, fmt.Errorf("journal ref completion %s: %w", m.Generation, err)
 		}
 		if err := op.Revalidate(m, "artifact"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("revalidate before artifact removal %s: %v", m.PromptArtifact, err)
 			return r, fmt.Errorf("revalidate before artifact removal %s: %w", m.PromptArtifact, err)
 		}
 		if err := op.Journal(m, "artifacts-intent"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("journal artifact phase %s: %v", m.Generation, err)
 			return r, fmt.Errorf("journal artifact phase %s: %w", m.Generation, err)
 		}
 		if err := op.RemoveArtifact(m); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("remove owned artifacts %s: %v", m.PromptArtifact, err)
 			return r, fmt.Errorf("remove owned artifacts %s: %w", m.PromptArtifact, err)
 		}
 		if err := op.Journal(m, "artifacts-done"); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("journal artifacts completion %s: %v", m.Generation, err)
 			return r, fmt.Errorf("journal artifacts completion %s: %w", m.Generation, err)
 		}
 		if err := op.Receipt(m, c.Decision); err != nil {
 			r.Failed++
+			c.Failed = true
+			c.Error = fmt.Sprintf("write retirement receipt %s: %v", m.Generation, err)
 			return r, fmt.Errorf("write retirement receipt %s: %w", m.Generation, err)
 		}
+		c.Retired = true
+		c.Completed = true
 		r.Retired++
 	}
 	return r, nil
