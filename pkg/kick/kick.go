@@ -28,6 +28,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/posture"
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
 // The canonical standing fleet roster is derived at runtime by StandingIDs()
@@ -39,15 +40,86 @@ import (
 // LiveStatuses identifies statuses that mean "agent session still holds the name".
 const LiveStatuses = "working|idle|starting|done|blocked"
 
+// AgentSession captures the agent session object or string value from herdr.
+type AgentSession struct {
+	Value  string `json:"value,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	Source string `json:"source,omitempty"`
+}
+
+func (s *AgentSession) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		if str == "" {
+			return errors.New("empty agent_session string")
+		}
+		s.Value = str
+		return nil
+	}
+	var obj struct {
+		Value  string `json:"value,omitempty"`
+		Kind   string `json:"kind,omitempty"`
+		Source string `json:"source,omitempty"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil && obj.Value != "" {
+		s.Value = obj.Value
+		s.Kind = obj.Kind
+		s.Source = obj.Source
+		return nil
+	}
+	return fmt.Errorf("invalid agent_session payload: %s", string(data))
+}
+
 // AgentEntry represents a single agent from herdr agent list.
 type AgentEntry struct {
-	Name        string `json:"name,omitempty"`
-	Label       string `json:"label,omitempty"`
-	Status      string `json:"agent_status,omitempty"`
-	PaneID      string `json:"pane_id,omitempty"`
-	TabID       string `json:"tab_id,omitempty"`
-	Workspace   string `json:"workspace_id,omitempty"`
-	Interactive *bool  `json:"interactive,omitempty"`
+	Name             string       `json:"name,omitempty"`
+	Label            string       `json:"label,omitempty"`
+	Kind             string       `json:"agent,omitempty"`
+	Status           string       `json:"agent_status,omitempty"`
+	PaneID           string       `json:"pane_id,omitempty"`
+	TabID            string       `json:"tab_id,omitempty"`
+	TerminalID       string       `json:"terminal_id,omitempty"`
+	Workspace        string       `json:"workspace_id,omitempty"`
+	Cwd              string       `json:"cwd,omitempty"`
+	Interactive      *bool        `json:"interactive,omitempty"`
+	Revision         uint64       `json:"revision,omitempty"`
+	StateChangeSeq   uint64       `json:"state_change_seq,omitempty"`
+	TabGeneration    uint64       `json:"tab_generation,omitempty"`
+	Session          AgentSession `json:"agent_session,omitempty"`
+	ExpectedModel    string       `json:"model,omitempty"`
+	ExpectedProvider string       `json:"provider,omitempty"`
+}
+
+// UnmarshalJSON implements custom unmarshaling to accept both native Herdr tags (model, provider)
+// and legacy/explicit tags (expected_model, expected_provider).
+func (a *AgentEntry) UnmarshalJSON(data []byte) error {
+	type rawEntry AgentEntry
+	var aux struct {
+		rawEntry
+		Model            string `json:"model,omitempty"`
+		Provider         string `json:"provider,omitempty"`
+		ExpectedModel    string `json:"expected_model,omitempty"`
+		ExpectedProvider string `json:"expected_provider,omitempty"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*a = AgentEntry(aux.rawEntry)
+	if a.ExpectedModel == "" {
+		if aux.Model != "" {
+			a.ExpectedModel = aux.Model
+		} else if aux.ExpectedModel != "" {
+			a.ExpectedModel = aux.ExpectedModel
+		}
+	}
+	if a.ExpectedProvider == "" {
+		if aux.Provider != "" {
+			a.ExpectedProvider = aux.Provider
+		} else if aux.ExpectedProvider != "" {
+			a.ExpectedProvider = aux.ExpectedProvider
+		}
+	}
+	return nil
 }
 
 // AgentListResult wraps the herdr agent list response.
@@ -172,9 +244,9 @@ func HerdStanding(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// FetchAgentList calls herdr agent list and returns the parsed result.
-func FetchAgentList() ([]AgentEntry, error) {
-	cmd := exec.Command("herdr", "agent", "list")
+// FetchAgentListContext calls herdr agent list under the given context and returns the parsed result.
+func FetchAgentListContext(ctx context.Context) ([]AgentEntry, error) {
+	cmd := procsignal.CommandContext(ctx, "herdr", "agent", "list")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("herdr agent list: %w", err)
@@ -184,6 +256,11 @@ func FetchAgentList() ([]AgentEntry, error) {
 		return nil, fmt.Errorf("parse agent list: %w", err)
 	}
 	return result.Result.Agents, nil
+}
+
+// FetchAgentList calls herdr agent list and returns the parsed result.
+func FetchAgentList() ([]AgentEntry, error) {
+	return FetchAgentListContext(context.Background())
 }
 
 // LookupAgent finds an agent by name and returns its status and pane ID.

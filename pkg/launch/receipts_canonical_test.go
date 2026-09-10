@@ -160,3 +160,48 @@ func TestReachingBuilderReceiptIgnoresLocatorFamily(t *testing.T) {
 		t.Fatalf("family=%q ok=%v", family, ok)
 	}
 }
+
+func TestAcceptedNativeLaunchRouteForAgent(t *testing.T) {
+	members := []Receipt{
+		{
+			CreatedAt:         time.Now().Add(-1 * time.Hour),
+			Accepted:          true,
+			Name:              "worker",
+			Lane:              "worker",
+			Provider:          "litellm",
+			Model:             "claude-3-5-sonnet",
+			RedactedAuthority: "anthropic-main",
+			HerdrSession:      "sess-123",
+			PaneID:            "%1",
+		},
+		{
+			CreatedAt:         time.Now().Add(-10 * time.Minute),
+			Accepted:          true,
+			Name:              "forge-worker",
+			Lane:              "worker",
+			Provider:          "litellm",
+			Model:             "claude-3-7-sonnet",
+			RedactedAuthority: "anthropic-prod",
+			HerdrSession:      "sess-456",
+			PaneID:            "%2",
+		},
+	}
+
+	// Lookup by session ID
+	prov, model, acc, err := AcceptedNativeLaunchRouteForAgent(members, "forge-worker", "sess-456", "%2", "")
+	if err != nil || prov != "litellm" || model != "claude-3-7-sonnet" || acc != "anthropic-prod" {
+		t.Fatalf("expected litellm/claude-3-7-sonnet/anthropic-prod, got prov=%q model=%q acc=%q err=%v", prov, model, acc, err)
+	}
+
+	// Lookup by lane name
+	prov, model, acc, err = AcceptedNativeLaunchRouteForAgent(members, "worker", "", "%1", "")
+	if err != nil || prov != "litellm" || model != "claude-3-5-sonnet" || acc != "anthropic-main" {
+		t.Fatalf("expected litellm/claude-3-5-sonnet/anthropic-main, got prov=%q model=%q acc=%q err=%v", prov, model, acc, err)
+	}
+
+	// Missing agent
+	_, _, _, err = AcceptedNativeLaunchRouteForAgent(members, "non-existent", "sess-999", "%9", "")
+	if err == nil || !strings.Contains(err.Error(), "no authentic accepted launch receipt found") {
+		t.Fatalf("expected not found error, got: %v", err)
+	}
+}

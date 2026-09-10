@@ -28,10 +28,14 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/broker"
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/patterns"
+	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/progress"
 )
 
@@ -152,6 +156,14 @@ func classifyStatus(status string) (AttentionLevel, string) {
 // parked the lane); provider death takes precedence over the raw status
 // for non-held lanes.
 func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeath bool) Item {
+	return ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, nil, process.SessionContext{}, "", nil)
+}
+
+// ClassifyAgentWithEvidence evaluates an agent entry alongside authoritative terminal evidence and pane text.
+// When finish=length (output token limit truncation) is present, the agent is NEVER classified as done/LevelHigh
+// (awaiting harvest/review) or LevelNone (working); it is classified as LevelMedium (incomplete / read pane).
+// When authoritative quota exhaustion is confirmed, it is classified as LevelCritical.
+func ClassifyAgentWithEvidence(a kick.AgentEntry, held bool, heldReason string, providerDeath bool, ev *process.TerminalEvidence, ctx process.SessionContext, paneText string, evErr error) Item {
 	name := a.Name
 	if name == "" {
 		name = a.Label
@@ -168,6 +180,8 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 	}
 	item.Decision = agentDecision(name, status)
 
+	eval := process.EvaluateEvidence(ev, ctx, paneText)
+
 	switch {
 	case strings.HasPrefix(heldReason, "authority-error:"):
 		item.Level = LevelCritical
@@ -180,9 +194,21 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 			item.HeldReason = "held by coordinator"
 		}
 		item.Reason = "held — parked by coordinator"
-	case providerDeath:
+	case eval.Class == process.Quota && eval.ProviderDeath:
+		item.Level = LevelCritical
+		item.Reason = "provider quota exhausted — needs reroute (mark unavailable)"
+	case providerDeath || eval.ProviderDeath:
 		item.Level = LevelCritical
 		item.Reason = "provider death — needs reroute (cooled reset-aware)"
+	case evErr != nil && strings.EqualFold(a.Kind, "opencode"):
+		// When native export/fence fails for an opencode agent, we MUST NOT blindly trust raw status "done".
+		// It is typed UNKNOWN / LevelMedium requiring pane read.
+		item.Level = LevelMedium
+		item.Reason = fmt.Sprintf("native evidence error: %v", evErr)
+	case eval.Reason == patterns.OutputLimitMessage || process.OutputLimitReason(paneText) != "":
+		// Output token limit truncation MUST NOT be classified as done or healthy working
+		item.Level = LevelMedium
+		item.Reason = "output limit reached (finish=length) — incomplete, read pane"
 	default:
 		lvl, reason := classifyStatus(status)
 		item.Level = lvl
@@ -212,21 +238,14 @@ func agentDecision(name, status string) *broker.Decision {
 	}
 }
 
-// Triage produces the coordinator-eyes triage from a live agent list and
-// the standing roster. heldChecker and providerDeathChecker are injected
-// so the function is fully deterministic and testable.
-//
-// Every standing ID is examined. IDs that are live but working/starting
-// are LevelNone and excluded from Items (but counted in Total). The
-// roster is the source of truth — extra live agents not in the roster are
-// ignored, matching the original jq-filter-on-standing behavior.
-func Triage(
+// TriageWithEvidence produces coordinator triage cross-referencing authoritative terminal evidence.
+func TriageWithEvidence(
 	agents []kick.AgentEntry,
 	standingIDs []string,
 	heldChecker func(string) (string, bool),
+	evidenceResolver func(string) (*process.TerminalEvidence, process.SessionContext, string, error),
 	providerDeathChecker func(string) bool,
 ) Result {
-	// Build a name->agent index for O(1) lookup (herdr may use name or label).
 	index := make(map[string]kick.AgentEntry, len(agents))
 	for _, a := range agents {
 		if a.Name != "" {
@@ -243,24 +262,9 @@ func Triage(
 	for _, id := range standingIDs {
 		a, found := index[id]
 		if !found {
-			// FAC-694: exact equality alone is the FAC-660 defect, fixed in
-			// findAttentionAgent below and left here -- so the two lookups in
-			// this one file disagreed about the same fleet.
-			//
-			// A live standing lane is spelled forge-<lane>-<digest>; the roster
-			// spells it forge-<lane>. Exact lookup misses every one, so Triage
-			// reported four lanes "missing" and told the operator to raise
-			// them while they were running and idle. The genuinely idle lanes
-			// were never surfaced at all, and the fleet sat still with the
-			// health check reporting a fleet gap that did not exist.
-			//
-			// Measured live: forge-scout-planner-2918de97b5 was reported
-			// missing while kick.LaneForAgent matched it to lane
-			// "scout-planner" from the same roster entry.
 			a, found = findAttentionAgent(agents, id)
 		}
 		if !found {
-			// Missing standing agent — fleet gap.
 			item := Item{
 				Name:   id,
 				Status: "missing",
@@ -273,15 +277,30 @@ func Triage(
 		}
 
 		heldReason, held := heldChecker(id)
-		providerDeath := providerDeathChecker(id)
-		item := ClassifyAgent(a, held, heldReason, providerDeath)
+		var ev *process.TerminalEvidence
+		var sctx process.SessionContext
+		var paneText string
+		var evErr error
+		if evidenceResolver != nil {
+			ev, sctx, paneText, evErr = evidenceResolver(id)
+		}
+		providerDeath := false
+		if providerDeathChecker != nil {
+			providerDeath = providerDeathChecker(id)
+		}
+
+		item := ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, ev, sctx, paneText, evErr)
+		if providerDeath && item.Level != LevelCritical && !item.Held {
+			item.Level = LevelCritical
+			item.Reason = "provider death — needs reroute (cooled reset-aware)"
+		}
+
 		counts[item.Level]++
 		if NeedsEyes(item.Level) {
 			items = append(items, item)
 		}
 	}
 
-	// Deterministic sort: (urgency DESC, name ASC).
 	sort.SliceStable(items, func(i, j int) bool {
 		ri, rj := urgencyRank(items[i].Level), urgencyRank(items[j].Level)
 		if ri != rj {
@@ -291,9 +310,9 @@ func Triage(
 	})
 
 	needing := 0
-	for lvl, c := range counts {
+	for lvl, count := range counts {
 		if NeedsEyes(lvl) {
-			needing += c
+			needing += count
 		}
 	}
 
@@ -303,6 +322,23 @@ func Triage(
 		Total:   len(standingIDs),
 		Needing: needing,
 	}
+}
+
+// Triage produces the coordinator-eyes triage from a live agent list and
+// the standing roster. heldChecker and providerDeathChecker are injected
+// so the function is fully deterministic and testable.
+//
+// Every standing ID is examined. IDs that are live but working/starting
+// are LevelNone and excluded from Items (but counted in Total). The
+// roster is the source of truth — extra live agents not in the roster are
+// ignored, matching the original jq-filter-on-standing behavior.
+func Triage(
+	agents []kick.AgentEntry,
+	standingIDs []string,
+	heldChecker func(string) (string, bool),
+	providerDeathChecker func(string) bool,
+) Result {
+	return TriageWithEvidence(agents, standingIDs, heldChecker, nil, providerDeathChecker)
 }
 
 // Summary returns a one-line human-readable triage summary.
@@ -437,7 +473,7 @@ func RunWithHoldReader(reader lifecycle.HoldReader, repository string) (*Result,
 }
 
 func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
-	return runWithFleet(kick.FetchAgentList, reader, repository, resolver, registry)
+	return runWithFleet(kick.FetchAgentListContext, reader, repository, resolver, registry)
 }
 
 // runWithFleet is the whole body of the scan, with the fleet census injected.
@@ -451,17 +487,48 @@ func RunWithHoldReaderAndTasks(reader lifecycle.HoldReader, repository string, r
 // pkg/kick ALREADY injects exactly this dependency as Options.FetchAgents; a
 // second convention for one rule is the duplicate-rule defect pkg/invariant
 // fails the build on.
-func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
+func runWithFleet(fetchAgents any, reader lifecycle.HoldReader, repository string, resolver lifecycle.ActiveTaskResolver, registry lifecycle.CanonicalLaneRegistry) (*Result, error) {
 	if reader == nil || strings.TrimSpace(repository) == "" {
 		return nil, fmt.Errorf("herd-attention: durable hold authority and repository identity are required")
 	}
 	if fetchAgents == nil {
 		return nil, fmt.Errorf("herd-attention: a fleet census source is required")
 	}
-	agents, err := fetchAgents()
+
+	var fetchContext func(context.Context) ([]kick.AgentEntry, error)
+	switch fn := fetchAgents.(type) {
+	case func(context.Context) ([]kick.AgentEntry, error):
+		fetchContext = fn
+	case func() ([]kick.AgentEntry, error):
+		fetchContext = func(ctx context.Context) ([]kick.AgentEntry, error) {
+			type fetchResult struct {
+				agents []kick.AgentEntry
+				err    error
+			}
+			ch := make(chan fetchResult, 1)
+			go func() {
+				ag, err := fn()
+				ch <- fetchResult{agents: ag, err: err}
+			}()
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("fleet census timed out: %w", ctx.Err())
+			case res := <-ch:
+				return res.agents, res.err
+			}
+		}
+	default:
+		return nil, fmt.Errorf("herd-attention: invalid census function type: %T", fetchAgents)
+	}
+
+	fleetCtx, fleetCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer fleetCancel()
+
+	agents, err := fetchContext(fleetCtx)
 	if err != nil {
 		return nil, fmt.Errorf("herd-attention: %w", err)
 	}
+
 	heldFacts := map[string]string{}
 	// FAC-698: one lane's unresolvable authority used to abort the WHOLE scan.
 	// Run against the chainseer fleet, attention reported
@@ -495,7 +562,7 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 			}
 			return 0, fmt.Errorf("herd-attention: current generation source is required")
 		}
-		err := lifecycle.CheckLaneAndTaskHold(context.Background(), reader, resolver, repository, lane.Role, lane.Name, generation)
+		err := lifecycle.CheckLaneAndTaskHold(fleetCtx, reader, resolver, repository, lane.Role, lane.Name, generation)
 		if err != nil {
 			if errors.Is(err, lifecycle.ErrHoldDenied) {
 				heldFacts[name] = err.Error()
@@ -506,7 +573,71 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 		}
 	}
 	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
-	r := Triage(agents, kick.StandingIDs(), check, kick.ProviderDeathCheck)
+
+	receiptsPath := launch.ReceiptPathFor(repository)
+	receipts, _ := launch.ReadReceipts(receiptsPath)
+
+	evidenceResolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string, error) {
+		a, found := findAttentionAgent(agents, name)
+		if !found {
+			return nil, process.SessionContext{}, "", nil
+		}
+
+		expectedProvider := a.ExpectedProvider
+		expectedModel := a.ExpectedModel
+		expectedAccount := ""
+		if expectedProvider == "" || expectedModel == "" {
+			if p, m, acc, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, a.Name, a.Session.Value, a.PaneID, a.TabID); err == nil {
+				expectedProvider = p
+				expectedModel = m
+				expectedAccount = acc
+			}
+		}
+
+		fence := process.IdentityFence{
+			Name:             a.Name,
+			Kind:             a.Kind,
+			SessionID:        a.Session.Value,
+			SessionKind:      a.Session.Kind,
+			SessionSource:    a.Session.Source,
+			PaneID:           a.PaneID,
+			TabID:            a.TabID,
+			TerminalID:       a.TerminalID,
+			Workspace:        a.Workspace,
+			Cwd:              a.Cwd,
+			Revision:         a.Revision,
+			StateChangeSeq:   a.StateChangeSeq,
+			TabGeneration:    a.TabGeneration,
+			ExpectedModel:    expectedModel,
+			ExpectedProvider: expectedProvider,
+			ExpectedAccount:  expectedAccount,
+		}
+		fetchAfter := func(agentName string) (*kick.AgentEntry, error) {
+			select {
+			case <-fleetCtx.Done():
+				return nil, fleetCtx.Err()
+			default:
+			}
+			resAgents, err := fetchContext(fleetCtx)
+			if err != nil {
+				return nil, err
+			}
+			cur, ok := findAttentionAgent(resAgents, agentName)
+			if !ok {
+				return nil, errors.New("agent not found in current fleet")
+			}
+			if cur.ExpectedModel == "" || cur.ExpectedProvider == "" {
+				if p, m, _, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, cur.Name, cur.Session.Value, cur.PaneID, cur.TabID); err == nil {
+					cur.ExpectedProvider = p
+					cur.ExpectedModel = m
+				}
+			}
+			return &cur, nil
+		}
+		ev, sctx, paneText, err := process.ResolveNativeAgentEvidenceWithFence(fleetCtx, fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
+		return ev, sctx, paneText, err
+	}
+	r := TriageWithEvidence(agents, kick.StandingIDs(), check, evidenceResolver, kick.ProviderDeathCheck)
 	// A degraded lane is CRITICAL and must not be silently downgraded to
 	// whatever its live status happened to be: an ambiguous task binding is a
 	// real finding, not a healthy idle lane.

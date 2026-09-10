@@ -198,3 +198,68 @@ func reviewSession(r Receipt) string {
 	}
 	return ""
 }
+
+// AcceptedNativeLaunchRouteForAgent resolves the authentic accepted launch route (provider, model, and optional account)
+// for an active live agent by matching against canonical accepted launch receipts.
+// Keyed by exact lane/name, session ID, pane ID, or tab ID.
+// Receipts that are not accepted, or whose session/pane/incarnation conflicts, are rejected.
+func AcceptedNativeLaunchRouteForAgent(members []Receipt, name, sessionID, paneID, tabID string) (provider, model, account string, err error) {
+	name = strings.TrimSpace(name)
+	sessionID = strings.TrimSpace(sessionID)
+	paneID = strings.TrimSpace(paneID)
+	tabID = strings.TrimSpace(tabID)
+
+	var matches []Receipt
+	for _, m := range members {
+		if !m.Accepted {
+			continue
+		}
+		if strings.TrimSpace(m.Provider) == "" || strings.TrimSpace(m.Model) == "" {
+			continue
+		}
+
+		// Check session match if receipt has session
+		if sessionID != "" && strings.TrimSpace(m.HerdrSession) != "" {
+			if strings.TrimSpace(m.HerdrSession) != sessionID {
+				continue
+			}
+		}
+
+		// Check pane match if receipt has pane
+		if paneID != "" && strings.TrimSpace(m.PaneID) != "" {
+			if strings.TrimSpace(m.PaneID) != paneID {
+				continue
+			}
+		}
+
+		// Check tab match if receipt has tab
+		if tabID != "" && strings.TrimSpace(m.TabID) != "" {
+			if strings.TrimSpace(m.TabID) != tabID {
+				continue
+			}
+		}
+
+		// Check name / lane match if name is provided
+		if name != "" {
+			mName := strings.TrimSpace(m.Name)
+			mLane := strings.TrimSpace(m.Lane)
+			nameMatches := mName == name || mLane == name ||
+				strings.TrimPrefix(name, "forge-") == mLane ||
+				strings.TrimPrefix(name, "forge-") == mName ||
+				strings.TrimPrefix(mName, "forge-") == name
+			if !nameMatches {
+				continue
+			}
+		}
+
+		matches = append(matches, m)
+	}
+
+	if len(matches) == 0 {
+		return "", "", "", fmt.Errorf("no authentic accepted launch receipt found for lane %q (session: %q, pane: %q)", name, sessionID, paneID)
+	}
+
+	// Latest accepted receipt wins
+	latest := matches[len(matches)-1]
+	return strings.TrimSpace(latest.Provider), strings.TrimSpace(latest.Model), strings.TrimSpace(latest.RedactedAuthority), nil
+}

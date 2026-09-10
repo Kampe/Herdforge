@@ -14,6 +14,8 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/process"
 	"github.com/Kampe/Herdforge/pkg/spin"
@@ -94,7 +96,123 @@ func runSpin() {
 			continue
 		}
 		tail, _ := herdr.PaneRead(a.PaneID, *tailLines)
-		pid, cwd, alive := paneProcessState(a.PaneID)
+		pid, procCwd, alive := paneProcessState(a.PaneID)
+
+		// Authoritative worktree is a.Cwd from Herdr row.
+		// If pane process has a distinct working directory that differs from Herdr's canonical Cwd,
+		// reject to prevent silent route/worktree substitution.
+		worktreeCwd := a.Cwd
+		if worktreeCwd == "" {
+			worktreeCwd = procCwd
+		}
+		if procCwd != "" && a.Cwd != "" && process.NormalizePath(procCwd) != process.NormalizePath(a.Cwd) {
+			assessments = append(assessments, spin.Assessment{
+				PaneID:     a.PaneID,
+				Name:       a.Name,
+				Cause:      spin.CauseUnknownState,
+				NextAction: spin.ActionObserve,
+				Evidence:   []string{fmt.Sprintf("process directory %q diverged from registered worktree %q", procCwd, a.Cwd)},
+			})
+			continue
+		}
+		cwd := worktreeCwd
+
+		receiptsPath := launch.ReceiptPathFor(repoRoot)
+		receipts, _ := launch.ReadReceipts(receiptsPath)
+
+		expectedProvider := a.ExpectedProvider
+		expectedModel := a.ExpectedModel
+		expectedAccount := ""
+		if expectedProvider == "" || expectedModel == "" {
+			if p, m, acc, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, a.Name, a.Session.Value, a.PaneID, a.TabID); err == nil {
+				expectedProvider = p
+				expectedModel = m
+				expectedAccount = acc
+			}
+		}
+
+		spinCtx, spinCancel := context.WithTimeout(ctx, 10*time.Second)
+		fence := process.IdentityFence{
+			Name:             a.Name,
+			Kind:             a.Kind,
+			SessionID:        a.Session.Value,
+			SessionKind:      a.Session.Kind,
+			SessionSource:    a.Session.Source,
+			PaneID:           a.PaneID,
+			TabID:            a.TabID,
+			TerminalID:       a.TerminalID,
+			Workspace:        a.Workspace,
+			Cwd:              worktreeCwd,
+			Revision:         a.Revision,
+			StateChangeSeq:   a.StateChangeSeq,
+			TabGeneration:    a.TabGeneration,
+			ExpectedModel:    expectedModel,
+			ExpectedProvider: expectedProvider,
+			ExpectedAccount:  expectedAccount,
+		}
+		fetchAfter := func(name string) (*kick.AgentEntry, error) {
+			select {
+			case <-spinCtx.Done():
+				return nil, spinCtx.Err()
+			default:
+			}
+			currentAgents, err := herdr.AgentListContext(spinCtx)
+			if err != nil {
+				return nil, err
+			}
+			for _, cur := range currentAgents {
+				if cur.Name == name {
+					p := cur.ExpectedProvider
+					m := cur.ExpectedModel
+					if p == "" || m == "" {
+						if prov, mod, _, err := launch.AcceptedNativeLaunchRouteForAgent(receipts, cur.Name, cur.Session.Value, cur.PaneID, cur.TabID); err == nil {
+							p = prov
+							m = mod
+						}
+					}
+					return &kick.AgentEntry{
+						Name:             cur.Name,
+						Kind:             cur.Kind,
+						Status:           cur.Status,
+						PaneID:           cur.PaneID,
+						TabID:            cur.TabID,
+						TerminalID:       cur.TerminalID,
+						Workspace:        cur.Workspace,
+						Cwd:              cur.Cwd,
+						Revision:         cur.Revision,
+						StateChangeSeq:   cur.StateChangeSeq,
+						TabGeneration:    cur.TabGeneration,
+						ExpectedModel:    m,
+						ExpectedProvider: p,
+						Session: kick.AgentSession{
+							Value:  cur.Session.Value,
+							Kind:   cur.Session.Kind,
+							Source: cur.Session.Source,
+						},
+					}, nil
+				}
+			}
+			return nil, errors.New("agent not found after export")
+		}
+		ev, sctx, _, evErr := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, time.Time{}, 5*time.Minute)
+		spinCancel()
+
+		var target process.Target
+		if evErr != nil && strings.EqualFold(a.Kind, "opencode") {
+			target = process.Target{
+				PaneID: a.PaneID,
+				Name:   a.Name,
+				Status: a.Status,
+				Class:  process.Unknown,
+				Action: "observe",
+				Tail:   fmt.Sprintf("native evidence error: %v", evErr),
+			}
+		} else {
+			target = process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)
+			if target.Class == process.Quota && ev != nil {
+				process.EvaluateAndRecordStop(ev, sctx, tail, 15*time.Minute)
+			}
+		}
 
 		obs := spin.Observation{
 			PaneID:      a.PaneID,
@@ -103,7 +221,7 @@ func runSpin() {
 			PID:         pid,
 			ProcAlive:   alive,
 			UniqueWork:  spin.TriUnknown,
-			Diagnostic:  string(process.ClassifyTarget(a.PaneID, a.Name, a.Status, tail).Class),
+			Diagnostic:  string(target.Class),
 			Progress:    spin.Progress{StateChangeSeq: a.StateChangeSeq},
 		}
 

@@ -9,16 +9,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
-
-	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 const (
@@ -58,6 +59,18 @@ func binaryPath() (string, error) {
 // runHerdr is overridable for crash-point / unit tests (FAC-121).
 var runHerdr = runHerdrReal
 
+var runHerdrContextOverride func(ctx context.Context, args ...string) (string, error)
+
+func runHerdrContext(ctx context.Context, args ...string) (string, error) {
+	if runHerdrContextOverride != nil {
+		return runHerdrContextOverride(ctx, args...)
+	}
+	if reflect.ValueOf(runHerdr).Pointer() != reflect.ValueOf(runHerdrReal).Pointer() {
+		return runHerdr(args...)
+	}
+	return runHerdrContextReal(ctx, args...)
+}
+
 // SetRunHerdrForTest replaces the CLI runner. Restore with the returned func.
 func SetRunHerdrForTest(f func(args ...string) (string, error)) func() {
 	old := runHerdr
@@ -67,6 +80,13 @@ func SetRunHerdrForTest(f func(args ...string) (string, error)) func() {
 		runHerdr = f
 	}
 	return func() { runHerdr = old }
+}
+
+// SetRunHerdrContextForTest replaces the CLI context runner. Restore with the returned func.
+func SetRunHerdrContextForTest(f func(ctx context.Context, args ...string) (string, error)) func() {
+	old := runHerdrContextOverride
+	runHerdrContextOverride = f
+	return func() { runHerdrContextOverride = old }
 }
 
 var (
@@ -1550,9 +1570,9 @@ func IsAvailable() bool {
 	return err == nil
 }
 
-// AgentList returns all agents managed by herdr.
-func AgentList() ([]AgentEntry, error) {
-	output, err := runHerdr("agent", "list")
+// AgentListContext returns all agents managed by herdr bounded by the provided context.
+func AgentListContext(ctx context.Context) ([]AgentEntry, error) {
+	output, err := runHerdrContext(ctx, "agent", "list")
 	if err != nil {
 		return nil, fmt.Errorf("herdr agent list: %w", err)
 	}
@@ -1569,6 +1589,11 @@ func AgentList() ([]AgentEntry, error) {
 		return nil, fmt.Errorf("herdr agent list returned no agents inventory")
 	}
 	return resp.Result.Agents, nil
+}
+
+// AgentList returns all agents managed by herdr.
+func AgentList() ([]AgentEntry, error) {
+	return AgentListContext(context.Background())
 }
 
 // AgentSession is optional provenance. Grok never reports it; claude/opencode
@@ -1619,7 +1644,41 @@ type AgentEntry struct {
 	// TabGeneration is the immutable tab identity exposed by newer Herdr
 	// pulse/agent-list surfaces. It is deliberately distinct from
 	// StateChangeSeq, which only counts agent state transitions.
-	TabGeneration uint64 `json:"tab_generation,omitempty"`
+	TabGeneration    uint64 `json:"tab_generation,omitempty"`
+	ExpectedModel    string `json:"model,omitempty"`
+	ExpectedProvider string `json:"provider,omitempty"`
+}
+
+// UnmarshalJSON implements custom unmarshaling to accept both native Herdr tags (model, provider)
+// and legacy/explicit tags (expected_model, expected_provider).
+func (a *AgentEntry) UnmarshalJSON(data []byte) error {
+	type rawEntry AgentEntry
+	var aux struct {
+		rawEntry
+		Model            string `json:"model,omitempty"`
+		Provider         string `json:"provider,omitempty"`
+		ExpectedModel    string `json:"expected_model,omitempty"`
+		ExpectedProvider string `json:"expected_provider,omitempty"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*a = AgentEntry(aux.rawEntry)
+	if a.ExpectedModel == "" {
+		if aux.Model != "" {
+			a.ExpectedModel = aux.Model
+		} else if aux.ExpectedModel != "" {
+			a.ExpectedModel = aux.ExpectedModel
+		}
+	}
+	if a.ExpectedProvider == "" {
+		if aux.Provider != "" {
+			a.ExpectedProvider = aux.Provider
+		} else if aux.ExpectedProvider != "" {
+			a.ExpectedProvider = aux.ExpectedProvider
+		}
+	}
+	return nil
 }
 
 // SessionID renders the launch-time pane identity a receipt binds to.
@@ -1987,11 +2046,15 @@ func EnsureHerdforgeLabel(label string) string {
 }
 
 func runHerdrReal(args ...string) (string, error) {
+	return runHerdrContextReal(context.Background(), args...)
+}
+
+func runHerdrContextReal(ctx context.Context, args ...string) (string, error) {
 	bin, binErr := binaryPath()
 	if binErr != nil {
 		return "", binErr
 	}
-	cmd := exec.Command(bin, args...)
+	cmd := procsignal.CommandContext(ctx, bin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
