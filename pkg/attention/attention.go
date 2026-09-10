@@ -441,10 +441,32 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 	if fetchAgents == nil {
 		return nil, fmt.Errorf("herd-attention: a fleet census source is required")
 	}
-	agents, err := fetchAgents()
-	if err != nil {
-		return nil, fmt.Errorf("herd-attention: %w", err)
+
+	fleetCtx, fleetCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer fleetCancel()
+
+	// Perform initial census within the aggregate fleet deadline
+	type fetchResult struct {
+		agents []kick.AgentEntry
+		err    error
 	}
+	fetchDone := make(chan fetchResult, 1)
+	go func() {
+		ag, err := fetchAgents()
+		fetchDone <- fetchResult{agents: ag, err: err}
+	}()
+
+	var agents []kick.AgentEntry
+	select {
+	case <-fleetCtx.Done():
+		return nil, fmt.Errorf("herd-attention: fleet census timed out: %w", fleetCtx.Err())
+	case res := <-fetchDone:
+		if res.err != nil {
+			return nil, fmt.Errorf("herd-attention: %w", res.err)
+		}
+		agents = res.agents
+	}
+
 	heldFacts := map[string]string{}
 	// FAC-698: one lane's unresolvable authority used to abort the WHOLE scan.
 	// Run against the chainseer fleet, attention reported
@@ -478,7 +500,7 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 			}
 			return 0, fmt.Errorf("herd-attention: current generation source is required")
 		}
-		err := lifecycle.CheckLaneAndTaskHold(context.Background(), reader, resolver, repository, lane.Role, lane.Name, generation)
+		err := lifecycle.CheckLaneAndTaskHold(fleetCtx, reader, resolver, repository, lane.Role, lane.Name, generation)
 		if err != nil {
 			if errors.Is(err, lifecycle.ErrHoldDenied) {
 				heldFacts[name] = err.Error()
@@ -489,8 +511,6 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 		}
 	}
 	check := func(name string) (string, bool) { reason, held := heldFacts[name]; return reason, held }
-	fleetCtx, fleetCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer fleetCancel()
 
 	evidenceResolver := func(name string) (*process.TerminalEvidence, process.SessionContext, string, error) {
 		a, found := findAttentionAgent(agents, name)
@@ -498,28 +518,46 @@ func runWithFleet(fetchAgents func() ([]kick.AgentEntry, error), reader lifecycl
 			return nil, process.SessionContext{}, "", nil
 		}
 		fence := process.IdentityFence{
-			Name:           a.Name,
-			Kind:           a.Kind,
-			SessionID:      a.Session.Value,
-			SessionKind:    a.Session.Kind,
-			SessionSource:  a.Session.Source,
-			PaneID:         a.PaneID,
-			TabID:          a.TabID,
-			TerminalID:     a.TerminalID,
-			Workspace:      a.Workspace,
-			Cwd:            a.Cwd,
-			StateChangeSeq: a.StateChangeSeq,
+			Name:             a.Name,
+			Kind:             a.Kind,
+			SessionID:        a.Session.Value,
+			SessionKind:      a.Session.Kind,
+			SessionSource:    a.Session.Source,
+			PaneID:           a.PaneID,
+			TabID:            a.TabID,
+			TerminalID:       a.TerminalID,
+			Workspace:        a.Workspace,
+			Cwd:              a.Cwd,
+			Revision:         a.Revision,
+			StateChangeSeq:   a.StateChangeSeq,
+			TabGeneration:    a.TabGeneration,
+			ExpectedModel:    a.ExpectedModel,
+			ExpectedProvider: a.ExpectedProvider,
 		}
 		fetchAfter := func(agentName string) (*kick.AgentEntry, error) {
-			currentAgents, err := fetchAgents()
-			if err != nil {
-				return nil, err
+			select {
+			case <-fleetCtx.Done():
+				return nil, fleetCtx.Err()
+			default:
 			}
-			cur, ok := findAttentionAgent(currentAgents, agentName)
-			if !ok {
-				return nil, errors.New("agent not found in current fleet")
+			afterDone := make(chan fetchResult, 1)
+			go func() {
+				ag, err := fetchAgents()
+				afterDone <- fetchResult{agents: ag, err: err}
+			}()
+			select {
+			case <-fleetCtx.Done():
+				return nil, fmt.Errorf("fetch agent after export timed out: %w", fleetCtx.Err())
+			case res := <-afterDone:
+				if res.err != nil {
+					return nil, res.err
+				}
+				cur, ok := findAttentionAgent(res.agents, agentName)
+				if !ok {
+					return nil, errors.New("agent not found in current fleet")
+				}
+				return &cur, nil
 			}
-			return &cur, nil
 		}
 		ev, sctx, paneText, err := process.ResolveNativeAgentEvidenceWithFence(fleetCtx, fence, fetchAfter, time.Now().UTC(), 5*time.Minute)
 		return ev, sctx, paneText, err

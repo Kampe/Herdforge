@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -423,5 +425,204 @@ func TestCaptureOpencodeExportLive_OversizeLimit(t *testing.T) {
 	_, err = captureOpencodeExportLive(ctx, "session-oversize", "")
 	if err == nil || !strings.Contains(err.Error(), "maximum size limit") {
 		t.Errorf("expected maximum size limit error on infinite output, got: %v", err)
+	}
+}
+
+func TestIdentityFence_RevisionMismatch_Rejects(t *testing.T) {
+	fence := IdentityFence{
+		Name:      "worker",
+		Kind:      "opencode",
+		SessionID: "sess-1",
+		Revision:  3,
+	}
+	after := kick.AgentEntry{
+		Name:     "worker",
+		Kind:     "opencode",
+		Revision: 4,
+		Session:  kick.AgentSession{Value: "sess-1"},
+	}
+	err := fence.Verify(after)
+	if err == nil || !strings.Contains(err.Error(), "revision changed from 3 to 4") {
+		t.Fatalf("expected revision mismatch error, got: %v", err)
+	}
+}
+
+func TestIdentityFence_BlankAfterSessionKind_RejectsWhenExpectedNonEmpty(t *testing.T) {
+	fence := IdentityFence{
+		Name:        "worker",
+		Kind:        "opencode",
+		SessionID:   "sess-1",
+		SessionKind: "id",
+	}
+	after := kick.AgentEntry{
+		Name:    "worker",
+		Kind:    "opencode",
+		Session: kick.AgentSession{Value: "sess-1", Kind: ""},
+	}
+	err := fence.Verify(after)
+	if err == nil || !strings.Contains(err.Error(), "session_kind changed") {
+		t.Fatalf("expected blank after session_kind to be rejected, got: %v", err)
+	}
+}
+
+func TestIdentityFence_BlankAfterSessionSource_RejectsWhenExpectedNonEmpty(t *testing.T) {
+	fence := IdentityFence{
+		Name:          "worker",
+		Kind:          "opencode",
+		SessionID:     "sess-1",
+		SessionSource: "herdr:opencode",
+	}
+	after := kick.AgentEntry{
+		Name:    "worker",
+		Kind:    "opencode",
+		Session: kick.AgentSession{Value: "sess-1", Source: ""},
+	}
+	err := fence.Verify(after)
+	if err == nil || !strings.Contains(err.Error(), "session_source changed") {
+		t.Fatalf("expected blank after session_source to be rejected, got: %v", err)
+	}
+}
+
+func TestResolveNativeAgentEvidenceWithFence_ExpectedModelAndProviderMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	exportJSON := generateLargeExportJSON(sessionID, "u1", "a1", "length", "litellm/actual-model", now)
+
+	prevRunner := defaultExportRunner
+	defaultExportRunner = func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return exportJSON, nil
+	}
+	defer func() { defaultExportRunner = prevRunner }()
+
+	fence := IdentityFence{
+		Name:             "worker",
+		Kind:             "opencode",
+		SessionID:        sessionID,
+		Cwd:              "/path/to/worktree",
+		ExpectedModel:    "litellm/expected-model",
+		ExpectedProvider: "litellm",
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:    "worker",
+			Kind:    "opencode",
+			Cwd:     "/path/to/worktree",
+			Session: kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	_, _, _, err := ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "model mismatch") {
+		t.Fatalf("expected model mismatch error, got: %v", err)
+	}
+}
+
+func TestResolveNativeAgentEvidenceWithFence_PerLanePostCaptureTimestamp(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	// Create an in-flight turn that started 15 minutes ago
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree","title":"in-flight"},"messages":[
+		{"info":{"id":"u1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a1","sessionID":%q,"role":"assistant","parentID":"u1","providerID":"litellm","modelID":"model","finish":"","time":{"created":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-15*time.Minute).UnixMilli(), sessionID, now.Add(-15*time.Minute).UnixMilli())
+
+	prevRunner := defaultExportRunner
+	defaultExportRunner = func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	}
+	defer func() { defaultExportRunner = prevRunner }()
+
+	fence := IdentityFence{
+		Name:      "worker",
+		Kind:      "opencode",
+		SessionID: sessionID,
+		Cwd:       "/path/to/worktree",
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:    "worker",
+			Kind:    "opencode",
+			Cwd:     "/path/to/worktree",
+			Session: kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	// Per-lane capture timestamp taken post-capture
+	lanePostCaptureTime := time.Now().UTC()
+	ev, sctx, _, err := ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, lanePostCaptureTime, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ResolveNativeAgentEvidenceWithFence failed: %v", err)
+	}
+
+	// In-flight turn must evaluate fresh against post-capture timestamp
+	if err := ev.Validate(sctx); err != nil {
+		t.Errorf("expected in-flight turn to pass freshness validation with post-capture CapturedAt: %v", err)
+	}
+
+	// If CapturedAt exceeds maxAge (e.g. stale scan start time), Validate must reject it
+	staleCtx := sctx
+	staleCtx.CapturedAt = now.Add(-10 * time.Minute)
+	staleEv := *ev
+	staleEv.CapturedAt = now.Add(-10 * time.Minute)
+	if err := staleEv.Validate(staleCtx); err == nil {
+		t.Errorf("expected stale CapturedAt to be rejected by Validate")
+	}
+}
+
+func TestCaptureOpencodeExportLive_OwnedProcessGroupTeardown_NoOrphanDescendants(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "fake-opencode-owned-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	pidFile := filepath.Join(tmpDir, "child.pid")
+	fakeBin := filepath.Join(tmpDir, "opencode")
+	scriptContent := fmt.Sprintf("#!/bin/sh\nsleep 60 &\nCHILD_PID=$!\necho $CHILD_PID > %s\nwait\n", pidFile)
+	if err := os.WriteFile(fakeBin, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("write fake opencode script: %v", err)
+	}
+
+	oldPath := os.Getenv("PATH")
+	os.Setenv("PATH", tmpDir+":"+oldPath)
+	defer os.Setenv("PATH", oldPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+	defer cancel()
+
+	_, err = captureOpencodeExportLive(ctx, "session-owned", "")
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout error for hanging script, got: %v", err)
+	}
+
+	// Read child PID
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("failed to read child PID file: %v", err)
+	}
+	childPIDStr := strings.TrimSpace(string(pidBytes))
+	childPID, err := strconv.Atoi(childPIDStr)
+	if err != nil {
+		t.Fatalf("invalid child PID %q: %v", childPIDStr, err)
+	}
+
+	// Give a brief window (up to 500ms) to ensure process group SIGKILL completes
+	deadline := time.Now().Add(500 * time.Millisecond)
+	alive := true
+	for time.Now().Before(deadline) {
+		err := syscall.Kill(childPID, 0)
+		if err != nil {
+			// ESRCH: process does not exist
+			alive = false
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if alive {
+		t.Errorf("child process PID %d is still alive after process group cancellation (orphaned)", childPID)
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
 	}
 }

@@ -1619,7 +1619,9 @@ type AgentEntry struct {
 	// TabGeneration is the immutable tab identity exposed by newer Herdr
 	// pulse/agent-list surfaces. It is deliberately distinct from
 	// StateChangeSeq, which only counts agent state transitions.
-	TabGeneration uint64 `json:"tab_generation,omitempty"`
+	TabGeneration    uint64 `json:"tab_generation,omitempty"`
+	ExpectedModel    string `json:"expected_model,omitempty"`
+	ExpectedProvider string `json:"expected_provider,omitempty"`
 }
 
 // SessionID renders the launch-time pane identity a receipt binds to.

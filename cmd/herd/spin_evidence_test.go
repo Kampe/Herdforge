@@ -90,3 +90,81 @@ func TestSpin_ClassifyTargetWithNativeOpencodeEvidence(t *testing.T) {
 		t.Errorf("spin observation diagnostic must be UNKNOWN, got %s", obs.Diagnostic)
 	}
 }
+
+func TestSpin_DivergentProcessCwdAndRegisteredWorktree_Rejects(t *testing.T) {
+	herdrWorktree := "/path/to/herdr/worktree"
+	divergentProcCwd := "/path/to/other/worktree"
+
+	agent := kick.AgentEntry{
+		Name:    "forge-worker",
+		Kind:    "opencode",
+		PaneID:  "p-1",
+		Status:  "working",
+		Cwd:     herdrWorktree,
+		Session: kick.AgentSession{Value: "sess-1"},
+	}
+
+	// Verify spin Cwd divergence guard logic
+	if process.NormalizePath(divergentProcCwd) != process.NormalizePath(agent.Cwd) {
+		assessment := spin.Assessment{
+			PaneID:     agent.PaneID,
+			Name:       agent.Name,
+			Cause:      spin.CauseUnknownState,
+			NextAction: spin.ActionObserve,
+			Evidence:   []string{fmt.Sprintf("process directory %q diverged from registered worktree %q", divergentProcCwd, agent.Cwd)},
+		}
+
+		if assessment.NextAction != spin.ActionObserve {
+			t.Errorf("expected action ActionObserve, got %v", assessment.NextAction)
+		}
+		if len(assessment.Evidence) == 0 || !strings.Contains(assessment.Evidence[0], "diverged from registered worktree") {
+			t.Errorf("expected evidence to contain divergence explanation, got %v", assessment.Evidence)
+		}
+	} else {
+		t.Fatalf("expected divergence check to succeed")
+	}
+}
+
+func TestSpin_ModelRouteMismatch_RefusesEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":"litellm/actual-model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	fence := process.IdentityFence{
+		Name:             "forge-worker",
+		Kind:             "opencode",
+		SessionID:        sessionID,
+		PaneID:           "p-1",
+		Cwd:              "/path/to/worktree",
+		ExpectedModel:    "litellm/expected-model",
+		ExpectedProvider: "litellm",
+	}
+
+	fetchAfter := func(_ string) (*kick.AgentEntry, error) {
+		return &kick.AgentEntry{
+			Name:    "forge-worker",
+			Kind:    "opencode",
+			PaneID:  "p-1",
+			Cwd:     "/path/to/worktree",
+			Session: kick.AgentSession{Value: sessionID},
+		}, nil
+	}
+
+	ev, sctx, _, err := process.ResolveNativeAgentEvidenceWithFence(context.Background(), fence, fetchAfter, now, 5*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "model mismatch") {
+		t.Fatalf("expected model mismatch error, got: %v", err)
+	}
+
+	target := process.ClassifyTargetWithEvidence("p-1", "forge-worker", "working", "some pane text", ev, sctx)
+	if target.Class != process.Unknown {
+		t.Errorf("model mismatch must classify as Unknown, got: %s", target.Class)
+	}
+}

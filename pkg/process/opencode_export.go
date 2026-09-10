@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
 // OpencodeExport represents the top-level structured JSON emitted by `opencode export <session> --sanitize --pure`.
@@ -70,7 +70,9 @@ type IdentityFence struct {
 	TerminalID       string
 	Workspace        string
 	Cwd              string
+	Revision         uint64
 	StateChangeSeq   uint64
+	TabGeneration    uint64
 	ExpectedModel    string
 	ExpectedProvider string
 }
@@ -86,10 +88,10 @@ func (f IdentityFence) Verify(after kick.AgentEntry) error {
 	if after.Session.Value != f.SessionID {
 		return fmt.Errorf("identity fence mismatch: session_id changed from %q to %q", f.SessionID, after.Session.Value)
 	}
-	if f.SessionKind != "" && after.Session.Kind != "" && after.Session.Kind != f.SessionKind {
+	if f.SessionKind != "" && after.Session.Kind != f.SessionKind {
 		return fmt.Errorf("identity fence mismatch: session_kind changed from %q to %q", f.SessionKind, after.Session.Kind)
 	}
-	if f.SessionSource != "" && after.Session.Source != "" && after.Session.Source != f.SessionSource {
+	if f.SessionSource != "" && after.Session.Source != f.SessionSource {
 		return fmt.Errorf("identity fence mismatch: session_source changed from %q to %q", f.SessionSource, after.Session.Source)
 	}
 	if after.PaneID != f.PaneID {
@@ -104,11 +106,17 @@ func (f IdentityFence) Verify(after kick.AgentEntry) error {
 	if after.Workspace != f.Workspace {
 		return fmt.Errorf("identity fence mismatch: workspace_id changed from %q to %q", f.Workspace, after.Workspace)
 	}
-	if normalizePath(after.Cwd) != normalizePath(f.Cwd) {
+	if NormalizePath(after.Cwd) != NormalizePath(f.Cwd) {
 		return fmt.Errorf("identity fence mismatch: cwd changed from %q to %q", f.Cwd, after.Cwd)
+	}
+	if after.Revision != f.Revision {
+		return fmt.Errorf("identity fence mismatch: revision changed from %d to %d", f.Revision, after.Revision)
 	}
 	if after.StateChangeSeq != f.StateChangeSeq {
 		return fmt.Errorf("identity fence mismatch: state_change_seq changed from %d to %d", f.StateChangeSeq, after.StateChangeSeq)
+	}
+	if f.TabGeneration != 0 && after.TabGeneration != f.TabGeneration {
+		return fmt.Errorf("identity fence mismatch: tab_generation changed from %d to %d", f.TabGeneration, after.TabGeneration)
 	}
 	return nil
 }
@@ -127,8 +135,8 @@ func SetDefaultExportRunner(runner OpencodeExportRunner) func() {
 	}
 }
 
-// normalizePath canonicalizes platform paths without suffix/case ambiguity.
-func normalizePath(p string) string {
+// NormalizePath canonicalizes platform paths without suffix/case ambiguity.
+func NormalizePath(p string) string {
 	if p == "" {
 		return ""
 	}
@@ -165,7 +173,7 @@ func captureOpencodeExportLive(ctx context.Context, sessionID string, targetDir 
 		os.Remove(tmpName)
 	}()
 
-	cmd := exec.CommandContext(ctx, "opencode", "export", sessionID, "--sanitize", "--pure")
+	cmd := procsignal.CommandContext(ctx, "opencode", "export", sessionID, "--sanitize", "--pure")
 	if targetDir != "" {
 		cmd.Dir = targetDir
 	}
@@ -193,7 +201,7 @@ func captureOpencodeExportLive(ctx context.Context, sessionID string, targetDir 
 		select {
 		case <-ctx.Done():
 			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
+				_ = procsignal.CancelSpawnedProcess(cmd.Process)
 			}
 			<-done
 			return nil, fmt.Errorf("opencode export timed out: %w", ctx.Err())
@@ -206,7 +214,7 @@ func captureOpencodeExportLive(ctx context.Context, sessionID string, targetDir 
 			fi, err := tmp.Stat()
 			if err == nil && fi.Size() > maxExportBytes {
 				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
+					_ = procsignal.CancelSpawnedProcess(cmd.Process)
 				}
 				<-done
 				return nil, fmt.Errorf("opencode export output exceeded maximum size limit of %d bytes", maxExportBytes)
@@ -261,8 +269,8 @@ func ExtractTerminalEvidenceFromExport(data []byte, expectedSessionID string, ex
 		if exp.Info.Directory == "" {
 			return nil, errors.New("opencode export missing directory metadata")
 		}
-		normExp := normalizePath(exp.Info.Directory)
-		normTarget := normalizePath(expectedDirectory)
+		normExp := NormalizePath(exp.Info.Directory)
+		normTarget := NormalizePath(expectedDirectory)
 		if normExp != normTarget {
 			return nil, fmt.Errorf("opencode export directory mismatch: expected %s, got %s", expectedDirectory, exp.Info.Directory)
 		}
@@ -424,12 +432,18 @@ func ResolveNativeAgentEvidenceWithFence(ctx context.Context, fence IdentityFenc
 		return nil, sctx, "", fmt.Errorf("identity fence rejected: %w", err)
 	}
 
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
 	ev, err := ExtractTerminalEvidenceFromExport(data, fence.SessionID, fence.Cwd, now, maxAge)
 	if err != nil {
 		return nil, sctx, "", fmt.Errorf("native evidence extraction: %w", err)
 	}
 
 	ev.CapturedAt = now
+	sctx.CapturedAt = now
+	sctx.Now = now
 
 	// Verify model against expected model if provided
 	if fence.ExpectedModel != "" && ev.Model != fence.ExpectedModel {

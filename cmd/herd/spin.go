@@ -94,23 +94,53 @@ func runSpin() {
 		if a.PaneID == "" {
 			continue
 		}
+		laneNow := time.Now().UTC()
 		tail, _ := herdr.PaneRead(a.PaneID, *tailLines)
-		pid, cwd, alive := paneProcessState(a.PaneID)
+		pid, procCwd, alive := paneProcessState(a.PaneID)
 
+		// Authoritative worktree is a.Cwd from Herdr row.
+		// If pane process has a distinct working directory that differs from Herdr's canonical Cwd,
+		// reject to prevent silent route/worktree substitution.
+		worktreeCwd := a.Cwd
+		if worktreeCwd == "" {
+			worktreeCwd = procCwd
+		}
+		if procCwd != "" && a.Cwd != "" && process.NormalizePath(procCwd) != process.NormalizePath(a.Cwd) {
+			assessments = append(assessments, spin.Assessment{
+				PaneID:     a.PaneID,
+				Name:       a.Name,
+				Cause:      spin.CauseUnknownState,
+				NextAction: spin.ActionObserve,
+				Evidence:   []string{fmt.Sprintf("process directory %q diverged from registered worktree %q", procCwd, a.Cwd)},
+			})
+			continue
+		}
+		cwd := worktreeCwd
+
+		spinCtx, spinCancel := context.WithTimeout(ctx, 10*time.Second)
 		fence := process.IdentityFence{
-			Name:           a.Name,
-			Kind:           a.Kind,
-			SessionID:      a.Session.Value,
-			SessionKind:    a.Session.Kind,
-			SessionSource:  a.Session.Source,
-			PaneID:         a.PaneID,
-			TabID:          a.TabID,
-			TerminalID:     a.TerminalID,
-			Workspace:      a.Workspace,
-			Cwd:            cwd,
-			StateChangeSeq: a.StateChangeSeq,
+			Name:             a.Name,
+			Kind:             a.Kind,
+			SessionID:        a.Session.Value,
+			SessionKind:      a.Session.Kind,
+			SessionSource:    a.Session.Source,
+			PaneID:           a.PaneID,
+			TabID:            a.TabID,
+			TerminalID:       a.TerminalID,
+			Workspace:        a.Workspace,
+			Cwd:              worktreeCwd,
+			Revision:         a.Revision,
+			StateChangeSeq:   a.StateChangeSeq,
+			TabGeneration:    a.TabGeneration,
+			ExpectedModel:    a.ExpectedModel,
+			ExpectedProvider: a.ExpectedProvider,
 		}
 		fetchAfter := func(name string) (*kick.AgentEntry, error) {
+			select {
+			case <-spinCtx.Done():
+				return nil, spinCtx.Err()
+			default:
+			}
 			currentAgents, err := herdr.AgentList()
 			if err != nil {
 				return nil, err
@@ -126,7 +156,9 @@ func runSpin() {
 						TerminalID:     cur.TerminalID,
 						Workspace:      cur.Workspace,
 						Cwd:            cur.Cwd,
+						Revision:       cur.Revision,
 						StateChangeSeq: cur.StateChangeSeq,
+						TabGeneration:  cur.TabGeneration,
 						Session: kick.AgentSession{
 							Value:  cur.Session.Value,
 							Kind:   cur.Session.Kind,
@@ -137,8 +169,7 @@ func runSpin() {
 			}
 			return nil, errors.New("agent not found after export")
 		}
-		spinCtx, spinCancel := context.WithTimeout(ctx, 10*time.Second)
-		ev, sctx, _, _ := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, now, 5*time.Minute)
+		ev, sctx, _, _ := process.ResolveNativeAgentEvidenceWithFence(spinCtx, fence, fetchAfter, laneNow, 5*time.Minute)
 		spinCancel()
 
 		target := process.ClassifyTargetWithEvidence(a.PaneID, a.Name, a.Status, tail, ev, sctx)

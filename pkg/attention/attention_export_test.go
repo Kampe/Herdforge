@@ -249,3 +249,169 @@ func TestAttention_RunWithFleet_MultipleHangingLanes_BoundedAggregateContext(t *
 		}
 	}
 }
+
+func TestAttention_RunWithFleet_BlockingInitialCensus_ReturnsAtDeadline(t *testing.T) {
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	// Inject blocking initial census
+	blockingCensus := func() ([]kick.AgentEntry, error) {
+		time.Sleep(30 * time.Second)
+		return nil, nil
+	}
+
+	start := time.Now()
+	_, err = runWithFleet(blockingCensus, callPathReader{}, "repo", resolver, registry)
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected fleet census timed out error, got: %v", err)
+	}
+
+	// Must unblock at aggregate deadline (~15s), not wait 30s
+	if elapsed > 18*time.Second {
+		t.Errorf("runWithFleet with blocking initial census took too long: %v (expected <= 18s)", elapsed)
+	}
+}
+
+func TestAttention_RunWithFleet_BlockingAfterCensus_ReturnsAtDeadline(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":"model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	callCount := 0
+	census := func() ([]kick.AgentEntry, error) {
+		callCount++
+		if callCount == 1 {
+			return []kick.AgentEntry{
+				{
+					Name:       "forge-lane-1",
+					Label:      "lane-1",
+					Kind:       "opencode",
+					Status:     "working",
+					PaneID:     "p-1",
+					Session:    kick.AgentSession{Value: sessionID},
+					TerminalID: "term-1",
+				},
+			}, nil
+		}
+		// Subsequent after-census call hangs
+		time.Sleep(30 * time.Second)
+		return nil, nil
+	}
+
+	start := time.Now()
+	result, err := runWithFleet(census, callPathReader{}, "repo", resolver, registry)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	if elapsed > 18*time.Second {
+		t.Errorf("runWithFleet with blocking after-census took too long: %v (expected <= 18s)", elapsed)
+	}
+
+	for _, item := range result.Items {
+		if item.Level != LevelMedium {
+			t.Errorf("lane with hanging after-census must be LevelMedium, got %s", item.Level)
+		}
+		if !strings.Contains(item.Reason, "native evidence error") {
+			t.Errorf("expected reason to contain 'native evidence error', got %q", item.Reason)
+		}
+	}
+}
+
+func TestAttention_RunWithFleet_ModelRouteMismatch_RefusesEvidence(t *testing.T) {
+	sessionID := "019fc450-7ce2-7602-a62c-329f31271c7a"
+	now := time.Now().UTC()
+	exportJSON := fmt.Sprintf(`{"info":{"id":%q,"directory":"/path/to/worktree"},"messages":[
+		{"info":{"id":"u-1","sessionID":%q,"role":"user","time":{"created":%d}},"parts":[{"type":"text"}]},
+		{"info":{"id":"a-1","sessionID":%q,"role":"assistant","parentID":"u-1","providerID":"litellm","modelID":"litellm/actual-model","finish":"stop","time":{"created":%d,"completed":%d}},"parts":[{"type":"text"}]}
+	]}`, sessionID, sessionID, now.Add(-1*time.Minute).UnixMilli(), sessionID, now.Add(-30*time.Second).UnixMilli(), now.UnixMilli())
+
+	restore := process.SetDefaultExportRunner(func(_ context.Context, _ string, _ string) ([]byte, error) {
+		return []byte(exportJSON), nil
+	})
+	defer restore()
+
+	kick.SetStandingOverride([]string{"forge-lane-1"})
+	t.Cleanup(func() { kick.SetStandingOverride(nil) })
+
+	registry, err := lifecycle.NewCanonicalLaneRegistry([]lifecycle.CanonicalLane{
+		{Name: "lane-1", Role: "worker", Standing: true},
+	})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	resolver := func(_ context.Context, laneName string) ([]lifecycle.HoldIdentity, error) {
+		return []lifecycle.HoldIdentity{
+			{Repository: "repo", Owner: "worker", Lane: laneName, Task: "CHA-1", Scope: "task"},
+		}, nil
+	}
+
+	fleet := []kick.AgentEntry{
+		{
+			Name:             "forge-lane-1",
+			Label:            "lane-1",
+			Kind:             "opencode",
+			Status:           "working",
+			PaneID:           "p-1",
+			Session:          kick.AgentSession{Value: sessionID},
+			TerminalID:       "term-1",
+			ExpectedModel:    "litellm/expected-model",
+			ExpectedProvider: "litellm",
+		},
+	}
+
+	result, err := runWithFleet(func() ([]kick.AgentEntry, error) {
+		return fleet, nil
+	}, callPathReader{}, "repo", resolver, registry)
+	if err != nil {
+		t.Fatalf("runWithFleet: %v", err)
+	}
+
+	for _, item := range result.Items {
+		if item.Level != LevelMedium {
+			t.Errorf("model mismatch must classify as LevelMedium, got: %s", item.Level)
+		}
+		if !strings.Contains(item.Reason, "native evidence error") || !strings.Contains(item.Reason, "model mismatch") {
+			t.Errorf("expected reason to contain 'model mismatch', got: %q", item.Reason)
+		}
+	}
+}
