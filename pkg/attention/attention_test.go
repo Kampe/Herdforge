@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/kick"
+	"github.com/Kampe/Herdforge/pkg/process"
 )
 
 func TestNeedsEyes(t *testing.T) {
@@ -562,5 +564,161 @@ func TestDegradedLaneWithNoLiveRowIsStillAdded(t *testing.T) {
 	got := applyDegradedAuthority(base, map[string]string{"forge-recovery-sentinel": "hold authority unavailable: boom"})
 	if got.Total != 2 || len(got.Items) != 2 {
 		t.Fatalf("a degraded lane with no live row was dropped: total=%d items=%d", got.Total, len(got.Items))
+	}
+}
+
+func TestClassifyAgentWithEvidence_FinishLength(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := process.SessionContext{
+		SessionID: "sess-att-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	ev := &process.TerminalEvidence{
+		SessionID:    "sess-att-1",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "length",
+		Timestamp:    now,
+	}
+
+	// Agent nominally reports "done", but was truncated by output limit (finish=length).
+	// Must NOT be LevelHigh (done - awaiting harvest/review) or LevelNone (working).
+	a := kick.AgentEntry{Name: "ux-comber", Status: "done", PaneID: "p1"}
+	item := ClassifyAgentWithEvidence(a, false, "", false, ev, ctx, "Status: COMPLETE\nfinish=length")
+
+	if item.Level != LevelMedium {
+		t.Fatalf("finish=length truncated agent must be LevelMedium, got %s", item.Level)
+	}
+	if !strings.Contains(item.Reason, "finish=length") {
+		t.Fatalf("reason should mention finish=length, got %q", item.Reason)
+	}
+}
+
+func TestClassifyAgentWithEvidence_QuotaExhaustion(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := process.SessionContext{
+		SessionID: "sess-att-2",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	ev := &process.TerminalEvidence{
+		SessionID:    "sess-att-2",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "quota",
+		Error:        "429 Too Many Requests: out of credits",
+		Timestamp:    now,
+	}
+
+	a := kick.AgentEntry{Name: "scout-planner", Status: "working", PaneID: "p2"}
+	item := ClassifyAgentWithEvidence(a, false, "", false, ev, ctx, "")
+
+	if item.Level != LevelCritical {
+		t.Fatalf("fresh authoritative quota failure must be LevelCritical, got %s", item.Level)
+	}
+	if !strings.Contains(item.Reason, "quota") {
+		t.Fatalf("reason should mention quota, got %q", item.Reason)
+	}
+}
+
+func TestClassifyAgentWithEvidence_StaleOrMismatchedQuotaRefused(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := process.SessionContext{
+		SessionID: "sess-att-3",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	// Stale evidence (10m old)
+	staleEv := &process.TerminalEvidence{
+		SessionID:    "sess-att-3",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "quota",
+		Error:        "429 Too Many Requests",
+		Timestamp:    now.Add(-10 * time.Minute),
+	}
+
+	a := kick.AgentEntry{Name: "scout-planner", Status: "idle", PaneID: "p3"}
+	// Stale evidence with raw quota text in pane must NOT trigger LevelCritical or quota cooldown
+	item := ClassifyAgentWithEvidence(a, false, "", false, staleEv, ctx, "429 Too Many Requests: out of credits")
+
+	if item.Level == LevelCritical {
+		t.Fatalf("stale quota evidence must NOT elevate agent to LevelCritical: got %s", item.Level)
+	}
+	if item.Level != LevelMedium {
+		t.Fatalf("idle agent with refused stale quota should remain LevelMedium, got %s", item.Level)
+	}
+}
+
+func TestTriageWithEvidence(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := process.SessionContext{
+		SessionID: "sess-triage",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	agents := []kick.AgentEntry{
+		{Name: "scout-planner", Status: "working", PaneID: "p1"}, // fresh quota -> critical
+		{Name: "ux-comber", Status: "done", PaneID: "p2"},        // finish=length -> medium (not high)
+		{Name: "api-crusader", Status: "working", PaneID: "p3"},   // healthy working -> none (excluded)
+	}
+
+	evidenceMap := map[string]*process.TerminalEvidence{
+		"scout-planner": {
+			SessionID:    "sess-triage",
+			TurnID:       "turn-1",
+			Provider:     "lazer",
+			Model:        "deepseek-v4-flash",
+			FinishReason: "quota",
+			Error:        "429 Too Many Requests",
+			Timestamp:    now,
+		},
+		"ux-comber": {
+			SessionID:    "sess-triage",
+			TurnID:       "turn-1",
+			Provider:     "lazer",
+			Model:        "deepseek-v4-flash",
+			FinishReason: "length",
+			Timestamp:    now,
+		},
+	}
+
+	resolver := func(lane string) (*process.TerminalEvidence, process.SessionContext, string) {
+		return evidenceMap[lane], ctx, ""
+	}
+
+	r := TriageWithEvidence(agents, []string{"scout-planner", "ux-comber", "api-crusader"}, noHold, resolver, nil)
+
+	// api-crusader is working/healthy (LevelNone) -> excluded from Items
+	// scout-planner is LevelCritical
+	// ux-comber is LevelMedium
+	if len(r.Items) != 2 {
+		t.Fatalf("expected 2 items needing eyes, got %d", len(r.Items))
+	}
+	if r.Items[0].Name != "scout-planner" || r.Items[0].Level != LevelCritical {
+		t.Errorf("expected scout-planner as LevelCritical, got %+v", r.Items[0])
+	}
+	if r.Items[1].Name != "ux-comber" || r.Items[1].Level != LevelMedium {
+		t.Errorf("expected ux-comber as LevelMedium, got %+v", r.Items[1])
 	}
 }

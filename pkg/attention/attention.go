@@ -31,6 +31,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/process"
 )
 
 // AttentionLevel ranks how urgently a lane needs coordinator eyes.
@@ -122,6 +123,14 @@ func classifyStatus(status string) (AttentionLevel, string) {
 // parked the lane); provider death takes precedence over the raw status
 // for non-held lanes.
 func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeath bool) Item {
+	return ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, nil, process.SessionContext{}, "")
+}
+
+// ClassifyAgentWithEvidence evaluates an agent entry alongside authoritative terminal evidence and pane text.
+// When finish=length (output token limit truncation) is present, the agent is NEVER classified as done/LevelHigh
+// (awaiting harvest/review) or LevelNone (working); it is classified as LevelMedium (incomplete / read pane).
+// When authoritative quota exhaustion is confirmed, it is classified as LevelCritical.
+func ClassifyAgentWithEvidence(a kick.AgentEntry, held bool, heldReason string, providerDeath bool, ev *process.TerminalEvidence, ctx process.SessionContext, paneText string) Item {
 	name := a.Name
 	if name == "" {
 		name = a.Label
@@ -137,6 +146,8 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 		PaneID: a.PaneID,
 	}
 
+	eval := process.EvaluateEvidence(ev, ctx, paneText)
+
 	switch {
 	case strings.HasPrefix(heldReason, "authority-error:"):
 		item.Level = LevelCritical
@@ -149,9 +160,16 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 			item.HeldReason = "held by coordinator"
 		}
 		item.Reason = "held — parked by coordinator"
-	case providerDeath:
+	case eval.Class == process.Quota && eval.ProviderDeath:
+		item.Level = LevelCritical
+		item.Reason = "provider quota exhausted — needs reroute (mark unavailable)"
+	case providerDeath || eval.ProviderDeath:
 		item.Level = LevelCritical
 		item.Reason = "provider death — needs reroute (cooled reset-aware)"
+	case eval.Reason == "output token limit reached (finish=length)" || process.OutputLimitReason(paneText) != "":
+		// Output token limit truncation MUST NOT be classified as done or healthy working
+		item.Level = LevelMedium
+		item.Reason = "output limit reached (finish=length) — incomplete, read pane"
 	default:
 		lvl, reason := classifyStatus(status)
 		item.Level = lvl
@@ -159,6 +177,91 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 	}
 
 	return item
+}
+
+// TriageWithEvidence produces coordinator triage cross-referencing authoritative terminal evidence.
+func TriageWithEvidence(
+	agents []kick.AgentEntry,
+	standingIDs []string,
+	heldChecker func(string) (string, bool),
+	evidenceResolver func(string) (*process.TerminalEvidence, process.SessionContext, string),
+	providerDeathChecker func(string) bool,
+) Result {
+	index := make(map[string]kick.AgentEntry, len(agents))
+	for _, a := range agents {
+		if a.Name != "" {
+			index[a.Name] = a
+		}
+		if a.Label != "" && a.Label != a.Name {
+			index[a.Label] = a
+		}
+	}
+
+	counts := map[AttentionLevel]int{}
+	var items []Item
+
+	for _, id := range standingIDs {
+		a, found := index[id]
+		if !found {
+			a, found = findAttentionAgent(agents, id)
+		}
+		if !found {
+			item := Item{
+				Name:   id,
+				Status: "missing",
+				Level:  LevelMissing,
+				Reason: "not live — needs raising (herd standing --only " + id + ")",
+			}
+			counts[LevelMissing]++
+			items = append(items, item)
+			continue
+		}
+
+		heldReason, held := heldChecker(id)
+		var ev *process.TerminalEvidence
+		var sctx process.SessionContext
+		var paneText string
+		if evidenceResolver != nil {
+			ev, sctx, paneText = evidenceResolver(id)
+		}
+		providerDeath := false
+		if providerDeathChecker != nil {
+			providerDeath = providerDeathChecker(id)
+		}
+
+		item := ClassifyAgentWithEvidence(a, held, heldReason, providerDeath, ev, sctx, paneText)
+		if providerDeath && item.Level != LevelCritical && !item.Held {
+			item.Level = LevelCritical
+			item.Reason = "provider death — needs reroute (cooled reset-aware)"
+		}
+
+		counts[item.Level]++
+		if NeedsEyes(item.Level) {
+			items = append(items, item)
+		}
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		ri, rj := urgencyRank(items[i].Level), urgencyRank(items[j].Level)
+		if ri != rj {
+			return ri > rj
+		}
+		return items[i].Name < items[j].Name
+	})
+
+	needing := 0
+	for lvl, count := range counts {
+		if NeedsEyes(lvl) {
+			needing += count
+		}
+	}
+
+	return Result{
+		Items:   items,
+		Counts:  counts,
+		Total:   len(standingIDs),
+		Needing: needing,
+	}
 }
 
 // Triage produces the coordinator-eyes triage from a live agent list and

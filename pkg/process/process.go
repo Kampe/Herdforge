@@ -42,23 +42,94 @@ type Digest struct {
 }
 
 // TerminalEvidence represents structured current-session provider terminal evidence.
+// Authoritative event fields MUST be present and validated against the session context.
 type TerminalEvidence struct {
-	SessionID    string    `json:"session_id,omitempty"`
-	TurnID       string    `json:"turn_id,omitempty"`
-	Provider     string    `json:"provider,omitempty"`
+	SessionID    string    `json:"session_id"`
+	TurnID       string    `json:"turn_id"`
+	Provider     string    `json:"provider"`
 	Account      string    `json:"account,omitempty"`
-	Model        string    `json:"model,omitempty"`
+	Model        string    `json:"model"`
 	FinishReason string    `json:"finish_reason,omitempty"`
 	Error        string    `json:"error,omitempty"`
 	Status       string    `json:"status,omitempty"`
-	Timestamp    time.Time `json:"timestamp,omitempty"`
+	Timestamp    time.Time `json:"timestamp"`
 }
 
-// SessionContext provides the expected session identity and bounded time window.
+// SessionContext provides the expected authoritative session identity, turn, route, and time window.
 type SessionContext struct {
 	SessionID string
+	TurnID    string
+	Provider  string
+	Account   string
+	Model     string
 	Now       time.Time
 	MaxAge    time.Duration
+}
+
+var (
+	ErrMissingSessionID = errors.New("terminal evidence: session_id is required")
+	ErrMissingTurnID    = errors.New("terminal evidence: turn_id is required")
+	ErrMissingProvider  = errors.New("terminal evidence: provider is required")
+	ErrMissingModel     = errors.New("terminal evidence: model is required")
+	ErrMissingTimestamp = errors.New("terminal evidence: timestamp is required")
+	ErrSessionMismatch  = errors.New("terminal evidence: session_id mismatch")
+	ErrTurnMismatch     = errors.New("terminal evidence: turn_id mismatch")
+	ErrRouteMismatch    = errors.New("terminal evidence: route provider/model mismatch")
+	ErrStaleEvidence    = errors.New("terminal evidence: timestamp outside bounded lookback window")
+)
+
+// Validate checks that the evidence contains all required fields and matches the authoritative context.
+func (ev *TerminalEvidence) Validate(ctx SessionContext) error {
+	if ev == nil {
+		return errors.New("terminal evidence is nil")
+	}
+	if strings.TrimSpace(ev.SessionID) == "" {
+		return ErrMissingSessionID
+	}
+	if strings.TrimSpace(ev.TurnID) == "" {
+		return ErrMissingTurnID
+	}
+	if strings.TrimSpace(ev.Provider) == "" {
+		return ErrMissingProvider
+	}
+	if strings.TrimSpace(ev.Model) == "" {
+		return ErrMissingModel
+	}
+	if ev.Timestamp.IsZero() {
+		return ErrMissingTimestamp
+	}
+
+	// Exact session binding
+	if ctx.SessionID != "" && ev.SessionID != ctx.SessionID {
+		return ErrSessionMismatch
+	}
+	// Exact turn binding
+	if ctx.TurnID != "" && ev.TurnID != ctx.TurnID {
+		return ErrTurnMismatch
+	}
+	// Route binding
+	if ctx.Provider != "" && !strings.EqualFold(ev.Provider, ctx.Provider) {
+		return ErrRouteMismatch
+	}
+	if ctx.Model != "" && !strings.EqualFold(ev.Model, ctx.Model) {
+		return ErrRouteMismatch
+	}
+	if ctx.Account != "" && ev.Account != "" && !strings.EqualFold(ev.Account, ctx.Account) {
+		return ErrRouteMismatch
+	}
+
+	// Freshness / bounded lookback
+	if !ctx.Now.IsZero() {
+		maxAge := ctx.MaxAge
+		if maxAge <= 0 {
+			maxAge = 5 * time.Minute
+		}
+		if ctx.Now.Sub(ev.Timestamp) > maxAge || ev.Timestamp.After(ctx.Now.Add(1*time.Minute)) {
+			return ErrStaleEvidence
+		}
+	}
+
+	return nil
 }
 
 // EvaluationResult represents the evaluated state of an agent's terminal output.
@@ -174,18 +245,55 @@ func actionFor(c Classification, isProviderDeath bool) string {
 	}
 }
 
+// classifyTextNoQuota classifies text without recognizing Quota, used when
+// evidence is unauthenticated, foreign, stale, or mismatched so untrusted text
+// NEVER triggers provider cooldowns or mark_unavailable actions.
+func classifyTextNoQuota(text string) Classification {
+	if text == "" {
+		return Unknown
+	}
+	if isTruncated := OutputLimitReason(text) != ""; isTruncated {
+		return Unknown
+	}
+	if regexp.MustCompile(`(?i)NEEDS_REVIEW|Status:\s*NEEDS_REVIEW`).MatchString(text) {
+		return NeedsReview
+	}
+	if regexp.MustCompile(`(?i)Merge recommendation:\s*YES|Verdict:\s*PASS`).MatchString(text) {
+		return Pass
+	}
+	if regexp.MustCompile(`(?i)Verdict:\s*FAIL|Merge recommendation:\s*NO`).MatchString(text) {
+		return Fail
+	}
+	if regexp.MustCompile(`(?i)Status:\s*COMPLETE\b`).MatchString(text) {
+		return Complete
+	}
+	if regexp.MustCompile(`(?i)Status:\s*BLOCKED|BLOCKED:`).MatchString(text) {
+		return Blocked
+	}
+	if regexp.MustCompile(`(?m)^❯\s`).MatchString(text) && !regexp.MustCompile(`(?i)Worked for|Status:`).MatchString(text) {
+		return Unconsumed
+	}
+	return Unknown
+}
+
 // EvaluateEvidence evaluates structured terminal evidence alongside pane text.
 func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) EvaluationResult {
 	if ev == nil {
 		c := classifyText(rawText)
 		isPD := CheckProviderDeath(rawText)
+		action := actionFor(c, isPD)
+		if c == Quota {
+			// Untrusted raw prose without structured authoritative evidence
+			// must NOT trigger a provider cooldown or mark_unavailable action.
+			action = "read_pane"
+		}
 		return EvaluationResult{
 			Class:          c,
-			Action:         actionFor(c, isPD),
-			Blocked:        c == Blocked || c == Quota,
-			ProviderDeath:  isPD || c == Quota,
-			Fresh:          true,
-			SessionMatched: true,
+			Action:         action,
+			Blocked:        c == Blocked,
+			ProviderDeath:  isPD,
+			Fresh:          false,
+			SessionMatched: false,
 		}
 	}
 
@@ -193,42 +301,27 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		Provider: ev.Provider,
 		Account:  ev.Account,
 		Model:    ev.Model,
-		Fresh:    true,
 	}
 
-	// 1. Session identity validation
-	if ctx.SessionID != "" && ev.SessionID != "" && ev.SessionID != ctx.SessionID {
-		// Session mismatch: evidence belongs to a different or recycled session.
-		// Unrelated sessions must not cool a provider or interrupt a lane.
-		res.SessionMatched = false
-		c := classifyText(rawText)
-		isPD := CheckProviderDeath(rawText)
-		res.Class = c
-		res.Action = actionFor(c, isPD)
-		res.Reason = fmt.Sprintf("session mismatch: expected %s, got %s", ctx.SessionID, ev.SessionID)
+	// 1. Authoritative session, turn, route, and freshness validation.
+	if err := ev.Validate(ctx); err != nil {
+		// Untrusted, mismatched, stale, or malformed evidence:
+		// MUST CAUSE NO STOP / COOLDOWN.
+		res.Fresh = !errors.Is(err, ErrStaleEvidence) && !errors.Is(err, ErrMissingTimestamp)
+		res.SessionMatched = !errors.Is(err, ErrSessionMismatch) && !errors.Is(err, ErrMissingSessionID)
+		res.Class = classifyTextNoQuota(rawText)
+		res.Action = "read_pane"
+		res.Reason = fmt.Sprintf("untrusted or invalid evidence: %v", err)
+		res.Blocked = false
+		res.ProviderDeath = false
 		return res
 	}
+
+	res.Fresh = true
 	res.SessionMatched = true
 
-	// 2. Freshness and bounded lookback validation
-	if !ev.Timestamp.IsZero() && !ctx.Now.IsZero() {
-		maxAge := ctx.MaxAge
-		if maxAge <= 0 {
-			maxAge = 5 * time.Minute
-		}
-		if ctx.Now.Sub(ev.Timestamp) > maxAge || ev.Timestamp.After(ctx.Now.Add(1*time.Minute)) {
-			// Stale history: outside bounded lookback window.
-			res.Fresh = false
-			c := classifyText(rawText)
-			isPD := CheckProviderDeath(rawText)
-			res.Class = c
-			res.Action = actionFor(c, isPD)
-			res.Reason = "stale evidence: outside bounded lookback window"
-			return res
-		}
-	}
-
-	// 3. Evaluate finish_reason: length (output token limit truncation)
+	// 2. Evaluate finish_reason: length (output token limit truncation).
+	// Must NEVER produce Done, Pass, or NeedsReview.
 	if strings.EqualFold(ev.FinishReason, "length") || OutputLimitReason(ev.Error) != "" || OutputLimitReason(rawText) != "" {
 		res.Class = Unknown
 		res.Action = "read_pane"
@@ -238,13 +331,16 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		return res
 	}
 
-	// 4. Evaluate explicit provider quota/rate-limit/suspension errors
+	// 3. Evaluate explicit provider quota/rate-limit/suspension errors from validated evidence.
 	exhaustionReason := ""
 	if ev.Error != "" {
 		exhaustionReason = ProviderExhaustionReason(ev.Error)
 		if exhaustionReason == "" && (strings.Contains(strings.ToLower(ev.Error), "quota") || strings.Contains(strings.ToLower(ev.Error), "suspended") || strings.Contains(strings.ToLower(ev.Error), "429")) {
 			exhaustionReason = ev.Error
 		}
+	}
+	if exhaustionReason == "" && strings.EqualFold(ev.FinishReason, "quota") {
+		exhaustionReason = "provider quota or rate limit reported"
 	}
 	if exhaustionReason == "" {
 		exhaustionReason = ProviderExhaustionReason(rawText)
@@ -262,7 +358,7 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		return res
 	}
 
-	// 5. Check other provider death errors (auth, connection lost, etc.)
+	// 4. Check other provider death errors (auth, connection lost, etc.)
 	if CheckProviderDeath(ev.Error) || CheckProviderDeath(rawText) {
 		res.Class = Blocked
 		res.Blocked = true
@@ -272,7 +368,7 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		return res
 	}
 
-	// 6. In-flight tool execution vs completion
+	// 5. In-flight tool execution vs completion
 	if strings.EqualFold(ev.FinishReason, "tool_use") || strings.EqualFold(ev.FinishReason, "tool_calls") {
 		res.Class = Unknown
 		res.Action = "read_pane"
@@ -280,7 +376,7 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 		return res
 	}
 
-	// 7. Successful / normal response evaluation
+	// 6. Successful / normal response evaluation
 	c := classifyText(rawText)
 	if ev.Status != "" && (c == Unknown || c == Unconsumed) {
 		c = classifyText("Status: " + ev.Status)
@@ -291,33 +387,24 @@ func EvaluateEvidence(ev *TerminalEvidence, ctx SessionContext, rawText string) 
 	return res
 }
 
-// ParseTerminalEvidence attempts to extract structured TerminalEvidence from text.
-// If valid JSON is present with terminal evidence fields, it is parsed and returned.
-func ParseTerminalEvidence(text string) (*TerminalEvidence, error) {
-	trimmed := strings.TrimSpace(text)
+// ParseTerminalEvidence strictly parses structured TerminalEvidence from a raw payload.
+// Untrusted prose with embedded braces is rejected. All required authoritative fields must be present.
+func ParseTerminalEvidence(data []byte) (*TerminalEvidence, error) {
+	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
-		return nil, errors.New("empty text")
+		return nil, errors.New("empty terminal evidence payload")
 	}
-
-	// Look for JSON block or object
-	var candidate string
-	if start := strings.Index(trimmed, "{"); start >= 0 {
-		if end := strings.LastIndex(trimmed, "}"); end > start {
-			candidate = trimmed[start : end+1]
-		}
-	}
-
-	if candidate == "" {
-		return nil, errors.New("no JSON object found")
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return nil, errors.New("terminal evidence must be a structured JSON object, not loose prose")
 	}
 
 	var ev TerminalEvidence
-	if err := json.Unmarshal([]byte(candidate), &ev); err != nil {
+	if err := json.Unmarshal([]byte(trimmed), &ev); err != nil {
 		return nil, fmt.Errorf("invalid terminal evidence JSON: %w", err)
 	}
 
-	if ev.SessionID == "" && ev.FinishReason == "" && ev.Error == "" && ev.Provider == "" && ev.Model == "" {
-		return nil, errors.New("JSON does not contain terminal evidence fields")
+	if err := ev.Validate(SessionContext{}); err != nil {
+		return nil, fmt.Errorf("invalid terminal evidence fields: %w", err)
 	}
 
 	return &ev, nil

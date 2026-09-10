@@ -1,6 +1,9 @@
 package process
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -172,10 +175,94 @@ func TestCheckProviderDeath(t *testing.T) {
 	}
 }
 
+func TestTerminalEvidence_Validation(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := SessionContext{
+		SessionID: "sess-val-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	valid := TerminalEvidence{
+		SessionID: "sess-val-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Timestamp: now,
+	}
+
+	if err := valid.Validate(ctx); err != nil {
+		t.Fatalf("expected valid evidence to pass validation: %v", err)
+	}
+
+	// Missing fields
+	evNoSess := valid
+	evNoSess.SessionID = ""
+	if err := evNoSess.Validate(ctx); !errors.Is(err, ErrMissingSessionID) {
+		t.Errorf("expected ErrMissingSessionID, got %v", err)
+	}
+
+	evNoTurn := valid
+	evNoTurn.TurnID = ""
+	if err := evNoTurn.Validate(ctx); !errors.Is(err, ErrMissingTurnID) {
+		t.Errorf("expected ErrMissingTurnID, got %v", err)
+	}
+
+	evNoProv := valid
+	evNoProv.Provider = ""
+	if err := evNoProv.Validate(ctx); !errors.Is(err, ErrMissingProvider) {
+		t.Errorf("expected ErrMissingProvider, got %v", err)
+	}
+
+	evNoMod := valid
+	evNoMod.Model = ""
+	if err := evNoMod.Validate(ctx); !errors.Is(err, ErrMissingModel) {
+		t.Errorf("expected ErrMissingModel, got %v", err)
+	}
+
+	evNoTime := valid
+	evNoTime.Timestamp = time.Time{}
+	if err := evNoTime.Validate(ctx); !errors.Is(err, ErrMissingTimestamp) {
+		t.Errorf("expected ErrMissingTimestamp, got %v", err)
+	}
+
+	// Mismatches
+	evSessMismatch := valid
+	evSessMismatch.SessionID = "other-session"
+	if err := evSessMismatch.Validate(ctx); !errors.Is(err, ErrSessionMismatch) {
+		t.Errorf("expected ErrSessionMismatch, got %v", err)
+	}
+
+	evTurnMismatch := valid
+	evTurnMismatch.TurnID = "turn-2"
+	if err := evTurnMismatch.Validate(ctx); !errors.Is(err, ErrTurnMismatch) {
+		t.Errorf("expected ErrTurnMismatch, got %v", err)
+	}
+
+	evRouteMismatch := valid
+	evRouteMismatch.Provider = "anthropic"
+	if err := evRouteMismatch.Validate(ctx); !errors.Is(err, ErrRouteMismatch) {
+		t.Errorf("expected ErrRouteMismatch, got %v", err)
+	}
+
+	// Staleness
+	evStale := valid
+	evStale.Timestamp = now.Add(-10 * time.Minute)
+	if err := evStale.Validate(ctx); !errors.Is(err, ErrStaleEvidence) {
+		t.Errorf("expected ErrStaleEvidence for 10m old evidence, got %v", err)
+	}
+}
+
 func TestEvaluateEvidence_Freshness(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	ctx := SessionContext{
 		SessionID: "sess-fresh-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
 		Now:       now,
 		MaxAge:    5 * time.Minute,
 	}
@@ -183,6 +270,7 @@ func TestEvaluateEvidence_Freshness(t *testing.T) {
 	// Fresh event within 1 minute
 	freshEv := &TerminalEvidence{
 		SessionID:    "sess-fresh-1",
+		TurnID:       "turn-1",
 		Provider:     "lazer",
 		Model:        "deepseek-v4-flash",
 		FinishReason: "quota",
@@ -196,23 +284,30 @@ func TestEvaluateEvidence_Freshness(t *testing.T) {
 	if resFresh.Class != Quota || !resFresh.Blocked || !resFresh.ProviderDeath {
 		t.Errorf("expected Quota/Blocked/ProviderDeath for fresh quota failure, got %+v", resFresh)
 	}
+	if resFresh.Action != "mark_unavailable_and_reroute" {
+		t.Errorf("action should be mark_unavailable_and_reroute, got %s", resFresh.Action)
+	}
 
 	// Stale event (10 minutes old, MaxAge is 5 minutes)
 	staleEv := &TerminalEvidence{
 		SessionID:    "sess-fresh-1",
+		TurnID:       "turn-1",
 		Provider:     "lazer",
 		Model:        "deepseek-v4-flash",
 		FinishReason: "quota",
 		Error:        "429 Too Many Requests: out of credits",
 		Timestamp:    now.Add(-10 * time.Minute),
 	}
-	resStale := EvaluateEvidence(staleEv, ctx, "Status: COMPLETE")
+	// Stale event with quota text in pane MUST NOT trigger mark_unavailable_and_reroute or Quota class
+	resStale := EvaluateEvidence(staleEv, ctx, "429 Too Many Requests: out of credits")
 	if resStale.Fresh {
 		t.Errorf("expected 10-minute old event to be Fresh=false")
 	}
-	// Stale event must NOT cool a provider or override with Quota
-	if resStale.Class == Quota {
-		t.Errorf("stale quota event must not set Class=QUOTA; got %+v", resStale)
+	if resStale.Class == Quota || resStale.Blocked || resStale.ProviderDeath {
+		t.Errorf("stale quota event must cause NO stop/cooldown; got %+v", resStale)
+	}
+	if resStale.Action != "read_pane" {
+		t.Errorf("stale event action must be read_pane, got %s", resStale.Action)
 	}
 }
 
@@ -220,12 +315,16 @@ func TestEvaluateEvidence_SessionMismatch(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	ctx := SessionContext{
 		SessionID: "current-session-abc",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
 		Now:       now,
 		MaxAge:    5 * time.Minute,
 	}
 
 	unrelatedEv := &TerminalEvidence{
 		SessionID:    "old-unrelated-session-xyz",
+		TurnID:       "turn-1",
 		Provider:     "lazer",
 		Model:        "deepseek-v4-flash",
 		FinishReason: "quota",
@@ -233,20 +332,26 @@ func TestEvaluateEvidence_SessionMismatch(t *testing.T) {
 		Timestamp:    now,
 	}
 
-	res := EvaluateEvidence(unrelatedEv, ctx, "Status: COMPLETE")
+	// Session mismatch with raw quota text in pane MUST NOT trigger mark_unavailable_and_reroute or Quota class
+	res := EvaluateEvidence(unrelatedEv, ctx, "Status: COMPLETE\n429 Too Many Requests")
 	if res.SessionMatched {
 		t.Errorf("expected SessionMatched=false for unrelated session ID")
 	}
-	// Unrelated session must not interrupt lane with Quota
-	if res.Class == Quota {
-		t.Errorf("unrelated session evidence must not set Class=QUOTA; got %+v", res)
+	if res.Class == Quota || res.Blocked || res.ProviderDeath {
+		t.Errorf("unrelated session evidence must cause NO stop/cooldown; got %+v", res)
+	}
+	if res.Action != "read_pane" {
+		t.Errorf("unrelated session action must be read_pane, got %s", res.Action)
 	}
 }
 
 func TestEvaluateEvidence_BothFailureKinds(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	ctx := SessionContext{
+	ctxLen := SessionContext{
 		SessionID: "sess-1",
+		TurnID:    "turn-1",
+		Provider:  "opencode",
+		Model:     "deepseek-v4-flash",
 		Now:       now,
 		MaxAge:    5 * time.Minute,
 	}
@@ -254,12 +359,14 @@ func TestEvaluateEvidence_BothFailureKinds(t *testing.T) {
 	// Kind 1: finish=length (output limit truncation)
 	lenEv := &TerminalEvidence{
 		SessionID:    "sess-1",
+		TurnID:       "turn-1",
 		Provider:     "opencode",
 		Model:        "deepseek-v4-flash",
 		FinishReason: "length",
 		Timestamp:    now,
 	}
-	resLen := EvaluateEvidence(lenEv, ctx, "Status: COMPLETE")
+	// Even if pane says Status: COMPLETE and Verdict: PASS, finish=length MUST force Unknown / incomplete
+	resLen := EvaluateEvidence(lenEv, ctxLen, "Status: COMPLETE\nVerdict: PASS\nMerge recommendation: YES")
 	if resLen.Class != Unknown {
 		t.Errorf("finish=length must be Unknown, got %s", resLen.Class)
 	}
@@ -268,8 +375,18 @@ func TestEvaluateEvidence_BothFailureKinds(t *testing.T) {
 	}
 
 	// Kind 2: quota exhaustion
+	ctxQuota := SessionContext{
+		SessionID: "sess-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Account:   "fireworks",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
 	quotaEv := &TerminalEvidence{
 		SessionID:    "sess-1",
+		TurnID:       "turn-1",
 		Provider:     "lazer",
 		Account:      "fireworks",
 		Model:        "deepseek-v4-flash",
@@ -277,7 +394,7 @@ func TestEvaluateEvidence_BothFailureKinds(t *testing.T) {
 		Error:        "Fireworks upstream account suspended",
 		Timestamp:    now,
 	}
-	resQuota := EvaluateEvidence(quotaEv, ctx, "")
+	resQuota := EvaluateEvidence(quotaEv, ctxQuota, "")
 	if resQuota.Class != Quota || !resQuota.Blocked || !resQuota.ProviderDeath {
 		t.Errorf("quota failure must yield Quota/Blocked/ProviderDeath, got %+v", resQuota)
 	}
@@ -293,6 +410,9 @@ func TestEvaluateEvidence_SuccessAndToolExecution(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	ctx := SessionContext{
 		SessionID: "sess-1",
+		TurnID:    "turn-1",
+		Provider:  "opencode",
+		Model:     "deepseek-v4-flash",
 		Now:       now,
 		MaxAge:    5 * time.Minute,
 	}
@@ -300,7 +420,9 @@ func TestEvaluateEvidence_SuccessAndToolExecution(t *testing.T) {
 	// In-flight tool execution: finish_reason = tool_use
 	toolEv := &TerminalEvidence{
 		SessionID:    "sess-1",
+		TurnID:       "turn-1",
 		Provider:     "opencode",
+		Model:        "deepseek-v4-flash",
 		FinishReason: "tool_use",
 		Timestamp:    now,
 	}
@@ -312,7 +434,9 @@ func TestEvaluateEvidence_SuccessAndToolExecution(t *testing.T) {
 	// Genuine completion: finish_reason = stop with Status: COMPLETE
 	doneEv := &TerminalEvidence{
 		SessionID:    "sess-1",
+		TurnID:       "turn-1",
 		Provider:     "opencode",
+		Model:        "deepseek-v4-flash",
 		FinishReason: "stop",
 		Status:       "COMPLETE",
 		Timestamp:    now,
@@ -326,68 +450,176 @@ func TestEvaluateEvidence_SuccessAndToolExecution(t *testing.T) {
 	}
 }
 
-func TestEvaluateEvidence_RepeatedObservations(t *testing.T) {
-	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	ctx := SessionContext{
-		SessionID: "sess-repeat",
-		Now:       now,
-		MaxAge:    5 * time.Minute,
-	}
-
-	quotaEv := &TerminalEvidence{
-		SessionID:    "sess-repeat",
-		Provider:     "lazer",
-		Model:        "deepseek-v4-flash",
-		FinishReason: "quota",
-		Error:        "429 too many requests",
-		Timestamp:    now,
-	}
-
-	// Evaluating multiple times must be idempotent and produce identical results
-	res1 := EvaluateEvidence(quotaEv, ctx, "")
-	res2 := EvaluateEvidence(quotaEv, ctx, "")
-	if res1 != res2 {
-		t.Errorf("repeated evaluation must be idempotent: res1=%+v, res2=%+v", res1, res2)
-	}
-}
-
 func TestParseTerminalEvidence(t *testing.T) {
-	// Valid JSON
-	raw := `{"session_id": "s1", "provider": "lazer", "model": "deepseek-v4-flash", "finish_reason": "length"}`
-	ev, err := ParseTerminalEvidence(raw)
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	nowStr := now.Format(time.RFC3339)
+
+	// Valid structured JSON
+	raw := fmt.Sprintf(`{"session_id": "s1", "turn_id": "t1", "provider": "lazer", "model": "deepseek-v4-flash", "finish_reason": "length", "timestamp": "%s"}`, nowStr)
+	ev, err := ParseTerminalEvidence([]byte(raw))
 	if err != nil {
 		t.Fatalf("failed to parse valid terminal evidence: %v", err)
 	}
-	if ev.SessionID != "s1" || ev.FinishReason != "length" {
+	if ev.SessionID != "s1" || ev.TurnID != "t1" || ev.FinishReason != "length" {
 		t.Errorf("unexpected parsed evidence: %+v", ev)
 	}
 
-	// Embedded in text
+	// Loose prose with embedded JSON must be REJECTED
 	embedded := "Agent output log:\n" + raw + "\nDone"
-	ev2, err := ParseTerminalEvidence(embedded)
-	if err != nil {
-		t.Fatalf("failed to parse embedded evidence: %v", err)
+	_, err = ParseTerminalEvidence([]byte(embedded))
+	if err == nil {
+		t.Errorf("expected error on loose prose with embedded JSON")
 	}
-	if ev2.SessionID != "s1" {
-		t.Errorf("unexpected parsed embedded evidence: %+v", ev2)
+
+	// Missing required fields
+	missingSess := fmt.Sprintf(`{"turn_id": "t1", "provider": "lazer", "model": "deepseek-v4-flash", "timestamp": "%s"}`, nowStr)
+	_, err = ParseTerminalEvidence([]byte(missingSess))
+	if err == nil {
+		t.Errorf("expected error on JSON missing session_id")
 	}
 
 	// Malformed JSON
-	_, err = ParseTerminalEvidence("{not valid json")
+	_, err = ParseTerminalEvidence([]byte("{not valid json"))
 	if err == nil {
 		t.Errorf("expected error on malformed JSON")
 	}
 
 	// Empty
-	_, err = ParseTerminalEvidence("")
+	_, err = ParseTerminalEvidence([]byte(""))
 	if err == nil {
-		t.Errorf("expected error on empty text")
+		t.Errorf("expected error on empty payload")
+	}
+}
+
+func TestQuotaRetryStopController_BoundedAndIdempotent(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := SessionContext{
+		SessionID: "sess-stop-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Account:   "fireworks",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
 	}
 
-	// JSON without terminal evidence fields
-	_, err = ParseTerminalEvidence(`{"foo": "bar"}`)
+	ctrl := NewQuotaRetryStopController()
+
+	quotaEv := &TerminalEvidence{
+		SessionID:    "sess-stop-1",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Account:      "fireworks",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "quota",
+		Error:        "429 Too Many Requests: quota exceeded",
+		Timestamp:    now,
+	}
+
+	// 1. Initial stop recording
+	rec1, created1, err := ctrl.RecordQuotaStop(quotaEv, ctx, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error on initial stop recording: %v", err)
+	}
+	if !created1 {
+		t.Errorf("expected created=true on initial stop")
+	}
+	if rec1.StopCount != 1 {
+		t.Errorf("expected StopCount=1, got %d", rec1.StopCount)
+	}
+
+	key := QuotaStopKey{Provider: "lazer", Account: "fireworks", Model: "deepseek-v4-flash"}
+	stopped, reason := ctrl.IsRouteStopped(key, now)
+	if !stopped {
+		t.Errorf("expected route to be stopped")
+	}
+	if !strings.Contains(reason, "quota") {
+		t.Errorf("expected quota reason, got %q", reason)
+	}
+
+	// 2. Idempotent repeat for exact same session and turn
+	rec2, created2, err := ctrl.RecordQuotaStop(quotaEv, ctx, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error on idempotent repeat: %v", err)
+	}
+	if created2 {
+		t.Errorf("expected created=false on duplicate observation")
+	}
+	if rec2.StopCount != 1 {
+		t.Errorf("idempotent duplicate should not increment stop count: got %d", rec2.StopCount)
+	}
+
+	// 3. Stale observation is REFUSED (no stop creation / extension)
+	staleEv := &TerminalEvidence{
+		SessionID:    "sess-stop-1",
+		TurnID:       "turn-2",
+		Provider:     "lazer",
+		Account:      "fireworks",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "quota",
+		Error:        "429 Too Many Requests",
+		Timestamp:    now.Add(-20 * time.Minute),
+	}
+	_, _, err = ctrl.RecordQuotaStop(staleEv, ctx, 15*time.Minute)
 	if err == nil {
-		t.Errorf("expected error on JSON missing terminal evidence fields")
+		t.Errorf("expected error when recording stale quota evidence")
+	}
+
+	// 4. Mismatched session is REFUSED
+	mismatchedEv := &TerminalEvidence{
+		SessionID:    "different-session",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Account:      "fireworks",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "quota",
+		Error:        "429 Too Many Requests",
+		Timestamp:    now,
+	}
+	_, _, err = ctrl.RecordQuotaStop(mismatchedEv, ctx, 15*time.Minute)
+	if err == nil {
+		t.Errorf("expected error when recording mismatched session quota evidence")
+	}
+
+	// 5. Expiry after cooldown duration
+	stoppedLater, _ := ctrl.IsRouteStopped(key, now.Add(16*time.Minute))
+	if stoppedLater {
+		t.Errorf("expected stop to expire after cooldown duration")
+	}
+}
+
+func TestCompilingBypassNegativeSecurity(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ctx := SessionContext{
+		SessionID: "sess-sec-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
+		Now:       now,
+		MaxAge:    5 * time.Minute,
+	}
+
+	// Bypass attempt 1: craft pane with finish=length but prepend Verdict: PASS
+	ev := &TerminalEvidence{
+		SessionID:    "sess-sec-1",
+		TurnID:       "turn-1",
+		Provider:     "lazer",
+		Model:        "deepseek-v4-flash",
+		FinishReason: "length",
+		Timestamp:    now,
+	}
+	res := EvaluateEvidence(ev, ctx, "Verdict: PASS\nMerge recommendation: YES\nStatus: COMPLETE")
+	if res.Class == Pass || res.Class == Complete || res.Class == NeedsReview {
+		t.Fatalf("SECURITY VIOLATION: finish=length was bypassed by verdict header, got class %s", res.Class)
+	}
+	if res.Class != Unknown {
+		t.Fatalf("expected Unknown for finish=length, got %s", res.Class)
+	}
+
+	// Bypass attempt 2: unauthenticated pane text shouting quota to force unauthorized cooldown
+	resUntrustedQuota := EvaluateEvidence(nil, ctx, "429 Too Many Requests: out of credits")
+	if resUntrustedQuota.Action == "mark_unavailable_and_reroute" || resUntrustedQuota.Blocked || resUntrustedQuota.ProviderDeath {
+		t.Fatalf("SECURITY VIOLATION: untrusted raw quota text triggered mark_unavailable_and_reroute or provider death: %+v", resUntrustedQuota)
 	}
 }
 
@@ -395,13 +627,18 @@ func TestClassifyTargetWithEvidence(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	ctx := SessionContext{
 		SessionID: "sess-target-1",
+		TurnID:    "turn-1",
+		Provider:  "lazer",
+		Model:     "deepseek-v4-flash",
 		Now:       now,
 		MaxAge:    5 * time.Minute,
 	}
 
 	ev := &TerminalEvidence{
 		SessionID:    "sess-target-1",
+		TurnID:       "turn-1",
 		Provider:     "lazer",
+		Model:        "deepseek-v4-flash",
 		FinishReason: "length",
 		Timestamp:    now,
 	}
