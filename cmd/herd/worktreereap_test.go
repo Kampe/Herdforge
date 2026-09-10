@@ -339,6 +339,73 @@ func TestSelectReapTargetsBoundsToExactRegisteredPaths(t *testing.T) {
 	}
 }
 
+func TestWorktreeReapTargetValidatesBeforeInspectingStatus(t *testing.T) {
+	root := t.TempDir()
+	selectedPath := filepath.Join(root, "one")
+	otherPath := filepath.Join(root, "two")
+	if err := os.Mkdir(selectedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(otherPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registrations := []worktreeEntry{
+		{Path: selectedPath, IsMain: true},
+		{Path: otherPath, IsMain: true},
+	}
+	var listed, inspected int
+	var inspectedPaths []string
+	originalLister, originalInspector := reapRegistrationLister, reapEntryInspector
+	t.Cleanup(func() {
+		reapRegistrationLister, reapEntryInspector = originalLister, originalInspector
+	})
+	reapRegistrationLister = func(gotRoot string) ([]worktreeEntry, error) {
+		if gotRoot != root {
+			t.Fatalf("registration root=%q, want %q", gotRoot, root)
+		}
+		listed++
+		return registrations, nil
+	}
+	reapEntryInspector = func(entries []worktreeEntry) ([]worktreeEntry, error) {
+		inspected++
+		for _, entry := range entries {
+			inspectedPaths = append(inspectedPaths, entry.Path)
+		}
+		return entries, nil
+	}
+	t.Setenv("HERD_ROOT", root)
+	if err := runWorktreeReap([]string{"--target", "one", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if listed != 1 || inspected != 1 || len(inspectedPaths) != 1 || inspectedPaths[0] != selectedPath {
+		t.Fatalf("target inspection counts/list=%d/%d/%v, want one selected path", listed, inspected, inspectedPaths)
+	}
+	if err := runWorktreeReap([]string{"--target", "missing", "--json"}); err == nil {
+		t.Fatal("unregistered target must fail before status inspection")
+	}
+	if inspected != 1 {
+		t.Fatalf("invalid target triggered status inspection: %d calls", inspected)
+	}
+}
+
+func TestInspectWorktreeEntriesStatusesOnlyProvidedTargets(t *testing.T) {
+	entries := []worktreeEntry{
+		{Path: "/private/selected-one", Branch: "one"},
+		{Path: "/private/selected-two", Branch: "two"},
+	}
+	original := reapStatusRunner
+	t.Cleanup(func() { reapStatusRunner = original })
+	var calls []string
+	reapStatusRunner = func(path string, args ...string) (string, error) {
+		calls = append(calls, path)
+		return "", nil
+	}
+	inspectWorktreeEntries(entries)
+	if strings.Join(calls, ",") != "/private/selected-one,/private/selected-two" {
+		t.Fatalf("status calls=%v, want exactly selected entries", calls)
+	}
+}
+
 func TestRetireLandedRefusesDirtyWorktreeAfterClassification(t *testing.T) {
 	root := t.TempDir()
 	runGitT(t, root, "init", "-q", "-b", "main", ".")
