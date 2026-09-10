@@ -66,8 +66,12 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		if session != "" {
 			sessionJSON = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, session)
 		}
-		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":"idle","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":1,"state_change_seq":%d%s}]}}`,
-			nativeOpenCodeTarget, terminalID, cwd, fgCwd, f.listCalls, sessionJSON), nil
+		agentStatus := "idle"
+		if f.mode == "cold-busy" && f.listCalls > 1 {
+			agentStatus = "working"
+		}
+		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":%q,"tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":1,"state_change_seq":%d%s}]}}`,
+			nativeOpenCodeTarget, agentStatus, terminalID, cwd, fgCwd, f.listCalls, sessionJSON), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
 		f.promptCalls++
@@ -84,8 +88,12 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		} else if !strings.HasPrefix(f.mode, "cold") {
 			ackSession = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, nativeOpenCodeSession)
 		}
-		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s,"state":"working"}}}`,
-			nativeOpenCodeTarget, ackSession), nil
+		promptState := "working"
+		if f.mode == "cold-staged-composer" || f.mode == "cold-busy" {
+			promptState = "staged"
+		}
+		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s,"state":%q}}}`,
+			nativeOpenCodeTarget, ackSession, promptState), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
 		f.keys++
@@ -93,6 +101,12 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 	}
 	if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
 		f.read++
+		if f.mode == "cold-staged-composer" {
+			return `{"result":{"type":"pane","content":"pasted text: PACKET"}}`, nil
+		}
+		if f.mode == "cold-permission-prompt" {
+			return `{"result":{"type":"pane","content":"Do you trust this folder?\n ❯ 1. Yes, I trust this folder\n 2. No, exit"}}`, nil
+		}
 		return `{"result":{"type":"pane","content":"decorative pane text"}}`, nil
 	}
 	return `{"result":{"type":"ok"}}`, nil
@@ -114,6 +128,12 @@ func (f *openCodeSendFixture) export(_ context.Context, sessionID, cwd string) (
 		return nil, fmt.Errorf("unexpected export cwd %q (want %q)", cwd, expectedCwd)
 	}
 	f.exportCalls++
+	if f.mode == "cold-staged-composer" {
+		if f.keys > 0 {
+			return nativeOpenCodeExport(true, "ses_cold", ""), nil
+		}
+		return nativeOpenCodeExport(false, "ses_cold", ""), nil
+	}
 	if strings.HasPrefix(f.mode, "cold-") {
 		return nativeOpenCodeCurrentExport(f.mode), nil
 	}
@@ -247,7 +267,7 @@ func nativeOpenCodeCurrentExport(mode string) []byte {
 		}
 		return body
 	}
-	if mode == "cold-queued-composer" {
+	if mode == "cold-queued-composer" || mode == "cold-permission-prompt" || mode == "cold-busy" {
 		return nativeOpenCodeExport(false, "ses_cold", "")
 	}
 	switch mode {
@@ -285,7 +305,7 @@ func TestPublicSendOpenCodeProvesNativeConsumption(t *testing.T) {
 	if f.exportCalls < 2 {
 		t.Fatalf("export calls = %d, want before and after evidence", f.exportCalls)
 	}
-	if f.keys != 1 || f.read != 0 {
+	if f.keys != 0 || f.read != 0 {
 		t.Fatalf("native proof used unsafe/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
 	}
 }
@@ -302,7 +322,7 @@ func TestPublicSendOpenCodeProvesColdSessionConsumption(t *testing.T) {
 	if status != "idle" {
 		t.Fatalf("status = %q, want idle", status)
 	}
-	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 1 || f.read != 0 {
+	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 0 || f.read != 0 {
 		t.Fatalf("cold delivery calls = prompts:%d exports:%d keys:%d reads:%d", f.promptCalls, f.exportCalls, f.keys, f.read)
 	}
 }
@@ -422,7 +442,7 @@ func TestPublicSendOpenCodeFailsClosedForNativeEvidenceGaps(t *testing.T) {
 			if f.promptCalls != 1 {
 				t.Fatalf("prompt calls = %d, want exactly one", f.promptCalls)
 			}
-			if f.keys != 1 || f.read != 0 {
+			if f.keys != 0 || f.read != 0 {
 				t.Fatalf("failure used duplicate/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
 			}
 		})
@@ -461,12 +481,8 @@ func TestPublicSendOpenCodeColdSessionFailsClosed(t *testing.T) {
 			if f.promptCalls != 1 {
 				t.Fatalf("prompt calls = %d, want exactly one", f.promptCalls)
 			}
-			expectedKeys := 1
-			if tc.mode == "cold-missing-ack" {
-				expectedKeys = 0
-			}
-			if f.keys != expectedKeys || f.read != 0 {
-				t.Fatalf("cold failure used duplicate/decorative pane operations: keys=%d (want %d) reads=%d", f.keys, expectedKeys, f.read)
+			if f.keys != 0 || f.read != 0 {
+				t.Fatalf("cold failure used duplicate/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
 			}
 		})
 	}
@@ -502,31 +518,50 @@ func TestPublicSendOpenCodeProviderErrorAndTimeoutAreBounded(t *testing.T) {
 	})
 }
 
-func TestPublicSendOpenCodeSubmitsEnterImmediatelyAfterPromptAck(t *testing.T) {
+func TestPublicSendOpenCodeColdSessionStagedComposerNudgesEnter(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
-	f, restore := newOpenCodeSendFixture(t, "cold-session")
+	f, restore := newOpenCodeSendFixture(t, "cold-staged-composer")
 	defer restore()
-
-	var order []string
-	restoreRun := SetRunHerdrForTest(func(args ...string) (string, error) {
-		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
-			order = append(order, "prompt")
-		}
-		if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
-			order = append(order, fmt.Sprintf("send-keys:%s", args[len(args)-1]))
-		}
-		return f.run(args...)
-	})
-	defer restoreRun()
 
 	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
 	if err != nil {
-		t.Fatalf("send failed: %v", err)
+		t.Fatalf("staged composer delivery failed: %v", err)
 	}
 	if status != "idle" {
 		t.Fatalf("status = %q, want idle", status)
 	}
-	if len(order) < 2 || order[0] != "prompt" || order[1] != "send-keys:Enter" {
-		t.Fatalf("transport order = %v, want [prompt, send-keys:Enter]", order)
+	if f.promptCalls != 1 || f.keys != 1 {
+		t.Fatalf("staged delivery calls: prompts=%d keys=%d (want 1 nudge)", f.promptCalls, f.keys)
+	}
+}
+
+func TestPublicSendOpenCodeAlreadyConsumedNeverSendsEnter(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	f, restore := newOpenCodeSendFixture(t, "cold-session")
+	defer restore()
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
+	if err != nil {
+		t.Fatalf("already consumed send failed: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
+	}
+	if f.keys != 0 {
+		t.Fatalf("already consumed send sent extra Enter keys: %d", f.keys)
+	}
+}
+
+func TestPublicSendOpenCodeBusyOrBlockedNeverSendsEnter(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	f, restore := newOpenCodeSendFixture(t, "cold-busy")
+	defer restore()
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, 250*time.Millisecond, "wK")
+	if err == nil || status != "queued" {
+		t.Fatalf("busy agent delivery must fail closed: status=%q err=%v", status, err)
+	}
+	if f.keys != 0 {
+		t.Fatalf("busy agent must never receive Enter: keys=%d", f.keys)
 	}
 }
