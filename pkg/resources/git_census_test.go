@@ -152,7 +152,10 @@ func TestLSOFProcessInspectorPreservesPositiveExitOneOwnerEvidence(t *testing.T)
 	if err := os.WriteFile(lsof, []byte("#!/bin/sh\nprintf 'p99999\\nfcwd\\nn%s\\n' \"$4\"\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
+	// Deterministic process table: the real host pid table's walk duration
+	// is a host-load property, unrelated to the lsof-exit-1 contract here.
+	writeSelfPS(t)
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: 15 * time.Second}
 	usage, err := inspector.InUse(context.Background(), root)
 	if err != nil {
 		t.Fatalf("positive lsof exit 1 should remain usable owner evidence: %v", err)
@@ -168,7 +171,8 @@ func TestLSOFProcessInspectorPositiveExitOneWithoutNameMarksMetadataUnavailable(
 	if err := os.WriteFile(lsof, []byte("#!/bin/sh\nprintf 'p99999\\nf3\\n'\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
+	writeSelfPS(t)
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: 15 * time.Second}
 	usage, err := inspector.InUse(context.Background(), root)
 	if err != nil {
 		t.Fatalf("positive lsof exit 1 should not fail hard when parsed: %v", err)
@@ -255,6 +259,16 @@ func writeSilentLsofAndSelfPS(t *testing.T) (lsofPath string) {
 	if err := os.WriteFile(lsofPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeSelfPS(t)
+	return lsofPath
+}
+
+// writeSelfPS installs a fake ps reporting this test process plus one
+// phantom pid. The phantom answers the owner query as gone (empty uid
+// output), so the walk is deterministic and never depends on the host
+// process table -- whose walk duration is a host-load property.
+func writeSelfPS(t *testing.T) {
+	t.Helper()
 	psDir := t.TempDir()
 	// Kept out of the probed path: the ps binary dir lands in the test
 	// process's own PATH environment, which the Linux /proc/self/environ
@@ -271,7 +285,28 @@ func writeSilentLsofAndSelfPS(t *testing.T) (lsofPath string) {
 	t.Setenv("PATH", psDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_PS_SELF_PID", strconv.Itoa(os.Getpid()))
 	t.Setenv("FAKE_PS_SELF_UID", strconv.Itoa(os.Getuid()))
-	return lsofPath
+}
+
+// writeSelfAndChildPS installs a fake ps whose census walk consults exactly
+// two same-uid pids: this test process and one live fixture child. The
+// child's real argv carries the probed path (the fixture launches it with
+// `cd <path>`), so walk-derived reference evidence stays exercised.
+func writeSelfAndChildPS(t *testing.T, childPID int) {
+	t.Helper()
+	psDir := t.TempDir()
+	psScript := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  *\"pid=,uid=\"*) printf '%s %s\\n%s %s\\n' \"$FAKE_PS_SELF_PID\" \"$FAKE_PS_SELF_UID\" \"$FAKE_PS_CHILD_PID\" \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"  *-axo*) printf '%s\\n%s\\n' \"$FAKE_PS_SELF_PID\" \"$FAKE_PS_CHILD_PID\" ;;\n" +
+		"  *\"-o uid=\"*) printf '%s\\n' \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"  *) printf '%s\\n' \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(psDir, "ps"), []byte(psScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", psDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_PS_SELF_PID", strconv.Itoa(os.Getpid()))
+	t.Setenv("FAKE_PS_SELF_UID", strconv.Itoa(os.Getuid()))
+	t.Setenv("FAKE_PS_CHILD_PID", strconv.Itoa(childPID))
 }
 
 // Cancellation landing exactly between PID iterations previously left the
