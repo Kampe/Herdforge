@@ -118,19 +118,19 @@ func (a *drainAdapters) hooks() drainActionHooks {
 // retireReviews is the bounded acting drain edge for admitted one-off review
 // lanes. It consumes only exact launch manifests; no tab label, board status,
 // callback, or broad filesystem scan can create a cleanup target.
-func (a *drainAdapters) retireReviews(ctx context.Context) error {
+func (a *drainAdapters) retireReviews(ctx context.Context) (herdr.ReviewRetirementReport, error) {
 	if a == nil || strings.TrimSpace(a.root) == "" {
-		return fmt.Errorf("review retirement authority is unavailable")
+		return herdr.ReviewRetirementReport{}, fmt.Errorf("review retirement authority is unavailable")
 	}
 	registry := herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(a.root)}
 	all, err := registry.Latest()
 	if err != nil {
-		return err
+		return herdr.ReviewRetirementReport{}, err
 	}
 	latest := make(map[string]herdr.ReviewRetirementManifest, len(all))
 	for _, m := range all {
 		if err := herdr.ValidateReviewRetirementManifest(m); err != nil {
-			return fmt.Errorf("review manifest generation %s: %w", m.Generation, err)
+			return herdr.ReviewRetirementReport{}, fmt.Errorf("review manifest generation %s: %w", m.Generation, err)
 		}
 		latest[m.Generation] = m
 	}
@@ -139,14 +139,19 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 		manifests = append(manifests, m)
 	}
 	if len(manifests) == 0 {
-		return nil
+		return herdr.ReviewRetirementReport{}, nil
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
 	op := &herdr.NativeReviewRetirementOp{Root: a.root, RepositoryIdentity: a.repository, Ledger: a.ledger}
 
+	combinedReport := herdr.ReviewRetirementReport{Candidates: make([]herdr.ReviewRetirementCandidate, 0, len(manifests))}
 	var opErrs []string
 	for _, m := range manifests {
 		subResult, subErr := herdr.RetireReviewLanesContext(ctx, op, []herdr.ReviewRetirementManifest{m}, false)
+		combinedReport.Candidates = append(combinedReport.Candidates, subResult.Candidates...)
+		combinedReport.Retired += subResult.Retired
+		combinedReport.Blocked += subResult.Blocked
+		combinedReport.Failed += subResult.Failed
 		if subErr != nil {
 			opErrs = append(opErrs, fmt.Sprintf("retire review %s: %v", m.Generation, subErr))
 			continue
@@ -157,9 +162,9 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 		}
 	}
 	if len(opErrs) > 0 {
-		return errors.New(strings.Join(opErrs, "; "))
+		return combinedReport, errors.New(strings.Join(opErrs, "; "))
 	}
-	return nil
+	return combinedReport, nil
 }
 
 // retireSourceLanes is the bounded acting drain edge for settled one-off source/mender

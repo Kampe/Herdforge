@@ -22,7 +22,7 @@ func TestDrainReviewRetirementDefaultRefusal(t *testing.T) {
 	if hooks.retireReviews == nil {
 		t.Fatal("retireReviews is not set in defaultDrainActionHooks")
 	}
-	err := hooks.retireReviews(context.Background())
+	_, err := hooks.retireReviews(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "no compiled review retirement authority is configured") {
 		t.Fatalf("expected refusal error, got %v", err)
 	}
@@ -34,7 +34,7 @@ func TestDrainReviewRetirementWiredInDrainAdapters(t *testing.T) {
 	if hooks.retireReviews == nil {
 		t.Fatal("retireReviews is not wired in drainAdapters.hooks()")
 	}
-	err := hooks.retireReviews(context.Background())
+	_, err := hooks.retireReviews(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "review retirement authority is unavailable") {
 		t.Fatalf("expected authority refusal, got %v", err)
 	}
@@ -54,7 +54,7 @@ func TestDrainAdaptersRetireReviews_MalformedManifestFailsClosed(t *testing.T) {
 		root:       root,
 		repository: "fixture-repo",
 	}
-	err := a.retireReviews(context.Background())
+	_, err := a.retireReviews(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "review manifest generation") {
 		t.Fatalf("expected malformed manifest to fail closed, got %v", err)
 	}
@@ -338,8 +338,15 @@ esac
 	}
 
 	// TICK 1: First acting drain tick
-	if err := adapters.retireReviews(context.Background()); err != nil {
+	rep1, err := adapters.retireReviews(context.Background())
+	if err != nil {
 		t.Fatalf("first drain tick retireReviews failed: %v", err)
+	}
+	if rep1.Retired != 1 {
+		t.Fatalf("expected 1 retired review in tick 1, got %d", rep1.Retired)
+	}
+	if rep1.Blocked != 2 {
+		t.Fatalf("expected 2 blocked reviews (active + canary) in tick 1, got %d", rep1.Blocked)
 	}
 
 	// Assert Manifest A was cleanly retired:
@@ -396,8 +403,15 @@ esac
 	}
 
 	// TICK 2: Second acting drain tick (idempotence / replay check)
-	if err := adapters.retireReviews(context.Background()); err != nil {
+	rep2, err := adapters.retireReviews(context.Background())
+	if err != nil {
 		t.Fatalf("second drain tick retireReviews failed: %v", err)
+	}
+	if rep2.Retired != 0 {
+		t.Fatalf("expected 0 newly retired reviews in tick 2 replay, got %d", rep2.Retired)
+	}
+	if rep2.Blocked != 2 {
+		t.Fatalf("expected 2 blocked reviews (active + canary) in tick 2 replay, got %d", rep2.Blocked)
 	}
 
 	// Assert close count did NOT increase (remains 1)
@@ -557,7 +571,7 @@ esac
 		ledger:     ledger,
 	}
 
-	err = adapters.retireReviews(context.Background())
+	_, err = adapters.retireReviews(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "retire review gen-fail") {
 		t.Fatalf("expected observable cleanup error, got %v", err)
 	}
@@ -767,8 +781,12 @@ esac
 	}
 
 	// First drain tick
-	if err := adapters.retireReviews(context.Background()); err != nil {
+	rep1, err := adapters.retireReviews(context.Background())
+	if err != nil {
 		t.Fatalf("first drain tick retireReviews failed: %v", err)
+	}
+	if rep1.Retired != 1 {
+		t.Fatalf("expected 1 retired review in tick 1, got %d", rep1.Retired)
 	}
 
 	// Assert worktree retired
@@ -777,7 +795,67 @@ esac
 	}
 
 	// Second drain tick (idempotent replay)
-	if err := adapters.retireReviews(context.Background()); err != nil {
+	rep2, err := adapters.retireReviews(context.Background())
+	if err != nil {
 		t.Fatalf("second drain tick retireReviews failed: %v", err)
+	}
+	if rep2.Retired != 0 {
+		t.Fatalf("expected 0 retired reviews in tick 2 replay, got %d", rep2.Retired)
+	}
+}
+
+// TestDrainExecuteActions_ReviewRetirementBlockedObservabilityPreservedWithoutRefusal asserts
+// that executeDrainActions surfaces individual blocked review retirement lanes and reasons
+// into operator output and structured report without marking the drain tick as failed or
+// treating safe holds as refusals.
+func TestDrainExecuteActions_ReviewRetirementBlockedObservabilityPreservedWithoutRefusal(t *testing.T) {
+	mockReport := herdr.ReviewRetirementReport{
+		Retired: 1,
+		Blocked: 1,
+		Candidates: []herdr.ReviewRetirementCandidate{
+			{
+				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-retired"},
+				Decision: herdr.ReviewRetirementDecision{Eligible: true, Reason: "cleanly retired"},
+			},
+			{
+				Manifest: herdr.ReviewRetirementManifest{Generation: "gen-blocked"},
+				Decision: herdr.ReviewRetirementDecision{Eligible: false, Reason: "BLOCKED: review pane still active"},
+			},
+		},
+	}
+
+	hooks := drainActionHooks{
+		launchReview: func(context.Context, drainActionEvidence) error { return nil },
+		harvest:      func(context.Context, drainActionEvidence) error { return nil },
+		retireReviews: func(context.Context) (herdr.ReviewRetirementReport, error) {
+			return mockReport, nil
+		},
+	}
+
+	var out strings.Builder
+	result := executeDrainActions(context.Background(), drainTestReport(), nil, 0, 0, 0, "", &out, hooks)
+
+	if result.Failed {
+		t.Fatalf("drain action result must not fail when review lanes are safely blocked, got failed=true")
+	}
+	if result.Refusals != 0 {
+		t.Fatalf("drain refusals must be 0 for safely blocked review lanes, got %d", result.Refusals)
+	}
+	if result.ReviewRetirements.Retired != 1 {
+		t.Fatalf("expected 1 retired review in result, got %d", result.ReviewRetirements.Retired)
+	}
+	if result.ReviewRetirements.Blocked != 1 {
+		t.Fatalf("expected 1 blocked review in result, got %d", result.ReviewRetirements.Blocked)
+	}
+
+	outStr := out.String()
+	if !strings.Contains(outStr, "RETIRED review generation=gen-retired") {
+		t.Errorf("expected human output to report retired review, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "BLOCKED review-retirement generation=gen-blocked: BLOCKED: review pane still active") {
+		t.Errorf("expected human output to report blocked review with reason, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "review_retired=1 review_blocked=1 refusals=0") {
+		t.Errorf("expected summary line to carry review_retired=1 review_blocked=1 refusals=0, got:\n%s", outStr)
 	}
 }

@@ -8887,12 +8887,13 @@ type drainActionHooks struct {
 	launchReview          func(context.Context, drainActionEvidence) error
 	dryRun                func(context.Context, drainActionEvidence) error
 	harvest               func(context.Context, drainActionEvidence) error
-	retireReviews         func(context.Context) error
+	retireReviews         func(context.Context) (herdr.ReviewRetirementReport, error)
 	retireSources         func(context.Context) error
 }
 
 type drainActionResult struct {
 	Reviews, Harvests, IntegrationSteps, DryRuns, Refusals int
+	ReviewRetirements                                      herdr.ReviewRetirementReport
 	Failed                                                 bool
 }
 
@@ -8915,8 +8916,8 @@ func defaultDrainActionHooks() drainActionHooks {
 		harvest: func(context.Context, drainActionEvidence) error {
 			return errors.New("no compiled harvest authority is configured")
 		},
-		retireReviews: func(context.Context) error {
-			return errors.New("no compiled review retirement authority is configured")
+		retireReviews: func(context.Context) (herdr.ReviewRetirementReport, error) {
+			return herdr.ReviewRetirementReport{}, errors.New("no compiled review retirement authority is configured")
 		},
 		retireSources: func(context.Context) error {
 			return errors.New("no compiled source retirement authority is configured")
@@ -9093,10 +9094,23 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 		}
 	}
 	if hooks.retireReviews != nil {
-		if err := hooks.retireReviews(ctx); err != nil {
+		rep, err := hooks.retireReviews(ctx)
+		result.ReviewRetirements = rep
+		if err != nil {
 			fmt.Fprintf(out, "REFUSED review-retirement: %v\n", err)
 			result.Failed = true
 			result.Refusals++
+		} else {
+			for _, c := range rep.Candidates {
+				if c.Completed {
+					continue
+				}
+				if !c.Decision.Eligible {
+					fmt.Fprintf(out, "BLOCKED review-retirement generation=%s: %s\n", c.Manifest.Generation, c.Decision.Reason)
+				} else {
+					fmt.Fprintf(out, "RETIRED review generation=%s\n", c.Manifest.Generation)
+				}
+			}
 		}
 	}
 	if hooks.retireSources != nil {
@@ -9106,8 +9120,8 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 			result.Refusals++
 		}
 	}
-	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d act_integration_steps=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",
-		result.Reviews, result.Harvests, result.IntegrationSteps, result.DryRuns, len(rebaseBlocked), result.Refusals)
+	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d act_integration_steps=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d review_retired=%d review_blocked=%d refusals=%d\n",
+		result.Reviews, result.Harvests, result.IntegrationSteps, result.DryRuns, len(rebaseBlocked), result.ReviewRetirements.Retired, result.ReviewRetirements.Blocked, result.Refusals)
 	return result
 }
 
