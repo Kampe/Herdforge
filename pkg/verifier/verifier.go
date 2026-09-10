@@ -150,6 +150,7 @@ type Verifier struct {
 	// afterMutationApplied runs after mutant bytes are on disk and before the
 	// mutant command is executed. Nil in production.
 	afterMutationApplied func()
+	beforeCommandStart   func(context.Context)
 }
 
 func defaultDiskAdmission() resources.DiskAdmission {
@@ -257,6 +258,20 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		return killProcessGroupIfLive(cmd.Process.Pid)
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
+	if v.beforeCommandStart != nil {
+		v.beforeCommandStart(commandCtx)
+	}
+	if commandCtx.Err() != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		if marker != nil {
+			_ = marker.Close()
+			_ = os.Remove(markerPath)
+		}
+		return newOutputResult(OutcomeBLOCKED, []byte(commandCtx.Err().Error()), -1, time.Since(started)), nil
+	}
 
 	var combined concurrentCombinedWriter
 	cmd.Stdout = &combined
