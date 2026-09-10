@@ -41,7 +41,48 @@ var (
 	wslDriveStatFS = func(ctx context.Context, mountPath string) (Capacity, error) {
 		return probeHostVolumeCapacity(ctx, mountPath)
 	}
+	// wslSignalStat probes the filesystem markers isWSLEnvironment uses as
+	// secondary signals. Seam: on a real WSL host these paths exist, so tests
+	// asserting the "no signals" branch must inject their own answer or they
+	// assert a property of the machine they run on (FAC-215, FAC-613).
+	wslSignalStat = func(path string) error {
+		_, err := os.Stat(path)
+		return err
+	}
 )
+
+// osBackendStatFSOverride, when non-nil, replaces OSBackend.StatFS entirely.
+// It is set only through SetOSBackendStatFSForTest; nil in production.
+var osBackendStatFSOverride func(path string) (Capacity, error)
+
+// SetOSBackendStatFSForTest pins the filesystem capacity OSBackend reports,
+// for out-of-package tests whose subjects construct the default capacity gate
+// (worktree, harvest, verifier, cmd/herd integration suites). Those tests
+// create real worktrees under temp dirs and must not assert a property of the
+// machine they run on (FAC-215): at a8cd39e15c85 `make ci` failed ~90 of them
+// on a real WSL host whose probe fails closed and whose physical drive sits
+// below the 15 GiB reserve, and the same suites fail on any macOS host under
+// the 2%% reserve. Gate BEHAVIOR is covered by each package's injected-fake
+// gate tests; production is unchanged — the host-volume bound and the reserve
+// policy still apply wherever this hook is not installed. Returns a restore
+// func.
+func SetOSBackendStatFSForTest(fn func(path string) (Capacity, error)) func() {
+	prev := osBackendStatFSOverride
+	osBackendStatFSOverride = fn
+	return func() { osBackendStatFSOverride = prev }
+}
+
+// HermeticStatFSForTest is the canned healthy filesystem for
+// SetOSBackendStatFSForTest: fixed, plentiful, and identical on every host.
+func HermeticStatFSForTest(path string) (Capacity, error) {
+	return Capacity{
+		FilesystemID: "hermetic-test-fs",
+		TotalBytes:   512 << 30,
+		FreeBytes:    256 << 30,
+		TotalInodes:  1 << 24,
+		FreeInodes:   1 << 23,
+	}, nil
+}
 
 type wslDistroInfo struct {
 	GUID             string
@@ -71,13 +112,13 @@ func isWSLEnvironment() bool {
 	if os.Getenv("WSL_DISTRO_NAME") != "" || os.Getenv("WSL_INTEROP") != "" {
 		return true
 	}
-	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/WSLInterop"); err == nil {
+	if wslSignalStat("/proc/sys/fs/binfmt_misc/WSLInterop") == nil {
 		return true
 	}
-	if _, err := os.Stat("/run/WSL"); err == nil {
+	if wslSignalStat("/run/WSL") == nil {
 		return true
 	}
-	if _, err := os.Stat("/usr/lib/wsl"); err == nil {
+	if wslSignalStat("/usr/lib/wsl") == nil {
 		return true
 	}
 	return false
@@ -118,14 +159,14 @@ func decodeProcfsEscape(s string) string {
 	return buf.String()
 }
 
-// parseDriveLetterFromDevice extracts drive letter if device explicitly names a Windows drive (e.g. "C:\134", "C:\", "C:").
+// parseDriveLetterFromDevice extracts drive letter if device explicitly names a Windows drive (e.g. "D:\134", "D:\", "D:").
 func parseDriveLetterFromDevice(device string) string {
 	clean := decodeProcfsEscape(device)
 	clean = strings.TrimSpace(clean)
 	return extractDriveLetter(clean)
 }
 
-// parseDriveLetterFromOptions extracts drive letter from drvfs options tokens (e.g. path=C:\ or path=C:).
+// parseDriveLetterFromOptions extracts drive letter from drvfs options tokens (e.g. path=D:\ or path=C:).
 func parseDriveLetterFromOptions(opts string) (string, bool) {
 	decoded := decodeProcfsEscape(opts)
 	tokens := strings.FieldsFunc(decoded, func(r rune) bool {
@@ -312,7 +353,7 @@ func resolveDistroBackingDrive(ctx context.Context) (string, error) {
 
 // findDriveMountPath locates the Linux mount point corresponding to a Windows drive letter.
 // It verifies that the mount is an authentic DrvFS or 9p mount for the requested drive letter:
-// - Matches device and/or options token boundaries (e.g. path=C:\),
+// - Matches device and/or options token boundaries (e.g. path=D:\),
 // - Rejects contradictory device vs options,
 // - Eliminates mountpoint-only fallbacks,
 // - Decodes procfs octal escape sequences for mountpoints with spaces.
@@ -345,7 +386,7 @@ func findDriveMountPath(driveLetter string, mountsData []byte) (string, error) {
 		devDrive := parseDriveLetterFromDevice(rawDevice)
 		optsDrive, hasOptsDrive := parseDriveLetterFromOptions(rawOpts)
 
-		// Reject contradictory device vs options (e.g. device is D: but options specify path=C:\)
+		// Reject contradictory device vs options (e.g. device is D: but options specify path=D:\)
 		if devDrive != "" && hasOptsDrive && devDrive != optsDrive {
 			continue
 		}

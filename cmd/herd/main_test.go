@@ -18,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/slot"
 	"github.com/Kampe/Herdforge/pkg/standing"
 )
@@ -122,7 +123,16 @@ func TestMain(m *testing.M) {
 		// there is no live root checkout whose configuration can be corrupted.
 		root = ""
 	}
+	// FAC-613: integration tests (FAC601 native harvest/drain) create real
+	// worktrees through the default OSBackend disk gate in-process, so they
+	// inherited whatever capacity the host reported — make ci at a8cd39e1
+	// failed them on a real WSL host (probe fails closed, drive below the
+	// 15 GiB reserve), and any macOS host under the 2% reserve fails
+	// identically (FAC-215). Pin a hermetic reading for the in-process suite;
+	// production and child CLIs keep the real bound and reserve policy.
+	restoreStatFS := resources.SetOSBackendStatFSForTest(resources.HermeticStatFSForTest)
 	code := m.Run()
+	restoreStatFS()
 	if root != "" {
 		if after, err := readRootGitState(root); err != nil {
 			fmt.Fprintf(os.Stderr, "root git configuration guard failed: %v\n", err)

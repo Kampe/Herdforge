@@ -26,7 +26,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{11111111-2222-
 
 HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{66666666-7777-8888-9999-000000000000}
     DistributionName    REG_SZ    Debian
-    BasePath            REG_SZ    C:\Users\kampe\AppData\Local\Packages\TheDebianProject_76v4gfsz1904\LocalState
+    BasePath            REG_SZ    E:\Users\kampe\AppData\Local\Packages\TheDebianProject_76v4gfsz1904\LocalState
     Version             REG_DWORD    0x2
 `
 
@@ -34,21 +34,41 @@ const sampleProcMounts = `
 rootfs / rootfs rw 0 0
 none /dev devtmpfs rw,nosuid,relatime,size=16335340k,nr_inodes=4083835,mode=755 0 0
 /dev/sdb / ext4 rw,relatime,discard,errors=remount-ro,data=ordered 0 0
-C:\ /mnt/c 9p rw,noatime,dirsync,aname=drvfs;path=C:\;uid=1000;gid=1000;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=8,wfd=8 0 0
+E:\ /mnt/e 9p rw,noatime,dirsync,aname=drvfs;path=E:\;uid=1000;gid=1000;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=8,wfd=8 0 0
 D:\ /mnt/d 9p rw,noatime,dirsync,aname=drvfs;path=D:\;uid=1000;gid=1000;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=8,wfd=8 0 0
 `
 
-func TestWSLDetectionHermetic(t *testing.T) {
+// stubWSLSignals pins every host-derived detection input so these tests are
+// deterministic on macOS, native Linux, AND a real WSL box. FAC-613: the CI
+// run at a8cd39e1 failed exactly these tests on real WSL because the host's
+// own WSL_DISTRO_NAME/WSL_INTEROP env and /run/WSL-style marker files leaked
+// into the "no signals" assertions.
+func stubWSLSignals(t *testing.T, statPresent map[string]bool) {
+	t.Helper()
 	oldReader := wslProcVersionReader
 	oldOverride := wslDetectionOverride
 	oldGOOS := wslRuntimeGOOS
-	defer func() {
+	oldStat := wslSignalStat
+	t.Cleanup(func() {
 		wslProcVersionReader = oldReader
 		wslDetectionOverride = oldOverride
 		wslRuntimeGOOS = oldGOOS
-	}()
+		wslSignalStat = oldStat
+	})
 	wslDetectionOverride = nil
 	wslRuntimeGOOS = "linux"
+	wslSignalStat = func(path string) error {
+		if statPresent[path] {
+			return nil
+		}
+		return os.ErrNotExist
+	}
+	t.Setenv("WSL_DISTRO_NAME", "")
+	t.Setenv("WSL_INTEROP", "")
+}
+
+func TestWSLDetectionHermetic(t *testing.T) {
+	stubWSLSignals(t, nil)
 
 	// 1. WSL kernel version text contains microsoft
 	wslProcVersionReader = func() ([]byte, error) {
@@ -62,8 +82,6 @@ func TestWSLDetectionHermetic(t *testing.T) {
 	wslProcVersionReader = func() ([]byte, error) {
 		return []byte(sampleNativeLinuxProcVersion), nil
 	}
-	t.Setenv("WSL_DISTRO_NAME", "")
-	t.Setenv("WSL_INTEROP", "")
 	if isWSLEnvironment() {
 		t.Fatal("expected isWSLEnvironment to return false for sample native Linux proc version without signals")
 	}
@@ -87,14 +105,14 @@ func TestWSLResolveDistroBackingDriveHermetic(t *testing.T) {
 		t.Fatalf("expected drive D: for Ubuntu-24.04, got %q", drive)
 	}
 
-	// Case 2: WSL_DISTRO_NAME matches Debian on C:
+	// Case 2: WSL_DISTRO_NAME matches Debian on E:
 	t.Setenv("WSL_DISTRO_NAME", "Debian")
 	drive, err = resolveDistroBackingDrive(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error resolving distro drive: %v", err)
 	}
-	if drive != "C:" {
-		t.Fatalf("expected drive C: for Debian, got %q", drive)
+	if drive != "E:" {
+		t.Fatalf("expected drive E: for Debian, got %q", drive)
 	}
 
 	// Case 3: WSL_DISTRO_NAME unset with multiple distros -> fails closed (no arbitrary selection)
@@ -113,14 +131,14 @@ func TestWSLResolveDistroDifferentDistroDefaultMismatch(t *testing.T) {
 		return []byte(sampleLxssRegistryOutput), nil
 	}
 
-	// Default distro in registry is Ubuntu-24.04 (D:), but running distro is Debian (C:)
+	// Default distro in registry is Ubuntu-24.04 (D:), but running distro is Debian (E:)
 	t.Setenv("WSL_DISTRO_NAME", "Debian")
 	drive, err := resolveDistroBackingDrive(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if drive != "C:" {
-		t.Fatalf("expected running distro drive C:, got %q (must not substitute default D:)", drive)
+	if drive != "E:" {
+		t.Fatalf("expected running distro drive E:, got %q (must not substitute default D:)", drive)
 	}
 }
 
@@ -152,7 +170,7 @@ func TestWSLResolveDistroNoNameMultiDistroNondeterminismFailsClosed(t *testing.T
 		return []byte(sampleLxssRegistryOutput), nil
 	}
 
-	// WSL_DISTRO_NAME is empty and there are 2 distros on different drives (D: and C:).
+	// WSL_DISTRO_NAME is empty and there are 2 distros on different drives (D: and E:).
 	// Must fail closed; must never arbitrarily iterate map or guess.
 	t.Setenv("WSL_DISTRO_NAME", "")
 	_, err := resolveDistroBackingDrive(context.Background())
@@ -174,7 +192,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss
 
 HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{11111111-2222-3333-4444-555555555555}
     DistributionName    REG_SZ    Ubuntu
-    BasePath            REG_SZ    C:\WSL\Ubuntu
+    BasePath            REG_SZ    E:\WSL\Ubuntu
 `
 	wslRegistryQueryExecutor = func(ctx context.Context) ([]byte, error) {
 		return []byte(singleDistroRegistry), nil
@@ -185,22 +203,13 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{11111111-2222-
 	if err != nil {
 		t.Fatalf("unexpected error for single registered distro: %v", err)
 	}
-	if drive != "C:" {
+	if drive != "E:" {
 		t.Fatalf("expected drive C:, got %q", drive)
 	}
 }
 
 func TestWSLAtypicalProcVersionInspectsSecondarySignals(t *testing.T) {
-	oldReader := wslProcVersionReader
-	oldOverride := wslDetectionOverride
-	oldGOOS := wslRuntimeGOOS
-	defer func() {
-		wslProcVersionReader = oldReader
-		wslDetectionOverride = oldOverride
-		wslRuntimeGOOS = oldGOOS
-	}()
-	wslDetectionOverride = nil
-	wslRuntimeGOOS = "linux"
+	stubWSLSignals(t, nil)
 
 	// Custom Linux kernel version text without "microsoft" or "wsl"
 	wslProcVersionReader = func() ([]byte, error) {
@@ -208,8 +217,6 @@ func TestWSLAtypicalProcVersionInspectsSecondarySignals(t *testing.T) {
 	}
 
 	// 1. Without secondary signals -> false
-	t.Setenv("WSL_DISTRO_NAME", "")
-	t.Setenv("WSL_INTEROP", "")
 	if isWSLEnvironment() {
 		t.Fatal("expected false for atypical kernel without secondary signals")
 	}
@@ -218,6 +225,19 @@ func TestWSLAtypicalProcVersionInspectsSecondarySignals(t *testing.T) {
 	t.Setenv("WSL_DISTRO_NAME", "Ubuntu")
 	if !isWSLEnvironment() {
 		t.Fatal("expected true for atypical kernel with WSL_DISTRO_NAME set")
+	}
+	t.Setenv("WSL_DISTRO_NAME", "")
+
+	// 3. With an injected filesystem marker signal -> true (proves the stat
+	// seam is consulted rather than the host's real filesystem)
+	wslSignalStat = func(path string) error {
+		if path == "/run/WSL" {
+			return nil
+		}
+		return os.ErrNotExist
+	}
+	if !isWSLEnvironment() {
+		t.Fatal("expected true for atypical kernel with /run/WSL marker present via seam")
 	}
 }
 
@@ -246,55 +266,55 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{11111111-2222-
 
 func TestWSLFindDriveMountPathRejectsMountSpoof(t *testing.T) {
 	// Mounts table contains:
-	// 1. spoofed ext4 entry at /mnt/c
-	// 2. ambiguous 9p DrvFS mount at /mnt/c backed by D: without path option
+	// 1. spoofed ext4 entry at /mnt/e
+	// 2. ambiguous 9p DrvFS mount at /mnt/e backed by D: without path option
 	// 3. tmpfs mount at /var/log/c
-	// 4. authentic 9p DrvFS mount at /media/c with path=C:\
+	// 4. authentic 9p DrvFS mount at /media/c with path=E:\
 	spoofedMounts := `
 rootfs / rootfs rw 0 0
-/dev/sdb /mnt/c ext4 rw,relatime 0 0
-D:\134 /mnt/c 9p rw,noatime,aname=drvfs;uid=1000;gid=1000 0 0
+/dev/sdb /mnt/e ext4 rw,relatime 0 0
+D:\134 /mnt/e 9p rw,noatime,aname=drvfs;uid=1000;gid=1000 0 0
 tmpfs /var/log/c tmpfs rw,relatime 0 0
-C:\134 /media/c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000,access=client 0 0
+E:\134 /media/c 9p rw,noatime,aname=drvfs;path=E:\;uid=1000;gid=1000,access=client 0 0
 `
-	mountC, err := findDriveMountPath("C:", []byte(spoofedMounts))
+	mountC, err := findDriveMountPath("E:", []byte(spoofedMounts))
 	if err != nil {
 		t.Fatalf("unexpected error finding mount for C:: %v", err)
 	}
-	// Must reject ext4 /mnt/c AND ambiguous 9p D: at /mnt/c, choosing genuine 9p /media/c
+	// Must reject ext4 /mnt/e AND ambiguous 9p D: at /mnt/e, choosing genuine 9p /media/c
 	if mountC != "/media/c" {
 		t.Fatalf("expected authentic 9p mount /media/c, got spoofed %q", mountC)
 	}
 }
 
 func TestWSLFindDriveMountPathRejectsAmbiguous9pDeviceDMountedAtMountCWithoutPathOption(t *testing.T) {
-	// Ambiguous 9p mount at /mnt/c where device is D: and no path= option is present.
+	// Ambiguous 9p mount at /mnt/e where device is D: and no path= option is present.
 	ambiguousMounts := `
-D:\134 /mnt/c 9p rw,noatime,aname=drvfs;uid=1000;gid=1000 0 0
+D:\134 /mnt/e 9p rw,noatime,aname=drvfs;uid=1000;gid=1000 0 0
 `
-	// Searching for C: must fail closed because /mnt/c is backed by D:, not C:.
-	_, err := findDriveMountPath("C:", []byte(ambiguousMounts))
+	// Searching for C: must fail closed because /mnt/e is backed by D:, not C:.
+	_, err := findDriveMountPath("E:", []byte(ambiguousMounts))
 	if err == nil {
-		t.Fatal("expected 9p mount at /mnt/c backed by device D: (without path option) to be rejected for drive C:")
+		t.Fatal("expected 9p mount at /mnt/e backed by device D: (without path option) to be rejected for drive C:")
 	}
 
-	// Searching for D: must resolve to /mnt/c.
+	// Searching for D: must resolve to /mnt/e.
 	mountD, err := findDriveMountPath("D:", []byte(ambiguousMounts))
 	if err != nil {
 		t.Fatalf("unexpected error resolving drive D:: %v", err)
 	}
-	if mountD != "/mnt/c" {
-		t.Fatalf("expected /mnt/c for drive D:, got %q", mountD)
+	if mountD != "/mnt/e" {
+		t.Fatalf("expected /mnt/e for drive D:, got %q", mountD)
 	}
 }
 
 func TestWSLFindDriveMountPathRejectsContradictoryDeviceAndOptions(t *testing.T) {
-	// Device says D: but options say path=C:\ (contradictory)
+	// Device says D: but options say path=E:\ (contradictory)
 	contradictoryMounts := `
-D:\134 /mnt/d 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000 0 0
+D:\134 /mnt/d 9p rw,noatime,aname=drvfs;path=E:\;uid=1000;gid=1000 0 0
 `
 	// Searching for C: must reject this mount because device contradicts options
-	_, err := findDriveMountPath("C:", []byte(contradictoryMounts))
+	_, err := findDriveMountPath("E:", []byte(contradictoryMounts))
 	if err == nil {
 		t.Fatal("expected contradictory device vs options mount to be rejected for C:")
 	}
@@ -307,32 +327,32 @@ D:\134 /mnt/d 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000 0 0
 }
 
 func TestWSLFindDriveMountPathRejectsDeviceDMountedAtMountC(t *testing.T) {
-	// Device D: mounted at /mnt/c (e.g. mountpoint remapped or spoofed)
+	// Device D: mounted at /mnt/e (e.g. mountpoint remapped or spoofed)
 	remappedMounts := `
-D:\134 /mnt/c 9p rw,noatime,aname=drvfs;path=D:\;uid=1000;gid=1000 0 0
+D:\134 /mnt/e 9p rw,noatime,aname=drvfs;path=D:\;uid=1000;gid=1000 0 0
 `
 	// Searching for C: must reject because device and options are D:
-	_, err := findDriveMountPath("C:", []byte(remappedMounts))
+	_, err := findDriveMountPath("E:", []byte(remappedMounts))
 	if err == nil {
-		t.Fatal("expected /mnt/c backed by D: to be rejected when resolving drive C:")
+		t.Fatal("expected /mnt/e backed by D: to be rejected when resolving drive C:")
 	}
 
-	// Searching for D: must resolve to /mnt/c
+	// Searching for D: must resolve to /mnt/e
 	mountD, err := findDriveMountPath("D:", []byte(remappedMounts))
 	if err != nil {
 		t.Fatalf("unexpected error resolving drive D:: %v", err)
 	}
-	if mountD != "/mnt/c" {
-		t.Fatalf("expected /mnt/c for drive D:, got %q", mountD)
+	if mountD != "/mnt/e" {
+		t.Fatalf("expected /mnt/e for drive D:, got %q", mountD)
 	}
 }
 
 func TestWSLFindDriveMountPathDecodesProcfsOctalEscapesWithSpaces(t *testing.T) {
 	// Mount point contains escaped space (\040)
 	spaceMounts := `
-C:\134 /mnt/my\040drive\040c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000 0 0
+E:\134 /mnt/my\040drive\040c 9p rw,noatime,aname=drvfs;path=E:\;uid=1000;gid=1000 0 0
 `
-	mountC, err := findDriveMountPath("C:", []byte(spaceMounts))
+	mountC, err := findDriveMountPath("E:", []byte(spaceMounts))
 	if err != nil {
 		t.Fatalf("unexpected error finding mount for C:: %v", err)
 	}
@@ -346,7 +366,7 @@ func TestWSLDecodeProcfsEscapeUnit(t *testing.T) {
 		input string
 		want  string
 	}{
-		{`C:\134`, `C:\`},
+		{`E:\134`, `E:\`},
 		{`/mnt/drive\040c`, `/mnt/drive c`},
 		{`\011\012\040\134`, "\t\n \\"},
 		{`normal/path`, `normal/path`},
@@ -393,7 +413,7 @@ func TestWSLRegistryInvalidByteEncodingFailsClosed(t *testing.T) {
 	// Registry contains null byte in string
 	nullByteRegistry := "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{11111111-2222-3333-4444-555555555555}\n" +
 		"    DistributionName    REG_SZ    Ubuntu\x00corrupt\n" +
-		"    BasePath            REG_SZ    C:\\WSL\\Ubuntu\n"
+		"    BasePath            REG_SZ    E:\\WSL\\Ubuntu\n"
 
 	wslRegistryQueryExecutor = func(ctx context.Context) ([]byte, error) {
 		return []byte(nullByteRegistry), nil
@@ -448,7 +468,7 @@ func TestWSLProbeHostVolumeMultiplicationOverflowFailsClosed(t *testing.T) {
 	}
 
 	// Uses real default wslDriveStatFS calling probeHostVolumeCapacity
-	_, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	_, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err == nil {
 		t.Fatal("expected overflow probe error to fail closed")
 	}
@@ -462,7 +482,7 @@ func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
 
 	// Case 1: Total bytes multiplication overflow
 	createFakeStatBinary(t, "18446744073709551615 2 1 100 100")
-	_, err := probeHostVolumeCapacity(ctx, "/mnt/c")
+	_, err := probeHostVolumeCapacity(ctx, "/mnt/e")
 	if err == nil {
 		t.Fatal("expected probeHostVolumeCapacity to fail on total bytes multiplication overflow")
 	}
@@ -481,7 +501,7 @@ func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
 
 	// Case 2: Free blocks > total blocks
 	createFakeStatBinary(t, "4096 100 200 100 100")
-	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
+	_, err = probeHostVolumeCapacity(ctx, "/mnt/e")
 	if err == nil {
 		t.Fatal("expected probeHostVolumeCapacity to fail when freeBlocks > totalBlocks")
 	}
@@ -491,7 +511,7 @@ func TestWSLDirectProbeHostVolumeMultiplicationOverflow(t *testing.T) {
 
 	// Case 3: Zero block size
 	createFakeStatBinary(t, "0 100 50 100 100")
-	_, err = probeHostVolumeCapacity(ctx, "/mnt/c")
+	_, err = probeHostVolumeCapacity(ctx, "/mnt/e")
 	if err == nil {
 		t.Fatal("expected probeHostVolumeCapacity to fail when blockSize == 0")
 	}
@@ -664,7 +684,7 @@ func TestWSLHostStatFSCancelledProbeFailsClosed(t *testing.T) {
 		FreeBytes:    776875823104,
 	}
 
-	_, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	_, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err == nil {
 		t.Fatal("expected cancelled probe to fail closed")
 	}
@@ -685,19 +705,19 @@ func TestWSLFindDriveMountPathHermetic(t *testing.T) {
 		t.Fatalf("expected /mnt/d, got %q", mountD)
 	}
 
-	// Check C: -> /mnt/c
-	mountC, err := findDriveMountPath("C:", mounts)
+	// Check E: -> /mnt/e
+	mountE, err := findDriveMountPath("E:", mounts)
 	if err != nil {
-		t.Fatalf("unexpected error finding mount for C:: %v", err)
+		t.Fatalf("unexpected error finding mount for E:: %v", err)
 	}
-	if mountC != "/mnt/c" {
-		t.Fatalf("expected /mnt/c, got %q", mountC)
+	if mountE != "/mnt/e" {
+		t.Fatalf("expected /mnt/e, got %q", mountE)
 	}
 
-	// Check unmounted E:
-	_, err = findDriveMountPath("E:", mounts)
+	// Check unmounted G:
+	_, err = findDriveMountPath("G:", mounts)
 	if err == nil {
-		t.Fatal("expected error for unmounted drive E:")
+		t.Fatal("expected error for unmounted drive G:")
 	}
 }
 
@@ -736,8 +756,8 @@ func TestWSLHostVolumeCappingGuestFreeGreaterThanHostFree(t *testing.T) {
 
 	// Physical Windows C: drive has only 14,308,425,728 bytes free (~13.3 GB) out of 1 TB
 	wslDriveStatFS = func(ctx context.Context, mountPath string) (Capacity, error) {
-		if mountPath != "/mnt/c" {
-			t.Fatalf("expected statfs on /mnt/c, got %q", mountPath)
+		if mountPath != "/mnt/e" {
+			t.Fatalf("expected statfs on /mnt/e, got %q", mountPath)
 		}
 		return Capacity{
 			FilesystemID: "host:c",
@@ -748,8 +768,8 @@ func TestWSLHostVolumeCappingGuestFreeGreaterThanHostFree(t *testing.T) {
 		}, nil
 	}
 
-	// Test bounding logic on virtual VHD path (/home/kampe/Herdforge)
-	bounded, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	// Test bounding logic on virtual VHD path (/srv/kampe/Herdforge)
+	bounded, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err != nil {
 		t.Fatalf("unexpected error bounding WSL capacity: %v", err)
 	}
@@ -809,7 +829,7 @@ func TestWSLHostVolumeCappingHostFreeGreaterThanGuestFree(t *testing.T) {
 		}, nil
 	}
 
-	bounded, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	bounded, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err != nil {
 		t.Fatalf("unexpected error bounding WSL capacity: %v", err)
 	}
@@ -843,8 +863,8 @@ func TestWSLDrvFSMountPathBypassesVHDHostCapping(t *testing.T) {
 		FreeInodes:   4000000,
 	}
 
-	// Path directly on /mnt/c/Users/... already queries Windows volume
-	bounded, err := boundWSLCapacity(guestCap, "/mnt/c/Users/kampe/Herdforge")
+	// Path directly on /mnt/e/Users/... already queries Windows volume
+	bounded, err := boundWSLCapacity(guestCap, "/mnt/e/Users/kampe/Herdforge")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -880,7 +900,7 @@ func TestWSLProbeErrorFailsClosedHermetic(t *testing.T) {
 		FreeInodes:   900000,
 	}
 
-	_, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	_, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err == nil {
 		t.Fatal("expected boundWSLCapacity to fail closed when registry query fails")
 	}
@@ -916,7 +936,7 @@ func TestWSLMalformedRegistryOutputFailsClosedHermetic(t *testing.T) {
 		FreeInodes:   900000,
 	}
 
-	_, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	_, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err == nil {
 		t.Fatal("expected error on malformed registry output")
 	}
@@ -947,7 +967,7 @@ func TestNativeDarwinLinuxNoInteropHermetic(t *testing.T) {
 		FreeInodes:   900000,
 	}
 
-	bounded, err := boundWSLCapacity(guestCap, "/Users/kampe/Herdforge")
+	bounded, err := boundWSLCapacity(guestCap, "/srv/kampe/Herdforge")
 	if err != nil {
 		t.Fatalf("unexpected error on native platform: %v", err)
 	}
@@ -1012,7 +1032,7 @@ func TestWSLProductionRegressionPhysicalBoundIgnoredMustBeRED(t *testing.T) {
 	policy := DefaultDiskPolicy() // 15 GB reserve
 	request := DiskRequest{
 		Operation:      "harvest_worktree",
-		Path:           "/home/kampe/Herdforge",
+		Path:           "/srv/kampe/Herdforge",
 		RequiredBytes:  20 * (1 << 30), // 20 GB
 		RequiredInodes: 100,
 	}
@@ -1099,11 +1119,11 @@ func TestExtractDriveLetter(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"C:\\Users\\test", "C:"},
+		{"E:\\Users\\test", "E:"},
 		{"d:\\wsl\\ubuntu", "D:"},
 		{"E:\\", "E:"},
 		{"\\\\?\\F:\\WSL", "F:"},
-		{"/mnt/c", ""},
+		{"/mnt/e", ""},
 		{"", ""},
 		{"relative\\path", ""},
 	}
