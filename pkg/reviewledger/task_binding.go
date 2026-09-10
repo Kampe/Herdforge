@@ -127,20 +127,30 @@ func taskBindingDecision(rows []LedgerRow, opts TaskBindingOpts) (bool, error) {
 	if prior == nil {
 		return false, fmt.Errorf("task binding prior verdict not found")
 	}
-	if VerdictEventDigest(*prior) != strings.TrimSpace(opts.PriorEventDigest) {
-		return false, fmt.Errorf("task binding prior event digest is stale or unbound")
+	task := CloseableCardRef(prior.Task)
+	anchor := VerdictEventDigest(*prior)
+	if anchor == "" {
+		return false, fmt.Errorf("task binding prior verdict has no stable event digest")
 	}
-	if CloseableCardRef(prior.Task) != CloseableCardRef(opts.PreviousTask) {
-		return false, fmt.Errorf("task binding previous task does not match the prior verdict")
+	if CloseableCardRef(opts.PreviousTask) != task && strings.TrimSpace(opts.PriorEventDigest) == anchor {
+		return false, fmt.Errorf("task binding previous task does not match the current chain task")
 	}
+	requestedDigest := strings.TrimSpace(opts.PriorEventDigest)
 	for _, row := range rows {
 		if row.Event != string(EventTaskBinding) || row.SHA != opts.SHA || row.Reviewer != opts.Reviewer {
 			continue
 		}
-		if row.Reassesses == opts.PriorEventDigest && row.PreviousTask == opts.PreviousTask && row.Task == opts.Task && row.ArtifactDigest == opts.ArtifactDigest {
+		if row.Reassesses != anchor || CloseableCardRef(row.PreviousTask) != task || CloseableCardRef(row.Task) == "" {
+			return false, fmt.Errorf("invalid task binding chain for sha %s reviewer %q", opts.SHA, opts.Reviewer)
+		}
+		if row.Reassesses == requestedDigest && row.PreviousTask == CloseableCardRef(opts.PreviousTask) && row.Task == CloseableCardRef(opts.Task) && row.ArtifactDigest == opts.ArtifactDigest {
 			return true, nil
 		}
-		return false, fmt.Errorf("conflicting task binding already exists for sha %s reviewer %q", opts.SHA, opts.Reviewer)
+		task = CloseableCardRef(row.Task)
+		anchor = VerdictEventDigest(row)
+	}
+	if requestedDigest != anchor || CloseableCardRef(opts.PreviousTask) != task {
+		return false, fmt.Errorf("task binding prior event digest is stale or unbound")
 	}
 	return false, nil
 }

@@ -101,6 +101,10 @@ type LedgerRow struct {
 	ContentProof       string `json:"content_proof,omitempty"`
 	Authority          string `json:"authority,omitempty"`
 	PreviousTask       string `json:"previous_task,omitempty"`
+	// rawEventDigest is populated when a row is read from the append-only
+	// ledger.  Projections may change Task, but the event digest must continue
+	// to identify the stored row rather than its projected view.
+	rawEventDigest string
 }
 
 // familyResolve represents the 3-state family resolution.
