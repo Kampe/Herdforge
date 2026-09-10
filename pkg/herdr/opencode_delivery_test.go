@@ -285,7 +285,7 @@ func TestPublicSendOpenCodeProvesNativeConsumption(t *testing.T) {
 	if f.exportCalls < 2 {
 		t.Fatalf("export calls = %d, want before and after evidence", f.exportCalls)
 	}
-	if f.keys != 0 || f.read != 0 {
+	if f.keys != 1 || f.read != 0 {
 		t.Fatalf("native proof used unsafe/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
 	}
 }
@@ -302,7 +302,7 @@ func TestPublicSendOpenCodeProvesColdSessionConsumption(t *testing.T) {
 	if status != "idle" {
 		t.Fatalf("status = %q, want idle", status)
 	}
-	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 0 || f.read != 0 {
+	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 1 || f.read != 0 {
 		t.Fatalf("cold delivery calls = prompts:%d exports:%d keys:%d reads:%d", f.promptCalls, f.exportCalls, f.keys, f.read)
 	}
 }
@@ -422,7 +422,7 @@ func TestPublicSendOpenCodeFailsClosedForNativeEvidenceGaps(t *testing.T) {
 			if f.promptCalls != 1 {
 				t.Fatalf("prompt calls = %d, want exactly one", f.promptCalls)
 			}
-			if f.keys != 0 || f.read != 0 {
+			if f.keys != 1 || f.read != 0 {
 				t.Fatalf("failure used duplicate/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
 			}
 		})
@@ -461,8 +461,12 @@ func TestPublicSendOpenCodeColdSessionFailsClosed(t *testing.T) {
 			if f.promptCalls != 1 {
 				t.Fatalf("prompt calls = %d, want exactly one", f.promptCalls)
 			}
-			if f.keys != 0 || f.read != 0 {
-				t.Fatalf("cold failure used duplicate/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
+			expectedKeys := 1
+			if tc.mode == "cold-missing-ack" {
+				expectedKeys = 0
+			}
+			if f.keys != expectedKeys || f.read != 0 {
+				t.Fatalf("cold failure used duplicate/decorative pane operations: keys=%d (want %d) reads=%d", f.keys, expectedKeys, f.read)
 			}
 		})
 	}
@@ -496,4 +500,33 @@ func TestPublicSendOpenCodeProviderErrorAndTimeoutAreBounded(t *testing.T) {
 			t.Fatalf("timeout retried prompt %d times", f.promptCalls)
 		}
 	})
+}
+
+func TestPublicSendOpenCodeSubmitsEnterImmediatelyAfterPromptAck(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	f, restore := newOpenCodeSendFixture(t, "cold-session")
+	defer restore()
+
+	var order []string
+	restoreRun := SetRunHerdrForTest(func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
+			order = append(order, "prompt")
+		}
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
+			order = append(order, fmt.Sprintf("send-keys:%s", args[len(args)-1]))
+		}
+		return f.run(args...)
+	})
+	defer restoreRun()
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
+	if err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
+	}
+	if len(order) < 2 || order[0] != "prompt" || order[1] != "send-keys:Enter" {
+		t.Fatalf("transport order = %v, want [prompt, send-keys:Enter]", order)
+	}
 }

@@ -456,6 +456,10 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 	if !cold && (!ack.SessionKnown || ack.SessionID != sessionID) {
 		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact warm session")
 	}
+	// OpenCode's interactive TUI keeps submitted text in its input composer
+	// until submitted. Submit once immediately after prompt acknowledgement so
+	// cold and warm native review sessions do not stall in composer (FAC-792).
+	_ = SendKeys(before.Name, "Enter")
 	deadline, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
 		return SendResult{Status: "queued"}, errors.New("OpenCode delivery lost its evidence deadline")

@@ -462,9 +462,7 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 	// Herdr can return after writing TEXT while the pane composer is still
 	// processing it.  Submit once immediately so a following status poll does
 	// not observe text stranded in the composer (FAC-388).
-	if !strings.EqualFold(resolved.Kind, "opencode") {
-		_ = SendKeys(resolvedTarget, "Enter")
-	}
+	_ = SendKeys(resolvedTarget, "Enter")
 	if !verify {
 		return SendResult{Status: "submitted"}, nil
 	}
