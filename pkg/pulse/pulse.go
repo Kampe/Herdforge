@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"sort"
 	"strings"
@@ -147,7 +148,10 @@ type ProviderObservation struct {
 	// NextBlocked records why each candidate was rejected (FAC-581), so a
 	// queue that looks empty can always be explained.
 	NextBlocked map[string]string `json:"next_blocked,omitempty"`
-	ObservedSeq uint64            `json:"observed_seq,omitempty"`
+	// Decision is the typed broker result consumed by pulse planning and
+	// retained in the beat receipt. Counts remain reporting fields only.
+	Decision    *broker.Decision `json:"decision,omitempty"`
+	ObservedSeq uint64           `json:"observed_seq,omitempty"`
 }
 
 // HerdrObservation is one read of the live fleet.
@@ -625,6 +629,8 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	var unknownReasons []string
 	if !obs.Provider.Known || strings.TrimSpace(obs.Provider.Error) != "" {
 		unknownReasons = append(unknownReasons, "provider: "+unknownDetail(obs.Provider.Known, obs.Provider.Error))
+	} else if obs.Provider.Decision != nil && obs.Provider.Decision.Outcome == broker.OutcomeUnknown {
+		unknownReasons = append(unknownReasons, "provider: "+obs.Provider.Decision.UnknownReason)
 	} else if obs.Provider.InReview >= 50 {
 		unknownReasons = append(unknownReasons, fmt.Sprintf("provider: in-review stall threshold exceeded (%d waiting)", obs.Provider.InReview))
 	}
@@ -987,6 +993,22 @@ func Plan(obs Observation, opts Options) (Snapshot, error) {
 	// emitting a dispatch action from Claimable > 0 alone is the selector
 	// defect this seam exists to remove.
 	nextRef := strings.TrimSpace(obs.Provider.NextTaskRef)
+	if d := obs.Provider.Decision; d != nil {
+		switch d.Outcome {
+		case broker.OutcomeWork:
+			if d.Task != nil {
+				nextRef = strings.TrimSpace(d.Task.Ref)
+			}
+		case broker.OutcomeWait:
+			if strings.TrimSpace(obs.Provider.NextWaitReason) == "" {
+				obs.Provider.NextWaitReason = d.WaitReason
+			}
+		case broker.OutcomeUnknown:
+			// Unknown is already included in UnknownCritical above. Keep the
+			// decision in the receipt and never derive dispatch from counts.
+			nextRef = ""
+		}
+	}
 	switch {
 	case opts.Act && opts.Spawn && !snap.BuilderDispatchBlocked && nextRef != "":
 		// Prefer a healthy idle lane as target; else generic queue. A held lease

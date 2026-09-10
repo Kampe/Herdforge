@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/progress"
 )
@@ -57,6 +58,9 @@ func TestClassifyAgent_Working(t *testing.T) {
 	}
 	if item.Reason != "working" {
 		t.Fatalf("reason should be 'working', got %q", item.Reason)
+	}
+	if item.Decision == nil || item.Decision.Outcome != broker.OutcomeUnknown || item.Decision.UnknownReason == "" {
+		t.Fatalf("working attention item without task identity must carry shared UNKNOWN: %+v", item.Decision)
 	}
 }
 

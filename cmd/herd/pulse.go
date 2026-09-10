@@ -235,11 +235,11 @@ func resolvePulseDispatchLane(registry lifecycle.CanonicalLaneRegistry, liveID s
 func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[string]bool) {
 	cfg, err := config.LoadConfig(".herd/herd.yaml")
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
+		return unknownPulseObservation("load herd config", err), nil
 	}
 	tp, err := loadTaskProvider(cfg)
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
+		return unknownPulseObservation("load task provider", err), nil
 	}
 	project := strings.TrimSpace(cfg.TaskProvider.ProjectID)
 	return collectPulseProviderObservation(ctx, tp, project)
@@ -252,7 +252,7 @@ func readPulseProvider(ctx context.Context) (pulse.ProviderObservation, map[stri
 func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvider, project string) (pulse.ProviderObservation, map[string]bool) {
 	tasks, err := tp.ListTasks(ctx, project, provider.StatusToDo)
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: err.Error()}, nil
+		return unknownPulseObservation("list to-do tasks", err), nil
 	}
 	var claimable, inProgress int64
 	doneRefs := make(map[string]bool)
@@ -277,7 +277,7 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 
 	inReviewTasks, err := tp.ListTasks(ctx, project, "in-review")
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: fmt.Sprintf("list in-review tasks: %v", err)}, nil
+		return unknownPulseObservation("list in-review tasks", err), nil
 	}
 
 	// FAC-581 correction (independent review finding 1): the closed-task
@@ -292,7 +292,7 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 	// in-review read.
 	doneTasks, err := tp.ListTasks(ctx, project, provider.StatusDone)
 	if err != nil {
-		return pulse.ProviderObservation{Known: false, Error: fmt.Sprintf("list done tasks: %v", err)}, nil
+		return unknownPulseObservation("list done tasks", err), nil
 	}
 	for _, t := range doneTasks {
 		if t == nil {
@@ -326,8 +326,10 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 	})
 	if err := d.Validate(); err != nil {
 		obs.NextWaitReason = "invalid dispatch decision: " + err.Error()
+		obs.Decision = ptrDecision(broker.Unknown("pulse", obs.NextWaitReason, progress.Record{Lane: "pulse", Action: progress.ClassWait, WaitReason: obs.NextWaitReason}))
 		return obs, doneRefs
 	}
+	obs.Decision = &d
 	if d.Outcome == broker.OutcomeWork && d.Task != nil {
 		want := strings.TrimSpace(d.Task.Ref)
 		for _, task := range claimableTasks {
@@ -350,6 +352,14 @@ func collectPulseProviderObservation(ctx context.Context, tp provider.TaskProvid
 		obs.NextBlocked = d.Blocked
 	}
 	return obs, doneRefs
+}
+
+func ptrDecision(d broker.Decision) *broker.Decision { return &d }
+
+func unknownPulseObservation(operation string, err error) pulse.ProviderObservation {
+	reason := fmt.Sprintf("%s: %v", operation, err)
+	d := broker.Unknown("pulse", reason, progress.Record{Lane: "pulse", Action: progress.ClassWait, WaitReason: reason})
+	return pulse.ProviderObservation{Known: false, Error: reason, Decision: &d}
 }
 
 // pulseDispatchDecision is the production pulse selector seam. Callers must

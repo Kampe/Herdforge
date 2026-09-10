@@ -479,23 +479,14 @@ func (p ClaimPreview) Decision(lane string) (broker.Decision, error) {
 	}
 
 	if len(p.ClaimableRefs) > 0 {
-		queue := make([]broker.Task, 0, len(p.ClaimableRefs))
-		for i, ref := range p.ClaimableRefs {
-			queue = append(queue, broker.Task{
-				Ref:      ref,
-				Kind:     broker.KindBuild,
-				Priority: len(p.ClaimableRefs) - i,
-			})
+		rows := make([]ScoutRow, 0, len(p.ClaimableRefs))
+		for _, ref := range p.ClaimableRefs {
+			rows = append(rows, ScoutRow{Ref: ref, Priority: provider.PriorityHigh})
 		}
-		d := broker.Decide(broker.Inputs{
+		d := ScoutDecision(rows, nil, false, "", progress.Record{
 			Lane:    lane,
-			Accepts: []broker.Kind{broker.KindBuild},
-			Queue:   queue,
-			Progress: progress.Record{
-				Lane:    lane,
-				TaskRef: p.ClaimableRefs[0],
-				Action:  progress.ClassBuild,
-			},
+			TaskRef: p.ClaimableRefs[0],
+			Action:  progress.ClassBuild,
 		})
 		if err := d.Validate(); err != nil {
 			return broker.Decision{}, err

@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/progress"
@@ -62,6 +63,11 @@ type Item struct {
 	PaneID     string         `json:"pane_id,omitempty"`
 	Held       bool           `json:"held,omitempty"`
 	HeldReason string         `json:"held_reason,omitempty"`
+	// Decision is the shared broker classification for this production lane
+	// observation. Attention does not invent dispatch authority: its roster has
+	// no exact task identity, so active lanes are UNKNOWN rather than fake WORK;
+	// an explicit idle condition is WAIT.
+	Decision *broker.Decision `json:"decision,omitempty"`
 }
 
 // Result is the full attention triage.
@@ -160,6 +166,7 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 		Status: status,
 		PaneID: a.PaneID,
 	}
+	item.Decision = agentDecision(name, status)
 
 	switch {
 	case strings.HasPrefix(heldReason, "authority-error:"):
@@ -183,6 +190,26 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 	}
 
 	return item
+}
+
+func agentDecision(name, status string) *broker.Decision {
+	prog := progress.Record{Lane: name, TaskRef: name}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "working", "starting":
+		prog.Action = progress.ClassBuild
+		prog.TaskRef = ""
+		d := broker.Unknown(name, "live agent status has no exact task-bound identity", prog)
+		return &d
+	case "idle", "done", "blocked":
+		prog.Action = progress.ClassWait
+		prog.WaitReason = "agent status is " + strings.ToLower(strings.TrimSpace(status))
+		d := broker.Decision{Outcome: broker.OutcomeWait, WaitReason: prog.WaitReason, Progress: prog}
+		return &d
+	default:
+		prog.Action = progress.ClassProbe
+		d := broker.Unknown(name, "agent status is unavailable", prog)
+		return &d
+	}
 }
 
 // Triage produces the coordinator-eyes triage from a live agent list and

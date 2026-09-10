@@ -8,7 +8,32 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/broker"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
+
+func TestPlanFailsClosedOnBrokerUnknownEvenWhenCountsLookClaimable(t *testing.T) {
+	d := broker.Unknown("pulse", "done-task snapshot unavailable", progress.Record{Lane: "pulse", Action: progress.ClassWait, WaitReason: "done-task snapshot unavailable"})
+	snap, err := Plan(Observation{
+		Provider: ProviderObservation{Known: true, Claimable: 1, NextTaskRef: "FAC-581", Decision: &d},
+		Herdr:    HerdrObservation{Known: true},
+		Review:   ReviewObservation{Known: true},
+		Quota:    QuotaObservation{Known: true},
+		WindDown: WindDownObservation{Known: true},
+	}, Options{Act: true, Spawn: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.UnknownCritical || !snap.BuilderDispatchBlocked {
+		t.Fatalf("unknown broker decision must block builder dispatch: %+v", snap)
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == ActionDispatch {
+			t.Fatal("unknown broker decision must never produce a dispatch action")
+		}
+	}
+}
 
 // fixedNow is the fake clock anchor for all deterministic tests.
 var fixedNow = time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)

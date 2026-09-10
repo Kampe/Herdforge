@@ -63,6 +63,12 @@ func TestADecisionWithoutATaskIdentityIsRejected(t *testing.T) {
 	if err := (Decision{}).Validate(); err == nil {
 		t.Fatal("a decision with no outcome must be rejected")
 	}
+	if err := (Decision{Outcome: OutcomeUnknown}).Validate(); err == nil {
+		t.Fatal("an unknown decision with no source reason must be rejected")
+	}
+	if err := Unknown("pulse", "provider read failed", progress.Record{Lane: "pulse"}).Validate(); err != nil {
+		t.Fatalf("unknown source decision must be valid when it names the source: %v", err)
+	}
 }
 
 // Dependency readiness blocks, and the block is REPORTED rather than silent.
