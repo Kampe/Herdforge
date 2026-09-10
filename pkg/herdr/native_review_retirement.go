@@ -34,6 +34,50 @@ type retirementPhaseRecord struct {
 	LeaseGeneration                                   int64 `json:"lease_generation"`
 }
 
+func canonicalRetirementVerdict(rows []reviewledger.LedgerRow, candidateSHA, reviewer string) (reviewledger.LedgerRow, error) {
+	type indexedRow struct {
+		row reviewledger.LedgerRow
+		idx int
+	}
+	var verdicts []indexedRow
+	byDigest := make(map[string]indexedRow)
+	for i, row := range rows {
+		if row.Event != string(reviewledger.EventVerdict) || row.SHA != candidateSHA || row.CandidateSHA != candidateSHA || row.Reviewer != reviewer {
+			continue
+		}
+		if row.Verdict != string(reviewledger.VerdictPASS) && row.Verdict != string(reviewledger.VerdictFAIL) && row.Verdict != string(reviewledger.VerdictBLOCKED) {
+			return reviewledger.LedgerRow{}, errors.New("matching terminal verdict has an invalid verdict")
+		}
+		item := indexedRow{row: row, idx: i}
+		verdicts = append(verdicts, item)
+		byDigest[reviewledger.VerdictEventDigest(row)] = item
+	}
+	if len(verdicts) == 0 {
+		return reviewledger.LedgerRow{}, nil
+	}
+	superseded := make(map[string]bool)
+	for _, item := range verdicts {
+		if item.row.Reassesses == "" {
+			continue
+		}
+		prior, ok := byDigest[item.row.Reassesses]
+		if !ok || prior.idx >= item.idx {
+			return reviewledger.LedgerRow{}, errors.New("matching verdict reassessment is stale or unbound")
+		}
+		superseded[item.row.Reassesses] = true
+	}
+	var terminal []reviewledger.LedgerRow
+	for _, item := range verdicts {
+		if !superseded[reviewledger.VerdictEventDigest(item.row)] {
+			terminal = append(terminal, item.row)
+		}
+	}
+	if len(terminal) != 1 {
+		return reviewledger.LedgerRow{}, errors.New("ambiguous matching terminal verdict")
+	}
+	return terminal[0], nil
+}
+
 func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRetirementEvidence, error) {
 	if n == nil || n.Ledger == nil || strings.TrimSpace(n.Root) == "" || strings.TrimSpace(n.RepositoryIdentity) == "" {
 		return ReviewRetirementEvidence{}, errors.New("native review retirement authority is incomplete")
@@ -53,7 +97,7 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 		return ReviewRetirementEvidence{}, fmt.Errorf("read review ledger: %w", err)
 	}
 	var launch, verdict reviewledger.LedgerRow
-	launchFound, verdictFound := false, false
+	launchFound := false
 	for _, row := range rows {
 		if row.Event == string(reviewledger.EventRecord) && row.SHA == m.CandidateSHA && row.Reviewer == m.Reviewer && row.Lease == m.Nonce {
 			if launchFound && !reflect.DeepEqual(launch, row) {
@@ -62,13 +106,10 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 			launch = row
 			launchFound = true
 		}
-		if row.Event == string(reviewledger.EventVerdict) && row.SHA == m.CandidateSHA && row.Reviewer == m.Reviewer {
-			if verdictFound && !reflect.DeepEqual(verdict, row) {
-				return ReviewRetirementEvidence{}, errors.New("ambiguous matching terminal verdict")
-			}
-			verdict = row
-			verdictFound = true
-		}
+	}
+	verdict, err = canonicalRetirementVerdict(rows, m.CandidateSHA, m.Reviewer)
+	if err != nil {
+		return ReviewRetirementEvidence{}, err
 	}
 	ack, ackErr := reviewack.Read(n.Root, m.CandidateSHA, m.Reviewer)
 	if ackErr != nil {

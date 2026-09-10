@@ -26,6 +26,37 @@ func TestNativeRetirementCorruptJournalFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCanonicalRetirementVerdictSelectsLatestReassessment(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	base := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: "reviewer", Verdict: string(reviewledger.VerdictFAIL), ArtifactDigest: strings.Repeat("1", 64)}
+	next := base
+	next.Verdict = string(reviewledger.VerdictPASS)
+	next.ArtifactDigest = strings.Repeat("2", 64)
+	next.Reassesses = reviewledger.VerdictEventDigest(base)
+	got, err := canonicalRetirementVerdict([]reviewledger.LedgerRow{base, next}, sha, "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Reassesses != next.Reassesses || got.Verdict != string(reviewledger.VerdictPASS) {
+		t.Fatalf("selected verdict=%+v, want latest reassessment", got)
+	}
+}
+
+func TestCanonicalRetirementVerdictRejectsConflictingReassessmentBranches(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	base := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: "reviewer", Verdict: string(reviewledger.VerdictFAIL), ArtifactDigest: strings.Repeat("1", 64)}
+	left := base
+	left.Verdict = string(reviewledger.VerdictPASS)
+	left.ArtifactDigest = strings.Repeat("2", 64)
+	left.Reassesses = reviewledger.VerdictEventDigest(base)
+	right := left
+	right.Verdict = string(reviewledger.VerdictBLOCKED)
+	right.ArtifactDigest = strings.Repeat("3", 64)
+	if _, err := canonicalRetirementVerdict([]reviewledger.LedgerRow{base, left, right}, sha, "reviewer"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("conflicting reassessment branch accepted: %v", err)
+	}
+}
+
 func TestNativeRetirementUsesLegacyIncarnationAndExactPoolAfterClosedPane(t *testing.T) {
 	foreignCWD := t.TempDir()
 	t.Chdir(foreignCWD)
