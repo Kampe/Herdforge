@@ -40,6 +40,58 @@ func TestEvaluateContinuesUntilBoundThenStops(t *testing.T) {
 	}
 }
 
+func TestEvaluateEventWaitDoesNotSpendContinuation(t *testing.T) {
+	s, _, e := testGoal(t)
+	e.ProgressClass = "probe"
+	e.LastArtifact = "sha-a"
+	e.Artifact = "sha-a"
+	got, err := s.Evaluate(e)
+	// FAC-581 correction: an event wait HOLDS the lane (FAC-652 landed "block
+	// means hold, quietly" — the stop hook blocks the stop and instructs the
+	// lane to wait) instead of allowing it to die, while spending no budget.
+	if err != nil || !got.Continue || got.Reason != "event_wait" || got.Continuations != 0 {
+		t.Fatalf("unchanged probe spent continuation or killed the lane: %+v err=%v", got, err)
+	}
+	again, err := s.Evaluate(e)
+	if err != nil || again.Continuations != 0 {
+		t.Fatalf("event wait must not consume budget on retry: %+v err=%v", again, err)
+	}
+}
+
+// FAC-581 correction (independent review finding 5): the comparison baseline
+// must be DURABLE. Rebuilding a transient record from each evidence meant
+// repeating the SAME evidence (LastArtifact=sha-before, Artifact=sha-after)
+// consumed a second continuation — the guard budget rewarded repetition.
+func TestEvaluateEventWaitBaselineIsDurableAcrossEvaluations(t *testing.T) {
+	s, _, e := testGoal(t)
+	e.LastArtifact = "sha-before"
+	e.Artifact = "sha-after"
+	first, err := s.Evaluate(e)
+	if err != nil || !first.Continue || first.Continuations != 1 || first.Reason != "goal_active" {
+		t.Fatalf("a genuinely new artifact is work and must spend one continuation: %+v err=%v", first, err)
+	}
+	// Same evidence again: the stored baseline is now sha-after, so the
+	// observation is UNCHANGED and must hold without spending budget.
+	second, err := s.Evaluate(e)
+	if err != nil || second.Reason != "event_wait" || second.Continuations != 1 {
+		t.Fatalf("repeated evidence consumed a second continuation: %+v err=%v", second, err)
+	}
+	third, err := s.Evaluate(e)
+	if err != nil || third.Reason != "event_wait" || third.Continuations != 1 {
+		t.Fatalf("a third unchanged observation must still hold without spending: %+v err=%v", third, err)
+	}
+	// A new artifact IS work again.
+	e.Artifact = "sha-after-2"
+	fourth, err := s.Evaluate(e)
+	if err != nil || !fourth.Continue || fourth.Continuations != 2 || fourth.Reason != "goal_active" {
+		t.Fatalf("a new artifact must resume spending budget: %+v err=%v", fourth, err)
+	}
+	g, err := s.Load()
+	if err != nil || g.Progress == nil || g.Progress.LastArtifact != "sha-after-2" {
+		t.Fatalf("the observed baseline must be persisted on the goal: %+v err=%v", g.Progress, err)
+	}
+}
+
 func TestEvaluateStopsForEveryTerminalCondition(t *testing.T) {
 	cases := []struct {
 		name   string
