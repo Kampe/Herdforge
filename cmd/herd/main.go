@@ -470,6 +470,9 @@ func main() {
 	case "pool":
 		runPool()
 
+	case "bundle-reclaim":
+		runBundleReclaim()
+
 	case "containers":
 		runContainers()
 
