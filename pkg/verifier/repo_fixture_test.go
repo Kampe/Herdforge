@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 type cachedRepoFixture struct {
@@ -46,9 +44,21 @@ func TestMain(m *testing.M) {
 	// 15 GiB reserve), and any macOS host under the 2% reserve fails
 	// identically (FAC-215). Pin a hermetic reading; disk_gate_test.go covers
 	// gate behavior with injected fakes.
-	restoreStatFS := resources.SetOSBackendStatFSForTest(resources.HermeticStatFSForTest)
+	restoreStatFS := setHermeticVerifierResources()
+	previousHermetic, hadHermetic := os.LookupEnv(hermeticContainerEnv)
+	if err := os.Setenv(hermeticContainerEnv, "1"); err != nil {
+		fmt.Fprintf(os.Stderr, "set hermetic test boundary: %v\n", err)
+		restoreStatFS()
+		_ = os.RemoveAll(root)
+		os.Exit(1)
+	}
 
 	code := m.Run()
+	if hadHermetic {
+		_ = os.Setenv(hermeticContainerEnv, previousHermetic)
+	} else {
+		_ = os.Unsetenv(hermeticContainerEnv)
+	}
 	restoreStatFS()
 	if err := os.RemoveAll(root); err != nil {
 		fmt.Fprintf(os.Stderr, "remove verifier fixture root: %v\n", err)

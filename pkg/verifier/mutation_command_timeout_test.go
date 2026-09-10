@@ -1,3 +1,5 @@
+//go:build !fac151_hermetic_integration
+
 package verifier
 
 import (
@@ -146,6 +148,11 @@ func TestRunMutationCheck_QueuedVacuousMutantFailsAfterSlotWait(t *testing.T) {
 
 func TestRunMutationCheck_CommandDeadlineExcludesPreparation(t *testing.T) {
 	isolateOneTestSlot(t)
+	// This test verifies the owned lifecycle handoff and command-timeout
+	// boundary. Linux containment is covered separately; use the supported
+	// hermetic fixture mode so an unavailable optional bwrap backend cannot
+	// bypass beforeCommandStart and strand the synchronization gate below.
+	t.Setenv(hermeticContainerEnv, "1")
 	dir, candidate := mutationRepo(t, false)
 	marker := filepath.Join(t.TempDir(), "mutation-outcome")
 	ready := make(chan struct{})

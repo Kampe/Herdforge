@@ -35,7 +35,7 @@ var providerProbeFailures = []string{
 	"no configured provider", "no configured model", "not logged in", "authentication",
 	"unauthorized", "forbidden", "no payment method", "insufficient", "quota",
 	"rate limit", "rate_limit", "429", "exhausted", "out of credit", "billing",
-	"usage limit",
+	"usage limit", "fable limit",
 }
 
 // defaultProviderProbe performs one bounded request for launch/admission.

@@ -169,6 +169,14 @@ func TestProviderProbeRejectsMissingConfigurationAndRateLimit(t *testing.T) {
 	}
 }
 
+func TestProviderProbeClassifiesClaudeFableLimit(t *testing.T) {
+	output := "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."
+	ok, reason := classifyProviderProbeOutput("", output, nil, false)
+	if ok || reason != "fable limit" {
+		t.Fatalf("Claude Fable refusal classified as ok=%t reason=%q, want unavailable/fable limit", ok, reason)
+	}
+}
+
 func TestProviderProbeSentinelMatching(t *testing.T) {
 	for _, tt := range []struct {
 		name   string

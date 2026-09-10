@@ -131,7 +131,19 @@ func TestMain(m *testing.M) {
 	// identically (FAC-215). Pin a hermetic reading for the in-process suite;
 	// production and child CLIs keep the real bound and reserve policy.
 	restoreStatFS := resources.SetOSBackendStatFSForTest(resources.HermeticStatFSForTest)
+	previousHermetic, hadHermetic := os.LookupEnv("HERD_HERMETIC_CONTAINER")
+	if err := os.Setenv("HERD_HERMETIC_CONTAINER", "1"); err != nil {
+		fmt.Fprintf(os.Stderr, "set hermetic test boundary: %v\n", err)
+		restoreStatFS()
+		restoreSlots()
+		os.Exit(1)
+	}
 	code := m.Run()
+	if hadHermetic {
+		_ = os.Setenv("HERD_HERMETIC_CONTAINER", previousHermetic)
+	} else {
+		_ = os.Unsetenv("HERD_HERMETIC_CONTAINER")
+	}
 	restoreStatFS()
 	if root != "" {
 		if after, err := readRootGitState(root); err != nil {

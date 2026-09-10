@@ -114,6 +114,9 @@ func TestRecordShotLifecycleLeaseGenerationRollbackDoesNotMutate(t *testing.T) {
 }
 
 func TestNewerSignedWorkerCallbackAdmitsExistingGenerationTwoPASS(t *testing.T) {
+	// The fixture owns its temporary root and verifier command. Production
+	// Linux verification remains fail-closed when bwrap is unavailable.
+	t.Setenv("HERD_HERMETIC_CONTAINER", "1")
 	root := t.TempDir()
 	run := func(dir string, args ...string) string {
 		t.Helper()

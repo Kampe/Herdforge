@@ -16,7 +16,7 @@ import (
 // remains the lifecycle supervisor and keeps marker/handshake semantics.
 func ownershipCommand(ctx context.Context, dir string, argv []string) (*exec.Cmd, error) {
 	if os.Getenv(hermeticContainerEnv) == "1" {
-		return exec.CommandContext(ctx, "sh", argv...), nil
+		return commandInDir(ctx, dir, "sh", argv...), nil
 	}
 	bwrap, err := exec.LookPath("bwrap")
 	if err != nil {

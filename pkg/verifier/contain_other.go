@@ -8,8 +8,7 @@ import (
 )
 
 func ownershipCommand(ctx context.Context, dir string, argv []string) (*exec.Cmd, error) {
-	cmd := exec.CommandContext(ctx, "sh", argv...)
-	cmd.Dir = dir
+	cmd := commandInDir(ctx, dir, "sh", argv...)
 	return cmd, nil
 }
 

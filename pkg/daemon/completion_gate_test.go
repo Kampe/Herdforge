@@ -78,6 +78,10 @@ func initGitCandidate(t *testing.T, dir string) string {
 
 func newGate(t *testing.T, argv []string, withMachine bool) (*CompletionGate, *lifecycle.Machine, string) {
 	t.Helper()
+	// These tests use private temporary roots and hermetic shell fixtures. The
+	// production Linux containment path remains bwrap-gated; this environment
+	// marks only the unit fixture as being inside its own containment boundary.
+	t.Setenv("HERD_HERMETIC_CONTAINER", "1")
 	root := t.TempDir()
 	receiptDir := filepath.Join(root, "receipts")
 	var machine *lifecycle.Machine
