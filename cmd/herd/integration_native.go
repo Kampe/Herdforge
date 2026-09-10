@@ -242,7 +242,7 @@ func (n *nativeIntegrationSteps) Execute(ctx context.Context, b harvest.Integrat
 		if moduleErr != nil || strings.TrimSpace(string(module)) != "github.com/Kampe/Herdforge" {
 			return fmt.Errorf("integration: repository has no native Herdforge runtime build contract")
 		}
-		if _, err = nativeIntegrationCommand(ctx, source, 10*time.Minute, "sh", "./scripts/build-herd.sh", "."); err != nil {
+		if _, err = nativeIntegrationCommand(ctx, source, 10*time.Minute, "sh", buildHerdScriptPath, "."); err != nil {
 			return err
 		}
 		_, err = (harvest.HerdRuntimeInstaller{Root: n.root, Source: source, Revision: m.PR.MergeCommit.OID}).Install(ctx)

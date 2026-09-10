@@ -422,6 +422,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "install":
+		if err := runNativeInstall(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "herd install: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "utilization":
 		runUtilizationCommand(os.Args[2:])
 

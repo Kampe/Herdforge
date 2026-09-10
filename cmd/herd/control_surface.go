@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 30
+const controlSurfaceVersion = 31
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "candidate", "capacity", "handoffs", "utilization", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "idle-pool", "kick", "labels", "lane-cut", "worktree-reap", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resource-governor", "review", "review-host", "integrate", "integration-wake", "review-classify", "review-ingest", "review-bind-evidence", "review-complete-record", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "idle-pool", "install", "kick", "labels", "lane-cut", "worktree-reap", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resource-governor", "review", "review-host", "integrate", "integration-wake", "review-classify", "review-ingest", "review-bind-evidence", "review-complete-record", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -110,6 +110,9 @@ func controlSurface() controlSurfaceManifest {
 // or reclassifying a command changes the hash and fails tests until the author
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
+	// 31 composes the native install registration with main's idle-pool
+	// registration in one registry state.
+	31: "46d8af7eb16b60871e23cb7bf202940a7e9e6861efd4fea88e31ade9c7806400",
 	// 30 adds idle-pool: bounded, non-current pool-root discovery and
 	// reclamation via the existing fail-closed Pool.GC primitive.
 	30: "8408a882eaf4a10d0fcea06ae9cf157076a61ec3c72dcd3550b4c025fe5501d6",
