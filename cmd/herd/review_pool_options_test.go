@@ -69,7 +69,7 @@ func TestEveryPoolParsingPassUsesOneSchema(t *testing.T) {
 		{"review_pool.go", "func parseReviewPoolArgs"},
 		{"main.go", "func parseReviewArgs"},
 	}
-	pool := regexp.MustCompile(`fs\.(String|Bool)\("(pool|sha|provider|model|exclude-family|pool-root|surface-root|packet-root|no-launch)"`)
+	pool := regexp.MustCompile(`fs\.(String|Bool)\("(pool|sha|provider|model|exclude-family|pool-root|surface-root|packet-root|no-launch|base)"`)
 	for _, p := range passes {
 		src, err := os.ReadFile(p.file)
 		if err != nil {
@@ -96,7 +96,7 @@ func TestEveryPoolParsingPassUsesOneSchema(t *testing.T) {
 	want := map[string]bool{
 		"allow-unproven-builder": true, "builder-family": true, "exclude-family": true, "model": true,
 		"no-launch": true, "packet-root": true, "pool": true, "pool-root": true,
-		"provider": true, "sha": true, "surface-root": true,
+		"provider": true, "sha": true, "surface-root": true, "base": true,
 	}
 	got := schemaFlagNames(t)
 	seen := map[string]bool{}

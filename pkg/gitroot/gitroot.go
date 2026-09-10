@@ -197,17 +197,35 @@ func RequireAncestor(root, ancestor, descendant string) error {
 
 // RequireAncestorContext retains the caller cancellation boundary for native integration.
 func RequireAncestorContext(ctx context.Context, root, ancestor, descendant string) error {
+	ok, err := IsAncestorContext(ctx, root, ancestor, descendant)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("git ancestry refused: %s is not an ancestor of %s", ancestor, descendant)
+	}
+	return nil
+}
+
+// IsAncestorContext is the canonical reachability predicate. It distinguishes
+// Git's ordinary false result (exit 1) from an unreadable or malformed query.
+func IsAncestorContext(ctx context.Context, root, ancestor, descendant string) (bool, error) {
 	ancestor, descendant = strings.TrimSpace(ancestor), strings.TrimSpace(descendant)
 	if ancestor == "" || descendant == "" {
-		return fmt.Errorf("ancestry requires two commit identities")
+		return false, fmt.Errorf("ancestry requires two commit identities")
 	}
 	args := []string{}
 	if strings.TrimSpace(root) != "" {
 		args = append(args, "-C", root)
 	}
 	args = append(args, "merge-base", "--is-ancestor", ancestor, descendant)
-	if err := exec.CommandContext(ctx, "git", args...).Run(); err != nil {
-		return fmt.Errorf("git ancestry refused: %w", err)
+	err := exec.CommandContext(ctx, "git", args...).Run()
+	if err == nil {
+		return true, nil
 	}
-	return nil
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git ancestry query failed: %w", err)
 }

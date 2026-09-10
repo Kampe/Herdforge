@@ -3,40 +3,50 @@
 package verifier
 
 import (
+	"context"
+	"fmt"
 	"os"
-	"syscall"
-
-	"golang.org/x/sys/unix"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 )
 
-// applyOwnershipContainment puts the ownership supervisor into a new user+PID
-// namespace when the kernel allows it. The supervisor becomes PID 1 inside the
-// namespace; when it exits, the kernel kills every remaining process in that
-// namespace — including setsid/double-fork descendants that left the original
-// process group. Namespace setup is required containment; exec.Start fails
-// closed if the kernel refuses it, and path residual ownership is not a
-// substitute for a missing namespace boundary.
-//
-// Nested unprivileged userns is skipped when HERD_HERMETIC_CONTAINER=1: the
-// outer Docker profile is the isolation boundary, and nested clone(NEWUSER)
-// remains unreliable under cap-drop ALL even with seccomp=unconfined on some
-// engines. Residual marker lineage is the escaped-writer kill authority.
-func applyOwnershipContainment(attr *syscall.SysProcAttr) {
-	if attr == nil {
-		return
-	}
+// ownershipCommand runs the existing lifecycle shell inside the supported
+// Linux ownership bootstrap. bwrap owns user/PID/mount setup; the shell
+// remains the lifecycle supervisor and keeps marker/handshake semantics.
+func ownershipCommand(ctx context.Context, dir string, argv []string) (*exec.Cmd, error) {
 	if os.Getenv(hermeticContainerEnv) == "1" {
-		return
+		return exec.CommandContext(ctx, "sh", argv...), nil
 	}
-	uid := os.Getuid()
-	gid := os.Getgid()
-	attr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWPID
-	attr.UidMappings = []syscall.SysProcIDMap{
-		{ContainerID: 0, HostID: uid, Size: 1},
+	bwrap, err := exec.LookPath("bwrap")
+	if err != nil {
+		return nil, fmt.Errorf("ownership containment requires bwrap: %w", err)
 	}
-	attr.GidMappings = []syscall.SysProcIDMap{
-		{ContainerID: 0, HostID: gid, Size: 1},
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("ownership containment worktree path: %w", err)
 	}
-	// Required for unprivileged user namespaces on many kernels.
-	attr.GidMappingsEnableSetgroups = false
+	uid, gid := os.Getuid(), os.Getgid()
+	bwrapArgs := []string{
+		"--die-with-parent", "--as-pid-1", "--unshare-user", "--unshare-pid",
+		"--uid", strconv.Itoa(uid), "--gid", strconv.Itoa(gid),
+		// Keep the existing filesystem policy. Only namespace mounts change;
+		// command paths, worktree, caches, and temporary files remain visible.
+		"--bind", "/", "/", "--bind", absDir, absDir,
+		"--proc", "/proc", "--dev", "/dev", "--chdir", absDir,
+		"--info-fd", "6", "--",
+		"sh",
+	}
+	if len(argv) >= 3 && argv[2] == "owned-wrap" {
+		bwrapArgs = append(bwrapArgs, argv[:3]...)
+		bwrapArgs = append(bwrapArgs, "--proc-ready")
+		bwrapArgs = append(bwrapArgs, argv[3:]...)
+	} else {
+		bwrapArgs = append(bwrapArgs, argv...)
+	}
+	cmd := exec.CommandContext(ctx, bwrap, bwrapArgs...)
+	cmd.Dir = absDir
+	return cmd, nil
 }
+
+func ownershipInfoExpected() bool { return os.Getenv(hermeticContainerEnv) != "1" }

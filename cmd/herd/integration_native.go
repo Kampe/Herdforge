@@ -422,12 +422,12 @@ func (n *nativeIntegrationSteps) runtimeNeedsFetch(ctx context.Context, landed s
 		}
 		return false, err
 	}
-	ancestor, ancestorErr := gitroot.GitCommitIsAncestor(ctx, n.root, landed, "origin/main")
-	if ancestorErr != nil {
-		return false, ancestorErr
+	onMain, err := gitroot.IsAncestorContext(ctx, n.root, landed, "origin/main")
+	if err != nil {
+		return false, err
 	}
-	if !ancestor {
-		return true, nil
+	if onMain {
+		return false, nil
 	}
-	return false, nil
+	return true, nil
 }

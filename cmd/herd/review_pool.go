@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,9 +15,13 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/reviewack"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/router"
@@ -112,16 +117,21 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("candidate %s is not a commit: %s", sha[:min(12, len(sha))], strings.TrimSpace(string(out)))
 	}
 
-	// FAC-668 correction finding 1: validate the candidate's review contract
-	// against the EXACT candidate tree BEFORE any provenance or pool state
-	// changes. Below this point the launch may record an operator-asserted
-	// builder family (a ledger write), resolve the reviewer route, lease a
-	// slot, EVICT stale occupants, reset the slot --hard and create the
-	// surface symlink. Neither the lease-release defer nor any later cleanup
-	// can un-write a provenance row or undo an eviction. A candidate whose
-	// tree cannot prove the reviewer contract must be refused while every one
-	// of those mutations is still ahead of us.
+	// FAC-668: validate the candidate's repository-owned review contract
+	// before resolving any candidate-owned task context. Contract refusal must
+	// name the missing/unowned path and remain ahead of pool/provenance effects.
 	if err := verifyCandidateTreeContract(root, sha); err != nil {
+		return err
+	}
+
+	// FAC-769: resolve the exact review base from the validated launch pin and
+	// fail closed if it cannot be resolved. The packet must carry the exact
+	// base/head the reviewer is expected to read; an unresolved or invalid base
+	// must refuse generation before any packet/provenance/launch effect. We never
+	// invent a base from the latest parent when the launcher has not resolved a
+	// valid review base.
+	base, err := resolveReviewBase(root, candidateDir, ref, sha, strings.TrimSpace(*opts.Base))
+	if err != nil {
 		return err
 	}
 
@@ -418,7 +428,7 @@ func runPoolReview(ref string) error {
 	if wsErr != nil {
 		packetWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	}
-	packetBody := reviewPacketBody(ref, sha, surface, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
+	packetBody := reviewPacketBody(ref, sha, base, surface, lease.Path, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -489,13 +499,50 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("advance admission phase to spawn: %w", err)
 	}
 	cleanupTab := true
+	// FAC-708: record a fail-closed intent before starting or delivering to the
+	// reviewer. A retirement manifest is authority, not a launch scratchpad; it
+	// must not exist until the cold harness has returned a real model session.
+	// This pending record preserves the exact launch fence and cleanup trail if
+	// startup, delivery, or post-prompt session capture fails.
+	pending := reviewRetirementPendingIntent{
+		Repository:      repositoryIdentityForLaunch(cfg),
+		TaskRef:         ref,
+		CandidateSHA:    sha,
+		Pool:            filepath.ToSlash(poolRelForPending(root, lease.Path)),
+		Slot:            lease.Name,
+		LeaseID:         lease.LeaseID,
+		LeaseGeneration: lease.LeasedAt.UnixNano(),
+		Workspace:       ws,
+		TabID:           tab.ID,
+		PaneID:          tab.Pane.ID,
+		TerminalID:      tab.Pane.TerminalID,
+		TabGeneration:   tab.Generation,
+		Cwd:             filepath.ToSlash(relPathForPending(root, surfaceAbs)),
+		Reviewer:        agentName,
+		Status:          "pending-start",
+	}
+	if err := appendReviewRetirementPending(root, pending); err != nil {
+		return fmt.Errorf("record review retirement pending intent: %w", err)
+	}
+	cleanupPending := func(status, reason string) {
+		pending.Status, pending.Reason = status, reason
+		if err := appendReviewRetirementPending(root, pending); err != nil {
+			fmt.Fprintf(os.Stderr, "review --pool: failed to persist retirement cleanup evidence: %v\n", err)
+		}
+	}
 	defer func() {
 		if cleanupTab {
-			// StartReviewAgent and the prompt path both use the exact tab/name
-			// identity; a failed launch must never leave a pool orphan behind.
-			_ = herdr.CloseReviewTab(tab.ID, agentName)
+			cleanupPending("cleanup-pending", "launch did not produce an authoritative retirement manifest")
+			if err := herdr.CloseReviewTab(tab.ID, agentName); err == nil {
+				cleanupPending("cleanup-complete", "exact tab cleanup completed")
+			} else {
+				cleanupPending("cleanup-failed", err.Error())
+			}
 		}
 	}()
+	if err := verifyReviewLaunchFence(ws, surfaceAbs, *tab, lease, sha); err != nil {
+		return fmt.Errorf("review launch fence: %w", err)
+	}
 	// FAC-576: pass the FLAGS, not the whole argv. herdr's `agent start ... --
 	// <args>` appends these after the harness command it resolves from --kind,
 	// so including argv[0] ran `claude claude --model ...` and the extra
@@ -534,10 +581,10 @@ func runPoolReview(ref string) error {
 	// depending on where the reviewer happens to stand.
 	packetAbs, err := filepath.Abs(packet)
 	if err != nil {
-		return errors.Join(fmt.Errorf("resolve review packet path: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("resolve review packet path: %w", err)
 	}
 	if _, statErr := os.Stat(packetAbs); statErr != nil {
-		return errors.Join(fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr)
 	}
 	// FAC-626: re-verify immediately before the reviewer is actually handed
 	// anything. Tab creation and AwaitInteractiveReady above can take 30+
@@ -545,16 +592,307 @@ func runPoolReview(ref string) error {
 	// is what "before any reviewer is launched against a pooled surface"
 	// means literally, and costs one git call against an already-warm slot.
 	if err := verifySurfaceCandidate(surface, sha); err != nil {
-		return errors.Join(err, herdr.CloseReviewTab(tab.ID, agentName))
+		return err
 	}
 	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packetAbs+" in full.", true, 30*time.Second); err != nil {
-		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("deliver review packet: %w", err)
+	}
+	// FAC-708: the reviewer is now a registered exact retirement target. Record
+	// this only after packet delivery succeeds, while every launch identity is
+	// still available. The record is append-only and repository-relative; the
+	// coordinator later reads it together with the admitted exact-SHA verdict.
+	// Cold Codex/OpenCode assigns agent_session only after the first accepted
+	// model turn. Capture it authoritatively after the single delivery boundary;
+	// never fabricate a session from pane, terminal, timestamp, or revision.
+	launchedAgent, err := awaitNativeReviewerSession(agentName, ws, *tab, 30*time.Second)
+	if err != nil {
+		cleanupPending("cleanup-pending", err.Error())
+		return fmt.Errorf("capture authoritative reviewer session after delivery: %w", err)
+	}
+	pending.Status = "session-bound"
+	pending.SessionID = launchedAgent.Session.Value
+	if err := appendReviewRetirementPending(root, pending); err != nil {
+		return fmt.Errorf("record bound review retirement intent: %w", err)
+	}
+	if err := recordReviewRetirementManifest(root, cfg, providerTask, ref, sha, lease, ws, *tab, agentName, reviewer, packet, surface, launchedAgent); err != nil {
+		return fmt.Errorf("record review retirement manifest: %w", err)
+	}
+	pending.Status = "manifest-recorded"
+	if err := appendReviewRetirementPending(root, pending); err != nil {
+		return fmt.Errorf("record retirement manifest completion: %w", err)
 	}
 	cleanupTab = false
 	releaseOnFailure = false
 	surfaceProvisional = false
 	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s pool=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Pool, reviewer.Family)
+	return nil
+}
+
+type reviewRetirementPendingIntent struct {
+	Repository      string `json:"repository"`
+	TaskRef         string `json:"task_ref"`
+	CandidateSHA    string `json:"candidate_sha"`
+	Pool            string `json:"pool"`
+	Slot            string `json:"slot"`
+	LeaseID         string `json:"lease_id"`
+	LeaseGeneration int64  `json:"lease_generation"`
+	Workspace       string `json:"workspace"`
+	TabID           string `json:"tab_id"`
+	PaneID          string `json:"pane_id"`
+	TerminalID      string `json:"terminal_id"`
+	TabGeneration   string `json:"tab_generation,omitempty"`
+	Cwd             string `json:"cwd"`
+	Reviewer        string `json:"reviewer"`
+	SessionID       string `json:"session_id,omitempty"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+	RecordedAt      string `json:"recorded_at"`
+}
+
+const reviewRetirementPendingFile = ".herd/review/retirement-pending.jsonl"
+
+func poolRelForPending(root, leasePath string) string {
+	poolAbs := filepath.Dir(filepath.Clean(leasePath))
+	if rel, err := filepath.Rel(root, poolAbs); err == nil {
+		return rel
+	}
+	return ""
+}
+
+func relPathForPending(root, path string) string {
+	if rel, err := filepath.Rel(root, path); err == nil {
+		return rel
+	}
+	return ""
+}
+
+func appendReviewRetirementPending(root string, intent reviewRetirementPendingIntent) error {
+	if strings.TrimSpace(intent.Status) == "" || strings.TrimSpace(intent.TabID) == "" || strings.TrimSpace(intent.PaneID) == "" || strings.TrimSpace(intent.TerminalID) == "" {
+		return errors.New("review retirement pending intent lacks exact launch identity")
+	}
+	if strings.TrimSpace(intent.RecordedAt) == "" {
+		intent.RecordedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	p := filepath.Join(root, filepath.FromSlash(reviewRetirementPendingFile))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	body, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(body, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// verifyReviewLaunchFence re-reads the exact tab/pane incarnation immediately
+// before starting the harness. A tab ID alone is reusable; terminal ID, cwd,
+// workspace, and the recorded lease/candidate are the prelaunch fence. Herdr
+// versions without an immutable tab generation leave it unknown rather than
+// substituting a mutable revision or a timestamp.
+func verifyReviewLaunchFence(workspace, cwd string, tab herdr.TabInfo, lease *worktree.PoolSlot, candidateSHA string) error {
+	if lease == nil || strings.TrimSpace(lease.LeaseID) == "" || lease.LeasedAt.IsZero() || strings.TrimSpace(candidateSHA) == "" {
+		return errors.New("prelaunch fence lacks authenticated candidate or lease identity")
+	}
+	if strings.TrimSpace(workspace) == "" || strings.TrimSpace(cwd) == "" || strings.TrimSpace(tab.ID) == "" || strings.TrimSpace(tab.Pane.ID) == "" || strings.TrimSpace(tab.Pane.TerminalID) == "" {
+		return errors.New("prelaunch fence lacks workspace, cwd, tab, pane, or terminal identity")
+	}
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		return fmt.Errorf("prelaunch fence cwd %q is not an existing directory: %v", cwd, err)
+	}
+	panes, err := herdr.PaneList()
+	if err != nil {
+		return fmt.Errorf("prelaunch pane fence: %w", err)
+	}
+	var found *herdr.PaneEntry
+	for i := range panes {
+		if panes[i].PaneID == tab.Pane.ID {
+			copy := panes[i]
+			found = &copy
+			break
+		}
+	}
+	if found == nil {
+		return errors.New("prelaunch fence pane is absent")
+	}
+	if found.TabID != tab.ID || found.Workspace != workspace || found.TerminalID != tab.Pane.TerminalID {
+		return fmt.Errorf("prelaunch pane incarnation changed: tab=%q workspace=%q terminal=%q", found.TabID, found.Workspace, found.TerminalID)
+	}
+	actualCwd := strings.TrimSpace(found.ForegroundCwd)
+	if actualCwd == "" {
+		actualCwd = strings.TrimSpace(found.Cwd)
+	}
+	if actualCwd != "" {
+		actualReal, realErr := filepath.EvalSymlinks(actualCwd)
+		wantReal, wantErr := filepath.EvalSymlinks(cwd)
+		if realErr != nil || wantErr != nil || filepath.Clean(actualReal) != filepath.Clean(wantReal) {
+			return fmt.Errorf("prelaunch cwd changed: want %q got %q", cwd, actualCwd)
+		}
+	}
+	tabs, err := herdr.TabList(workspace)
+	if err != nil {
+		return fmt.Errorf("prelaunch tab fence: %w", err)
+	}
+	for _, live := range tabs {
+		if live.TabID != tab.ID {
+			continue
+		}
+		if live.WorkspaceID != workspace {
+			return errors.New("prelaunch tab workspace changed")
+		}
+		if tab.Generation != "" && live.Generation != "" && live.Generation != tab.Generation {
+			return fmt.Errorf("prelaunch tab generation changed: want %q got %q", tab.Generation, live.Generation)
+		}
+		return nil
+	}
+	return errors.New("prelaunch fence tab is absent")
+}
+
+// awaitNativeReviewerSession waits only for the model-owned session identity
+// that cold Codex/OpenCode emits after its first accepted turn. It never uses
+// a pane, terminal, revision, timestamp, or provisional value as a session.
+func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeout time.Duration) (*herdr.AgentEntry, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	last := "agent session is not assigned until the first model turn"
+	for {
+		a, err := herdr.LookupAgent(name)
+		if err == nil {
+			if a.TabID != tab.ID || a.PaneID != tab.Pane.ID || a.TerminalID != tab.Pane.TerminalID || a.Workspace != workspace {
+				return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
+			}
+			if herdr.RealModelSessionID(a.Session.Value) {
+				return a, nil
+			}
+			last = "agent session remains unavailable after delivery"
+		} else if !errors.Is(err, herdr.ErrAgentNotFound) {
+			last = err.Error()
+		}
+		if !time.Now().Before(deadline) {
+			return nil, errors.New(last)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func recordReviewRetirementManifest(root string, cfg *config.Config, task *provider.Task, ref, sha string, lease *worktree.PoolSlot, workspace string, tab herdr.TabInfo, agentName string, reviewer poolReviewer, packet, surface string, launchedAgent *herdr.AgentEntry) error {
+	if lease == nil || task == nil {
+		return errors.New("review retirement manifest requires task and pool lease")
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	worktreeAbs, err := filepath.Abs(lease.Path)
+	if err != nil {
+		return err
+	}
+	packetAbs, err := filepath.Abs(packet)
+	if err != nil {
+		return err
+	}
+	worktreeRel, err := filepath.Rel(rootAbs, worktreeAbs)
+	if err != nil || filepath.IsAbs(worktreeRel) || strings.HasPrefix(worktreeRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement worktree escaped repository root")
+	}
+	packetRel, err := filepath.Rel(rootAbs, packetAbs)
+	if err != nil || filepath.IsAbs(packetRel) || strings.HasPrefix(packetRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement prompt escaped repository root")
+	}
+	packetBody, err := os.ReadFile(packetAbs)
+	if err != nil {
+		return fmt.Errorf("read review prompt for retirement binding: %w", err)
+	}
+	poolAbs, err := filepath.Abs(filepath.Dir(lease.Path))
+	if err != nil {
+		return err
+	}
+	poolRel, err := filepath.Rel(rootAbs, poolAbs)
+	if err != nil || filepath.IsAbs(poolRel) || strings.HasPrefix(poolRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement pool escaped repository root")
+	}
+	base, err := exec.Command("git", "-C", rootAbs, "merge-base", sha, "origin/main").Output()
+	if err != nil {
+		return fmt.Errorf("resolve review base: %w", err)
+	}
+	baseSHA := strings.TrimSpace(string(base))
+	if len(baseSHA) != 40 || strings.Trim(baseSHA, "0123456789abcdefABCDEF") != "" {
+		return fmt.Errorf("resolve review base returned invalid sha %q", baseSHA)
+	}
+	if strings.TrimSpace(tab.ID) == "" || strings.TrimSpace(tab.Pane.ID) == "" || strings.TrimSpace(tab.Pane.TerminalID) == "" {
+		return errors.New("review retirement manifest requires exact tab, pane, and terminal identity")
+	}
+	generation := strings.TrimSpace(tab.Generation)
+	if generation == "" {
+		// Legacy Herdr does not expose a tab generation. Keep the exact
+		// authenticated lease nonce as the manifest attempt identity; never
+		// invent a tab generation from a mutable counter or timestamp.
+		generation = lease.LeaseID
+	}
+	// Current Herdr agent-get/list payloads do not expose immutable tab
+	// generation. Preserve that uncertainty explicitly; terminal_id plus the
+	// authenticated agent session is the supported legacy incarnation binding.
+	sessionGeneration := ""
+	if cfg == nil {
+		return errors.New("review retirement manifest requires launch configuration")
+	}
+	reviewRef := herdr.ReviewRefPrefix + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	if _, err := exec.Command("git", "-C", rootAbs, "update-ref", reviewRef, sha, "").CombinedOutput(); err != nil {
+		return fmt.Errorf("create exact owned review ref: %w", err)
+	}
+	refCreated := true
+	defer func() {
+		if refCreated {
+			_, _ = exec.Command("git", "-C", rootAbs, "update-ref", "-d", reviewRef, sha).CombinedOutput()
+		}
+	}()
+	surfaceAbs, err := filepath.Abs(surface)
+	if err != nil {
+		return err
+	}
+	surfaceRel, err := filepath.Rel(rootAbs, surfaceAbs)
+	if err != nil || filepath.IsAbs(surfaceRel) || strings.HasPrefix(surfaceRel, ".."+string(filepath.Separator)) {
+		return errors.New("review retirement surface escaped repository root")
+	}
+	m := herdr.NewReviewRetirementManifest(time.Now(), herdr.ReviewRetirementManifest{
+		Repository: repositoryIdentityForLaunch(cfg), TaskRef: ref, TaskID: task.ID,
+		CandidateSHA: sha, BaseSHA: baseSHA, Branch: reviewRef,
+		Worktree: filepath.ToSlash(worktreeRel), Pool: filepath.ToSlash(poolRel), Slot: lease.Name,
+		LeaseGeneration: lease.LeasedAt.UnixNano(), Workspace: workspace, TabID: tab.ID, PaneID: tab.Pane.ID,
+		TerminalID: tab.Pane.TerminalID, SessionID: launchedAgent.Session.Value, SessionGeneration: sessionGeneration, Reviewer: agentName,
+		ReviewerFamily: reviewer.Family, ReviewerModel: reviewer.Model, PromptArtifact: filepath.ToSlash(packetRel), PromptDigest: reviewack.ArtifactDigest(packetBody), Surface: filepath.ToSlash(surfaceRel), ReviewRef: reviewRef,
+		Generation: generation, Nonce: lease.LeaseID,
+	})
+	registry := herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(rootAbs)}
+	manifestRel := filepath.ToSlash(filepath.Join(".herd", "review", "manifests", generation+".json"))
+	m.ManifestArtifact = manifestRel
+	m.BindingDigest = herdr.ReviewRetirementBindingDigest(m)
+	manifestPath := filepath.Join(rootAbs, filepath.FromSlash(manifestRel))
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		return err
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(manifestPath, append(body, '\n'), 0o600); err != nil {
+		return err
+	}
+	if err := registry.Record(m); err != nil {
+		_ = os.Remove(manifestPath)
+		return err
+	}
+	refCreated = false
 	return nil
 }
 
@@ -975,6 +1313,7 @@ type poolReviewOptions struct {
 	SurfaceRoot          *string
 	PacketRoot           *string
 	NoLaunch             *bool
+	Base                 *string
 	AllowUnprovenBuilder *bool
 	BuilderFamily        *string
 }
@@ -1002,6 +1341,7 @@ func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 		SurfaceRoot: fs.String("surface-root", filepath.Join(".herd", "review-surfaces"), "Review surface symlink root"),
 		PacketRoot:  fs.String("packet-root", filepath.Join(".herd", "review-packets"), "Review packet root"),
 		NoLaunch:    fs.Bool("no-launch", false, "Prepare and print the surface without starting Herdr"),
+		Base:        fs.String("base", "", "Exact reviewed base commit; required when the candidate has no authenticated task context"),
 		BuilderFamily: fs.String("builder-family", "",
 			"Assert the candidate's builder family and RECORD it, so the resulting verdict is admissible."),
 		// Retained as an accepted no-op: FAC-627 made unprovable candidates
@@ -1098,7 +1438,17 @@ func resolvePoolReviewer(provider, model, excludeFamily string) (poolReviewer, e
 	// launch was 1.4s. The reading's age is reported rather than hidden, because
 	// routing on quota that is silently minutes old can spend a request against a
 	// surface that has since gone to zero.
-	snap, age, err := usage.FetchSnapshotCached()
+	var snap *usage.UsageSnapshot
+	var age time.Duration
+	var err error
+	if strings.TrimSpace(provider) != "" {
+		// An explicit provider is already a routing decision. Acquire only that
+		// native authority so a Claude review cannot trigger unrelated AGY/Grok
+		// requests or fail because an unused account is unavailable.
+		snap, err = usage.FetchProviderModelForce(provider, model, false)
+	} else {
+		snap, age, err = usage.FetchSnapshotCached()
+	}
 	if err == nil {
 		if age > 0 {
 			fmt.Printf("using quota reading from %s ago\n", age.Round(time.Second))
@@ -1395,6 +1745,56 @@ func completeReviewLaunchProvenance(root, ref, sha, leaseID, packetTask string) 
 	})
 }
 
+// resolveReviewBase resolves the exact base the candidate is reviewed against.
+//
+// FAC-769: the packet must carry the exact reviewed-base/head from the
+// authenticated launch pin, never a base invented from ambient origin/main.
+// An authenticated candidate task context is preferred; an explicit base is
+// the only fallback. An unresolved or invalid base fails closed before any
+// packet/provenance/launch effect.
+func resolveReviewBase(root, candidateDir, ref, sha, explicitBase string) (string, error) {
+	authenticatedBase := ""
+	if strings.TrimSpace(candidateDir) != "" {
+		tc, err := dispatch.ReadTaskContext(candidateDir)
+		if err == nil {
+			verifier, verifyErr := dispatch.LoadVerifier(root)
+			if verifyErr != nil {
+				return "", fmt.Errorf("resolve review base for %s: load candidate receipt verifier: %w", shortSHA(sha), verifyErr)
+			}
+			if verifyErr := verifier.Verify(tc); verifyErr != nil {
+				return "", fmt.Errorf("resolve review base for %s: authenticate candidate task context: %w", shortSHA(sha), verifyErr)
+			}
+			if !strings.EqualFold(strings.TrimSpace(tc.TaskRef), strings.TrimSpace(ref)) {
+				return "", fmt.Errorf("resolve review base for %s: authenticated task context ref %q does not match %q", shortSHA(sha), tc.TaskRef, ref)
+			}
+			if tc.CandidateSHA != "" && !strings.EqualFold(strings.TrimSpace(tc.CandidateSHA), strings.TrimSpace(sha)) {
+				return "", fmt.Errorf("resolve review base for %s: authenticated task context candidate %q does not match", shortSHA(sha), tc.CandidateSHA)
+			}
+			authenticatedBase = strings.TrimSpace(tc.BaseSHA)
+		} else if !errors.Is(err, os.ErrNotExist) || strings.TrimSpace(explicitBase) == "" {
+			return "", fmt.Errorf("resolve review base for %s: candidate has no authenticated task context: %w", shortSHA(sha), err)
+		}
+	}
+
+	base := authenticatedBase
+	if strings.TrimSpace(explicitBase) != "" {
+		if base != "" && !strings.EqualFold(base, strings.TrimSpace(explicitBase)) {
+			return "", fmt.Errorf("resolve review base for %s: explicit base %s contradicts authenticated base %s", shortSHA(sha), shortSHA(explicitBase), shortSHA(base))
+		}
+		base = strings.TrimSpace(explicitBase)
+	}
+	if len(base) != 40 {
+		return "", fmt.Errorf("resolve review base for %s: unresolved or invalid base %q", shortSHA(sha), base)
+	}
+	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", base+"^{commit}").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("resolve review base for %s: base %s is not a commit: %s", shortSHA(sha), shortSHA(base), strings.TrimSpace(string(out)))
+	}
+	if err := gitroot.RequireAncestor(root, base, sha); err != nil {
+		return "", fmt.Errorf("resolve review base for %s: base %s is not an ancestor of the candidate: %w", shortSHA(sha), shortSHA(base), err)
+	}
+	return base, nil
+}
+
 // candidatePatchIdentity computes the stable patch id for a candidate against
 // its merge base. Verified stable across a clean rebase, which is the property
 // the admission binding depends on.
@@ -1624,7 +2024,7 @@ func liveAgentByPrefix(prefixes ...string) string {
 	return ""
 }
 
-func reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
+func reviewPacketBody(ref, sha, base, surface, poolSlotPath, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
@@ -1632,7 +2032,7 @@ Your cwd is an isolated review surface. Every command you run must stay inside i
 NEVER run git, or any command that writes, against the canonical shared checkout.
 
 The Surface path below is a SYMLINK into your exclusive leased warm-pool slot
-(.herd/pool/pool-NN). That alias is intentional: herd review --pool leases one
+(%s). That alias is intentional: herd review --pool leases one
 clean slot, pins the candidate there, and points the surface at that same tree.
 Seeing the symlink resolve to your own pool cwd is NOT a broken isolation
 contract and is NOT shared main. Isolation means exclusive lease + pool
@@ -1640,7 +2040,7 @@ worktree, not "surface path string differs from cwd".
 
 git rev-parse --show-toplevel resolves THROUGH the symlink to the pool
 worktree path. That is correct. Fail closed only if toplevel is the canonical
-shared checkout (the repo root that is not under .herd/pool/). Comparing
+shared checkout (the repo root that is not under the pool root). Comparing
 toplevel to the literal Surface symlink string and calling a match
 "non-isolated" is a false positive.
 
@@ -1653,7 +2053,7 @@ and a coordinator had to restore it by hand.
 
 If you swap a file to prove non-vacuity:
   1. confirm where you are first: git rev-parse --show-toplevel
-     it MUST resolve under .herd/pool/ (your leased slot). If it names the
+     it MUST resolve under the pool root (your leased slot). If it names the
      shared checkout root, STOP.
   2. prefer /tmp or an untracked scratch file; if you must swap a tracked file
      inside the pool, do the swap, run the test, then restore: git checkout -- <path>
@@ -1662,8 +2062,15 @@ Never pass -C, --git-dir or --work-tree pointing outside your surface/pool, and
 never cd out of it to run a build or test. If something seems to require the
 shared checkout, that is a finding to report, not a step to take.
 
+The ONLY operations permitted outside your source surface are:
+  * writing your verdict artifact to the canonical inbox path below, and
+  * transporting that verdict home (verdict-push or mail) as instructed below.
+Everything else — every git command, build, and test — stays inside your
+exclusive leased pool slot.
+
 Candidate: %s
 Surface: %s
+Leased slot: %s
 
 Read .herd/prompts/reviewer.md and .herd/prompts/review-verdict.template.md from
 the candidate surface and inspect only this candidate. These paths are
@@ -1689,6 +2096,7 @@ reviewer: <your lane name — never a coordinator>
 reviewer-family: <your VENDOR family — see the exact list below>
 builder-family: %s
 verdict: PASS|FAIL|BLOCKED
+reviewed-base: %s
 reviewed-head: <output of git rev-parse HEAD in the tree you actually read>
 ---
 
@@ -1698,6 +2106,11 @@ that disagrees with the ledger is refused as a launch/verdict identity conflict.
 If it reads "unproven", this review was dispatched with
 --allow-unproven-builder and its verdict will need hand admission -- say so in
 your evidence.
+
+The reviewed-base above is PREFILLED from the exact launch pin. Review the whole
+range from that base to the candidate head; do not start partway through. A
+verdict whose reviewed-base is a strict descendant of this base is refused as
+covering less than the candidate spans.
 
 FAMILY VALUES ARE A CLOSED SET. Use exactly one of:
 
@@ -1729,7 +2142,7 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, sha, surface, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+`, ref, poolSlotPath, sha, surface, poolSlotPath, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), base, reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing

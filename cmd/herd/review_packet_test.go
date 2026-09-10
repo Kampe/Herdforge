@@ -10,7 +10,7 @@ import (
 )
 
 func packetBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace string) string {
-	return reviewPacketBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace, ref)
+	return reviewPacketBody(ref, sha, "base", surface, ".herd/pool/pool-01", verdictPath, supervisor, builderFamily, workspace, ref)
 }
 
 // FAC-583: the packet used to ask for "the required verdict artifact" without
@@ -72,7 +72,8 @@ func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.selector, func(t *testing.T) {
 			body := reviewPacketBody(tt.selector, "a0a0704dde900000000000000000000000000000",
-				".herd/review-surfaces/review-a0a0704dde90",
+				"base", ".herd/review-surfaces/review-a0a0704dde90",
+				".herd/pool/pool-01",
 				"/repo/.herd/review/inbox/a0a0704dde90-review.md",
 				"forge-review-supervisor-4922de28", "xai", "wK", tt.card)
 			if tt.selector != tt.card && strings.Contains(body, "\ntask: "+tt.selector+"\n") {
@@ -89,7 +90,7 @@ func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
 }
 
 func TestReviewPacketNamesRepositoryOwnedContractPaths(t *testing.T) {
-	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "surface", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-668")
+	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "base", "surface", ".herd/pool/pool-01", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-668")
 	for _, path := range []string{".herd/prompts/reviewer.md", ".herd/prompts/review-verdict.template.md"} {
 		if !strings.Contains(body, path) {
 			t.Errorf("packet must name candidate-owned contract path %q", path)

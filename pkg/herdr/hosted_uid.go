@@ -320,7 +320,7 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 			ProcessInfo struct {
 				PaneID                   string `json:"pane_id"`
 				ShellPID                 int    `json:"shell_pid"`
-				ForegroundProcessGroupID int    `json:"foreground_process_group_id"`
+				ForegroundProcessGroupID *int   `json:"foreground_process_group_id"`
 				// Pointer so null vs [] is distinguishable (fail closed on null).
 				ForegroundProcesses *[]struct {
 					PID  int      `json:"pid"`
@@ -338,9 +338,11 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 		return nil, fmt.Errorf("%w: pane process-info returned nil foreground inventory", ErrHostedUIDProofFailed)
 	}
 	info := &HostedPaneIdentity{
-		PaneID:         resp.Result.ProcessInfo.PaneID,
-		ShellPID:       resp.Result.ProcessInfo.ShellPID,
-		ProcessGroupID: resp.Result.ProcessInfo.ForegroundProcessGroupID,
+		PaneID:   resp.Result.ProcessInfo.PaneID,
+		ShellPID: resp.Result.ProcessInfo.ShellPID,
+	}
+	if resp.Result.ProcessInfo.ForegroundProcessGroupID != nil {
+		info.ProcessGroupID = *resp.Result.ProcessInfo.ForegroundProcessGroupID
 	}
 	byPID := map[int]*HostedProcessIdentity{}
 	// required=true: shell/foreground must be observable. required=false: pgid/
@@ -405,17 +407,19 @@ func GetHostedPaneIdentity(paneID string) (*HostedPaneIdentity, error) {
 	}
 	// Process-group members: reported PGID > 1 must be usable. Silent skip
 	// when ValidatePGID fails would drop prior HIGH #3 coverage.
-	if info.ProcessGroupID > 1 {
+	if resp.Result.ProcessInfo.ForegroundProcessGroupID != nil {
 		if err := procsignal.ValidatePGID(info.ProcessGroupID); err != nil {
 			return nil, fmt.Errorf("%w: hosted process group %d unusable: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
 		}
-		members, err := listPGIDMembers(info.ProcessGroupID)
-		if err != nil {
-			return nil, fmt.Errorf("%w: process-group members pgid %d: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
-		}
-		for _, pid := range members {
-			if err := add(pid, "pgid", false); err != nil {
-				return nil, err
+		if info.ProcessGroupID > 1 {
+			members, err := listPGIDMembers(info.ProcessGroupID)
+			if err != nil {
+				return nil, fmt.Errorf("%w: process-group members pgid %d: %v", ErrHostedUIDProofFailed, info.ProcessGroupID, err)
+			}
+			for _, pid := range members {
+				if err := add(pid, "pgid", false); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}

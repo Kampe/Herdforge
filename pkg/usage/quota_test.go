@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 )
@@ -418,6 +419,97 @@ func TestComputeAll_NilSnapshot(t *testing.T) {
 	computed := e.ComputeAll(nil)
 	if computed != nil {
 		t.Error("nil snapshot should return nil")
+	}
+}
+
+func TestComputeBindingNormalizesRequestsAndUSD(t *testing.T) {
+	prov := ProviderUsage{Account: &AccountIdentity{Key: "acct", Provenance: "fixture"}, Resources: map[string]ResourceUsage{
+		"requests": {Kind: "consumption", Unit: "requests", Used: 25, Limit: 100, Remaining: 75, Pool: "default", WindowSeconds: WindowWeekly, ResetsAt: "2099-01-01T00:00:00Z"},
+		"budget":   {Kind: "consumption", Unit: "usd", Used: 4, Limit: 10, Remaining: 6, Pool: "premium", WindowSeconds: Window5h, ResetsAt: "2099-01-01T00:00:00Z"},
+	}}
+	bs := computeBinding(prov, nil, DefaultExhaustedPct, freezeTime())
+	if bs == nil || len(bs.Windows) != 2 {
+		t.Fatalf("normalized non-percent resources missing: %+v", bs)
+	}
+	if bs.Windows[0].Unit != "requests" && bs.Windows[1].Unit != "requests" {
+		t.Fatal("request unit provenance was lost")
+	}
+	if bs.Windows[0].Account == nil || bs.Windows[1].Account == nil {
+		t.Fatal("account provenance was lost")
+	}
+	for _, window := range bs.Windows {
+		if window.Used < 0 || window.Used > 100 {
+			t.Fatalf("normalized usage out of bounds: %+v", window)
+		}
+	}
+	invalid := ProviderUsage{Resources: map[string]ResourceUsage{"nan": {Unit: "usd", Used: math.NaN(), Limit: 10, WindowSeconds: Window5h}}}
+	if got := computeBinding(invalid, nil, DefaultExhaustedPct, freezeTime()); got != nil {
+		t.Fatalf("non-finite budget became routable: %+v", got)
+	}
+}
+
+func TestComputeAllPublicFixtureCoversEveryNativeProvider(t *testing.T) {
+	future := "2099-01-01T00:00:00Z"
+	percent := func(used float64) ResourceUsage {
+		return ResourceUsage{Kind: "consumption", Unit: "percent", Used: used, Limit: 100, Remaining: 100 - used, WindowSeconds: WindowWeekly, ResetsAt: future}
+	}
+	request := func(used float64) ResourceUsage {
+		return ResourceUsage{Kind: "consumption", Unit: "requests", Used: used, Limit: 100, Remaining: 100 - used, WindowSeconds: WindowWeekly, ResetsAt: future}
+	}
+	usd := func(used float64) ResourceUsage {
+		return ResourceUsage{Kind: "consumption", Unit: "usd", Used: used, Limit: 100, Remaining: 100 - used, WindowSeconds: WindowWeekly, ResetsAt: future}
+	}
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{
+		"claude": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "codex": {Resources: map[string]ResourceUsage{"weekly": percent(100)}},
+		"gemini": {Resources: map[string]ResourceUsage{"weekly": request(10)}}, "grok": {Resources: map[string]ResourceUsage{"weekly": percent(100)}},
+		"antigravity": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "litellm": {Resources: map[string]ResourceUsage{"weekly": usd(10)}},
+		"opencode": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "ollama": {Resources: map[string]ResourceUsage{"weekly": percent(10)}}, "kimi": {Resources: map[string]ResourceUsage{"weekly": request(100)}},
+	}}
+	computed := newTestEngine().ComputeAll(snap)
+	for _, provider := range []string{"claude", "gemini", "antigravity", "litellm", "opencode", "ollama"} {
+		if !computed[provider].Available {
+			t.Errorf("%s fixture should be available: %+v", provider, computed[provider])
+		}
+	}
+	for _, provider := range []string{"codex", "grok", "kimi"} {
+		if computed[provider].Available || computed[provider].Reason != "exhausted" {
+			t.Errorf("%s fixture should be exhausted: %+v", provider, computed[provider])
+		}
+	}
+	if _, ok := computed["missing"]; ok {
+		t.Fatal("missing provider must remain unavailable/unknown")
+	}
+}
+
+func TestComputeAllKeepsFiniteLiteLLMBudgetWithoutReset(t *testing.T) {
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{
+		"opencode": {
+			Account: identity("litellm", "lazer-gemini", "litellm:key-info:key_name"),
+			Resources: map[string]ResourceUsage{
+				"budget": {Kind: "consumption", State: "active", Pool: "default", Unit: "usd", Limit: 100, Used: 0, Remaining: 100},
+			},
+		},
+	}}
+	computed := newTestEngine().ComputeAll(snap)
+	state, ok := computed["opencode"]
+	if !ok || !state.Available {
+		t.Fatalf("finite authenticated budget without reset must remain routable: ok=%v state=%+v", ok, state)
+	}
+	if state.Reason != "ok" || state.Remaining != 100 || len(state.Windows) != 1 || state.Windows[0].Account == nil {
+		t.Fatalf("finite LiteLLM budget lost binding or capacity: %+v", state)
+	}
+}
+
+func TestComputeAllKeepsAuthenticatedLiteLLMUnmeteredState(t *testing.T) {
+	snap := &UsageSnapshot{Providers: map[string]ProviderUsage{
+		"opencode": {
+			Status:  "unmetered",
+			Account: identity("litellm", "lazer-unmetered", "litellm:key-info:key_name"),
+		},
+	}}
+	state, ok := newTestEngine().ComputeAll(snap)["opencode"]
+	if !ok || !state.Available || state.Reason != "unmetered-authenticated" || state.Account == nil {
+		t.Fatalf("authenticated unmetered LiteLLM state was not routable: ok=%v state=%+v", ok, state)
 	}
 }
 

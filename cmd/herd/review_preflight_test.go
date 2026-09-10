@@ -59,6 +59,24 @@ func TestPreflightRefusesUnreadyReviewer(t *testing.T) {
 	}
 }
 
+// TestPreflightOpenCodeProbeError verifies that a native OpenCode reviewer passes
+// the auth gate and fails cleanly at the secondary probe when pointed at an unroutable model,
+// with no lease or tab created.
+func TestPreflightOpenCodeProbeError(t *testing.T) {
+	err := preflightReviewerReadiness(poolReviewer{
+		Kind: "opencode", Provider: "definitely-not-a-provider", Model: "no-such-model",
+	})
+	if err == nil {
+		t.Fatal("probe failure must be refused")
+	}
+	msg := err.Error()
+	for _, want := range []string{"definitely-not-a-provider", "no-such-model", "failed a request in this process", "No lease or tab was created"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal must mention %q, got: %v", want, msg)
+		}
+	}
+}
+
 // FAC-579 corrected this test's premise.
 //
 // It used to require that the preflight "execute a request" and forbid any

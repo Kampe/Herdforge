@@ -668,8 +668,8 @@ func printUsage() {
 	fmt.Println("  legacy-receipts  Audit/tombstone receiptless legacy in-progress tasks (fail-closed)")
 	fmt.Println("  standing   Raise/status/shutdown declarative standing control roles")
 	fmt.Println("  daemon     Start the long-running orchestration daemon (infinite pulse loop)")
-	fmt.Println("  usage      Show harness quota usage from OpenUsage CLI")
-	fmt.Println("  quota      Show binding headroom, pace/pressure, pool breakdown")
+	fmt.Println("  usage      Show harness quota usage from native provider pollers")
+	fmt.Println("  quota      Show binding headroom, pace/pressure, pool breakdown (--limits: raw native limits JSON)")
 	fmt.Println("  up         Start a single agent lane (herd up <lane-name>)")
 	fmt.Println("  activate   Bring up all deployables + health-check gate (compose + /v1/status)")
 	fmt.Println("  validate-config  Validate .herd/herd.yaml configuration")
@@ -700,7 +700,7 @@ func printUsage() {
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
 	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
 	fmt.Println("  command         Run a root-authorized command under a durable attempt budget")
-	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; no OpenCode)")
+	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; native auth diagnose, no OpenCode broker)")
 	fmt.Println("  control        Issue/drain authenticated control envelopes (FAC-133)")
 	fmt.Println("  netbroker-serve Durable network allowlist broker process (FAC-133)")
 	fmt.Println("  transcript      Read a lane's recent output and final handoff (read-only)")
@@ -1483,6 +1483,7 @@ func runUsage() {
 func runQuota() {
 	fs := flag.NewFlagSet("quota", flag.ExitOnError)
 	wantJSON := fs.Bool("json", false, "Output JSON")
+	limitsMode := fs.Bool("limits", false, "Emit the raw native limits snapshot as JSON (schema herd.quota.limits.v1) for external consumers")
 	pickMode := fs.Bool("pick", false, "Pick best provider")
 	among := fs.String("among", "", "Comma-separated providers for --pick (default: codex,claude)")
 	oneProvider := fs.String("provider", "", "Query one provider")
@@ -1491,9 +1492,17 @@ func runQuota() {
 	// discarded and pkg/usage exposes no bypass, so the flag never did anything.
 	// Accepted for compatibility with existing call sites, and now says so
 	// rather than promising a behaviour that does not exist.
-	_ = fs.Bool("force", false, "Accepted for compatibility; IGNORED (no openusage cache bypass exists)")
+	force := fs.Bool("force", false, "Bypass persistent and in-process quota caches for this request")
 	exhaustedPct := fs.Float64("exhausted-at", usage.DefaultExhaustedPct, "Exhausted threshold percent")
 	fs.Parse(os.Args[2:])
+
+	// --limits is the portable raw-quota surface (FAC-786): what was read, from
+	// which native endpoint, for which opaque account, how old, and exactly why
+	// any attempted provider failed. The BurnState output below is unchanged.
+	if *limitsMode {
+		runQuotaLimits(*oneProvider, *force)
+		return
+	}
 
 	e := usage.NewQuotaEngine()
 	e.ExhaustedPct = *exhaustedPct
@@ -1672,6 +1681,40 @@ func orEmpty(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// runQuotaLimits emits the portable limits document (herd.quota.limits.v1) for
+// external consumers such as the dotfiles quota wrappers. Exit codes are part
+// of the contract: 0 = at least one provider reading; 1 = no provider could be
+// polled (the JSON still carries per-provider reasons); 4 = --provider named a
+// provider with no reading.
+func runQuotaLimits(oneProvider string, force bool) {
+	var snap *usage.UsageSnapshot
+	var age time.Duration
+	var err error
+	if p := strings.TrimSpace(oneProvider); p != "" {
+		snap, err = usage.FetchProviderForce(p, force)
+	} else {
+		snap, age, err = usage.FetchSnapshotCachedForce(force)
+	}
+	if snap == nil {
+		// The snapshot itself was unobtainable (e.g. an unreadable fixture
+		// file); there is no provider attribution to report.
+		fmt.Fprintf(os.Stderr, "quota: %v\n", err)
+		os.Exit(1)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(snap.LimitsReport(age)); err != nil {
+		fmt.Fprintf(os.Stderr, "quota: encode limits: %v\n", err)
+		os.Exit(1)
+	}
+	switch {
+	case err == nil:
+		return
+	case strings.TrimSpace(oneProvider) != "":
+		os.Exit(4)
+	default:
+		os.Exit(1)
+	}
 }
 
 func runDaemon() {
@@ -3871,7 +3914,14 @@ func approveOne(ctx context.Context, cfg *config.Config, tp provider.TaskProvide
 	}
 	receipt := req.Receipt
 	repository := dispatch.RepositoryIdentityOrName(root, cfg.Project.Name)
-	approvalTask, err := resolveTaskByRef(ctx, tp, cfg.TaskProvider.ProjectID, ref)
+	// FAC-783: authenticate the receipt BEFORE any locator derived from it is
+	// consumed — ResolveDoneTask reads the provider with the receipt's own
+	// task id, so the digest, repository, lifecycle, and integration proof
+	// must be proven before that read happens.
+	if err := hsync.AuthenticateDoneReceipt(req, root, ref); err != nil {
+		return nil, err
+	}
+	approvalTask, err := hsync.ResolveDoneTask(ctx, tp, req)
 	if err != nil {
 		return nil, err
 	}
@@ -4561,10 +4611,14 @@ func runHerdrDeliver() {
 // deterministic receipts/counts. Dry-run is report-only.
 func runCleanup() {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
-	dryRun := fs.Bool("dry-run", false, "List what would be closed without closing")
+	dryRun := fs.Bool("dry-run", true, "List what would be closed without closing (default)")
+	act := fs.Bool("act", false, "Apply bounded exact cleanup mutations")
 	asJSON := fs.Bool("json", false, "Output JSON")
 	applyVerifyStacks := fs.Bool("reap-verify-stacks", false, "Actually reap eligible verify-harness Compose stacks (default is report-only)")
 	fs.Parse(os.Args[2:])
+	if *act {
+		*dryRun = false
+	}
 
 	if !herdr.IsAvailable() {
 		fmt.Fprintf(os.Stderr, "herd cleanup: herdr CLI not found\n")
@@ -4588,22 +4642,32 @@ func runCleanup() {
 	}
 	res, err := herdr.CleanupFencedInWorkspace(workspace, standing, *dryRun)
 	res.Repository = repository
+	reviewReport, reviewErr := runReviewRetirementCleanup(context.Background(), repository, *dryRun)
+	if err == nil {
+		err = reviewErr
+	}
+	sourceReport, sourceErr := runSourceRetirementCleanup(context.Background(), repository, *dryRun)
+	if err == nil {
+		err = sourceErr
+	}
 	stackReport, stackErr := runRepoVerifyReaper(context.Background(), repository, *applyVerifyStacks && !*dryRun)
 	if err == nil {
 		err = stackErr
 	}
 	if *asJSON {
 		out := map[string]interface{}{
-			"dry_run":       res.DryRun,
-			"workspace":     res.Workspace,
-			"repository":    res.Repository,
-			"candidates":    res.Candidates,
-			"attempts":      res.Attempts,
-			"closed":        res.Closed,
-			"blocked":       res.Blocked,
-			"errored":       res.Errored,
-			"error_count":   len(res.Attempts) - res.Closed - res.Blocked,
-			"verify_reaper": stackReport,
+			"dry_run":           res.DryRun,
+			"workspace":         res.Workspace,
+			"repository":        res.Repository,
+			"candidates":        res.Candidates,
+			"attempts":          res.Attempts,
+			"closed":            res.Closed,
+			"blocked":           res.Blocked,
+			"errored":           res.Errored,
+			"error_count":       len(res.Attempts) - res.Closed - res.Blocked,
+			"verify_reaper":     stackReport,
+			"review_retirement": reviewReport,
+			"source_retirement": sourceReport,
 		}
 		if err != nil {
 			out["error"] = err.Error()
@@ -4620,6 +4684,12 @@ func runCleanup() {
 			for _, c := range res.Candidates {
 				fmt.Printf("herd cleanup: would close %s (tab %s) — %s\n", c.Name, c.TabID, c.Reason)
 			}
+			for _, c := range reviewReport.Candidates {
+				fmt.Printf("herd cleanup: would retire review generation=%s tab=%s worktree=%s ref=%s prompt=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.ReviewRef, c.Manifest.PromptArtifact, c.Decision.Reason)
+			}
+			for _, c := range sourceReport.Candidates {
+				fmt.Printf("herd cleanup: would retire source generation=%s tab=%s worktree=%s ref=%s sha=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.TaskRef, c.Manifest.CandidateSHA, c.Decision.Reason)
+			}
 		} else {
 			for _, att := range res.Attempts {
 				switch att.Outcome {
@@ -4635,6 +4705,12 @@ func runCleanup() {
 				fmt.Printf("herd cleanup: closed=%d blocked=%d errored=%d candidates=%d\n",
 					res.Closed, res.Blocked, res.Errored, len(res.Candidates))
 			}
+		}
+		if !res.DryRun && len(reviewReport.Candidates) > 0 {
+			fmt.Printf("herd cleanup: review-retirement retired=%d blocked=%d failed=%d candidates=%d\n", reviewReport.Retired, reviewReport.Blocked, reviewReport.Failed, len(reviewReport.Candidates))
+		}
+		if !res.DryRun && len(sourceReport.Candidates) > 0 {
+			fmt.Printf("herd cleanup: source-retirement retired=%d blocked=%d failed=%d candidates=%d\n", sourceReport.Retired, sourceReport.Blocked, sourceReport.Failed, len(sourceReport.Candidates))
 		}
 		if stackReport.Output != "" {
 			fmt.Printf("herd cleanup: verify reaper: %s\n", stackReport.Output)
@@ -6513,6 +6589,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 		}
 	}
 	pinnedBuilder := role == router.RoleWorker || role == router.RoleForgeSmith || role == router.RoleRecovery
+	hardPin := pinnedBuilder && !lane.Standing
 	request := router.LaunchRequest{LaneName: strings.TrimSpace(lane.Name), Role: router.Role(strings.TrimSpace(lane.Role)), NativeRole: role, Shape: shape, TaskRef: contextRef, Scope: scope, Risk: classify.TierR1}
 	request.Standing = lane.Standing
 	if pinnedBuilder {
@@ -6554,9 +6631,18 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	// made codex unreachable from every lane whose configured model was not
 	// itself the probe-gated one.
 	if productionMode() {
-		candidates, wfErr := router.Waterfall(shape)
-		if wfErr != nil {
-			return nil, wfErr
+		var candidates []string
+		if hardPin {
+			// A hard provider pin is an acquisition boundary as well as a
+			// routing constraint: do not poll or probe unrelated providers while
+			// preparing this launch.
+			candidates = []string{provider}
+		} else {
+			var wfErr error
+			candidates, wfErr = router.Waterfall(shape)
+			if wfErr != nil {
+				return nil, wfErr
+			}
 		}
 		probes := map[string]bool{}
 		for _, cp := range candidates {
@@ -6571,14 +6657,18 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 			probes[key] = probeModel(ctx, cp, cm, lane.Effort).Available
 		}
 		if router.ModelRequiresProbe(model) {
-			probe := probeModel(ctx, provider, model, lane.Effort)
-			probes[router.ProbeKey(provider, model)] = probe.Available
-			if pinnedBuilder && !probe.Available {
-				reason := strings.TrimSpace(probe.Reason)
-				if reason == "" {
-					reason = "unknown probe failure"
+			if alreadyProbed, ok := probes[router.ProbeKey(provider, model)]; !ok {
+				probe := probeModel(ctx, provider, model, lane.Effort)
+				probes[router.ProbeKey(provider, model)] = probe.Available
+				if pinnedBuilder && !probe.Available {
+					reason := strings.TrimSpace(probe.Reason)
+					if reason == "" {
+						reason = "unknown probe failure"
+					}
+					return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
 				}
-				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: %s", lane.Name, provider, model, reason)
+			} else if pinnedBuilder && !alreadyProbed {
+				return nil, fmt.Errorf("lane %q configured probe %s/%s unavailable: no exact probe output", lane.Name, provider, model)
 			}
 		}
 		if len(probes) > 0 {
@@ -6600,10 +6690,16 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	//
 	// Quota is read best-effort. An unavailable snapshot warns and routes on
 	// availability alone, exactly as liveScorer does -- degraded routing beats
-	// refusing every launch because openusage is down.
+	// refusing every launch because the quota snapshot is unavailable.
 	engine := usage.NewQuotaEngine()
 	computed := map[string]usage.BurnState{}
-	if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
+	if hardPin {
+		if snap, err := usage.FetchProviderForce(provider, false); err == nil && snap != nil {
+			computed = engine.ComputeAll(snap)
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "herd: WARN lane %q native quota unavailable for pinned provider %s (%v); routing on availability only\n", lane.Name, provider, err)
+		}
+	} else if snap, _, err := usage.FetchSnapshotCached(); err == nil && snap != nil {
 		computed = engine.ComputeAll(snap)
 	} else if err != nil {
 		fmt.Fprintf(os.Stderr, "herd: WARN lane %q live quota unavailable (%v); routing on availability only\n", lane.Name, err)
@@ -6665,7 +6761,6 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	//
 	// observed live after provider, model and bind fallthrough were all working.
 	// A non-standing pinned builder keeps every one of these checks.
-	hardPin := pinnedBuilder && !lane.Standing
 	if hardPin && decision.Harness != strings.ToLower(strings.TrimSpace(lane.Harness)) {
 		return nil, fmt.Errorf("lane %q routed harness drift: got %s, want %s", lane.Name, decision.Harness, lane.Harness)
 	}
@@ -6927,6 +7022,13 @@ func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecisio
 	// they start. Avoid launching a second headless model session here: local
 	// hooks and authentication can block the forge before a pane exists. The
 	// production path below remains the strict artifact-write probe.
+	//
+	// The synthetic local-harness receipt is invocation-local evidence
+	// (FAC-679): persisting it through the durable file cache wrote
+	// .herd/toolprobe-cache.json into the process working directory, leaving
+	// untracked files that BLOCKED managed verification of an otherwise clean
+	// candidate. Keep the admission validation a durable write enforces
+	// (identity + signature) by storing it in a per-call memory cache.
 	if strings.ToLower(strings.TrimSpace(os.Getenv("HERD_MODE"))) != "production" &&
 		strings.ToLower(strings.TrimSpace(os.Getenv("HERD_LOCAL_TOOL_PROBE"))) != "strict" {
 		harness := strings.TrimSpace(decision.Harness)
@@ -6944,8 +7046,10 @@ func ensureArtifactToolProbe(ctx context.Context, decision *router.LaunchDecisio
 		if receiptErr != nil {
 			return nil, receiptErr
 		}
-		cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
-		_ = cache.Put(receipt)
+		cache := toolprobe.NewMemoryCache()
+		if err := cache.Put(receipt); err != nil {
+			return nil, fmt.Errorf("local tool-probe receipt not admissible: %w", err)
+		}
 		return &receipt, nil
 	}
 	cache := toolprobe.NewFileCache(toolprobe.DefaultCachePath)
@@ -7493,7 +7597,7 @@ func runProcess() {
 }
 
 // liveScorer backs lane resolution with the real herd-route port over live
-// openusage quota — the same decision core the zsh fleet uses.
+// native quota — the same decision core the zsh fleet uses.
 //
 // CHA-2451: install read-path probes that skip live generation (CLI + quota
 // only). A stuck defaultProviderProbe (45s, e.g. codex spark) previously made
@@ -8723,6 +8827,8 @@ type drainActionHooks struct {
 	launchReview          func(context.Context, drainActionEvidence) error
 	dryRun                func(context.Context, drainActionEvidence) error
 	harvest               func(context.Context, drainActionEvidence) error
+	retireReviews         func(context.Context) error
+	retireSources         func(context.Context) error
 }
 
 type drainActionResult struct {
@@ -8748,6 +8854,12 @@ func defaultDrainActionHooks() drainActionHooks {
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
 			return errors.New("no compiled harvest authority is configured")
+		},
+		retireReviews: func(context.Context) error {
+			return errors.New("no compiled review retirement authority is configured")
+		},
+		retireSources: func(context.Context) error {
+			return errors.New("no compiled source retirement authority is configured")
 		},
 	}
 }
@@ -8920,6 +9032,20 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 			fmt.Fprintf(out, "  note: relaunch bound %d would have truncated this list to %d of %d\n", maxRelaunch, maxRelaunch, len(rebaseBlocked))
 		}
 	}
+	if hooks.retireReviews != nil {
+		if err := hooks.retireReviews(ctx); err != nil {
+			fmt.Fprintf(out, "REFUSED review-retirement: %v\n", err)
+			result.Failed = true
+			result.Refusals++
+		}
+	}
+	if hooks.retireSources != nil {
+		if err := hooks.retireSources(ctx); err != nil {
+			fmt.Fprintf(out, "REFUSED source-retirement: %v\n", err)
+			result.Failed = true
+			result.Refusals++
+		}
+	}
 	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d act_integration_steps=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",
 		result.Reviews, result.Harvests, result.IntegrationSteps, result.DryRuns, len(rebaseBlocked), result.Refusals)
 	return result
@@ -8935,45 +9061,14 @@ func containsDrainSHA(shas []string, want string) bool {
 }
 
 func verificationCommandProfile(root string) (verifier.CommandProfile, string, error) {
-	buildCommand := "true"
-	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
-		buildCommand = "go build ./..."
+	// The one derivation is pkg/verifier.ResolveProfile; this wrapper only
+	// keeps the cmd/herd error contract. Both the managed completion gate and
+	// the candidate index admit receipts against that same derivation.
+	resolved := verifier.ResolveProfile(root)
+	if resolved.Refusal != "" {
+		return verifier.CommandProfile{}, "", errors.New(resolved.Refusal)
 	}
-	profile := verifier.CommandProfile{
-		ID: verificationProfile,
-		// Repositories without a Go module must not be forced through a
-		// meaningless Go build. Their declared test command (for example
-		// bin/ci-local) owns build/typecheck coverage; the no-op build keeps
-		// the receipt profile explicit without claiming a Go build ran.
-		BuildCommand: buildCommand,
-		TestCommand:  "go test ./...",
-		TestTimeout:  30 * time.Minute,
-	}
-	path := filepath.Join(root, ".herd", "herd.yaml")
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return profile, "default", nil
-	}
-	if err != nil {
-		return profile, "", fmt.Errorf("read verification config: %w", err)
-	}
-	cfg, err := config.ParseConfig(data)
-	if err != nil {
-		return profile, "", err
-	}
-	if strings.TrimSpace(cfg.Verification.TestCommand) == "" {
-		return profile, "", errors.New("verification.test_command is required")
-	}
-	profile.TestCommand = strings.TrimSpace(cfg.Verification.TestCommand)
-	if raw := strings.TrimSpace(cfg.Verification.TestTimeout); raw != "" {
-		profile.TestTimeout, err = time.ParseDuration(raw)
-		if err != nil || profile.TestTimeout <= 0 {
-			return profile, "", fmt.Errorf("verification.test_timeout must be a positive Go duration: %q", raw)
-		}
-	}
-	profile.PreflightCommand = strings.TrimSpace(cfg.Verification.PreflightCommand)
-	sum := sha256.Sum256(data)
-	return profile, "sha256:" + hex.EncodeToString(sum[:]), nil
+	return resolved.Base, resolved.Revision, nil
 }
 
 // verificationExecutionProfile derives the exact command profile executed by

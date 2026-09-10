@@ -2,6 +2,8 @@ package candidateindex
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/verifier"
 )
 
 type mockProvider struct {
@@ -62,6 +65,23 @@ func TestCandidateIndex_DeterministicSorting(t *testing.T) {
 		if cands[i].Ref != exp {
 			t.Fatalf("expected index %d to be %s, got %s", i, exp, cands[i].Ref)
 		}
+	}
+}
+
+func TestAuthoritativeCandidate_PrefersHighestCompletedLeaseGeneration(t *testing.T) {
+	oldSHA := "283f5c958818126e82bf38db4d5127c3f933cf4c"
+	newSHA := "cb6b6c55b8aa799357d78129f2a61a7f6ce25cb9"
+	when := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+	old := &Candidate{Ref: "FAC-703", CandidateSHA: oldSHA, LeaseGeneration: 8, CompletionCallback: true}
+	new := &Candidate{Ref: "FAC-703", CandidateSHA: newSHA, LeaseGeneration: 9, CompletionCallback: true}
+	evidence := map[candidateKey]candidateEvidence{
+		{ref: "FAC-703", sha: oldSHA}: {observedAt: when, source: SourceReviewLedger, sequence: 10},
+		{ref: "FAC-703", sha: newSHA}: {observedAt: when, source: SourceReviewLedger, sequence: 10},
+	}
+
+	got := authoritativeCandidate([]*Candidate{old, new}, evidence)
+	if got != new {
+		t.Fatalf("selected %s, want newest lease-generation candidate %s", got.CandidateSHA, newSHA)
 	}
 }
 
@@ -173,6 +193,7 @@ func TestCandidateIndex_BuildIndexMergesSourcesAndDeduplicates(t *testing.T) {
 		PatchURL:       "patch-101",
 		Lease:          "lease-101",
 	})
+	writeCompletionReceipt(t, dir, "FAC-101", validSHA, "3", []string{"go", "test", "./..."}, "", "", "")
 
 	idx := New(IndexOptions{
 		RepoRoot:     dir,
@@ -516,6 +537,7 @@ func TestCandidateIndex_LaterCompleteCallbackClearsSameLeaseBlock(t *testing.T) 
 	if err := mailFile.Close(); err != nil {
 		t.Fatalf("close mail: %v", err)
 	}
+	writeCompletionReceipt(t, dir, "FAC-312", sha, "2", []string{"go", "test", "./..."}, "", "", "")
 
 	cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath}).BuildIndex(context.Background())
 	if err != nil {
@@ -573,6 +595,7 @@ func TestCandidateIndex_DefaultCallbackMailboxClearsBlockedEvidence(t *testing.T
 	if err := mailFile.Close(); err != nil {
 		t.Fatalf("close callback mailbox: %v", err)
 	}
+	writeCompletionReceipt(t, dir, "FAC-360", sha, "2", []string{"go", "test", "./..."}, "", "", "")
 
 	cands, err := New(IndexOptions{RepoRoot: dir}).BuildIndex(context.Background())
 	if err != nil {
@@ -588,6 +611,431 @@ func TestCandidateIndex_DefaultCallbackMailboxClearsBlockedEvidence(t *testing.T
 	if c.State == StateBlocked || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
 		t.Fatalf("complete callback did not clear same-lease block on canonical mailbox: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
 	}
+}
+
+func TestCandidateIndex_LaterGenerationClearsEarlierSameSHABlockedCallback(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	sha := "46be267dd2cc0a42acb70141838d0e3f5645605b"
+	base := "b42b69763598436c29d49e7922b27f011ae168a5"
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	writeCallback := func(sequence, generation int64, kind mail.CallbackKind, detail string) {
+		t.Helper()
+		body, marshalErr := json.Marshal(mail.Callback{
+			Ref: "FAC-618", Kind: kind, SHA: sha, Detail: detail,
+			LeaseGeneration: generation,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal callback: %v", marshalErr)
+		}
+		if encodeErr := json.NewEncoder(mailFile).Encode(mail.Envelope{
+			ID: fmt.Sprintf("fac-618-callback-%d", sequence), Sequence: sequence,
+			Sender: "worker", Recipient: mail.CoordinatorInbox,
+			Subject: string(kind) + ": FAC-618", Body: string(body),
+			Timestamp: time.Unix(sequence, 0).UTC(),
+		}); encodeErr != nil {
+			t.Fatalf("write callback: %v", encodeErr)
+		}
+	}
+	writeCallback(620, 1, mail.CallbackBlocked, "generation 1 failed")
+	writeCallback(621, 2, mail.CallbackComplete, "generation 2 complete")
+	if err := mailFile.Close(); err != nil {
+		t.Fatalf("close mail: %v", err)
+	}
+
+	receipt := verifier.Receipt{
+		Version: 1, TaskRef: "FAC-618", LeaseGeneration: "2",
+		CandidateSHA: sha, BaseSHA: base, Command: []string{"go", "test", "./..."},
+		ExitCode: 0, Outcome: verifier.OutcomePASS,
+	}
+	receipt.Digest = receipt.ComputeDigest()
+	receiptDir := filepath.Join(dir, ".herd", "verification-receipts")
+	if err := os.MkdirAll(receiptDir, 0700); err != nil {
+		t.Fatalf("create receipt dir: %v", err)
+	}
+	receiptData, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal receipt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(receiptDir, receipt.Digest[len("sha256:"):]+".json"), receiptData, 0600); err != nil {
+		t.Fatalf("write receipt: %v", err)
+	}
+
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	ledgerFile, err := os.Create(ledgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	if err := json.NewEncoder(ledgerFile).Encode(reviewledger.LedgerRow{
+		Timestamp: "2026-09-02T00:00:00Z", Event: string(reviewledger.EventVerdict),
+		SHA: sha, Task: "FAC-618", Verdict: string(reviewledger.VerdictPASS),
+	}); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+	if err := ledgerFile.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+
+	cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.CandidateSHA != sha || c.LeaseGeneration != 2 || !c.CompletionValid {
+		t.Fatalf("generation 2 evidence was not selected: %+v", c)
+	}
+	if c.State != StateEligible || len(c.BlockedReasons) != 0 || len(c.BlockedEvidence) != 0 {
+		t.Fatalf("generation 1 block contaminated completed generation 2: %+v", c)
+	}
+}
+
+func writeFAC744CallbackMail(t *testing.T, mailPath string, callbacks []struct {
+	sequence, generation int64
+	kind                 mail.CallbackKind
+	detail               string
+}) {
+	t.Helper()
+	mailFile, err := os.Create(mailPath)
+	if err != nil {
+		t.Fatalf("create mail: %v", err)
+	}
+	defer func() {
+		if closeErr := mailFile.Close(); closeErr != nil {
+			t.Fatalf("close mail: %v", closeErr)
+		}
+	}()
+	for _, cb := range callbacks {
+		body, marshalErr := json.Marshal(mail.Callback{
+			Ref: "FAC-744", Kind: cb.kind, SHA: "56be267dd2cc0a42acb70141838d0e3f5645605b",
+			Detail: cb.detail, LeaseGeneration: cb.generation,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal callback: %v", marshalErr)
+		}
+		if encodeErr := json.NewEncoder(mailFile).Encode(mail.Envelope{
+			ID: fmt.Sprintf("fac-744-callback-%d", cb.sequence), Sequence: cb.sequence,
+			Sender: "worker", Recipient: mail.CoordinatorInbox,
+			Subject: string(cb.kind) + ": FAC-744", Body: string(body),
+			Timestamp: time.Unix(cb.sequence, 0).UTC(),
+		}); encodeErr != nil {
+			t.Fatalf("write callback: %v", encodeErr)
+		}
+	}
+}
+
+func writeCompletionReceipt(t *testing.T, dir, taskRef, sha, generation string, command []string, profileDigest, profileName, configRevision string) verifier.Receipt {
+	t.Helper()
+	receipt := verifier.Receipt{
+		Version: 1, TaskRef: taskRef, LeaseGeneration: generation,
+		CandidateSHA: sha,
+		BaseSHA:      "b42b69763598436c29d49e7922b27f011ae168a5",
+		Command:      command, ExitCode: 0, Outcome: verifier.OutcomePASS,
+		ProfileDigest:       profileDigest,
+		VerificationProfile: profileName,
+		ConfigRevision:      configRevision,
+	}
+	receipt.Digest = receipt.ComputeDigest()
+	receiptDir := filepath.Join(dir, ".herd", "verification-receipts")
+	if err := os.MkdirAll(receiptDir, 0700); err != nil {
+		t.Fatalf("create receipt dir: %v", err)
+	}
+	receiptData, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal receipt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(receiptDir, receipt.Digest[len("sha256:"):]+".json"), receiptData, 0600); err != nil {
+		t.Fatalf("write receipt: %v", err)
+	}
+	return receipt
+}
+
+func writeFAC744PassVerdict(t *testing.T, dir string) string {
+	t.Helper()
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	ledgerFile, err := os.Create(ledgerPath)
+	if err != nil {
+		t.Fatalf("create ledger: %v", err)
+	}
+	if err := json.NewEncoder(ledgerFile).Encode(reviewledger.LedgerRow{
+		Timestamp: "2026-09-02T00:00:00Z", Event: string(reviewledger.EventVerdict),
+		SHA: "56be267dd2cc0a42acb70141838d0e3f5645605b", Task: "FAC-744",
+		Verdict: string(reviewledger.VerdictPASS),
+	}); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+	if err := ledgerFile.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	return ledgerPath
+}
+
+// FAC-744 finding 3: a PASS receipt only counts as the exact full-suite
+// completion proof when its command is the repository's authorized full-suite
+// test command and any profile identity it carries matches the live profile.
+// Targeted runs, scoped package subsets, and token lookalikes must not mark a
+// completion valid.
+func TestCandidateIndex_ReceiptAdmissionRequiresExactFullSuiteCommand(t *testing.T) {
+	tests := []struct {
+		name           string
+		command        []string
+		profileDigest  string
+		profileName    string
+		configRevision string
+		wantAdmitted   bool
+	}{
+		{
+			name:    "targeted run flag is not the full suite",
+			command: []string{"go", "test", "./...", "-run", "TestOne"},
+		},
+		{
+			name:    "extra scoped package arguments are not the full suite",
+			command: []string{"go", "test", "./pkg/candidateindex", "./..."},
+		},
+		{
+			name:    "token lookalike non-Go command is refused",
+			command: []string{"echo", "go", "test", "./..."},
+		},
+		{
+			name:          "foreign profile digest is refused",
+			command:       []string{"go", "test", "./..."},
+			profileDigest: "sha256:" + strings.Repeat("1", 64),
+		},
+		{
+			name:        "foreign verification profile name is refused",
+			command:     []string{"go", "test", "./..."},
+			profileName: "not-the-verification-profile",
+		},
+		{
+			name:           "foreign config revision is refused",
+			command:        []string{"go", "test", "./..."},
+			configRevision: "sha256:" + strings.Repeat("2", 64),
+		},
+		{
+			name:         "exact authorized full-suite command is admitted",
+			command:      []string{"go", "test", "./..."},
+			wantAdmitted: true,
+		},
+		{
+			name:    "one argv element is not equivalent to the configured command",
+			command: []string{"go test", "./..."},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mailPath := filepath.Join(dir, "mail.jsonl")
+			writeFAC744CallbackMail(t, mailPath, []struct {
+				sequence, generation int64
+				kind                 mail.CallbackKind
+				detail               string
+			}{{sequence: 621, generation: 2, kind: mail.CallbackComplete}})
+			writeCompletionReceipt(t, dir, "FAC-744", "56be267dd2cc0a42acb70141838d0e3f5645605b", "2", tt.command, tt.profileDigest, tt.profileName, tt.configRevision)
+			ledgerPath := writeFAC744PassVerdict(t, dir)
+
+			cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+			if err != nil {
+				t.Fatalf("BuildIndex failed: %v", err)
+			}
+			if len(cands) != 1 {
+				t.Fatalf("expected one candidate, got %d", len(cands))
+			}
+			c := cands[0]
+			if tt.wantAdmitted {
+				if !c.CompletionValid {
+					t.Fatalf("exact full-suite receipt was not admitted: %+v", c)
+				}
+				if c.State == StateBlocked || len(c.BlockedReasons) != 0 {
+					t.Fatalf("admitted receipt left candidate blocked: %+v", c)
+				}
+				return
+			}
+			if c.CompletionValid {
+				t.Fatalf("non-full-suite receipt was admitted as the completion proof: command=%v", tt.command)
+			}
+		})
+	}
+}
+
+// FAC-744 finding 2: an older generation's completion must never clear a
+// newer generation's veto, including when callbacks arrive out of order.
+func TestCandidateIndex_OlderCompletionMustNotClearNewerGenerationVeto(t *testing.T) {
+	dir := t.TempDir()
+	mailPath := filepath.Join(dir, "mail.jsonl")
+	writeFAC744CallbackMail(t, mailPath, []struct {
+		sequence, generation int64
+		kind                 mail.CallbackKind
+		detail               string
+	}{
+		{sequence: 20, generation: 2, kind: mail.CallbackBlocked, detail: "generation 2 failed review"},
+		{sequence: 21, generation: 1, kind: mail.CallbackBlocked, detail: "generation 1 failed"},
+		{sequence: 22, generation: 1, kind: mail.CallbackComplete},
+	})
+	writeCompletionReceipt(t, dir, "FAC-744", "56be267dd2cc0a42acb70141838d0e3f5645605b", "1", []string{"go", "test", "./..."}, "", "", "")
+	ledgerPath := writeFAC744PassVerdict(t, dir)
+
+	cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+	if err != nil {
+		t.Fatalf("BuildIndex failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("expected one candidate, got %d", len(cands))
+	}
+	c := cands[0]
+	if c.State != StateBlocked {
+		t.Fatalf("older completion cleared the newer generation's veto: state=%s reasons=%v evidence=%v", c.State, c.BlockedReasons, c.BlockedEvidence)
+	}
+	if !containsBlockedReason(c.BlockedReasons, BlockedVetoVerdict) {
+		t.Fatalf("expected the newer generation's veto to survive: reasons=%v", c.BlockedReasons)
+	}
+	if !containsBlockedEvidence(c.BlockedEvidence, "generation 2 failed review") {
+		t.Fatalf("expected the newer generation's veto evidence to survive: evidence=%v", c.BlockedEvidence)
+	}
+}
+
+// FAC-744 finding 1: every positive-generation completion claim requires its
+// exact full-suite PASS receipt, even with a single reused candidate SHA, and
+// must not fall back to an older receipt or an older verdict.
+func TestCandidateIndex_SingleSHACompletionWithoutExactReceiptStaysBlocked(t *testing.T) {
+	tests := []struct {
+		name        string
+		withReceipt bool
+		receiptGen  string
+		receiptCmd  []string
+	}{
+		{name: "no receipt at all"},
+		{
+			name:        "older generation receipt is not a fallback",
+			withReceipt: true, receiptGen: "1", receiptCmd: []string{"go", "test", "./..."},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mailPath := filepath.Join(dir, "mail.jsonl")
+			writeFAC744CallbackMail(t, mailPath, []struct {
+				sequence, generation int64
+				kind                 mail.CallbackKind
+				detail               string
+			}{{sequence: 621, generation: 2, kind: mail.CallbackComplete}})
+			if tt.withReceipt {
+				writeCompletionReceipt(t, dir, "FAC-744", "56be267dd2cc0a42acb70141838d0e3f5645605b", tt.receiptGen, tt.receiptCmd, "", "", "")
+			}
+			ledgerPath := writeFAC744PassVerdict(t, dir)
+
+			cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+			if err != nil {
+				t.Fatalf("BuildIndex failed: %v", err)
+			}
+			if len(cands) != 1 {
+				t.Fatalf("expected one candidate, got %d", len(cands))
+			}
+			c := cands[0]
+			if c.CompletionValid {
+				t.Fatalf("completion was validated without the selected generation's exact receipt: %+v", c)
+			}
+			if c.State != StateBlocked {
+				t.Fatalf("single-SHA completion without its exact receipt must block review: state=%s reasons=%v", c.State, c.BlockedReasons)
+			}
+			if !containsBlockedReason(c.BlockedReasons, BlockedMissingReceipt) {
+				t.Fatalf("expected BlockedMissingReceipt, got reasons=%v", c.BlockedReasons)
+			}
+			if !containsBlockedEvidence(c.BlockedEvidence, "generation 2") {
+				t.Fatalf("expected missing-receipt evidence naming generation 2, got evidence=%v", c.BlockedEvidence)
+			}
+		})
+	}
+}
+
+// The configured-repository admission contract: managed verification receipts
+// carry the executed test command (timeout applied) and the live profile
+// identity, exactly as bindMatchesReceipt binds them. Both the executed and
+// the configured base form must stay admissible so real managed receipts
+// (for example the FAC-703 full-suite shape) continue to validate completions.
+func TestCandidateIndex_ConfiguredProfileExecutionReceiptIsAdmitted(t *testing.T) {
+	yamlData := []byte("version: 1\nproject:\n  name: herdforge-test\ntask_provider:\n  type: memory\nverification:\n  test_command: \"go test ./...\"\n  test_timeout: \"30m\"\n  preflight_command: \"go build ./...\"\n")
+	base := verifier.CommandProfile{
+		ID: "config-verification", BuildCommand: "true",
+		TestCommand: "go test ./...", TestTimeout: 30 * time.Minute,
+		PreflightCommand: "go build ./...",
+	}
+	executed, err := verifier.ApplyTestTimeout(base.TestCommand, base.TestTimeout)
+	if err != nil {
+		t.Fatalf("derive execution command: %v", err)
+	}
+	execution := base
+	execution.TestCommand = executed
+	sum := sha256.Sum256(yamlData)
+	revision := "sha256:" + hex.EncodeToString(sum[:])
+
+	tests := []struct {
+		name    string
+		command []string
+		digest  string
+		want    bool
+	}{
+		{name: "executed full-suite command with execution profile digest", command: strings.Fields(execution.TestCommand), digest: execution.Digest(), want: true},
+		{name: "configured base command with base profile digest", command: strings.Fields(base.TestCommand), digest: base.Digest(), want: true},
+		{name: "configured command with execution profile digest is a cross-pair", command: strings.Fields(base.TestCommand), digest: execution.Digest()},
+		{name: "executed command with base profile digest is a cross-pair", command: strings.Fields(execution.TestCommand), digest: base.Digest()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, ".herd"), 0o755); err != nil {
+				t.Fatalf("create config dir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, ".herd", "herd.yaml"), yamlData, 0o600); err != nil {
+				t.Fatalf("write herd.yaml: %v", err)
+			}
+			mailPath := filepath.Join(dir, "mail.jsonl")
+			writeFAC744CallbackMail(t, mailPath, []struct {
+				sequence, generation int64
+				kind                 mail.CallbackKind
+				detail               string
+			}{{sequence: 621, generation: 2, kind: mail.CallbackComplete}})
+			writeCompletionReceipt(t, dir, "FAC-744", "56be267dd2cc0a42acb70141838d0e3f5645605b", "2", tt.command, tt.digest, "config-verification+preflight", revision)
+			ledgerPath := writeFAC744PassVerdict(t, dir)
+
+			cands, err := New(IndexOptions{RepoRoot: dir, MailPath: mailPath, LedgerPath: ledgerPath}).BuildIndex(context.Background())
+			if err != nil {
+				t.Fatalf("BuildIndex failed: %v", err)
+			}
+			if len(cands) != 1 {
+				t.Fatalf("expected one candidate, got %d", len(cands))
+			}
+			c := cands[0]
+			if c.CompletionValid != tt.want {
+				t.Fatalf("receipt admission = %v, want %v: command=%v digest=%s", c.CompletionValid, tt.want, tt.command, tt.digest)
+			}
+			if tt.want && (c.State == StateBlocked || len(c.BlockedReasons) != 0) {
+				t.Fatalf("admitted managed receipt left candidate blocked: %+v", c)
+			}
+		})
+	}
+}
+
+func containsBlockedReason(reasons []BlockedReason, want BlockedReason) bool {
+	for _, reason := range reasons {
+		if reason == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBlockedEvidence(evidence []string, want string) bool {
+	for _, item := range evidence {
+		if strings.Contains(item, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsCandidateSource(sources []CandidateSource, want CandidateSource) bool {

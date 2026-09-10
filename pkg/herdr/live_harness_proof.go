@@ -187,6 +187,66 @@ func CloseSettledReviewTab(agent AgentEntry) error {
 	return hardCloseTab(exact.TabID, exact.Name)
 }
 
+// CloseSettledSourceTab retires a source/mender agent terminal only from a fully
+// observed live identity. It snapshots the pane's exact PID/start-token tree before the
+// fenced close, then reaps any survivors after close (including reparented children)
+// without ever matching by process name.
+func CloseSettledSourceTab(agent AgentEntry) error {
+	if strings.TrimSpace(agent.Name) == "" || strings.TrimSpace(agent.TabID) == "" ||
+		strings.TrimSpace(agent.PaneID) == "" || strings.TrimSpace(agent.Workspace) == "" ||
+		strings.TrimSpace(agent.TerminalID) == "" || strings.TrimSpace(agent.Session.Value) == "" {
+		return fmt.Errorf("settled source close: incomplete agent/tab/pane incarnation")
+	}
+	if agent.Focused == nil || *agent.Focused {
+		return fmt.Errorf("settled source close: tab focus is not explicitly false")
+	}
+	if agent.Status != "idle" && agent.Status != "done" {
+		return fmt.Errorf("settled source close: status %q is not idle or done", agent.Status)
+	}
+
+	live, err := AgentList()
+	if err != nil {
+		return fmt.Errorf("settled source close readback: %w", err)
+	}
+	var exact *AgentEntry
+	for i := range live {
+		a := &live[i]
+		if a.Name == agent.Name && a.TabID == agent.TabID && a.PaneID == agent.PaneID &&
+			a.Workspace == agent.Workspace && a.TerminalID == agent.TerminalID &&
+			a.Session.Value == agent.Session.Value && a.Revision == agent.Revision &&
+			a.StateChangeSeq == agent.StateChangeSeq {
+			exact = a
+			break
+		}
+	}
+	if exact == nil {
+		return fmt.Errorf("settled source close: live agent identity changed")
+	}
+	if exact.Focused == nil || *exact.Focused || (exact.Status != "idle" && exact.Status != "done") {
+		return fmt.Errorf("settled source close: live status/focus changed")
+	}
+	procs, pErr := paneProcessesForRetirement(exact.PaneID)
+	if pErr != nil {
+		return fmt.Errorf("settled source close pane process read: %w", pErr)
+	}
+	if active := collectActiveDescendants(procs); len(active) > 0 {
+		return fmt.Errorf("settled source close: active non-idle processes running in pane: %s", strings.Join(active, ", "))
+	}
+	snapshot, err := GetHostedPaneIdentity(exact.PaneID)
+	if err != nil {
+		return fmt.Errorf("settled source close process snapshot: %w", err)
+	}
+	if _, err := CloseExactTab(exactIdentityFor(*exact)); err != nil {
+		return fmt.Errorf("settled source close exact tab: %w", err)
+	}
+	if snapshot != nil && len(snapshot.Tree) > 0 {
+		if err := ReapHostedPaneSnapshot(snapshot); err != nil {
+			return fmt.Errorf("settled source close process tree: %w", err)
+		}
+	}
+	return nil
+}
+
 func randomNonce(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

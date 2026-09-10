@@ -61,6 +61,14 @@ func killProcessGroupMembers(pgid int) error {
 // killProcessGroupMembersExcept identity-kills live members of pgid except
 // exceptPID (the supervisor leader must not kill itself mid-drain).
 func killProcessGroupMembersExcept(pgid, exceptPID int) error {
+	except := map[int]struct{}{}
+	if exceptPID > 0 {
+		except[exceptPID] = struct{}{}
+	}
+	return killProcessGroupMembersExceptSet(pgid, except)
+}
+
+func killProcessGroupMembersExceptSet(pgid int, except map[int]struct{}) error {
 	if pgid <= 1 {
 		return fmt.Errorf("kill process group members: invalid pgid %d", pgid)
 	}
@@ -70,7 +78,7 @@ func killProcessGroupMembersExcept(pgid, exceptPID int) error {
 	}
 	var errs []error
 	for _, tok := range snap.membersOfGroup(pgid) {
-		if exceptPID > 0 && tok.pid == exceptPID {
+		if _, skip := except[tok.pid]; skip {
 			continue
 		}
 		h, herr := openHandle(tok)
@@ -121,8 +129,9 @@ type ownedSubprocess struct {
 	cmd          *exec.Cmd
 	leader       int
 	pgid         int
-	candidateDir string // verification root (corroboration / diagnostics only)
-	markerPath   string // private ownership marker path (lineage authority)
+	protected    map[int]struct{} // bwrap and protocol shell remain live until ack
+	candidateDir string           // verification root (corroboration / diagnostics only)
+	markerPath   string           // private ownership marker path (lineage authority)
 	markerFile   *os.File
 
 	mu       sync.Mutex
@@ -143,6 +152,10 @@ type ownedSubprocess struct {
 	finalizeFn func() error
 	reapFn     func(bool) error
 	readyFn    func([]string) bool
+	// commandStart runs after the pre-exec ownership barrier is released. It
+	// marks the point at which a command timeout may begin; the ownership
+	// handshake itself is bounded separately by handshakeReadBound.
+	commandStart func()
 }
 
 // ownershipWrapperScript: pre-exec cont barrier + two-phase residual drain.
@@ -157,8 +170,23 @@ type ownedSubprocess struct {
 // drain runs while the original process group is still owned by a live
 // supervisor.
 const ownershipWrapperScript = `
+proc_ready=0
+if [ "$1" = "--proc-ready" ]; then
+  proc_ready=1
+  shift
+fi
 user_path="$1"
 shift
+# Make the inherited root mount private before replacing proc. This keeps the
+# namespace-relative proc view local to the owned supervisor and its children.
+# The fixed hermetic Docker profile already supplies the proc authority and
+# intentionally disables nested namespace setup.
+if [ "$proc_ready" -ne 1 ] && [ "${HERD_HERMETIC_CONTAINER:-}" != "1" ] && [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+  # Namespace mount setup is Linux-only. Non-Linux ownershipCommand paths
+  # retain the same handshake and residual protocol without mount syscalls.
+  mount --make-rprivate / || exit 1
+  mount -t proc proc /proc || exit 1
+fi
 (
   # Block before exec until parent has recorded causal handles (pre-fork barrier).
   IFS= read -r _cont <&4 || exit 1
@@ -185,16 +213,16 @@ exit "$ec"
 // prepareOwnedCommand builds a Setpgid supervisor with status+ack pipes and an
 // inherited ownership marker FD. On Linux, also applies required PID/user
 // namespace containment; cmd.Start fails closed if the kernel refuses it.
-func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW, marker *os.File, markerPath string, err error) {
+func prepareOwnedCommand(ctx context.Context, path string, args []string, dir string, env []string) (cmd *exec.Cmd, statusR, statusW, ackR, ackW, marker *os.File, markerPath string, infoR, infoW *os.File, err error) {
 	statusR, statusW, err = os.Pipe()
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("status pipe: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("status pipe: %w", err)
 	}
 	ackR, ackW, err = os.Pipe()
 	if err != nil {
 		_ = statusR.Close()
 		_ = statusW.Close()
-		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("ack pipe: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("ack pipe: %w", err)
 	}
 	marker, markerPath, err = createOwnershipMarker()
 	if err != nil {
@@ -202,31 +230,53 @@ func prepareOwnedCommand(ctx context.Context, path string, args []string, dir st
 		_ = statusW.Close()
 		_ = ackR.Close()
 		_ = ackW.Close()
-		return nil, nil, nil, nil, nil, nil, "", fmt.Errorf("ownership marker: %w", err)
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("ownership marker: %w", err)
+	}
+	infoR, infoW, err = os.Pipe()
+	if err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		_ = marker.Close()
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, fmt.Errorf("ownership info pipe: %w", err)
 	}
 	wrapArgs := append([]string{"-c", ownershipWrapperScript, "owned-wrap", path}, args...)
-	cmd = exec.CommandContext(ctx, "sh", wrapArgs...)
-	cmd.Dir = dir
+	cmd, err = ownershipCommand(ctx, dir, wrapArgs)
+	if err != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		_ = marker.Close()
+		_ = infoR.Close()
+		_ = infoW.Close()
+		return nil, nil, nil, nil, nil, nil, "", nil, nil, err
+	}
 	if env != nil {
 		cmd.Env = env
 	}
 	attr := &syscall.SysProcAttr{Setpgid: true}
-	applyOwnershipContainment(attr)
 	cmd.SysProcAttr = attr
-	// ExtraFiles: child FD3=statusW, FD4=ackR, FD5=marker
-	cmd.ExtraFiles = []*os.File{statusW, ackR, marker}
-	return cmd, statusR, statusW, ackR, ackW, marker, markerPath, nil
+	// ExtraFiles: child FD3=statusW, FD4=ackR, FD5=marker, FD6=bwrap info.
+	cmd.ExtraFiles = []*os.File{statusW, ackR, marker, infoW}
+	return cmd, statusR, statusW, ackR, ackW, marker, markerPath, infoR, infoW, nil
 }
 
 // adoptOwnedCmd records the leader and prepares for the two-phase protocol.
 // handshake pipes: statusR reads start/done; ackW writes go.
 // marker/markerPath are the inherited lineage marker (kill authority for
 // escaped descendants). candidateDir is corroboration-only.
-func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
+func adoptOwnedCmd(cmd *exec.Cmd, leader, pgid int, statusR, ackW *os.File, candidateDir, markerPath string, marker *os.File) (*ownedSubprocess, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, errors.New("adopt owned cmd: nil process")
 	}
-	leader := cmd.Process.Pid
+	if leader <= 1 {
+		return nil, fmt.Errorf("adopt owned cmd: invalid supervisor pid %d", leader)
+	}
+	if pgid <= 1 {
+		return nil, fmt.Errorf("adopt owned cmd: invalid process group %d", pgid)
+	}
 	tok, err := tokenOf(leader)
 	if err != nil {
 		return nil, fmt.Errorf("adopt owned cmd: leader token: %w", err)
@@ -238,7 +288,8 @@ func adoptOwnedCmd(cmd *exec.Cmd, statusR, ackW *os.File, candidateDir, markerPa
 	o := &ownedSubprocess{
 		cmd:          cmd,
 		leader:       leader,
-		pgid:         leader,
+		pgid:         pgid,
+		protected:    map[int]struct{}{leader: {}, pgid: {}},
 		candidateDir: candidateDir,
 		markerPath:   markerPath,
 		markerFile:   marker,
@@ -329,6 +380,9 @@ func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
 		return -1, fmt.Errorf("ownership cont: %w", err)
 	}
 	contSent = true
+	if o.commandStart != nil {
+		o.commandStart()
+	}
 
 	// Phase 2: done <ec> — bounded read; Cancel kills supervisor → EOF sooner.
 	if err := o.statusR.SetReadDeadline(time.Now().Add(handshakeDoneBound)); err != nil {
@@ -447,7 +501,7 @@ func (o *ownedSubprocess) drainResidualsWhileLeaderLive() error {
 	// we release the supervisor (same-group residual writers). The waiter
 	// identity-kills members from a fresh snapshot whenever it finds any, so a
 	// separate unconditional enumeration immediately beforehand is redundant.
-	if err := waitProcessGroupEmptyExcept(pgid, o.leader, processGroupGoneBound); err != nil {
+	if err := waitProcessGroupEmptyExceptSet(pgid, o.protected, processGroupGoneBound); err != nil {
 		return fmt.Errorf("drain residuals group empty: %w", err)
 	}
 	// Marker lineage residual: processes that still hold the inherited
@@ -540,6 +594,10 @@ func (o *ownedSubprocess) finishMarkerResidualError(cause error) error {
 // waitProcessGroupEmptyExcept repeatedly membership-kills and probes until
 // pgid has no live members other than exceptPID, or the bound elapses.
 func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error {
+	return waitProcessGroupEmptyExceptSet(pgid, map[int]struct{}{exceptPID: {}}, bound)
+}
+
+func waitProcessGroupEmptyExceptSet(pgid int, except map[int]struct{}, bound time.Duration) error {
 	if pgid <= 1 {
 		return fmt.Errorf("wait process group empty: invalid pgid %d", pgid)
 	}
@@ -551,7 +609,7 @@ func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error
 		}
 		live := 0
 		for _, tok := range snap.membersOfGroup(pgid) {
-			if exceptPID > 0 && tok.pid == exceptPID {
+			if _, skip := except[tok.pid]; skip {
 				continue
 			}
 			if tok.isLiveTarget() {
@@ -561,7 +619,7 @@ func waitProcessGroupEmptyExcept(pgid, exceptPID int, bound time.Duration) error
 		if live == 0 {
 			return nil
 		}
-		if err := killProcessGroupMembersExcept(pgid, exceptPID); err != nil {
+		if err := killProcessGroupMembersExceptSet(pgid, except); err != nil {
 			return err
 		}
 		if time.Now().After(deadline) {
@@ -728,8 +786,13 @@ func (o *ownedSubprocess) killTracked(includeLeader bool) error {
 	o.mu.Lock()
 	handles := make([]ownedHandle, 0, len(o.handles))
 	for pid, h := range o.handles {
-		if !includeLeader && pid == o.leader {
-			continue
+		if !includeLeader {
+			if pid == o.leader {
+				continue
+			}
+			if _, protected := o.protected[pid]; protected {
+				continue
+			}
 		}
 		handles = append(handles, h)
 	}
@@ -914,7 +977,11 @@ func ReapOwnedCmd(cmd *exec.Cmd) error {
 	if cmd != nil {
 		dir = cmd.Dir
 	}
-	owned, err := adoptOwnedCmd(cmd, nil, nil, dir, "", nil)
+	leader := 0
+	if cmd != nil && cmd.Process != nil {
+		leader = cmd.Process.Pid
+	}
+	owned, err := adoptOwnedCmd(cmd, leader, leader, nil, nil, dir, "", nil)
 	if err != nil {
 		return err
 	}

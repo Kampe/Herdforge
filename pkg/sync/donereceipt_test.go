@@ -112,6 +112,20 @@ func validReceipt(t *testing.T, dir, ref, mergeSHA, baseSHA string) *CompletionR
 	return r
 }
 
+// bindLiveRevision re-seals the receipt against the revision the live board
+// task currently encodes — how an integrator mints a receipt for a real board
+// (FAC-783). Closure fixtures must bind it: the exact-receipt gate refuses a
+// full receipt whose revision no longer matches the live task.
+func bindLiveRevision(t *testing.T, r *CompletionReceipt, tp provider.TaskProvider, taskID string) {
+	t.Helper()
+	task, err := tp.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("bind live revision: %v", err)
+	}
+	r.ProviderRevision = string(provider.EncodeRevision(task))
+	r.Seal()
+}
+
 // fakeLifecycle is the durable-state authority under test control.
 type fakeLifecycle struct {
 	st  *lifecycle.TaskState
@@ -392,6 +406,7 @@ func TestValidReceiptAdvancesExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	cp := newReceiptBoard(t, "FAC-132", testTaskID)
 	r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
 	req := DoneRequest{
 		RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
 		Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
@@ -443,6 +458,7 @@ func TestProviderWriteWithoutMatchingReadbackIsHardFailure(t *testing.T) {
 	cp := newReceiptBoard(t, "FAC-132", testTaskID)
 	cp.lieOnReadTo = "in-review" // write "succeeds", readback disagrees
 	r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
 
 	_, err := BoardDone(context.Background(), cp, DoneRequest{
 		RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
@@ -564,6 +580,7 @@ func TestBoardDoneCrashBetweenReadbackAndRecord(t *testing.T) {
 	ctx := context.Background()
 	cp := newReceiptBoard(t, "FAC-132", testTaskID)
 	r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
 	req := DoneRequest{
 		RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
 		Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
@@ -588,28 +605,26 @@ func TestBoardDoneCrashBetweenReadbackAndRecord(t *testing.T) {
 	}
 
 	// Replay after the crash: the card is already done, the record is absent.
+	// Generic done status is not receipt-bound evidence (FAC-783 reviewer
+	// c7102a76), so the replay must refuse fail-closed — it can never
+	// converge the missing record (the done log is the only receipt-bound
+	// closure evidence) and it must not write or append on the refusal.
 	if err := os.Chmod(logPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := BoardDone(ctx, cp, req)
-	if err != nil {
-		t.Fatalf("replay after a crash must converge, got %v", err)
+	if _, err := BoardDone(ctx, cp, req); err == nil ||
+		!strings.Contains(err.Error(), "cannot be accepted on stale evidence") {
+		t.Fatalf("replay on a done card with no receipt-bound record must refuse, got %v", err)
 	}
-	if res.Idempotent {
-		t.Fatal("the record was never written, so this replay must actually record it")
+	if got := statusOf(t, cp, testTaskID); got != "done" {
+		t.Fatalf("status = %q, want unchanged done", got)
 	}
 	log, err := ReadDoneLog(dir)
-	if err != nil || len(log) != 1 {
-		t.Fatalf("replay must leave exactly one record, got %+v err %v", log, err)
+	if err != nil || len(log) != 0 {
+		t.Fatalf("the refusal must not fabricate a record, got %+v err %v", log, err)
 	}
-
-	// And a third delivery is now the idempotent no-op.
-	third, err := BoardDone(ctx, cp, req)
-	if err != nil || !third.Idempotent {
-		t.Fatalf("third delivery must be idempotent, got %+v err %v", third, err)
-	}
-	if cp.updates != 2 {
-		t.Fatalf("exactly the two pre-record attempts should have written, updates=%d", cp.updates)
+	if cp.updates != 1 {
+		t.Fatalf("zero mutation on refusal: exactly the pre-record write may stand, updates=%d", cp.updates)
 	}
 }
 
@@ -642,6 +657,7 @@ func TestAuditDoneReportsSuspiciousClosuresWithoutMutating(t *testing.T) {
 	cp := &countingProvider{MemoryProvider: mp}
 
 	r := validReceipt(t, dir, "FAC-132", mergeSHA, baseSHA)
+	bindLiveRevision(t, r, cp, testTaskID)
 	if _, err := BoardDone(ctx, cp, DoneRequest{
 		RepoDir: dir, ProjectID: "p1", Ref: "FAC-132", Receipt: r,
 		Lifecycle: fakeLifecycle{st: integratedState("FAC-132")},
