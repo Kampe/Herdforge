@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/launch"
 )
 
@@ -117,6 +118,7 @@ type SourceRetirementWorktree struct {
 	Dirty  bool
 	Head   string
 	Branch string
+	Path   string
 }
 
 type SourceRetirementDecision struct {
@@ -182,13 +184,20 @@ func ValidateSourceRetirementManifest(m SourceRetirementManifest) error {
 }
 
 func isAncestor(dir, ancestor, descendant string) bool {
-	if strings.TrimSpace(ancestor) == "" || strings.TrimSpace(descendant) == "" || strings.TrimSpace(dir) == "" {
+	ancestor = strings.TrimSpace(ancestor)
+	descendant = strings.TrimSpace(descendant)
+	dir = strings.TrimSpace(dir)
+	if ancestor == "" || descendant == "" {
 		return false
 	}
 	if ancestor == descendant {
 		return true
 	}
-	return exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
+	if dir == "" {
+		return false
+	}
+	ok, err := gitroot.IsAncestorContext(context.Background(), dir, ancestor, descendant)
+	return err == nil && ok
 }
 
 func isSourceRole(role string) bool {
@@ -248,8 +257,26 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 	if e.Launch.Repository != "" && !strings.EqualFold(e.Launch.Repository, m.Repository) {
 		return blockSourceRetirement("launch provenance repository mismatch")
 	}
-	if e.Launch.CandidateSHA != "" && e.Launch.CandidateSHA != m.CandidateSHA && e.Launch.CandidateSHA != m.BaseSHA {
-		return blockSourceRetirement("launch provenance candidate SHA mismatch")
+	wtDir := e.Worktree.Path
+	if wtDir == "" {
+		wtDir = m.Worktree
+	}
+	if e.Launch.CandidateSHA != "" {
+		if e.Launch.CandidateSHA == m.CandidateSHA {
+			// Non-empty launch pin matching final candidate
+		} else if e.Launch.CandidateSHA == m.BaseSHA {
+			// Non-empty launch pin matching base pin; authenticate that start pin reaches final candidate
+			if !isAncestor(wtDir, e.Launch.CandidateSHA, m.CandidateSHA) {
+				return blockSourceRetirement("launch provenance candidate SHA is not an ancestor of manifest candidate")
+			}
+		} else {
+			return blockSourceRetirement("launch provenance candidate SHA mismatch")
+		}
+	}
+	if m.BaseSHA != m.CandidateSHA {
+		if !isAncestor(wtDir, m.BaseSHA, m.CandidateSHA) {
+			return blockSourceRetirement("manifest base SHA is not an ancestor of manifest candidate")
+		}
 	}
 	if e.Launch.TabID != "" && e.Launch.TabID != m.TabID {
 		return blockSourceRetirement("launch provenance tab ID mismatch")
@@ -747,10 +774,20 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 		}
 
 		baseSHA := candidateSHA
-		if r.CandidateSHA != "" && r.CandidateSHA != candidateSHA {
-			baseSHA = r.CandidateSHA
+		if r.CandidateSHA != "" {
+			if r.CandidateSHA == candidateSHA {
+				baseSHA = candidateSHA
+			} else {
+				if !isAncestor(wtAbs, r.CandidateSHA, candidateSHA) {
+					continue
+				}
+				baseSHA = r.CandidateSHA
+			}
 		} else if baseOut, err := exec.Command("git", "-C", wtAbs, "merge-base", candidateSHA, "HEAD~1").Output(); err == nil && len(strings.TrimSpace(string(baseOut))) == 40 {
-			baseSHA = strings.TrimSpace(string(baseOut))
+			b := strings.TrimSpace(string(baseOut))
+			if isAncestor(wtAbs, b, candidateSHA) {
+				baseSHA = b
+			}
 		}
 
 		branch := r.Branch

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,7 +17,7 @@ func sourceRetirementManifest(t *testing.T, generation string) SourceRetirementM
 	t.Helper()
 	m := NewSourceRetirementManifest(time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC), SourceRetirementManifest{
 		Repository: "herdforge", TaskRef: "FAC-794", TaskID: "task-794",
-		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40), Branch: "recovery/fac-794-source-retirement",
+		CandidateSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("a", 40), Branch: "recovery/fac-794-source-retirement",
 		Worktree: ".worktrees/mender-fac794-source-retirement", Workspace: "wK",
 		TabID: "wK:t17G", PaneID: "wK:p17G", TerminalID: "term-1", SessionID: "session-1", SessionGeneration: "",
 		AgentName: "forge-mender-fac794-gem-6774ef2d", Role: "mender", AgentKind: "opencode",
@@ -569,5 +570,221 @@ func TestRetireSourceLanesContext_MixedBatchFailClosedIsolation(t *testing.T) {
 		if f.events[i] != wantEvents[i] {
 			t.Fatalf("event[%d] got %s want %s", i, f.events[i], wantEvents[i])
 		}
+	}
+}
+
+func TestEvaluateSourceRetirementAncestryAuthentication(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", repo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatalf("base commit: %v (%s)", err, out)
+	}
+	baseBytes, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := strings.TrimSpace(string(baseBytes))
+
+	// Create a descendant commit
+	if out, err := exec.Command("git", "-C", repo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "descendant").CombinedOutput(); err != nil {
+		t.Fatalf("descendant commit: %v (%s)", err, out)
+	}
+	descendantBytes, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descendantSHA := strings.TrimSpace(string(descendantBytes))
+
+	// Create an unrelated orphan commit
+	if out, err := exec.Command("git", "-C", repo, "checkout", "-q", "--orphan", "unrelated").CombinedOutput(); err != nil {
+		t.Fatalf("orphan checkout: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", repo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "unrelated").CombinedOutput(); err != nil {
+		t.Fatalf("orphan commit: %v (%s)", err, out)
+	}
+	unrelatedBytes, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedSHA := strings.TrimSpace(string(unrelatedBytes))
+
+	// 1. Positive: launch start pin is baseSHA, manifest candidate is descendantSHA, worktree points to repo.
+	mPos := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+		Repository: "herdforge", TaskRef: "FAC-794", TaskID: "task-794",
+		CandidateSHA: descendantSHA, BaseSHA: baseSHA, Branch: "main",
+		Worktree: ".worktrees/mender-fac794-source-retirement", Workspace: "wK", TabID: "wK:t17G", PaneID: "wK:p17G", TerminalID: "term-1",
+		SessionID: "session-1", AgentName: "forge-mender-fac794-gem-6774ef2d", Role: "mender", AgentKind: "opencode",
+		ReportArtifact: ".herd/reports/fac-794.md", ReportDigest: strings.Repeat("d", 64),
+		Generation: "g-pos", Nonce: "nonce-1",
+	})
+	ePos := sourceRetirementEvidence(mPos)
+	ePos.Launch.CandidateSHA = baseSHA // Start pin is base
+	ePos.Worktree.Path = repo
+	ePos.Worktree.Head = descendantSHA
+	ePos.Handoff.CandidateSHA = descendantSHA
+	dPos := EvaluateSourceRetirement(ePos)
+	if !dPos.Eligible {
+		t.Fatalf("expected legitimate descendant to be eligible, got: %+v", dPos)
+	}
+
+	// 2. Negative: launch start pin is unrelatedSHA (not an ancestor of descendantSHA).
+	mNeg := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+		Repository: "herdforge", TaskRef: "FAC-794", TaskID: "task-794",
+		CandidateSHA: descendantSHA, BaseSHA: unrelatedSHA, Branch: "main",
+		Worktree: ".worktrees/mender-fac794-source-retirement", Workspace: "wK", TabID: "wK:t17G", PaneID: "wK:p17G", TerminalID: "term-1",
+		SessionID: "session-1", AgentName: "forge-mender-fac794-gem-6774ef2d", Role: "mender", AgentKind: "opencode",
+		ReportArtifact: ".herd/reports/fac-794.md", ReportDigest: strings.Repeat("d", 64),
+		Generation: "g-neg", Nonce: "nonce-1",
+	})
+	eNeg := sourceRetirementEvidence(mNeg)
+	eNeg.Launch.CandidateSHA = unrelatedSHA // Unrelated start pin
+	eNeg.Worktree.Path = repo
+	eNeg.Worktree.Head = descendantSHA
+	eNeg.Handoff.CandidateSHA = descendantSHA
+	dNeg := EvaluateSourceRetirement(eNeg)
+	if dNeg.Eligible || !strings.Contains(dNeg.Reason, "is not an ancestor") {
+		t.Fatalf("expected unrelated start pin to be blocked with ancestry error, got: %+v", dNeg)
+	}
+
+	// 3. Negative: launch candidate matches candidate, but manifest BaseSHA is unrelatedSHA.
+	mNegBase := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
+		Repository: "herdforge", TaskRef: "FAC-794", TaskID: "task-794",
+		CandidateSHA: descendantSHA, BaseSHA: unrelatedSHA, Branch: "main",
+		Worktree: ".worktrees/mender-fac794-source-retirement", Workspace: "wK", TabID: "wK:t17G", PaneID: "wK:p17G", TerminalID: "term-1",
+		SessionID: "session-1", AgentName: "forge-mender-fac794-gem-6774ef2d", Role: "mender", AgentKind: "opencode",
+		ReportArtifact: ".herd/reports/fac-794.md", ReportDigest: strings.Repeat("d", 64),
+		Generation: "g-neg-base", Nonce: "nonce-1",
+	})
+	eNegBase := sourceRetirementEvidence(mNegBase)
+	eNegBase.Launch.CandidateSHA = descendantSHA
+	eNegBase.Worktree.Path = repo
+	eNegBase.Worktree.Head = descendantSHA
+	eNegBase.Handoff.CandidateSHA = descendantSHA
+	dNegBase := EvaluateSourceRetirement(eNegBase)
+	if dNegBase.Eligible || !strings.Contains(dNegBase.Reason, "is not an ancestor") {
+		t.Fatalf("expected unrelated base SHA to be blocked with ancestry error, got: %+v", dNegBase)
+	}
+}
+
+func TestEnrollReadySourceManifestsAncestryAuthentication(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatalf("base commit: %v (%s)", err, out)
+	}
+	baseBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := strings.TrimSpace(string(baseBytes))
+
+	// Create descendant commit
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "descendant").CombinedOutput(); err != nil {
+		t.Fatalf("descendant commit: %v (%s)", err, out)
+	}
+	descendantBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descendantSHA := strings.TrimSpace(string(descendantBytes))
+
+	// Create unrelated orphan commit
+	if out, err := exec.Command("git", "-C", root, "checkout", "-q", "--orphan", "unrelated").CombinedOutput(); err != nil {
+		t.Fatalf("orphan checkout: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "unrelated").CombinedOutput(); err != nil {
+		t.Fatalf("orphan commit: %v (%s)", err, out)
+	}
+	unrelatedBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedSHA := strings.TrimSpace(string(unrelatedBytes))
+
+	// Switch back to main
+	if out, err := exec.Command("git", "-C", root, "checkout", "-q", "main").CombinedOutput(); err != nil {
+		t.Fatalf("checkout main: %v (%s)", err, out)
+	}
+
+	agentName := "forge-mender-fac794-gem-6774ef2d"
+	reportRel := ".herd/reports/fac-794.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportData := []byte("## Report for FAC-794\nTask: FAC-794\nAgent: " + agentName + "\nCandidate: " + descendantSHA + "\nStatus: READY\n")
+	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wtRel := "worktrees/mender-wt"
+	if err := os.MkdirAll(filepath.Join(root, wtRel), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Negative: Launch receipt with unrelated candidate SHA (not an ancestor of report's candidate)
+	launchReceiptsPath := filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lrNeg := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         agentName,
+		Branch:       "main",
+		Worktree:     wtRel,
+		CandidateSHA: unrelatedSHA,
+		PaneID:       "wK:p17G",
+		TabID:        "wK:t17G",
+		HerdrSession: "session-1",
+		Repository:   "fixture-repo",
+	}
+	lrNegBytes, _ := json.Marshal(lrNeg)
+	if err := os.WriteFile(launchReceiptsPath, append(lrNegBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	enrolledNeg, err := EnrollReadySourceManifests(root, "fixture-repo", false)
+	if err != nil {
+		t.Fatalf("EnrollReadySourceManifests failed: %v", err)
+	}
+	if len(enrolledNeg) != 0 {
+		t.Fatalf("expected unrelated launch pin not to be enrolled, got %d manifests: %+v", len(enrolledNeg), enrolledNeg)
+	}
+
+	// 2. Positive: Launch receipt with baseSHA (legitimate ancestor of report's candidate)
+	lrPos := launch.Receipt{
+		Accepted:     true,
+		TaskRef:      "FAC-794",
+		Role:         "mender",
+		Name:         agentName,
+		Branch:       "main",
+		Worktree:     wtRel,
+		CandidateSHA: baseSHA,
+		PaneID:       "wK:p17G",
+		TabID:        "wK:t17G",
+		HerdrSession: "session-1",
+		Repository:   "fixture-repo",
+	}
+	lrPosBytes, _ := json.Marshal(lrPos)
+	if err := os.WriteFile(launchReceiptsPath, append(lrPosBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	enrolledPos, err := EnrollReadySourceManifests(root, "fixture-repo", false)
+	if err != nil {
+		t.Fatalf("EnrollReadySourceManifests failed: %v", err)
+	}
+	if len(enrolledPos) != 1 {
+		t.Fatalf("expected legitimate descendant to be enrolled, got %d manifests: %+v", len(enrolledPos), enrolledPos)
+	}
+	if enrolledPos[0].BaseSHA != baseSHA || enrolledPos[0].CandidateSHA != descendantSHA {
+		t.Fatalf("enrolled manifest base/candidate mismatch: got base=%s candidate=%s, want base=%s candidate=%s",
+			enrolledPos[0].BaseSHA, enrolledPos[0].CandidateSHA, baseSHA, descendantSHA)
 	}
 }

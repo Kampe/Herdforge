@@ -393,3 +393,22 @@ func TestSourceCleanupNative_HerdYamlAbsenceVsMalformed(t *testing.T) {
 		t.Fatal("expected malformed herd.yaml to fail closed with error, got nil")
 	}
 }
+
+func TestDrainAdaptersRetireSourceLanes_MalformedConfigFailsClosed(t *testing.T) {
+	rootMalformed := t.TempDir()
+	herdDir := filepath.Join(rootMalformed, ".herd")
+	if err := os.MkdirAll(herdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(herdDir, "herd.yaml"), []byte("invalid: yaml: [syntax"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &drainAdapters{
+		root:       rootMalformed,
+		repository: "fixture-repo",
+	}
+	err := a.retireSourceLanes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "load herd configuration") {
+		t.Fatalf("expected drain hook to fail closed on malformed herd.yaml, got %v", err)
+	}
+}

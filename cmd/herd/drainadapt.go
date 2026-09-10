@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -159,7 +160,15 @@ func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
 	if a == nil || strings.TrimSpace(a.root) == "" {
 		return fmt.Errorf("source retirement authority is unavailable")
 	}
-	if _, err := herdr.EnrollReadySourceManifests(a.root, a.repository, true); err != nil {
+	cfg, err := config.LoadConfig(filepath.Join(a.root, ".herd", "herd.yaml"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load herd configuration: %w", err)
+	}
+	repoIdent := a.repository
+	if repoIdent == "" && cfg != nil {
+		repoIdent = repositoryIdentityForLaunch(cfg)
+	}
+	if _, err := herdr.EnrollReadySourceManifests(a.root, repoIdent, true); err != nil {
 		return fmt.Errorf("enroll ready source manifests: %w", err)
 	}
 	registry := herdr.SourceRetirementRegistry{Path: herdr.SourceRetirementRegistryPath(a.root)}
@@ -182,11 +191,8 @@ func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
 		return nil
 	}
 	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
-	var standing map[string]bool
-	if cfg, err := config.LoadConfig(filepath.Join(a.root, ".herd", "herd.yaml")); err == nil && cfg != nil {
-		standing = configuredStandingAgentNames(cfg)
-	}
-	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: a.repository, StandingLanes: standing}
+	standing := configuredStandingAgentNames(cfg)
+	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: repoIdent, StandingLanes: standing}
 	_, err = herdr.RetireSourceLanesContext(ctx, op, manifests, false)
 	if err != nil {
 		return err

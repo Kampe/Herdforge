@@ -153,8 +153,11 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 		if r.PaneID != "" && m.PaneID != "" && r.PaneID != m.PaneID {
 			continue
 		}
-		if r.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA && r.CandidateSHA != m.BaseSHA {
-			continue
+		wtAbs := filepath.Join(n.Root, filepath.Clean(m.Worktree))
+		if r.CandidateSHA != "" && r.CandidateSHA != m.CandidateSHA {
+			if r.CandidateSHA != m.BaseSHA || !isAncestor(wtAbs, r.CandidateSHA, m.CandidateSHA) {
+				continue
+			}
 		}
 		matching = append(matching, r)
 	}
@@ -162,10 +165,12 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 		return matching[0]
 	}
 	if len(matching) > 1 {
+		wtAbs := filepath.Join(n.Root, filepath.Clean(m.Worktree))
 		// If multiple receipts exist, check if there's an exact candidate+session or base+session match without ambiguity
 		var exactMatch []launch.Receipt
 		for _, r := range matching {
-			if (r.CandidateSHA == m.CandidateSHA || r.CandidateSHA == m.BaseSHA || r.CandidateSHA == "") && (m.SessionID == "" || r.HerdrSession == m.SessionID) {
+			candMatch := r.CandidateSHA == "" || r.CandidateSHA == m.CandidateSHA || (r.CandidateSHA == m.BaseSHA && isAncestor(wtAbs, r.CandidateSHA, m.CandidateSHA))
+			if candMatch && (m.SessionID == "" || r.HerdrSession == m.SessionID) {
 				exactMatch = append(exactMatch, r)
 			}
 		}
@@ -379,6 +384,7 @@ func (n *NativeSourceRetirementOp) observeWorktree(m SourceRetirementManifest) (
 		Dirty:  strings.TrimSpace(status) != "",
 		Head:   strings.TrimSpace(head),
 		Branch: strings.TrimSpace(branch),
+		Path:   dir,
 	}, nil
 }
 

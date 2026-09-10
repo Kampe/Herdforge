@@ -1,10 +1,11 @@
 # FAC-794: Source Lane Retirement Hardening & Provenance Safety Report
 
 Task: FAC-794
-Agent: forge-mender-fac794-nat-b95272da
-Candidate: aeca8f4eec4930f05fd7e7b991907b5ded573cf5
+Agent: forge-mender-fac794-anc-01722e3b
+Candidate: 3720b5c2dfdb2f6c0133c9daaa5b0d5c8ebfcb87
 Status: READY
 Branch: recovery/fac-794-source-retirement
+Builder-Family: google
 
 ## Safety Fix 1: Durable Handoff Parser Hardening
 - **Vulnerability / Flaw**: `ParseStructuredHandoffReport` previously permitted incomplete reports (missing task, agent, or candidate SHA), accepted non-ready verdicts, failed to reject contradictory duplicates (e.g. `Status: READY` followed by `Status: BLOCKED`), and misidentified markdown quoted prose (`> Task: ...`) or code fences (```) as top-level identity headers.
@@ -73,7 +74,7 @@ Branch: recovery/fac-794-source-retirement
 
 ## Safety Fix 5: `.herd/herd.yaml` Absence vs Malformed Configuration
 - **Vulnerability / Flaw**: Missing `.herd/herd.yaml` in minimal/WSL environments threw unexpected errors, but ignoring errors completely risked hiding malformed syntax or permission errors.
-- **Production Guard (`cmd/herd/source_cleanup_native.go`)**:
+- **Production Guard (`cmd/herd/source_cleanup_native.go` & `cmd/herd/drainadapt.go`)**:
   - Distinguishes `errors.Is(err, os.ErrNotExist)` (configuration absence is harmless when no cleanup authority configured) from real syntax/validation errors (`!errors.Is(err, os.ErrNotExist)` fails closed).
 - **RED Evidence**:
   - Malformed YAML in `.herd/herd.yaml` -> previously silently fell back to nil config instead of failing.
@@ -81,7 +82,34 @@ Branch: recovery/fac-794-source-retirement
   - `TestSourceCleanupNative_HerdYamlAbsenceVsMalformed`:
     - Missing `.herd/herd.yaml`: returns `report.Retired == 0, err == nil`.
     - Malformed `.herd/herd.yaml`: returns `err != nil` (fails closed).
+  - `TestDrainAdaptersRetireSourceLanes_MalformedConfigFailsClosed`:
+    - Malformed `.herd/herd.yaml` during drain hook: returns `err != nil` with `load herd configuration` error (fails closed).
+
+## Safety Fix 6: Deduplicated `--is-ancestor` Rule & Canonical `pkg/gitroot.IsAncestorContext`
+- **Vulnerability / Flaw**: Multiple packages (`cmd/herd/integration_native.go`, `pkg/gitroot/gitroot.go`, `pkg/herdr/source_retirement.go`) directly invoked `git merge-base --is-ancestor`, violating the non-duplication invariant (`TestNoNewDuplicatedRules`).
+- **Production Guard (`pkg/gitroot/gitroot.go`)**:
+  - Imported canonical `gitroot.IsAncestorContext(ctx, root, ancestor, descendant)` helper from reviewed FAC-769 (`4ef360e8`).
+  - Refactored `cmd/herd/integration_native.go` and `pkg/herdr/source_retirement.go` to use `gitroot.IsAncestorContext`.
+- **RED Evidence**:
+  - Running `go test ./pkg/invariant -run TestNoNewDuplicatedRules` previously exited with status 2 due to 3 duplicate `--is-ancestor` calls.
+- **Restored GREEN Evidence (`pkg/invariant` & `pkg/gitroot`)**:
+  - `TestNoNewDuplicatedRules` -> PASS (0 duplicate violations).
+  - `TestIsAncestorContextDistinguishesFalseFromGitFailure` -> PASS.
+
+## Safety Fix 7: Ancestry Authentication for Launch Start Pin & Base Commit
+- **Vulnerability / Flaw**: Manifest enrollment and evaluation accepted unauthenticated start pins and base commits without verifying that the launch candidate commit reached the claimed candidate commit in Git history.
+- **Production Guard (`pkg/herdr/source_retirement.go` & `pkg/herdr/native_source_retirement.go`)**:
+  - `EvaluateSourceRetirement` verifies `isAncestor(wtDir, e.Launch.CandidateSHA, m.CandidateSHA)` when `e.Launch.CandidateSHA == m.BaseSHA`.
+  - `EvaluateSourceRetirement` verifies `isAncestor(wtDir, m.BaseSHA, m.CandidateSHA)` when `m.BaseSHA != m.CandidateSHA`.
+  - `EnrollReadySourceManifests` validates that launch receipt candidate SHA is an ancestor of the parsed report candidate before enrollment.
+- **RED Evidence**:
+  - Launch receipt with unrelated commit SHA -> previously enrolled and evaluated as eligible (UNAUTHENTICATED LAUNCH ACCEPTANCE).
+- **Restored GREEN Evidence (`pkg/herdr/source_retirement_test.go`)**:
+  - `TestEvaluateSourceRetirementAncestryAuthentication` -> PASS (unrelated start pin / base SHA blocked with ancestry error; legitimate descendant allowed).
+  - `TestEnrollReadySourceManifestsAncestryAuthentication` -> PASS (unrelated launch pin skipped; legitimate descendant enrolled).
 
 ## Verification Matrix
-- Unit Tests: `GOMAXPROCS=2 GOFLAGS=-p=2 go test -v ./pkg/herdr` (All PASS)
-- CLI Tests: `GOMAXPROCS=2 GOFLAGS=-p=2 go test -v ./cmd/herd -run "SourceCleanup|SourceRetirement|DrainSourceRetirement"` (All PASS)
+- Invariant Gate: `GOMAXPROCS=2 GOFLAGS=-p=2 go test ./pkg/invariant -run TestNoNewDuplicatedRules` (PASS)
+- Gitroot Tests: `GOMAXPROCS=2 GOFLAGS=-p=2 go test ./pkg/gitroot` (PASS)
+- Herdr Unit Tests: `GOMAXPROCS=2 GOFLAGS=-p=2 go test ./pkg/herdr` (PASS)
+- CLI Tests: `GOMAXPROCS=2 GOFLAGS=-p=2 go test ./cmd/herd -run "SourceCleanup|SourceRetirement|DrainSourceRetirement|DrainAdaptersRetireSourceLanes"` (PASS)
