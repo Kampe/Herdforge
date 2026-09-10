@@ -259,3 +259,79 @@ func TestRuntimeInstallRefusesSharedLockAndDoesNotMutate(t *testing.T) {
 		t.Fatalf("lock refusal changed installed target: before=%v after=%v err=%v", before, after, err)
 	}
 }
+
+// TestRuntimeRetentionRefusesRemovalWhenCurrentInstallChangedSinceCensus
+// proves the just-in-time recheck at the deletion point of
+// retireRuntimeBackupsWith: manifest.Current captured at one moment (the
+// census) is later handed to a real second retention pass after the
+// installed binary has genuinely moved on to a different revision/digest
+// -- via two real, provenance-valid installs, never a hand-forged byte
+// mismatch. The candidate itself is untouched (same path, same inode, same
+// stat, single link, owned, not itself part of the stale manifest's
+// Previous chain) so no other guard in the loop -- link count, ownership,
+// containment, the candidate's own before/after Lstat recheck -- has any
+// basis to hold it; only the current-binding digest recheck can and must
+// refuse it.
+func TestRuntimeRetentionRefusesRemovalWhenCurrentInstallChangedSinceCensus(t *testing.T) {
+	f := retentionFixture(t)
+	if _, err := f.installer.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(f.root, ".herd", runtimeRetentionManifestName)
+	staleManifest, err := f.installer.loadRetentionManifest(manifestPath)
+	if err != nil || staleManifest == nil {
+		t.Fatalf("stale manifest: %v", err)
+	}
+	staleCurrentDigest := staleManifest.Current.Digest
+
+	// A second real install genuinely changes the installed binary's
+	// revision and digest -- staleManifest.Current now names a binding
+	// that is no longer what is actually installed at bin/herd.
+	advanceRetentionRuntime(t, &f, "third")
+	installedNow, err := f.installer.inspect(filepath.Join(f.root, "bin", "herd"))
+	if err != nil {
+		t.Fatalf("inspect installed: %v", err)
+	}
+	if installedNow.Digest == staleCurrentDigest {
+		t.Fatal("test setup failure: installed digest did not actually change")
+	}
+
+	dir := filepath.Join(f.root, ".herd", "runtime-previous")
+	candidate := filepath.Join(dir, "jit-guard-candidate")
+	if err := os.WriteFile(candidate, []byte("otherwise fully eligible backup content"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	journalPath := filepath.Join(f.root, ".herd", runtimeRetentionJournalName)
+	report, err := f.installer.retireRuntimeBackupsWith(context.Background(), *staleManifest, journalPath, 16, defaultRuntimeRetentionBytes,
+		func(context.Context, string) (RuntimeOwnerStatus, error) { return RuntimeOwnerAbsent, nil })
+	if err != nil {
+		t.Fatalf("retireRuntimeBackupsWith: %v", err)
+	}
+	if report.Removed != 0 {
+		t.Fatalf("stale current binding must remove nothing, report=%+v", report)
+	}
+	if report.Errors == 0 || report.Reason != "current-install-changed" {
+		t.Fatalf("expected a current-install-changed refusal, got report=%+v", report)
+	}
+
+	after, err := os.Lstat(candidate)
+	if err != nil {
+		t.Fatalf("candidate must be retained on disk, stat failed: %v", err)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		t.Fatalf("candidate identity changed across a refused pass: before=%+v after=%+v", before, after)
+	}
+
+	journal, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(journal), `"path":"jit-guard-candidate","logical_bytes"`) || strings.Contains(string(journal), `"event":"removed","path":"jit-guard-candidate"`) {
+		t.Fatalf("journal must not record a destructive success for the held candidate: %s", journal)
+	}
+}
