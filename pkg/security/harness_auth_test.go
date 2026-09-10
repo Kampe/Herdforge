@@ -1,6 +1,9 @@
 package security
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // TestClaudeNeedsNoBrokeredHostCredential is the FAC-576 gate.
 //
@@ -89,6 +92,82 @@ func TestClaudeDiagnosisIsBrokerable(t *testing.T) {
 	if d.Blocker != "" {
 		t.Errorf("a brokerable kind must carry no blocker, got %q", d.Blocker)
 	}
+}
+
+// TestClaudeDeterministicAuthStatusProbes tests all probe states deterministically
+// via the test seam, guaranteeing hermetic verification regardless of host auth state.
+func TestClaudeDeterministicAuthStatusProbes(t *testing.T) {
+	t.Run("logged-out", func(t *testing.T) {
+		restore := SetHarnessLoginProbeForTesting(func(ctx context.Context, kind string) ([]byte, error) {
+			return []byte(`{"loggedIn": false}`), nil
+		})
+		defer restore()
+
+		if got := HarnessLoginState(AuthorKindClaude); got != HarnessLoggedOut {
+			t.Fatalf("HarnessLoginState = %q, want %q", got, HarnessLoggedOut)
+		}
+		d := DiagnoseKindAuthReadiness(AuthorKindClaude)
+		if d.Brokerable {
+			t.Fatalf("logged-out claude must not be brokerable: %+v", d)
+		}
+		if d.Class != KindAuthExternal {
+			t.Errorf("class = %q, want %q", d.Class, KindAuthExternal)
+		}
+		if d.ReasonCode != "harness_not_logged_in" {
+			t.Errorf("reason = %q, want harness_not_logged_in", d.ReasonCode)
+		}
+		if d.Blocker != "FAC-576 BLOCKED: the claude harness is installed but not logged in" {
+			t.Errorf("unexpected blocker: %q", d.Blocker)
+		}
+		if d.RecommendedAction != "log in with the claude CLI on this host; no API key is used or wanted" {
+			t.Errorf("unexpected recommended action: %q", d.RecommendedAction)
+		}
+	})
+
+	t.Run("logged-in", func(t *testing.T) {
+		restore := SetHarnessLoginProbeForTesting(func(ctx context.Context, kind string) ([]byte, error) {
+			return []byte(`{"loggedIn": true}`), nil
+		})
+		defer restore()
+
+		if got := HarnessLoginState(AuthorKindClaude); got != HarnessLoggedIn {
+			t.Fatalf("HarnessLoginState = %q, want %q", got, HarnessLoggedIn)
+		}
+		d := DiagnoseKindAuthReadiness(AuthorKindClaude)
+		if !d.Brokerable {
+			t.Fatalf("logged-in claude must be brokerable: %+v", d)
+		}
+		if d.Class != KindAuthOK {
+			t.Errorf("class = %q, want %q", d.Class, KindAuthOK)
+		}
+		if d.ReasonCode != "native_auth" {
+			t.Errorf("reason = %q, want native_auth", d.ReasonCode)
+		}
+		if d.Blocker != "" {
+			t.Errorf("blocker must be empty, got: %q", d.Blocker)
+		}
+	})
+
+	t.Run("probe-error-is-unknown", func(t *testing.T) {
+		restore := SetHarnessLoginProbeForTesting(func(ctx context.Context, kind string) ([]byte, error) {
+			return nil, context.DeadlineExceeded
+		})
+		defer restore()
+
+		if got := HarnessLoginState(AuthorKindClaude); got != HarnessLoginUnknown {
+			t.Fatalf("HarnessLoginState = %q, want %q", got, HarnessLoginUnknown)
+		}
+		d := DiagnoseKindAuthReadiness(AuthorKindClaude)
+		if !d.Brokerable {
+			t.Fatalf("unknown auth state must remain brokerable (fail-open for admission): %+v", d)
+		}
+		if d.Class != KindAuthOK {
+			t.Errorf("class = %q, want %q", d.Class, KindAuthOK)
+		}
+		if d.ReasonCode != "native_auth" {
+			t.Errorf("reason = %q, want native_auth", d.ReasonCode)
+		}
+	})
 }
 
 // An unanswerable login probe must not be read as logged out: a CLI that is

@@ -1,7 +1,7 @@
 # rule	file	line	fingerprint	rationale	owner	expires (UTC)
 # Entries are generated from rule|repo-relative-file|line with SHA-256.  They
 # must exactly match every unresolved HIGH/CRITICAL gosec finding.
-G101	cmd/herd/hostcreds.go	258	4b79005f180b647e2c8fa10ef58deaee108e79a574898856a166fd30f62fb755	deterministic self-test bearer value	hostcreds-maintainers	2026-12-31
+G101	cmd/herd/hostcreds.go	259	8f18acdbe9b0bc6e0320b69e5fc5361f9224defa0ac30ad038beacfbe5d52b01	deterministic self-test bearer value	hostcreds-maintainers	2026-12-31
 G101	pkg/agentpolicy/enforce.go	14	e61726f2a438054615e49439bb48420246827ce448ef634cdf5c50ef4f641fc6	environment variable name only	security-maintainers	2026-12-31
 G101	pkg/envplan/envplan.go	36	1bd68f2084d85b2a890bd0cfd9017eeffc207af2197440d935c3797dd8472405	capability label only	envplan-maintainers	2026-12-31
 G101	pkg/provider/fence_broker.go	705	5ae3de5a9fd5b9c4ddf79ff07cb44da01a883e4196ab35bd396d6321fc8b2d58	credential-file leaf name only	provider-maintainers	2026-12-31

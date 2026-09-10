@@ -61,6 +61,18 @@ const (
 // hung CLI must not hang the gate.
 const harnessLoginProbeTimeout = 8 * time.Second
 
+// harnessLoginProbeHook allows tests to override the status probe for harness auth.
+// When nil, the default CLI execution is used.
+var harnessLoginProbeHook func(ctx context.Context, kind string) ([]byte, error)
+
+// SetHarnessLoginProbeForTesting sets a hook for testing harness login probes.
+// It returns a cleanup function that restores the previous hook.
+func SetHarnessLoginProbeForTesting(fn func(ctx context.Context, kind string) ([]byte, error)) func() {
+	prev := harnessLoginProbeHook
+	harnessLoginProbeHook = fn
+	return func() { harnessLoginProbeHook = prev }
+}
+
 // HarnessLoginState asks a harness whether it is signed in.
 //
 // It reads ONLY the boolean. The response also carries an email, an org id and a
@@ -76,12 +88,20 @@ func HarnessLoginState(kind string) HarnessLogin {
 	if kind != AuthorKindClaude {
 		return HarnessLoginUnknown
 	}
-	if _, err := exec.LookPath("claude"); err != nil {
-		return HarnessLoginUnknown
+	var out []byte
+	var err error
+	if harnessLoginProbeHook != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), harnessLoginProbeTimeout)
+		defer cancel()
+		out, err = harnessLoginProbeHook(ctx, kind)
+	} else {
+		if _, lookErr := exec.LookPath("claude"); lookErr != nil {
+			return HarnessLoginUnknown
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), harnessLoginProbeTimeout)
+		defer cancel()
+		out, err = exec.CommandContext(ctx, "claude", "auth", "status", "--json").Output()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), harnessLoginProbeTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "claude", "auth", "status", "--json").Output()
 	if err != nil {
 		return HarnessLoginUnknown
 	}

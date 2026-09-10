@@ -87,6 +87,22 @@ func TestHostCredsCLI_UnknownKindRejected(t *testing.T) {
 	}
 }
 
+func TestHostCredsCLI_UsageIncludesOpenCodeDiagnose(t *testing.T) {
+	bin := buildHerdForHostCreds(t)
+	cmd := exec.Command(bin, "hostcreds", "help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("hostcreds help failed: %v\n%s", err, out)
+	}
+	s := string(out)
+	if !strings.Contains(s, "opencode") {
+		t.Errorf("hostcreds help must mention opencode under diagnose: %s", s)
+	}
+	if !strings.Contains(s, "raw HostCreds session/live broker remains unsupported for OpenCode") {
+		t.Errorf("hostcreds help must clarify raw broker unsupported for OpenCode: %s", s)
+	}
+}
+
 func buildHerdForHostCreds(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

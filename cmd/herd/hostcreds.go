@@ -45,7 +45,7 @@ func printHostCredsUsage() {
 	fmt.Fprintln(os.Stderr, `herd hostcreds — HostCreds (FAC-170)
 
 Usage:
-  herd hostcreds diagnose  --kind <grok|claude|codex>
+  herd hostcreds diagnose  --kind <grok|claude|codex|agy|opencode>
   herd hostcreds session   --kind <grok|claude|codex>
   herd hostcreds selftest
   herd hostcreds boundary          # reports FAC-169 dependency status
@@ -56,7 +56,8 @@ Usage:
 Production secrets: FAC-169 IPC authority after merge (not in-process test vault)
 OS isolation: FAC-169 (hard blocker). Live waits for FAC-169 + RequireOSBoundary.
 
-Exit: 0 ok, 1 fatal, 2 BLOCKED/usage. Never prints credential bytes. No OpenCode.`)
+Exit: 0 ok, 1 fatal, 2 BLOCKED/usage. Never prints credential bytes.
+Diagnose supports native harness auth (including OpenCode); raw HostCreds session/live broker remains unsupported for OpenCode.`)
 }
 
 func runHostCredsAuthorCausal(args []string) int {
