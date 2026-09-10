@@ -66,6 +66,13 @@ func TestFenceBrokerClientLookupOpFailClosed(t *testing.T) {
 			`{"error":"ledger mismatch"}`,
 			`{"error":500}`,
 			`{"error":true}`,
+			`{"error":false}`,
+			`{"error":0}`,
+			`{"error":null}`,
+			`{"error":""}`,
+			`{"Error":null}`,
+			`{"error":null,"applied":true,"ambiguous":false,"op_id":"aa","task_id":"t1"}`,
+			`{"error":"","applied":true,"ambiguous":false,"op_id":"aa","task_id":"t1"}`,
 			`{"error":{"code":500,"message":"ledger mismatch"}}`,
 			`{"error":["ledger mismatch"]}`,
 		} {
@@ -78,6 +85,23 @@ func TestFenceBrokerClientLookupOpFailClosed(t *testing.T) {
 				t.Fatalf("HTTP 200 error body %s must be a hard error", errBody)
 			}
 			srv.Close()
+		}
+	})
+
+	t.Run("body read error fails closed", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "1000")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"applied":true,"ambiguous":false,"op_id":"aa","task_id":"t1"`))
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, _ := hj.Hijack()
+				_ = conn.Close()
+			}
+		}))
+		defer srv.Close()
+		c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
+		if _, err := c.LookupOp(ctx, "aa"); err == nil {
+			t.Fatal("body read error must fail closed")
 		}
 	})
 
@@ -164,5 +188,49 @@ func TestValidateOpID(t *testing.T) {
 		if err := ValidateOpID(bad); err == nil {
 			t.Fatalf("ValidateOpID(%q) = nil, want error", bad)
 		}
+	}
+}
+
+// TestFAC785ReviewNullEmptyJSONErrorMustFailClosed tests that HTTP 200 responses with
+// {"error":null} or {"error":""} fail closed as hard errors.
+func TestFAC785ReviewNullEmptyJSONErrorMustFailClosed(t *testing.T) {
+	ctx := context.Background()
+	for _, errBody := range []string{
+		`{"error":null}`,
+		`{"error":""}`,
+		`{"error":false}`,
+		`{"Error":null}`,
+		`{"error":null,"applied":true,"ambiguous":false,"op_id":"aa","task_id":"t1"}`,
+		`{"error":"","applied":true,"ambiguous":false,"op_id":"aa","task_id":"t1"}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(errBody))
+		}))
+		c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
+		if _, err := c.LookupOp(ctx, "aa"); err == nil {
+			srv.Close()
+			t.Fatalf("HTTP 200 %s must fail closed", errBody)
+		}
+		srv.Close()
+	}
+}
+
+// TestFAC785ReviewLookupOpReadErrorMustFailClosed tests that body read errors in LookupOp
+// fail closed instead of being ignored.
+func TestFAC785ReviewLookupOpReadErrorMustFailClosed(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"applied":true,"ambiguous":false,"op_id":"aa","task_id":"t1"`))
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		}
+	}))
+	defer srv.Close()
+	c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
+	if _, err := c.LookupOp(ctx, "aa"); err == nil {
+		t.Fatal("body read error must fail closed")
 	}
 }

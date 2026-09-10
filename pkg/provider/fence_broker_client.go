@@ -165,7 +165,10 @@ func (c *FenceBrokerClient) Status(ctx context.Context) (*FenceBrokerStatus, err
 		return nil, fmt.Errorf("fence-broker status: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("fence-broker status: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
 		return nil, fmt.Errorf("fence-broker status: %w", err)
 	}
@@ -192,7 +195,10 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 		return false, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("fence-broker op lookup: %w", err)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return false, nil
 	}
@@ -257,7 +263,10 @@ func (c *FenceBrokerClient) LookupOp(ctx context.Context, opID string) (*FenceOp
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("fence-broker op lookup: %w", err)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
@@ -334,7 +343,10 @@ func (c *FenceBrokerClient) MutateStatus(ctx context.Context, taskID, status str
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("fence-broker mutate: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
 		return err
 	}
@@ -374,7 +386,10 @@ func (c *FenceBrokerClient) MutateComment(ctx context.Context, taskID, commentBo
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("fence-broker comment: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
 		return err
 	}
@@ -398,10 +413,7 @@ func rejectJSONErrorBody(status int, body []byte) error {
 	}
 	for k, raw := range probe {
 		if strings.EqualFold(k, "error") {
-			rawStr := strings.TrimSpace(string(raw))
-			if rawStr != "" && rawStr != "null" && rawStr != `""` {
-				return fmt.Errorf("fence-broker: HTTP %d body carries error (fail-closed): %s", status, rawStr)
-			}
+			return fmt.Errorf("fence-broker: HTTP %d body carries error (fail-closed): %s", status, strings.TrimSpace(string(raw)))
 		}
 	}
 	return nil
