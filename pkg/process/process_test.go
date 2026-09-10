@@ -36,6 +36,7 @@ func TestClassify(t *testing.T) {
 		{"blocked colon", "BLOCKED: timeout", Blocked},
 		{"quota weekly", "weekly quota exceeded", Quota},
 		{"quota usage limit", "usage limit reached; resets in 3h", Quota},
+		{"quota claude fable limit", "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.", Quota},
 		{"quota rate hit", "rate limit exceeded", Quota},
 		{"quota token quota", "token quota reached", Quota},
 		{"quota too many requests", "429 too many requests", Quota},
@@ -71,6 +72,9 @@ func TestClassify(t *testing.T) {
 }
 
 func TestProviderExhaustionReason(t *testing.T) {
+	if got := ProviderExhaustionReason("You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."); got == "" {
+		t.Fatal("Claude Fable limit refusal was not detected")
+	}
 	if got := ProviderExhaustionReason("OpenCode: weekly quota exceeded; retry later"); got == "" {
 		t.Fatal("quota failure was not detected")
 	}
@@ -108,7 +112,7 @@ func TestOutputLimitReason(t *testing.T) {
 		{`response truncated due to output limit`, true},
 		{"normal text without limits", false},
 		{"Verdict: PASS\nTested finish=length unit tests", false}, // review marker excludes
-		{"CONFIRMED: finish_reason: length is tested", false},   // review marker excludes
+		{"CONFIRMED: finish_reason: length is tested", false},     // review marker excludes
 	}
 
 	for _, tt := range tests {

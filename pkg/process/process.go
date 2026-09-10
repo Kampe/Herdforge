@@ -234,7 +234,7 @@ func ProviderExhaustionReason(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return ""
 	}
-	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|individual quota reached|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)|account (?:has been |is )?suspended|upstream account suspended|account (?:has been |is )?deactivated|insufficient[_\s]quota|credit balance is too low|402\s+payment\s+required|billing (?:not active|account disabled|hard limit reached)|rate_limit_exceeded|resource_exhausted`)
+	quotaPat := regexp.MustCompile(`(?i)out of credits|out of quota|too many requests|429 too many|individual quota reached|reached your [[:alnum:]_-]+ limit|(rate.?limit|usage limit|weekly limit|daily limit|monthly limit|token quota|api quota|quota)[^.]{0,24}(exceeded|reached|throttled|hit|exhausted)|exceeded your (quota|rate|usage|limit)|account (?:has been |is )?suspended|upstream account suspended|account (?:has been |is )?deactivated|insufficient[_\s]quota|credit balance is too low|402\s+payment\s+required|billing (?:not active|account disabled|hard limit reached)|rate_limit_exceeded|resource_exhausted`)
 	if quotaPat.MatchString(text) && !patterns.ReviewMarkerPattern().MatchString(text) {
 		return "provider quota or rate limit reported"
 	}
