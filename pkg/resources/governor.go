@@ -458,7 +458,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			return GovernorReport{}, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
 		}
 		seen[lanes[i].Path] = struct{}{}
-		usage, measureErr := g.Measure.Measure(lanes[i].Path, g.Policy.MaxScanEntries)
+		usage, measureErr := g.Measure.Measure(lanes[i].Path, g.registeredMeasureLimit())
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_allocation_unavailable"
@@ -559,7 +559,25 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 		if err != nil {
 			return result, fmt.Errorf("read known orphan root: %w", err)
 		}
+		// Rotate the bounded window by a time bucket. A protected early entry
+		// must not permanently starve later eligible entries across sweeps.
+		if len(entries) > 0 {
+			start := int((g.Now().Unix() / int64(time.Minute/time.Second)) % int64(len(entries)))
+			entries = append(append([]os.DirEntry(nil), entries[start:]...), entries[:start]...)
+		}
 		limit := g.orphanCensusLimit()
+		rootProcessUsage := map[string]ProcessUsage(nil)
+		var rootProcessErr error
+		if batch, ok := g.Processes.(BatchProcessInspector); ok {
+			rootProcessUsage = make(map[string]ProcessUsage)
+			batchPaths := orphanBatchPaths(entries, root, known, limit, g.Policy.OrphanDerivedTargets)
+			if len(batchPaths) > 0 {
+				rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
+				if err := ctx.Err(); err != nil {
+					return result, err
+				}
+			}
+		}
 		candidates := 0
 		for _, entry := range entries {
 			if err := ctx.Err(); err != nil {
@@ -590,6 +608,7 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 				continue
 			}
 			orphan := OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), AllocatedBytes: usage.Bytes, Entries: usage.Entries, AllocationTruncated: usage.Truncated, PreserveReason: "unregistered_worktree_authority_unavailable"}
+			processUsage, processErr := rootProcessUsage, rootProcessErr
 			for _, rel := range g.Policy.OrphanDerivedTargets {
 				target, targetRel, resolveErr := orphanTargetPath(path, rel)
 				row := OrphanDerivedTarget{Path: target, RelativePath: targetRel, ReportPath: reportPath(g.Policy.RepositoryRoot, target), Decision: "blocked", Reason: "orphan_derived_target_evidence_unavailable"}
@@ -598,7 +617,7 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 					orphan.DerivedTargets = append(orphan.DerivedTargets, row)
 					continue
 				}
-				usage, eligible, reason := g.orphanTargetProof(ctx, path, target, rel, before)
+				usage, eligible, reason := g.orphanTargetProofWithProcess(ctx, path, target, rel, before, processUsage, processErr)
 				row.AllocatedBytes, row.Decision, row.Reason = usage.Bytes, "blocked", reason
 				if eligible {
 					row.Decision = string(TargetWouldReap)
@@ -627,7 +646,52 @@ func (g *Governor) orphanCensusLimit() int {
 	return limit
 }
 
+func orphanBatchPaths(entries []os.DirEntry, root string, known map[string]struct{}, limit int, targets []string) []string {
+	paths := make([]string, 0, limit*len(targets))
+	candidates := 0
+	for _, entry := range entries {
+		if candidates >= limit {
+			break
+		}
+		path := filepath.Join(root, entry.Name())
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			continue
+		}
+		if _, ok := known[filepath.Clean(resolved)]; ok {
+			continue
+		}
+		candidates++
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		for _, rel := range targets {
+			target, _, err := orphanTargetPath(path, rel)
+			if err != nil {
+				continue
+			}
+			info, err := os.Lstat(target)
+			if err == nil && info.Mode()&os.ModeSymlink == 0 {
+				paths = append(paths, target)
+			}
+		}
+	}
+	return paths
+}
+
 func (g *Governor) orphanMeasureLimit() int {
+	limit := g.Policy.MaxScanEntries
+	if limit <= 0 || limit > 1 {
+		return 1
+	}
+	return limit
+}
+
+func (g *Governor) registeredMeasureLimit() int {
+	// Registered worktree accounting is capacity telemetry, not destructive
+	// authority. Keep it bounded across large fleets; target proofs below still
+	// use MaxScanEntries and refuse truncated ownership evidence.
 	limit := g.Policy.MaxScanEntries
 	if limit <= 0 || limit > 4096 {
 		return 4096
@@ -671,6 +735,10 @@ func orphanTargetPath(orphan, policyTarget string) (string, string, error) {
 }
 
 func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policyTarget string, before Capacity) (PhysicalUsage, bool, string) {
+	return g.orphanTargetProofWithProcess(ctx, orphan, target, policyTarget, before, nil, nil)
+}
+
+func (g *Governor) orphanTargetProofWithProcess(ctx context.Context, orphan, target, policyTarget string, before Capacity, processUsage map[string]ProcessUsage, processErr error) (PhysicalUsage, bool, string) {
 	expected, _, err := orphanTargetPath(orphan, policyTarget)
 	if err != nil || filepath.Clean(expected) != filepath.Clean(target) {
 		return PhysicalUsage{}, false, "derived_target_authority_changed"
@@ -713,9 +781,18 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if err != nil || usage.Truncated {
 		return usage, false, "derived_target_allocation_unavailable"
 	}
-	process, err := g.Processes.InUse(ctx, target)
-	if err != nil {
-		return usage, false, "derived_target_process_evidence_unavailable"
+	var process ProcessUsage
+	if processUsage != nil {
+		var ok bool
+		process, ok = processUsage[filepath.Clean(resolved)]
+		if !ok || processErr != nil {
+			return usage, false, "derived_target_process_evidence_unavailable"
+		}
+	} else {
+		process, err = g.Processes.InUse(ctx, target)
+		if err != nil {
+			return usage, false, "derived_target_process_evidence_unavailable"
+		}
 	}
 	if active, reason := managedCacheLeaseActive(ctx, g.Policy.RepositoryRoot, orphan, target, g.Now()); active {
 		return usage, false, reason

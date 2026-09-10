@@ -373,6 +373,65 @@ func (s staticProcessInspector) InUse(context.Context, string) (ProcessUsage, er
 	return s.usage, nil
 }
 
+type batchOnlyProcessInspector struct{}
+
+func (batchOnlyProcessInspector) InUse(context.Context, string) (ProcessUsage, error) {
+	return ProcessUsage{}, errors.New("per-target process census must not be used")
+}
+
+type cancelingBatchProcessInspector struct{ cancel context.CancelFunc }
+
+func (cancelingBatchProcessInspector) InUse(context.Context, string) (ProcessUsage, error) {
+	return ProcessUsage{}, errors.New("unexpected per-target process census")
+}
+
+func (s cancelingBatchProcessInspector) InUseMany(context.Context, []string) (map[string]ProcessUsage, error) {
+	s.cancel()
+	return map[string]ProcessUsage{}, nil
+}
+
+func (batchOnlyProcessInspector) InUseMany(_ context.Context, paths []string) (map[string]ProcessUsage, error) {
+	usage := make(map[string]ProcessUsage, len(paths))
+	for _, path := range paths {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, err
+		}
+		usage[filepath.Clean(resolved)] = ProcessUsage{}
+	}
+	return usage, nil
+}
+
+func TestGovernorUsesBoundedBatchProcessCensusForOrphans(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 900000)
+	g.Processes = batchOnlyProcessInspector{}
+	g.Policy.OrphanRoots = []string{filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	orphan := filepath.Join(g.Policy.OrphanRoots[0], "fac-batch")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	graph := filepath.Join(orphan, "graph.db")
+	if err := os.WriteFile(graph, []byte("immutable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Unix(-10000, 0)
+	if err := os.Chtimes(graph, old, old); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Orphans) != 1 || len(report.Orphans[0].DerivedTargets) != 1 {
+		t.Fatalf("batch orphan report=%+v", report.Orphans)
+	}
+	if got := report.Orphans[0].DerivedTargets[0].Decision; got != string(TargetWouldReap) {
+		t.Fatalf("batch process census decision=%q reason=%q", got, report.Orphans[0].DerivedTargets[0].Reason)
+	}
+}
+
 func TestGovernorSafetyReasonsCoverDestructiveAuthority(t *testing.T) {
 	tests := []struct {
 		name string
@@ -923,7 +982,7 @@ func TestGovernorBoundsUnregisteredOrphanCensusAndReportsRemainder(t *testing.T)
 		}
 	}
 	g.Policy.OrphanRoots = []string{root}
-	g.Policy.OrphanDerivedTargets = []string{"bootstrap-go-build"}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
 	g.Policy.OrphanCacheTTL = time.Hour
 	g.Policy.OrphanCacheBudgetBytes = 1 << 20
 
@@ -939,6 +998,46 @@ func TestGovernorBoundsUnregisteredOrphanCensusAndReportsRemainder(t *testing.T)
 	}
 }
 
+func TestGovernorOrphanWindowRotatesAcrossSweeps(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	g.Processes = batchOnlyProcessInspector{}
+	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	g.Policy.OrphanRoots = []string{root}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	for i := 0; i < 20; i++ {
+		orphan := filepath.Join(root, fmt.Sprintf("rotating-%02d", i))
+		if err := os.MkdirAll(orphan, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(orphan, "graph.db"), []byte("immutable"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	minute := int64(1000)
+	g.Now = func() time.Time { return time.Unix(minute*60, 0) }
+	first, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	minute++
+	second, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := func(report GovernorReport, path string) bool {
+		for _, orphan := range report.Orphans {
+			if strings.HasSuffix(orphan.Path, path) {
+				return true
+			}
+		}
+		return false
+	}
+	if seen(first, "rotating-16") || !seen(second, "rotating-16") {
+		t.Fatalf("rotating orphan window first=%t second=%t", seen(first, "rotating-16"), seen(second, "rotating-16"))
+	}
+}
+
 func TestGovernorOrphanCensusFailureRetainsPartialReport(t *testing.T) {
 	g, _, _ := governorFor(t, "host", 900000)
 	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
@@ -946,11 +1045,17 @@ func TestGovernorOrphanCensusFailureRetainsPartialReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.Policy.OrphanRoots = []string{root}
-	g.Policy.OrphanDerivedTargets = []string{"bootstrap-go-build"}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
 	g.Policy.OrphanCacheTTL = time.Hour
 	g.Policy.OrphanCacheBudgetBytes = 1 << 20
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	// The process census is reached after the registered census. Cancel from
+	// that injected seam so this test asserts the orphan-phase error itself.
+	g.Processes = cancelingBatchProcessInspector{cancel: cancel}
+	graph := filepath.Join(root, "orphan", "graph.db")
+	if err := os.WriteFile(graph, []byte("immutable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	report, err := g.Run(ctx, RunOptions{})
 	if err == nil || !strings.Contains(err.Error(), "unregistered-orphan census") {
