@@ -88,7 +88,7 @@ func runUpCommand(laneName string, runtime upRuntime, out io.Writer) error {
 	restoreHooks := useHarnessHooksFromWorktree(cwd)
 	defer restoreHooks()
 	var tab *herdr.TabInfo
-	decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, runtime.Route, func(d *router.LaunchDecision) error {
+	decision, err := launchAdmissionWithLifecycle(context.Background(), liveLaunchLifecycle{}, cfg, lane, true, runtime.Route, func(d *router.LaunchDecision) error {
 		var e error
 		tab, e = runtime.Open(d, launch.Request{Decision: d, TaskRef: lane.Name, Scope: router.ScopeLane, Repository: repository, Lane: lane.Name}, lane, workspace, name, cwd)
 		return e
@@ -96,7 +96,7 @@ func runUpCommand(laneName string, runtime upRuntime, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("launch route rejected: %w", err)
 	}
-	if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+	if err := validateDecisionBeforeSideEffect(context.Background(), decision, lane.Name); err != nil {
 		return err
 	}
 	if err := runtime.Ready(tab); err != nil {

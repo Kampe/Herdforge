@@ -1766,13 +1766,14 @@ func runDaemon() {
 		// tick for the coordinator's entire uptime (herd daemon, default
 		// unbounded), all in one process -- the same shape standing's
 		// AdmitRoute has. Scope hook policy to the lane's own worktree and
-		// mint one attempt identity per cycle, before admission runs.
+		// mint one attempt identity per cycle, carried on ctx (not a
+		// package global) so two textually-concurrent admissions -- were
+		// this ever made concurrent -- cannot observe each other's value.
 		restoreHooks := laneHookPolicyScope(lane)
 		defer restoreHooks()
-		restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
-		defer restoreAttempt()
+		ctx = withAttemptID(ctx, launch.NewAttemptID())
 		var tp provider.TaskProvider
-		decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
+		decision, admitErr := launchAdmissionWithLifecycle(ctx, liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
 			var tpErr error
 			tp, tpErr = loadTaskProvider(cfg)
 			return tpErr
@@ -2059,20 +2060,20 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			// attempts within one long-lived process -- exactly this
 			// AdmitRoute, rearmed on every ForgeLoop tick for the
 			// coordinator's entire uptime. Mint one identity per attempt,
-			// here, once, before admission runs.
-			restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
-			defer restoreAttempt()
+			// here, once, carried on ctx rather than a package global so
+			// two textually-concurrent admissions cannot cross-contaminate.
+			ctx := withAttemptID(context.Background(), launch.NewAttemptID())
 			// The launch decision is the sole standing admission authority. Do
 			// not run a separate quota-only pre-gate here: it reads a different
 			// snapshot from the router and cannot account for live concurrency,
 			// provider probes, cooldowns, or the router's fallback decision.
 			// FAC-618: two health authorities must not silently disagree and
 			// strand a standing lane before the actual launch decision runs.
-			decision, err := launchAdmission(cfg, lane, true, routedLaneDecision(context.Background(), nil))
+			decision, err := launchAdmission(ctx, cfg, lane, true, routedLaneDecision(ctx, nil))
 			if err != nil {
 				return standing.Route{}, err
 			}
-			if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+			if err := validateDecisionBeforeSideEffect(ctx, decision, lane.Name); err != nil {
 				return standing.Route{}, err
 			}
 			lastAdmit.lane = lane
@@ -2790,7 +2791,8 @@ func runReview() {
 		}
 		restoreHooks := useHarnessHooksFromWorktree(wt)
 		defer restoreHooks()
-		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
+		reviewCtx := withAttemptID(ctx, launch.NewAttemptID())
+		decision, err := launchAdmissionWithLifecycle(reviewCtx, liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(reviewCtx, task), func(_ *router.LaunchDecision) error {
 			_, listErr := herdr.AgentList()
 			return listErr
 		})
@@ -2798,7 +2800,7 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
 			os.Exit(1)
 		}
-		if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
+		if err := validateDecisionBeforeSideEffect(reviewCtx, decision, task.Ref); err != nil {
 			fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
 			os.Exit(1)
 		}
@@ -5484,9 +5486,8 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 		// mint one attempt identity per dispatch attempt.
 		restoreHooks := laneHookPolicyScope(launchLane)
 		defer restoreHooks()
-		restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
-		defer restoreAttempt()
-		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, launchLane, true, routedLaneDecision(ctx, nil), func(admitted *router.LaunchDecision) error {
+		admitCtx := withAttemptID(ctx, launch.NewAttemptID())
+		decision, err = launchAdmissionWithLifecycle(admitCtx, liveLaunchLifecycle{}, cfg, launchLane, true, routedLaneDecision(admitCtx, nil), func(admitted *router.LaunchDecision) error {
 			if err := admitDispatch(); err != nil {
 				return err
 			}
@@ -6197,7 +6198,7 @@ func runForgeE() error {
 	if err != nil {
 		return fmt.Errorf("launch route rejected before forge claim: %w", err)
 	}
-	if err := validateDecisionBeforeSideEffect(forgeDecision, forgeLane.Name); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, forgeDecision, forgeLane.Name); err != nil {
 		return fmt.Errorf("launch decision rejected before forge claim: %w", err)
 	}
 	if eng == nil {
@@ -6226,7 +6227,7 @@ func runForgeE() error {
 		if herdr.IsAvailable() {
 			lane := forgeLane
 			if lane != nil {
-				decision, bindErr := rebindDecisionForTask(forgeDecision, task.Ref, forgeLeaseGeneration)
+				decision, bindErr := rebindDecisionForTask(ctx, forgeDecision, task.Ref, forgeLeaseGeneration)
 				if bindErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge launch decision rejected after claim: %w", bindErr))
 				}
@@ -6545,9 +6546,8 @@ func forgeGitOutput(dir string, args ...string) string {
 func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
 	restoreHooks := laneHookPolicyScope(lane)
 	defer restoreHooks()
-	restoreAttempt := useLaunchAttemptID(launch.NewAttemptID())
-	defer restoreAttempt()
-	return launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(ctx, nil), effect)
+	ctx = withAttemptID(ctx, launch.NewAttemptID())
+	return launchAdmissionWithLifecycle(ctx, liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(ctx, nil), effect)
 }
 
 // findLaneByName resolves the one lane an operator named. Unlike a role, a lane
@@ -6856,7 +6856,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	} else if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
 		fmt.Fprintf(os.Stderr, "herd: lane %q rerouted by quota: %s/%s/%s -> %s/%s/%s (%s)\n", lane.Name, lane.Provider, lane.Model, lane.Effort, decision.Provider, decision.Model, decision.Effort, decision.Availability)
 	}
-	if err := validateDecisionBeforeSideEffect(decision, contextRef); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, decision, contextRef); err != nil {
 		return nil, err
 	}
 	return decision, nil
@@ -7086,11 +7086,11 @@ func recordWorkerModelPolicyBlocked(st *store.Store, entrypoint, reason string) 
 	return err
 }
 
-func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef string) error {
+func validateDecisionBeforeSideEffect(ctx context.Context, decision *router.LaunchDecision, taskRef string) error {
 	if decision == nil {
 		return fmt.Errorf("missing routed launch decision")
 	}
-	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, AttemptID: readLaunchAttemptID()}, nil)
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, AttemptID: attemptIDFromContext(ctx)}, nil)
 }
 
 // ensureArtifactToolProbe returns a current tool-probe PASS for decision's
@@ -7172,12 +7172,12 @@ func openWriteCapableTab(decision *router.LaunchDecision, req launch.Request, la
 	})
 }
 
-func rebindDecisionForTask(decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
+func rebindDecisionForTask(ctx context.Context, decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
 	bound, err := router.RebindDecision(decision, taskRef, leaseGeneration)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDecisionBeforeSideEffect(bound, taskRef); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, bound, taskRef); err != nil {
 		return nil, err
 	}
 	return bound, nil
@@ -7225,8 +7225,8 @@ func (liveLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*rou
 	return effect(decision)
 }
 
-func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
-	decision, err := launchAdmission(cfg, lane, herdrAvailable, route)
+func launchAdmissionWithLifecycle(ctx context.Context, lc launchLifecycle, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
+	decision, err := launchAdmission(ctx, cfg, lane, herdrAvailable, route)
 	if err != nil {
 		return nil, err
 	}
@@ -7242,7 +7242,7 @@ func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, lane *
 // smith-grok are both "worker" -- so `herd dispatch --lane smith-grok` resolved
 // smith-grok by name, passed only its role here, and launched smith's codex
 // argv under smith-grok's identity. Taking the lane makes that unrepresentable.
-func launchAdmission(cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
+func launchAdmission(ctx context.Context, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
 	if lane == nil {
 		return nil, fmt.Errorf("launch admission requires an exact lane")
 	}
@@ -7270,7 +7270,7 @@ func launchAdmission(cfg *config.Config, lane *config.LaneDef, herdrAvailable bo
 	case router.ScopeLane:
 		validationContext = lane.Name
 	}
-	if err := validateDecisionBeforeSideEffect(decision, validationContext); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, decision, validationContext); err != nil {
 		return nil, err
 	}
 	return decision, nil

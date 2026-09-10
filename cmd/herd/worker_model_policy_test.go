@@ -195,7 +195,7 @@ func TestLaunchAdmissionLifecycleComposesModelGateBeforeClaim(t *testing.T) {
 	}
 
 	rec := &fakeLaunchLifecycle{}
-	got, err := launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true,
+	got, err := launchAdmissionWithLifecycle(context.Background(), rec, cfg, &cfg.Lanes[0], true,
 		func(*config.LaneDef) (*router.LaunchDecision, error) { return high, nil },
 		func(d *router.LaunchDecision) error {
 			return applyWorkerModelRouterBeforeClaim(d, func(mr *router.ModelRouter) error {

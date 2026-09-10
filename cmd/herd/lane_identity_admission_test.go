@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -93,7 +94,7 @@ func TestExplicitLaneSurvivesLaunchAdmission(t *testing.T) {
 	want := &cfg.Lanes[1] // smith-grok, named explicitly by the operator
 
 	var routed *config.LaneDef
-	_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, want, true,
+	_, err := launchAdmissionWithLifecycle(context.Background(), &fakeLaunchLifecycle{}, cfg, want, true,
 		func(lane *config.LaneDef) (*router.LaunchDecision, error) {
 			routed = lane
 			return nil, errStopBeforeSideEffect
@@ -126,7 +127,7 @@ func TestEachSharedRoleLaneAdmitsAsItself(t *testing.T) {
 		lane := &cfg.Lanes[i]
 		t.Run(lane.Name, func(t *testing.T) {
 			var routed *config.LaneDef
-			_, _ = launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, lane, true,
+			_, _ = launchAdmissionWithLifecycle(context.Background(), &fakeLaunchLifecycle{}, cfg, lane, true,
 				func(got *config.LaneDef) (*router.LaunchDecision, error) {
 					routed = got
 					return nil, errStopBeforeSideEffect
@@ -151,7 +152,7 @@ func TestUnconfiguredLaneIsRefused(t *testing.T) {
 		TaskShape: "implementation",
 	}
 	routed := false
-	_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, imposter, true,
+	_, err := launchAdmissionWithLifecycle(context.Background(), &fakeLaunchLifecycle{}, cfg, imposter, true,
 		func(*config.LaneDef) (*router.LaunchDecision, error) {
 			routed = true
 			return nil, errStopBeforeSideEffect

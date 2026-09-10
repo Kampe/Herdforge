@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -367,55 +366,41 @@ func laneHookPolicyScope(lane *config.LaneDef) func() {
 	return useHarnessHooksFromWorktree(filepath.Join(".", lane.Worktree))
 }
 
-// currentLaunchAttemptID is the caller-minted identity (FAC-624,
-// launch.NewAttemptID) of the admission attempt in progress, read by
-// validateDecisionBeforeSideEffect when it builds its Request. Scoped for
-// the duration of one call the same way useHarnessHooksFromWorktree scopes
-// HERD_HARNESS_HOOKS_FILE via an env var: set by useLaunchAttemptID before
-// the admission call, restored after. Empty by default, so every caller
-// that does not opt in sees no behavior change -- launch.Request.AttemptID
-// stays "" and recordHookFailure falls back to its own process-identity
-// default.
+// attemptIDContextKey carries one caller-minted admission-attempt identity
+// (FAC-624, launch.NewAttemptID) on a context.Context, read by
+// validateDecisionBeforeSideEffect when it builds its Request.
 //
-// Concurrency audit (FAC-624): every admission caller that scopes this
-// today -- herd up, standing's AdmitRoute, the recovery/pulse daemon
-// cycle, dispatch, forgeLaunchAdmission -- runs on its own single
-// goroutine per process (grep for `go func` across cmd/herd and
-// pkg/daemon/forgeloop.go turns up nothing on any admission path); none
-// of ForgeLoop's tick, the pulse scheduler's tick, or the daemon cycle
-// fan out admissions concurrently. So this global cannot race TODAY. It
-// is still a global, not a per-attempt value, so it is not a durable
-// guarantee against a future concurrent admission path silently
-// cross-contaminating two attempts' identities -- guarded here with a
-// mutex only so a read/write is never torn, not so two truly concurrent
-// admissions get correctly independent values. If a concurrent admission
-// path is ever introduced, the correct fix is threading launch.Request
-// (or an explicit attemptID parameter) through
-// launchAdmission/validateDecisionBeforeSideEffect instead of relying on
-// this var at all.
-var (
-	currentLaunchAttemptIDMu sync.Mutex
-	currentLaunchAttemptID   string
-)
+// This replaces an earlier package-global var. The global was auditable-safe
+// today (grep for `go func` across cmd/herd and pkg/daemon/forgeloop.go
+// finds no admission path that fans out concurrently -- every caller that
+// would have scoped it runs on its own single goroutine per process), but a
+// global is still one shared mutable cell: it cannot, even in principle,
+// give two textually-concurrent admissions independent values, no matter how
+// carefully it is mutex-guarded (a mutex only stops a torn read/write, not
+// cross-contamination of WHICH value a concurrent caller sees). A
+// context.Context value is scoped to the call tree that carries it, so two
+// admissions -- sequential or, if ever made concurrent, truly parallel --
+// each with their own ctx, cannot observe each other's attempt identity.
+// Every real admission caller mints its ctx via withAttemptID before routing
+// or validating; a ctx with none set reads back "" (attemptIDFromContext),
+// which recordHookFailure treats identically to how the old unset global
+// behaved -- no behavior change for any caller that does not opt in.
+type attemptIDContextKey struct{}
 
-func readLaunchAttemptID() string {
-	currentLaunchAttemptIDMu.Lock()
-	defer currentLaunchAttemptIDMu.Unlock()
-	return currentLaunchAttemptID
+// withAttemptID returns ctx carrying id as this call tree's admission
+// attempt identity. Callers mint id ONCE per logical attempt (launch.NewAttemptID)
+// and pass the returned ctx through every route/validate call belonging to
+// that same attempt -- never re-minting per call, which would defeat
+// idempotent-retry dedup.
+func withAttemptID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, attemptIDContextKey{}, id)
 }
 
-// useLaunchAttemptID scopes one caller-minted attempt identity for the
-// duration of a single admission attempt.
-func useLaunchAttemptID(id string) func() {
-	currentLaunchAttemptIDMu.Lock()
-	previous := currentLaunchAttemptID
-	currentLaunchAttemptID = id
-	currentLaunchAttemptIDMu.Unlock()
-	return func() {
-		currentLaunchAttemptIDMu.Lock()
-		currentLaunchAttemptID = previous
-		currentLaunchAttemptIDMu.Unlock()
-	}
+// attemptIDFromContext reads the attempt identity ctx carries, or "" if none
+// was set (every caller that has not opted in).
+func attemptIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(attemptIDContextKey{}).(string)
+	return id
 }
 
 // useHarnessHooksFromWorktree supplies the repository-declared hook policy

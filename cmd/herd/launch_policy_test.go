@@ -312,7 +312,7 @@ func TestLaunchAdmissionRejectsBeforeCompiledLifecycleSeams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
+	_, err = launchAdmissionWithLifecycle(context.Background(), rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
 		if admitted != valid {
 			t.Fatalf("lifecycle received a different decision: got %p want %p", admitted, valid)
 		}
@@ -334,7 +334,7 @@ func TestLaunchAdmissionPassesExactDecisionToLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &fakeLaunchLifecycle{}
-	got, err := launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
+	got, err := launchAdmissionWithLifecycle(context.Background(), rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(admitted *router.LaunchDecision) error {
 		if admitted != valid || admitted.Proof != valid.Proof {
 			t.Fatalf("lifecycle did not receive exact admitted decision")
 		}
@@ -364,7 +364,7 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 	t.Run("candidate context reaches effect once", func(t *testing.T) {
 		decision := newDecision(t, "FAC-153")
 		effects := 0
-		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+		_, err := launchAdmissionWithLifecycle(context.Background(), &fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
 			effects++
 			return nil
 		})
@@ -377,7 +377,7 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 		decision := newDecision(t, "FAC-153")
 		decision.TaskRef = "FAC-154"
 		effects := 0
-		_, err := launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+		_, err := launchAdmissionWithLifecycle(context.Background(), &fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
 			effects++
 			return nil
 		})
@@ -395,7 +395,7 @@ func TestLaunchAdmissionValidatesDecisionContextByScope(t *testing.T) {
 			t.Fatal(err)
 		}
 		effects := 0
-		_, err = launchAdmissionWithLifecycle(&fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
+		_, err = launchAdmissionWithLifecycle(context.Background(), &fakeLaunchLifecycle{}, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return decision, nil }, func(*router.LaunchDecision) error {
 			effects++
 			return nil
 		})
@@ -427,7 +427,7 @@ func TestWorkerUnprobedFallbackRejectsBeforeAnySideEffect(t *testing.T) {
 			})
 			r.Probes = &router.Probes{CLIPresent: func(cli string) bool { return cli == router.PiHarness }, Now: func() time.Time { return time.Unix(1_800_000_000, 0) }}
 			rec := &fakeLaunchLifecycle{}
-			decision, err := launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(lane *config.LaneDef) (*router.LaunchDecision, error) {
+			decision, err := launchAdmissionWithLifecycle(context.Background(), rec, cfg, &cfg.Lanes[0], true, func(lane *config.LaneDef) (*router.LaunchDecision, error) {
 				return r.Decide(router.LaunchRequest{
 					Role:              router.Role(role),
 					Shape:             launch.Implementation,
@@ -557,7 +557,7 @@ func TestUnsupportedHarnessConfigRejectsBeforeLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &fakeLaunchLifecycle{}
-	_, err = launchAdmissionWithLifecycle(rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(*router.LaunchDecision) error {
+	_, err = launchAdmissionWithLifecycle(context.Background(), rec, cfg, &cfg.Lanes[0], true, func(*config.LaneDef) (*router.LaunchDecision, error) { return valid, nil }, func(*router.LaunchDecision) error {
 		t.Fatal("unsupported harness reached lifecycle")
 		return nil
 	})

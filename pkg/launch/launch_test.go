@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -726,6 +727,57 @@ func TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated(t *testing.
 
 	if len(sink.Receipts) != 1 {
 		t.Fatalf("retrying the same attempt was not deduplicated: %+v", sink.Receipts)
+	}
+}
+
+// TestEmptyPolicySetConcurrentIndependentAttemptsDoNotCrossContaminate is the
+// FAC-624 concurrency requirement: two GENUINELY concurrent, independent
+// admission attempts (real goroutines, not sequential calls faking it) must
+// each get their own receipt under their own AttemptID -- proving
+// Request.AttemptID is request-scoped, not shared mutable state that a
+// concurrent caller could observe or clobber. Request is a plain value type
+// with no shared state of its own; the only shared thing both goroutines
+// touch is the sink, whose MemorySink.WriteOnce/Write are already
+// mutex-guarded, so -race must find nothing.
+func TestEmptyPolicySetConcurrentIndependentAttemptsDoNotCrossContaminate(t *testing.T) {
+	reqA := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	reqA.AttemptID = "concurrent-attempt-A"
+	reqB := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	reqB.AttemptID = "concurrent-attempt-B"
+	sink := &MemorySink{}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := Validate(reqA, sink); err == nil {
+			t.Error("attempt A: empty required policy set must fail closed")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := Validate(reqB, sink); err == nil {
+			t.Error("attempt B: empty required policy set must fail closed")
+		}
+	}()
+	wg.Wait()
+
+	receipts := sink.Receipts
+	if len(receipts) != 2 {
+		t.Fatalf("two genuinely concurrent, independent attempts did not each get their own receipt: %+v", receipts)
+	}
+	seen := map[string]bool{}
+	for _, r := range receipts {
+		seen[r.ReceiptKey] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("concurrent independent attempts cross-contaminated onto the same receipt key: %+v", receipts)
+	}
+	if !strings.HasSuffix(receipts[0].ReceiptKey, "|concurrent-attempt-A") && !strings.HasSuffix(receipts[0].ReceiptKey, "|concurrent-attempt-B") {
+		t.Fatalf("receipt key does not end with either attempt's own identity: %q", receipts[0].ReceiptKey)
+	}
+	if !strings.HasSuffix(receipts[1].ReceiptKey, "|concurrent-attempt-A") && !strings.HasSuffix(receipts[1].ReceiptKey, "|concurrent-attempt-B") {
+		t.Fatalf("receipt key does not end with either attempt's own identity: %q", receipts[1].ReceiptKey)
 	}
 }
 

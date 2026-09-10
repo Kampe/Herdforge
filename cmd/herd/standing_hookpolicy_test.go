@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -263,4 +266,33 @@ func TestForgeLaunchAdmissionAttemptIdentityDistinguishesTwoAttemptsInSameProces
 	if policySetMissing[0].ReceiptKey == policySetMissing[1].ReceiptKey {
 		t.Fatalf("two distinct forgeLaunchAdmission attempts in one process collapsed onto the same receipt key: %q", policySetMissing[0].ReceiptKey)
 	}
+}
+
+// TestAttemptIDContextIsolatedAcrossConcurrentGoroutines directly targets the
+// FAC-624 concurrency concern that replaced currentLaunchAttemptID (a
+// package global) with context-carried identity: many goroutines, each
+// carrying its own distinct attempt id on its own ctx, must read back only
+// their own value -- never another goroutine's -- with no shared mutable
+// state to guard. A global var, however carefully mutex-guarded, could not
+// give this guarantee (a lock only prevents a torn read/write, not a
+// concurrent caller observing a DIFFERENT goroutine's value); a
+// context.Context value scoped to one call tree can.
+func TestAttemptIDContextIsolatedAcrossConcurrentGoroutines(t *testing.T) {
+	const n = 64
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("goroutine-attempt-%d", i)
+			ctx := withAttemptID(context.Background(), id)
+			// Yield so other goroutines interleave before this one reads back --
+			// a shared global would show its damage here.
+			runtime.Gosched()
+			if got := attemptIDFromContext(ctx); got != id {
+				t.Errorf("goroutine %d: read back %q, want %q -- cross-contamination", i, got, id)
+			}
+		}(i)
+	}
+	wg.Wait()
 }
