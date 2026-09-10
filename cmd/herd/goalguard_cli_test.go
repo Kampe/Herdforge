@@ -318,6 +318,14 @@ func TestGenuineCanonicalCompletionReceiptRetiresGoal(t *testing.T) {
 	repoDir := t.TempDir()
 	state := filepath.Join(repoDir, "goal.json")
 	t.Setenv("HERD_ROOT", repoDir)
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repoDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
 	s, err := goalguard.Open(state)
 	if err != nil {
 		t.Fatal(err)
@@ -414,6 +422,114 @@ func TestGenuineCanonicalCompletionReceiptRetiresGoal(t *testing.T) {
 	}
 	if retired, err := s.HasRetirement(); err != nil || !retired {
 		t.Fatalf("retirement record was not written: err=%v, retired=%v", err, retired)
+	}
+}
+
+func TestHostileHerdRootOverrideRefusesGoalRetirement(t *testing.T) {
+	// A hostile caller sets HERD_ROOT to a fully self-controlled repository
+	// distinct from the real, cwd-discovered canonical repository, and
+	// fabricates a self-consistent receipt and Done log inside it. Being a
+	// genuine git repo with real commits/patch-id makes the receipt
+	// internally valid; the goal-guard must still refuse it because the
+	// override does not match where the caller's process actually lives.
+	fake := t.TempDir()
+	state := filepath.Join(t.TempDir(), "goal.json")
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{
+		Lane: "standing", Task: "FAC-767", Owner: "worker", Generation: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HERD_ROOT", fake)
+
+	exec.Command("git", "-C", fake, "init").Run()
+	exec.Command("git", "-C", fake, "config", "user.name", "Hostile Test").Run()
+	exec.Command("git", "-C", fake, "config", "user.email", "hostile@herd.local").Run()
+	fakeFile := filepath.Join(fake, "file.txt")
+	os.WriteFile(fakeFile, []byte("hello\n"), 0600)
+	exec.Command("git", "-C", fake, "add", ".").Run()
+	exec.Command("git", "-C", fake, "commit", "-m", "initial commit").Run()
+	baseOut, _ := exec.Command("git", "-C", fake, "rev-parse", "HEAD").Output()
+	baseSHA := strings.TrimSpace(string(baseOut))
+	os.WriteFile(fakeFile, []byte("hello world\n"), 0600)
+	exec.Command("git", "-C", fake, "add", ".").Run()
+	exec.Command("git", "-C", fake, "commit", "-m", "feature commit").Run()
+	mergeOut, _ := exec.Command("git", "-C", fake, "rev-parse", "HEAD").Output()
+	mergeSHA := strings.TrimSpace(string(mergeOut))
+	patchID, err := hsync.PatchID(fake, mergeSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", fake, "branch", "origin/main", "HEAD").Run()
+	exec.Command("git", "-C", fake, "config", "remote.origin.url", "file://"+fake).Run()
+	repoID, err := toolchild.RepositoryIdentity(fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fakeReceipt := hsync.CompletionReceipt{
+		Version:            1,
+		ProvenanceMode:     hsync.ProvenanceReduced,
+		PullRequest:        42,
+		TaskRef:            "FAC-767",
+		Verdict:            "PASS",
+		IntegrationResult:  hsync.IntegrationMerged,
+		RepoID:             repoID,
+		BaseSHA:            baseSHA,
+		CandidateSHA:       mergeSHA,
+		MergeSHA:           mergeSHA,
+		PatchID:            patchID,
+		VerificationDigest: "ffffffffffffffffffffffffffffffffffffffff",
+		RiskTier:           "R1",
+		AuthorFamily:       "openai",
+		ReviewerFamily:     "google",
+	}
+	fakeReceipt.Digest = fakeReceipt.ComputeDigest()
+	receiptPath := filepath.Join(fake, "receipt.json")
+	rb, err := json.Marshal(fakeReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, rb, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	doneDir := filepath.Join(fake, ".herd")
+	if err := os.MkdirAll(doneDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	doneRecord := hsync.DoneRecord{
+		Ref:              "FAC-767",
+		ReceiptDigest:    fakeReceipt.Digest,
+		ProviderReadback: "done",
+	}
+	db, err := json.Marshal(doneRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doneDir, "board-done.jsonl"), append(db, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = clearGoal(s, "", 0, receiptPath)
+	if err == nil {
+		t.Fatal("HERD_ROOT override to a self-controlled, self-consistent fabricated repository bypassed goal retirement protection")
+	}
+	if after, _ := os.ReadFile(state); string(after) != string(before) {
+		t.Fatal("hostile HERD_ROOT override mutated or deleted goal file")
+	}
+	if retired, _ := s.HasRetirement(); retired {
+		t.Fatal("hostile HERD_ROOT override recorded retirement evidence")
 	}
 }
 

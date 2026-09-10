@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -172,8 +173,45 @@ func clearGoal(s *goalguard.Store, grantor string, generation int64, receiptPath
 	return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Receipt: receipt.Digest, RetiredAt: time.Now().UTC()})
 }
 
+// resolveTrustedCanonicalRoot resolves the canonical repository root for
+// goal-clear authority checks. HERD_ROOT/HERD_REPO_ROOT short-circuit git
+// discovery elsewhere in the codebase, but a goal-clear caller controls its
+// own environment: an untrusted process can point that override at a
+// throwaway repository it fully controls, fabricate a self-consistent
+// receipt/Done log inside it, and pass every check below against fictional
+// "canonical" state. A genuine caller's override always agrees with the
+// repository git actually discovers from its real process cwd (a linked
+// worktree of the same shared .git), so refuse whenever it doesn't.
+func resolveTrustedCanonicalRoot(ctx context.Context) (string, error) {
+	override := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "")
+	root, err := worktree.ResolveCanonicalRoot(ctx, ".", override)
+	if err != nil {
+		return "", err
+	}
+	if override == "" {
+		return root, nil
+	}
+	discoveredCommon, err := worktree.GitCommonDir(ctx, ".")
+	if err != nil {
+		return "", fmt.Errorf("verify HERD_ROOT override: git-discovered repository is unavailable: %w", err)
+	}
+	discoveredRoot := filepath.Dir(discoveredCommon)
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("verify HERD_ROOT override: stat %q: %w", root, err)
+	}
+	discoveredInfo, err := os.Stat(discoveredRoot)
+	if err != nil {
+		return "", fmt.Errorf("verify HERD_ROOT override: stat git-discovered root %q: %w", discoveredRoot, err)
+	}
+	if !os.SameFile(rootInfo, discoveredInfo) {
+		return "", fmt.Errorf("goal-guard: HERD_ROOT override %q does not match the git-discovered repository %q", root, discoveredRoot)
+	}
+	return root, nil
+}
+
 func validateNativeGrantor(g goalguard.Goal, grantor string, generation int64) error {
-	root, err := worktree.ResolveCanonicalRoot(context.Background(), ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	root, err := resolveTrustedCanonicalRoot(context.Background())
 	if err != nil {
 		return fmt.Errorf("goal-guard: clear refused: resolve canonical repository: %w", err)
 	}
@@ -298,7 +336,7 @@ func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionRe
 	if receipt.Verdict != "PASS" || receipt.IntegrationResult != hsync.IntegrationMerged {
 		return errors.New("goal-guard: clear refused: completion receipt is not a merged PASS")
 	}
-	root, err := worktree.ResolveCanonicalRoot(context.Background(), ".", firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ""))
+	root, err := resolveTrustedCanonicalRoot(context.Background())
 	if err != nil {
 		return fmt.Errorf("goal-guard: clear refused: resolve canonical repository: %w", err)
 	}
