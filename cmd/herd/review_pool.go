@@ -841,6 +841,11 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 		return errors.New("review retirement manifest requires launch configuration")
 	}
 	reviewRef := herdr.ReviewRefPrefix + safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	if leasePart := safeReviewSurfacePart(lease.LeaseID); leasePart != "" {
+		reviewRef += "-" + leasePart
+	} else if genPart := safeReviewSurfacePart(generation); genPart != "" {
+		reviewRef += "-" + genPart
+	}
 	if _, err := exec.Command("git", "-C", rootAbs, "update-ref", reviewRef, sha, "").CombinedOutput(); err != nil {
 		return fmt.Errorf("create exact owned review ref: %w", err)
 	}
