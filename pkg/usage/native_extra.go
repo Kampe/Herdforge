@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	urlpkg "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -456,7 +457,11 @@ func litellmPoll() (ProviderUsage, error) {
 	if key == "" || base == "" {
 		return ProviderUsage{}, pollErrf("auth-missing", "litellm self-key or configured base URL is unavailable")
 	}
-	return litellmPollWithURL(base+"/key/info", key)
+	managementURL, err := litellmManagementURL(base)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	return litellmPollWithURL(managementURL, key)
 }
 
 func litellmConfiguredKey() string {
@@ -513,6 +518,25 @@ func litellmBaseURL() string {
 		}
 	}
 	return ""
+}
+
+// litellmManagementURL converts the configured OpenAI-compatible inference
+// base into LiteLLM's management endpoint. LiteLLM serves /key/info at the
+// proxy root, while OpenCode's compatible provider base convention appends
+// /v1 for inference routes. Preserve a deployment prefix when one exists.
+func litellmManagementURL(base string) (string, error) {
+	u, err := urlpkg.Parse(strings.TrimSpace(base))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", pollErrf("config-invalid", "litellm base URL is invalid")
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	path := strings.TrimRight(u.Path, "/")
+	if strings.HasSuffix(path, "/v1") {
+		path = strings.TrimSuffix(path, "/v1")
+	}
+	u.Path = strings.TrimRight(path, "/") + "/key/info"
+	return u.String(), nil
 }
 
 func findProviderBaseURL(value any) string {

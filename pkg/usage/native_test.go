@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -290,6 +291,32 @@ func TestLiteLLMBaseURLReadsOpenCodeConfig(t *testing.T) {
 	writeJSONFile(t, filepath.Join(home, ".config", "opencode", "opencode.json"), `{"provider":{"lazer":{"options":{"baseURL":"http://lazer.test/v1"}}}}`)
 	if got := litellmBaseURL(); got != "http://lazer.test/v1" {
 		t.Fatalf("LiteLLM base URL = %q, want configured provider URL", got)
+	}
+}
+
+func TestLiteLLMCollectorUsesManagementPathOutsideInferenceV1(t *testing.T) {
+	var gotPath string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.URL.Path != "/key/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"key_name":"lazer","budget_max":100,"budget_spent":40}`)
+	}))
+	t.Cleanup(s.Close)
+
+	managementURL, err := litellmManagementURL(s.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := litellmPollWithURL(managementURL, "tok")
+	if err != nil {
+		t.Fatalf("LiteLLM management endpoint failed: %v (path=%q)", err, gotPath)
+	}
+	if gotPath != "/key/info" || p.Resources["budget"].Remaining != 60 {
+		t.Fatalf("LiteLLM management request = path %q usage %+v", gotPath, p.Resources)
 	}
 }
 
