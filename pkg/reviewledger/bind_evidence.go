@@ -146,6 +146,7 @@ func independentPassTargets(l *Ledger, rows []LedgerRow, sha, task string) (pass
 	latest := map[ProjectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
+			r.Task = EffectiveTask(rows, r)
 			latest[rowProjection(r)] = r
 		}
 	}

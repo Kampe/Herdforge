@@ -370,6 +370,7 @@ func (l *Ledger) VerdictFor(sha string) (LedgerRow, bool, error) {
 	for i := len(rows) - 1; i >= 0; i-- {
 		row := rows[i]
 		if row.Event == string(EventVerdict) && row.SHA == sha && strings.TrimSpace(row.Verdict) != "" {
+			row.Task = EffectiveTask(rows, row)
 			return row, true, nil
 		}
 	}
@@ -387,6 +388,7 @@ func (l *Ledger) VerdictForReviewer(sha, reviewer string) (LedgerRow, bool, erro
 	for i := len(rows) - 1; i >= 0; i-- {
 		row := rows[i]
 		if row.Event == string(EventVerdict) && row.SHA == sha && row.Reviewer == reviewer {
+			row.Task = EffectiveTask(rows, row)
 			return row, true, nil
 		}
 	}
@@ -777,6 +779,10 @@ func (l *Ledger) eligible(sha, builderFamily string, allowUnrecorded bool) (bool
 
 	launch := indexProjectionEvent(rows, string(EventRecord), true)
 	latest := indexProjectionEvent(rows, string(EventVerdict), true)
+	for key, row := range latest {
+		row.Task = EffectiveTask(rows, row)
+		latest[key] = row
+	}
 
 	done := make(map[string]bool)
 	for _, r := range qrows {
