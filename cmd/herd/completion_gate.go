@@ -22,9 +22,8 @@ import (
 // review --spawn. CheckCompletion is never review authority.
 
 const (
-	defaultReceiptDir   = ".herd/verification-receipts"
-	defaultLifecycleDB  = ".herd/lifecycle.db"
-	verificationProfile = "config-verification"
+	defaultReceiptDir  = ".herd/verification-receipts"
+	defaultLifecycleDB = ".herd/lifecycle.db"
 )
 
 func openCompletionGate(cfg *config.Config) (*daemon.CompletionGate, *lifecycle.Machine, error) {

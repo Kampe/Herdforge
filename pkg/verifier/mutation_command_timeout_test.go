@@ -7,10 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/laneenv"
+	"github.com/Kampe/Herdforge/pkg/resources"
 	"github.com/Kampe/Herdforge/pkg/slot"
 )
 
@@ -54,6 +56,10 @@ func commandStartArgv(marker string) []string {
 	return []string{"sh", "-c", `printf 'started\n' > "$1"`, "command-start", marker}
 }
 
+func mutationOutcomeArgv(marker string) []string {
+	return []string{"sh", "-c", `IFS= read -r candidate < candidate.txt; if [ "$candidate" = "mutant" ]; then printf 'mutant\n' >> "$1"; exit 1; fi; printf 'original\n' >> "$1"; exit 0`, "mutation-outcome", marker}
+}
+
 func waitBaselineThenHoldSlot(t *testing.T, baselineDone, slotHeld chan struct{}) *slot.Lease {
 	t.Helper()
 	var once sync.Once
@@ -87,6 +93,9 @@ func TestRunMutationCheck_QueuedVacuousMutantFailsAfterSlotWait(t *testing.T) {
 	baselineDone := make(chan struct{})
 	slotHeld := make(chan struct{})
 	v := NewVerifierArgs([]string{"true"})
+	v.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
 	v.afterMutationApplied = func() {
 		close(baselineDone)
 		<-slotHeld
@@ -110,7 +119,6 @@ func TestRunMutationCheck_QueuedVacuousMutantFailsAfterSlotWait(t *testing.T) {
 	}()
 
 	lease := waitBaselineThenHoldSlot(t, baselineDone, slotHeld)
-	time.Sleep(3 * commandTimeout)
 	if err := lease.Release(); err != nil {
 		t.Fatalf("release isolated slot: %v", err)
 	}
@@ -131,6 +139,62 @@ func TestRunMutationCheck_QueuedVacuousMutantFailsAfterSlotWait(t *testing.T) {
 	}
 	if result.Outcome == OutcomeBLOCKED || strings.Contains(result.Output, "context deadline exceeded") {
 		t.Fatalf("slot wait must not classify as command timeout: %+v", result)
+	}
+	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
+	requireIsolatedSlotEmpty(t)
+}
+
+func TestRunMutationCheck_CommandDeadlineExcludesPreparation(t *testing.T) {
+	isolateOneTestSlot(t)
+	dir, candidate := mutationRepo(t, false)
+	marker := filepath.Join(t.TempDir(), "mutation-outcome")
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	var mutant atomic.Bool
+	var gate sync.Once
+	v := NewVerifierArgs(mutationOutcomeArgv(marker))
+	v.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
+		return resources.DiskDecision{Allowed: true}
+	})
+	v.afterMutationApplied = func() { mutant.Store(true) }
+	v.beforeCommandStart = func(ctx context.Context) {
+		if !mutant.Load() {
+			return
+		}
+		gate.Do(func() {
+			if _, hasDeadline := ctx.Deadline(); hasDeadline {
+				// OLD placement: preparation consumes the command deadline.
+				close(ready)
+				return
+			}
+			// New placement: preparation is released explicitly before the timer
+			// is armed and the real owned command is handed FD4 cont.
+			close(ready)
+			<-release
+		})
+	}
+
+	done := make(chan *MutationResult, 1)
+	go func() {
+		result, _ := v.RunMutationCheckForCandidate(context.Background(), dir, MutationRequest{
+			CandidateSHA: candidate, EnvironmentPolicy: EnvironmentPolicyInherited,
+			TargetFile: "candidate.txt", OriginalCode: "original\n", MutantCode: "mutant\n",
+			Timeout: 100 * time.Millisecond,
+		})
+		done <- result
+	}()
+	<-ready
+	close(release)
+	result := <-done
+	if result == nil || result.Outcome != OutcomePASS || !result.Killed || !result.Restored {
+		t.Fatalf("100ms command deadline must exclude preparation: %+v", result)
+	}
+	if result.Baseline.ExitCode != 0 || result.Mutant.ExitCode != 1 || result.Final.ExitCode != 0 {
+		t.Fatalf("expected 0/1/0 exits: baseline=%d mutant=%d final=%d", result.Baseline.ExitCode, result.Mutant.ExitCode, result.Final.ExitCode)
+	}
+	markerBytes, err := os.ReadFile(marker)
+	if err != nil || !strings.Contains(string(markerBytes), "mutant\n") || !strings.HasSuffix(string(markerBytes), "original\n") {
+		t.Fatalf("marker must record mutant execution and restored original execution: %q (err=%v)", markerBytes, err)
 	}
 	assertFile(t, filepath.Join(dir, "candidate.txt"), "original\n")
 	requireIsolatedSlotEmpty(t)

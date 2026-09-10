@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -149,6 +150,7 @@ type Verifier struct {
 	// afterMutationApplied runs after mutant bytes are on disk and before the
 	// mutant command is executed. Nil in production.
 	afterMutationApplied func()
+	beforeCommandStart   func(context.Context)
 }
 
 func defaultDiskAdmission() resources.DiskAdmission {
@@ -211,12 +213,18 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	defer func() { _ = lease.Release() }()
 
 	started := time.Now()
+	// The command timeout starts when the ownership wrapper releases its
+	// pre-exec barrier, not while the verifier is preparing and adopting that
+	// wrapper. The latter has its own handshake bound and is not user command
+	// runtime. Parent cancellation still flows through commandCtx immediately.
 	commandCtx := ctx
-	if commandTimeout > 0 {
-		var cancel context.CancelFunc
-		commandCtx, cancel = context.WithTimeout(ctx, commandTimeout)
-		defer cancel()
-	}
+	var commandTimer *time.Timer
+	var timedOut atomic.Bool
+	defer func() {
+		if commandTimer != nil {
+			commandTimer.Stop()
+		}
+	}()
 	commandPath := v.Argv[0]
 	var commandEnv []string
 	if policy == EnvironmentPolicyHermetic {
@@ -250,6 +258,20 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		return killProcessGroupIfLive(cmd.Process.Pid)
 	}
 	cmd.WaitDelay = 100 * time.Millisecond
+	if v.beforeCommandStart != nil {
+		v.beforeCommandStart(commandCtx)
+	}
+	if commandCtx.Err() != nil {
+		_ = statusR.Close()
+		_ = statusW.Close()
+		_ = ackR.Close()
+		_ = ackW.Close()
+		if marker != nil {
+			_ = marker.Close()
+			_ = os.Remove(markerPath)
+		}
+		return newOutputResult(OutcomeBLOCKED, []byte(commandCtx.Err().Error()), -1, time.Since(started)), nil
+	}
 
 	var combined concurrentCombinedWriter
 	cmd.Stdout = &combined
@@ -320,6 +342,14 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 		}
 		return newOutputResult(OutcomeBLOCKED, []byte(strings.Join(parts, "\n")), exitCode(cmd, waitErr), time.Since(started)), nil
 	}
+	if commandTimeout > 0 {
+		owned.commandStart = func() {
+			commandTimer = time.AfterFunc(commandTimeout, func() {
+				timedOut.Store(true)
+				_ = cmd.Cancel()
+			})
+		}
+	}
 	if commandCtx.Err() != nil {
 		reapErr := owned.Reap()
 		msg := commandCtx.Err().Error()
@@ -355,7 +385,7 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	if waitErr != nil {
 		result.Passed = false
 		result.Outcome = OutcomeFAIL
-		if commandCtx.Err() != nil || cmd.ProcessState == nil {
+		if timedOut.Load() || commandCtx.Err() != nil || cmd.ProcessState == nil {
 			result.Outcome = OutcomeBLOCKED
 		}
 		result.Output = boundedOutput([]byte(fmt.Sprintf("verification failed: %v\noutput:\n%s", waitErr, string(output))))

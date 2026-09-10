@@ -6,7 +6,7 @@
       "cmd/herd/clihelp.go",
       "cmd/herd/worktrees.go"
     ],
-    " containing exactly the text EXECUTED. Do not print the file content — actually create the file.": [
+    " containing exactly the text EXECUTED. Do not print the file content \u2014 actually create the file.": [
       "pkg/herdr/toolprobe.go",
       "pkg/toolprobe/probe.go"
     ],
@@ -521,11 +521,11 @@
       "cmd/herd/main.go",
       "pkg/kick/roster.go"
     ],
-    "done — awaiting review/": [
+    "done \u2014 awaiting review/": [
       "pkg/attention/attention.go",
       "pkg/wave/wave.go"
     ],
-    "done — awaiting review/harvest": [
+    "done \u2014 awaiting review/harvest": [
       "pkg/attention/attention.go",
       "pkg/wave/wave.go"
     ],
@@ -538,17 +538,17 @@
       "pkg/claim/memory_store.go",
       "pkg/claim/sqlite_store.go"
     ],
-    "file:%s?_pragma=busy_timeout(%d)\u0026_pragma=journal_mode(WAL)": [
+    "file:%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)": [
       "pkg/boardfreeze/boardfreeze.go",
       "pkg/cmdauth/cmdauth.go",
       "pkg/provider/fence_store.go"
     ],
-    "file:%s?_pragma=busy_timeout(10000)\u0026_pragma=journal_mode(WAL)": [
+    "file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)": [
       "pkg/claim/outbox_store.go",
       "pkg/claim/sqlite_store.go",
       "pkg/scopefence/sqlite_store.go"
     ],
-    "file:%s?_pragma=busy_timeout(5000)\u0026_pragma=journal_mode(WAL)": [
+    "file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)": [
       "pkg/provider/fence_broker.go",
       "pkg/provider/shared_marker.go"
     ],
@@ -566,23 +566,27 @@
     ],
     "go build ./": [
       "cmd/herd/finish.go",
-      "cmd/herd/main.go"
+      "cmd/herd/main.go",
+      "pkg/verifier/profile.go"
     ],
     "go build ./...": [
       "cmd/herd/finish.go",
-      "cmd/herd/main.go"
+      "cmd/herd/main.go",
+      "pkg/verifier/profile.go"
     ],
     "go test ./": [
       "cmd/herd/finish.go",
       "cmd/herd/main.go",
       "pkg/security/sandbox.go",
-      "pkg/security/verify_tools.go"
+      "pkg/security/verify_tools.go",
+      "pkg/verifier/profile.go"
     ],
     "go test ./...": [
       "cmd/herd/finish.go",
       "cmd/herd/main.go",
       "pkg/security/sandbox.go",
-      "pkg/security/verify_tools.go"
+      "pkg/security/verify_tools.go",
+      "pkg/verifier/profile.go"
     ],
     "gpt-5.3-codex-spark": [
       "pkg/resolve/resolve.go",
@@ -642,7 +646,7 @@
       "pkg/lifecycle/hold.go",
       "pkg/worktree/removal_guard.go"
     ],
-    "herdr CLI not found — install herdr first": [
+    "herdr CLI not found \u2014 install herdr first": [
       "cmd/herd/main.go",
       "cmd/herd/wave.go"
     ],
@@ -694,7 +698,7 @@
       "pkg/router/launch.go",
       "pkg/router/route.go"
     ],
-    "no file created — model described the write but did not execute the tool": [
+    "no file created \u2014 model described the write but did not execute the tool": [
       "pkg/herdr/toolprobe.go",
       "pkg/toolprobe/probe.go"
     ],

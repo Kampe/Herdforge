@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -110,6 +111,7 @@ func (a *drainAdapters) hooks() drainActionHooks {
 		dryRun:                func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, true) },
 		harvest:               func(ctx context.Context, e drainActionEvidence) error { return a.integrate(ctx, e, false) },
 		retireReviews:         a.retireReviews,
+		retireSources:         a.retireSourceLanes,
 	}
 }
 
@@ -147,6 +149,53 @@ func (a *drainAdapters) retireReviews(ctx context.Context) error {
 	}
 	if result.Blocked > 0 {
 		return fmt.Errorf("%d review retirement lane(s) blocked; retained exact manifests", result.Blocked)
+	}
+	return nil
+}
+
+// retireSourceLanes is the bounded acting drain edge for settled one-off source/mender
+// lanes. It consumes only exact launch manifests; no tab label, board status,
+// callback, or broad filesystem scan can create a cleanup target.
+func (a *drainAdapters) retireSourceLanes(ctx context.Context) error {
+	if a == nil || strings.TrimSpace(a.root) == "" {
+		return fmt.Errorf("source retirement authority is unavailable")
+	}
+	cfg, err := config.LoadConfig(filepath.Join(a.root, ".herd", "herd.yaml"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load herd configuration: %w", err)
+	}
+	repoIdent := a.repository
+	if repoIdent == "" && cfg != nil {
+		repoIdent = repositoryIdentityForLaunch(cfg)
+	}
+	if _, err := herdr.EnrollReadySourceManifests(a.root, repoIdent, true); err != nil {
+		return fmt.Errorf("enroll ready source manifests: %w", err)
+	}
+	registry := herdr.SourceRetirementRegistry{Path: herdr.SourceRetirementRegistryPath(a.root)}
+	all, err := registry.Latest()
+	if err != nil {
+		return err
+	}
+	latest := make(map[string]herdr.SourceRetirementManifest, len(all))
+	for _, m := range all {
+		if err := herdr.ValidateSourceRetirementManifest(m); err != nil {
+			return fmt.Errorf("source manifest generation %s: %w", m.Generation, err)
+		}
+		latest[m.Generation] = m
+	}
+	manifests := make([]herdr.SourceRetirementManifest, 0, len(latest))
+	for _, m := range latest {
+		manifests = append(manifests, m)
+	}
+	if len(manifests) == 0 {
+		return nil
+	}
+	sort.Slice(manifests, func(i, j int) bool { return manifests[i].Generation < manifests[j].Generation })
+	standing := configuredStandingAgentNames(cfg)
+	op := &herdr.NativeSourceRetirementOp{Root: a.root, RepositoryIdentity: repoIdent, StandingLanes: standing}
+	_, err = herdr.RetireSourceLanesContext(ctx, op, manifests, false)
+	if err != nil {
+		return err
 	}
 	return nil
 }

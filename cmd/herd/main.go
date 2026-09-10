@@ -4640,6 +4640,10 @@ func runCleanup() {
 	if err == nil {
 		err = reviewErr
 	}
+	sourceReport, sourceErr := runSourceRetirementCleanup(context.Background(), repository, *dryRun)
+	if err == nil {
+		err = sourceErr
+	}
 	stackReport, stackErr := runRepoVerifyReaper(context.Background(), repository, *applyVerifyStacks && !*dryRun)
 	if err == nil {
 		err = stackErr
@@ -4657,6 +4661,7 @@ func runCleanup() {
 			"error_count":       len(res.Attempts) - res.Closed - res.Blocked,
 			"verify_reaper":     stackReport,
 			"review_retirement": reviewReport,
+			"source_retirement": sourceReport,
 		}
 		if err != nil {
 			out["error"] = err.Error()
@@ -4676,6 +4681,9 @@ func runCleanup() {
 			for _, c := range reviewReport.Candidates {
 				fmt.Printf("herd cleanup: would retire review generation=%s tab=%s worktree=%s ref=%s prompt=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.ReviewRef, c.Manifest.PromptArtifact, c.Decision.Reason)
 			}
+			for _, c := range sourceReport.Candidates {
+				fmt.Printf("herd cleanup: would retire source generation=%s tab=%s worktree=%s ref=%s sha=%s — %s\n", c.Manifest.Generation, c.Manifest.TabID, c.Manifest.Worktree, c.Manifest.TaskRef, c.Manifest.CandidateSHA, c.Decision.Reason)
+			}
 		} else {
 			for _, att := range res.Attempts {
 				switch att.Outcome {
@@ -4694,6 +4702,9 @@ func runCleanup() {
 		}
 		if !res.DryRun && len(reviewReport.Candidates) > 0 {
 			fmt.Printf("herd cleanup: review-retirement retired=%d blocked=%d failed=%d candidates=%d\n", reviewReport.Retired, reviewReport.Blocked, reviewReport.Failed, len(reviewReport.Candidates))
+		}
+		if !res.DryRun && len(sourceReport.Candidates) > 0 {
+			fmt.Printf("herd cleanup: source-retirement retired=%d blocked=%d failed=%d candidates=%d\n", sourceReport.Retired, sourceReport.Blocked, sourceReport.Failed, len(sourceReport.Candidates))
 		}
 		if stackReport.Output != "" {
 			fmt.Printf("herd cleanup: verify reaper: %s\n", stackReport.Output)
@@ -8804,6 +8815,7 @@ type drainActionHooks struct {
 	dryRun                func(context.Context, drainActionEvidence) error
 	harvest               func(context.Context, drainActionEvidence) error
 	retireReviews         func(context.Context) error
+	retireSources         func(context.Context) error
 }
 
 type drainActionResult struct {
@@ -8829,6 +8841,12 @@ func defaultDrainActionHooks() drainActionHooks {
 		},
 		harvest: func(context.Context, drainActionEvidence) error {
 			return errors.New("no compiled harvest authority is configured")
+		},
+		retireReviews: func(context.Context) error {
+			return errors.New("no compiled review retirement authority is configured")
+		},
+		retireSources: func(context.Context) error {
+			return errors.New("no compiled source retirement authority is configured")
 		},
 	}
 }
@@ -9008,6 +9026,13 @@ func executeDrainActions(ctx context.Context, r *review.DrainReport, evidence []
 			result.Refusals++
 		}
 	}
+	if hooks.retireSources != nil {
+		if err := hooks.retireSources(ctx); err != nil {
+			fmt.Fprintf(out, "REFUSED source-retirement: %v\n", err)
+			result.Failed = true
+			result.Refusals++
+		}
+	}
 	fmt.Fprintf(out, "act_reviews=%d act_harvests=%d act_integration_steps=%d dry_runs=%d rebase_mail=0 rebase_blocked=%d refusals=%d\n",
 		result.Reviews, result.Harvests, result.IntegrationSteps, result.DryRuns, len(rebaseBlocked), result.Refusals)
 	return result
@@ -9023,45 +9048,14 @@ func containsDrainSHA(shas []string, want string) bool {
 }
 
 func verificationCommandProfile(root string) (verifier.CommandProfile, string, error) {
-	buildCommand := "true"
-	if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
-		buildCommand = "go build ./..."
+	// The one derivation is pkg/verifier.ResolveProfile; this wrapper only
+	// keeps the cmd/herd error contract. Both the managed completion gate and
+	// the candidate index admit receipts against that same derivation.
+	resolved := verifier.ResolveProfile(root)
+	if resolved.Refusal != "" {
+		return verifier.CommandProfile{}, "", errors.New(resolved.Refusal)
 	}
-	profile := verifier.CommandProfile{
-		ID: verificationProfile,
-		// Repositories without a Go module must not be forced through a
-		// meaningless Go build. Their declared test command (for example
-		// bin/ci-local) owns build/typecheck coverage; the no-op build keeps
-		// the receipt profile explicit without claiming a Go build ran.
-		BuildCommand: buildCommand,
-		TestCommand:  "go test ./...",
-		TestTimeout:  30 * time.Minute,
-	}
-	path := filepath.Join(root, ".herd", "herd.yaml")
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return profile, "default", nil
-	}
-	if err != nil {
-		return profile, "", fmt.Errorf("read verification config: %w", err)
-	}
-	cfg, err := config.ParseConfig(data)
-	if err != nil {
-		return profile, "", err
-	}
-	if strings.TrimSpace(cfg.Verification.TestCommand) == "" {
-		return profile, "", errors.New("verification.test_command is required")
-	}
-	profile.TestCommand = strings.TrimSpace(cfg.Verification.TestCommand)
-	if raw := strings.TrimSpace(cfg.Verification.TestTimeout); raw != "" {
-		profile.TestTimeout, err = time.ParseDuration(raw)
-		if err != nil || profile.TestTimeout <= 0 {
-			return profile, "", fmt.Errorf("verification.test_timeout must be a positive Go duration: %q", raw)
-		}
-	}
-	profile.PreflightCommand = strings.TrimSpace(cfg.Verification.PreflightCommand)
-	sum := sha256.Sum256(data)
-	return profile, "sha256:" + hex.EncodeToString(sum[:]), nil
+	return resolved.Base, resolved.Revision, nil
 }
 
 // verificationExecutionProfile derives the exact command profile executed by

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
+	"github.com/Kampe/Herdforge/pkg/verifier"
 
 	"github.com/Kampe/Herdforge/pkg/reviewroot"
 )
@@ -67,23 +69,27 @@ const (
 
 // Candidate represents an unintegrated or active review candidate.
 type Candidate struct {
-	Ref             string            `json:"ref"`
-	TaskID          string            `json:"task_id,omitempty"`
-	Title           string            `json:"title,omitempty"`
-	Priority        provider.Priority `json:"priority"`
-	CandidateSHA    string            `json:"candidate_sha"`
-	BaseSHA         string            `json:"base_sha,omitempty"`
-	Sources         []CandidateSource `json:"sources"`
-	State           CandidateState    `json:"state"`
-	BlockedReasons  []BlockedReason   `json:"blocked_reasons,omitempty"`
-	BlockedEvidence []string          `json:"blocked_evidence,omitempty"`
-	Verdict         string            `json:"verdict,omitempty"`
-	Reviewer        string            `json:"reviewer,omitempty"`
-	ReviewerFamily  string            `json:"reviewer_family,omitempty"`
-	AuthorFamily    string            `json:"author_family,omitempty"`
-	LeaseGeneration int64             `json:"lease_generation,omitempty"`
-	WorktreePath    string            `json:"worktree_path,omitempty"`
-	UpdatedAt       time.Time         `json:"updated_at,omitempty"`
+	Ref                string            `json:"ref"`
+	TaskID             string            `json:"task_id,omitempty"`
+	Title              string            `json:"title,omitempty"`
+	Priority           provider.Priority `json:"priority"`
+	CandidateSHA       string            `json:"candidate_sha"`
+	BaseSHA            string            `json:"base_sha,omitempty"`
+	Sources            []CandidateSource `json:"sources"`
+	State              CandidateState    `json:"state"`
+	BlockedReasons     []BlockedReason   `json:"blocked_reasons,omitempty"`
+	BlockedEvidence    []string          `json:"blocked_evidence,omitempty"`
+	Verdict            string            `json:"verdict,omitempty"`
+	Reviewer           string            `json:"reviewer,omitempty"`
+	ReviewerFamily     string            `json:"reviewer_family,omitempty"`
+	AuthorFamily       string            `json:"author_family,omitempty"`
+	LeaseGeneration    int64             `json:"lease_generation,omitempty"`
+	ReceiptDigest      string            `json:"receipt_digest,omitempty"`
+	CompletionSequence int64             `json:"completion_sequence,omitempty"`
+	CompletionValid    bool              `json:"completion_valid,omitempty"`
+	CompletionCallback bool              `json:"completion_callback,omitempty"`
+	WorktreePath       string            `json:"worktree_path,omitempty"`
+	UpdatedAt          time.Time         `json:"updated_at,omitempty"`
 }
 
 // IndexOptions configures candidate discovery and indexing.
@@ -208,6 +214,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 		lease    int64
 	}
 	callbackBlocks := make(map[candidateKey]callbackBlock)
+	completionCallbacks := make(map[candidateKey]callbackBlock)
 	var evidenceOrdinal int
 
 	addSource := func(k candidateKey, src CandidateSource) {
@@ -282,9 +289,29 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 							c.State = StateBlocked
 							c.BlockedReasons = append(c.BlockedReasons, BlockedVetoVerdict)
 							c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("callback blocked: %s", cb.Detail))
-							callbackBlocks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							// Retain the highest active generation's block. A
+							// lower-generation block never supersedes a newer
+							// generation's veto, so out-of-order arrival must
+							// not overwrite the newer block's fencing.
+							if block, ok := callbackBlocks[key]; !ok || cb.LeaseGeneration > block.lease || (cb.LeaseGeneration == block.lease && env.Sequence > block.sequence) {
+								callbackBlocks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							}
 						} else if cb.Kind == mail.CallbackComplete {
-							if block, ok := callbackBlocks[key]; ok && env.Sequence > block.sequence && cb.LeaseGeneration == block.lease {
+							// Retain the highest completed generation so an
+							// out-of-order older completion cannot become the
+							// receipt join target and mask the authoritative
+							// newer generation's missing receipt.
+							if prev, ok := completionCallbacks[key]; !ok || cb.LeaseGeneration > prev.lease || (cb.LeaseGeneration == prev.lease && env.Sequence > prev.sequence) {
+								completionCallbacks[key] = callbackBlock{sequence: env.Sequence, lease: cb.LeaseGeneration}
+							}
+							c.CompletionCallback = true
+							// A completion from the same or a later lease generation
+							// supersedes the block it causally follows. A later
+							// generation may reuse the identical candidate SHA, so
+							// fencing this comparison to equality would preserve a
+							// stale block forever. An older completion must never
+							// clear a newer generation's block.
+							if block, ok := callbackBlocks[key]; ok && env.Sequence > block.sequence && cb.LeaseGeneration >= block.lease {
 								c.State = StatePending
 								c.BlockedReasons = removeBlockedReason(c.BlockedReasons, BlockedVetoVerdict)
 								c.BlockedEvidence = removeCallbackBlockedEvidence(c.BlockedEvidence)
@@ -399,6 +426,53 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 		}
 	}
 
+	// A completion callback is only a claim that verification finished. The
+	// verifier receipt is the exact, content-bound PASS proof. Join it to the
+	// callback by task, candidate, and lease before selecting a candidate.
+	// Only receipts whose command is the repository's authorized full-suite
+	// test command, and whose profile identity (when carried) matches the
+	// live derivation, count as that proof; a refusal to resolve the
+	// repository profile admits no receipts at all.
+	if idx.opts.RepoRoot != "" {
+		receiptDir := filepath.Join(idx.opts.RepoRoot, ".herd", "verification-receipts")
+		profiles := verifier.ResolveProfile(idx.opts.RepoRoot)
+		if entries, err := os.ReadDir(receiptDir); err == nil && profiles.Refusal == "" {
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+					continue
+				}
+				data, readErr := os.ReadFile(filepath.Join(receiptDir, entry.Name()))
+				if readErr != nil {
+					continue
+				}
+				var receipt verifier.Receipt
+				if json.Unmarshal(data, &receipt) != nil || receipt.Outcome != verifier.OutcomePASS || receipt.ValidateDigest() != nil ||
+					!profiles.CommandAdmitted(receipt.Command) || !profiles.ReceiptAdmitted(receipt) {
+					continue
+				}
+				gen, genErr := strconv.ParseInt(strings.TrimSpace(receipt.LeaseGeneration), 10, 64)
+				if genErr != nil || gen <= 0 || !sha40Re.MatchString(receipt.CandidateSHA) || strings.TrimSpace(receipt.TaskRef) == "" || !sha40Re.MatchString(receipt.BaseSHA) {
+					continue
+				}
+				key := candidateKey{ref: strings.TrimSpace(receipt.TaskRef), sha: strings.TrimSpace(receipt.CandidateSHA)}
+				cb, ok := completionCallbacks[key]
+				if !ok || cb.lease != gen {
+					continue
+				}
+				c := getOrCreate(key.ref, key.sha, provider.PriorityMedium)
+				// The joined receipt validates its own generation's
+				// completion claim; it must never downgrade a higher lease
+				// generation already observed for this candidate.
+				if gen > c.LeaseGeneration {
+					c.LeaseGeneration = gen
+				}
+				c.BaseSHA = receipt.BaseSHA
+				c.ReceiptDigest, c.CompletionSequence = receipt.Digest, cb.sequence
+				c.CompletionValid = true
+			}
+		}
+	}
+
 	// 5. Coalesce by ref to link candidate SHAs across sources
 	byRef := make(map[string][]*Candidate)
 	for _, c := range merged {
@@ -462,6 +536,11 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 		resolvedReviewerFamily := selected.ReviewerFamily
 		resolvedAuthorFamily := selected.AuthorFamily
 		resolvedLease := selected.LeaseGeneration
+		resolvedBase := selected.BaseSHA
+		resolvedReceipt := selected.ReceiptDigest
+		resolvedCompletionSequence := selected.CompletionSequence
+		resolvedCompletionValid := selected.CompletionValid
+		resolvedCompletionCallback := selected.CompletionCallback
 		selectedBlockedReasons := append([]BlockedReason(nil), selected.BlockedReasons...)
 		selectedBlockedEvidence := append([]string(nil), selected.BlockedEvidence...)
 		hasBlockedState := selected.State == StateBlocked
@@ -486,20 +565,25 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 		// SHA with the newest candidate would break exact SHA fencing.
 
 		c := &Candidate{
-			Ref:             ref,
-			CandidateSHA:    resolvedSHA,
-			TaskID:          resolvedTaskID,
-			Title:           resolvedTitle,
-			Priority:        bestPriority,
-			Verdict:         resolvedVerdict,
-			Reviewer:        resolvedReviewer,
-			ReviewerFamily:  resolvedReviewerFamily,
-			AuthorFamily:    resolvedAuthorFamily,
-			LeaseGeneration: resolvedLease,
-			State:           StatePending,
-			WorktreePath:    worktreePath,
-			BlockedReasons:  selectedBlockedReasons,
-			BlockedEvidence: selectedBlockedEvidence,
+			Ref:                ref,
+			CandidateSHA:       resolvedSHA,
+			TaskID:             resolvedTaskID,
+			Title:              resolvedTitle,
+			Priority:           bestPriority,
+			Verdict:            resolvedVerdict,
+			Reviewer:           resolvedReviewer,
+			ReviewerFamily:     resolvedReviewerFamily,
+			AuthorFamily:       resolvedAuthorFamily,
+			LeaseGeneration:    resolvedLease,
+			BaseSHA:            resolvedBase,
+			ReceiptDigest:      resolvedReceipt,
+			CompletionSequence: resolvedCompletionSequence,
+			CompletionValid:    resolvedCompletionValid,
+			CompletionCallback: resolvedCompletionCallback,
+			State:              StatePending,
+			WorktreePath:       worktreePath,
+			BlockedReasons:     selectedBlockedReasons,
+			BlockedEvidence:    selectedBlockedEvidence,
 		}
 		if hasBlockedState {
 			c.State = StateBlocked
@@ -523,6 +607,15 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 			c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("candidate SHA %q is not 40 hex chars", c.CandidateSHA))
 		}
 
+		// A positive-generation completion claim is only review-admissible
+		// with its exact full-suite PASS receipt. The requirement holds for
+		// every authoritative candidate, including a single reused candidate
+		// SHA, and there is no fallback to an older receipt or verdict.
+		if c.State != StateBlocked && c.State != StateConsumed && c.LeaseGeneration > 0 && c.CompletionCallback && !c.CompletionValid {
+			c.State = StateBlocked
+			c.BlockedReasons = append(c.BlockedReasons, BlockedMissingReceipt)
+			c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("lease generation %d has no exact full-suite PASS receipt bound to candidate %s and its completion callback", c.LeaseGeneration, c.CandidateSHA))
+		}
 		if c.State != StateBlocked && c.State != StateConsumed {
 			if c.Verdict == string(reviewledger.VerdictFAIL) || c.Verdict == string(reviewledger.VerdictBLOCKED) {
 				c.State = StateBlocked
@@ -622,6 +715,17 @@ func authoritativeCandidate(list []*Candidate, evidence map[candidateKey]candida
 func candidateIsNewer(candidate *Candidate, current candidateEvidence, selected *Candidate, previous candidateEvidence) bool {
 	if (candidate.CandidateSHA != "") != (selected.CandidateSHA != "") {
 		return candidate.CandidateSHA != ""
+	}
+	if candidate.LeaseGeneration != selected.LeaseGeneration {
+		if candidate.CompletionCallback || candidate.CompletionValid || selected.CompletionCallback || selected.CompletionValid {
+			return candidate.LeaseGeneration > selected.LeaseGeneration
+		}
+	}
+	if candidate.CompletionValid != selected.CompletionValid {
+		return candidate.CompletionValid
+	}
+	if candidate.CompletionSequence != selected.CompletionSequence {
+		return candidate.CompletionSequence > selected.CompletionSequence
 	}
 	if newerEvidence(current, previous) {
 		return true

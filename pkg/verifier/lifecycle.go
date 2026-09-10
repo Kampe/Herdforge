@@ -152,6 +152,10 @@ type ownedSubprocess struct {
 	finalizeFn func() error
 	reapFn     func(bool) error
 	readyFn    func([]string) bool
+	// commandStart runs after the pre-exec ownership barrier is released. It
+	// marks the point at which a command timeout may begin; the ownership
+	// handshake itself is bounded separately by handshakeReadBound.
+	commandStart func()
 }
 
 // ownershipWrapperScript: pre-exec cont barrier + two-phase residual drain.
@@ -376,6 +380,9 @@ func (o *ownedSubprocess) RunProtocol() (userExitHint int, err error) {
 		return -1, fmt.Errorf("ownership cont: %w", err)
 	}
 	contSent = true
+	if o.commandStart != nil {
+		o.commandStart()
+	}
 
 	// Phase 2: done <ec> — bounded read; Cancel kills supervisor → EOF sooner.
 	if err := o.statusR.SetReadDeadline(time.Now().Add(handshakeDoneBound)); err != nil {

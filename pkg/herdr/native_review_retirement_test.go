@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,82 @@ func TestNativeRetirementCorruptJournalFailsClosed(t *testing.T) {
 	op := &NativeReviewRetirementOp{Root: t.TempDir(), JournalPath: p}
 	if _, err := op.Completed(ReviewRetirementManifest{Generation: "g", CandidateSHA: strings.Repeat("a", 40), Reviewer: "r", BindingDigest: "d"}); err == nil {
 		t.Fatal("corrupt retirement journal was silently ignored")
+	}
+}
+
+func TestCanonicalRetirementVerdictSelectsLatestReassessment(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	base := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: "reviewer", Verdict: string(reviewledger.VerdictFAIL), ArtifactDigest: strings.Repeat("1", 64)}
+	next := base
+	next.Verdict = string(reviewledger.VerdictPASS)
+	next.ArtifactDigest = strings.Repeat("2", 64)
+	next.Reassesses = reviewledger.VerdictEventDigest(base)
+	got, err := canonicalRetirementVerdict([]reviewledger.LedgerRow{base, next}, sha, "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Reassesses != next.Reassesses || got.Verdict != string(reviewledger.VerdictPASS) {
+		t.Fatalf("selected verdict=%+v, want latest reassessment", got)
+	}
+}
+
+func TestCanonicalRetirementVerdictRejectsConflictingReassessmentBranches(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	base := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: "reviewer", Verdict: string(reviewledger.VerdictFAIL), ArtifactDigest: strings.Repeat("1", 64)}
+	left := base
+	left.Verdict = string(reviewledger.VerdictPASS)
+	left.ArtifactDigest = strings.Repeat("2", 64)
+	left.Reassesses = reviewledger.VerdictEventDigest(base)
+	right := left
+	right.Verdict = string(reviewledger.VerdictBLOCKED)
+	right.ArtifactDigest = strings.Repeat("3", 64)
+	if _, err := canonicalRetirementVerdict([]reviewledger.LedgerRow{base, left, right}, sha, "reviewer"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("conflicting reassessment branch accepted: %v", err)
+	}
+}
+
+func TestLaunchSelectionIgnoresLaterHistoricalDuplicate(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	m := retirementManifest(t, "launch-bound")
+	m.CandidateSHA = sha
+	m.RecordedAt = "2026-09-10T05:44:34.504025Z"
+	rows := []reviewledger.LedgerRow{
+		{Event: string(reviewledger.EventRecord), SHA: sha, Reviewer: m.Reviewer, Lease: m.Nonce, Branch: m.TaskRef, Timestamp: "2026-09-10T05:44:34.000000Z"},
+		{Event: string(reviewledger.EventRecord), SHA: sha, Reviewer: m.Reviewer, Lease: m.Nonce, Branch: "wrong-history", Timestamp: "2026-09-10T05:44:35.000000Z"},
+	}
+	var selected reviewledger.LedgerRow
+	for _, row := range rows {
+		if row.Event == string(reviewledger.EventRecord) && row.SHA == m.CandidateSHA && row.Reviewer == m.Reviewer && row.Lease == m.Nonce && launchBeforeManifest(row, m.RecordedAt) {
+			if selected.Event != "" && !reflect.DeepEqual(selected, row) {
+				t.Fatal("historical launch selection became ambiguous")
+			}
+			selected = row
+		}
+	}
+	if selected.Branch != m.TaskRef {
+		t.Fatalf("selected launch=%+v", selected)
+	}
+}
+
+func TestRetireReviewLanesRetainsSupersededButContinuesEligible(t *testing.T) {
+	old, current := retirementManifest(t, "old"), retirementManifest(t, "current")
+	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"old": {}, "current": retirementEvidence(current)}}
+	// The fake models a closed historical manifest whose named slot is now
+	// owned by another lease; the current lane remains independently eligible.
+	oldErr := errRetirementSuperseded
+	f.observeErr = map[string]error{"old": oldErr}
+	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{old, current}, false)
+	if err != nil || r.Failed != 0 || r.Blocked != 1 || r.Retired != 1 {
+		t.Fatalf("report=%+v err=%v events=%v", r, err, f.events)
+	}
+}
+
+func TestRetireReviewLanesAggregatesHardObservationFailure(t *testing.T) {
+	bad, good := retirementManifest(t, "bad-observation"), retirementManifest(t, "good-observation")
+	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"good-observation": retirementEvidence(good)}, observeErr: map[string]error{"bad-observation": errors.New("active mismatched lease")}}
+	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{bad, good}, false)
+	if err == nil || r.Failed != 1 || len(f.events) != 0 {
+		t.Fatalf("report=%+v err=%v events=%v", r, err, f.events)
 	}
 }
 
