@@ -80,6 +80,7 @@ func (l *Ledger) AdmitReduced(opts ReducedAdmissionOpts) (*AdmissionResult, erro
 	latest := map[ProjectionKey]LedgerRow{}
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
+			r.Task = EffectiveTask(rows, r)
 			latest[rowProjection(r)] = r
 		}
 	}
@@ -281,6 +282,7 @@ func (l *Ledger) Admit(opts AdmissionOpts) (*AdmissionResult, error) {
 	var order []ProjectionKey
 	for _, r := range rows {
 		if r.Event == string(EventVerdict) && r.SHA == sha {
+			r.Task = EffectiveTask(rows, r)
 			k := rowProjection(r)
 			if _, seen := latest[k]; !seen {
 				order = append(order, k)

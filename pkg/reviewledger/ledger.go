@@ -149,6 +149,7 @@ func readRows(path string) ([]LedgerRow, error) {
 			quarantineLine(line, err)
 			continue
 		}
+		row.rawEventDigest = rawEventDigest(row)
 		rows = append(rows, row)
 	}
 	return rows, sc.Err()

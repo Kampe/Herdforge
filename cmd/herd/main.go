@@ -8318,6 +8318,8 @@ func runReviewLedger() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "task-bind":
+		runReviewTaskBind(l)
 	case "readiness":
 		// FAC-636: MergeReadiness existed only as a Go API, so the coordinator had
 		// no way to classify candidates except grepping the ledger -- which is
@@ -8413,7 +8415,7 @@ func runReviewLedger() {
 			fmt.Printf("builder-family drift: lane=%s agent=%s recorded=%s live=%s\n", finding.Lane, finding.Identity, finding.Recorded, finding.Live)
 		}
 	case "-h", "--help":
-		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>|drift")
+		fmt.Println("Usage: herd review-ledger list|queued|pending|tier <sha>|task-bind --artifact FILE --previous-task FAC-N|drift")
 	default:
 		fmt.Fprintf(os.Stderr, "review-ledger: unknown mode %q\n", mode)
 		os.Exit(2)
