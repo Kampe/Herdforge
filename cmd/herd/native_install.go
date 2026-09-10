@@ -43,12 +43,21 @@ func runNativeInstall(args []string) error {
 
 func parseNativeInstallArgs(args []string) (nativeInstallOptions, error) {
 	var opts nativeInstallOptions
+	actSeen, dryRunSeen := false, false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
 		case "--act":
+			if dryRunSeen {
+				return nativeInstallOptions{}, fmt.Errorf("herd install: --act and --dry-run are contradictory")
+			}
+			actSeen = true
 			opts.act = true
 		case "--dry-run":
+			if actSeen {
+				return nativeInstallOptions{}, fmt.Errorf("herd install: --act and --dry-run are contradictory")
+			}
+			dryRunSeen = true
 			opts.act = false
 		case "--source", "--revision", "--target":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(args[i+1], "-") {
