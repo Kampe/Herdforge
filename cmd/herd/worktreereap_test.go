@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // FAC-672: a standing lane's RESIDENT HOME tracks the base and therefore has no
@@ -191,7 +194,10 @@ func TestRetireLandedReportsOnlyWhatItActuallyRemoved(t *testing.T) {
 	run("worktree", "add", "-q", "-b", "landed-branch", dir)
 	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 
-	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "landed-branch", Head: strings.TrimSpace(string(head)), Class: "landed"}})
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	retired, failed := retireLandedWithInspector(root, []reapRow{{Path: dir, Branch: "landed-branch", Head: strings.TrimSpace(string(head)), Class: "landed"}}, clean)
 	if len(retired) != 1 || len(failed) != 0 {
 		t.Fatalf("a real removal must be reported as retired: retired=%v failed=%v", retired, failed)
 	}
@@ -233,7 +239,10 @@ func TestRetireLandedDeletesPatchLandedNonAncestorBranch(t *testing.T) {
 	run("cherry-pick", "patch-landed")
 	head, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 
-	retired, failed := retireLanded(root, []reapRow{{Path: dir, Branch: "patch-landed", Head: strings.TrimSpace(string(head)), Class: "landed"}})
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	retired, failed := retireLandedWithInspector(root, []reapRow{{Path: dir, Branch: "patch-landed", Head: strings.TrimSpace(string(head)), Class: "landed"}}, clean)
 	if len(retired) != 1 || len(failed) != 0 {
 		t.Fatalf("patch-landed branch must retire transactionally: retired=%v failed=%v", retired, failed)
 	}
@@ -306,6 +315,355 @@ func TestRetireLandedRefusesBranchThatAdvancedAfterClassification(t *testing.T) 
 	}
 	if !worktreeExists(dir) {
 		t.Fatal("identity mismatch must refuse before removing the worktree")
+	}
+}
+
+func TestSelectReapTargetsBoundsToExactRegisteredPaths(t *testing.T) {
+	root := t.TempDir()
+	entries := []worktreeEntry{
+		{Path: filepath.Join(root, "one"), Branch: "landed-one"},
+		{Path: filepath.Join(root, "two"), Branch: "landed-two"},
+	}
+	selected, err := selectReapTargets(root, entries, reapTargets{"one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].Branch != "landed-one" {
+		t.Fatalf("exact selection escaped its target: %+v", selected)
+	}
+	if _, err := selectReapTargets(root, entries, reapTargets{"missing"}); err == nil {
+		t.Fatal("an unregistered target must fail closed")
+	}
+	if _, err := selectReapTargets(root, entries, reapTargets{"../two"}); err == nil {
+		t.Fatal("a target escaping the repository must fail closed")
+	}
+}
+
+func TestWorktreeReapTargetValidatesBeforeInspectingStatus(t *testing.T) {
+	root := t.TempDir()
+	selectedPath := filepath.Join(root, "one")
+	otherPath := filepath.Join(root, "two")
+	if err := os.Mkdir(selectedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(otherPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registrations := []worktreeEntry{
+		{Path: selectedPath, IsMain: true},
+		{Path: otherPath, IsMain: true},
+	}
+	var listed, inspected int
+	var inspectedPaths []string
+	originalLister, originalInspector := reapRegistrationLister, reapEntryInspector
+	t.Cleanup(func() {
+		reapRegistrationLister, reapEntryInspector = originalLister, originalInspector
+	})
+	reapRegistrationLister = func(gotRoot string) ([]worktreeEntry, error) {
+		if gotRoot != root {
+			t.Fatalf("registration root=%q, want %q", gotRoot, root)
+		}
+		listed++
+		return registrations, nil
+	}
+	reapEntryInspector = func(entries []worktreeEntry) ([]worktreeEntry, error) {
+		inspected++
+		for _, entry := range entries {
+			inspectedPaths = append(inspectedPaths, entry.Path)
+		}
+		return entries, nil
+	}
+	t.Setenv("HERD_ROOT", root)
+	if err := runWorktreeReap([]string{"--target", "one", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if listed != 1 || inspected != 1 || len(inspectedPaths) != 1 || inspectedPaths[0] != selectedPath {
+		t.Fatalf("target inspection counts/list=%d/%d/%v, want one selected path", listed, inspected, inspectedPaths)
+	}
+	if err := runWorktreeReap([]string{"--target", "missing", "--json"}); err == nil {
+		t.Fatal("unregistered target must fail before status inspection")
+	}
+	if inspected != 1 {
+		t.Fatalf("invalid target triggered status inspection: %d calls", inspected)
+	}
+}
+
+func TestInspectWorktreeEntriesStatusesOnlyProvidedTargets(t *testing.T) {
+	entries := []worktreeEntry{
+		{Path: "/private/selected-one", Branch: "one"},
+		{Path: "/private/selected-two", Branch: "two"},
+	}
+	original := reapStatusRunner
+	t.Cleanup(func() { reapStatusRunner = original })
+	var calls []string
+	reapStatusRunner = func(path string, args ...string) (string, error) {
+		calls = append(calls, path)
+		return "", nil
+	}
+	inspectWorktreeEntries(entries)
+	if strings.Join(calls, ",") != "/private/selected-one,/private/selected-two" {
+		t.Fatalf("status calls=%v, want exactly selected entries", calls)
+	}
+}
+
+func TestRetireLandedRefusesDirtyWorktreeAfterClassification(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	injected := false
+	run := func(repo string, args ...string) ([]byte, error) {
+		verify := false
+		for _, arg := range args {
+			if arg == "--verify" {
+				verify = true
+				break
+			}
+		}
+		if !injected && len(args) >= 1 && args[0] == "rev-parse" && verify {
+			injected = true
+			if err := os.WriteFile(filepath.Join(dir, "new-evidence"), []byte("must survive"), 0644); err != nil {
+				t.Fatalf("dirty fixture: %v", err)
+			}
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run)
+	if err == nil || !strings.Contains(err.Error(), "act-time worktree has") {
+		t.Fatalf("dirty-after-plan must refuse before removal, got %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("dirty worktree was removed")
+	}
+}
+
+func TestRetireLandedRefusesLockedWorktreeAfterClassification(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	injected := false
+	run := func(repo string, args ...string) ([]byte, error) {
+		verify := false
+		for _, arg := range args {
+			if arg == "--verify" {
+				verify = true
+				break
+			}
+		}
+		if !injected && len(args) >= 1 && args[0] == "rev-parse" && verify {
+			injected = true
+			if out, err := runReapGit(repo, "worktree", "lock", dir); err != nil {
+				t.Fatalf("lock fixture: %v: %s", err, out)
+			}
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run)
+	if err == nil || !strings.Contains(err.Error(), "act-time worktree is locked") {
+		t.Fatalf("locked-after-plan must refuse before removal, got %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("locked worktree was removed")
+	}
+}
+
+func TestRetireLandedDoesNotForceOrRetryRemoval(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	removeCalls := 0
+	run := func(repo string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+			removeCalls++
+			for _, arg := range args {
+				if arg == "--force" || arg == "-f" {
+					t.Fatalf("removal must not be forced: %v", args)
+				}
+			}
+			return []byte("synthetic removal refusal"), fmt.Errorf("synthetic removal refusal")
+		}
+		return runReapGit(repo, args...)
+	}
+	err := retireLandedOne(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run)
+	if err == nil || removeCalls != 1 {
+		t.Fatalf("removal failure must be reported after one safe attempt: err=%v calls=%d", err, removeCalls)
+	}
+}
+
+type reapProcessInspectorFunc func(context.Context, string) (resources.ProcessUsage, error)
+
+func (f reapProcessInspectorFunc) InUse(ctx context.Context, path string) (resources.ProcessUsage, error) {
+	return f(ctx, path)
+}
+
+func TestRetireLandedRefusesActiveOwnerButAllowsCleanNonresident(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	row := reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}
+	active := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{CWD: true, PIDs: []int{1234}}, nil
+	})
+	if err := retireLandedOneWithInspector(root, row, runReapGit, active); err == nil || !strings.Contains(err.Error(), "active use") {
+		t.Fatalf("active owner must block retirement: %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("active owner refusal removed the worktree")
+	}
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	if err := retireLandedOneWithInspector(root, row, runReapGit, clean); err != nil {
+		t.Fatalf("clean nonresident worktree should retire: %v", err)
+	}
+}
+
+func TestRetireLandedRefusesUnknownOwnerEvidence(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	row := reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}
+	unknown := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{MetadataUnavailable: true}, nil
+	})
+	err := retireLandedOneWithInspector(root, row, runReapGit, unknown)
+	if err == nil || !strings.Contains(err.Error(), "census is incomplete") {
+		t.Fatalf("unknown owner evidence must block: %v", err)
+	}
+	if !worktreeExists(dir) {
+		t.Fatal("unknown owner refusal removed the worktree")
+	}
+}
+
+func TestIgnoredOnlyWorktreeContentIsNotClean(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(root, "wt")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored-cache\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, dir, "add", ".gitignore")
+	runGitT(t, dir, "commit", "-qm", "fixture ignore rules")
+	if err := os.WriteFile(filepath.Join(dir, "ignored-cache"), []byte("evidence"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := listWorktreeEntries(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := exactWorktreeEntry(entries, dir)
+	if !ok || !entry.Dirty {
+		t.Fatalf("ignored-only content must be classified dirty: %+v", entry)
+	}
+}
+
+func TestGitStatusErrorsAreReturned(t *testing.T) {
+	if _, err := gitOutIn(filepath.Join(t.TempDir(), "missing"), "status", "--porcelain"); err == nil {
+		t.Fatal("git status failure must not become an empty clean result")
+	}
+}
+
+func TestRetireLandedRefusesStatusErrorAtActFence(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	dir := filepath.Join(filepath.Dir(root), "wt-status-error")
+	runGitT(t, root, "worktree", "add", "-q", "-b", "landed", dir)
+	head := strings.TrimSpace(runGitT(t, dir, "rev-parse", "HEAD"))
+	payload := filepath.Join(dir, "must-survive")
+	if err := os.WriteFile(payload, []byte("evidence"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	removeCalls := 0
+	run := func(repo string, args ...string) ([]byte, error) {
+		verify := false
+		for _, arg := range args {
+			if arg == "--verify" {
+				verify = true
+				break
+			}
+		}
+		if len(args) >= 1 && args[0] == "rev-parse" && verify {
+			if err := os.Remove(filepath.Join(dir, ".git")); err != nil {
+				t.Fatalf("break status fixture: %v", err)
+			}
+		}
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+			removeCalls++
+			return []byte("must not reach removal"), nil
+		}
+		return runReapGit(repo, args...)
+	}
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+	err := retireLandedOneWithInspector(root, reapRow{Path: dir, Branch: "landed", Head: head, Class: "landed"}, run, clean)
+	if err == nil || !strings.Contains(err.Error(), "status is unknown") {
+		t.Fatalf("act-time status error must refuse: %v", err)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("status error reached removal: calls=%d", removeCalls)
+	}
+	if _, statErr := os.Stat(payload); statErr != nil {
+		t.Fatalf("status refusal lost payload: %v", statErr)
 	}
 }
 

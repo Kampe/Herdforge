@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,11 +10,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/refname"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // reapRow is one classified worktree.
@@ -52,6 +55,8 @@ func runWorktreeReap(args []string) error {
 	apply := fs.Bool("apply", false, "remove the landed worktrees; without it, report only")
 	asJSON := fs.Bool("json", false, "emit the classification as JSON")
 	base := fs.String("base", "origin/main", "ref that defines 'landed'")
+	var targets reapTargets
+	fs.Var(&targets, "target", "exact repository-relative worktree path to inspect (repeatable; bounds the operation)")
 	// FAC-673: retire by the PR's own closure, not only by branch state.
 	//
 	// worktree-reap alone is a SWEEP: it must be run, and between runs the leak
@@ -67,7 +72,21 @@ func runWorktreeReap(args []string) error {
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
 
-	entries, err := listWorktreeEntries(root)
+	var entries []worktreeEntry
+	var err error
+	if len(targets) > 0 {
+		registrations, listErr := reapRegistrationLister(root)
+		if listErr != nil {
+			return listErr
+		}
+		selected, selectErr := selectReapTargets(root, registrations, targets)
+		if selectErr != nil {
+			return selectErr
+		}
+		entries, err = reapEntryInspector(selected)
+	} else {
+		entries, err = listWorktreeEntries(root)
+	}
 	if err != nil {
 		return err
 	}
@@ -85,6 +104,8 @@ func runWorktreeReap(args []string) error {
 			r.Class, r.Reason = "locked", "locked: "+e.LockReason
 		case e.Branch == "":
 			r.Class, r.Reason = "unknown", "no branch and not detached; unresolved state, left alone"
+		case e.StatusError != "":
+			r.Class, r.Reason = "unknown", "status inspection failed: "+e.StatusError
 		case e.Dirty:
 			r.Class, r.Reason = "dirty", "uncommitted changes would be destroyed"
 		case isResidentHome(e.Branch, e.Path):
@@ -215,18 +236,20 @@ func runWorktreeReap(args []string) error {
 
 // retireLanded removes each landed surface and reports EXACTLY what happened.
 //
-// FAC-681: git refuses `worktree remove --force` for a surface it considers
-// locked or otherwise held, and the operator observed that a second --force
-// succeeded where one did not. So a single attempt that fails is escalated once,
-// and if it still fails the path is reported as KEPT with git's own message
-// rather than counted as retired.
+// FAC-681: a removal failure is reported as KEPT with git's own message rather
+// than counted as retired. Removal is deliberately non-forced: a lock, dirty
+// surface, or any other refusal is a safety result, not an escalation prompt.
 //
 // Removal is verified by looking, not by trusting the exit status: the whole
 // defect being fixed here is a command that reported success for work it never
 // did, so the confirmation has to be independent of the claim.
 func retireLanded(root string, landed []reapRow) (retired, failed []map[string]string) {
+	return retireLandedWithInspector(root, landed, resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20})
+}
+
+func retireLandedWithInspector(root string, landed []reapRow, inspector resources.ProcessInspector) (retired, failed []map[string]string) {
 	for _, l := range landed {
-		err := retireLandedOne(root, l, runReapGit)
+		err := retireLandedOneWithInspector(root, l, runReapGit, inspector)
 		if err != nil {
 			failed = append(failed, map[string]string{
 				"path":   l.Path,
@@ -242,6 +265,63 @@ func retireLanded(root string, landed []reapRow) (retired, failed []map[string]s
 
 type reapGitRunner func(root string, args ...string) ([]byte, error)
 
+type reapTargets []string
+
+func (t *reapTargets) String() string { return strings.Join(*t, ",") }
+
+func (t *reapTargets) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("worktree-reap: --target must not be empty")
+	}
+	if filepath.IsAbs(value) {
+		return fmt.Errorf("worktree-reap: --target must be repository-relative: %q", value)
+	}
+	clean := filepath.Clean(value)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("worktree-reap: --target escapes the repository: %q", value)
+	}
+	*t = append(*t, clean)
+	return nil
+}
+
+func selectReapTargets(root string, entries []worktreeEntry, targets reapTargets) ([]worktreeEntry, error) {
+	if len(targets) == 0 {
+		return entries, nil
+	}
+	absRoot, err := canonicalWorktreePath(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repository root: %w", err)
+	}
+	byPath := make(map[string]worktreeEntry, len(entries))
+	for _, entry := range entries {
+		path, err := canonicalWorktreePath(entry.Path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worktree %q: %w", entry.Path, err)
+		}
+		byPath[filepath.Clean(path)] = entry
+	}
+	selected := make([]worktreeEntry, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		path := filepath.Clean(filepath.Join(absRoot, target))
+		path, err = canonicalWorktreePath(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve target %q: %w", target, err)
+		}
+		entry, ok := byPath[path]
+		if !ok {
+			return nil, fmt.Errorf("worktree-reap: --target %q is not a registered worktree", target)
+		}
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		selected = append(selected, entry)
+	}
+	return selected, nil
+}
+
 func runReapGit(root string, args ...string) ([]byte, error) {
 	return exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput()
 }
@@ -251,6 +331,16 @@ func runReapGit(root string, args ...string) ([]byte, error) {
 // after the required worktree removal, the still-existing branch is used to
 // restore the exact worktree path before failure is returned.
 func retireLandedOne(root string, l reapRow, run reapGitRunner) error {
+	return retireLandedOneWithInspector(root, l, run, noOpReapProcessInspector{})
+}
+
+type noOpReapProcessInspector struct{}
+
+func (noOpReapProcessInspector) InUse(context.Context, string) (resources.ProcessUsage, error) {
+	return resources.ProcessUsage{}, nil
+}
+
+func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector) error {
 	if strings.TrimSpace(l.Head) == "" {
 		return fmt.Errorf("retire %s: observed worktree HEAD is required", l.Path)
 	}
@@ -260,11 +350,49 @@ func retireLandedOne(root string, l reapRow, run reapGitRunner) error {
 		return fmt.Errorf("retire %s: branch identity changed or unreadable (observed=%q want=%q error=%v)",
 			l.Path, strings.TrimSpace(string(observed)), strings.TrimSpace(l.Head), observeErr)
 	}
-	out, err := run(root, "worktree", "remove", "--force", l.Path)
-	if err != nil {
-		// One escalation: git needs a second --force for a locked surface.
-		out, err = run(root, "worktree", "remove", "--force", "--force", l.Path)
+	// Classification and act are separate processes in the CLI lifecycle. A
+	// writer can acquire the surface, add evidence, or lock it after the first
+	// scan. Re-read the native worktree state immediately before removal and
+	// refuse every changed or uncertain identity; this is the act-time fence.
+	entries, listErr := listWorktreeEntries(root)
+	if listErr != nil {
+		return fmt.Errorf("retire %s: act-time worktree revalidation failed: %w", l.Path, listErr)
 	}
+	current, found := exactWorktreeEntry(entries, l.Path)
+	if !found {
+		return fmt.Errorf("retire %s: act-time worktree identity disappeared", l.Path)
+	}
+	if current.Head != l.Head || current.Branch != l.Branch || current.Detached || current.IsMain {
+		return fmt.Errorf("retire %s: act-time worktree identity changed (head=%q branch=%q)", l.Path, current.Head, current.Branch)
+	}
+	if current.StatusError != "" {
+		return fmt.Errorf("retire %s: act-time worktree status is unknown: %s", l.Path, current.StatusError)
+	}
+	if current.Locked {
+		return fmt.Errorf("retire %s: act-time worktree is locked: %s", l.Path, current.LockReason)
+	}
+	if current.Dirty {
+		return fmt.Errorf("retire %s: act-time worktree has uncommitted, untracked, or ignored content", l.Path)
+	}
+	if isResidentHome(current.Branch, current.Path) {
+		return fmt.Errorf("retire %s: act-time worktree is a protected resident home", l.Path)
+	}
+	ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
+	usage, ownerErr := inspector.InUse(ownerCtx, current.Path)
+	cancelOwner()
+	if ownerErr != nil {
+		return fmt.Errorf("retire %s: act-time owner census failed: %w", l.Path, ownerErr)
+	}
+	if usage.MetadataUnavailable {
+		return fmt.Errorf("retire %s: act-time owner census is incomplete", l.Path)
+	}
+	if usage.CWD || usage.OpenFile || usage.ReferencedPath {
+		return fmt.Errorf("retire %s: act-time owner census found active use (cwd=%t open=%t referenced=%t pids=%v)", l.Path, usage.CWD, usage.OpenFile, usage.ReferencedPath, usage.PIDs)
+	}
+
+	// Never force removal: Git's normal operation is the final safety check and
+	// refuses a worktree that became dirty or locked after our revalidation.
+	out, err := run(root, "worktree", "remove", l.Path)
 	if err == nil && worktreeExists(l.Path) {
 		err = fmt.Errorf("git reported success but worktree still exists")
 	}
@@ -298,6 +426,34 @@ func retireLandedOne(root string, l reapRow, run reapGitRunner) error {
 	}
 	return fmt.Errorf("delete branch %s after worktree removal: %s (%w); worktree restored at %s",
 		l.Branch, strings.TrimSpace(string(branchOut)), branchErr, l.Path)
+}
+
+func exactWorktreeEntry(entries []worktreeEntry, path string) (worktreeEntry, bool) {
+	want, err := canonicalWorktreePath(path)
+	if err != nil {
+		return worktreeEntry{}, false
+	}
+	want = filepath.Clean(want)
+	for _, entry := range entries {
+		got, err := canonicalWorktreePath(entry.Path)
+		if err == nil && filepath.Clean(got) == want {
+			return entry, true
+		}
+	}
+	return worktreeEntry{}, false
+}
+
+func canonicalWorktreePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	} else if parent, parentErr := filepath.EvalSymlinks(filepath.Dir(abs)); parentErr == nil {
+		abs = filepath.Join(parent, filepath.Base(abs))
+	}
+	return filepath.Clean(abs), nil
 }
 
 // isResidentHome reports whether a worktree is a standing lane's home rather
@@ -405,17 +561,29 @@ func configuredLaneNames(root string) []string {
 }
 
 type worktreeEntry struct {
-	Path       string
-	Branch     string
-	Head       string
-	Detached   bool
-	Locked     bool
-	LockReason string
-	Dirty      bool
-	IsMain     bool
+	Path        string
+	Branch      string
+	Head        string
+	Detached    bool
+	Locked      bool
+	LockReason  string
+	Dirty       bool
+	StatusError string
+	IsMain      bool
 }
 
 func listWorktreeEntries(root string) ([]worktreeEntry, error) {
+	entries, err := listWorktreeRegistrations(root)
+	if err != nil {
+		return nil, err
+	}
+	return inspectWorktreeEntries(entries), nil
+}
+
+// listWorktreeRegistrations reads only Git's registration metadata. It does
+// not inspect any registered worktree, so target-bounded reaping can validate
+// selectors before touching unselected paths.
+func listWorktreeRegistrations(root string) ([]worktreeEntry, error) {
 	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return nil, fmt.Errorf("list worktrees: %w", err)
@@ -429,9 +597,6 @@ func listWorktreeEntries(root string) ([]worktreeEntry, error) {
 		}
 		if abs, err := filepath.Abs(cur.Path); err == nil && abs == absRoot {
 			cur.IsMain = true
-		}
-		if !cur.IsMain && !cur.Detached {
-			cur.Dirty = len(strings.TrimSpace(gitOutIn(cur.Path, "status", "--porcelain"))) > 0
 		}
 		entries = append(entries, *cur)
 		cur = nil
@@ -458,12 +623,41 @@ func listWorktreeEntries(root string) ([]worktreeEntry, error) {
 	return entries, nil
 }
 
-func gitOutIn(dir string, args ...string) string {
-	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
-	if err != nil {
-		return ""
+// inspectWorktreeEntries performs the expensive status inspection for the
+// already-selected registrations. Main and detached surfaces never required
+// status for classification, matching the historical full-sweep behavior.
+func inspectWorktreeEntries(entries []worktreeEntry) []worktreeEntry {
+	for index := range entries {
+		entry := &entries[index]
+		if entry.IsMain || entry.Detached {
+			continue
+		}
+		// Include ignored files: generated evidence/cache content is part of
+		// the safety boundary even when ordinary status hides it.
+		status, statusErr := reapStatusRunner(entry.Path, "status", "--porcelain", "--untracked-files=all", "--ignored")
+		if statusErr != nil {
+			entry.StatusError = statusErr.Error()
+		} else {
+			entry.Dirty = len(strings.TrimSpace(status)) > 0
+		}
 	}
-	return string(out)
+	return entries
+}
+
+var (
+	reapRegistrationLister = listWorktreeRegistrations
+	reapEntryInspector     = func(entries []worktreeEntry) ([]worktreeEntry, error) {
+		return inspectWorktreeEntries(entries), nil
+	}
+	reapStatusRunner = gitOutIn
+)
+
+func gitOutIn(dir string, args ...string) (string, error) {
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("git -C %s %s: %w: %s", dir, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 // commitsAhead returns how many commits branch has that base does not, or -1

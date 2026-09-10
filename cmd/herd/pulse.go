@@ -100,7 +100,20 @@ func runPulseCommandContext(ctx context.Context, args []string, out, errOut *os.
 		return 1
 	}
 	writePulseOutput(out, errOut, snap, *asJSON, *quiet)
-	return snap.ExitCode
+	exitCode := snap.ExitCode
+	if opts.Act {
+		// Bounded idle-pool reclamation rides the existing --act heartbeat
+		// instead of requiring `herd pool gc` to be invoked by hand per pool.
+		// It never overrides a beat failure the beat itself already reported,
+		// but a genuine maintenance failure (not an ordinary retained/leased
+		// case, and not a benign concurrent-tick deferral) must still make
+		// this process exit non-zero: silent success on a real cleanup
+		// failure violates this repo's fail-closed invariant.
+		if !reclaimIdlePoolsOnPulse(ctx, errOut) && exitCode == 0 {
+			exitCode = 1
+		}
+	}
+	return exitCode
 }
 
 func writePulseOutput(out, errOut *os.File, snap pulse.Snapshot, asJSON, quiet bool) {

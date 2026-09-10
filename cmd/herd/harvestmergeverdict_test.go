@@ -121,3 +121,29 @@ func TestHarvestMergeAcceptsLedgerPassForExactCandidate(t *testing.T) {
 		t.Fatal("an unsuperseded FAIL for the exact candidate still yielded consent")
 	}
 }
+
+func TestHarvestMergePinnedUnrecordedProvenanceNamesReadinessCause(t *testing.T) {
+	const candidate = "0123456789abcdef0123456789abcdef01234567"
+	reason := harvestCandidateRefusalReason(harvestCandidateReport{
+		ProvenanceUnrecorded: true,
+	}, candidate)
+	if !strings.Contains(reason, "builder provenance is unrecorded") {
+		t.Fatalf("refusal omitted provenance cause: %q", reason)
+	}
+	if strings.Contains(reason, "drifted past") {
+		t.Fatalf("pinned provenance refusal was mislabeled as branch drift: %q", reason)
+	}
+	if !strings.Contains(reason, "--allow-unrecorded-provenance") {
+		t.Fatalf("refusal omitted explicit recovery option: %q", reason)
+	}
+}
+
+func TestHarvestMergePinnedReadinessReasonIsNotDrift(t *testing.T) {
+	const candidate = "fedcba9876543210fedcba9876543210fedcba98"
+	reason := harvestCandidateRefusalReason(harvestCandidateReport{
+		EligibilityReason: "no verdict recorded for this candidate",
+	}, candidate)
+	if !strings.Contains(reason, "no verdict recorded") || strings.Contains(reason, "drifted past") {
+		t.Fatalf("pinned readiness refusal was not reported precisely: %q", reason)
+	}
+}

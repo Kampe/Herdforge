@@ -216,11 +216,23 @@ func (n *NativeReviewRetirementOp) reviewerSuperseded(m ReviewRetirementManifest
 	return true, nil
 }
 
+// ReviewRetirementPhasesFile is the canonical location of the native review
+// retirement phase journal, relative to a repository root.
+const ReviewRetirementPhasesFile = ".herd/review/retirement-phases.jsonl"
+
+// ReviewRetirementPhasesPath is the single authoritative phase-journal path
+// for the native review retirement record; every reader (including the
+// idle-pool completion probe) must resolve it through this helper so the
+// decision exists in exactly one place.
+func ReviewRetirementPhasesPath(root string) string {
+	return filepath.Join(root, ReviewRetirementPhasesFile)
+}
+
 func (n *NativeReviewRetirementOp) phasePath() string {
 	if n.JournalPath != "" {
 		return n.JournalPath
 	}
-	return filepath.Join(n.Root, ".herd", "review", "retirement-phases.jsonl")
+	return ReviewRetirementPhasesPath(n.Root)
 }
 
 func (n *NativeReviewRetirementOp) phaseRecords(m ReviewRetirementManifest) ([]retirementPhaseRecord, error) {
