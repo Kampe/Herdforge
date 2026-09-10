@@ -661,7 +661,7 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if err != nil {
 		return usage, false, "derived_target_process_evidence_unavailable"
 	}
-	if process.CWD || process.OpenFile {
+	if process.MetadataUnavailable || process.CWD || process.OpenFile || process.ReferencedPath {
 		return usage, false, "derived_target_active_process"
 	}
 	if g.Policy.OrphanCacheTTL <= 0 {
@@ -1097,7 +1097,7 @@ func (g *Governor) recoverInterruptedQuarantines(ctx context.Context, report *Go
 			return count, reclaimed, errors.New("recovery quarantine allocation proof unavailable")
 		}
 		process, processErr := g.Processes.InUse(ctx, child)
-		if processErr != nil || process.CWD || process.OpenFile {
+		if processErr != nil || process.MetadataUnavailable || process.CWD || process.OpenFile || process.ReferencedPath {
 			return count, reclaimed, errors.New("recovery quarantine active process proof unavailable")
 		}
 		if err := g.RemoveTree(quarantine); err != nil {

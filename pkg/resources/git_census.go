@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,9 +19,11 @@ import (
 )
 
 type ProcessUsage struct {
-	CWD      bool
-	OpenFile bool
-	PIDs     []int
+	CWD                 bool
+	OpenFile            bool
+	ReferencedPath      bool
+	MetadataUnavailable bool
+	PIDs                []int
 }
 
 type ProcessInspector interface {
@@ -579,7 +582,119 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 		usage.PIDs = append(usage.PIDs, pid)
 	}
 	sortInts(usage.PIDs)
+	allPIDs, processListErr := listProcessIDs(ctx)
+	if processListErr != nil {
+		return ProcessUsage{}, processListErr
+	}
+	for _, pid := range allPIDs {
+		if _, alreadySeen := seen[pid]; !alreadySeen {
+			usage.PIDs = append(usage.PIDs, pid)
+		}
+		referenced, referenceErr := processReferences(ctx, pid, resolved)
+		if referenceErr != nil {
+			usage.MetadataUnavailable = true
+			break
+		}
+		usage.ReferencedPath = usage.ReferencedPath || referenced
+	}
+	sortInts(usage.PIDs)
 	return usage, nil
+}
+
+func listProcessIDs(ctx context.Context) ([]int, error) {
+	ps, err := exec.LookPath("ps")
+	if err != nil {
+		return nil, fmt.Errorf("process list unavailable: %w", err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, ps, "-axo", "pid=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("read process list: %w", err)
+	}
+	var pids []int
+	for _, line := range strings.Split(string(out), "\n") {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(line))
+		if parseErr == nil && pid > 0 {
+			pids = append(pids, pid)
+		}
+		if len(pids) >= 32768 {
+			break
+		}
+	}
+	if len(pids) == 0 {
+		return nil, errors.New("process list is empty")
+	}
+	return pids, nil
+}
+
+// processReferences closes the gap between filesystem handles and a process
+// that intends to recreate/use a cache through GOCACHE, argv, or a mapped
+// executable/database. An unavailable metadata surface is an error: deleting
+// while that proof is missing is not safe.
+func processReferences(ctx context.Context, pid int, path string) (bool, error) {
+	needle := []byte(path)
+	if procData, procErr := readProcessProc(pid); procErr == nil {
+		for _, data := range procData {
+			if bytes.Contains(data, needle) {
+				return true, nil
+			}
+		}
+		return false, nil
+	} else if os.IsNotExist(procErr) {
+		if _, procRootErr := os.Stat("/proc"); procRootErr == nil {
+			return false, nil
+		}
+	}
+	ps, err := exec.LookPath("ps")
+	if err != nil {
+		return false, fmt.Errorf("process metadata unavailable for pid %d: %w", pid, err)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, ps, "e", "ww", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return false, fmt.Errorf("read process argv/environment for pid %d: %w", pid, err)
+	}
+	if bytes.Contains(out, needle) {
+		return true, nil
+	}
+	if runtime.GOOS == "darwin" {
+		launchctl, launchErr := exec.LookPath("launchctl")
+		if launchErr != nil {
+			return false, fmt.Errorf("process environment unavailable for pid %d: %w", pid, launchErr)
+		}
+		envOut, envErr := exec.CommandContext(probeCtx, launchctl, "procinfo", strconv.Itoa(pid)).Output()
+		if envErr != nil {
+			return false, fmt.Errorf("read process environment for pid %d: %w", pid, envErr)
+		}
+		if bytes.Contains(envOut, needle) {
+			return true, nil
+		}
+	}
+	vmmap, err := exec.LookPath("vmmap")
+	if err != nil {
+		return false, fmt.Errorf("process maps unavailable for pid %d: %w", pid, err)
+	}
+	out, err = exec.CommandContext(probeCtx, vmmap, "-w", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false, fmt.Errorf("read process maps for pid %d: %w", pid, err)
+	}
+	return bytes.Contains(out, needle), nil
+}
+
+func readProcessProc(pid int) ([][]byte, error) {
+	base := filepath.Join("/proc", strconv.Itoa(pid))
+	names := []string{"environ", "cmdline", "maps"}
+	data := make([][]byte, 0, len(names))
+	for _, name := range names {
+		value, err := os.ReadFile(filepath.Join(base, name))
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, value)
+	}
+	return data, nil
 }
 
 type limitedOutput struct {

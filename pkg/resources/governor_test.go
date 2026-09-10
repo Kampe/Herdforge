@@ -240,6 +240,7 @@ func TestGovernorRefusesOrphanCacheOnOwnershipOrOpenFileUncertainty(t *testing.T
 	}{
 		{name: "foreign ownership", reason: "derived_target_foreign_uid", owner: func(os.FileInfo) (string, bool) { return "foreign", true }},
 		{name: "open file", reason: "derived_target_active_process", owner: func(os.FileInfo) (string, bool) { return strconv.Itoa(os.Getuid()), true }, usage: ProcessUsage{OpenFile: true}},
+		{name: "metadata unavailable", reason: "derived_target_active_process", owner: func(os.FileInfo) (string, bool) { return strconv.Itoa(os.Getuid()), true }, usage: ProcessUsage{MetadataUnavailable: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g, _, _ := governorFor(t, "host", 900000, 900000)
