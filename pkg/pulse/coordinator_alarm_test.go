@@ -46,7 +46,9 @@ func TestPausedCoordinatorObserveFailsLoudlyButActCanRecover(t *testing.T) {
 
 func TestOrdinaryObserveWouldRunRemainsAdvisory(t *testing.T) {
 	obs := Observation{
-		Provider: ProviderObservation{Known: true, Claimable: 1},
+		// FAC-581: the would-run names the broker-admitted task; a count alone
+		// is no longer dispatch authority.
+		Provider: ProviderObservation{Known: true, Claimable: 1, NextTaskRef: "FAC-581"},
 		Herdr:    HerdrObservation{Known: true},
 		Quota:    QuotaObservation{Known: true},
 		Review:   ReviewObservation{Known: true},

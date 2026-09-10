@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -199,5 +200,116 @@ func TestGoalGuardStopHookWarnsButContinuesOnLegacyGrant(t *testing.T) {
 	}
 	if !strings.Contains(string(stdout), "AUTOMATED STOP-HOOK OUTPUT — NOT AN ASSIGNMENT") {
 		t.Fatalf("stop-hook output must be distinguishable from assignments, stdout=%q", stdout)
+	}
+}
+
+// FAC-581 correction (independent review finding 5): the production stop hook
+// must feed the event-wait branch from the REAL observation path — the lane
+// worktree's HEAD commit — and an unchanged HEAD must hold the lane without
+// spending a continuation.
+func TestGoalGuardStopHookEventWaitsOnUnchangedWorktreeHEAD(t *testing.T) {
+	dir := t.TempDir()
+	gitRun := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun("init")
+	gitRun("config", "user.email", "t@example.com")
+	gitRun("config", "user.name", "t")
+	gitRun("add", "f.txt")
+	gitRun("commit", "-m", "init")
+	head1 := gitRun("rev-parse", "HEAD")
+
+	// The Stop hook observes the cwd worktree; lease store absence is UNKNOWN
+	// (held), so the goal stays active without a live lease db.
+	t.Chdir(dir)
+	t.Setenv("HERD_LEASE_DB", filepath.Join(dir, "launch-claims.db"))
+
+	state := filepath.Join(dir, "goal.json")
+	s, err := goalguard.Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := s.Set(goalguard.Goal{Lane: "forge-worker", Task: "FAC-581", Owner: "coordinator", Generation: 7, MaxContinuations: 5, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	runHook := func() string {
+		t.Helper()
+		oldStdout, oldStderr := os.Stdout, os.Stderr
+		outR, outW, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		errR, errW, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stdout, os.Stderr = outW, errW
+		hookErr := runGoalGuardStopHook(s, []byte("{}"))
+		_ = outW.Close()
+		_ = errW.Close()
+		os.Stdout, os.Stderr = oldStdout, oldStderr
+		stdout, _ := io.ReadAll(outR)
+		_ = outR.Close()
+		_ = errR.Close()
+		if hookErr != nil {
+			t.Fatalf("stop hook must never return an error: %v", hookErr)
+		}
+		return string(stdout)
+	}
+
+	// First stop: the HEAD observation establishes the durable baseline and
+	// spends one continuation, exactly as every pre-FAC-581 stop did.
+	first := runHook()
+	if !strings.Contains(first, `"decision": "block"`) && !strings.Contains(first, `"decision":"block"`) {
+		t.Fatalf("active goal must block the stop, stdout=%q", first)
+	}
+	g, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Continuations != 1 || g.Progress == nil || g.Progress.LastArtifact != head1 {
+		t.Fatalf("first stop must record the observed HEAD %s and spend one continuation: continuations=%d progress=%+v", head1, g.Continuations, g.Progress)
+	}
+
+	// Second stop with NO new commit: an unchanged HEAD is an EVENT WAIT —
+	// the lane is held (blocked) but the continuation budget is NOT spent.
+	second := runHook()
+	if !strings.Contains(second, "event wait") || !strings.Contains(second, "NOT spent") {
+		t.Fatalf("unchanged HEAD must instruct a wait without spending budget, stdout=%q", second)
+	}
+	g, err = s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Continuations != 1 {
+		t.Fatalf("event wait must not spend a continuation: continuations=%d", g.Continuations)
+	}
+
+	// A new artifact (commit) resumes real work and spends budget again.
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun("add", "f.txt")
+	gitRun("commit", "-m", "work")
+	third := runHook()
+	if !strings.Contains(third, `"decision": "block"`) && !strings.Contains(third, `"decision":"block"`) {
+		t.Fatalf("a lane with a new artifact must stay blocked on an unmet goal, stdout=%q", third)
+	}
+	g, err = s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Continuations != 2 {
+		t.Fatalf("a new artifact must spend a continuation: continuations=%d", g.Continuations)
 	}
 }

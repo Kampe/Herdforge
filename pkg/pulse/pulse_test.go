@@ -8,14 +8,41 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/broker"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
+
+func TestPlanFailsClosedOnBrokerUnknownEvenWhenCountsLookClaimable(t *testing.T) {
+	d := broker.Unknown("pulse", "done-task snapshot unavailable", progress.Record{Lane: "pulse", Action: progress.ClassWait, WaitReason: "done-task snapshot unavailable"})
+	snap, err := Plan(Observation{
+		Provider: ProviderObservation{Known: true, Claimable: 1, NextTaskRef: "FAC-581", Decision: &d},
+		Herdr:    HerdrObservation{Known: true},
+		Review:   ReviewObservation{Known: true},
+		Quota:    QuotaObservation{Known: true},
+		WindDown: WindDownObservation{Known: true},
+	}, Options{Act: true, Spawn: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.UnknownCritical || !snap.BuilderDispatchBlocked {
+		t.Fatalf("unknown broker decision must block builder dispatch: %+v", snap)
+	}
+	for _, action := range snap.Actions {
+		if action.Kind == ActionDispatch {
+			t.Fatal("unknown broker decision must never produce a dispatch action")
+		}
+	}
+}
 
 // fixedNow is the fake clock anchor for all deterministic tests.
 var fixedNow = time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 
 func healthyObs() Observation {
 	return Observation{
-		Provider: ProviderObservation{Known: true, QueueDepth: 2, Claimable: 2, InProgress: 1},
+		// FAC-581: the broker decision is dispatch authority — the fixture
+		// names the exact admitted task, not just a claimable count.
+		Provider: ProviderObservation{Known: true, QueueDepth: 2, Claimable: 2, InProgress: 1, NextTaskRef: "FAC-1", NextTaskID: "t-1"},
 		Herdr: HerdrObservation{
 			Known: true,
 			Agents: []AgentObservation{
@@ -563,6 +590,78 @@ func TestActSpawnWithNoHealthyIdleAgentsReportsNoEligibleTarget(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("missing no-eligible-target report: %+v", out.Actions)
+	}
+}
+
+// FAC-581 (independent review finding 4): a claimable count is not dispatch
+// authority. An all-blocked or identityless queue must produce NO dispatch
+// action under --act --spawn, and the broker's named wait must be surfaced.
+func TestPlanDoesNotDispatchWithoutNamedTask(t *testing.T) {
+	obs := healthyObs()
+	obs.Provider = ProviderObservation{
+		Known: true, QueueDepth: 2, Claimable: 2, InProgress: 0,
+		NextWaitReason: "blocked by FAC-136",
+		NextBlocked:    map[string]string{"FAC-75": "blocked by FAC-136"},
+	}
+	snap, err := Plan(obs, Options{Act: true, Spawn: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.Dispatch != 0 {
+		t.Fatalf("a queue with no dispatchable identity must not dispatch: %+v", snap.Actions)
+	}
+	found := false
+	for _, a := range snap.Actions {
+		if a.Kind == ActionDispatch {
+			t.Fatalf("dispatch planned from a count without identity: %+v", a)
+		}
+		if a.Kind == ActionWouldRun && strings.Contains(a.Reason, "broker wait") && strings.Contains(a.Reason, "FAC-136") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the named wait must be surfaced instead of dispatch: %+v", snap.Actions)
+	}
+}
+
+// FAC-581 (independent review finding 4): review-only saturation is not a
+// builder bound at the Apply mutation gate either. Planning legitimately
+// plans a dispatch under BuilderDispatchBlocked=false; Apply must not veto it
+// with the global DispatchBlocked and fail the beat.
+func TestApplyAllowsDispatchWhenOnlyReviewSaturated(t *testing.T) {
+	obs := healthyObs()
+	snap, err := Plan(obs, Options{Act: true, Spawn: true, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasDispatch := false
+	for _, a := range snap.Actions {
+		if a.Kind == ActionDispatch {
+			hasDispatch = true
+		}
+	}
+	if !hasDispatch {
+		t.Fatal("fixture must plan a dispatch for the apply probe")
+	}
+	// Review-only saturation: global blocked, builder bound clear.
+	snap.DispatchBlocked = true
+	snap.DispatchBlockReason = "review capacity is full: 3 in flight >= cap 3"
+	snap.BuilderDispatchBlocked = false
+	actor := &recordingActor{}
+	out, err := Apply(context.Background(), snap, actor)
+	if err != nil {
+		t.Fatalf("review-only saturation must not fail a builder dispatch beat: %v", err)
+	}
+	if actor.dispatch != 1 {
+		t.Fatalf("the dispatch must execute, got %d calls", actor.dispatch)
+	}
+	for _, a := range out.Actions {
+		if a.Kind == ActionDispatch && a.ApplyError != "" {
+			t.Fatalf("dispatch apply error: %q", a.ApplyError)
+		}
+	}
+	if out.ExitCode != 0 {
+		t.Fatalf("healthy beat exit=%d want 0: %+v", out.ExitCode, out)
 	}
 }
 

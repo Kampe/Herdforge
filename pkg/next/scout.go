@@ -3,7 +3,11 @@ package next
 import (
 	"context"
 	"sort"
+	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
+	"github.com/Kampe/Herdforge/pkg/candidateindex"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -16,10 +20,10 @@ import (
 
 // ScoutRow is one ranked claimable card.
 type ScoutRow struct {
-	Ref      string
-	Title    string
-	Priority provider.Priority
-	Blocked  bool     // true when held back by an open dependency
+	Ref       string
+	Title     string
+	Priority  provider.Priority
+	Blocked   bool     // true when held back by an open dependency
 	BlockedBy []string // open refs blocking this one (empty when claimable)
 }
 
@@ -70,4 +74,45 @@ func ScoutQueue(ctx context.Context, tp provider.TaskProvider, projectID string,
 	rank(claimable)
 	rank(blocked)
 	return claimable, blocked, nil
+}
+
+// ScoutDecision projects scout rows onto pkg/broker.Decide so selection,
+// dependency blocking, and review-saturation independence stay identical to
+// the pulse production caller. The next command consumes this projection
+// through ClaimPreview.Decision; ScoutQueue is therefore not a test-only
+// helper or a second selection path.
+func ScoutDecision(claimable, blocked []ScoutRow, reviewSaturated bool, reviewWait string, prog progress.Record) broker.Decision {
+	queue := make([]broker.Task, 0, len(claimable)+len(blocked))
+	for _, row := range claimable {
+		if strings.TrimSpace(row.Ref) == "" {
+			continue
+		}
+		queue = append(queue, broker.Task{
+			Ref:      strings.TrimSpace(row.Ref),
+			Kind:     broker.KindBuild,
+			Priority: candidateindex.PriorityRank(row.Priority),
+		})
+	}
+	for _, row := range blocked {
+		if strings.TrimSpace(row.Ref) == "" {
+			continue
+		}
+		queue = append(queue, broker.Task{
+			Ref:       strings.TrimSpace(row.Ref),
+			Kind:      broker.KindBuild,
+			Priority:  candidateindex.PriorityRank(row.Priority),
+			DependsOn: append([]string(nil), row.BlockedBy...),
+		})
+	}
+	if strings.TrimSpace(prog.Lane) == "" {
+		prog.Lane = "scout"
+	}
+	return broker.Decide(broker.Inputs{
+		Lane:             "scout",
+		Accepts:          []broker.Kind{broker.KindBuild},
+		Queue:            queue,
+		ReviewSaturated:  reviewSaturated,
+		ReviewWaitReason: reviewWait,
+		Progress:         prog,
+	})
 }

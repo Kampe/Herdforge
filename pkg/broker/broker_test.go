@@ -63,6 +63,12 @@ func TestADecisionWithoutATaskIdentityIsRejected(t *testing.T) {
 	if err := (Decision{}).Validate(); err == nil {
 		t.Fatal("a decision with no outcome must be rejected")
 	}
+	if err := (Decision{Outcome: OutcomeUnknown}).Validate(); err == nil {
+		t.Fatal("an unknown decision with no source reason must be rejected")
+	}
+	if err := Unknown("pulse", "provider read failed", progress.Record{Lane: "pulse"}).Validate(); err != nil {
+		t.Fatalf("unknown source decision must be valid when it names the source: %v", err)
+	}
 }
 
 // Dependency readiness blocks, and the block is REPORTED rather than silent.
@@ -160,6 +166,30 @@ func TestSelectionIsDeterministic(t *testing.T) {
 		if d.Task == nil || d.Task.Ref != "CHA-1" {
 			t.Fatalf("iteration %d selected %+v; want CHA-1 (priority desc, then ref asc)", i, d.Task)
 		}
+	}
+}
+
+// FAC-581 correction: equal-priority refs must order by NUMERIC ticket number,
+// not lexically. Lexical order put FAC-10 before FAC-3 and FAC-100 before
+// FAC-99, violating the Priority DESC, Ref ASC claim-order invariant
+// (AGENTS.md deterministic task selection) that provider.CompareRefs encodes.
+func TestSelectionOrdersEqualPriorityRefsNumerically(t *testing.T) {
+	q := []Task{
+		{Ref: "FAC-10", Kind: KindBuild, Priority: 5},
+		{Ref: "FAC-100", Kind: KindBuild, Priority: 5},
+		{Ref: "FAC-3", Kind: KindBuild, Priority: 5},
+	}
+	d := Decide(Inputs{Lane: "x", Accepts: []Kind{KindBuild}, Queue: q})
+	if d.Task == nil || d.Task.Ref != "FAC-3" {
+		t.Fatalf("equal priority must select the numerically lowest ref FAC-3, got %+v", d.Task)
+	}
+	q2 := []Task{
+		{Ref: "FAC-61", Kind: KindBuild, Priority: 5},
+		{Ref: "FAC-9", Kind: KindBuild, Priority: 5},
+	}
+	d = Decide(Inputs{Lane: "x", Accepts: []Kind{KindBuild}, Queue: q2})
+	if d.Task == nil || d.Task.Ref != "FAC-9" {
+		t.Fatalf("FAC-9 must sort before FAC-61 (numeric, not lexical), got %+v", d.Task)
 	}
 }
 

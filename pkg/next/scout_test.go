@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -69,5 +71,24 @@ func TestScoutQueue_ResolvedBlockerBecomesClaimable(t *testing.T) {
 	}
 	if len(claimable) != 1 || claimable[0].Ref != "FAC-63" {
 		t.Fatalf("resolved blocker must free FAC-63, got claimable=%v blocked=%v", claimable, blocked)
+	}
+}
+
+func TestScoutDecisionRoutesThroughBrokerDecide(t *testing.T) {
+	d := ScoutDecision(
+		[]ScoutRow{{Ref: "FAC-64", Priority: provider.PriorityLow}},
+		[]ScoutRow{{Ref: "FAC-63", Priority: provider.PriorityUrgent, Blocked: true, BlockedBy: []string{"FAC-87"}}},
+		true,
+		"review capacity is full",
+		progress.Record{Lane: "scout", Action: progress.ClassBuild},
+	)
+	if err := d.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if d.Outcome != broker.OutcomeWork || d.Task == nil || d.Task.Ref != "FAC-64" {
+		t.Fatalf("ready builder must be admitted despite review saturation and a blocked urgent: %+v", d)
+	}
+	if got := d.Blocked["FAC-63"]; got == "" {
+		t.Fatalf("blocked identity must be named: %+v", d.Blocked)
 	}
 }

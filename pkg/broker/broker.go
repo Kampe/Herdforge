@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/progress"
+	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
 // Kind is what a lane is being asked to do.
@@ -61,6 +62,10 @@ const (
 	OutcomeWork Outcome = "work"
 	// OutcomeWait names the event being waited on. Legitimate, and not failure.
 	OutcomeWait Outcome = "wait"
+	// OutcomeUnknown means the broker could not establish a safe decision.
+	// Unknown is distinct from WAIT: a wait is a known condition that may
+	// unblock, while unknown must fail closed until its source is readable.
+	OutcomeUnknown Outcome = "unknown"
 )
 
 // Decision is the broker's answer, and it always explains itself.
@@ -70,6 +75,10 @@ type Decision struct {
 	// WaitReason is required when Outcome is OutcomeWait. A wait with no named
 	// event cannot be told apart from a spin.
 	WaitReason string `json:"wait_reason,omitempty"`
+	// UnknownReason is required when Outcome is OutcomeUnknown. Keeping this
+	// separate from WaitReason prevents source failure from being presented as
+	// a normal idle event by consumers.
+	UnknownReason string `json:"unknown_reason,omitempty"`
 	// Blocked records why each rejected task was rejected, so a queue that looks
 	// empty can always be explained. This is what "4 claimable" never carried.
 	Blocked map[string]string `json:"blocked,omitempty"`
@@ -94,9 +103,24 @@ func (d Decision) Validate() error {
 			return fmt.Errorf("broker: a wait decision must name the event it is waiting on; an unnamed wait is indistinguishable from a spin")
 		}
 		return nil
+	case OutcomeUnknown:
+		if strings.TrimSpace(d.UnknownReason) == "" {
+			return fmt.Errorf("broker: an unknown decision must name the unavailable source")
+		}
+		return nil
 	default:
 		return fmt.Errorf("broker: decision has no outcome")
 	}
+}
+
+// Unknown constructs the fail-closed decision used when a required source
+// could not be read. It is intentionally validated here so every production
+// consumer receives the same typed WORK/WAIT/UNKNOWN contract.
+func Unknown(lane, reason string, prog progress.Record) Decision {
+	if strings.TrimSpace(prog.Lane) == "" {
+		prog.Lane = strings.TrimSpace(lane)
+	}
+	return Decision{Outcome: OutcomeUnknown, UnknownReason: strings.TrimSpace(reason), Progress: prog}
 }
 
 // Inputs is everything the decision depends on, passed explicitly so the whole
@@ -127,13 +151,16 @@ func Decide(in Inputs) Decision {
 	}
 
 	candidates := append([]Task(nil), in.Queue...)
-	// Deterministic: priority descending, then ref ascending. A selector whose
-	// order depends on map iteration cannot be reasoned about or reproduced.
+	// Deterministic: priority descending, then ref ascending in NUMERIC ticket
+	// order (FAC-9 < FAC-61 < FAC-100) via the repo's shared ref comparator.
+	// Plain lexical order put FAC-100 before FAC-99, violating the Priority
+	// DESC, Ref ASC claim-order invariant. A selector whose order depends on
+	// map iteration or lexical accident cannot be reasoned about or reproduced.
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority > candidates[j].Priority
 		}
-		return candidates[i].Ref < candidates[j].Ref
+		return provider.CompareRefs(candidates[i].Ref, candidates[j].Ref) < 0
 	})
 
 	for _, t := range candidates {

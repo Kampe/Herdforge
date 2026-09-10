@@ -29,8 +29,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/broker"
 	"github.com/Kampe/Herdforge/pkg/kick"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
 
 // AttentionLevel ranks how urgently a lane needs coordinator eyes.
@@ -61,6 +63,11 @@ type Item struct {
 	PaneID     string         `json:"pane_id,omitempty"`
 	Held       bool           `json:"held,omitempty"`
 	HeldReason string         `json:"held_reason,omitempty"`
+	// Decision is the shared broker classification for this production lane
+	// observation. Attention does not invent dispatch authority: its roster has
+	// no exact task identity, so active lanes are UNKNOWN rather than fake WORK;
+	// an explicit idle condition is WAIT.
+	Decision *broker.Decision `json:"decision,omitempty"`
 }
 
 // Result is the full attention triage.
@@ -96,6 +103,29 @@ func urgencyRank(l AttentionLevel) int {
 // LevelNone (working/starting) is the only level that does not.
 func NeedsEyes(l AttentionLevel) bool {
 	return l != LevelNone
+}
+
+// ClassifyProgress maps pkg/progress onto attention. Event waits are visible
+// without being mistaken for useful work that needs escalation.
+//
+// FAC-581 scope note (independent review finding 6): the attention triage's
+// data source is the herdr agent list, which carries no progress records, so
+// this classifier has no production feeder yet — production progress records
+// exist on broker.Decisions (pulse selection, goal-guard stop hook). Wiring it
+// into the attention CLI requires a progress sidecar that does not exist
+// today; that adoption is tracked as future work, not silently claimed here.
+func ClassifyProgress(rec progress.Record) (AttentionLevel, string) {
+	if rec.Action == progress.ClassWait || rec.Action == progress.ClassProbe || rec.Plateaued(progress.PlateauAfter) {
+		reason := strings.TrimSpace(rec.WaitReason)
+		if reason == "" {
+			reason = "event wait: " + string(rec.Action) + " is not useful work"
+		}
+		return LevelLow, reason
+	}
+	if ok, why := rec.Actionable(); !ok {
+		return LevelLow, why
+	}
+	return LevelNone, "useful work"
 }
 
 // classifyStatus maps a raw agent status string to an attention level
@@ -136,6 +166,7 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 		Status: status,
 		PaneID: a.PaneID,
 	}
+	item.Decision = agentDecision(name, status)
 
 	switch {
 	case strings.HasPrefix(heldReason, "authority-error:"):
@@ -159,6 +190,26 @@ func ClassifyAgent(a kick.AgentEntry, held bool, heldReason string, providerDeat
 	}
 
 	return item
+}
+
+func agentDecision(name, status string) *broker.Decision {
+	prog := progress.Record{Lane: name, TaskRef: name}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "working", "starting":
+		prog.Action = progress.ClassBuild
+		prog.TaskRef = ""
+		d := broker.Unknown(name, "live agent status has no exact task-bound identity", prog)
+		return &d
+	case "idle", "done", "blocked":
+		prog.Action = progress.ClassWait
+		prog.WaitReason = "agent status is " + strings.ToLower(strings.TrimSpace(status))
+		d := broker.Decision{Outcome: broker.OutcomeWait, WaitReason: prog.WaitReason, Progress: prog}
+		return &d
+	default:
+		prog.Action = progress.ClassProbe
+		d := broker.Unknown(name, "agent status is unavailable", prog)
+		return &d
+	}
 }
 
 // Triage produces the coordinator-eyes triage from a live agent list and

@@ -13,6 +13,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/candidateindex"
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/deps"
+	"github.com/Kampe/Herdforge/pkg/progress"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -166,10 +167,21 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	if preview.Claimable == 0 && preview.ProvenanceBlocked > 0 {
 		claimCommand = "herd deps migrate"
 	}
+	// FAC-581 correction (independent review finding 6): the claim action
+	// consumes the broker decision, not just the preview count. A work
+	// decision names the EXACT task to claim; a wait decision already names
+	// its event through Description(); a preview that reports claimable work
+	// without naming a ref is surfaced as the defect it is.
+	claimDesc := preview.Description()
+	if d, derr := preview.Decision("next"); derr != nil {
+		claimDesc += " (broker decision unavailable: " + derr.Error() + ")"
+	} else if d.Outcome == broker.OutcomeWork && d.Task != nil {
+		claimDesc = "Next claimable: " + d.Task.Ref + " — " + preview.Description()
+	}
 	actions = append(actions, &NextAction{
 		Type:        ActionClaim,
 		Priority:    100,
-		Description: preview.Description(),
+		Description: claimDesc,
 		Command:     claimCommand,
 		AutoSafe:    false,
 	})
@@ -467,10 +479,15 @@ func (p ClaimPreview) Decision(lane string) (broker.Decision, error) {
 	}
 
 	if len(p.ClaimableRefs) > 0 {
-		d := broker.Decision{
-			Outcome: broker.OutcomeWork,
-			Task:    &broker.Task{Ref: p.ClaimableRefs[0], Kind: broker.KindBuild},
+		rows := make([]ScoutRow, 0, len(p.ClaimableRefs))
+		for _, ref := range p.ClaimableRefs {
+			rows = append(rows, ScoutRow{Ref: ref, Priority: provider.PriorityHigh})
 		}
+		d := ScoutDecision(rows, nil, false, "", progress.Record{
+			Lane:    lane,
+			TaskRef: p.ClaimableRefs[0],
+			Action:  progress.ClassBuild,
+		})
 		if err := d.Validate(); err != nil {
 			return broker.Decision{}, err
 		}

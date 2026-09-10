@@ -1,8 +1,8 @@
 // Package goalguard owns the durable continuation contract for a standing
-// lane. A guard decision is deliberately boring: it either consumes one
-// bounded continuation or returns a durable stop reason. Missing, malformed,
-// expired, or mismatched authority evidence is an error, never permission to
-// continue.
+// lane. A guard decision is deliberately boring: it consumes one bounded
+// continuation, holds the lane on a named event wait WITHOUT spending budget,
+// or returns a durable stop reason. Missing, malformed, expired, or mismatched
+// authority evidence is an error, never permission to continue.
 package goalguard
 
 import (
@@ -17,6 +17,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/posture"
+	"github.com/Kampe/Herdforge/pkg/progress"
 )
 
 const SchemaVersion = 1
@@ -87,19 +88,29 @@ type Goal struct {
 	UpdatedAt        time.Time          `json:"updated_at"`
 	ExpiresAt        *time.Time         `json:"expires_at,omitempty"`
 	Authority        *AuthorityEnvelope `json:"authority,omitempty"`
+	// Progress is the durable observation baseline for the event-wait rule.
+	// FAC-581: without it, Evaluate rebuilt a transient record from each
+	// evidence and the SAME unchanged observation consumed a continuation on
+	// every evaluation — the guard budget rewarded a lane for repeating
+	// itself. Nil on goals that predate the field; the first observation then
+	// establishes the baseline.
+	Progress *progress.Record `json:"progress,omitempty"`
 }
 
 // Evidence is the live authority snapshot supplied for one guard decision.
 type Evidence struct {
-	Lane       string    `json:"lane"`
-	Task       string    `json:"task"`
-	Owner      string    `json:"owner"`
-	Generation int64     `json:"generation"`
-	Completed  bool      `json:"completed"`
-	LeaseHeld  bool      `json:"lease_held"`
-	Held       bool      `json:"held"`
-	WindDown   bool      `json:"wind_down"`
-	Now        time.Time `json:"now"`
+	Lane          string         `json:"lane"`
+	Task          string         `json:"task"`
+	Owner         string         `json:"owner"`
+	Generation    int64          `json:"generation"`
+	Completed     bool           `json:"completed"`
+	LeaseHeld     bool           `json:"lease_held"`
+	Held          bool           `json:"held"`
+	WindDown      bool           `json:"wind_down"`
+	Now           time.Time      `json:"now"`
+	ProgressClass progress.Class `json:"progress_class,omitempty"`
+	LastArtifact  string         `json:"last_artifact,omitempty"`
+	Artifact      string         `json:"artifact,omitempty"`
 }
 
 type Decision struct {
@@ -212,9 +223,10 @@ func (s *Store) Set(g Goal) error {
 	return nil
 }
 
-// Evaluate validates live evidence, persists a terminal stop when needed, or
-// consumes exactly one continuation. Stop conditions are evaluated before the
-// budget so completed/held/expired work never spends another continuation.
+// Evaluate validates live evidence, persists a terminal stop when needed,
+// consumes exactly one continuation, or holds the lane on a named event wait
+// without spending budget. Stop conditions are evaluated before the budget so
+// completed/held/expired work never spends another continuation.
 func (s *Store) Evaluate(e Evidence) (Decision, error) {
 	// The continuation counter is a cross-process compare-and-write. Serialize
 	// the read/decision/write sequence so two coordinator restarts cannot both
@@ -249,6 +261,46 @@ func (s *Store) Evaluate(e Evidence) (Decision, error) {
 	}
 	if g.Stop.WindDown || e.WindDown {
 		return Decision{Reason: "wind_down", Continuations: g.Continuations}, nil
+	}
+	// FAC-581 correction (independent review finding 5): the event-wait
+	// comparison baseline is the DURABLE record persisted on the goal, not a
+	// transient record rebuilt from each evidence. Rebuilding it meant the
+	// same unchanged observation consumed a continuation on EVERY evaluation.
+	// The stored baseline makes the second unchanged observation an event
+	// wait, and an event wait CONTINUES the lane (FAC-652 landed "block means
+	// hold, quietly") without spending budget.
+	// An observation exists when a progress class is declared or an artifact
+	// is observed. The 93b source required BOTH artifacts for the implicit
+	// build comparison, which meant a production caller observing only the
+	// current artifact (the stop hook observes the worktree HEAD) never
+	// reached the event-wait branch at all.
+	if e.ProgressClass != "" || strings.TrimSpace(e.Artifact) != "" {
+		action := e.ProgressClass
+		if action == "" {
+			action = progress.ClassBuild
+		}
+		artifact := strings.TrimSpace(e.Artifact)
+		if artifact == "" {
+			artifact = strings.TrimSpace(e.LastArtifact)
+		}
+		rec := progress.Record{}
+		if g.Progress != nil {
+			rec = *g.Progress
+		}
+		if strings.TrimSpace(rec.LastArtifact) == "" && strings.TrimSpace(e.LastArtifact) != "" {
+			// First observation with no stored baseline: the evidence's own
+			// last-known artifact is the baseline the lane vouches for.
+			rec = progress.Record{Lane: e.Lane, TaskRef: e.Task, LastArtifact: strings.TrimSpace(e.LastArtifact), Action: action}
+		}
+		rec, advanced := rec.Observe(now, action, artifact)
+		g.Progress = &rec
+		if !advanced {
+			g.UpdatedAt = now
+			if err := s.Set(g); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Continue: true, Reason: "event_wait", Continuations: g.Continuations}, nil
+		}
 	}
 	if g.MaxContinuations > 0 && g.Continuations >= g.MaxContinuations {
 		return Decision{Reason: "max_continuations", Continuations: g.Continuations}, nil
