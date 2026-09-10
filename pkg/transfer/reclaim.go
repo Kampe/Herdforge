@@ -45,6 +45,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
@@ -442,7 +443,7 @@ func resolveScope(ctx context.Context, opts ReclaimOptions) (string, error) {
 	if fi, err := os.Lstat(opts.Root); err != nil || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("bundle reclaim: bundle directory must be a real directory")
 	}
-	top, err := gitOutput(ctx, dir, "rev-parse", "--show-toplevel")
+	top, err := gitroot.Toplevel(ctx, dir)
 	if err != nil {
 		return "", fmt.Errorf("bundle reclaim: bundle directory is not inside the repository: %w", err)
 	}
@@ -472,15 +473,6 @@ func resolveScope(ctx context.Context, opts ReclaimOptions) (string, error) {
 		return "", fmt.Errorf("bundle reclaim: bundle directory is not inside the containing repository's owned .herd state")
 	}
 	return dir, nil
-}
-
-func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	gitArgs := append([]string{"git"}, args...)
-	out, err := runBounded(ctx, defaultGitTimeout, gitOutputCapBytes, dir, gitArgs...)
-	if err != nil {
-		return "", err
-	}
-	return out, nil
 }
 
 func verifyBundle(ctx context.Context, repoRoot, path string) bool {

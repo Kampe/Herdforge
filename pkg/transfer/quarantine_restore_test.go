@@ -41,6 +41,27 @@ func TestQuarantineRestoreNoClobberSecondWriterSurvives(t *testing.T) {
 	}
 
 	before := writeAt(original)
+	// Pin the original inode with a live descriptor. writeAt replaces by
+	// unlink-and-recreate, and filesystems that recycle freed inode
+	// numbers (ext4, overlayfs on Linux CI) may hand the replacement the
+	// original's inode number. os.SameFile compares only device and inode
+	// number, so without a live pin the stale snapshot `before` and the
+	// quarantined replacement can compare equal across generations and
+	// divert the restore into the content-identity branch (which still
+	// preserves the object, but reports a different reason). Holding the
+	// descriptor keeps the original inode allocated until the test ends,
+	// making the two generations provably distinct on every filesystem,
+	// exactly like production's revalidation of a live file.
+	beforeFile, statErr := os.Open(filepath.Join(dir, name))
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	defer beforeFile.Close()
+	if beforeStat, statErr := beforeFile.Stat(); statErr != nil {
+		t.Fatal(statErr)
+	} else {
+		before = beforeStat
+	}
 	// Deterministic pre-rename swap: the entry is replaced between the
 	// final revalidation (before) and the quarantine rename, so the
 	// quarantine receives the replacement and the mismatch path restores.
