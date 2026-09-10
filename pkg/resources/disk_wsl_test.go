@@ -235,8 +235,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{11111111-2222-
 	if err == nil {
 		t.Fatal("expected error on unsupported REG_BINARY BasePath")
 	}
-	if !strings.Contains(err.Error(), "unsupported registry type") {
-		t.Fatalf("expected error mentioning unsupported registry type, got %q", err.Error())
+	if !strings.Contains(err.Error(), "unsupported registry value type") {
+		t.Fatalf("expected error mentioning unsupported registry value type, got %q", err.Error())
 	}
 }
 
@@ -256,6 +256,168 @@ C:\134 /media/c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000,access=clie
 	// Must reject ext4 /mnt/c and choose genuine 9p /media/c
 	if mountC != "/media/c" {
 		t.Fatalf("expected authentic 9p mount /media/c, got spoofed %q", mountC)
+	}
+}
+
+func TestWSLFindDriveMountPathRejectsContradictoryDeviceAndOptions(t *testing.T) {
+	// Device says D: but options say path=C:\ (contradictory)
+	contradictoryMounts := `
+D:\134 /mnt/d 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000 0 0
+`
+	// Searching for C: must reject this mount because device contradicts options
+	_, err := findDriveMountPath("C:", []byte(contradictoryMounts))
+	if err == nil {
+		t.Fatal("expected contradictory device vs options mount to be rejected for C:")
+	}
+
+	// Searching for D: must also reject this mount because options contradict device
+	_, err = findDriveMountPath("D:", []byte(contradictoryMounts))
+	if err == nil {
+		t.Fatal("expected contradictory device vs options mount to be rejected for D:")
+	}
+}
+
+func TestWSLFindDriveMountPathRejectsDeviceDMountedAtMountC(t *testing.T) {
+	// Device D: mounted at /mnt/c (e.g. mountpoint remapped or spoofed)
+	remappedMounts := `
+D:\134 /mnt/c 9p rw,noatime,aname=drvfs;path=D:\;uid=1000;gid=1000 0 0
+`
+	// Searching for C: must reject because device and options are D:
+	_, err := findDriveMountPath("C:", []byte(remappedMounts))
+	if err == nil {
+		t.Fatal("expected /mnt/c backed by D: to be rejected when resolving drive C:")
+	}
+
+	// Searching for D: must resolve to /mnt/c
+	mountD, err := findDriveMountPath("D:", []byte(remappedMounts))
+	if err != nil {
+		t.Fatalf("unexpected error resolving drive D:: %v", err)
+	}
+	if mountD != "/mnt/c" {
+		t.Fatalf("expected /mnt/c for drive D:, got %q", mountD)
+	}
+}
+
+func TestWSLFindDriveMountPathDecodesProcfsOctalEscapesWithSpaces(t *testing.T) {
+	// Mount point contains escaped space (\040)
+	spaceMounts := `
+C:\134 /mnt/my\040drive\040c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000;gid=1000 0 0
+`
+	mountC, err := findDriveMountPath("C:", []byte(spaceMounts))
+	if err != nil {
+		t.Fatalf("unexpected error finding mount for C:: %v", err)
+	}
+	if mountC != "/mnt/my drive c" {
+		t.Fatalf("expected decoded mount path %q, got %q", "/mnt/my drive c", mountC)
+	}
+}
+
+func TestWSLDecodeProcfsEscapeUnit(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{`C:\134`, `C:\`},
+		{`/mnt/drive\040c`, `/mnt/drive c`},
+		{`\011\012\040\134`, "\t\n \\"},
+		{`normal/path`, `normal/path`},
+		{`\999`, `\999`}, // invalid octal preserved
+		{`\`, `\`},
+		{`\04`, `\04`},
+	}
+	for _, tc := range tests {
+		got := decodeProcfsEscape(tc.input)
+		if got != tc.want {
+			t.Errorf("decodeProcfsEscape(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestWSLCheckedMulUnit(t *testing.T) {
+	// Safe product
+	res, overflow := checkedMul(4096, 1000)
+	if overflow || res != 4096000 {
+		t.Fatalf("expected 4096000 (no overflow), got %d (overflow=%v)", res, overflow)
+	}
+
+	// Zero products
+	res, overflow = checkedMul(0, 500)
+	if overflow || res != 0 {
+		t.Fatalf("expected 0, got %d", res)
+	}
+	res, overflow = checkedMul(500, 0)
+	if overflow || res != 0 {
+		t.Fatalf("expected 0, got %d", res)
+	}
+
+	// Overflow product
+	_, overflow = checkedMul(^uint64(0), 2)
+	if !overflow {
+		t.Fatal("expected overflow for max uint64 * 2")
+	}
+}
+
+func TestWSLRegistryInvalidByteEncodingFailsClosed(t *testing.T) {
+	oldExecutor := wslRegistryQueryExecutor
+	defer func() { wslRegistryQueryExecutor = oldExecutor }()
+
+	// Registry contains null byte in string
+	nullByteRegistry := "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{11111111-2222-3333-4444-555555555555}\n" +
+		"    DistributionName    REG_SZ    Ubuntu\x00corrupt\n" +
+		"    BasePath            REG_SZ    C:\\WSL\\Ubuntu\n"
+
+	wslRegistryQueryExecutor = func(ctx context.Context) ([]byte, error) {
+		return []byte(nullByteRegistry), nil
+	}
+
+	t.Setenv("WSL_DISTRO_NAME", "Ubuntu")
+	_, err := resolveDistroBackingDrive(context.Background())
+	if err == nil {
+		t.Fatal("expected error on registry entry with embedded null byte")
+	}
+}
+
+func TestWSLProbeHostVolumeMultiplicationOverflowFailsClosed(t *testing.T) {
+	// stat binary produces enormous block size causing checked multiplication overflow
+	oldOverride := wslDetectionOverride
+	oldMounts := wslProcMountsReader
+	oldReg := wslRegistryQueryExecutor
+	oldStatFS := wslDriveStatFS
+	defer func() {
+		wslDetectionOverride = oldOverride
+		wslProcMountsReader = oldMounts
+		wslRegistryQueryExecutor = oldReg
+		wslDriveStatFS = oldStatFS
+	}()
+
+	isWSL := true
+	wslDetectionOverride = &isWSL
+
+	wslProcMountsReader = func() ([]byte, error) {
+		return []byte(sampleProcMounts), nil
+	}
+	wslRegistryQueryExecutor = func(ctx context.Context) ([]byte, error) {
+		return []byte(sampleLxssRegistryOutput), nil
+	}
+	t.Setenv("WSL_DISTRO_NAME", "Debian")
+
+	// StatFS returns overflow error directly through probe seam
+	wslDriveStatFS = func(ctx context.Context, mountPath string) (Capacity, error) {
+		return Capacity{}, errors.New("host volume probe total bytes overflow (18446744073709551615 * 2)")
+	}
+
+	guestCap := Capacity{
+		FilesystemID: "guest:ext4",
+		TotalBytes:   1073741824000,
+		FreeBytes:    776875823104,
+	}
+
+	_, err := boundWSLCapacity(guestCap, "/home/kampe/Herdforge")
+	if err == nil {
+		t.Fatal("expected overflow probe error to fail closed")
+	}
+	if !strings.Contains(err.Error(), "overflow") {
+		t.Fatalf("expected overflow in error, got %q", err.Error())
 	}
 }
 

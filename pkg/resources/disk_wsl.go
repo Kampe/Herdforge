@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // wslProbeTimeout bounds all external Windows and 9p/drvfs probes to prevent hanging.
@@ -96,9 +97,68 @@ func extractDriveLetter(path string) string {
 	return ""
 }
 
+// decodeProcfsEscape decodes standard 3-digit octal escape sequences (e.g. \040 -> space, \134 -> \)
+// used by Linux /proc/mounts.
+func decodeProcfsEscape(s string) string {
+	var buf strings.Builder
+	buf.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '\\' && i+3 < len(s) {
+			o1, o2, o3 := s[i+1], s[i+2], s[i+3]
+			if o1 >= '0' && o1 <= '7' && o2 >= '0' && o2 <= '7' && o3 >= '0' && o3 <= '7' {
+				val := (o1-'0')*64 + (o2-'0')*8 + (o3 - '0')
+				buf.WriteByte(byte(val))
+				i += 4
+				continue
+			}
+		}
+		buf.WriteByte(s[i])
+		i++
+	}
+	return buf.String()
+}
+
+// parseDriveLetterFromDevice extracts drive letter if device explicitly names a Windows drive (e.g. "C:\134", "C:\", "C:").
+func parseDriveLetterFromDevice(device string) string {
+	clean := decodeProcfsEscape(device)
+	clean = strings.TrimSpace(clean)
+	return extractDriveLetter(clean)
+}
+
+// parseDriveLetterFromOptions extracts drive letter from drvfs options tokens (e.g. path=C:\ or path=C:).
+func parseDriveLetterFromOptions(opts string) (string, bool) {
+	decoded := decodeProcfsEscape(opts)
+	tokens := strings.FieldsFunc(decoded, func(r rune) bool {
+		return r == ',' || r == ';'
+	})
+	for _, tok := range tokens {
+		tok = strings.TrimSpace(tok)
+		if strings.HasPrefix(strings.ToLower(tok), "path=") {
+			val := strings.TrimPrefix(tok, tok[:5])
+			dl := extractDriveLetter(val)
+			if dl != "" {
+				return dl, true
+			}
+		}
+	}
+	return "", false
+}
+
+// checkedMul performs safe uint64 multiplication and reports overflow.
+func checkedMul(a, b uint64) (uint64, bool) {
+	if a == 0 || b == 0 {
+		return 0, false
+	}
+	c := a * b
+	if c/a != b {
+		return 0, true
+	}
+	return c, false
+}
+
 // parseLxssRegistryOutput parses reg.exe query output for the Lxss registry tree.
-// It tracks distributions by GUID and DistributionName. If an unsupported value encoding is
-// encountered for BasePath or DistributionName, it records an explicit diagnostic.
+// It validates registry value types (REG_SZ, REG_EXPAND_SZ) and byte encodings (valid UTF-8, no embedded nulls).
+// Any unsupported value type or invalid byte encoding is explicitly flagged.
 func parseLxssRegistryOutput(output string) (map[string]wslDistroInfo, string, error) {
 	distros := make(map[string]wslDistroInfo)
 	var defaultGUID string
@@ -145,6 +205,12 @@ func parseLxssRegistryOutput(output string) (map[string]wslDistroInfo, string, e
 				val = strings.Join(fields[2:], " ")
 			}
 
+			// Validate byte encoding
+			if !utf8.ValidString(val) || strings.ContainsRune(val, 0) {
+				currentDistro.EncodingError = fmt.Sprintf("invalid byte encoding in registry value %s", name)
+				continue
+			}
+
 			switch strings.ToLower(name) {
 			case "defaultdistribution":
 				if valType == "REG_SZ" || valType == "REG_EXPAND_SZ" {
@@ -154,7 +220,7 @@ func parseLxssRegistryOutput(output string) (map[string]wslDistroInfo, string, e
 				if valType == "REG_SZ" || valType == "REG_EXPAND_SZ" {
 					currentDistro.DistributionName = strings.TrimSpace(val)
 				} else {
-					currentDistro.EncodingError = fmt.Sprintf("unsupported registry type %s for DistributionName", valType)
+					currentDistro.EncodingError = fmt.Sprintf("unsupported registry value type %s for DistributionName", valType)
 				}
 			case "basepath":
 				if valType == "REG_SZ" || valType == "REG_EXPAND_SZ" {
@@ -162,7 +228,7 @@ func parseLxssRegistryOutput(output string) (map[string]wslDistroInfo, string, e
 					currentDistro.BasePath = cleanVal
 					currentDistro.DriveLetter = extractDriveLetter(cleanVal)
 				} else {
-					currentDistro.EncodingError = fmt.Sprintf("unsupported registry type %s for BasePath", valType)
+					currentDistro.EncodingError = fmt.Sprintf("unsupported registry value type %s for BasePath", valType)
 				}
 			}
 		}
@@ -245,13 +311,17 @@ func resolveDistroBackingDrive(ctx context.Context) (string, error) {
 }
 
 // findDriveMountPath locates the Linux mount point corresponding to a Windows drive letter.
-// It verifies that the mount is an authentic DrvFS or 9p mount for the requested drive letter,
-// rejecting ext4/tmpfs mounts or spoofed paths.
+// It verifies that the mount is an authentic DrvFS or 9p mount for the requested drive letter:
+// - Matches device and/or options token boundaries (e.g. path=C:\),
+// - Rejects contradictory device vs options,
+// - Eliminates mountpoint-only fallbacks,
+// - Decodes procfs octal escape sequences for mountpoints with spaces.
 func findDriveMountPath(driveLetter string, mountsData []byte) (string, error) {
 	drivePrefix := strings.ToUpper(strings.TrimSuffix(driveLetter, ":"))
 	if len(drivePrefix) != 1 || drivePrefix[0] < 'A' || drivePrefix[0] > 'Z' {
 		return "", fmt.Errorf("invalid drive letter %q", driveLetter)
 	}
+	targetDrive := drivePrefix + ":"
 
 	lines := strings.Split(string(mountsData), "\n")
 	for _, line := range lines {
@@ -259,40 +329,36 @@ func findDriveMountPath(driveLetter string, mountsData []byte) (string, error) {
 		if len(fields) < 3 {
 			continue
 		}
-		device := fields[0]
-		mountPoint := fields[1]
+		rawDevice := fields[0]
+		rawMountPoint := fields[1]
 		fsType := fields[2]
-		opts := ""
+		rawOpts := ""
 		if len(fields) >= 4 {
-			opts = fields[3]
+			rawOpts = fields[3]
 		}
 
-		isDrvFS := fsType == "drvfs" || fsType == "9p" || strings.Contains(opts, "aname=drvfs")
+		isDrvFS := fsType == "drvfs" || fsType == "9p" || strings.Contains(rawOpts, "aname=drvfs")
 		if !isDrvFS {
 			continue
 		}
 
-		// Device field in /proc/mounts (e.g. "C:\134", "C:\", "C:", "c:")
-		devClean := strings.ToUpper(device)
-		devClean = strings.ReplaceAll(devClean, `\134`, `\`)
-		devClean = strings.TrimSuffix(devClean, `\`)
-		devClean = strings.TrimSuffix(devClean, `:`)
+		devDrive := parseDriveLetterFromDevice(rawDevice)
+		optsDrive, hasOptsDrive := parseDriveLetterFromOptions(rawOpts)
 
-		if devClean == drivePrefix {
-			return mountPoint, nil
+		// Reject contradictory device vs options (e.g. device is D: but options specify path=C:\)
+		if devDrive != "" && hasOptsDrive && devDrive != optsDrive {
+			continue
 		}
 
-		// Mount options path check (e.g. "aname=drvfs;path=C:\;...")
-		optsUpper := strings.ToUpper(opts)
-		if strings.Contains(optsUpper, "PATH="+drivePrefix+`:\`) ||
-			strings.Contains(optsUpper, "PATH="+drivePrefix+`:`) ||
-			strings.Contains(optsUpper, "PATH="+drivePrefix+`;`) {
-			return mountPoint, nil
+		matched := false
+		if devDrive == targetDrive {
+			matched = true
+		} else if hasOptsDrive && optsDrive == targetDrive {
+			matched = true
 		}
 
-		// Canonical DrvFS mount point /mnt/<drive>
-		if strings.HasPrefix(mountPoint, "/mnt/") && len(mountPoint) == 6 && strings.ToUpper(string(mountPoint[5])) == drivePrefix {
-			return mountPoint, nil
+		if matched {
+			return decodeProcfsEscape(rawMountPoint), nil
 		}
 	}
 
@@ -311,13 +377,14 @@ func isPathOnDrvFS(path string, mountsData []byte) bool {
 		if len(fields) < 3 {
 			continue
 		}
-		mountPoint := fields[1]
+		rawMountPoint := fields[1]
 		fsType := fields[2]
-		opts := ""
+		rawOpts := ""
 		if len(fields) >= 4 {
-			opts = fields[3]
+			rawOpts = fields[3]
 		}
-		if fsType == "9p" || fsType == "drvfs" || strings.Contains(opts, "aname=drvfs") {
+		if fsType == "9p" || fsType == "drvfs" || strings.Contains(rawOpts, "aname=drvfs") {
+			mountPoint := decodeProcfsEscape(rawMountPoint)
 			if abs == mountPoint || strings.HasPrefix(abs, strings.TrimSuffix(mountPoint, "/")+"/") {
 				return true
 			}
@@ -327,44 +394,66 @@ func isPathOnDrvFS(path string, mountsData []byte) bool {
 }
 
 // probeHostVolumeCapacity runs an external bounded statfs observation against mountPath.
-// To prevent indefinite hangs on degraded 9p/DrvFS mounts, it uses a context-bounded subprocess
-// ("stat -f -c ...") which is killed if ctx expires.
+// It uses a context-bounded subprocess ("stat -f -c ...") which cleanly terminates if ctx expires.
+// Unbounded in-process statfs is never executed on 9p/drvfs to prevent kernel D-state hangs.
 func probeHostVolumeCapacity(ctx context.Context, mountPath string) (Capacity, error) {
-	// First attempt bounded coreutils stat command which cleanly terminates on timeout.
 	statBin, err := exec.LookPath("stat")
-	if err == nil {
-		cmd := exec.CommandContext(ctx, statBin, "-f", "-c", "%S %b %a %c %d", mountPath)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err == nil {
-			fields := strings.Fields(strings.TrimSpace(stdout.String()))
-			if len(fields) >= 5 {
-				blockSize, e1 := strconv.ParseUint(fields[0], 10, 64)
-				totalBlocks, e2 := strconv.ParseUint(fields[1], 10, 64)
-				freeBlocks, e3 := strconv.ParseUint(fields[2], 10, 64)
-				totalInodes, e4 := strconv.ParseUint(fields[3], 10, 64)
-				freeInodes, e5 := strconv.ParseUint(fields[4], 10, 64)
-				if e1 == nil && e2 == nil && e3 == nil && e4 == nil && e5 == nil && blockSize > 0 {
-					return Capacity{
-						FilesystemID: mountPath,
-						TotalBytes:   blockSize * totalBlocks,
-						FreeBytes:    blockSize * freeBlocks,
-						TotalInodes:  totalInodes,
-						FreeInodes:   freeInodes,
-					}, nil
-				}
-			}
-		} else if ctx.Err() != nil {
-			return Capacity{}, fmt.Errorf("host volume probe timed out: %w", ctx.Err())
-		}
+	if err != nil {
+		return Capacity{}, fmt.Errorf("host volume probe tool unavailable: %w", err)
 	}
 
-	// Fallback to in-process statfs if stat command is unavailable and context is not cancelled.
-	if err := ctx.Err(); err != nil {
-		return Capacity{}, fmt.Errorf("host volume probe context: %w", err)
+	cmd := exec.CommandContext(ctx, statBin, "-f", "-c", "%S %b %a %c %d", mountPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return Capacity{}, fmt.Errorf("host volume probe timed out: %w", ctx.Err())
+		}
+		return Capacity{}, fmt.Errorf("host volume probe command failed (%s): %w", strings.TrimSpace(stderr.String()), err)
 	}
-	return statFSUnix(mountPath)
+
+	fields := strings.Fields(strings.TrimSpace(stdout.String()))
+	if len(fields) < 5 {
+		return Capacity{}, fmt.Errorf("host volume probe returned unexpected output %q", stdout.String())
+	}
+
+	blockSize, e1 := strconv.ParseUint(fields[0], 10, 64)
+	totalBlocks, e2 := strconv.ParseUint(fields[1], 10, 64)
+	freeBlocks, e3 := strconv.ParseUint(fields[2], 10, 64)
+	totalInodes, e4 := strconv.ParseUint(fields[3], 10, 64)
+	freeInodes, e5 := strconv.ParseUint(fields[4], 10, 64)
+
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil {
+		return Capacity{}, fmt.Errorf("host volume probe returned invalid integer fields: %v", fields)
+	}
+
+	if blockSize == 0 || totalBlocks == 0 {
+		return Capacity{}, fmt.Errorf("host volume probe reported zero block size or total blocks (blockSize=%d, totalBlocks=%d)", blockSize, totalBlocks)
+	}
+
+	if freeBlocks > totalBlocks {
+		return Capacity{}, fmt.Errorf("host volume probe reported free blocks %d > total blocks %d", freeBlocks, totalBlocks)
+	}
+
+	totalBytes, overflow1 := checkedMul(blockSize, totalBlocks)
+	if overflow1 {
+		return Capacity{}, fmt.Errorf("host volume probe total bytes overflow (%d * %d)", blockSize, totalBlocks)
+	}
+
+	freeBytes, overflow2 := checkedMul(blockSize, freeBlocks)
+	if overflow2 {
+		return Capacity{}, fmt.Errorf("host volume probe free bytes overflow (%d * %d)", blockSize, freeBlocks)
+	}
+
+	return Capacity{
+		FilesystemID: mountPath,
+		TotalBytes:   totalBytes,
+		FreeBytes:    freeBytes,
+		TotalInodes:  totalInodes,
+		FreeInodes:   freeInodes,
+	}, nil
 }
 
 // boundWSLCapacity bounds guest filesystem capacity by the actual physical Windows host volume.
