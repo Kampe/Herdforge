@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -18,9 +19,20 @@ import (
 
 func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-308"}, "coordinator", "coordinator", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
-	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-308", "--owner", "coordinator", "--generation", "4", "--max", "1", "--grantor", "coordinator", "--packet", "packet.md", "--autonomy", "bounded", "--mutations", "worktree", "--forbidden", "merge", "--stop-conditions", "stop"}
+	os.Args = []string{"herd", "goal-guard", "--set", "--state", state, "--lane", "forge-worker", "--task", "FAC-308", "--owner", "coordinator", "--generation", strconv.FormatInt(lease.Generation, 10), "--max", "1", "--grantor", "coordinator", "--packet", "packet.md", "--autonomy", "bounded", "--mutations", "worktree", "--forbidden", "merge", "--stop-conditions", "stop"}
 	if err := runGoalGuard(); err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +43,7 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := input.WriteString(`{"lane":"forge-worker","task":"FAC-308","owner":"coordinator","generation":4,"lease_held":true,"now":"2026-08-16T02:00:00Z"}`); err != nil {
+	if _, err := input.WriteString(fmt.Sprintf(`{"lane":"forge-worker","task":"FAC-308","owner":"coordinator","generation":%d,"lease_held":true,"now":"2026-08-16T02:00:00Z"}`, lease.Generation)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := input.Seek(0, 0); err != nil {
@@ -46,7 +58,7 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	os.Args = []string{"herd", "goal-guard", "--clear", "--state", state, "--grantor", "coordinator", "--generation", "4"}
+	os.Args = []string{"herd", "goal-guard", "--clear", "--state", state, "--grantor", "coordinator", "--generation", strconv.FormatInt(lease.Generation, 10)}
 	if err := runGoalGuard(); err != nil {
 		t.Fatal(err)
 	}

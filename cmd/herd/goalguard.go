@@ -17,6 +17,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/claim"
 	"github.com/Kampe/Herdforge/pkg/goalguard"
 	"github.com/Kampe/Herdforge/pkg/lock"
+	"github.com/Kampe/Herdforge/pkg/security"
 )
 
 func runGoalGuard() error {
@@ -147,7 +148,10 @@ func clearGoal(s *goalguard.Store, grantor string, generation int64, receiptPath
 			return fmt.Errorf("goal-guard: clear refused for owner %q: grantor %q is not the recorded grantor %q", g.Owner, grantor, g.Authority.Grantor)
 		}
 		if generation != g.Generation {
-			return fmt.Errorf("goal-guard: clear refused for owner %q: stale generation %d (current generation %d)", g.Owner, generation, g.Generation)
+			return fmt.Errorf("goal-guard: clear refused for owner %q: stale generation %d (goal generation %d)", g.Owner, generation, g.Generation)
+		}
+		if err := validateNativeGrantor(g, grantor, generation); err != nil {
+			return err
 		}
 		return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Grantor: grantor, RetiredAt: time.Now().UTC()})
 	}
@@ -162,6 +166,31 @@ func clearGoal(s *goalguard.Store, grantor string, generation int64, receiptPath
 		return err
 	}
 	return retireGoal(s, g, goalguard.Retirement{Lane: g.Lane, Task: g.Task, Owner: g.Owner, Generation: g.Generation, Receipt: receipt.Digest, RetiredAt: time.Now().UTC()})
+}
+
+func validateNativeGrantor(g goalguard.Goal, grantor string, generation int64) error {
+	path := security.CanonicalLeaseDBPath(".")
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("goal-guard: clear refused for owner %q: native claim authority is missing; coordinator must present the live claim", g.Owner)
+		}
+		return fmt.Errorf("goal-guard: clear refused: inspect native claim authority: %w", err)
+	}
+	if err := security.WireCanonicalClaimAuthority("."); err != nil {
+		return fmt.Errorf("goal-guard: clear refused: open native claim authority: %w", err)
+	}
+	lookup, err := security.RequireClaimAuthority()
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused: %w", err)
+	}
+	current, err := lookup.LookupActiveClaim(context.Background(), g.Task)
+	if err != nil {
+		return fmt.Errorf("goal-guard: clear refused for task %q: native claim is not active: %w", g.Task, err)
+	}
+	if current == nil || current.TaskRef != g.Task || current.OwnerID != grantor || current.Generation != generation {
+		return fmt.Errorf("goal-guard: clear refused: native claim owner/generation mismatch (want owner=%q generation=%d)", grantor, generation)
+	}
+	return nil
 }
 
 func validateGoalCompletionReceipt(g goalguard.Goal, receipt *hsync.CompletionReceipt) error {
