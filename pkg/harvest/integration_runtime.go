@@ -188,11 +188,17 @@ func (r HerdRuntimeInstaller) inspect(path string) (*RuntimeBinding, error) {
 // input to the next install, not a claim that it is the new artifact.
 func (r HerdRuntimeInstaller) inspectPrior(path string) (*RuntimeBinding, error) {
 	st, err := os.Lstat(path)
-	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0111 == 0 {
+	if err != nil {
+		return nil, fmt.Errorf("runtime bind: prior executable is not a regular executable file: %w", err)
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0111 == 0 {
 		return nil, fmt.Errorf("runtime bind: prior executable is not a regular executable file")
 	}
 	info, err := provenance.ReadExecutable(path, r.Source)
-	if err != nil || !info.Comparable || !fullIntegrationSHA(info.BinaryRevision) {
+	if err != nil {
+		return nil, fmt.Errorf("runtime bind: prior executable identity is unknown: %w", err)
+	}
+	if !info.Comparable || !fullIntegrationSHA(info.BinaryRevision) {
 		return nil, fmt.Errorf("runtime bind: prior executable identity is unknown")
 	}
 	f, err := os.Open(path)
@@ -334,7 +340,10 @@ func (r HerdRuntimeInstaller) Install(ctx context.Context) (*RuntimeBinding, err
 			return nil, fmt.Errorf("runtime bind: refusing to replace a non-regular target")
 		}
 		prior, err = r.inspectPrior(target)
-		if err != nil || prior == nil {
+		if err != nil {
+			return nil, fmt.Errorf("runtime bind: prior executable identity is unknown: %w", err)
+		}
+		if prior == nil {
 			return nil, fmt.Errorf("runtime bind: prior executable identity is unknown")
 		}
 		// A concurrent newer install, or unrelated binary, must never be downgraded.
