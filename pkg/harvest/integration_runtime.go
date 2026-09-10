@@ -77,7 +77,15 @@ type RuntimeRetentionManifest struct {
 	// Previous list, with their full recorded identity. This is the ONLY
 	// positive allowlist a retention pass may remove against; a candidate
 	// that matches no displaced binding is held as unknown, never deleted.
+	// Unresolved displaced bindings are carried forward across subsequent
+	// installs so their allowlist identity is never forgotten.
 	Displaced []RuntimeRetentionBinding `json:"displaced,omitempty"`
+	// MaintenanceUnresolved records that the last bounded retention pass
+	// ended with a hard partial result (held, unknown, error, or budget).
+	// An exact-revision retry must resolve it or keep surfacing the hard
+	// partial error; it must never silently succeed over retained state.
+	MaintenanceUnresolved bool   `json:"maintenance_unresolved,omitempty"`
+	MaintenanceReason     string `json:"maintenance_reason,omitempty"`
 }
 
 type RuntimeRetentionEvent struct {
@@ -373,7 +381,11 @@ func (r HerdRuntimeInstaller) Install(ctx context.Context) (*RuntimeBinding, err
 	}
 	target := filepath.Join(r.Root, "bin", "herd")
 	if binding, err := r.Observe(ctx); err == nil {
-		return binding, nil
+		// An exact-revision retry over a previously returned hard
+		// retention-maintenance failure must resolve it or keep surfacing
+		// the error — never silently succeed over retained unresolved
+		// state.
+		return r.ResolveRetainedMaintenance(ctx, binding)
 	}
 	source := filepath.Join(r.Source, "bin", "herd")
 	if _, err := r.inspect(source); err != nil {
@@ -480,6 +492,76 @@ func (r HerdRuntimeInstaller) Install(ctx context.Context) (*RuntimeBinding, err
 		// The installed binding is real and intentionally returned alongside the
 		// maintenance failure; callers must not interpret this as rollback.
 		return binding, err
+	}
+	return binding, nil
+}
+
+// ResolveRetainedMaintenance is the exact-revision retry contract for
+// retained hard retention-maintenance failures. When the retention manifest
+// records an unresolved pass, this reruns the same bounded, allowlist- and
+// owner-fenced maintenance and either resolves it (returning the binding and
+// a nil error) or returns the binding alongside the continuing hard partial
+// error. When nothing is retained unresolved, the binding passes through
+// unchanged. A retry never silently succeeds over retained state, and the
+// rerun never widens the deletion allowlist: only manifest-recorded
+// displaced bindings with absent owners are removed.
+func (r HerdRuntimeInstaller) ResolveRetainedMaintenance(ctx context.Context, binding *RuntimeBinding) (*RuntimeBinding, error) {
+	if binding == nil {
+		return nil, fmt.Errorf("runtime bind: retained maintenance resolution requires an installed binding")
+	}
+	manifestPath, journalPath := r.retentionPaths()
+	manifest, err := r.loadRetentionManifest(manifestPath)
+	if err != nil {
+		return binding, fmt.Errorf("runtime bind: installed binding preserved; retained retention manifest unknown: %w", err)
+	}
+	if manifest == nil || !manifest.MaintenanceUnresolved {
+		return binding, nil
+	}
+	options := r.retentionOptions()
+	maxCandidates := options.MaxCandidates
+	if maxCandidates <= 0 {
+		maxCandidates = defaultRuntimeRetentionCandidates
+	}
+	maxBytes := options.MaxAllocatedBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultRuntimeRetentionBytes
+	}
+	timeout := options.Timeout
+	if timeout <= 0 {
+		timeout = defaultRuntimeRetentionTimeout
+	}
+	retentionCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	report, err := r.retireRuntimeBackupsWith(retentionCtx, *manifest, journalPath, maxCandidates, maxBytes, options.LiveOwner)
+	if err != nil {
+		return binding, fmt.Errorf("runtime bind: installed binding preserved; retained retention maintenance failed: %w", err)
+	}
+	if report.Partial || report.Held > 0 || report.Errors > 0 {
+		reason := report.Reason
+		if reason == "" {
+			reason = "held-unknown-candidate"
+		}
+		manifest.MaintenanceReason = reason
+		if writeErr := writeRuntimeRetentionManifest(manifestPath, *manifest); writeErr != nil {
+			return binding, fmt.Errorf("runtime bind: installed binding preserved; retention maintenance partial (retained): %s (unresolved state write failed: %v)", reason, writeErr)
+		}
+		return binding, fmt.Errorf("runtime bind: installed binding preserved; retention maintenance partial (retained): %s", reason)
+	}
+	// The retained failure is now resolved. Drop displaced bindings whose
+	// files are gone, keep any still on disk with their identity, and clear
+	// the unresolved flag.
+	keptDisplaced := make([]RuntimeRetentionBinding, 0, len(manifest.Displaced))
+	for _, old := range manifest.Displaced {
+		if _, statErr := os.Lstat(filepath.Join(r.Root, old.Path)); statErr == nil {
+			keptDisplaced = append(keptDisplaced, old)
+		} else if !os.IsNotExist(statErr) {
+			keptDisplaced = append(keptDisplaced, old)
+		}
+	}
+	manifest.Displaced = keptDisplaced
+	manifest.MaintenanceUnresolved, manifest.MaintenanceReason = false, ""
+	if err := writeRuntimeRetentionManifest(manifestPath, *manifest); err != nil {
+		return binding, fmt.Errorf("runtime bind: installed binding preserved; retention manifest resolve write: %w", err)
 	}
 	return binding, nil
 }
@@ -696,21 +778,37 @@ func (r HerdRuntimeInstaller) retireRuntimeBackups(ctx context.Context, current,
 	}
 	// Prior-chain bindings that no longer fit the kept Previous list are
 	// recorded as displaced with their full identity: the retention pass may
-	// remove exactly these, and nothing else.
+	// remove exactly these, and nothing else. Displaced bindings left
+	// unresolved by earlier passes are carried forward with their identity
+	// intact -- forgetting them would make the file permanently
+	// unreclaimable and silently drop the allowlist identity a live owner
+	// still protects.
 	var displaced []RuntimeRetentionBinding
 	if manifest != nil {
-		for _, old := range manifest.Previous {
-			carried := false
+		carriedDisplaced := make([]RuntimeRetentionBinding, 0, len(manifest.Previous)+len(manifest.Displaced))
+		appendDisplaced := func(old RuntimeRetentionBinding) {
+			if old.Path == "" || old.Digest == "" || old.Revision == "" {
+				return
+			}
 			for _, kept := range previous {
 				if runtimeRetentionSameIdentity(kept, old) {
-					carried = true
-					break
+					return
 				}
 			}
-			if !carried && old.Path != "" && old.Digest != "" && old.Revision != "" {
-				displaced = append(displaced, old)
+			for _, seen := range carriedDisplaced {
+				if runtimeRetentionSameIdentity(seen, old) {
+					return
+				}
 			}
+			carriedDisplaced = append(carriedDisplaced, old)
 		}
+		for _, old := range manifest.Displaced {
+			appendDisplaced(old)
+		}
+		for _, old := range manifest.Previous {
+			appendDisplaced(old)
+		}
+		displaced = carriedDisplaced
 	}
 	newManifest := RuntimeRetentionManifest{Version: runtimeRetentionManifestVersion, Current: currentEntry, Previous: previous, Displaced: displaced}
 	if err := writeRuntimeRetentionManifest(manifestPath, newManifest); err != nil {
@@ -718,13 +816,39 @@ func (r HerdRuntimeInstaller) retireRuntimeBackups(ctx context.Context, current,
 	}
 	report, err := r.retireRuntimeBackupsWith(retentionCtx, newManifest, journalPath, maxCandidates, maxBytes, options.LiveOwner)
 	if err != nil {
+		newManifest.MaintenanceUnresolved, newManifest.MaintenanceReason = true, "maintenance-error"
+		if writeErr := writeRuntimeRetentionManifest(manifestPath, newManifest); writeErr != nil {
+			return fmt.Errorf("runtime bind: installed binding preserved; retention maintenance failed (%w) and unresolved state write failed (%v)", err, writeErr)
+		}
 		return fmt.Errorf("runtime bind: installed binding preserved; retention maintenance failed: %w", err)
 	}
 	if report.Partial || report.Held > 0 || report.Errors > 0 {
 		if report.Reason == "" {
 			report.Reason = "held-unknown-candidate"
 		}
+		newManifest.MaintenanceUnresolved, newManifest.MaintenanceReason = true, report.Reason
+		if writeErr := writeRuntimeRetentionManifest(manifestPath, newManifest); writeErr != nil {
+			return fmt.Errorf("runtime bind: installed binding preserved; retention maintenance partial: %s (unresolved state write failed: %v)", report.Reason, writeErr)
+		}
 		return fmt.Errorf("runtime bind: installed binding preserved; retention maintenance partial: %s", report.Reason)
+	}
+	// The pass fully resolved: displaced bindings whose files are gone are
+	// done -- drop them from the allowlist and clear the unresolved flag.
+	// A displaced binding whose file still exists keeps its identity.
+	keptDisplaced := make([]RuntimeRetentionBinding, 0, len(newManifest.Displaced))
+	for _, old := range newManifest.Displaced {
+		if _, statErr := os.Lstat(filepath.Join(r.Root, old.Path)); statErr == nil {
+			keptDisplaced = append(keptDisplaced, old)
+		} else if !os.IsNotExist(statErr) {
+			keptDisplaced = append(keptDisplaced, old)
+		}
+	}
+	newManifest.Displaced = keptDisplaced
+	newManifest.MaintenanceUnresolved, newManifest.MaintenanceReason = false, ""
+	if manifest != nil && (manifest.MaintenanceUnresolved || len(manifest.Displaced) != len(keptDisplaced)) {
+		if writeErr := writeRuntimeRetentionManifest(manifestPath, newManifest); writeErr != nil {
+			return fmt.Errorf("runtime bind: installed binding preserved; retention manifest resolve write: %w", writeErr)
+		}
 	}
 	return nil
 }

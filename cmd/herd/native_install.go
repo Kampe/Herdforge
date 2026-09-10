@@ -108,7 +108,10 @@ func executeNativeInstall(ctx context.Context, opts nativeInstallOptions, build 
 		return nil, nil
 	}
 	if current != nil {
-		return current, nil
+		// An exact-revision retry must resolve or keep surfacing a
+		// previously returned hard retention-maintenance failure; it must
+		// never silently succeed over retained unresolved state.
+		return installer.ResolveRetainedMaintenance(ctx, current)
 	}
 	if err := build(ctx, source); err != nil {
 		return nil, fmt.Errorf("herd install: build refused: %w", err)
