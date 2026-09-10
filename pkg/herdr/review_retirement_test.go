@@ -209,27 +209,95 @@ func TestRetireReviewLanesStopsAfterEarlierFailure(t *testing.T) {
 }
 
 func TestRetireReviewLanesFaultMatrixStopsBeforeLaterDestructiveBoundary(t *testing.T) {
-	m := retirementManifest(t, "fault-matrix")
-	boundaries := []string{
-		"close", "lease-release", "journal-worktree-intent", "worktree",
-		"journal-worktree-done", "journal-ref-intent", "branch", "journal-ref-done",
-		"journal-artifacts-intent", "artifact", "journal-artifacts-done", "receipt",
+	m1 := retirementManifest(t, "g1")
+	m2 := retirementManifest(t, "g2")
+	m3 := retirementManifest(t, "g3")
+	boundaries := []struct {
+		name          string
+		expectedError string
+	}{
+		{name: "close", expectedError: "close "},
+		{name: "lease-release", expectedError: "release lease "},
+		{name: "journal-worktree-intent", expectedError: "journal worktree phase "},
+		{name: "worktree", expectedError: "remove worktree "},
+		{name: "journal-worktree-done", expectedError: "journal worktree completion "},
+		{name: "journal-ref-intent", expectedError: "journal ref phase "},
+		{name: "branch", expectedError: "remove branch "},
+		{name: "journal-ref-done", expectedError: "journal ref completion "},
+		{name: "journal-artifacts-intent", expectedError: "journal artifact phase "},
+		{name: "artifact", expectedError: "remove owned artifacts "},
+		{name: "journal-artifacts-done", expectedError: "journal artifacts completion "},
+		{name: "receipt", expectedError: "write retirement receipt "},
 	}
-	for _, boundary := range boundaries {
-		t.Run(boundary, func(t *testing.T) {
-			f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"fault-matrix": retirementEvidence(m)}, fail: boundary}
-			r, err := RetireReviewLanes(f, []ReviewRetirementManifest{m}, false)
-			if err == nil || r.Failed != 1 {
-				t.Fatalf("boundary %s was not surfaced: report=%+v err=%v events=%v", boundary, r, err, f.events)
+	for _, b := range boundaries {
+		t.Run(b.name, func(t *testing.T) {
+			f := &retirementFake{
+				evidence: map[string]ReviewRetirementEvidence{
+					"g1": retirementEvidence(m1),
+					"g2": retirementEvidence(m2),
+					"g3": retirementEvidence(m3),
+				},
+				fail:    b.name,
+				failGen: "g2",
 			}
+			r, err := RetireReviewLanes(f, []ReviewRetirementManifest{m1, m2, m3}, false)
+			if err == nil || r.Failed != 1 {
+				t.Fatalf("boundary %s was not surfaced: report=%+v err=%v events=%v", b.name, r, err, f.events)
+			}
+			if r.Retired != 1 {
+				t.Fatalf("expected 1 retired candidate (g1), got %d: %+v", r.Retired, r)
+			}
+			if len(r.Candidates) != 3 {
+				t.Fatalf("expected 3 candidates, got %d", len(r.Candidates))
+			}
+
+			// Candidate 0: cleanly retired before failure
+			c0 := r.Candidates[0]
+			if !c0.Retired || !c0.Completed || c0.Failed || c0.Error != "" {
+				t.Fatalf("candidate 0 should be cleanly retired: %+v", c0)
+			}
+			if !c0.Decision.Eligible {
+				t.Fatalf("candidate 0 should remain eligible: %+v", c0)
+			}
+
+			// Candidate 1: failed at this boundary; must NOT be marked Retired or Completed
+			c1 := r.Candidates[1]
+			if c1.Retired {
+				t.Fatalf("candidate 1 at boundary %s must have Retired=false, got Retired=true: %+v", b.name, c1)
+			}
+			if c1.Completed {
+				t.Fatalf("candidate 1 at boundary %s must have Completed=false, got Completed=true: %+v", b.name, c1)
+			}
+			if !c1.Failed {
+				t.Fatalf("candidate 1 at boundary %s must have Failed=true: %+v", b.name, c1)
+			}
+			if !strings.Contains(c1.Error, b.expectedError) || !strings.Contains(c1.Error, "injected failure") {
+				t.Fatalf("candidate 1 error %q does not match expected prefix %q with injected failure", c1.Error, b.expectedError)
+			}
+			if !c1.Decision.Eligible {
+				t.Fatalf("candidate 1 should preserve initial Eligible=true decision: %+v", c1)
+			}
+
+			// Candidate 2: unattempted due to prior failure
+			c2 := r.Candidates[2]
+			if c2.Retired || c2.Completed || c2.Failed || c2.Error != "" {
+				t.Fatalf("candidate 2 should be unattempted: %+v", c2)
+			}
+			if !c2.Decision.Eligible {
+				t.Fatalf("candidate 2 should preserve initial Eligible=true decision: %+v", c2)
+			}
+
+			// Candidate 0 ran 13 phases. Verify that candidate 1 (starting at index 13)
+			// never executed any later destructive boundary after the injected failure.
+			c1Events := f.events[13:]
 			seen := false
-			for _, event := range f.events {
-				if event == boundary {
+			for _, event := range c1Events {
+				if event == b.name {
 					seen = true
 					continue
 				}
 				if seen && (event == "worktree" || event == "branch" || event == "artifact" || event == "receipt") {
-					t.Fatalf("later destructive boundary %q ran after injected %q: %v", event, boundary, f.events)
+					t.Fatalf("later destructive boundary %q ran for candidate 1 after injected %q: %v", event, b.name, c1Events)
 				}
 			}
 		})
