@@ -24,3 +24,5 @@ func runtimeFileMetaFromInfo(info os.FileInfo) (runtimeFileMeta, bool) {
 }
 
 func runtimeCurrentUID() (uint64, bool) { return uint64(os.Getuid()), true }
+
+func runtimeInstallSupported() bool { return true }

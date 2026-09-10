@@ -60,7 +60,9 @@ type RuntimeRetentionOptions struct {
 
 type RuntimeRetentionBinding struct {
 	RuntimeBinding
-	Path            string `json:"path"`
+	Path string `json:"path"`
+	// FileID is receipt data only: a device:inode snapshot recorded for audit
+	// receipts. Retention decisions compare digests, never FileID.
 	FileID          string `json:"file_id"`
 	Size            int64  `json:"size"`
 	ModTimeUnixNano int64  `json:"mod_time_unix_nano"`
@@ -105,6 +107,14 @@ type HerdRuntimeInstaller struct {
 	Revision  string
 	retention *RuntimeRetentionOptions
 }
+
+var runtimeInstallCapability = runtimeInstallSupported
+
+// RuntimeInstallSupported reports whether this platform can produce the file
+// metadata (owner, link count, inode identity) that retention requires to
+// operate fail-closed. Callers must refuse install before any build or
+// mutation when it is false; unknown metadata is never treated as absent.
+func RuntimeInstallSupported() bool { return runtimeInstallCapability() }
 
 func (r HerdRuntimeInstaller) validate(ctx context.Context) error {
 	if !fullIntegrationSHA(r.Revision) || r.Root == "" || r.Source == "" {
@@ -300,6 +310,9 @@ func (r HerdRuntimeInstaller) Observe(ctx context.Context) (*RuntimeBinding, err
 // A retry after rename simply reads the exact installed binding; it does not
 // overwrite a newer runtime. It does not move refs, close panes, or mark Done.
 func (r HerdRuntimeInstaller) Install(ctx context.Context) (*RuntimeBinding, error) {
+	if !runtimeInstallCapability() {
+		return nil, fmt.Errorf("runtime bind: unsupported platform: runtime file metadata is unavailable, refusing install before any mutation")
+	}
 	if err := r.validate(ctx); err != nil {
 		return nil, err
 	}

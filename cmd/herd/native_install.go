@@ -77,6 +77,9 @@ func parseNativeInstallArgs(args []string) (nativeInstallOptions, error) {
 }
 
 func executeNativeInstall(ctx context.Context, opts nativeInstallOptions, build nativeInstallBuild) (*harvest.RuntimeBinding, error) {
+	if !harvest.RuntimeInstallSupported() {
+		return nil, fmt.Errorf("herd install: unsupported platform: runtime install capability is unavailable, refusing before build or mutation")
+	}
 	source, err := filepath.Abs(opts.source)
 	if err != nil {
 		return nil, fmt.Errorf("herd install: source path: %w", err)
