@@ -34,14 +34,25 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
 		f.listCalls++
 		terminalID, cwd := "term-1", nativeOpenCodeCwd
-		if f.mode == "reused-pane" && f.listCalls > 1 {
+		if (f.mode == "reused-pane" || f.mode == "cold-reused-pane") && f.listCalls > 1 {
 			terminalID = "term-2"
 		}
-		if f.mode == "wrong-cwd" && f.listCalls > 1 {
+		if (f.mode == "wrong-cwd" || f.mode == "cold-wrong-cwd") && f.listCalls > 1 {
 			cwd = "/other-repo"
 		}
-		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":"idle","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"agent_session":{"value":%q}}]}}`,
-			nativeOpenCodeTarget, terminalID, cwd, cwd, nativeOpenCodeSession), nil
+		session := ""
+		if !strings.HasPrefix(f.mode, "cold") || (f.mode != "cold-never-session" && f.listCalls > 1) {
+			session = nativeOpenCodeSession
+			if strings.HasPrefix(f.mode, "cold") {
+				session = "ses_cold"
+			}
+		}
+		sessionJSON := ""
+		if session != "" {
+			sessionJSON = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, session)
+		}
+		return fmt.Sprintf(`{"result":{"type":"agents","agents":[{"name":%q,"agent":"opencode","agent_status":"idle","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","terminal_id":%q,"cwd":%q,"foreground_cwd":%q,"revision":%d,"state_change_seq":%d%s}]}}`,
+			nativeOpenCodeTarget, terminalID, cwd, cwd, f.listCalls, f.listCalls, sessionJSON), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "prompt" {
 		f.promptCalls++
@@ -49,8 +60,17 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		if f.mode == "provider-error" {
 			return "provider unavailable", errors.New("provider unavailable")
 		}
-		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"pane_id":"wK:p1","agent":%q,"agent_session":{"source":"herdr","agent":%q,"kind":"id","value":%q},"state":"working"}}}`,
-			nativeOpenCodeTarget, nativeOpenCodeTarget, nativeOpenCodeSession), nil
+		if f.mode == "cold-missing-ack" {
+			return `{"result":{"type":"agent_prompted","agent":{"agent":"reviewer"}}}`, nil
+		}
+		ackSession := ""
+		if f.mode == "cold-wrong-ack-session" {
+			ackSession = `,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":"ses_other"}`
+		} else if !strings.HasPrefix(f.mode, "cold") {
+			ackSession = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, nativeOpenCodeSession)
+		}
+		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"pane_id":"wK:p1","agent":%q%s,"state":"working"}}}`,
+			nativeOpenCodeTarget, ackSession), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
 		f.keys++
@@ -64,13 +84,20 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 }
 
 func (f *openCodeSendFixture) export(_ context.Context, sessionID, cwd string) ([]byte, error) {
-	if sessionID != nativeOpenCodeSession {
+	expectedSession := nativeOpenCodeSession
+	if strings.HasPrefix(f.mode, "cold") {
+		expectedSession = "ses_cold"
+	}
+	if sessionID != expectedSession {
 		return nil, fmt.Errorf("unexpected export session %q", sessionID)
 	}
 	if cwd != nativeOpenCodeCwd {
 		return nil, fmt.Errorf("unexpected export cwd %q", cwd)
 	}
 	f.exportCalls++
+	if strings.HasPrefix(f.mode, "cold-") {
+		return nativeOpenCodeCurrentExport(f.mode), nil
+	}
 	if f.exportCalls == 1 || f.mode == "timeout" || f.mode == "unchanged" || f.mode == "stale" {
 		return f.baseline, nil
 	}
@@ -108,12 +135,12 @@ func nativeOpenCodeExport(consumed bool, sessionID, parentID string, values ...s
 	oldCreated := time.Now().Add(-2 * time.Second).UnixMilli()
 	messages := []map[string]interface{}{
 		{"info": map[string]interface{}{
-			"id": "user-old", "sessionID": nativeOpenCodeSession, "role": "user",
+			"id": "user-old", "sessionID": sessionID, "role": "user",
 			"time":  map[string]interface{}{"created": oldCreated},
 			"model": map[string]interface{}{"providerID": providerID, "modelID": "gpt-5.6-luna"},
 		}, "parts": []map[string]string{{"type": "text", "text": "old"}}},
 		{"info": map[string]interface{}{
-			"id": "assistant-old", "sessionID": nativeOpenCodeSession, "role": "assistant", "parentID": "user-old",
+			"id": "assistant-old", "sessionID": sessionID, "role": "assistant", "parentID": "user-old",
 			"time":    map[string]interface{}{"created": oldCreated + 100, "completed": oldCreated + 200},
 			"modelID": "gpt-5.6-luna", "providerID": providerID,
 		}, "parts": []map[string]string{{"type": "text", "text": "old reply"}}},
@@ -125,12 +152,12 @@ func nativeOpenCodeExport(consumed bool, sessionID, parentID string, values ...s
 		}
 		messages = append(messages,
 			map[string]interface{}{"info": map[string]interface{}{
-				"id": "user-current", "sessionID": nativeOpenCodeSession, "role": "user",
+				"id": "user-current", "sessionID": sessionID, "role": "user",
 				"time":  map[string]interface{}{"created": created},
 				"model": map[string]interface{}{"providerID": providerID, "modelID": "gpt-5.6-luna"},
 			}, "parts": []map[string]string{{"type": "text", "text": packetText}}},
 			map[string]interface{}{"info": map[string]interface{}{
-				"id": "assistant-current", "sessionID": nativeOpenCodeSession, "role": "assistant", "parentID": parentID,
+				"id": "assistant-current", "sessionID": sessionID, "role": "assistant", "parentID": parentID,
 				"time":    map[string]interface{}{"created": created + 100, "completed": created + 200},
 				"modelID": "gpt-5.6-luna", "providerID": providerID,
 			}, "parts": []map[string]string{{"type": "text", "text": "[redacted:text:assistant-current]"}}},
@@ -154,6 +181,23 @@ func nativeOpenCodeExport(consumed bool, sessionID, parentID string, values ...s
 }
 
 func nativeOpenCodeCurrentExport(mode string) []byte {
+	if mode == "cold-reused-session" || mode == "cold-old-user" {
+		return nativeOpenCodeExport(false, "ses_cold", "")
+	}
+	if mode == "cold-no-assistant" {
+		raw := nativeOpenCodeExport(true, "ses_cold", "")
+		var data map[string]interface{}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			panic(err)
+		}
+		messages := data["messages"].([]interface{})
+		data["messages"] = messages[:len(messages)-1]
+		body, err := json.Marshal(data)
+		if err != nil {
+			panic(err)
+		}
+		return body
+	}
 	switch mode {
 	case "wrong-session":
 		return nativeOpenCodeExport(true, "ses_other", "")
@@ -163,6 +207,8 @@ func nativeOpenCodeCurrentExport(mode string) []byte {
 		return nativeOpenCodeExport(true, "", "wrong-user")
 	case "wrong-model":
 		return nativeOpenCodeExport(true, "", "", "anthropic")
+	case "cold", "cold-session", "cold-reused-pane", "cold-conflicting-identity", "cold-wrong-ack-session", "cold-missing-ack":
+		return nativeOpenCodeExport(true, "ses_cold", "")
 	default:
 		return nativeOpenCodeExport(true, "", "")
 	}
@@ -188,6 +234,23 @@ func TestPublicSendOpenCodeProvesNativeConsumption(t *testing.T) {
 	}
 	if f.keys != 0 || f.read != 0 {
 		t.Fatalf("native proof used unsafe/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
+	}
+}
+
+func TestPublicSendOpenCodeProvesColdSessionConsumption(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	f, restore := newOpenCodeSendFixture(t, "cold-session")
+	defer restore()
+
+	status, err := Send(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second)
+	if err != nil {
+		t.Fatalf("cold native consumed send failed: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
+	}
+	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 0 || f.read != 0 {
+		t.Fatalf("cold delivery calls = prompts:%d exports:%d keys:%d reads:%d", f.promptCalls, f.exportCalls, f.keys, f.read)
 	}
 }
 
@@ -251,6 +314,42 @@ func TestPublicSendOpenCodeFailsClosedForNativeEvidenceGaps(t *testing.T) {
 			}
 			if f.keys != 0 || f.read != 0 {
 				t.Fatalf("failure used duplicate/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
+			}
+		})
+	}
+}
+
+func TestPublicSendOpenCodeColdSessionFailsClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		mode string
+		want string
+	}{
+		{name: "missing-ack", mode: "cold-missing-ack", want: "pane"},
+		{name: "session-never-assigned", mode: "cold-never-session", want: "queued-but-not-consumed"},
+		{name: "reused-session-old-transcript", mode: "cold-reused-session", want: "queued-but-not-consumed"},
+		{name: "old-user-only", mode: "cold-old-user", want: "queued-but-not-consumed"},
+		{name: "no-assistant", mode: "cold-no-assistant", want: "queued-but-not-consumed"},
+		{name: "conflicting-pane-incarnation", mode: "cold-reused-pane", want: "identity changed"},
+		{name: "conflicting-cwd", mode: "cold-wrong-cwd", want: "identity changed"},
+		{name: "ack-session-disagrees", mode: "cold-wrong-ack-session", want: "differs from assigned"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, restore := newOpenCodeSendFixture(t, tc.mode)
+			defer restore()
+			status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, 350*time.Millisecond, "wK")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("status/error = %q/%v, want error containing %q", status, err, tc.want)
+			}
+			if tc.mode != "cold-missing-ack" && status != "queued" {
+				t.Fatalf("status = %q, want queued", status)
+			}
+			if f.promptCalls != 1 {
+				t.Fatalf("prompt calls = %d, want exactly one", f.promptCalls)
+			}
+			if f.keys != 0 || f.read != 0 {
+				t.Fatalf("cold failure used duplicate/decorative pane operations: keys=%d reads=%d", f.keys, f.read)
 			}
 		})
 	}

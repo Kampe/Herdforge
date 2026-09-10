@@ -44,10 +44,11 @@ func SetOpenCodeExecutableForTest(path string) func() {
 }
 
 type opencodePromptAck struct {
-	PaneID    string
-	Agent     string
-	Session   AgentSession
-	SessionID string
+	PaneID       string
+	Agent        string
+	Session      AgentSession
+	SessionID    string
+	SessionKnown bool
 }
 
 func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
@@ -55,9 +56,9 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 		Result struct {
 			Type  string `json:"type"`
 			Agent struct {
-				PaneID  string       `json:"pane_id"`
-				Agent   string       `json:"agent"`
-				Session AgentSession `json:"agent_session"`
+				PaneID  string        `json:"pane_id"`
+				Agent   string        `json:"agent"`
+				Session *AgentSession `json:"agent_session"`
 			} `json:"agent"`
 		} `json:"result"`
 	}
@@ -68,13 +69,19 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 		return opencodePromptAck{}, fmt.Errorf("native prompt acknowledgement type %q is not agent_prompted", envelope.Result.Type)
 	}
 	ack := opencodePromptAck{
-		PaneID:  envelope.Result.Agent.PaneID,
-		Agent:   envelope.Result.Agent.Agent,
-		Session: envelope.Result.Agent.Session,
+		PaneID: envelope.Result.Agent.PaneID,
+		Agent:  envelope.Result.Agent.Agent,
 	}
-	ack.SessionID = strings.TrimSpace(ack.Session.Value)
-	if ack.PaneID == "" || ack.Agent == "" || ack.SessionID == "" || ack.Session.Kind != "id" {
+	if envelope.Result.Agent.Session != nil {
+		ack.Session = *envelope.Result.Agent.Session
+		ack.SessionID = strings.TrimSpace(ack.Session.Value)
+		ack.SessionKnown = true
+	}
+	if ack.PaneID == "" || ack.Agent == "" {
 		return opencodePromptAck{}, errors.New("native prompt acknowledgement omitted pane, agent, or session identity")
+	}
+	if ack.SessionKnown && (!RealModelSessionID(ack.SessionID) || ack.Session.Kind != "id") {
+		return opencodePromptAck{}, errors.New("native prompt acknowledgement contained an invalid native session identity")
 	}
 	return ack, nil
 }
@@ -245,6 +252,32 @@ func sameOpenCodeIncarnation(before, after AgentEntry) error {
 	return nil
 }
 
+func sameOpenCodePrelaunchIdentity(before, after AgentEntry) error {
+	if before.Name == "" || before.Kind == "" || before.TabID == "" || before.PaneID == "" || before.Workspace == "" || before.TerminalID == "" {
+		return errors.New("OpenCode delivery requires exact prelaunch pane identity evidence")
+	}
+	checks := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"name", before.Name, after.Name},
+		{"kind", before.Kind, after.Kind},
+		{"tab", before.TabID, after.TabID},
+		{"pane", before.PaneID, after.PaneID},
+		{"workspace", before.Workspace, after.Workspace},
+		{"terminal", before.TerminalID, after.TerminalID},
+		{"cwd", before.Cwd, after.Cwd},
+		{"foreground cwd", before.ForegroundCwd, after.ForegroundCwd},
+	}
+	for _, check := range checks {
+		if check.before != check.after {
+			return fmt.Errorf("OpenCode delivery %s identity changed before session assignment", check.name)
+		}
+	}
+	return nil
+}
+
 func messageErrorAbsent(raw json.RawMessage) bool {
 	return len(raw) == 0 || string(raw) == "null"
 }
@@ -253,8 +286,8 @@ func modelMatches(expected, got opencodeModel) bool {
 	return expected.id() != "" && expected.id() == got.id() && expected.provider() == got.provider()
 }
 
-func openCodeConsumptionProof(before, after opencodeExportData, sessionID, cwd, payload string, submittedAt time.Time) error {
-	if before.Info.ID != sessionID {
+func openCodeConsumptionProof(before, after opencodeExportData, sessionID, cwd, payload string, submittedAt time.Time, cold bool) error {
+	if !cold && before.Info.ID != sessionID {
 		return errors.New("OpenCode pre-send export session does not match live session")
 	}
 	if after.Info.ID != sessionID {
@@ -354,16 +387,20 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 		return SendResult{}, err
 	}
 	sessionID := strings.TrimSpace(before.Session.Value)
-	if !RealModelSessionID(sessionID) {
-		return SendResult{}, errors.New("OpenCode delivery requires a real native model session")
+	cold := sessionID == ""
+	if !cold && !RealModelSessionID(sessionID) {
+		return SendResult{}, errors.New("OpenCode delivery has an invalid native model session")
 	}
-	baselineRaw, err := runOpenCodeExport(ctx, sessionID, cwd)
-	if err != nil {
-		return SendResult{}, fmt.Errorf("capture OpenCode pre-send evidence: %w", err)
-	}
-	baseline, err := parseOpenCodeExport(baselineRaw)
-	if err != nil {
-		return SendResult{}, err
+	var baseline opencodeExportData
+	if !cold {
+		baselineRaw, exportErr := runOpenCodeExport(ctx, sessionID, cwd)
+		if exportErr != nil {
+			return SendResult{}, fmt.Errorf("capture OpenCode pre-send evidence: %w", exportErr)
+		}
+		baseline, err = parseOpenCodeExport(baselineRaw)
+		if err != nil {
+			return SendResult{}, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return SendResult{Status: "queued"}, err
@@ -379,8 +416,11 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 	if err != nil {
 		return SendResult{}, err
 	}
-	if ack.Agent != before.Name || ack.PaneID != before.PaneID || ack.SessionID != sessionID {
-		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact target or session")
+	if ack.Agent != before.Name || ack.PaneID != before.PaneID {
+		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact target")
+	}
+	if !cold && (!ack.SessionKnown || ack.SessionID != sessionID) {
+		return SendResult{}, errors.New("OpenCode prompt acknowledgement does not bind the exact warm session")
 	}
 	deadline, hasDeadline := ctx.Deadline()
 	if !hasDeadline {
@@ -391,6 +431,42 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 		if err := ctx.Err(); err != nil {
 			return SendResult{Status: "queued"}, errQueuedUnobserved(before.Name, before.Status)
 		}
+		live, liveErr := requireAgentWorkspaceIn(target, workspace)
+		if liveErr != nil {
+			return SendResult{Status: "queued"}, liveErr
+		}
+		if identityErr := sameOpenCodePrelaunchIdentity(before, live); identityErr != nil {
+			return SendResult{Status: "queued"}, identityErr
+		}
+		if liveCwd, cwdErr := exactOpenCodeCwd(live); cwdErr != nil || liveCwd != cwd {
+			return SendResult{Status: "queued"}, errors.New("OpenCode live cwd changed during delivery")
+		}
+		if cold {
+			// Herdr's revision is the producer sequence for this AgentInfo. A
+			// real session appearing without a post-prompt revision transition
+			// could be a stale report of an old reusable session, so keep polling
+			// rather than accepting it as a newly-created native session.
+			if !RealModelSessionID(strings.TrimSpace(live.Session.Value)) || live.Session.Kind != "id" || live.Revision <= before.Revision {
+				if !time.Now().Before(deadline) {
+					return SendResult{Status: "queued"}, errQueuedUnobserved(before.Name, live.Status)
+				}
+				select {
+				case <-ctx.Done():
+					return SendResult{Status: "queued"}, errQueuedUnobserved(before.Name, live.Status)
+				case <-time.After(100 * time.Millisecond):
+				}
+				continue
+			}
+			sessionID = strings.TrimSpace(live.Session.Value)
+			if ack.SessionKnown && ack.SessionID != sessionID {
+				return SendResult{Status: "queued"}, errors.New("OpenCode prompt acknowledgement session differs from assigned native session")
+			}
+		}
+		if !cold {
+			if identityErr := sameOpenCodeIncarnation(before, live); identityErr != nil {
+				return SendResult{Status: "queued"}, identityErr
+			}
+		}
 		raw, exportErr := runOpenCodeExport(ctx, sessionID, cwd)
 		if exportErr != nil {
 			return SendResult{Status: "queued"}, fmt.Errorf("OpenCode consumption evidence unavailable: %w", exportErr)
@@ -399,17 +475,7 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 		if parseErr != nil {
 			return SendResult{Status: "queued"}, parseErr
 		}
-		live, liveErr := requireAgentWorkspaceIn(target, workspace)
-		if liveErr != nil {
-			return SendResult{Status: "queued"}, liveErr
-		}
-		if identityErr := sameOpenCodeIncarnation(before, live); identityErr != nil {
-			return SendResult{Status: "queued"}, identityErr
-		}
-		if liveCwd, cwdErr := exactOpenCodeCwd(live); cwdErr != nil || liveCwd != cwd {
-			return SendResult{Status: "queued"}, errors.New("OpenCode live cwd changed during delivery")
-		}
-		if proofErr := openCodeConsumptionProof(baseline, after, sessionID, cwd, payload, submittedAt); proofErr == nil {
+		if proofErr := openCodeConsumptionProof(baseline, after, sessionID, cwd, payload, submittedAt, cold); proofErr == nil {
 			return SendResult{Status: live.Status}, nil
 		} else {
 			lastProofErr = proofErr
