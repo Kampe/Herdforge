@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -262,6 +263,63 @@ type GitWorktreeEnumerator struct {
 
 type GitTrackedSourceInspector struct{}
 
+type gitStatusResult struct {
+	dirty, untracked bool
+	err              error
+}
+
+func batchGitStatus(ctx context.Context, lanes []RegisteredWorktree) map[string]gitStatusResult {
+	results := make(map[string]gitStatusResult, len(lanes))
+	paths := make([]string, 0, len(lanes))
+	for _, lane := range lanes {
+		resolved, err := filepath.EvalSymlinks(lane.Path)
+		if err == nil {
+			paths = append(paths, filepath.Clean(resolved))
+		}
+	}
+	if len(paths) == 0 {
+		return results
+	}
+	jobs := make(chan string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	workers := 8
+	if len(paths) < workers {
+		workers = len(paths)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case path, ok := <-jobs:
+					if !ok {
+						return
+					}
+					dirty, untracked, err := gitStatus(ctx, path)
+					mu.Lock()
+					results[path] = gitStatusResult{dirty: dirty, untracked: untracked, err: err}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+sendJobs:
+	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			break sendJobs
+		case jobs <- path:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
 func (GitTrackedSourceInspector) HasTrackedSource(ctx context.Context, worktree, relative string) (bool, error) {
 	out, err := gitOutput(ctx, worktree, "--literal-pathspecs", "ls-files", "-z", "--", filepath.ToSlash(relative))
 	if err != nil {
@@ -289,6 +347,7 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 	if processes == nil {
 		processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
 	}
+	statusResults := batchGitStatus(ctx, lanes)
 	var batchUsage map[string]ProcessUsage
 	var batchErr error
 	batchAttempted := false
@@ -317,7 +376,12 @@ func (e GitWorktreeEnumerator) List(ctx context.Context, repoRoot, baseRef strin
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "worktree_stat_unavailable"
 			continue
 		}
-		dirty, untracked, statusErr := gitStatus(ctx, lanes[i].Path)
+		statusResult, statusFound := statusResults[filepath.Clean(lanes[i].Path)]
+		if !statusFound {
+			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "git_status_unavailable"
+			continue
+		}
+		dirty, untracked, statusErr := statusResult.dirty, statusResult.untracked, statusResult.err
 		if statusErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "git_status_unavailable"
 			continue
