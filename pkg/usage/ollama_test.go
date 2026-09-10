@@ -77,7 +77,7 @@ func TestOllamaPollSignsExactRequestAndMapsFractions(t *testing.T) {
 		_, _ = w.Write([]byte(`{"plan":"pro","limits":{"session":{"usage":0.25},"weekly":{"usage":0.75}}}`))
 	}))
 	defer server.Close()
-	p, err := ollamaPollWithURL(server.URL, key, func() time.Time { return wantTime })
+	p, err := ollamaPollWithURL(server.URL+"/api/usage", key, func() time.Time { return wantTime })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,11 +94,23 @@ func TestOllamaPollRejectsHTTP200ErrorAndInvalidFraction(t *testing.T) {
 	defer zeroOllamaKey(&key)
 	for _, body := range []string{`{"error":"rate limited"}`, `{"limits":{"session":{"usage":1.1}}}`} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
-		_, err := ollamaPollWithURL(server.URL, key, time.Now)
+		_, err := ollamaPollWithURL(server.URL+"/api/usage", key, time.Now)
 		server.Close()
 		if err == nil {
 			t.Fatalf("invalid Ollama response %s was accepted", body)
 		}
+	}
+}
+
+func TestOllamaSignedPollRejectsPartialInvalidWindows(t *testing.T) {
+	key, _ := ollamaFixtureKey(t)
+	defer zeroOllamaKey(&key)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"limits":{"session":{"usage":0.4},"weekly":{"usage":1.2}}}`))
+	}))
+	defer server.Close()
+	if _, err := ollamaPollWithURL(server.URL+"/api/usage", key, time.Now); pollErrorCode(err) != "decode-failed" {
+		t.Fatalf("partial invalid signed response must fail closed, got %v", err)
 	}
 }
 

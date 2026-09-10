@@ -75,8 +75,10 @@ func ollamaCloudBearerPollWithURL(endpoint, credential string, now func() time.T
 		return ProviderUsage{}, pollErrf("provider-error", "ollama-cloud quota: %s", strings.TrimSpace(body.Error))
 	}
 	resources := map[string]ResourceUsage{}
+	invalidWindow := false
 	add := func(name string, usage *float64, seconds int) {
 		if usage == nil || *usage < 0 || *usage > 1 {
+			invalidWindow = true
 			return
 		}
 		used := *usage * 100
@@ -88,6 +90,9 @@ func ollamaCloudBearerPollWithURL(endpoint, credential string, now func() time.T
 	if body.Limits.Weekly != nil {
 		add("weekly", body.Limits.Weekly.Usage, WindowWeekly)
 	}
+	if invalidWindow {
+		return ProviderUsage{}, pollErrf("decode-failed", "ollama-cloud quota: invalid session or weekly window")
+	}
 	if len(resources) == 0 {
 		return ProviderUsage{}, pollErrf("no-windows", "ollama-cloud quota: no usable session or weekly window")
 	}
@@ -98,7 +103,7 @@ func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Ti
 	ts := strconv.FormatInt(now().Unix(), 10)
 	requestURI := "/api/usage?ts=" + ts
 	url := strings.TrimRight(endpoint, "/")
-	if parsed, err := http.NewRequest("GET", url+requestURI, nil); err == nil {
+	if parsed, err := http.NewRequest("GET", url+"?ts="+ts, nil); err == nil {
 		signature := ed25519.Sign(key.private, []byte("GET,"+requestURI))
 		parsed.Header.Set("Authorization", base64.StdEncoding.EncodeToString(key.blob)+":"+base64.StdEncoding.EncodeToString(signature))
 		resp, requestErr := pollClient().Do(parsed)
@@ -120,8 +125,10 @@ func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Ti
 			return ProviderUsage{}, pollErrf("provider-error", "ollama quota: %s", strings.TrimSpace(body.Error))
 		}
 		resources := map[string]ResourceUsage{}
+		invalidWindow := false
 		add := func(name string, usage *float64, seconds int) {
 			if usage == nil || *usage < 0 || *usage > 1 {
+				invalidWindow = true
 				return
 			}
 			used := *usage * 100
@@ -132,6 +139,9 @@ func ollamaPollWithURL(endpoint string, key ollamaSigningKey, now func() time.Ti
 		}
 		if body.Limits.Weekly != nil {
 			add("weekly", body.Limits.Weekly.Usage, WindowWeekly)
+		}
+		if invalidWindow {
+			return ProviderUsage{}, pollErrf("decode-failed", "ollama quota: invalid session or weekly window")
 		}
 		if len(resources) == 0 {
 			return ProviderUsage{}, pollErrf("no-windows", "ollama quota: no usable session or weekly window")
