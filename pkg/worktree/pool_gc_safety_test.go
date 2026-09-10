@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/resources"
 )
@@ -447,5 +448,32 @@ func TestPoolGCCleanInjectedCensusRemovesAndEnsureRebuilds(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(pool.Root, "pool-01")); err != nil {
 		t.Fatalf("Ensure should rebuild removed slot: %v", err)
+	}
+}
+
+func TestPoolGCRefusesPositiveExitOneWithoutDescriptorName(t *testing.T) {
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lsof := filepath.Join(root, "lsof")
+	if err := os.WriteFile(lsof, []byte("#!/bin/sh\nprintf 'p99999\\nf3\\n'\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pool.ProcessInspector = resources.LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
+
+	err := pool.GC(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "metadata unavailable") {
+		t.Fatalf("GC error = %v, want fail-closed census refusal on partial positive exit 1", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("partial positive census must preserve pool state, slots=%d err=%v", len(slots), err)
+	}
+	if _, err := os.Stat(filepath.Join(pool.Root, "pool-01")); err != nil {
+		t.Fatalf("slot must not be deleted on partial positive exit 1: %v", err)
 	}
 }

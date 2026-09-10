@@ -162,6 +162,22 @@ func TestLSOFProcessInspectorPreservesPositiveExitOneOwnerEvidence(t *testing.T)
 	}
 }
 
+func TestLSOFProcessInspectorPositiveExitOneWithoutNameMarksMetadataUnavailable(t *testing.T) {
+	root := t.TempDir()
+	lsof := filepath.Join(root, "lsof")
+	if err := os.WriteFile(lsof, []byte("#!/bin/sh\nprintf 'p99999\\nf3\\n'\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Second}
+	usage, err := inspector.InUse(context.Background(), root)
+	if err != nil {
+		t.Fatalf("positive lsof exit 1 should not fail hard when parsed: %v", err)
+	}
+	if !usage.MetadataUnavailable {
+		t.Fatalf("expected MetadataUnavailable for positive exit 1 without name, got usage=%+v", usage)
+	}
+}
+
 func TestProcessOwnerViaPSClassifiesOwnerEvidence(t *testing.T) {
 	foreignUID := 0
 	if os.Getuid() == 0 {
