@@ -229,6 +229,88 @@ func TestUpCommandExplicitOverrideBoundsWorktreePolicy(t *testing.T) {
 	}
 }
 
+// TestUpCommandExplicitMalformedOverrideIsNotReplacedByTargetPolicy proves the
+// worktree-scoping fix never second-guesses an operator's explicit override:
+// even when that override file is itself malformed, useHarnessHooksFromWorktree
+// must not silently substitute the target worktree's own (valid) pin. The
+// launch fails closed on the operator's file, exactly as it would have before
+// this correction existed.
+func TestUpCommandExplicitMalformedOverrideIsNotReplacedByTargetPolicy(t *testing.T) {
+	root, targetDir, runtime := upHookPolicyFixture(t, "target-worktree")
+	writeHookPolicyFile(t, filepath.Join(root, ".herd", "harness-hooks.json"), "canonical-marker")
+	writeHookPolicyFile(t, filepath.Join(targetDir, ".herd", "harness-hooks.json"), "target-marker-must-not-be-used")
+	operatorFile := filepath.Join(root, "operator-pin.json")
+	if err := os.WriteFile(operatorFile, []byte("{not valid json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", operatorFile)
+
+	err := runUpCommand("worker", runtime, os.Stdout)
+	if err == nil {
+		t.Fatal("malformed explicit operator override did not refuse the launch")
+	}
+	if runtime.opens != 0 {
+		t.Fatalf("malformed explicit override still opened a tab: %d", runtime.opens)
+	}
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != operatorFile {
+		t.Fatalf("HERD_HARNESS_HOOKS_FILE was not left exactly as the operator set it: got %q want %q", got, operatorFile)
+	}
+	for _, r := range readReceipts(t, root) {
+		if r.Accepted {
+			t.Fatalf("malformed explicit override produced an accepted receipt: %+v", r)
+		}
+	}
+}
+
+// TestUpCommandExplicitOverrideToMissingFileIsNotReplacedByTargetPolicy covers
+// an operator override pointed at a file that doesn't exist yet (e.g. not
+// pinned this cycle): DefaultDiscovery already treats a missing explicit
+// override as a hard failure (harness.go:285), and the worktree-scoping fix
+// must preserve that -- not fall back to the target's own valid pin.
+func TestUpCommandExplicitOverrideToMissingFileIsNotReplacedByTargetPolicy(t *testing.T) {
+	root, targetDir, runtime := upHookPolicyFixture(t, "target-worktree")
+	writeHookPolicyFile(t, filepath.Join(root, ".herd", "harness-hooks.json"), "canonical-marker")
+	writeHookPolicyFile(t, filepath.Join(targetDir, ".herd", "harness-hooks.json"), "target-marker-must-not-be-used")
+	operatorFile := filepath.Join(root, "does-not-exist.json")
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", operatorFile)
+
+	err := runUpCommand("worker", runtime, os.Stdout)
+	if err == nil {
+		t.Fatal("explicit operator override to a missing file did not refuse the launch")
+	}
+	if runtime.opens != 0 {
+		t.Fatalf("missing explicit override still opened a tab: %d", runtime.opens)
+	}
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != operatorFile {
+		t.Fatalf("HERD_HARNESS_HOOKS_FILE was not left exactly as the operator set it: got %q want %q", got, operatorFile)
+	}
+}
+
+// TestUpCommandRestoresEnvironmentAfterRefusedLaunch proves the deferred
+// restore fires on every exit path, not only the success path -- a leaked
+// HERD_HARNESS_HOOKS_FILE from one refused lane launch must never leak into
+// whatever the coordinator process does next.
+func TestUpCommandRestoresEnvironmentAfterRefusedLaunch(t *testing.T) {
+	root, targetDir, runtime := upHookPolicyFixture(t, "target-worktree")
+	writeHookPolicyFile(t, filepath.Join(root, ".herd", "harness-hooks.json"), "canonical-marker")
+	if err := os.MkdirAll(filepath.Join(targetDir, ".herd"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, ".herd", "harness-hooks.json"), []byte("{not valid json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, hadPrevious := os.LookupEnv("HERD_HARNESS_HOOKS_FILE"); hadPrevious {
+		t.Fatal("test environment already has HERD_HARNESS_HOOKS_FILE set")
+	}
+
+	if err := runUpCommand("worker", runtime, os.Stdout); err == nil {
+		t.Fatal("malformed target worktree hook policy did not refuse the launch")
+	}
+	if got, isSet := os.LookupEnv("HERD_HARNESS_HOOKS_FILE"); isSet {
+		t.Fatalf("HERD_HARNESS_HOOKS_FILE leaked past a refused launch: %q", got)
+	}
+}
+
 // TestUpCommandFallsBackToCanonicalPolicyWhenTargetHasNone covers the no-target
 // case: when the lane worktree has no pin file of its own, behavior is
 // unchanged from before this correction -- canonical discovery still applies.

@@ -1717,6 +1717,51 @@ func runQuotaLimits(oneProvider string, force bool) {
 	}
 }
 
+// recoveryCycleAdmission is the FAC-196/FAC-624 admission seam extracted
+// from runDaemon's per-tick cycle closure (minimal extraction, declared
+// here) so it is directly testable without a live store, board, broker, or
+// task provider -- exactly the launch-admission portion cycle performs
+// before any live daemon.Engine/RunDaemonTick work begins. buildTaskProvider
+// is loadTaskProvider in production; injected here only so a test can prove
+// admission-refusal behavior without needing a real one (it is never
+// invoked when admission itself is refused, since launchAdmissionWithLifecycle
+// only runs its effect after a successful decision).
+//
+// FAC-196: claim-to-dispatch is one transaction. Non-compensable prep (lane,
+// routed decision, Herdr) happens before RunPulse. FAC-194 still owns
+// removing any residual OpenCode ModelRouter constructions on other
+// entrypoints; this path uses the authoritative launchAdmission +
+// SurfaceRouter waterfall only.
+//
+// FAC-624: this is re-run on every daemon.RunPulseScheduler tick for the
+// coordinator's entire uptime (herd daemon, default unbounded), all in one
+// process -- the same shape standing's AdmitRoute has. Scope hook policy to
+// the lane's own worktree and mint one attempt identity per cycle, carried
+// on ctx (not a package global) so two textually-concurrent admissions --
+// were this ever made concurrent -- cannot observe each other's value.
+func recoveryCycleAdmission(ctx context.Context, cfg *config.Config, role string, buildTaskProvider func(*config.Config) (provider.TaskProvider, error)) (*router.LaunchDecision, provider.TaskProvider, *config.LaneDef, error) {
+	lane := findLaneForRole(cfg, role)
+	if lane == nil {
+		return nil, nil, nil, fmt.Errorf("no lane configured for role %q", role)
+	}
+	restoreHooks := laneHookPolicyScope(lane)
+	defer restoreHooks()
+	ctx = withAttemptID(ctx, launch.NewAttemptID())
+	var tp provider.TaskProvider
+	decision, admitErr := launchAdmissionWithLifecycle(ctx, liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
+		var tpErr error
+		tp, tpErr = buildTaskProvider(cfg)
+		return tpErr
+	})
+	if admitErr != nil {
+		return nil, nil, nil, fmt.Errorf("launch route rejected before claim: %w", admitErr)
+	}
+	if tp == nil {
+		return nil, nil, nil, fmt.Errorf("task provider: not constructed after launch admission")
+	}
+	return decision, tp, lane, nil
+}
+
 func runDaemon() {
 	if err := requireFleetAdmission(context.Background()); err != nil {
 		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
@@ -1753,26 +1798,9 @@ func runDaemon() {
 	}
 
 	cycle := func(ctx context.Context) error {
-		// FAC-196: claim-to-dispatch is one transaction. Non-compensable
-		// prep (lane, routed decision, Herdr) happens before RunPulse.
-		// FAC-194 still owns removing any residual OpenCode ModelRouter
-		// constructions on other entrypoints; this path uses the
-		// authoritative launchAdmission + SurfaceRouter waterfall only.
-		lane := findLaneForRole(cfg, *role)
-		if lane == nil {
-			return fmt.Errorf("no lane configured for role %q", *role)
-		}
-		var tp provider.TaskProvider
-		decision, admitErr := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, herdr.IsAvailable(), routedLaneDecision(ctx, nil), func(_ *router.LaunchDecision) error {
-			var tpErr error
-			tp, tpErr = loadTaskProvider(cfg)
-			return tpErr
-		})
+		decision, tp, lane, admitErr := recoveryCycleAdmission(ctx, cfg, *role, loadTaskProvider)
 		if admitErr != nil {
-			return fmt.Errorf("launch route rejected before claim: %w", admitErr)
-		}
-		if tp == nil {
-			return fmt.Errorf("task provider: not constructed after launch admission")
+			return admitErr
 		}
 		repository := repositoryIdentityForLaunch(cfg)
 		if repository == "" {
@@ -2040,17 +2068,30 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			if err := validateLaneLaunchConfig(lane); err != nil {
 				return standing.Route{}, err
 			}
+			// FAC-624: admission below can run against a stale canonical hook
+			// policy pin even though this lane's own target worktree has a
+			// fresh one -- exactly the gap FAC-767/185679cd closed for
+			// `herd up`. lane.Worktree is already known here, before CreateTab.
+			restoreHooks := laneHookPolicyScope(lane)
+			defer restoreHooks()
+			// FAC-624: a bare PID cannot distinguish repeated admission
+			// attempts within one long-lived process -- exactly this
+			// AdmitRoute, rearmed on every ForgeLoop tick for the
+			// coordinator's entire uptime. Mint one identity per attempt,
+			// here, once, carried on ctx rather than a package global so
+			// two textually-concurrent admissions cannot cross-contaminate.
+			ctx := withAttemptID(context.Background(), launch.NewAttemptID())
 			// The launch decision is the sole standing admission authority. Do
 			// not run a separate quota-only pre-gate here: it reads a different
 			// snapshot from the router and cannot account for live concurrency,
 			// provider probes, cooldowns, or the router's fallback decision.
 			// FAC-618: two health authorities must not silently disagree and
 			// strand a standing lane before the actual launch decision runs.
-			decision, err := launchAdmission(cfg, lane, true, routedLaneDecision(context.Background(), nil))
+			decision, err := launchAdmission(ctx, cfg, lane, true, routedLaneDecision(ctx, nil))
 			if err != nil {
 				return standing.Route{}, err
 			}
-			if err := validateDecisionBeforeSideEffect(decision, lane.Name); err != nil {
+			if err := validateDecisionBeforeSideEffect(ctx, decision, lane.Name); err != nil {
 				return standing.Route{}, err
 			}
 			lastAdmit.lane = lane
@@ -2768,7 +2809,8 @@ func runReview() {
 		}
 		restoreHooks := useHarnessHooksFromWorktree(wt)
 		defer restoreHooks()
-		decision, err := launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(context.Background(), task), func(_ *router.LaunchDecision) error {
+		reviewCtx := withAttemptID(ctx, launch.NewAttemptID())
+		decision, err := launchAdmissionWithLifecycle(reviewCtx, liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(reviewCtx, task), func(_ *router.LaunchDecision) error {
 			_, listErr := herdr.AgentList()
 			return listErr
 		})
@@ -2776,7 +2818,7 @@ func runReview() {
 			fmt.Fprintf(os.Stderr, "review launch route rejected before tab creation: %v\n", err)
 			os.Exit(1)
 		}
-		if err := validateDecisionBeforeSideEffect(decision, task.Ref); err != nil {
+		if err := validateDecisionBeforeSideEffect(reviewCtx, decision, task.Ref); err != nil {
 			fmt.Fprintf(os.Stderr, "review launch decision rejected before tab creation: %v\n", err)
 			os.Exit(1)
 		}
@@ -5455,7 +5497,15 @@ func dispatchTicketDecision(ctx context.Context, req dispatchRequest, announce i
 			}
 			return nil, nil, fmt.Errorf("dispatch lane %q is not configured for launch", canonicalLane.Name)
 		}
-		decision, err = launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, launchLane, true, routedLaneDecision(ctx, nil), func(admitted *router.LaunchDecision) error {
+		// FAC-624: dispatchTicketDecision is called repeatedly by
+		// pulse.go's sweep over the lifetime of a long-lived `herd
+		// daemon`/`herd pulse` process, same shape as standing's
+		// AdmitRoute. Scope hook policy to the lane's own worktree and
+		// mint one attempt identity per dispatch attempt.
+		restoreHooks := laneHookPolicyScope(launchLane)
+		defer restoreHooks()
+		admitCtx := withAttemptID(ctx, launch.NewAttemptID())
+		decision, err = launchAdmissionWithLifecycle(admitCtx, liveLaunchLifecycle{}, cfg, launchLane, true, routedLaneDecision(admitCtx, nil), func(admitted *router.LaunchDecision) error {
 			if err := admitDispatch(); err != nil {
 				return err
 			}
@@ -6166,7 +6216,7 @@ func runForgeE() error {
 	if err != nil {
 		return fmt.Errorf("launch route rejected before forge claim: %w", err)
 	}
-	if err := validateDecisionBeforeSideEffect(forgeDecision, forgeLane.Name); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, forgeDecision, forgeLane.Name); err != nil {
 		return fmt.Errorf("launch decision rejected before forge claim: %w", err)
 	}
 	if eng == nil {
@@ -6195,7 +6245,7 @@ func runForgeE() error {
 		if herdr.IsAvailable() {
 			lane := forgeLane
 			if lane != nil {
-				decision, bindErr := rebindDecisionForTask(forgeDecision, task.Ref, forgeLeaseGeneration)
+				decision, bindErr := rebindDecisionForTask(ctx, forgeDecision, task.Ref, forgeLeaseGeneration)
 				if bindErr != nil {
 					return compensateLaunchFailure(fmt.Errorf("forge launch decision rejected after claim: %w", bindErr))
 				}
@@ -6507,8 +6557,15 @@ func forgeGitOutput(dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// forgeLaunchAdmission is called repeatedly for the same lane over the
+// lifetime of a long-lived `herd forge --loop` coordinator process (FAC-624):
+// scope hook policy to the lane's own worktree and mint one attempt identity
+// per call, exactly as standing's AdmitRoute does.
 func forgeLaunchAdmission(cfg *config.Config, lane *config.LaneDef, ctx context.Context, effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
-	return launchAdmissionWithLifecycle(liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(ctx, nil), effect)
+	restoreHooks := laneHookPolicyScope(lane)
+	defer restoreHooks()
+	ctx = withAttemptID(ctx, launch.NewAttemptID())
+	return launchAdmissionWithLifecycle(ctx, liveLaunchLifecycle{}, cfg, lane, true, routedLaneDecision(ctx, nil), effect)
 }
 
 // findLaneByName resolves the one lane an operator named. Unlike a role, a lane
@@ -6817,7 +6874,7 @@ func laneLaunchDecisionWithProbe(ctx context.Context, lane *config.LaneDef, task
 	} else if decision.Provider != lane.Provider || decision.Model != lane.Model || decision.Effort != lane.Effort {
 		fmt.Fprintf(os.Stderr, "herd: lane %q rerouted by quota: %s/%s/%s -> %s/%s/%s (%s)\n", lane.Name, lane.Provider, lane.Model, lane.Effort, decision.Provider, decision.Model, decision.Effort, decision.Availability)
 	}
-	if err := validateDecisionBeforeSideEffect(decision, contextRef); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, decision, contextRef); err != nil {
 		return nil, err
 	}
 	return decision, nil
@@ -7047,11 +7104,11 @@ func recordWorkerModelPolicyBlocked(st *store.Store, entrypoint, reason string) 
 	return err
 }
 
-func validateDecisionBeforeSideEffect(decision *router.LaunchDecision, taskRef string) error {
+func validateDecisionBeforeSideEffect(ctx context.Context, decision *router.LaunchDecision, taskRef string) error {
 	if decision == nil {
 		return fmt.Errorf("missing routed launch decision")
 	}
-	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope}, nil)
+	return launch.Validate(launch.Request{Decision: decision, TaskRef: taskRef, LeaseGeneration: decision.LeaseGeneration, Scope: decision.Scope, AttemptID: attemptIDFromContext(ctx)}, nil)
 }
 
 // ensureArtifactToolProbe returns a current tool-probe PASS for decision's
@@ -7133,12 +7190,12 @@ func openWriteCapableTab(decision *router.LaunchDecision, req launch.Request, la
 	})
 }
 
-func rebindDecisionForTask(decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
+func rebindDecisionForTask(ctx context.Context, decision *router.LaunchDecision, taskRef string, leaseGeneration int64) (*router.LaunchDecision, error) {
 	bound, err := router.RebindDecision(decision, taskRef, leaseGeneration)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDecisionBeforeSideEffect(bound, taskRef); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, bound, taskRef); err != nil {
 		return nil, err
 	}
 	return bound, nil
@@ -7186,8 +7243,8 @@ func (liveLaunchLifecycle) Run(decision *router.LaunchDecision, effect func(*rou
 	return effect(decision)
 }
 
-func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
-	decision, err := launchAdmission(cfg, lane, herdrAvailable, route)
+func launchAdmissionWithLifecycle(ctx context.Context, lc launchLifecycle, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error), effect func(*router.LaunchDecision) error) (*router.LaunchDecision, error) {
+	decision, err := launchAdmission(ctx, cfg, lane, herdrAvailable, route)
 	if err != nil {
 		return nil, err
 	}
@@ -7203,7 +7260,7 @@ func launchAdmissionWithLifecycle(lc launchLifecycle, cfg *config.Config, lane *
 // smith-grok are both "worker" -- so `herd dispatch --lane smith-grok` resolved
 // smith-grok by name, passed only its role here, and launched smith's codex
 // argv under smith-grok's identity. Taking the lane makes that unrepresentable.
-func launchAdmission(cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
+func launchAdmission(ctx context.Context, cfg *config.Config, lane *config.LaneDef, herdrAvailable bool, route func(*config.LaneDef) (*router.LaunchDecision, error)) (*router.LaunchDecision, error) {
 	if lane == nil {
 		return nil, fmt.Errorf("launch admission requires an exact lane")
 	}
@@ -7231,7 +7288,7 @@ func launchAdmission(cfg *config.Config, lane *config.LaneDef, herdrAvailable bo
 	case router.ScopeLane:
 		validationContext = lane.Name
 	}
-	if err := validateDecisionBeforeSideEffect(decision, validationContext); err != nil {
+	if err := validateDecisionBeforeSideEffect(ctx, decision, validationContext); err != nil {
 		return nil, err
 	}
 	return decision, nil

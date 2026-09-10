@@ -728,10 +728,19 @@ func TestDaemonTick_CmdWiringCallsRunDaemonTick(t *testing.T) {
 		t.Fatal("runDaemon still reports Claimed without Dispatched — orphan path")
 	}
 	// Non-compensable admission must precede the tick (which claims).
-	admitIdx := strings.Index(fn, "launchAdmissionWithLifecycle")
+	admitIdx := strings.Index(fn, "recoveryCycleAdmission")
 	tickIdx := strings.Index(fn, "RunDaemonTick")
 	if admitIdx < 0 || tickIdx < 0 || admitIdx > tickIdx {
 		t.Fatalf("launch admission must precede RunDaemonTick (admit=%d tick=%d)", admitIdx, tickIdx)
+	}
+
+	// Verify recoveryCycleAdmission executes launchAdmissionWithLifecycle.
+	admitFn := extractFunc(string(src), "func recoveryCycleAdmission(")
+	if admitFn == "" {
+		t.Fatal("recoveryCycleAdmission not found in cmd/herd/main.go")
+	}
+	if !strings.Contains(admitFn, "launchAdmissionWithLifecycle") {
+		t.Fatal("recoveryCycleAdmission must call launchAdmissionWithLifecycle")
 	}
 }
 

@@ -372,7 +372,10 @@ func TestHookPoliciesBindExactRevisionAndHealthAuthority(t *testing.T) {
 		revision string
 		code     HookCode
 	}{
-		{"missing", HookPolicy{}, "", HookCodePolicyMissing},
+		// FAC-624: an empty policy set is its own condition
+		// (HookCodePolicySetMissing), distinct from a named hook lacking a
+		// policy (HookCodePolicyMissing, still exercised below).
+		{"missing", HookPolicy{}, "", HookCodePolicySetMissing},
 		{"stale", valid, "sha256:stale", HookCodePolicyStale},
 		{"mismatch", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequirement("unknown"), HealthURL: valid.HealthURL}, "", HookCodePolicyMismatch},
 		{"external", HookPolicy{HandlerDigest: hook.Name, Requirement: HookRequired, HealthURL: "https://example.com/health"}, "", HookCodeAuthority},

@@ -11,13 +11,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 	"github.com/Kampe/Herdforge/pkg/harness"
+	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/toolpolicy"
 )
@@ -69,6 +72,16 @@ type Request struct {
 	HookWarning        func(string)
 	HookDiscovery      harness.HookDiscovery
 	HookPolicyRevision string
+	// AttemptID identifies one logical admission attempt (FAC-624). It must
+	// be minted ONCE by the caller at the start of that attempt (see
+	// NewAttemptID) and reused for every Validate call belonging to that
+	// same attempt -- never re-minted per Validate/WriteOnce call, or an
+	// idempotent retry would wrongly look like a new attempt. A caller that
+	// never sets it (most callers today; only `herd standing`'s AdmitRoute
+	// does) falls back to this process's own identity, which is correct for
+	// a one-shot process but not for a long-lived one that can attempt the
+	// same admission many times (see attemptIdentity).
+	AttemptID string
 }
 
 // LaunchEffects are the write-capable operations that must remain behind the
@@ -915,7 +928,14 @@ func preflightHooks(req Request, sink Sink) (harness.HookReport, error) {
 	if result.PolicyRequired {
 		bound, code, digest := harness.ApplyHookPolicies(result.Hooks, result.Policies, result.PolicyRevision)
 		if code != harness.HookCodeHealthy {
-			return report, recordHookFailure(req, sink, code, digest, harness.EndpointInvalid, "")
+			name := digest
+			if code == harness.HookCodePolicySetMissing {
+				// FAC-624: name the discovery source, never a hook -- an
+				// empty policy set is a resolution failure, not evidence
+				// against whichever hook happened to be first in the list.
+				name = fmt.Sprintf("no policy set loaded; source=%q", result.SourcePath)
+			}
+			return report, recordHookFailure(req, sink, code, name, harness.EndpointInvalid, "")
 		}
 		result.Hooks = bound
 	}
@@ -955,6 +975,50 @@ func hookReceiptKey(req Request, code harness.HookCode, name string) string {
 	return fmt.Sprintf("hook|%s|%d|%s|%s|%s|%s|%s", req.TaskRef, req.LeaseGeneration, req.HookPolicyRevision, DecisionDigest(req.Decision), name, string(code), req.Scope)
 }
 
+// attemptIdentity distinguishes one launch attempt from another for receipt
+// keys that must not silently collapse two genuinely separate blocked
+// launches (FAC-624 defect 3), while an idempotent retry of the SAME attempt
+// still dedupes as before. Wall-clock time cannot do this: two distinct
+// attempts can land in the same bucket, and one retried attempt can straddle
+// a bucket boundary. A process's own PID is a real, already-existing identity
+// for "this attempt" -- `herd up`/`herd standing` are each a fresh process
+// per invocation, stable for that invocation's lifetime and distinct across
+// separate ones -- not an invented or random receipt ID. Overridden in tests.
+// attemptIdentity is the fallback attempt identity for callers that have not
+// migrated to NewAttemptID/Request.AttemptID. A fresh one-shot process does
+// NOT by itself eliminate PID reuse (a later, unrelated process can be
+// assigned the same PID once this one exits), so this binds
+// mail.ProcessIncarnationID() (PID + process start time + boot id) rather
+// than the bare PID; falling back to the bare PID only if the incarnation
+// identity is unavailable for some reason.
+var attemptIdentity = func() string {
+	if id, err := mail.ProcessIncarnationID(); err == nil && id != "" {
+		return id
+	}
+	return strconv.Itoa(os.Getpid())
+}
+
+// attemptCounter distinguishes multiple attempts minted within one process
+// incarnation (e.g. `herd standing`'s AdmitRoute, called repeatedly for the
+// entire lifetime of a long-lived `herd forge --loop` coordinator process).
+var attemptCounter int64
+
+// NewAttemptID mints a fresh identity for ONE logical admission attempt.
+// Callers mint exactly once, at the start of that attempt (before calling
+// into admission), and reuse the same value for every Validate call that
+// belongs to it -- minting a new one per Validate/WriteOnce call would
+// defeat idempotent-retry dedup entirely, which is exactly the "invented
+// random receipt ID" failure mode to avoid.
+//
+// Binds mail.ProcessIncarnationID() (this exact process incarnation --
+// immune to PID reuse across separate processes, unlike attemptIdentity's
+// bare PID) to a monotonic per-process counter, so repeated attempts within
+// one long-lived process are still distinguishable from each other.
+func NewAttemptID() string {
+	n := atomic.AddInt64(&attemptCounter, 1)
+	return fmt.Sprintf("%s-%d", attemptIdentity(), n)
+}
+
 func recordHookFailure(req Request, sink Sink, code harness.HookCode, name string, endpoint harness.EndpointClass, authority string) error {
 	role, shape, provider, model, effort, digest, argv := fields(req)
 	fd, fa, ff, fs := fleetReceiptFields(req)
@@ -965,7 +1029,34 @@ func recordHookFailure(req Request, sink Sink, code harness.HookCode, name strin
 	receipt.HookName = name
 	receipt.EndpointClass = string(endpoint)
 	receipt.RedactedAuthority = authority
-	receipt.ReceiptKey = hookReceiptKey(req, code, name)
+	key := hookReceiptKey(req, code, name)
+	if code == harness.HookCodePolicySetMissing {
+		// FAC-624 defect 3: WriteOnce dedupes a ReceiptKey against the
+		// receipt log's ENTIRE history, forever -- fine for a stable
+		// misconfiguration fact (a genuinely missing/stale/mismatched
+		// policy always deserves the same key), but an empty-policy read
+		// is a per-occurrence discovery failure. Without this, one
+		// historical hit permanently silences every later refusal that
+		// happens to share task/generation/policy-revision/source, which
+		// is exactly how the operator's blocked launches left no receipt
+		// to inspect. Bind to the actual attempt instead of wall-clock
+		// time: two distinct attempts landing in the same instant must
+		// each be observable, while retrying the SAME attempt must still
+		// dedupe. req.AttemptID (minted once at the caller's admission
+		// boundary, see NewAttemptID) is authoritative when a caller sets
+		// it -- unlike a bare PID, it survives a single long-lived process
+		// attempting the same admission many times (`herd standing`'s
+		// AdmitRoute, rearmed repeatedly by a `herd forge --loop`
+		// coordinator). Callers that do not set it fall back to
+		// attemptIdentity() (this process's PID), correct for their
+		// one-shot-process shape but not for a long-lived one.
+		id := strings.TrimSpace(req.AttemptID)
+		if id == "" {
+			id = attemptIdentity()
+		}
+		key = fmt.Sprintf("%s|%s", key, id)
+	}
+	receipt.ReceiptKey = key
 	if _, err := writeOnce(sink, receipt); err != nil {
 		return fmt.Errorf("launch hook preflight failed: %s", code)
 	}

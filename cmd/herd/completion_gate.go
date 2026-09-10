@@ -351,6 +351,58 @@ func worktreeExists(path string) bool {
 	return err == nil && fi.IsDir()
 }
 
+// laneHookPolicyScope is useHarnessHooksFromWorktree applied to a lane's own
+// configured worktree (FAC-624). Every launchAdmission caller admits through
+// the same launchAdmission -> preflightHooks -> harness.DefaultDiscovery
+// chain `herd up` had the original gap in (FAC-767/185679cd): without this,
+// admission resolves .herd/harness-hooks.json relative to the coordinator's
+// own cwd, so a stale canonical pin can strand a lane whose own target
+// worktree already has a fresh one. A nil lane (defensive only -- every real
+// caller resolves one first) is a no-op, matching "nothing to scope to."
+func laneHookPolicyScope(lane *config.LaneDef) func() {
+	if lane == nil {
+		return func() {}
+	}
+	return useHarnessHooksFromWorktree(filepath.Join(".", lane.Worktree))
+}
+
+// attemptIDContextKey carries one caller-minted admission-attempt identity
+// (FAC-624, launch.NewAttemptID) on a context.Context, read by
+// validateDecisionBeforeSideEffect when it builds its Request.
+//
+// This replaces an earlier package-global var. The global was auditable-safe
+// today (grep for `go func` across cmd/herd and pkg/daemon/forgeloop.go
+// finds no admission path that fans out concurrently -- every caller that
+// would have scoped it runs on its own single goroutine per process), but a
+// global is still one shared mutable cell: it cannot, even in principle,
+// give two textually-concurrent admissions independent values, no matter how
+// carefully it is mutex-guarded (a mutex only stops a torn read/write, not
+// cross-contamination of WHICH value a concurrent caller sees). A
+// context.Context value is scoped to the call tree that carries it, so two
+// admissions -- sequential or, if ever made concurrent, truly parallel --
+// each with their own ctx, cannot observe each other's attempt identity.
+// Every real admission caller mints its ctx via withAttemptID before routing
+// or validating; a ctx with none set reads back "" (attemptIDFromContext),
+// which recordHookFailure treats identically to how the old unset global
+// behaved -- no behavior change for any caller that does not opt in.
+type attemptIDContextKey struct{}
+
+// withAttemptID returns ctx carrying id as this call tree's admission
+// attempt identity. Callers mint id ONCE per logical attempt (launch.NewAttemptID)
+// and pass the returned ctx through every route/validate call belonging to
+// that same attempt -- never re-minting per call, which would defeat
+// idempotent-retry dedup.
+func withAttemptID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, attemptIDContextKey{}, id)
+}
+
+// attemptIDFromContext reads the attempt identity ctx carries, or "" if none
+// was set (every caller that has not opted in).
+func attemptIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(attemptIDContextKey{}).(string)
+	return id
+}
+
 // useHarnessHooksFromWorktree supplies the repository-declared hook policy
 // when a coordinator is reviewing a candidate before that candidate has
 // landed on the coordinator's checkout. The candidate worktree is already

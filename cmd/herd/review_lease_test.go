@@ -432,6 +432,61 @@ func TestUseHarnessHooksFromWorktreePreservesExplicitOverride(t *testing.T) {
 	restore()
 }
 
+// TestStandingHookPolicyScopeUsesLaneWorktreePolicy is FAC-624's `standing`
+// defect: standing's AdmitRoute admits through the same launchAdmission ->
+// preflightHooks -> harness.DefaultDiscovery chain `herd up` does, and had
+// the identical unscoped-cwd gap FAC-767/185679cd fixed for `up`.
+func TestStandingHookPolicyScopeUsesLaneWorktreePolicy(t *testing.T) {
+	// lane.Worktree is configured relative (e.g. "." or "target-worktree"),
+	// exactly like runUpCommand's cwd := filepath.Join(".", lane.Worktree) --
+	// a lane never carries an absolute worktree path in production.
+	root := t.TempDir()
+	t.Chdir(root)
+	worktreeRel := "target-worktree"
+	worktreeAbs := filepath.Join(root, worktreeRel)
+	hooks := filepath.Join(worktreeAbs, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"providers":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "")
+	lane := &config.LaneDef{Name: "chain-indexer", Worktree: worktreeRel}
+	restore := laneHookPolicyScope(lane)
+	wantRel := filepath.Join(worktreeRel, ".herd", "harness-hooks.json")
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != wantRel {
+		t.Fatalf("standing admission did not scope hook policy to the lane's own worktree: got %q want %q", got, wantRel)
+	}
+	restore()
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "" {
+		t.Fatalf("standing hook policy scoping was not restored: %q", got)
+	}
+}
+
+// TestStandingHookPolicyScopePreservesExplicitOverride mirrors up's boundary:
+// an operator's explicit HERD_HARNESS_HOOKS_FILE must still win over a
+// standing lane's own worktree pin.
+func TestStandingHookPolicyScopePreservesExplicitOverride(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	worktreeRel := "target-worktree"
+	hooks := filepath.Join(root, worktreeRel, ".herd", "harness-hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"providers":{}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_HARNESS_HOOKS_FILE", "explicit-policy.json")
+	lane := &config.LaneDef{Name: "chain-indexer", Worktree: worktreeRel}
+	restore := laneHookPolicyScope(lane)
+	if got := os.Getenv("HERD_HARNESS_HOOKS_FILE"); got != "explicit-policy.json" {
+		t.Fatalf("standing scoping clobbered an explicit operator override: %q", got)
+	}
+	restore()
+}
+
 func TestRecordForgeLifecycle_ProjectsClaimThroughBuilding(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".herd"), 0755); err != nil {

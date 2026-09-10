@@ -40,6 +40,21 @@ func selfTokenIdentity() (waiterTokenBody, error) {
 	return selfIdent, selfIdentErr
 }
 
+// ProcessIncarnationID returns a stable identity for THIS process's exact
+// incarnation: PID alone is reused by the OS across unrelated processes, so
+// callers that need to distinguish "this process, right now" from "some
+// later process that happens to get the same PID" bind PID to its start
+// time (and boot id, when available) exactly as selfTokenIdentity already
+// does for mail waiter tokens. Cheap (no subprocess): a syscall, cached
+// after the first call.
+func ProcessIncarnationID() (string, error) {
+	body, err := selfTokenIdentity()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d-%d-%s", body.PID, body.StartNS, body.BootID), nil
+}
+
 // encodeTokenBody serializes a waiter token (no host paths).
 func encodeTokenBody(t waiterTokenBody) ([]byte, error) {
 	return json.Marshal(t)

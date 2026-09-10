@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -603,6 +604,206 @@ func TestHookReceiptRedactsAuthorityAndIsStable(t *testing.T) {
 	receipt := sink.Receipts[0]
 	if !strings.HasPrefix(receipt.Reason, "launch hook preflight failed:") || strings.Contains(receipt.RedactedAuthority, "secret") || strings.Contains(receipt.RedactedAuthority, "http") || receipt.HookCode == "" {
 		t.Fatalf("unredacted hook receipt = %+v", receipt)
+	}
+}
+
+// emptyPolicySetRequest builds a request whose discovery reports a required
+// policy set that is intermittently empty (FAC-624's live incident: 29 live
+// hooks, PolicyRequired=true, zero policies actually read back).
+func emptyPolicySetRequest(t *testing.T, sourcePath string) Request {
+	t.Helper()
+	req := good(t)
+	req.HookDiscovery = harness.HookDiscoveryFunc(func(string) (harness.HookDiscoveryResult, error) {
+		return harness.HookDiscoveryResult{
+			State:          harness.DiscoveryHooks,
+			Hooks:          []harness.Hook{{Name: "innocent-hook", URL: "http://127.0.0.1:1", Requirement: harness.HookRequired}},
+			PolicyRequired: true,
+			SourcePath:     sourcePath,
+		}, nil
+	})
+	return req
+}
+
+// TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook is FAC-624 defect 2:
+// discovery finding hooks with PolicyRequired but zero policies is a
+// resolution failure, not evidence against whichever hook happened to be
+// first in the list. Every historical policy_missing receipt in the FAC-624
+// incident named the same innocent digest.
+func TestEmptyPolicySetRefusalNamesSourceNotAnInnocentHook(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("receipts = %+v", sink.Receipts)
+	}
+	r := sink.Receipts[0]
+	if r.HookCode != string(harness.HookCodePolicySetMissing) {
+		t.Fatalf("hook code = %q, want %q", r.HookCode, harness.HookCodePolicySetMissing)
+	}
+	if strings.Contains(r.HookName, "innocent-hook") {
+		t.Fatalf("empty-policy-set refusal still blamed a specific hook: %+v", r)
+	}
+	if !strings.Contains(r.HookName, "/fake/.herd/harness-hooks.json") {
+		t.Fatalf("empty-policy-set refusal did not name its resolved source path: %+v", r)
+	}
+}
+
+// TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated is FAC-624 defect 3:
+// WriteOnce dedupes a ReceiptKey against the sink's entire history forever.
+// That is correct for a stable misconfiguration (a genuinely missing/stale
+// policy is the same fact every time) but wrong for an intermittent empty
+// read: once any prior cycle recorded the naive classification key, every
+// later occurrence would be silently swallowed -- exactly how the operator's
+// blocked launches left no receipt to inspect.
+func TestEmptyPolicySetRefusalIsNotPermanentlyDeduplicated(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	req.AttemptID = "attempt-fresh"
+	// preflightHooks sets req.HookPolicyRevision from the discovery result's
+	// PolicyRevision, which emptyPolicySetRequest leaves at its zero value.
+	name := fmt.Sprintf("no policy set loaded; source=%q", "/fake/.herd/harness-hooks.json")
+	staleKey := hookReceiptKey(req, harness.HookCodePolicySetMissing, name)
+	sink := &MemorySink{Receipts: []Receipt{{ReceiptKey: staleKey, Kind: "launch_rejected", HookCode: string(harness.HookCodePolicySetMissing)}}}
+
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if len(sink.Receipts) != 2 {
+		t.Fatalf("a historical hit on the naive classification key silenced this occurrence's receipt: %+v", sink.Receipts)
+	}
+	fresh := sink.Receipts[1]
+	if fresh.ReceiptKey == staleKey {
+		t.Fatalf("fresh occurrence reused the exact stale key instead of a per-occurrence one: %q", fresh.ReceiptKey)
+	}
+	if !strings.HasPrefix(fresh.ReceiptKey, staleKey+"|") {
+		t.Fatalf("fresh key %q is not the stale classification key plus an attempt identity (%q)", fresh.ReceiptKey, staleKey)
+	}
+}
+
+// TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted is the acceptance
+// criterion "every blocked launch is observable": two GENUINELY separate
+// attempts landing in the same instant (a wall-clock bucket would collapse
+// them, and so would a bare PID within one long-lived process) must each
+// get their own receipt. req.AttemptID is set to two different caller-minted
+// values, exactly as a real caller (see cmd/herd's standing AdmitRoute) mints
+// one per attempt via launch.NewAttemptID before calling Validate.
+func TestEmptyPolicySetTwoDistinctAttemptsAreBothReceipted(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	sink := &MemorySink{}
+
+	req.AttemptID = "attempt-A"
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	req.AttemptID = "attempt-B"
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+
+	if len(sink.Receipts) != 2 {
+		t.Fatalf("two distinct attempts did not each get their own receipt: %+v", sink.Receipts)
+	}
+	if sink.Receipts[0].ReceiptKey == sink.Receipts[1].ReceiptKey {
+		t.Fatalf("two distinct attempts collapsed onto the same receipt key: %q", sink.Receipts[0].ReceiptKey)
+	}
+}
+
+// TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated is the
+// other half of the acceptance criterion: an idempotent retry of the SAME
+// attempt (req.AttemptID unchanged -- the caller did not mint a new one)
+// must not spam a new receipt per retry.
+func TestEmptyPolicySetIdempotentRetryOfSameAttemptStaysDeduplicated(t *testing.T) {
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	req.AttemptID = "attempt-A"
+	sink := &MemorySink{}
+
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("retrying the same attempt was not deduplicated: %+v", sink.Receipts)
+	}
+}
+
+// TestEmptyPolicySetConcurrentIndependentAttemptsDoNotCrossContaminate is the
+// FAC-624 concurrency requirement: two GENUINELY concurrent, independent
+// admission attempts (real goroutines, not sequential calls faking it) must
+// each get their own receipt under their own AttemptID -- proving
+// Request.AttemptID is request-scoped, not shared mutable state that a
+// concurrent caller could observe or clobber. Request is a plain value type
+// with no shared state of its own; the only shared thing both goroutines
+// touch is the sink, whose MemorySink.WriteOnce/Write are already
+// mutex-guarded, so -race must find nothing.
+func TestEmptyPolicySetConcurrentIndependentAttemptsDoNotCrossContaminate(t *testing.T) {
+	reqA := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	reqA.AttemptID = "concurrent-attempt-A"
+	reqB := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	reqB.AttemptID = "concurrent-attempt-B"
+	sink := &MemorySink{}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := Validate(reqA, sink); err == nil {
+			t.Error("attempt A: empty required policy set must fail closed")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := Validate(reqB, sink); err == nil {
+			t.Error("attempt B: empty required policy set must fail closed")
+		}
+	}()
+	wg.Wait()
+
+	receipts := sink.Receipts
+	if len(receipts) != 2 {
+		t.Fatalf("two genuinely concurrent, independent attempts did not each get their own receipt: %+v", receipts)
+	}
+	seen := map[string]bool{}
+	for _, r := range receipts {
+		seen[r.ReceiptKey] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("concurrent independent attempts cross-contaminated onto the same receipt key: %+v", receipts)
+	}
+	if !strings.HasSuffix(receipts[0].ReceiptKey, "|concurrent-attempt-A") && !strings.HasSuffix(receipts[0].ReceiptKey, "|concurrent-attempt-B") {
+		t.Fatalf("receipt key does not end with either attempt's own identity: %q", receipts[0].ReceiptKey)
+	}
+	if !strings.HasSuffix(receipts[1].ReceiptKey, "|concurrent-attempt-A") && !strings.HasSuffix(receipts[1].ReceiptKey, "|concurrent-attempt-B") {
+		t.Fatalf("receipt key does not end with either attempt's own identity: %q", receipts[1].ReceiptKey)
+	}
+}
+
+// TestEmptyPolicySetFallsBackToProcessIdentityWhenCallerSetsNoAttemptID
+// covers every OTHER caller of Validate today (up, dispatch, the
+// recovery/pulse cycle, forgeLaunchAdmission) -- none of them mint
+// req.AttemptID yet (only standing's AdmitRoute does). They must keep
+// exactly their prior behavior: attemptIdentity() (this process's PID).
+func TestEmptyPolicySetFallsBackToProcessIdentityWhenCallerSetsNoAttemptID(t *testing.T) {
+	previous := attemptIdentity
+	attemptIdentity = func() string { return "fallback-pid" }
+	t.Cleanup(func() { attemptIdentity = previous })
+
+	req := emptyPolicySetRequest(t, "/fake/.herd/harness-hooks.json")
+	if req.AttemptID != "" {
+		t.Fatalf("fixture unexpectedly set AttemptID: %q", req.AttemptID)
+	}
+	sink := &MemorySink{}
+	if err := Validate(req, sink); err == nil {
+		t.Fatal("an empty required policy set must fail closed")
+	}
+	if len(sink.Receipts) != 1 {
+		t.Fatalf("receipts = %+v", sink.Receipts)
+	}
+	if !strings.HasSuffix(sink.Receipts[0].ReceiptKey, "|fallback-pid") {
+		t.Fatalf("caller with no AttemptID did not fall back to attemptIdentity(): %q", sink.Receipts[0].ReceiptKey)
 	}
 }
 
