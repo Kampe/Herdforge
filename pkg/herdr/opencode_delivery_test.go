@@ -88,12 +88,8 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 		} else if !strings.HasPrefix(f.mode, "cold") {
 			ackSession = fmt.Sprintf(`,"agent_session":{"source":"herdr:opencode","agent":"opencode","kind":"id","value":%q}`, nativeOpenCodeSession)
 		}
-		promptState := "working"
-		if f.mode == "cold-staged-composer" || f.mode == "cold-busy" {
-			promptState = "staged"
-		}
-		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s,"state":%q}}}`,
-			nativeOpenCodeTarget, ackSession, promptState), nil
+		return fmt.Sprintf(`{"result":{"type":"agent_prompted","agent":{"name":%q,"agent":"opencode","pane_id":"wK:p1"%s}}}`,
+			nativeOpenCodeTarget, ackSession), nil
 	}
 	if len(args) >= 2 && args[0] == "agent" && args[1] == "send-keys" {
 		f.keys++
@@ -101,12 +97,6 @@ func (f *openCodeSendFixture) run(args ...string) (string, error) {
 	}
 	if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
 		f.read++
-		if f.mode == "cold-staged-composer" {
-			return `{"result":{"type":"pane","content":"pasted text: PACKET"}}`, nil
-		}
-		if f.mode == "cold-permission-prompt" {
-			return `{"result":{"type":"pane","content":"Do you trust this folder?\n ❯ 1. Yes, I trust this folder\n 2. No, exit"}}`, nil
-		}
 		return `{"result":{"type":"pane","content":"decorative pane text"}}`, nil
 	}
 	return `{"result":{"type":"ok"}}`, nil
@@ -128,12 +118,6 @@ func (f *openCodeSendFixture) export(_ context.Context, sessionID, cwd string) (
 		return nil, fmt.Errorf("unexpected export cwd %q (want %q)", cwd, expectedCwd)
 	}
 	f.exportCalls++
-	if f.mode == "cold-staged-composer" {
-		if f.keys > 0 {
-			return nativeOpenCodeExport(true, "ses_cold", ""), nil
-		}
-		return nativeOpenCodeExport(false, "ses_cold", ""), nil
-	}
 	if strings.HasPrefix(f.mode, "cold-") {
 		return nativeOpenCodeCurrentExport(f.mode), nil
 	}
@@ -518,50 +502,19 @@ func TestPublicSendOpenCodeProviderErrorAndTimeoutAreBounded(t *testing.T) {
 	})
 }
 
-func TestPublicSendOpenCodeColdSessionStagedComposerNudgesEnter(t *testing.T) {
-	t.Setenv("HERD_WORKSPACE", "wK")
-	f, restore := newOpenCodeSendFixture(t, "cold-staged-composer")
-	defer restore()
-
-	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
-	if err != nil {
-		t.Fatalf("staged composer delivery failed: %v", err)
-	}
-	if status != "idle" {
-		t.Fatalf("status = %q, want idle", status)
-	}
-	if f.promptCalls != 1 || f.keys != 1 {
-		t.Fatalf("staged delivery calls: prompts=%d keys=%d (want 1 nudge)", f.promptCalls, f.keys)
-	}
-}
-
-func TestPublicSendOpenCodeAlreadyConsumedNeverSendsEnter(t *testing.T) {
+func TestPublicSendOpenCodeNeverSendsPaneKeys(t *testing.T) {
 	t.Setenv("HERD_WORKSPACE", "wK")
 	f, restore := newOpenCodeSendFixture(t, "cold-session")
 	defer restore()
 
 	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
 	if err != nil {
-		t.Fatalf("already consumed send failed: %v", err)
+		t.Fatalf("cold session delivery failed: %v", err)
 	}
 	if status != "idle" {
 		t.Fatalf("status = %q, want idle", status)
 	}
 	if f.keys != 0 {
-		t.Fatalf("already consumed send sent extra Enter keys: %d", f.keys)
-	}
-}
-
-func TestPublicSendOpenCodeBusyOrBlockedNeverSendsEnter(t *testing.T) {
-	t.Setenv("HERD_WORKSPACE", "wK")
-	f, restore := newOpenCodeSendFixture(t, "cold-busy")
-	defer restore()
-
-	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, 250*time.Millisecond, "wK")
-	if err == nil || status != "queued" {
-		t.Fatalf("busy agent delivery must fail closed: status=%q err=%v", status, err)
-	}
-	if f.keys != 0 {
-		t.Fatalf("busy agent must never receive Enter: keys=%d", f.keys)
+		t.Fatalf("OpenCode delivery must never send keys to the pane: keys=%d", f.keys)
 	}
 }

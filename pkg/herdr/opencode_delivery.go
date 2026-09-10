@@ -47,7 +47,6 @@ type opencodePromptAck struct {
 	PaneID       string
 	Name         string
 	Kind         string
-	State        string
 	Session      AgentSession
 	SessionID    string
 	SessionKnown bool
@@ -61,7 +60,6 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 				PaneID  string        `json:"pane_id"`
 				Name    string        `json:"name"`
 				Kind    string        `json:"agent"`
-				State   string        `json:"state"`
 				Session *AgentSession `json:"agent_session"`
 			} `json:"agent"`
 		} `json:"result"`
@@ -76,7 +74,6 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 		PaneID: envelope.Result.Agent.PaneID,
 		Name:   envelope.Result.Agent.Name,
 		Kind:   envelope.Result.Agent.Kind,
-		State:  strings.TrimSpace(envelope.Result.Agent.State),
 	}
 	if envelope.Result.Agent.Session != nil {
 		ack.Session = *envelope.Result.Agent.Session
@@ -90,11 +87,6 @@ func parseOpenCodePromptAck(raw string) (opencodePromptAck, error) {
 		return opencodePromptAck{}, errors.New("native prompt acknowledgement contained an invalid native session identity")
 	}
 	return ack, nil
-}
-
-func isStagedPromptAck(ack opencodePromptAck) bool {
-	state := strings.ToLower(ack.State)
-	return state == "staged" || state == "composer" || state == "unsubmitted"
 }
 
 type opencodeModel struct {
@@ -469,7 +461,6 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 		return SendResult{Status: "queued"}, errors.New("OpenCode delivery lost its evidence deadline")
 	}
 	var lastProofErr error
-	nudgedStaged := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return SendResult{Status: "queued"}, errQueuedUnobserved(before.Name, before.Status)
@@ -489,12 +480,6 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 			if !RealModelSessionID(liveSession) || live.Session.Kind != "id" {
 				if !time.Now().Before(deadline) {
 					return SendResult{Status: "queued"}, errQueuedUnobserved(before.Name, live.Status)
-				}
-				// If exact owned matching composer is positively staged/unsubmitted,
-				// nudge Enter once. Never send if busy, working, or blocked.
-				if isStagedPromptAck(ack) && !nudgedStaged && live.Status != "working" && live.Status != "busy" && live.Status != "blocked" {
-					_ = SendKeys(before.Name, "Enter")
-					nudgedStaged = true
 				}
 				select {
 				case <-ctx.Done():
@@ -525,12 +510,6 @@ func deliverOpenCode(target, payload string, timeout time.Duration, before Agent
 			return SendResult{Status: live.Status}, nil
 		} else {
 			lastProofErr = proofErr
-		}
-		// Send Enter only if exact owned matching composer is positively staged/unsubmitted;
-		// never when prompt already consumed, busy, blocked, or new incarnation.
-		if isStagedPromptAck(ack) && !nudgedStaged && live.Status != "working" && live.Status != "busy" && live.Status != "blocked" {
-			_ = SendKeys(before.Name, "Enter")
-			nudgedStaged = true
 		}
 		if !time.Now().Before(deadline) {
 			return SendResult{Status: "queued"}, fmt.Errorf("%w: native evidence: %v", errQueuedUnobserved(before.Name, live.Status), lastProofErr)
