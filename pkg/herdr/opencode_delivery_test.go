@@ -198,6 +198,39 @@ func nativeOpenCodeCurrentExport(mode string) []byte {
 		}
 		return body
 	}
+	if mode == "cold-incomplete" {
+		raw := nativeOpenCodeExport(true, "ses_cold", "")
+		var data map[string]interface{}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			panic(err)
+		}
+		messages := data["messages"].([]interface{})
+		assistantInfo := messages[len(messages)-1].(map[string]interface{})["info"].(map[string]interface{})
+		delete(assistantInfo["time"].(map[string]interface{}), "completed")
+		body, err := json.Marshal(data)
+		if err != nil {
+			panic(err)
+		}
+		return body
+	}
+	if mode == "cold-missing-bound-user" {
+		raw := nativeOpenCodeExport(true, "ses_cold", "")
+		var data map[string]interface{}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			panic(err)
+		}
+		messages := data["messages"].([]interface{})
+		userInfo := messages[len(messages)-2].(map[string]interface{})["info"].(map[string]interface{})
+		userInfo["sessionID"] = ""
+		body, err := json.Marshal(data)
+		if err != nil {
+			panic(err)
+		}
+		return body
+	}
+	if mode == "cold-queued-composer" {
+		return nativeOpenCodeExport(false, "ses_cold", "")
+	}
 	switch mode {
 	case "wrong-session":
 		return nativeOpenCodeExport(true, "ses_other", "")
@@ -207,7 +240,7 @@ func nativeOpenCodeCurrentExport(mode string) []byte {
 		return nativeOpenCodeExport(true, "", "wrong-user")
 	case "wrong-model":
 		return nativeOpenCodeExport(true, "", "", "anthropic")
-	case "cold", "cold-session", "cold-reused-pane", "cold-conflicting-identity", "cold-wrong-ack-session", "cold-missing-ack":
+	case "cold", "cold-session", "cold-incomplete", "cold-missing-bound-user", "cold-queued-composer", "cold-reused-pane", "cold-conflicting-identity", "cold-wrong-ack-session", "cold-missing-ack":
 		return nativeOpenCodeExport(true, "ses_cold", "")
 	default:
 		return nativeOpenCodeExport(true, "", "")
@@ -251,6 +284,19 @@ func TestPublicSendOpenCodeProvesColdSessionConsumption(t *testing.T) {
 	}
 	if f.promptCalls != 1 || f.exportCalls == 0 || f.keys != 0 || f.read != 0 {
 		t.Fatalf("cold delivery calls = prompts:%d exports:%d keys:%d reads:%d", f.promptCalls, f.exportCalls, f.keys, f.read)
+	}
+}
+
+func TestPublicSendOpenCodeColdStartedAssistantDoesNotNeedCompletion(t *testing.T) {
+	f, restore := newOpenCodeSendFixture(t, "cold-incomplete")
+	defer restore()
+
+	status, err := SendInWorkspace(nativeOpenCodeTarget, nativeOpenCodePacket, true, time.Second, "wK")
+	if err != nil {
+		t.Fatalf("started incomplete assistant must prove consumption: %v", err)
+	}
+	if status != "idle" || f.promptCalls != 1 {
+		t.Fatalf("status/prompts = %q/%d, want idle/1", status, f.promptCalls)
 	}
 }
 
@@ -330,6 +376,8 @@ func TestPublicSendOpenCodeColdSessionFailsClosed(t *testing.T) {
 		{name: "reused-session-old-transcript", mode: "cold-reused-session", want: "queued-but-not-consumed"},
 		{name: "old-user-only", mode: "cold-old-user", want: "queued-but-not-consumed"},
 		{name: "no-assistant", mode: "cold-no-assistant", want: "queued-but-not-consumed"},
+		{name: "missing-native-bound-user", mode: "cold-missing-bound-user", want: "queued-but-not-consumed"},
+		{name: "queued-composer", mode: "cold-queued-composer", want: "queued-but-not-consumed"},
 		{name: "conflicting-pane-incarnation", mode: "cold-reused-pane", want: "identity changed"},
 		{name: "conflicting-cwd", mode: "cold-wrong-cwd", want: "identity changed"},
 		{name: "ack-session-disagrees", mode: "cold-wrong-ack-session", want: "differs from assigned"},

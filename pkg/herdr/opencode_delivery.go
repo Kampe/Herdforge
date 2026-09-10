@@ -326,7 +326,7 @@ func openCodeConsumptionProof(before, after opencodeExportData, sessionID, cwd, 
 			continue
 		}
 		if message.Info.Time.Created < user.Info.Time.Created || message.Info.Time.Created < submittedAt.UnixMilli() ||
-			message.Info.Time.Completed == nil || *message.Info.Time.Completed < message.Info.Time.Created || !messageErrorAbsent(message.Info.Error) {
+			!messageErrorAbsent(message.Info.Error) {
 			continue
 		}
 		assistants = append(assistants, message)
