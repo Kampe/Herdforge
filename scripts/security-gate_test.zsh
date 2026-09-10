@@ -102,6 +102,220 @@ grep -F -- "error: gosec timed out after 1s" "$gosec_precedence_out" >/dev/null 
 	exit 1
 }
 
+# A gosec crash that leaves an EMPTY subreport must fail closed with a
+# diagnostic naming gosec's report, not pass with zero findings, and not
+# surface as an unrelated jq iteration error.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		: > "${arg#-out=}"
+	fi
+done
+exit 2
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_crash_empty_out="$tmp/gosec-crash-empty.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_crash_empty_out" 2>&1; then
+	print -u2 "error: empty crashed gosec report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_crash_empty_out" >/dev/null || {
+	print -u2 "error: missing empty gosec report diagnostic"
+	exit 1
+}
+
+# A subreport WITHOUT an Issues key must fail closed: jq reads a missing
+# member as null, so only the pinned gosec shape (an object that HAS the
+# Issues member) may pass.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_missing_key_out="$tmp/gosec-missing-key.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_missing_key_out" 2>&1; then
+	print -u2 "error: gosec report without an Issues key was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_missing_key_out" >/dev/null || {
+	print -u2 "error: missing gosec missing-key diagnostic"
+	exit 1
+}
+
+# Error-shaped bodies must fail closed even when they also supply
+# Issues: null or Issues: [].
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Err":"gosec panicked: stack overflow","Issues":null}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_err_body_out="$tmp/gosec-err-body.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_err_body_out" 2>&1; then
+	print -u2 "error: gosec Err body with Issues null was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_err_body_out" >/dev/null || {
+	print -u2 "error: missing gosec error-body diagnostic"
+	exit 1
+}
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"error":"exit status 2","Issues":[]}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_error_body_out="$tmp/gosec-error-body.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_error_body_out" 2>&1; then
+	print -u2 "error: gosec error body with Issues array was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_error_body_out" >/dev/null || {
+	print -u2 "error: missing gosec error-body (lowercase) diagnostic"
+	exit 1
+}
+
+# A gosec crash that leaves a MALFORMED subreport must fail closed; the
+# aggregation must not swallow the parse failure and evaluate zero findings.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print 'garbage{' > "${arg#-out=}"
+	fi
+done
+exit 2
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_crash_malformed_out="$tmp/gosec-crash-malformed.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_crash_malformed_out" 2>&1; then
+	print -u2 "error: malformed gosec report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_crash_malformed_out" >/dev/null || {
+	print -u2 "error: missing malformed gosec report diagnostic"
+	exit 1
+}
+
+
+# A multi-document subreport is not one complete JSON document and must
+# fail closed even though every document is individually valid.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Issues":[]}{"Issues":[]}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_multidoc_out="$tmp/gosec-multidoc.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_multidoc_out" 2>&1; then
+	print -u2 "error: multi-document gosec report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec produced no complete single-document JSON report' "$gosec_multidoc_out" >/dev/null || {
+	print -u2 "error: missing multi-document gosec report diagnostic"
+	exit 1
+}
+
+# The pinned gosec v2.22.10 emits, for no findings, a JSON object whose
+# "Issues" member is null. That representation must be ACCEPTED and the
+# gate must proceed (a bare top-level null remains the Gitleaks contract
+# and is rejected; see the malformed/multidoc cases above).
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Issues":null}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_issues_null_out="$tmp/gosec-issues-null.out"
+if ! PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_issues_null_out" 2>&1; then
+	print -u2 "error: pinned gosec Issues-null no-findings report was rejected"
+	exit 1
+fi
+grep -F -- '==> FAC-251 gosec HIGH/CRITICAL baseline is exact and current' "$gosec_issues_null_out" >/dev/null || {
+	print -u2 "error: missing gosec baseline diagnostic for Issues-null report"
+	exit 1
+}
+
+# A genuine HIGH finding with a matching baseline row must pass the
+# baseline-exactness check end to end.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		out="${arg#-out=}"
+		scan_root=$(dirname "$(dirname "$out")")
+		print "{\"Issues\":[{\"severity\":\"HIGH\",\"rule_id\":\"G104\",\"file\":\"$scan_root/fixture.go\",\"line\":3,\"what\":\"fixture finding\"}]}" > "$out"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+finding_fp=$(print -rn -- 'G104|fixture.go|3' | shasum -a 256 | awk '{print $1}')
+print "# rule\tfile\tline\tfingerprint\trationale\towner\texpiry" > security/baselines/gosec-high.tsv
+print "G104\tfixture.go\t3\t$finding_fp\tfixture reviewed finding\towner\t2099-12-31" >> security/baselines/gosec-high.tsv
+git add security/baselines/gosec-high.tsv
+git -c commit.gpgsign=false commit -qm 'test: fixture baseline for the genuine HIGH finding'
+gosec_baseline_out="$tmp/gosec-baseline.out"
+if ! PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_baseline_out" 2>&1; then
+	print -u2 "error: genuine HIGH finding with exact baseline was rejected"
+	exit 1
+fi
+grep -F -- '==> FAC-251 gosec HIGH/CRITICAL baseline is exact and current' "$gosec_baseline_out" >/dev/null || {
+	print -u2 "error: missing baseline-exact diagnostic for genuine finding"
+	exit 1
+}
+
+# Restore the empty baseline so later sections see the fixture's original
+# no-findings state.
+print '# rule\tfile\tline\tfingerprint\trationale\towner\texpiry' > security/baselines/gosec-high.tsv
+git add security/baselines/gosec-high.tsv
+git -c commit.gpgsign=false commit -qm 'test: restore empty FAC-251 fixture baseline'
+
+# An operational gosec failure (exit status 2) with a COMPLETE report must
+# fail closed: a status other than 0 or 124 is a scanner failure even when
+# the report looks usable.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Issues":[]}' > "${arg#-out=}"
+	fi
+done
+exit 2
+EOF
+chmod +x "$mock_bin/gosec"
+gosec_status2_out="$tmp/gosec-status2.out"
+if PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_status2_out" 2>&1; then
+	print -u2 "error: gosec operational failure with complete report was accepted"
+	exit 1
+fi
+grep -F -- 'error: gosec scanner failed with exit status 2' "$gosec_status2_out" >/dev/null || {
+	print -u2 "error: missing gosec scanner failure diagnostic"
+	exit 1
+}
+
 # 2. Test gitleaks timeout enforcement and child process cleanup
 cat << 'EOF' > "$mock_bin/gosec"
 #!/usr/bin/env zsh

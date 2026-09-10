@@ -114,22 +114,61 @@ run_gosec() {
 	typeset -a subreports
 	subreports=()
 	local mdir subrep
+	typeset -i gosec_failures=0
+	local gosec_last_status=0
+	# Module reports live INSIDE the owned scan root: the gate's existing
+	# EXIT trap deletes scan_root on every exit path, including a
+	# run_with_timeout SIGKILL of this function (whose own traps cannot
+	# run), so no module report is ever leaked outside owned space.
+	mkdir -p "$scan_root/.gosec-reports"
 	for gomod in go.mod **/go.mod; do
 		[[ -f "$gomod" ]] || continue
 		mdir="${gomod:h}"
-		subrep=$(mktemp)
+		subrep=$(mktemp "$scan_root/.gosec-reports/report.XXXXXX")
 		subreports+=( "$subrep" )
 		cd "$scan_root/$mdir"
-		gosec -fmt=json -out="$subrep" --no-fail -exclude=G701,G702,G703,G704,G705,G706,G707,G708,G709,G710 ./... >/dev/null 2>&1 || true
+		# A module failure is recorded, not immediately fatal: remaining
+		# modules are still scanned. The recorded failure fails the gate
+		# below, so an operational gosec failure can never be evaluated
+		# as zero findings.
+		gosec -fmt=json -out="$subrep" --no-fail -exclude=G701,G702,G703,G704,G705,G706,G707,G708,G709,G710 ./... >/dev/null 2>&1 || { gosec_last_status=$?; gosec_failures=1; }
 		cd "$scan_root"
 	done
-	jq -s '{Issues: (map(.Issues // []) | add)}' "${subreports[@]}" > "$report"
+	# The per-module failure recording intentionally keeps the scan
+	# running when individual modules fail, so a crashed gosec surfaces
+	# only as an empty, truncated, malformed, or multi-document
+	# subreport. jq -s succeeds on zero input documents, and a findings
+	# pipeline over such output evaluates no findings. Every subreport
+	# must therefore be exactly ONE complete JSON document. The pinned
+	# gosec v2.22.10 emits, for no findings, a JSON OBJECT whose "Issues"
+	# member is null (an empty Go slice marshals as null); that
+	# representation is accepted. jq reads a MISSING member as null, so
+	# the Issues key must be REQUIRED with has("Issues") - {} alone is
+	# rejected. Error-shaped bodies are rejected even when they also
+	# supply Issues: null or Issues: []. A bare top-level null is the
+	# Gitleaks no-findings contract, not gosec's, and is rejected here.
+	for subrep in "${subreports[@]}"; do
+		if [[ ! -s "$subrep" ]] || ! jq -e -s 'length == 1 and (.[0] | type == "object" and has("Issues") and ([has("Err"), has("error"), has("Error")] | any | not) and (.Issues | type == "null" or type == "array"))' "$subrep" >/dev/null 2>&1; then
+			print -u2 'error: gosec produced no complete single-document JSON report'
+			return 1
+		fi
+	done
+	if (( gosec_failures )); then
+		print -u2 "error: gosec scanner failed with exit status $gosec_last_status"
+		return 1
+	fi
+	jq -s '{Issues: ((map(.Issues // []) | add) // [])}' "${subreports[@]}" > "$report"
 	rm -f "${subreports[@]}"
+	rmdir "$scan_root/.gosec-reports" 2>/dev/null || true
 }
 
 gosec_status=0
 run_with_timeout "$gosec_timeout" "gosec" run_gosec || gosec_status=$?
 if (( gosec_status == 124 )); then
+	exit 1
+fi
+if (( gosec_status != 0 )); then
+	print -u2 "error: gosec scanner failed with exit status $gosec_status"
 	exit 1
 fi
 
@@ -145,7 +184,10 @@ while IFS=$'\t' read -r rule file line fingerprint rationale owner expiry; do
 done < "$baseline"
 
 findings=$(mktemp)
-jq -r --arg root "$scan_root/" '.Issues[] | select((.severity == "HIGH" or .severity == "CRITICAL") and (.file | startswith($root))) | [.rule_id,.file,.line] | @tsv' "$report" | LC_ALL=C sort > "$findings"
+# A no-findings gosec report is an object with a null Issues member (the
+# pinned v2.22.10 representation), so iterate over the null-coalesced
+# array: null yields no findings instead of a jq iteration error.
+jq -r --arg root "$scan_root/" '(.Issues // [])[] | select((.severity == "HIGH" or .severity == "CRITICAL") and (.file | startswith($root))) | [.rule_id,.file,.line] | @tsv' "$report" | LC_ALL=C sort > "$findings"
 while IFS=$'\t' read -r rule file line; do
 	file=${file#$scan_root/}
 	fingerprint=$(print -rn -- "$rule|$file|$line" | shasum -a 256 | awk '{print $1}')
