@@ -486,13 +486,50 @@ func runPoolReview(ref string) error {
 		return fmt.Errorf("advance admission phase to spawn: %w", err)
 	}
 	cleanupTab := true
+	// FAC-708: record a fail-closed intent before starting or delivering to the
+	// reviewer. A retirement manifest is authority, not a launch scratchpad; it
+	// must not exist until the cold harness has returned a real model session.
+	// This pending record preserves the exact launch fence and cleanup trail if
+	// startup, delivery, or post-prompt session capture fails.
+	pending := reviewRetirementPendingIntent{
+		Repository:      repositoryIdentityForLaunch(cfg),
+		TaskRef:         ref,
+		CandidateSHA:    sha,
+		Pool:            filepath.ToSlash(poolRelForPending(root, lease.Path)),
+		Slot:            lease.Name,
+		LeaseID:         lease.LeaseID,
+		LeaseGeneration: lease.LeasedAt.UnixNano(),
+		Workspace:       ws,
+		TabID:           tab.ID,
+		PaneID:          tab.Pane.ID,
+		TerminalID:      tab.Pane.TerminalID,
+		TabGeneration:   tab.Generation,
+		Cwd:             filepath.ToSlash(relPathForPending(root, surfaceAbs)),
+		Reviewer:        agentName,
+		Status:          "pending-start",
+	}
+	if err := appendReviewRetirementPending(root, pending); err != nil {
+		return fmt.Errorf("record review retirement pending intent: %w", err)
+	}
+	cleanupPending := func(status, reason string) {
+		pending.Status, pending.Reason = status, reason
+		if err := appendReviewRetirementPending(root, pending); err != nil {
+			fmt.Fprintf(os.Stderr, "review --pool: failed to persist retirement cleanup evidence: %v\n", err)
+		}
+	}
 	defer func() {
 		if cleanupTab {
-			// StartReviewAgent and the prompt path both use the exact tab/name
-			// identity; a failed launch must never leave a pool orphan behind.
-			_ = herdr.CloseReviewTab(tab.ID, agentName)
+			cleanupPending("cleanup-pending", "launch did not produce an authoritative retirement manifest")
+			if err := herdr.CloseReviewTab(tab.ID, agentName); err == nil {
+				cleanupPending("cleanup-complete", "exact tab cleanup completed")
+			} else {
+				cleanupPending("cleanup-failed", err.Error())
+			}
 		}
 	}()
+	if err := verifyReviewLaunchFence(ws, surfaceAbs, *tab, lease, sha); err != nil {
+		return fmt.Errorf("review launch fence: %w", err)
+	}
 	// FAC-576: pass the FLAGS, not the whole argv. herdr's `agent start ... --
 	// <args>` appends these after the harness command it resolves from --kind,
 	// so including argv[0] ran `claude claude --model ...` and the extra
@@ -531,10 +568,10 @@ func runPoolReview(ref string) error {
 	// depending on where the reviewer happens to stand.
 	packetAbs, err := filepath.Abs(packet)
 	if err != nil {
-		return errors.Join(fmt.Errorf("resolve review packet path: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("resolve review packet path: %w", err)
 	}
 	if _, statErr := os.Stat(packetAbs); statErr != nil {
-		return errors.Join(fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("review packet %q is not readable: %w", packetAbs, statErr)
 	}
 	// FAC-626: re-verify immediately before the reviewer is actually handed
 	// anything. Tab creation and AwaitInteractiveReady above can take 30+
@@ -542,24 +579,34 @@ func runPoolReview(ref string) error {
 	// is what "before any reviewer is launched against a pooled surface"
 	// means literally, and costs one git call against an already-warm slot.
 	if err := verifySurfaceCandidate(surface, sha); err != nil {
-		return errors.Join(err, herdr.CloseReviewTab(tab.ID, agentName))
+		return err
 	}
 	if _, err := herdr.Send(agentName, "Read and execute the review packet at "+packetAbs+" in full.", true, 30*time.Second); err != nil {
-		return errors.Join(fmt.Errorf("deliver review packet: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("deliver review packet: %w", err)
 	}
 	// FAC-708: the reviewer is now a registered exact retirement target. Record
 	// this only after packet delivery succeeds, while every launch identity is
 	// still available. The record is append-only and repository-relative; the
 	// coordinator later reads it together with the admitted exact-SHA verdict.
-	launchedAgent, err := herdr.LookupAgent(agentName)
+	// Cold Codex/OpenCode assigns agent_session only after the first accepted
+	// model turn. Capture it authoritatively after the single delivery boundary;
+	// never fabricate a session from pane, terminal, timestamp, or revision.
+	launchedAgent, err := awaitNativeReviewerSession(agentName, ws, *tab, 30*time.Second)
 	if err != nil {
-		return errors.Join(fmt.Errorf("resolve launched reviewer identity: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+		cleanupPending("cleanup-pending", err.Error())
+		return fmt.Errorf("capture authoritative reviewer session after delivery: %w", err)
 	}
-	if launchedAgent.Session.Value == "" {
-		return errors.Join(errors.New("launched reviewer lacks authenticated session identity"), herdr.CloseReviewTab(tab.ID, agentName))
+	pending.Status = "session-bound"
+	pending.SessionID = launchedAgent.Session.Value
+	if err := appendReviewRetirementPending(root, pending); err != nil {
+		return fmt.Errorf("record bound review retirement intent: %w", err)
 	}
 	if err := recordReviewRetirementManifest(root, cfg, providerTask, ref, sha, lease, ws, *tab, agentName, reviewer, packet, surface, launchedAgent); err != nil {
-		return errors.Join(fmt.Errorf("record review retirement manifest: %w", err), herdr.CloseReviewTab(tab.ID, agentName))
+		return fmt.Errorf("record review retirement manifest: %w", err)
+	}
+	pending.Status = "manifest-recorded"
+	if err := appendReviewRetirementPending(root, pending); err != nil {
+		return fmt.Errorf("record retirement manifest completion: %w", err)
 	}
 	cleanupTab = false
 	releaseOnFailure = false
@@ -567,6 +614,162 @@ func runPoolReview(ref string) error {
 	fmt.Printf("agent started in %s\n", time.Since(startedAt).Round(time.Second))
 	fmt.Printf("reviewer launched ref=%s sha=%s lease=%s surface=%s tab=%s agent=%s packet=%s harness=%s provider=%s model=%s pool=%s family=%s\n", ref, shortSHA(sha), lease.LeaseID, surface, tabLabel, agentName, packet, reviewer.Kind, reviewer.Provider, reviewer.Model, reviewer.Pool, reviewer.Family)
 	return nil
+}
+
+type reviewRetirementPendingIntent struct {
+	Repository      string `json:"repository"`
+	TaskRef         string `json:"task_ref"`
+	CandidateSHA    string `json:"candidate_sha"`
+	Pool            string `json:"pool"`
+	Slot            string `json:"slot"`
+	LeaseID         string `json:"lease_id"`
+	LeaseGeneration int64  `json:"lease_generation"`
+	Workspace       string `json:"workspace"`
+	TabID           string `json:"tab_id"`
+	PaneID          string `json:"pane_id"`
+	TerminalID      string `json:"terminal_id"`
+	TabGeneration   string `json:"tab_generation,omitempty"`
+	Cwd             string `json:"cwd"`
+	Reviewer        string `json:"reviewer"`
+	SessionID       string `json:"session_id,omitempty"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+	RecordedAt      string `json:"recorded_at"`
+}
+
+const reviewRetirementPendingFile = ".herd/review/retirement-pending.jsonl"
+
+func poolRelForPending(root, leasePath string) string {
+	poolAbs := filepath.Dir(filepath.Clean(leasePath))
+	if rel, err := filepath.Rel(root, poolAbs); err == nil {
+		return rel
+	}
+	return ""
+}
+
+func relPathForPending(root, path string) string {
+	if rel, err := filepath.Rel(root, path); err == nil {
+		return rel
+	}
+	return ""
+}
+
+func appendReviewRetirementPending(root string, intent reviewRetirementPendingIntent) error {
+	if strings.TrimSpace(intent.Status) == "" || strings.TrimSpace(intent.TabID) == "" || strings.TrimSpace(intent.PaneID) == "" || strings.TrimSpace(intent.TerminalID) == "" {
+		return errors.New("review retirement pending intent lacks exact launch identity")
+	}
+	if strings.TrimSpace(intent.RecordedAt) == "" {
+		intent.RecordedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	p := filepath.Join(root, filepath.FromSlash(reviewRetirementPendingFile))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	body, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(body, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// verifyReviewLaunchFence re-reads the exact tab/pane incarnation immediately
+// before starting the harness. A tab ID alone is reusable; terminal ID, cwd,
+// workspace, and the recorded lease/candidate are the prelaunch fence. Herdr
+// versions without an immutable tab generation leave it unknown rather than
+// substituting a mutable revision or a timestamp.
+func verifyReviewLaunchFence(workspace, cwd string, tab herdr.TabInfo, lease *worktree.PoolSlot, candidateSHA string) error {
+	if lease == nil || strings.TrimSpace(lease.LeaseID) == "" || lease.LeasedAt.IsZero() || strings.TrimSpace(candidateSHA) == "" {
+		return errors.New("prelaunch fence lacks authenticated candidate or lease identity")
+	}
+	if strings.TrimSpace(workspace) == "" || strings.TrimSpace(cwd) == "" || strings.TrimSpace(tab.ID) == "" || strings.TrimSpace(tab.Pane.ID) == "" || strings.TrimSpace(tab.Pane.TerminalID) == "" {
+		return errors.New("prelaunch fence lacks workspace, cwd, tab, pane, or terminal identity")
+	}
+	if info, err := os.Stat(cwd); err != nil || !info.IsDir() {
+		return fmt.Errorf("prelaunch fence cwd %q is not an existing directory: %v", cwd, err)
+	}
+	panes, err := herdr.PaneList()
+	if err != nil {
+		return fmt.Errorf("prelaunch pane fence: %w", err)
+	}
+	var found *herdr.PaneEntry
+	for i := range panes {
+		if panes[i].PaneID == tab.Pane.ID {
+			copy := panes[i]
+			found = &copy
+			break
+		}
+	}
+	if found == nil {
+		return errors.New("prelaunch fence pane is absent")
+	}
+	if found.TabID != tab.ID || found.Workspace != workspace || found.TerminalID != tab.Pane.TerminalID {
+		return fmt.Errorf("prelaunch pane incarnation changed: tab=%q workspace=%q terminal=%q", found.TabID, found.Workspace, found.TerminalID)
+	}
+	actualCwd := strings.TrimSpace(found.ForegroundCwd)
+	if actualCwd == "" {
+		actualCwd = strings.TrimSpace(found.Cwd)
+	}
+	if actualCwd != "" {
+		actualReal, realErr := filepath.EvalSymlinks(actualCwd)
+		wantReal, wantErr := filepath.EvalSymlinks(cwd)
+		if realErr != nil || wantErr != nil || filepath.Clean(actualReal) != filepath.Clean(wantReal) {
+			return fmt.Errorf("prelaunch cwd changed: want %q got %q", cwd, actualCwd)
+		}
+	}
+	tabs, err := herdr.TabList(workspace)
+	if err != nil {
+		return fmt.Errorf("prelaunch tab fence: %w", err)
+	}
+	for _, live := range tabs {
+		if live.TabID != tab.ID {
+			continue
+		}
+		if live.WorkspaceID != workspace {
+			return errors.New("prelaunch tab workspace changed")
+		}
+		if tab.Generation != "" && live.Generation != "" && live.Generation != tab.Generation {
+			return fmt.Errorf("prelaunch tab generation changed: want %q got %q", tab.Generation, live.Generation)
+		}
+		return nil
+	}
+	return errors.New("prelaunch fence tab is absent")
+}
+
+// awaitNativeReviewerSession waits only for the model-owned session identity
+// that cold Codex/OpenCode emits after its first accepted turn. It never uses
+// a pane, terminal, revision, timestamp, or provisional value as a session.
+func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeout time.Duration) (*herdr.AgentEntry, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	last := "agent session is not assigned until the first model turn"
+	for {
+		a, err := herdr.LookupAgent(name)
+		if err == nil {
+			if a.TabID != tab.ID || a.PaneID != tab.Pane.ID || a.TerminalID != tab.Pane.TerminalID || a.Workspace != workspace {
+				return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
+			}
+			if herdr.RealModelSessionID(a.Session.Value) {
+				return a, nil
+			}
+			last = "agent session remains unavailable after delivery"
+		} else if !errors.Is(err, herdr.ErrAgentNotFound) {
+			last = err.Error()
+		}
+		if !time.Now().Before(deadline) {
+			return nil, errors.New(last)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 func recordReviewRetirementManifest(root string, cfg *config.Config, task *provider.Task, ref, sha string, lease *worktree.PoolSlot, workspace string, tab herdr.TabInfo, agentName string, reviewer poolReviewer, packet, surface string, launchedAgent *herdr.AgentEntry) error {
@@ -618,7 +821,10 @@ func recordReviewRetirementManifest(root string, cfg *config.Config, task *provi
 	}
 	generation := strings.TrimSpace(tab.Generation)
 	if generation == "" {
-		generation = fmt.Sprintf("%d", lease.LeasedAt.UnixNano())
+		// Legacy Herdr does not expose a tab generation. Keep the exact
+		// authenticated lease nonce as the manifest attempt identity; never
+		// invent a tab generation from a mutable counter or timestamp.
+		generation = lease.LeaseID
 	}
 	// Current Herdr agent-get/list payloads do not expose immutable tab
 	// generation. Preserve that uncertainty explicitly; terminal_id plus the
