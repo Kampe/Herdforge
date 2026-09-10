@@ -138,7 +138,32 @@ func (n *NativeSourceRetirementOp) findLaunchReceipt(m SourceRetirementManifest)
 		if n.RepositoryIdentity != "" && r.Repository != "" && !strings.EqualFold(r.Repository, n.RepositoryIdentity) {
 			continue
 		}
-		if r.TaskRef != m.TaskRef || r.Name != m.AgentName || r.Worktree != m.Worktree {
+		// Match worktree directly or via CWD relative path
+		wtRel := r.Worktree
+		if wtRel == "" && r.CWD != "" {
+			cwdClean := filepath.Clean(r.CWD)
+			rootClean := filepath.Clean(n.Root)
+			if rel, err := filepath.Rel(rootClean, cwdClean); err == nil && !strings.HasPrefix(rel, "..") && rel != "." {
+				wtRel = rel
+			}
+		}
+		if wtRel != m.Worktree {
+			continue
+		}
+		if r.TaskRef != m.TaskRef {
+			// Check if receipt's TaskRef matches manifest's TaskRef or if worktree's verified TASK-CONTEXT matches
+			wtAbs := filepath.Join(n.Root, filepath.Clean(m.Worktree))
+			tcMatch := false
+			if tc, err := readVerifiedSourceTaskContext(n.Root, wtAbs); err == nil {
+				if strings.EqualFold(tc.TaskRef, m.TaskRef) {
+					tcMatch = true
+				}
+			}
+			if !tcMatch {
+				continue
+			}
+		}
+		if r.Name != m.AgentName {
 			continue
 		}
 		if r.Branch != "" && m.Branch != "" && r.Branch != m.Branch {

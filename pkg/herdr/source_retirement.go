@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -234,19 +235,81 @@ func EvaluateSourceRetirement(e SourceRetirementEvidence) SourceRetirementDecisi
 		return blockSourceRetirement("launch provenance was not accepted or is missing")
 	}
 	if e.Launch.TaskRef != m.TaskRef {
-		return blockSourceRetirement("launch provenance task ref mismatch")
+		wtDir := e.Worktree.Path
+		if wtDir == "" {
+			wtDir = m.Worktree
+		}
+		tcMatched := false
+		repoRoot := filepath.Dir(wtDir)
+		if rootCandidate, _, err := gitroot.ProjectRoot(context.Background(), wtDir); err == nil && rootCandidate != "" {
+			repoRoot = rootCandidate
+		}
+		if tc, err := readVerifiedSourceTaskContext(repoRoot, wtDir); err == nil {
+			if strings.EqualFold(tc.TaskRef, m.TaskRef) {
+				tcMatched = true
+			}
+		}
+		if !tcMatched {
+			return blockSourceRetirement("launch provenance task ref mismatch")
+		}
 	}
 	if e.Launch.Name != m.AgentName {
 		return blockSourceRetirement("launch provenance agent name mismatch")
 	}
 	if strings.TrimSpace(e.Launch.Worktree) == "" || e.Launch.Worktree != m.Worktree {
-		return blockSourceRetirement("launch provenance worktree mismatch")
+		// Also allow launch receipt where CWD matches the worktree
+		cwdMatched := false
+		if strings.TrimSpace(e.Launch.CWD) != "" {
+			cwdClean := filepath.Clean(e.Launch.CWD)
+			if filepath.IsAbs(cwdClean) {
+				wtAbs := e.Worktree.Path
+				if wtAbs == "" {
+					wtAbs = m.Worktree
+				}
+				if filepath.Clean(wtAbs) == cwdClean {
+					cwdMatched = true
+				} else if rel, err := filepath.Rel(filepath.Dir(cwdClean), cwdClean); err == nil && rel == filepath.Base(m.Worktree) {
+					// relative match
+				}
+			}
+			if !cwdMatched && e.Worktree.Path != "" {
+				if filepath.Clean(e.Launch.CWD) == filepath.Clean(e.Worktree.Path) {
+					cwdMatched = true
+				}
+			}
+			if !cwdMatched {
+				// Try resolving relative to repo dir if known
+				repoDir := filepath.Dir(e.Worktree.Path)
+				if rel, err := filepath.Rel(repoDir, cwdClean); err == nil && !strings.HasPrefix(rel, "..") && rel == m.Worktree {
+					cwdMatched = true
+				}
+			}
+		}
+		if !cwdMatched {
+			return blockSourceRetirement("launch provenance worktree mismatch")
+		}
 	}
 	if strings.TrimSpace(e.Launch.Branch) == "" || e.Launch.Branch != m.Branch {
 		return blockSourceRetirement("launch provenance branch mismatch")
 	}
 	if strings.TrimSpace(e.Launch.HerdrSession) == "" || e.Launch.HerdrSession != m.SessionID {
-		return blockSourceRetirement("launch provenance session mismatch")
+		wtDir := e.Worktree.Path
+		if wtDir == "" {
+			wtDir = m.Worktree
+		}
+		tcMatched := false
+		repoRoot := filepath.Dir(wtDir)
+		if rootCandidate, _, err := gitroot.ProjectRoot(context.Background(), wtDir); err == nil && rootCandidate != "" {
+			repoRoot = rootCandidate
+		}
+		if tc, err := readVerifiedSourceTaskContext(repoRoot, wtDir); err == nil {
+			if tc.SessionID != "" && tc.SessionID == m.SessionID {
+				tcMatched = true
+			}
+		}
+		if !tcMatched {
+			return blockSourceRetirement("launch provenance session mismatch")
+		}
 	}
 	if !isSourceRole(e.Launch.Role) {
 		return blockSourceRetirement("launch provenance role is not an authorized source role: " + e.Launch.Role)
@@ -673,6 +736,75 @@ func ParseStructuredHandoffReport(data []byte) (StructuredHandoffReport, error) 
 	return r, nil
 }
 
+type signedSourceTaskContext struct {
+	ProviderType      string    `json:"provider_type"`
+	ProjectID         string    `json:"project_id"`
+	ProviderWorkspace string    `json:"provider_workspace,omitempty"`
+	ProviderProfile   string    `json:"provider_profile,omitempty"`
+	Repository        string    `json:"repository"`
+	Role              string    `json:"role"`
+	TaskRef           string    `json:"task_ref"`
+	TaskID            string    `json:"task_id"`
+	Branch            string    `json:"branch"`
+	BaseSHA           string    `json:"base_sha"`
+	CandidateSHA      string    `json:"candidate_sha,omitempty"`
+	AuthorityScope    string    `json:"authority_scope,omitempty"`
+	AnchorRef         string    `json:"anchor_ref,omitempty"`
+	HerdrWorkspace    string    `json:"herdr_workspace,omitempty"`
+	LeaseID           string    `json:"lease_id"`
+	LeaseGeneration   int64     `json:"lease_generation"`
+	LeaseTaskRef      string    `json:"lease_task_ref"`
+	SessionID         string    `json:"session_id"`
+	AgentSessionID    string    `json:"agent_session_id,omitempty"`
+	AllowedOps        []string  `json:"allowed_ops"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	Signature         string    `json:"signature,omitempty"`
+}
+
+// readVerifiedSourceTaskContext reads and cryptographically verifies TASK-CONTEXT.json
+// against the repository's published receipt key (.herd/receipt.pub). If the receipt is
+// unsigned, tampered, or the key is missing/corrupt, it fails closed with an error.
+func readVerifiedSourceTaskContext(repoRoot, worktreeAbs string) (signedSourceTaskContext, error) {
+	var tc signedSourceTaskContext
+	data, err := os.ReadFile(filepath.Join(worktreeAbs, "TASK-CONTEXT.json"))
+	if err != nil {
+		return tc, fmt.Errorf("read TASK-CONTEXT.json: %w", err)
+	}
+	if err := json.Unmarshal(data, &tc); err != nil {
+		return tc, fmt.Errorf("unmarshal TASK-CONTEXT.json: %w", err)
+	}
+	if strings.TrimSpace(tc.Signature) == "" {
+		return tc, errors.New("TASK-CONTEXT.json is unsigned (FAC-145: missing authority signature)")
+	}
+
+	pubData, err := os.ReadFile(filepath.Join(repoRoot, ".herd", "receipt.pub"))
+	if err != nil {
+		return tc, fmt.Errorf("no receipt verification key at %s (FAC-145): %w", filepath.Join(repoRoot, ".herd", "receipt.pub"), err)
+	}
+	rawPub, err := hex.DecodeString(strings.TrimSpace(string(pubData)))
+	if err != nil || len(rawPub) != ed25519.PublicKeySize {
+		return tc, errors.New("receipt verification key is corrupt")
+	}
+
+	sigBytes, err := hex.DecodeString(strings.TrimSpace(tc.Signature))
+	if err != nil || len(sigBytes) != ed25519.SignatureSize {
+		return tc, errors.New("TASK-CONTEXT.json carries malformed signature")
+	}
+
+	tcCopy := tc
+	tcCopy.Signature = ""
+	canonical, err := json.Marshal(tcCopy)
+	if err != nil {
+		return tc, fmt.Errorf("canonicalize TASK-CONTEXT: %w", err)
+	}
+
+	if !ed25519.Verify(ed25519.PublicKey(rawPub), canonical, sigBytes) {
+		return tc, errors.New("TASK-CONTEXT.json failed cryptographic signature verification")
+	}
+
+	return tc, nil
+}
+
 // EnrollReadySourceManifests discovers accepted source/mender launch receipts that have
 // produced authentic durable ready reports, creates their exact SourceRetirementManifest,
 // and records them to the registry if persist is true.
@@ -711,16 +843,63 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 		if repositoryIdentity != "" && r.Repository != "" && !strings.EqualFold(r.Repository, repositoryIdentity) {
 			continue
 		}
-		if strings.TrimSpace(r.TaskRef) == "" || strings.TrimSpace(r.Worktree) == "" || strings.TrimSpace(r.TabID) == "" ||
-			strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.HerdrSession) == "" {
+		if strings.TrimSpace(r.Name) == "" {
 			continue
 		}
-		wtAbs := r.Worktree
+
+		// Resolve worktree: check r.Worktree first, then r.CWD
+		worktreeRel := strings.TrimSpace(r.Worktree)
+		if worktreeRel == "" && strings.TrimSpace(r.CWD) != "" {
+			cwdClean := filepath.Clean(r.CWD)
+			rootClean := filepath.Clean(root)
+			if cwdClean == rootClean {
+				// CWD is root, not an isolated worktree
+			} else if rel, err := filepath.Rel(rootClean, cwdClean); err == nil && !strings.HasPrefix(rel, "..") && rel != "." {
+				worktreeRel = rel
+			}
+		}
+
+		// Verify worktree exists on disk
+		if worktreeRel == "" {
+			continue
+		}
+		wtAbs := worktreeRel
 		if !filepath.IsAbs(wtAbs) {
 			wtAbs = filepath.Join(root, wtAbs)
 		}
-		if _, err := os.Stat(wtAbs); err != nil {
+		if fi, err := os.Stat(wtAbs); err != nil || !fi.IsDir() {
 			continue
+		}
+
+		// Determine authentic task ref:
+		// 1. From cryptographically verified TASK-CONTEXT.json in the worktree if present
+		// 2. From launch receipt's TaskRef
+		taskRef := strings.TrimSpace(r.TaskRef)
+		taskID := "task-" + taskRef
+		var tcSessionID string
+		var tcRole string
+		var tcBranch string
+		var tcBaseSHA string
+		if tc, err := readVerifiedSourceTaskContext(root, wtAbs); err == nil {
+			if strings.TrimSpace(tc.TaskRef) != "" {
+				taskRef = strings.TrimSpace(tc.TaskRef)
+				taskID = tc.TaskID
+				if taskID == "" {
+					taskID = "task-" + taskRef
+				}
+			}
+			tcSessionID = strings.TrimSpace(tc.SessionID)
+			tcRole = strings.TrimSpace(tc.Role)
+			tcBranch = strings.TrimSpace(tc.Branch)
+			tcBaseSHA = strings.TrimSpace(tc.BaseSHA)
+		}
+		if taskRef == "" {
+			continue
+		}
+
+		role := r.Role
+		if role == "" {
+			role = tcRole
 		}
 
 		// Find durable handoff report
@@ -728,10 +907,16 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 		var reportData []byte
 		var parsedReport StructuredHandoffReport
 		candidates := []string{
-			filepath.Join(".herd", "reports", r.TaskRef+".md"),
-			filepath.Join(".herd", "reports", strings.ToLower(r.TaskRef)+".md"),
-			filepath.Join(r.Worktree, "REPORT"),
-			filepath.Join(r.Worktree, "REPORT.md"),
+			filepath.Join(".herd", "reports", taskRef+".md"),
+			filepath.Join(".herd", "reports", strings.ToLower(taskRef)+".md"),
+			filepath.Join(worktreeRel, "REPORT"),
+			filepath.Join(worktreeRel, "REPORT.md"),
+		}
+		if r.TaskRef != "" && !strings.EqualFold(r.TaskRef, taskRef) {
+			candidates = append(candidates,
+				filepath.Join(".herd", "reports", r.TaskRef+".md"),
+				filepath.Join(".herd", "reports", strings.ToLower(r.TaskRef)+".md"),
+			)
 		}
 		for _, candRel := range candidates {
 			candAbs := candRel
@@ -740,7 +925,7 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 			}
 			if b, err := os.ReadFile(candAbs); err == nil {
 				if parsed, pErr := ParseStructuredHandoffReport(b); pErr == nil {
-					if !strings.EqualFold(parsed.TaskRef, r.TaskRef) {
+					if !strings.EqualFold(parsed.TaskRef, taskRef) && (r.TaskRef == "" || !strings.EqualFold(parsed.TaskRef, r.TaskRef)) {
 						continue
 					}
 					if parsed.AgentName != "" && parsed.AgentName != r.Name {
@@ -783,6 +968,8 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 				}
 				baseSHA = r.CandidateSHA
 			}
+		} else if tcBaseSHA != "" && len(tcBaseSHA) == 40 && isAncestor(wtAbs, tcBaseSHA, candidateSHA) {
+			baseSHA = tcBaseSHA
 		} else if baseOut, err := exec.Command("git", "-C", wtAbs, "merge-base", candidateSHA, "HEAD~1").Output(); err == nil && len(strings.TrimSpace(string(baseOut))) == 40 {
 			b := strings.TrimSpace(string(baseOut))
 			if isAncestor(wtAbs, b, candidateSHA) {
@@ -791,6 +978,9 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 		}
 
 		branch := r.Branch
+		if branch == "" {
+			branch = tcBranch
+		}
 		if branch == "" {
 			if brOut, err := exec.Command("git", "-C", wtAbs, "symbolic-ref", "--short", "HEAD").Output(); err == nil {
 				branch = strings.TrimSpace(string(brOut))
@@ -802,19 +992,19 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 
 		workspace := "wK"
 		sessionID := r.HerdrSession
+		if sessionID == "" {
+			sessionID = tcSessionID
+		}
 		terminalID := "term-" + r.Name
 		paneID := r.PaneID
 		tabID := r.TabID
-		taskID := "task-" + r.TaskRef
 
+		// If launch receipt has tab/pane, we check live AgentList ONLY to verify matching incarnation
 		if agents, err := AgentList(); err == nil {
 			for _, a := range agents {
-				if a.Name == r.Name || a.TabID == r.TabID {
+				if a.Name == r.Name && ((r.TabID != "" && a.TabID == r.TabID) || (r.PaneID != "" && a.PaneID == r.PaneID)) {
 					if a.Workspace != "" {
 						workspace = a.Workspace
-					}
-					if a.Session.Value != "" {
-						sessionID = a.Session.Value
 					}
 					if a.TerminalID != "" {
 						terminalID = a.TerminalID
@@ -825,34 +1015,38 @@ func EnrollReadySourceManifests(root string, repositoryIdentity string, persist 
 					if a.TabID != "" {
 						tabID = a.TabID
 					}
+					// Live agent session must match bound session if both present
+					if sessionID == "" && a.Session.Value != "" && tcSessionID == a.Session.Value {
+						sessionID = a.Session.Value
+					}
 					break
 				}
 			}
 		}
-		if sessionID == "" {
+		if sessionID == "" || tabID == "" || paneID == "" {
 			// No unauthenticated fabricated sessions allowed
 			continue
 		}
-		generation := "gen-" + r.TaskRef + "-" + candidateSHA[:8]
-		if enrolledKeys[generation] || enrolledKeys[r.TaskRef+":"+candidateSHA] || enrolledKeys[tabID] {
+		generation := "gen-" + taskRef + "-" + candidateSHA[:8]
+		if enrolledKeys[generation] || enrolledKeys[taskRef+":"+candidateSHA] || enrolledKeys[tabID] {
 			continue
 		}
 
 		m := NewSourceRetirementManifest(time.Now(), SourceRetirementManifest{
 			Repository:     repositoryIdentity,
-			TaskRef:        r.TaskRef,
+			TaskRef:        taskRef,
 			TaskID:         taskID,
 			CandidateSHA:   candidateSHA,
 			BaseSHA:        baseSHA,
 			Branch:         branch,
-			Worktree:       r.Worktree,
+			Worktree:       worktreeRel,
 			Workspace:      workspace,
 			TabID:          tabID,
 			PaneID:         paneID,
 			TerminalID:     terminalID,
 			SessionID:      sessionID,
 			AgentName:      r.Name,
-			Role:           r.Role,
+			Role:           role,
 			AgentKind:      r.Provider,
 			ReportArtifact: reportPathRel,
 			ReportDigest:   reportDigest,

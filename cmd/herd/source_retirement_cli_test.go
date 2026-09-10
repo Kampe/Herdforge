@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -341,6 +342,203 @@ func TestSourceCleanupNativeAutomaticEnrollmentFromDurableHandoff(t *testing.T) 
 	receiptsPath := filepath.Join(root, herdr.SourceRetirementReceiptsFile)
 	if _, err := os.Stat(receiptsPath); err != nil {
 		t.Fatalf("expected retirement receipts file to be created: %v", err)
+	}
+}
+
+func TestSourceCleanupNative_ProductionNativeLaunchReceiptEnrollmentAndRetirement(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "add", "main.go").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "initial").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	baseSHABytes, _ := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	baseSHA := strings.TrimSpace(string(baseSHABytes))
+
+	// Create worktree for native mender lane
+	laneName := "mender-fac786-native-endpoint"
+	agentName := "forge-mender-fac786-nat-b5e8985e"
+	sessionID := "session-live-nat-5678"
+	wtRel := ".worktrees/mender-fac786-native-endpoint"
+	wtPath := filepath.Join(root, wtRel)
+	branch := "recovery/fac-786-native-endpoint"
+	if err := os.MkdirAll(filepath.Dir(wtPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "-b", branch, wtPath, "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %v (%s)", err, out)
+	}
+
+	if err := os.WriteFile(filepath.Join(wtPath, "fix.go"), []byte("package main\n// fixed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", wtPath, "add", "fix.go").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", wtPath, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "fix: endpoint issue").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	candidateSHABytes, _ := exec.Command("git", "-C", wtPath, "rev-parse", "HEAD").Output()
+	candidateSHA := strings.TrimSpace(string(candidateSHABytes))
+
+	if out, err := exec.Command("git", "-C", root, "remote", "add", "origin", "https://example.invalid/fixture.git").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	repository, err := dispatch.AuthenticatedRepositoryIdentity(root)
+	if err != nil {
+		t.Fatalf("resolve repository identity: %v", err)
+	}
+
+	// Generate receipt signing key and write published verification key to .herd/receipt.pub
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	herdConfigDir := filepath.Join(root, ".herd")
+	if err := os.MkdirAll(herdConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(herdConfigDir, "receipt.pub"), []byte(hex.EncodeToString(pub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Write signed TASK-CONTEXT.json in worktree
+	tc := dispatch.TaskContext{
+		ProviderType:    "kaneo",
+		ProjectID:       "proj-1",
+		Repository:      repository,
+		Role:            "mender",
+		TaskRef:         "FAC-786",
+		TaskID:          "task-fac-786",
+		Branch:          branch,
+		BaseSHA:         baseSHA,
+		LeaseID:         "lease-1",
+		LeaseGeneration: 1,
+		LeaseTaskRef:    "FAC-786",
+		SessionID:       sessionID,
+		AllowedOps:      []string{"get", "list", "comment"},
+		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	canonical, err := json.Marshal(tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(priv, canonical)
+	tc.Signature = hex.EncodeToString(sig)
+
+	taskContextData, err := json.Marshal(tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, "TASK-CONTEXT.json"), taskContextData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Track TASK-CONTEXT.json in git to keep worktree clean
+	if out, err := exec.Command("git", "-C", wtPath, "add", "TASK-CONTEXT.json").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", wtPath, "-c", "user.email=test@example.invalid", "-c", "user.name=test", "commit", "-qm", "chore: add task context").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	candidateSHABytes, _ = exec.Command("git", "-C", wtPath, "rev-parse", "HEAD").Output()
+	candidateSHA = strings.TrimSpace(string(candidateSHABytes))
+
+	// 2. Write durable handoff report in .herd/reports/FAC-786.md
+	reportRel := ".herd/reports/FAC-786.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportContent := "# FAC-786 Report\nTask: FAC-786\nAgent: " + agentName + "\nStatus: READY\nCandidate: " + candidateSHA + "\n"
+	if err := os.WriteFile(reportPath, []byte(reportContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Write herd.yaml
+	if err := os.WriteFile(filepath.Join(herdConfigDir, "herd.yaml"), []byte("version: \"1\"\nproject:\n  name: fixture\ntask_provider:\n  type: memory\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Write launch receipt from herd up (with CWD, no worktree, no herdr_session, no candidate_sha, TaskRef=laneName)
+	launchReceiptsPath := filepath.Join(root, ".herd/launch-receipts.jsonl")
+	lr := launch.Receipt{
+		Accepted:       true,
+		TaskRef:        laneName,
+		Lane:           laneName,
+		Name:           agentName,
+		Role:           "mender",
+		TaskShape:      "mender",
+		Provider:       "litellm",
+		Model:          "gpt-5.6-luna",
+		Effort:         "high",
+		DecisionDigest: "digest-1",
+		PaneID:         "wK:p17G",
+		TabID:          "wK:t17G",
+		Repository:     repository,
+		BuilderFamily:  "openai",
+		Branch:         branch,
+		CWD:            wtPath,
+	}
+	lrBytes, _ := json.Marshal(lr)
+	if err := os.WriteFile(launchReceiptsPath, append(lrBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tabClosed := false
+	t.Cleanup(herdr.SetRunHerdrForTest(func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			if tabClosed {
+				return `{"result":{"agents":[]}}`, nil
+			}
+			return `{"result":{"agents":[{"name":"` + agentName + `","agent_status":"idle","pane_id":"wK:p17G","tab_id":"wK:t17G","workspace_id":"wK","terminal_id":"term-1","cwd":"` + wtPath + `","focused":false,"agent_session":{"value":"` + sessionID + `"}}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && args[1] == "list" {
+			if tabClosed {
+				return `{"result":{"tabs":[]}}`, nil
+			}
+			return `{"result":{"tabs":[{"tab_id":"wK:t17G","workspace_id":"wK"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "process-info" {
+			if tabClosed {
+				return `{"error":{"code":"pane_not_found","message":"pane not found"}}`, errors.New("exit status 1")
+			}
+			return `{"result":{"process_info":{"foreground_processes":[]}}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "tab" && (args[1] == "compare-close" || args[1] == "close") {
+			tabClosed = true
+			return `{"result":{"closed":true}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "api" && args[1] == "capabilities" {
+			return `{"result":{"capabilities":["tab_compare_close"]}}`, nil
+		}
+		return "", errors.New("unexpected mock Herdr command: " + strings.Join(args, " "))
+	}))
+
+	report, err := runSourceRetirementCleanup(context.Background(), root, false)
+	if err != nil {
+		t.Fatalf("runSourceRetirementCleanup failed: %v", err)
+	}
+	if report.Retired != 1 || report.Failed != 0 || report.Blocked != 0 {
+		t.Fatalf("expected 1 retired candidate, got report: %+v", report)
+	}
+	if !tabClosed {
+		t.Fatal("expected tab to be closed after acting cleanup")
+	}
+
+	// Invariants: worktree and branch must remain intact!
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("source worktree was unexpectedly removed: %v", err)
+	}
+	branchCheck, err := exec.Command("git", "-C", root, "rev-parse", "--verify", branch).Output()
+	if err != nil || strings.TrimSpace(string(branchCheck)) != candidateSHA {
+		t.Fatalf("source branch was deleted or mutated: %v (%s)", err, branchCheck)
 	}
 }
 

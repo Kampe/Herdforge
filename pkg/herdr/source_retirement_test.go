@@ -1,6 +1,8 @@
 package herdr
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -786,5 +788,170 @@ func TestEnrollReadySourceManifestsAncestryAuthentication(t *testing.T) {
 	if enrolledPos[0].BaseSHA != baseSHA || enrolledPos[0].CandidateSHA != descendantSHA {
 		t.Fatalf("enrolled manifest base/candidate mismatch: got base=%s candidate=%s, want base=%s candidate=%s",
 			enrolledPos[0].BaseSHA, enrolledPos[0].CandidateSHA, baseSHA, descendantSHA)
+	}
+}
+
+func TestEnrollReadySourceManifests_ResolvesNativeLaunchReceiptWithoutWorktreeOrSession(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "-C", root, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", root, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatalf("base commit: %v (%s)", err, out)
+	}
+	baseBytes, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSHA := strings.TrimSpace(string(baseBytes))
+
+	agentName := "forge-mender-fac786-nat-b5e8985e"
+	laneName := "mender-fac786-native-endpoint"
+	wtRel := ".worktrees/mender-fac786-native-endpoint"
+	wtAbs := filepath.Join(root, wtRel)
+	if err := os.MkdirAll(wtAbs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create branch in worktree
+	branch := "recovery/fac-786-native-endpoint"
+	if out, err := exec.Command("git", "-C", root, "worktree", "add", "-q", "-b", branch, wtAbs, "main").CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %v (%s)", err, out)
+	}
+
+	// Write work commit
+	if err := os.WriteFile(filepath.Join(wtAbs, "fix.txt"), []byte("native endpoint fix\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", wtAbs, "add", "fix.txt").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	if out, err := exec.Command("git", "-C", wtAbs, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "-m", "fix: native endpoint").CombinedOutput(); err != nil {
+		t.Fatal(string(out))
+	}
+	candidateBytes, err := exec.Command("git", "-C", wtAbs, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateSHA := strings.TrimSpace(string(candidateBytes))
+
+	// Generate receipt signing key and write published verification key to .herd/receipt.pub
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	herdDir := filepath.Join(root, ".herd")
+	if err := os.MkdirAll(herdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(herdDir, "receipt.pub"), []byte(hex.EncodeToString(pub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write TASK-CONTEXT.json in worktree (authenticates task ref, role, and session)
+	unsignedTC := signedSourceTaskContext{
+		ProviderType:    "kaneo",
+		ProjectID:       "proj-1",
+		Repository:      "fixture-repo",
+		Role:            "mender",
+		TaskRef:         "FAC-786",
+		TaskID:          "task-fac-786",
+		Branch:          branch,
+		BaseSHA:         baseSHA,
+		LeaseID:         "lease-1",
+		LeaseGeneration: 1,
+		LeaseTaskRef:    "FAC-786",
+		SessionID:       "session-live-nat-1234",
+		AllowedOps:      []string{"get", "list", "comment"},
+		ExpiresAt:       time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	canonicalBytes, err := json.Marshal(unsignedTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(priv, canonicalBytes)
+	unsignedTC.Signature = hex.EncodeToString(sig)
+
+	taskContextData, err := json.Marshal(unsignedTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtAbs, "TASK-CONTEXT.json"), taskContextData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write durable handoff report in .herd/reports/
+	reportRel := ".herd/reports/fac-786.md"
+	reportPath := filepath.Join(root, reportRel)
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportData := []byte("## Report for FAC-786\nTask: FAC-786\nAgent: " + agentName + "\nCandidate: " + candidateSHA + "\nStatus: READY\n")
+	if err := os.WriteFile(reportPath, reportData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Production launch receipt produced by herd up / recordResolvedLaunchReceipt:
+	// Notice: TaskRef is the lane name "mender-fac786-native-endpoint"
+	// Worktree is empty
+	// HerdrSession is empty
+	// CandidateSHA is empty
+	// CWD is set
+	launchReceiptsPath := filepath.Join(root, ".herd", "launch-receipts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(launchReceiptsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lr := launch.Receipt{
+		Accepted:       true,
+		TaskRef:        laneName,
+		Lane:           laneName,
+		Name:           agentName,
+		Role:           "mender",
+		TaskShape:      "mender",
+		Provider:       "litellm",
+		Model:          "gpt-5.6-luna",
+		Effort:         "high",
+		DecisionDigest: "digest-1",
+		PaneID:         "wK:p17G",
+		TabID:          "wK:t17G",
+		Repository:     "fixture-repo",
+		BuilderFamily:  "openai",
+		Branch:         branch,
+		CWD:            wtAbs,
+	}
+	lrBytes, _ := json.Marshal(lr)
+	if err := os.WriteFile(launchReceiptsPath, append(lrBytes, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock runHerdr for live AgentList resolving session
+	oldRunHerdr := runHerdr
+	t.Cleanup(func() { runHerdr = oldRunHerdr })
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"` + agentName + `","agent_status":"idle","pane_id":"wK:p17G","tab_id":"wK:t17G","workspace_id":"wK","terminal_id":"term-1","cwd":"` + wtAbs + `","focused":false,"agent_session":{"value":"session-live-nat-1234"}}]}}`, nil
+		}
+		return "", errors.New("unsupported mock Herdr command")
+	}
+
+	manifests, err := EnrollReadySourceManifests(root, "fixture-repo", true)
+	if err != nil {
+		t.Fatalf("EnrollReadySourceManifests failed: %v", err)
+	}
+	if len(manifests) != 1 {
+		t.Fatalf("expected 1 enrolled manifest, got %d", len(manifests))
+	}
+	m := manifests[0]
+	if m.TaskRef != "FAC-786" {
+		t.Errorf("manifest TaskRef = %q, want %q", m.TaskRef, "FAC-786")
+	}
+	if m.Worktree != wtRel {
+		t.Errorf("manifest Worktree = %q, want %q", m.Worktree, wtRel)
+	}
+	if m.SessionID != "session-live-nat-1234" {
+		t.Errorf("manifest SessionID = %q, want %q", m.SessionID, "session-live-nat-1234")
+	}
+	if m.CandidateSHA != candidateSHA {
+		t.Errorf("manifest CandidateSHA = %q, want %q", m.CandidateSHA, candidateSHA)
 	}
 }
