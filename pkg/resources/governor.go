@@ -256,6 +256,14 @@ type GovernorReport struct {
 	Foreign                      []ForeignTelemetry   `json:"foreign,omitempty"`
 	Reaped                       int                  `json:"reaped"`
 	ReclaimedBytes               uint64               `json:"reclaimed_bytes"`
+	OrphanCensusTruncated        bool                 `json:"orphan_census_truncated,omitempty"`
+	OrphanCensusRemaining        int                  `json:"orphan_census_remaining,omitempty"`
+}
+
+type orphanCensusResult struct {
+	Orphans   []OrphanWorktree
+	Truncated bool
+	Remaining int
 }
 
 // OrphanWorktree is an unregistered child of a repository-declared known lane
@@ -471,10 +479,10 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	for i := range report.Worktrees {
 		report.Worktrees[i].ReportPath = reportPath(g.Policy.RepositoryRoot, report.Worktrees[i].Path)
 	}
-	orphans, orphanErr := g.censusOrphans(ctx, report.Worktrees, before)
-	if orphanErr != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
-	}
+	orphanResult, orphanErr := g.censusOrphans(ctx, report.Worktrees, before)
+	orphans := orphanResult.Orphans
+	report.OrphanCensusTruncated = orphanResult.Truncated
+	report.OrphanCensusRemaining = orphanResult.Remaining
 	report.Orphans = orphans
 	for _, orphan := range orphans {
 		for _, target := range orphan.DerivedTargets {
@@ -486,6 +494,9 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 				})
 			}
 		}
+	}
+	if orphanErr != nil {
+		return report, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
 	}
 	for _, lane := range lanes {
 		for _, rel := range g.Policy.GeneratedDirectories {
@@ -511,9 +522,10 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	return report, nil
 }
 
-func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree, before Capacity) ([]OrphanWorktree, error) {
+func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree, before Capacity) (orphanCensusResult, error) {
+	var result orphanCensusResult
 	if len(g.Policy.OrphanRoots) == 0 {
-		return nil, nil
+		return result, nil
 	}
 	known := make(map[string]struct{}, len(registered))
 	for _, lane := range registered {
@@ -524,9 +536,8 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 	}
 	repoRoot, err := filepath.EvalSymlinks(g.Policy.RepositoryRoot)
 	if err != nil {
-		return nil, fmt.Errorf("resolve repository root for orphan census: %w", err)
+		return result, fmt.Errorf("resolve repository root for orphan census: %w", err)
 	}
-	var out []OrphanWorktree
 	seenRoots := make(map[string]struct{}, len(g.Policy.OrphanRoots))
 	for _, rawRoot := range g.Policy.OrphanRoots {
 		root, err := filepath.EvalSymlinks(rawRoot)
@@ -534,11 +545,11 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("resolve known orphan root: %w", err)
+			return result, fmt.Errorf("resolve known orphan root: %w", err)
 		}
 		root = filepath.Clean(root)
 		if !containedPath(repoRoot, root) {
-			return nil, errors.New("known orphan root escapes repository root")
+			return result, errors.New("known orphan root escapes repository root")
 		}
 		if _, duplicate := seenRoots[root]; duplicate {
 			continue
@@ -546,11 +557,13 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 		seenRoots[root] = struct{}{}
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			return nil, fmt.Errorf("read known orphan root: %w", err)
+			return result, fmt.Errorf("read known orphan root: %w", err)
 		}
+		limit := g.orphanCensusLimit()
+		candidates := 0
 		for _, entry := range entries {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return result, err
 			}
 			path := filepath.Join(root, entry.Name())
 			resolved, resolveErr := filepath.EvalSymlinks(path)
@@ -561,13 +574,19 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			if _, ok := known[resolved]; ok {
 				continue
 			}
+			if candidates >= limit {
+				result.Truncated = true
+				result.Remaining++
+				continue
+			}
+			candidates++
 			info, statErr := os.Stat(path)
 			if statErr != nil || !info.IsDir() {
 				continue
 			}
-			usage, measureErr := g.Measure.Measure(path, g.Policy.MaxScanEntries)
+			usage, measureErr := g.Measure.Measure(path, g.orphanMeasureLimit())
 			if measureErr != nil {
-				out = append(out, OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), PreserveReason: "orphan_allocation_unavailable"})
+				result.Orphans = append(result.Orphans, OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), PreserveReason: "orphan_allocation_unavailable"})
 				continue
 			}
 			orphan := OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), AllocatedBytes: usage.Bytes, Entries: usage.Entries, AllocationTruncated: usage.Truncated, PreserveReason: "unregistered_worktree_authority_unavailable"}
@@ -586,11 +605,34 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 				}
 				orphan.DerivedTargets = append(orphan.DerivedTargets, row)
 			}
-			out = append(out, orphan)
+			result.Orphans = append(result.Orphans, orphan)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
-	return out, nil
+	sort.Slice(result.Orphans, func(i, j int) bool { return result.Orphans[i].Path < result.Orphans[j].Path })
+	return result, nil
+}
+
+// orphanCensusLimit bounds expensive recursive accounting and process proof.
+// It is deliberately several batches wide so repeated periodic sweeps make
+// progress after earlier candidates are reclaimed, while unknown/deferred
+// candidates remain conservatively preserved and reported as partial census.
+func (g *Governor) orphanCensusLimit() int {
+	limit := g.Policy.ReapBatchLimit * 4
+	if limit < 16 {
+		limit = 16
+	}
+	if limit > 64 {
+		limit = 64
+	}
+	return limit
+}
+
+func (g *Governor) orphanMeasureLimit() int {
+	limit := g.Policy.MaxScanEntries
+	if limit <= 0 || limit > 4096 {
+		return 4096
+	}
+	return limit
 }
 
 type bootstrapReceiptEvidence struct {

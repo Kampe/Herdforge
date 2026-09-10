@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -907,5 +908,55 @@ func TestParseWorktreePorcelainDecodesGitQuotedPath(t *testing.T) {
 	}
 	if len(lanes) != 1 || lanes[0].Path != "/repo/lane\nname" {
 		t.Fatalf("quoted worktree path=%+v", lanes)
+	}
+}
+
+func TestGovernorBoundsUnregisteredOrphanCensusAndReportsRemainder(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := os.Mkdir(filepath.Join(root, fmt.Sprintf("orphan-%02d", i)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g.Policy.OrphanRoots = []string{root}
+	g.Policy.OrphanDerivedTargets = []string{"bootstrap-go-build"}
+	g.Policy.OrphanCacheTTL = time.Hour
+	g.Policy.OrphanCacheBudgetBytes = 1 << 20
+
+	report, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.OrphanCensusTruncated || report.OrphanCensusRemaining != 4 {
+		t.Fatalf("orphan census bound=%+v", report)
+	}
+	if len(report.Orphans) != 16 {
+		t.Fatalf("bounded orphan diagnostics=%d, want 16", len(report.Orphans))
+	}
+}
+
+func TestGovernorOrphanCensusFailureRetainsPartialReport(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	if err := os.MkdirAll(filepath.Join(root, "orphan"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	g.Policy.OrphanRoots = []string{root}
+	g.Policy.OrphanDerivedTargets = []string{"bootstrap-go-build"}
+	g.Policy.OrphanCacheTTL = time.Hour
+	g.Policy.OrphanCacheBudgetBytes = 1 << 20
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	report, err := g.Run(ctx, RunOptions{})
+	if err == nil || !strings.Contains(err.Error(), "unregistered-orphan census") {
+		t.Fatalf("canceled orphan census error=%v", err)
+	}
+	if report.HostID != "host" || len(report.Worktrees) != 1 || report.CapacityBefore.FreeBytes != 900000 {
+		t.Fatalf("partial census report was discarded: %+v", report)
 	}
 }
