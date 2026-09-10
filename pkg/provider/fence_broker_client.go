@@ -205,6 +205,7 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 	var out struct {
 		Applied        bool   `json:"applied"`
 		Ambiguous      bool   `json:"ambiguous"`
+		OpID           string `json:"op_id"`
 		TaskID         string `json:"task_id"`
 		ExpectedStatus string `json:"expected_status"`
 	}
@@ -212,6 +213,9 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 		return false, err
 	}
 	if !out.Applied || out.Ambiguous {
+		return false, nil
+	}
+	if out.OpID == "" || !strings.EqualFold(out.OpID, opID) {
 		return false, nil
 	}
 	if out.TaskID != taskID {
@@ -269,6 +273,12 @@ func (c *FenceBrokerClient) LookupOp(ctx context.Context, opID string) (*FenceOp
 	}
 	if out.Ambiguous && out.Applied {
 		return nil, fmt.Errorf("fence-broker op lookup: contradictory receipt (applied and ambiguous)")
+	}
+	if out.OpID == "" || !strings.EqualFold(out.OpID, opID) {
+		return nil, fmt.Errorf("fence-broker op lookup: receipt op_id %q does not match requested %q", out.OpID, opID)
+	}
+	if out.Applied && strings.TrimSpace(out.TaskID) == "" {
+		return nil, fmt.Errorf("fence-broker op lookup: applied receipt is missing task identity")
 	}
 	return &out, nil
 }
@@ -377,19 +387,22 @@ func (c *FenceBrokerClient) MutateComment(ctx context.Context, taskID, commentBo
 	return nil
 }
 
-// rejectJSONErrorBody enforces fail-closed: HTTP 2xx with {"error":...} is a hard error.
+// rejectJSONErrorBody enforces fail-closed: HTTP 2xx with {"error":...} of any JSON type is a hard error.
 func rejectJSONErrorBody(status int, body []byte) error {
 	if status < 200 || status >= 300 || len(body) == 0 {
 		return nil
 	}
-	var probe struct {
-		Error string `json:"error"`
-	}
+	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(body, &probe); err != nil {
 		return nil
 	}
-	if strings.TrimSpace(probe.Error) != "" {
-		return fmt.Errorf("fence-broker: HTTP %d body carries error (fail-closed): %s", status, probe.Error)
+	for k, raw := range probe {
+		if strings.EqualFold(k, "error") {
+			rawStr := strings.TrimSpace(string(raw))
+			if rawStr != "" && rawStr != "null" && rawStr != `""` {
+				return fmt.Errorf("fence-broker: HTTP %d body carries error (fail-closed): %s", status, rawStr)
+			}
+		}
 	}
 	return nil
 }

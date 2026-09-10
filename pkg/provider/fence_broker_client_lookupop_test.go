@@ -62,13 +62,57 @@ func TestFenceBrokerClientLookupOpFailClosed(t *testing.T) {
 	})
 
 	t.Run("200 error body is hard error", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{"error":"ledger mismatch"}`))
-		}))
-		defer srv.Close()
-		c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
-		if _, err := c.LookupOp(ctx, "aa"); err == nil {
-			t.Fatal("HTTP 200 error body must be a hard error")
+		for _, errBody := range []string{
+			`{"error":"ledger mismatch"}`,
+			`{"error":500}`,
+			`{"error":true}`,
+			`{"error":{"code":500,"message":"ledger mismatch"}}`,
+			`{"error":["ledger mismatch"]}`,
+		} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(errBody))
+			}))
+			c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
+			if _, err := c.LookupOp(ctx, "aa"); err == nil {
+				srv.Close()
+				t.Fatalf("HTTP 200 error body %s must be a hard error", errBody)
+			}
+			srv.Close()
+		}
+	})
+
+	t.Run("receipt with foreign or empty op_id is rejected", func(t *testing.T) {
+		for _, body := range []string{
+			`{"applied":true,"ambiguous":false,"op_id":"bb","task_id":"t1","fence_token":3}`,
+			`{"applied":true,"ambiguous":false,"op_id":"","task_id":"t1","fence_token":3}`,
+			`{"applied":true,"ambiguous":false,"task_id":"t1","fence_token":3}`,
+		} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
+			if _, err := c.LookupOp(ctx, "aa"); err == nil {
+				srv.Close()
+				t.Fatalf("receipt %s must be rejected for op aa", body)
+			}
+			srv.Close()
+		}
+	})
+
+	t.Run("applied receipt with missing task_id is rejected", func(t *testing.T) {
+		for _, body := range []string{
+			`{"applied":true,"ambiguous":false,"op_id":"aa","task_id":"","fence_token":3}`,
+			`{"applied":true,"ambiguous":false,"op_id":"aa","fence_token":3}`,
+		} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			c := &FenceBrokerClient{BaseURL: srv.URL, Token: "token-0123456789abcdef"}
+			if _, err := c.LookupOp(ctx, "aa"); err == nil {
+				srv.Close()
+				t.Fatalf("applied receipt %s must be rejected for missing task_id", body)
+			}
+			srv.Close()
 		}
 	})
 

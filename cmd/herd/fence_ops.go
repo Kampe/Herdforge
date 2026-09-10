@@ -242,36 +242,33 @@ func localReceiptAsReadback(rc *provider.OpReceipt) *provider.FenceOpReadback {
 	}
 }
 
-// findOutboxRecord scans pending provider-transition records for the exact
-// operation payload. Read-only.
+// findOutboxRecord scans provider-transition records for the exact
+// operation payload across all lifecycle states. Read-only.
 func findOutboxRecord(ctx context.Context, outbox *claim.SQLiteOutbox, opID string) (*fenceOpOutboxView, error) {
-	if outbox == nil {
+	if outbox == nil || opID == "" {
 		return nil, nil
 	}
-	pending, err := outbox.Pending(ctx)
+	rec, err := outbox.FindByPayload(ctx, []byte(opID))
 	if err != nil {
 		return nil, err
 	}
-	for _, rec := range pending {
-		if !claim.IsProviderTransitionKind(rec.Kind) {
-			continue
-		}
-		if strings.TrimSpace(string(rec.Payload)) != opID {
-			continue
-		}
-		view := &fenceOpOutboxView{
-			IdempotencyKey: rec.IdempotencyKey,
-			Kind:           rec.Kind,
-			Status:         string(rec.Status),
-			Attempts:       rec.Attempts,
-			LastError:      rec.LastError,
-		}
-		if pk, ok := parseProviderIntentKey(rec.IdempotencyKey); ok {
-			view.Identity = pk
-		}
-		return view, nil
+	if rec == nil {
+		return nil, nil
 	}
-	return nil, nil
+	if !claim.IsProviderTransitionKind(rec.Kind) {
+		return nil, nil
+	}
+	view := &fenceOpOutboxView{
+		IdempotencyKey: rec.IdempotencyKey,
+		Kind:           rec.Kind,
+		Status:         string(rec.Status),
+		Attempts:       rec.Attempts,
+		LastError:      rec.LastError,
+	}
+	if pk, ok := parseProviderIntentKey(rec.IdempotencyKey); ok {
+		view.Identity = pk
+	}
+	return view, nil
 }
 
 // fenceOpBindingRefusals checks caller-asserted bindings against evidence.

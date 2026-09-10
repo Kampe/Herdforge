@@ -331,6 +331,59 @@ func TestFenceOpStatusAppliedOp(t *testing.T) {
 	}
 }
 
+func TestFenceOpStatusRetainsIdentityForAppliedOutbox(t *testing.T) {
+	f := seedFenceOpFixture(t, fenceOpFixtureApplied, false)
+	// Mark the outbox record applied in the store to simulate completed local settlement.
+	outbox, err := claim.NewSQLiteOutbox(f.outboxPath)
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	if err := outbox.ForceMarkApplied(context.Background(), f.intentKey, time.Now()); err != nil {
+		t.Fatalf("force mark applied: %v", err)
+	}
+	outbox.Close()
+
+	// 1. Plain status should retain outbox identity and report applied status.
+	exit, stdout, stderr := runFenceOpCLI(t, f, "", "fence-op", "status", f.opID, "--json")
+	if exit != 0 {
+		t.Fatalf("status for applied outbox should exit 0, got %d (stdout=%s stderr=%s)", exit, stdout, stderr)
+	}
+	m := decodeFenceOpJSON(t, stdout)
+	if m["applied"] != true {
+		t.Fatalf("expected applied=true, got %v", m)
+	}
+	ob, _ := m["outbox"].(map[string]any)
+	if ob == nil {
+		t.Fatalf("outbox record missing from applied status output: %v", m)
+	}
+	if status, _ := ob["status"].(string); status != "applied" {
+		t.Fatalf("expected outbox.status=applied, got %v", ob["status"])
+	}
+	id, _ := ob["identity"].(map[string]any)
+	if id == nil || id["repo"] != fenceOpFixtureRepo || id["project"] != fenceOpFixtureProject || id["task_ref"] != fenceOpFixtureTaskRef {
+		t.Fatalf("identity binding missing or wrong on applied outbox: %v", ob)
+	}
+
+	// 2. Caller-supplied --repo, --project, --task-ref, --task should confirm binding and succeed.
+	exit, stdout, stderr = runFenceOpCLI(t, f, "", "fence-op", "status", f.opID, "--json",
+		"--repo", fenceOpFixtureRepo,
+		"--project", fenceOpFixtureProject,
+		"--task-ref", fenceOpFixtureTaskRef,
+		"--task", fenceOpFixtureTaskID,
+	)
+	if exit != 0 {
+		t.Fatalf("matching binding flags on applied outbox should exit 0, got %d (stdout=%s stderr=%s)", exit, stdout, stderr)
+	}
+
+	// 3. Mismatched binding flag on applied outbox must refuse.
+	exit, stdout, stderr = runFenceOpCLI(t, f, "", "fence-op", "status", f.opID, "--json",
+		"--repo", "/tmp/mismatched-repo",
+	)
+	if exit == 0 {
+		t.Fatalf("mismatched repo on applied outbox must refuse with non-zero exit, got 0")
+	}
+}
+
 func TestFenceOpStatusBindingMismatchRefuses(t *testing.T) {
 	f := seedFenceOpFixture(t, fenceOpFixtureAmbiguous, true)
 	before := snapshotFenceOpFixture(t, f)

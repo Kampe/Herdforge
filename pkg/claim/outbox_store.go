@@ -79,6 +79,10 @@ type DurableOutbox interface {
 	// Get returns the current record for idempotencyKey, or nil if none.
 	Get(ctx context.Context, idempotencyKey string) (*OutboxRecord, error)
 
+	// FindByPayload returns the newest outbox record matching payload regardless
+	// of lifecycle status (pending, in_progress, failed, applied), or (nil, nil) if none.
+	FindByPayload(ctx context.Context, payload []byte) (*OutboxRecord, error)
+
 	// Pending returns every record in Pending, Failed, or InProgress
 	// state, oldest first, for a reconciliation sweep to inspect.
 	Pending(ctx context.Context) ([]*OutboxRecord, error)
@@ -162,6 +166,15 @@ func scanOutbox(row interface{ Scan(...any) error }) (*OutboxRecord, error) {
 
 func (o *SQLiteOutbox) Get(ctx context.Context, idempotencyKey string) (*OutboxRecord, error) {
 	row := o.db.QueryRowContext(ctx, `SELECT `+outboxColumns+` FROM outbox WHERE idempotency_key = ?`, idempotencyKey)
+	r, err := scanOutbox(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return r, err
+}
+
+func (o *SQLiteOutbox) FindByPayload(ctx context.Context, payload []byte) (*OutboxRecord, error) {
+	row := o.db.QueryRowContext(ctx, `SELECT `+outboxColumns+` FROM outbox WHERE payload = ? OR payload = ? ORDER BY id DESC LIMIT 1`, payload, string(payload))
 	r, err := scanOutbox(row)
 	if err == sql.ErrNoRows {
 		return nil, nil

@@ -64,6 +64,68 @@ func TestNewSQLiteOutboxCreatesParentDirectory(t *testing.T) {
 	}
 }
 
+func TestSQLiteOutboxFindByPayload(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "outbox.db")
+	outbox, err := NewSQLiteOutbox(path)
+	if err != nil {
+		t.Fatalf("new outbox: %v", err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+
+	// Unknown payload returns nil, nil
+	rec, err := outbox.FindByPayload(ctx, []byte("unknown-op"))
+	if err != nil || rec != nil {
+		t.Fatalf("expected (nil, nil) for unknown payload, got (%+v, %v)", rec, err)
+	}
+
+	// Enqueue a record (pending status)
+	intent := OutboxIntent{
+		IdempotencyKey: "provider:repo/kaneo/proj/TASK-1:g1:status:done",
+		Kind:           "status:done",
+		Payload:        []byte("op-uuid-1234"),
+	}
+	if _, err := outbox.Enqueue(ctx, intent); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	rec, err = outbox.FindByPayload(ctx, []byte("op-uuid-1234"))
+	if err != nil || rec == nil {
+		t.Fatalf("expected record for pending op-uuid-1234, got (%+v, %v)", rec, err)
+	}
+	if rec.Status != OutboxPending || rec.IdempotencyKey != intent.IdempotencyKey {
+		t.Fatalf("unexpected record: %+v", rec)
+	}
+
+	// Transition to in_progress via Claim
+	claimed, err := outbox.Claim(ctx, intent.IdempotencyKey, "settler-1", time.Minute, time.Now())
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: (%+v, %v)", claimed, err)
+	}
+	rec, err = outbox.FindByPayload(ctx, []byte("op-uuid-1234"))
+	if err != nil || rec == nil || rec.Status != OutboxInProgress {
+		t.Fatalf("expected in_progress record, got (%+v, %v)", rec, err)
+	}
+
+	// Transition to failed via MarkFailed
+	if err := outbox.MarkFailed(ctx, intent.IdempotencyKey, "settler-1", "err", time.Now()); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	rec, err = outbox.FindByPayload(ctx, []byte("op-uuid-1234"))
+	if err != nil || rec == nil || rec.Status != OutboxFailed {
+		t.Fatalf("expected failed record, got (%+v, %v)", rec, err)
+	}
+
+	// Transition to applied via ForceMarkApplied
+	if err := outbox.ForceMarkApplied(ctx, intent.IdempotencyKey, time.Now()); err != nil {
+		t.Fatalf("force mark applied: %v", err)
+	}
+	rec, err = outbox.FindByPayload(ctx, []byte("op-uuid-1234"))
+	if err != nil || rec == nil || rec.Status != OutboxApplied {
+		t.Fatalf("expected applied record, got (%+v, %v)", rec, err)
+	}
+}
+
 func newTestHoldAuthority(t *testing.T) *lifecycle.HoldAuthority {
 	t.Helper()
 	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
