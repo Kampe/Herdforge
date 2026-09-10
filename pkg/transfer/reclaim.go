@@ -3,25 +3,35 @@
 //
 // Retention contract: a bundle is reclaimable only when every gate holds —
 //
+//   - native serialization: the pass runs under the shared-checkout DirLock,
+//     serializing reclaimers against each other and against participating
+//     transfers that hold the same native lock;
+//   - manifest authority: the coordinator's retention manifest inside the
+//     owned root lists the exact bundle filename; repository location and a
+//     `.bundle` suffix never prove ownership;
 //   - canonical identity: the bundle directory resolves to the canonical
 //     repository (itself or one of its worktrees) and lives inside owned
 //     `.herd` state, never arbitrary user paths;
-//   - regular file: Lstat shows a regular file, never a symlink;
+//   - regular file: Lstat shows a regular file, never a symlink, with a
+//     link count of exactly one;
 //   - integrity: `git bundle verify` passes against the canonical repo;
 //   - containment: every contained tip is retained by canonical refs
-//     (present locally AND reachable from `--all`);
+//     (present locally AND reachable from `--all`), with list-heads output
+//     parsed strictly — malformed or partial output is an unknown;
 //   - no readers: authoritative lsof proof that no process holds it open;
-//   - revalidation: identity, reader proof, and containment are rechecked
-//     immediately before unlink.
+//   - revalidation: parent-directory identity, file identity, reader proof,
+//     and containment are rechecked immediately before a directory-relative
+//     unlink pinned to the parent directory descriptor.
 //
-// Any error, unknown reader, changed file, or missing or unique object
-// retains the bundle with an actionable reason. Non-`.bundle` entries
-// (receipt logs, matrices, recovery records) are never candidates.
-// A dry-run never unlinks and never reports bytes as freed.
+// Any error, unknown reader, changed file or parent, missing or unique
+// object, hard-linked inode, timed-out or overflowing child, or malformed
+// output retains the bundle with an actionable reason. Non-`.bundle`
+// entries (receipt logs, matrices, recovery records) are never candidates.
+// A dry-run never unlinks and never reports bytes as freed. Directory
+// iteration and every child process lifetime/output are bounded.
 package transfer
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -32,6 +42,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/lock"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -40,6 +51,11 @@ const (
 
 	DefaultMaxFiles        = 256
 	DefaultMaxReclaimBytes = int64(4) << 30
+
+	// dirChunkSize bounds directory iteration: entries are streamed in
+	// chunks and enumeration stops once the bundle-name budget is met, so a
+	// directory with unbounded non-bundle evidence is never fully loaded.
+	dirChunkSize = 256
 )
 
 // ReaderStatus is deliberately tri-state. Missing reader inspection never
@@ -58,8 +74,17 @@ type ReclaimOptions struct {
 	RepoRoot string
 	// Root is the owned bundle directory under `.herd` state.
 	Root string
+	// Manifest is the required coordinator-owned retention manifest inside
+	// Root listing the exact bundle filenames that may be considered.
+	Manifest string
 	// Act performs unlinks. Zero value is a dry-run that only reports.
 	Act bool
+	// LockDir is the native shared-checkout lock directory serializing
+	// reclaimers and participating transfers. Empty defaults to the
+	// canonical repo's `.git/herd-shared-checkout.lock.d`.
+	LockDir string
+	// LockWait bounds how long the pass waits for the native lock.
+	LockWait time.Duration
 	// MaxFiles bounds how many bundle files one pass examines.
 	MaxFiles int
 	// MaxBytes bounds reclaimed (act) or would-reclaim (dry-run) bytes.
@@ -109,6 +134,37 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 	if err != nil {
 		return report, err
 	}
+	manifest, err := LoadRetentionManifest(dir, opts.Manifest)
+	if err != nil {
+		return report, err
+	}
+	if strings.TrimSpace(opts.LockDir) == "" {
+		opts.LockDir = filepath.Join(opts.RepoRoot, lock.DefaultRelDir)
+	}
+	lockDirAbs, err := filepath.EvalSymlinks(filepath.Dir(opts.LockDir))
+	if err != nil {
+		return report, fmt.Errorf("bundle reclaim: native lock parent: %w", err)
+	}
+	opts.LockDir = filepath.Join(lockDirAbs, filepath.Base(opts.LockDir))
+	shared := lock.NewDirLock(opts.LockDir)
+	var lockOwned bool
+	// Re-entrancy is exclusively the `herd lock with` contract: the env names
+	// THIS lockdir. An existing lock held by anyone else must block/refuse
+	// through Acquire, never be adopted — and never released by this pass.
+	if os.Getenv(lock.EnvHeld) != opts.LockDir {
+		wait := opts.LockWait
+		if wait <= 0 {
+			wait = 30 * time.Second
+		}
+		if err := shared.Acquire(ctx, wait, "herd bundle-reclaim serializes reclaimers and participating transfers"); err != nil {
+			return report, fmt.Errorf("bundle reclaim: native lock: %w", err)
+		}
+		lockOwned = true
+	}
+	if lockOwned {
+		defer shared.Release()
+	}
+
 	maxFiles := opts.MaxFiles
 	if maxFiles <= 0 {
 		maxFiles = DefaultMaxFiles
@@ -126,25 +182,46 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 		reader = DefaultLsofReader
 	}
 
-	entries, err := os.ReadDir(dir)
+	// Bounded, deterministic enumeration: stream directory chunks, collect
+	// only manifest-relevant .bundle names up to the file budget, then sort.
+	var bundleNames []string
+	dirFile, err := os.Open(dir)
 	if err != nil {
 		return report, fmt.Errorf("bundle reclaim: read %s: %w", dir, err)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	for _, entry := range entries {
+	defer dirFile.Close()
+enumerate:
+	for {
 		if ctx.Err() != nil {
 			report.Partial, report.Reason = true, "timeout"
 			break
 		}
-		name := entry.Name()
-		if !strings.HasSuffix(name, bundleSuffix) {
-			report.NonBundleEntries++
-			continue
+		chunk, readErr := dirFile.ReadDir(dirChunkSize)
+		for _, entry := range chunk {
+			name := entry.Name()
+			if !strings.HasSuffix(name, bundleSuffix) {
+				report.NonBundleEntries++
+				continue
+			}
+			if len(bundleNames) >= maxFiles {
+				report.Partial, report.Reason = true, "file-budget"
+				break enumerate
+			}
+			bundleNames = append(bundleNames, name)
 		}
-		if report.Scanned >= maxFiles {
-			report.Partial, report.Reason = true, "file-budget"
+		if readErr != nil {
+			if !errors.Is(readErr, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
+					report.Partial, report.Reason = true, "timeout"
+					break
+				}
+			}
 			break
 		}
+	}
+	sort.Strings(bundleNames)
+
+	for _, name := range bundleNames {
 		report.Scanned++
 		disp := FileDisposition{Name: name}
 		path := filepath.Join(dir, name)
@@ -155,11 +232,20 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 			continue
 		}
 		disp.Bytes = st.Size()
+		if manifestGate := !manifestContains(manifest, name); manifestGate {
+			disp.Action, disp.Reason = "retained", "not-in-retention-manifest"
+			report.Dispositions = append(report.Dispositions, disp)
+			continue
+		}
 		if retain := gate(&disp, "not-regular-file", !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0, ""); retain {
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
 		if retain := gate(&disp, "explicitly-protected", protected[name], ""); retain {
+			report.Dispositions = append(report.Dispositions, disp)
+			continue
+		}
+		if retain := gate(&disp, "hard-link-substitution-possible", fileLinkCount(st) != 1, ""); retain {
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
@@ -208,20 +294,28 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
-		if reason := revalidateBeforeUnlink(ctx, opts, reader, path, st, tips); reason != "" {
+		dirBefore, dirBeforeErr := os.Lstat(dir)
+		if dirBeforeErr != nil {
+			disp.Action, disp.Reason = "retained", fmt.Sprintf("parent-stat-unknown: %v", dirBeforeErr)
+			report.Dispositions = append(report.Dispositions, disp)
+			continue
+		}
+		if reason := revalidateBeforeUnlink(ctx, opts, reader, dir, dirFile, dirBefore, path, st, tips); reason != "" {
 			disp.Action, disp.Reason = "retained", reason
 			report.Dispositions = append(report.Dispositions, disp)
 			continue
 		}
 		report.Candidates++
-		if err := os.Remove(path); err != nil {
+		if err := removeDirRelative(dirFile, name); err != nil {
 			disp.Action, disp.Reason = "retained", fmt.Sprintf("unlink-failed: %v", err)
 			report.Dispositions = append(report.Dispositions, disp)
+			report.Candidates--
 			continue
 		}
 		if _, readbackErr := os.Lstat(path); !os.IsNotExist(readbackErr) {
 			disp.Action, disp.Reason = "retained", "unlink-readback-unknown"
 			report.Dispositions = append(report.Dispositions, disp)
+			report.Candidates--
 			continue
 		}
 		report.Reclaimed++
@@ -230,6 +324,15 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 		report.Dispositions = append(report.Dispositions, disp)
 	}
 	return report, nil
+}
+
+func manifestContains(m RetentionManifest, name string) bool {
+	for _, listed := range m.Bundles {
+		if listed == name {
+			return true
+		}
+	}
+	return false
 }
 
 func gate(disp *FileDisposition, reason string, cond bool, detail string) bool {
@@ -292,49 +395,76 @@ func hasPathComponent(path, want string) bool {
 }
 
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	gitArgs := append([]string{"git"}, args...)
+	out, err := runBounded(ctx, defaultGitTimeout, gitOutputCapBytes, dir, gitArgs...)
 	if err != nil {
 		return "", err
 	}
-	return string(out), nil
+	return out, nil
 }
 
 func verifyBundle(ctx context.Context, repoRoot, path string) bool {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "bundle", "verify", path)
-	return cmd.Run() == nil
+	_, err := runBounded(ctx, defaultGitTimeout, gitOutputCapBytes, repoRoot, "git", "-C", repoRoot, "bundle", "verify", path)
+	return err == nil
+}
+
+// parseListHeadsOutput parses `git bundle list-heads` output strictly: every
+// non-empty line must be exactly one 40-hex sha and one non-empty ref.
+// Malformed or partial output is an error — a skipped line would silently
+// skip a tip check and cannot prove all tips were verified.
+func parseListHeadsOutput(data string) ([]bundleTip, error) {
+	var tips []bundleTip
+	for _, line := range strings.Split(data, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("malformed list-heads line %q", line)
+		}
+		sha, ref := fields[0], fields[1]
+		if len(sha) != 40 {
+			return nil, fmt.Errorf("malformed list-heads sha %q", sha)
+		}
+		for _, r := range sha {
+			if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+				return nil, fmt.Errorf("malformed list-heads sha %q", sha)
+			}
+		}
+		if strings.TrimSpace(ref) == "" {
+			return nil, fmt.Errorf("malformed list-heads ref in line %q", line)
+		}
+		tips = append(tips, bundleTip{SHA: sha, Ref: ref})
+	}
+	if len(tips) == 0 {
+		return nil, fmt.Errorf("list-heads output contained no refs")
+	}
+	return tips, nil
 }
 
 func listBundleTips(ctx context.Context, path string) ([]bundleTip, error) {
-	out, err := exec.CommandContext(ctx, "git", "bundle", "list-heads", path).Output()
+	out, err := runBounded(ctx, defaultGitTimeout, gitOutputCapBytes, "", "git", "bundle", "list-heads", path)
 	if err != nil {
 		return nil, err
 	}
-	var tips []bundleTip
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		tips = append(tips, bundleTip{SHA: fields[0], Ref: fields[1]})
-	}
-	if len(tips) == 0 {
-		return nil, fmt.Errorf("bundle lists no refs")
-	}
-	return tips, nil
+	return parseListHeadsOutput(out)
 }
 
 // containmentReason returns "" when every tip is retained by canonical refs;
 // otherwise it returns an actionable retention reason.
 func containmentReason(ctx context.Context, repoRoot string, tips []bundleTip) string {
-	cmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "cat-file", "--batch-check", "--buffer")
+	cctx, cancel := context.WithTimeout(ctx, defaultGitTimeout)
+	defer cancel()
+	cmd := gitCommand(cctx, repoRoot, "git", "cat-file", "--batch-check", "--buffer")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Sprintf("tip-existence-unknown: %v", err)
 	}
-	var stdout bytes.Buffer
+	var stdout boundedBuffer
+	stdout.limit = gitOutputCapBytes
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stdout
+	cmd.WaitDelay = childWaitDelay
 	if err := cmd.Start(); err != nil {
 		return fmt.Sprintf("tip-existence-unknown: %v", err)
 	}
@@ -349,6 +479,9 @@ func containmentReason(ctx context.Context, repoRoot string, tips []bundleTip) s
 	if err := cmd.Wait(); err != nil {
 		return fmt.Sprintf("tip-existence-unknown: %v", err)
 	}
+	if stdout.overflow {
+		return "tip-existence-unknown: batch-check output exceeded bound"
+	}
 	for _, line := range strings.Split(stdout.String(), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && fields[1] == "missing" {
@@ -360,27 +493,38 @@ func containmentReason(ctx context.Context, repoRoot string, tips []bundleTip) s
 			return fmt.Sprintf("tip-missing-from-canonical: %s is not retained by any canonical ref", fields[0])
 		}
 	}
-	args := []string{"-C", repoRoot, "rev-list", "--count"}
+	args := []string{"git", "-C", repoRoot, "rev-list", "--count"}
 	for _, tip := range tips {
 		args = append(args, tip.SHA)
 	}
 	args = append(args, "--not", "--all")
-	out, err := exec.CommandContext(ctx, "git", args...).Output()
+	out, err := runBounded(ctx, defaultGitTimeout, gitOutputCapBytes, repoRoot, args...)
 	if err != nil {
 		return fmt.Sprintf("reachability-unknown: %v", err)
 	}
-	if strings.TrimSpace(string(out)) != "0" {
+	if strings.TrimSpace(out) != "0" {
 		return "tips-not-retained-by-canonical-refs: canonical refs no longer contain every bundle tip"
 	}
 	return ""
 }
 
-// revalidateBeforeUnlink re-runs identity, reader, and containment proof
-// immediately before unlink; any drift retains the bundle.
-func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader func(context.Context, string) (ReaderStatus, error), path string, before os.FileInfo, tips []bundleTip) string {
+// revalidateBeforeUnlink re-runs scope, parent identity, reader, and
+// containment proof immediately before the directory-relative unlink; any
+// drift retains the bundle.
+func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader func(context.Context, string) (ReaderStatus, error), dir string, dirFile *os.File, dirBefore os.FileInfo, path string, before os.FileInfo, tips []bundleTip) string {
+	dirNow, err := os.Lstat(dir)
+	if err != nil || dirBefore == nil || !os.SameFile(dirBefore, dirNow) {
+		return "parent-changed-during-reclaim: bundle directory identity moved between census and unlink"
+	}
+	if pinned, pinErr := dirFile.Stat(); pinErr != nil || !os.SameFile(pinned, dirNow) {
+		return "parent-changed-during-reclaim: pinned directory descriptor no longer matches the bundle directory"
+	}
 	st, err := os.Lstat(path)
 	if err != nil || !os.SameFile(before, st) || st.Size() != before.Size() || !st.ModTime().Equal(before.ModTime()) {
 		return "changed-during-reclaim: bundle identity moved between census and unlink"
+	}
+	if fileLinkCount(st) != 1 {
+		return "hard-link-substitution-possible-at-unlink"
 	}
 	status, readerErr := reader(ctx, path)
 	if readerErr != nil {
@@ -399,23 +543,27 @@ func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader fun
 }
 
 // DefaultLsofReader is the authoritative no-reader proof. Missing tooling,
-// partial output, or unexpected exits are unknown, never absence.
+// partial output, unexpected exits, timeouts, or overflow are unknown, never
+// absence.
 func DefaultLsofReader(ctx context.Context, path string) (ReaderStatus, error) {
-	lsof, err := exec.LookPath("lsof")
+	lsof, err := execLookPath("lsof")
 	if err != nil {
 		return ReaderUnknown, fmt.Errorf("reader proof unavailable: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, lsof, "--", path)
-	out, err := cmd.CombinedOutput()
-	if err == nil && len(bytes.TrimSpace(out)) > 0 {
+	out, runErr := runBounded(ctx, defaultLsofTimeout, lsofOutputCapBytes, "", lsof, "--", path)
+	if runErr != nil {
+		// lsof's canonical "nothing open" answer is exit 1 with no output.
+		// Only that exact shape proves absence; timeouts and overflow stay
+		// unknown.
+		var exitErr *exec.ExitError
+		if !strings.Contains(runErr.Error(), "timed out") && !strings.Contains(runErr.Error(), "exceeded") &&
+			errors.As(runErr, &exitErr) && exitErr.ExitCode() == 1 && len(strings.TrimSpace(out)) == 0 {
+			return ReaderAbsent, nil
+		}
+		return ReaderUnknown, fmt.Errorf("lsof: %w", runErr)
+	}
+	if len(strings.TrimSpace(out)) > 0 {
 		return ReaderPresent, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(bytes.TrimSpace(out)) == 0 {
-		return ReaderAbsent, nil
-	}
-	if err == nil && len(bytes.TrimSpace(out)) == 0 {
-		return ReaderUnknown, fmt.Errorf("lsof returned empty success")
-	}
-	return ReaderUnknown, fmt.Errorf("lsof: %w", err)
+	return ReaderUnknown, fmt.Errorf("lsof returned empty success")
 }

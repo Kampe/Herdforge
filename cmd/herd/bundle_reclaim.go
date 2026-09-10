@@ -121,12 +121,34 @@ func parseBundleReclaimArgs(args []string) (bundleReclaimOptions, error) {
 					opts.Protect = append(opts.Protect, strings.TrimSpace(name))
 				}
 			}
+		case "--manifest":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(args[i+1], "-") {
+				return bundleReclaimOptions{}, fmt.Errorf("herd bundle-reclaim: %s requires a value", arg)
+			}
+			i++
+			opts.Manifest = args[i]
+		case "--lock-dir":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(args[i+1], "-") {
+				return bundleReclaimOptions{}, fmt.Errorf("herd bundle-reclaim: %s requires a value", arg)
+			}
+			i++
+			opts.LockDir = args[i]
+		case "--lock-wait":
+			if i+1 >= len(args) {
+				return bundleReclaimOptions{}, fmt.Errorf("herd bundle-reclaim: %s requires a duration", arg)
+			}
+			i++
+			d, err := time.ParseDuration(args[i])
+			if err != nil || d < 0 {
+				return bundleReclaimOptions{}, fmt.Errorf("herd bundle-reclaim: --lock-wait requires a non-negative duration")
+			}
+			opts.LockWait = d
 		default:
 			return bundleReclaimOptions{}, fmt.Errorf("herd bundle-reclaim: unknown flag %s", arg)
 		}
 	}
 	if opts.Root == "" {
-		return bundleReclaimOptions{}, fmt.Errorf("usage: herd bundle-reclaim --root <owned .herd bundle directory> [--dry-run|--act] [--json] [--max-files N] [--max-bytes N] [--min-age DUR] [--protect NAME,NAME]")
+		return bundleReclaimOptions{}, fmt.Errorf("usage: herd bundle-reclaim --root <owned .herd bundle directory> --manifest <retention manifest> [--dry-run|--act] [--json] [--lock-dir DIR] [--lock-wait DUR] [--max-files N] [--max-bytes N] [--min-age DUR] [--protect NAME,NAME]")
 	}
 	opts.RepoRoot = lockCanonicalRoot()
 	return opts, nil
