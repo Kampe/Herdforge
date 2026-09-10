@@ -90,18 +90,23 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 	}
 	waited := 0
 	waitSecs := int(wait.Seconds())
-	flockUnsupported := false
 	flockHeld := false
 	for {
-		if !flockHeld && !flockUnsupported {
-			switch held, err := l.tryFlock(); {
-			case err != nil:
-				// flock is unsupported on this filesystem: degrade to the
-				// historical mkdir-only semantics rather than refuse.
-				flockUnsupported = true
-			case held:
-				flockHeld = true
-			default:
+		if !flockHeld {
+			held, err := l.tryFlock()
+			if err != nil {
+				// Fail closed: ANY open or flock error (EACCES, EMFILE,
+				// ENFILE, EIO, ENOLCK, a truly unsupported filesystem, ...)
+				// means the kernel exclusion is NOT held, and mkdir-only
+				// semantics would silently lose the mutual exclusion the
+				// directory lock exists to provide. There is no equally
+				// safe atomic fallback, so the acquisition fails with the
+				// error and takes no ownership: no lock directory is
+				// created, replaced, or removed.
+				l.releaseFlock()
+				return fmt.Errorf("shared checkout lock: kernel exclusion unavailable, refusing unsafe mkdir-only fallback: %w", err)
+			}
+			if !held {
 				// EWOULDBLOCK: a live holder owns the kernel exclusion. Its
 				// lock directory must never be stale-broken by a waiter.
 				if waited >= waitSecs {
@@ -115,6 +120,7 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 				waited++
 				continue
 			}
+			flockHeld = true
 		}
 		l.breakIfStale()
 		if err := os.Mkdir(l.dir, 0o755); err == nil {
@@ -124,8 +130,22 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 			// holder write is best-effort (zsh `> "$holder" ... || true`).
 			l.writeHolder(reason)
 			// Pin the directory inode this owner created: Release removes
-			// only the directory it pinned, never a replacement.
-			l.dirFile, _ = os.Open(l.dir)
+			// only the directory it pinned, never a replacement. A pinned
+			// descriptor is REQUIRED: without it Release could not bind the
+			// removal to the created inode, so failing to open it is an
+			// acquisition failure. The just-created directory is removed
+			// again while the flock is still held (no compliant successor
+			// can exist yet, and the token in the holder file is ours), so
+			// the failed acquirer leaves no orphan ownership behind.
+			dirFile, openErr := pinLockDir(l.dir)
+			if openErr != nil {
+				if now, lerr := os.Lstat(l.dir); lerr == nil && now.IsDir() {
+					_ = removeLockDir(l.dir)
+				}
+				l.releaseFlock()
+				return fmt.Errorf("shared checkout lock: acquired directory could not be pinned: %w", openErr)
+			}
+			l.dirFile = dirFile
 			return nil
 		}
 		if waited >= waitSecs {
@@ -151,7 +171,9 @@ func (l *DirLock) flockPath() string { return l.dir + ".flock" }
 
 // tryFlock takes LOCK_EX|LOCK_NB on the persistent lock file. Returns
 // (true, nil) when exclusion is held, (false, nil) when a live holder owns
-// it (EWOULDBLOCK), and an error when flock is unsupported.
+// it (EWOULDBLOCK), and an error for every open or flock failure: there is
+// no silent degrade-to-mkdir path, because every such error means the
+// kernel exclusion that anchors the lock is not held.
 func (l *DirLock) tryFlock() (bool, error) {
 	if l.flockFile != nil {
 		return true, nil
@@ -160,7 +182,7 @@ func (l *DirLock) tryFlock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flockFn(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return false, nil
@@ -362,3 +384,13 @@ var interleaveHook func(stage string)
 // removeLockDir is the removal primitive for the lock directory, a package
 // variable so tests can observe the check/remove boundary.
 var removeLockDir = os.RemoveAll
+
+// flockFn is the kernel advisory-flock primitive, a package variable so
+// injected-error tests can fail the syscall deterministically. Production
+// leaves it as syscall.Flock.
+var flockFn = syscall.Flock
+
+// pinLockDir opens the lock directory for inode pinning, a package variable
+// so injected-error tests can fail the open deterministically. Production
+// leaves it as os.Open.
+var pinLockDir = os.Open

@@ -43,11 +43,14 @@ func removeDirRelative(dirFile *os.File, name string) error {
 //     digest equal to the manifest-pinned digest — race-free now.
 //  4. Only a proven-owned object is unlinked, from its quarantine path.
 //
-// Any mismatch restores the moved object to its original name (or a
-// non-manifest-eligible recovery name when that name is taken again) and
-// reports why. A foreign replacement is never deleted; data is never
-// silently stranded — an unrestorable object stays in its quarantine
-// directory and the recovery path is reported.
+// Any mismatch restores the moved object to its original name with an
+// ATOMIC NO-CLOBBER operation (linkat): a second concurrent origin writer
+// inside the mismatch-to-restore window is never overwritten. When the
+// origin name is occupied, the object moves to a non-manifest-eligible
+// recovery name, again no-clobber; when every name is occupied it stays in
+// its quarantine directory and the recovery path is reported. A foreign
+// replacement is never deleted; data is never silently stranded or
+// destroyed.
 func quarantineAndRemove(dirFile *os.File, dir, name string, before os.FileInfo, pinnedDigest string) (bool, string) {
 	if dirFile == nil {
 		return false, "pinned parent directory is not open"
@@ -69,51 +72,80 @@ func quarantineAndRemove(dirFile *os.File, dir, name string, before os.FileInfo,
 		return false, fmt.Sprintf("quarantine-rename-failed: %v", err)
 	}
 	stagedPath := filepath.Join(quarantine, staged)
+	// Deterministic interleaving seam (bundle-flock-restore-727): fires once
+	// with the origin name now free and the moved object pinned at the
+	// quarantine path — the exact mismatch-to-restore window a second
+	// concurrent origin writer would enter. Production leaves it nil.
+	if interleaveHook != nil {
+		interleaveHook("quarantined")
+	}
 	removeQuarantineIfEmpty := func() {
 		if entries, dirErr := os.ReadDir(quarantine); dirErr == nil && len(entries) == 0 {
 			_ = os.Remove(quarantine)
 		}
+	}
+	// restoreNoClobber atomically restores the staged object to target
+	// name without ever overwriting an occupant: linkat is a no-clobber
+	// operation (EEXIST if the name is taken), so a second concurrent
+	// origin writer's file can never be destroyed by a restore. On success
+	// the staged entry is unlinked and the target path is reported. When
+	// the origin name and every recovery name are occupied, the object
+	// stays quarantined (never stranded, never destroyed) and "" is
+	// reported.
+	restoreNoClobber := func() (string, bool) {
+		if err := unix.Linkat(int(qFile.Fd()), staged, int(dirFile.Fd()), name, 0); err != nil {
+			if !os.IsExist(err) {
+				return "", false
+			}
+		} else {
+			_ = unix.Unlinkat(int(qFile.Fd()), staged, 0)
+			removeQuarantineIfEmpty()
+			return name, true
+		}
+		for attempt := 0; attempt < 8; attempt++ {
+			recovered := name + ".recovered-" + randomSuffix()
+			if err := unix.Linkat(int(qFile.Fd()), staged, int(dirFile.Fd()), recovered, 0); err != nil {
+				if os.IsExist(err) {
+					continue
+				}
+				return "", false
+			}
+			_ = unix.Unlinkat(int(qFile.Fd()), staged, 0)
+			removeQuarantineIfEmpty()
+			return recovered, true
+		}
+		return "", false
 	}
 
 	moved, lstatErr := os.Lstat(stagedPath)
 	if lstatErr != nil || !os.SameFile(before, moved) {
 		// The entry swapped between the final revalidation and the rename:
 		// the moved object is a foreign replacement. Restore it — never
-		// delete it.
-		if err := unix.Renameat(int(qFile.Fd()), staged, int(dirFile.Fd()), name); err != nil {
-			recovered := name + ".recovered-" + randomSuffix()
-			if recoverErr := unix.Renameat(int(qFile.Fd()), staged, int(dirFile.Fd()), recovered); recoverErr != nil {
-				// The object stays in the quarantine directory rather than
-				// being stranded or destroyed; report the recovery path.
-				return false, fmt.Sprintf("restored-after-quarantine-failed: foreign replacement preserved at %s (%v)", stagedPath, err)
-			}
-			removeQuarantineIfEmpty()
-			return false, fmt.Sprintf("restored-after-quarantine: foreign replacement preserved at %s (%v)", recovered, err)
+		// delete it, and never overwrite whatever a second writer placed
+		// at the origin name inside this window.
+		if restored, ok := restoreNoClobber(); ok {
+			return false, fmt.Sprintf("restored-after-quarantine: foreign replacement preserved at %s", restored)
 		}
-		removeQuarantineIfEmpty()
-		return false, "restored-after-quarantine: entry replaced between revalidation and deletion"
+		return false, fmt.Sprintf("restored-after-quarantine-failed: foreign replacement preserved at %s", stagedPath)
 	}
 	if fileLinkCount(moved) != 1 {
-		if err := unix.Renameat(int(qFile.Fd()), staged, int(dirFile.Fd()), name); err != nil {
-			return false, fmt.Sprintf("restored-after-quarantine-failed: %v", err)
+		if restored, ok := restoreNoClobber(); ok {
+			return false, fmt.Sprintf("restored-after-quarantine: hard-link-substitution-possible, object preserved at %s", restored)
 		}
-		removeQuarantineIfEmpty()
-		return false, "restored-after-quarantine: hard-link-substitution-possible"
+		return false, "restored-after-quarantine-failed: hard-link-substitution-possible"
 	}
 	digest, err := fileContentDigest(stagedPath, before.Size())
 	if err != nil {
-		if rErr := unix.Renameat(int(qFile.Fd()), staged, int(dirFile.Fd()), name); rErr != nil {
-			return false, fmt.Sprintf("restored-after-quarantine-failed: %v", rErr)
+		if restored, ok := restoreNoClobber(); ok {
+			return false, fmt.Sprintf("restored-after-quarantine: content-identity-unknown, object preserved at %s: %v", restored, err)
 		}
-		removeQuarantineIfEmpty()
-		return false, fmt.Sprintf("restored-after-quarantine: content-identity-unknown: %v", err)
+		return false, fmt.Sprintf("restored-after-quarantine-failed: content-identity-unknown, object preserved at %s: %v", stagedPath, err)
 	}
 	if digest != pinnedDigest {
-		if rErr := unix.Renameat(int(qFile.Fd()), staged, int(dirFile.Fd()), name); rErr != nil {
-			return false, fmt.Sprintf("restored-after-quarantine-failed: %v", rErr)
+		if restored, ok := restoreNoClobber(); ok {
+			return false, fmt.Sprintf("restored-after-quarantine: content-identity-mismatch-at-quarantine, object preserved at %s", restored)
 		}
-		removeQuarantineIfEmpty()
-		return false, "restored-after-quarantine: content-identity-mismatch-at-quarantine"
+		return false, "restored-after-quarantine-failed: content-identity-mismatch-at-quarantine, object preserved in quarantine"
 	}
 	if err := unix.Unlinkat(int(qFile.Fd()), staged, 0); err != nil {
 		return false, fmt.Sprintf("quarantine-unlink-failed: %v", err)
