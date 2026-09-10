@@ -569,18 +569,24 @@ func TestDiscoverIdlePools_CanceledContextIsRespectedNotSilentlyIgnored(t *testi
 	}
 }
 
-// TestDiscoverIdlePools_PoolAbsentFromManifestRetains pins the positive-
-// evidence contract at the discovery surface: a clean, unleased, registered,
-// reachable pool root that the manifest registry never named is RETAINED,
-// not eligible -- unknown scope is not automatically disposable.
-func TestDiscoverIdlePools_PoolAbsentFromManifestRetains(t *testing.T) {
+// TestDiscoverIdlePools_UnknownRootRetainsAndNativeOwnedEligible pins the
+// two positive-evidence paths at the discovery surface. An UNKNOWN pool
+// root -- no native pool.json, not owner-created -- is RETAINED, never
+// automatically disposable, even when it is clean and unleased. A
+// natively-created pool root (Pool.Ensure wrote its state and bound its
+// slots to real registrations in this repository) is ELIGIBLE on that
+// native authority evidence alone, deliberately, even when the
+// review-retirement manifest never named it -- ordinary warm pools are the
+// supported owned path, and the native state IS their authority evidence.
+func TestDiscoverIdlePools_UnknownRootRetainsAndNativeOwnedEligible(t *testing.T) {
 	root := t.TempDir()
 	initRepo(t, root)
 	makeIdlePoolRoot(t, root, "pool-fac-a", "main")
-	// pool-fac-b gets NO evidence file rows: its manifest mention is
-	// stripped after the fixture created it.
-	evidenced := makeIdlePoolRoot(t, root, "pool-fac-b", "main")
-	_ = evidenced
+	// pool-fac-b gets NO review-retirement evidence rows: its manifest
+	// mention is stripped after the fixture created it. Its native
+	// pool.json + real git registrations still authorize it.
+	native := makeIdlePoolRoot(t, root, "pool-fac-b", "main")
+	_ = native
 	manifestPath := filepath.Join(root, "retirement-manifests.jsonl")
 	journalPath := filepath.Join(root, "retirement-phases.jsonl")
 	stripRow := func(path, pool string) {
@@ -600,17 +606,32 @@ func TestDiscoverIdlePools_PoolAbsentFromManifestRetains(t *testing.T) {
 	}
 	stripRow(manifestPath, "pool-fac-b")
 	stripRow(journalPath, "pool-fac-b")
+	// An unknown root: a directory shaped like a pool with a parseable
+	// native-schema pool.json, but created by nobody and bound to nothing
+	// -- its recorded slot has no git registration in this repository. It
+	// must retain, not be eligible.
+	unknown := filepath.Join(root, ".herd", "pool-fac-unknown")
+	if err := os.MkdirAll(filepath.Join(unknown, "pool-01"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreignState := fmt.Sprintf(`{"version":1,"slots":[{"name":"pool-01","path":"%s"}]}`, filepath.Join(unknown, "pool-01"))
+	if err := os.WriteFile(filepath.Join(unknown, "pool.json"), []byte(foreignState), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := DiscoverIdlePools(context.Background(), testCfg(root))
 	if err != nil {
 		t.Fatalf("DiscoverIdlePools: %v", err)
 	}
-	if result.Eligible != 1 || result.Retained != 1 {
-		t.Fatalf("absent-evidence pool must retain while evidenced pool is eligible: %+v", result)
+	if result.Eligible != 2 || result.Retained != 1 {
+		t.Fatalf("native-owned pools must be eligible on native evidence while the unknown root retains: %+v", result)
 	}
 	for _, d := range result.Dispositions {
-		if d.Root == "pool-fac-b" && d.Status != IdlePoolRetained {
-			t.Fatalf("pool-fac-b must be retained, got %+v", d)
+		if d.Root == "pool-fac-unknown" && d.Status != IdlePoolRetained {
+			t.Fatalf("unknown root must be retained, got %+v", d)
+		}
+		if d.Root == "pool-fac-b" && d.Status != IdlePoolEligible {
+			t.Fatalf("native-created pool absent from manifest must be eligible via native authority, got %+v", d)
 		}
 	}
 }

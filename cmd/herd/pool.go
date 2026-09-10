@@ -59,10 +59,19 @@ func runPool() {
 	// The direct `herd pool gc` path enforces the SAME retirement-evidence
 	// authority the idle-discovery reclaim path uses: the fence lives in the
 	// destructive primitive, which refuses a nil authority outright, so this
-	// command can never bypass the manifest/phase-evidence protection by
-	// being invoked directly.
-	gcAuthority := worktree.NewManifestRetirementAuthority(root,
-		herdr.ReviewRetirementRegistryPath(root), reviewRetirementPhaseJournalPath(root))
+	// command can never bypass evidence protection by being invoked directly.
+	// Two positive evidence paths with deliberate precedence, each
+	// fail-closed on absence: a pool root the review-retirement manifest
+	// names gets the manifest's verdict as final (active/unconfirmed
+	// protects, completed authorizes); pools the manifest never names fall
+	// through to the native pool-creation state (schema-valid pool.json
+	// bound to real registrations in this repository). Unknown, foreign, or
+	// corrupt pool roots retain.
+	gcAuthority := worktree.NewManifestFirstRetirementAuthority(
+		worktree.NewManifestRetirementAuthority(root,
+			herdr.ReviewRetirementRegistryPath(root), reviewRetirementPhaseJournalPath(root)),
+		worktree.NewNativePoolCreationAuthority(root),
+	)
 	ctx := context.Background()
 	switch fs.Arg(0) {
 	case "ensure":

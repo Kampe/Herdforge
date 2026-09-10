@@ -592,7 +592,18 @@ func runIdlePoolTickLocked(ctx context.Context, cfg IdlePoolDiscoveryConfig, act
 	// The same manifest/journal evidence backs the authority the
 	// destructive primitive itself will consult: discovery and GC can never
 	// disagree about which pools carry verified retirement evidence.
-	authority := NewManifestRetirementAuthority(cfg.RepoRoot, cfg.ManifestPath, cfg.PhaseJournalPath)
+	// Two positive evidence paths with deliberate precedence, each
+	// fail-closed on absence: a pool root the review-retirement manifest
+	// names gets the manifest's verdict as final (active/unconfirmed
+	// evidence protects, a fully completed generation authorizes); pools
+	// the manifest never names fall through to the native pool-creation
+	// state (schema-valid pool.json bound to real registrations in this
+	// repository). Unknown, foreign, or corrupt pool roots retain -- never
+	// automatically disposable.
+	authority := NewManifestFirstRetirementAuthority(
+		NewManifestRetirementAuthority(cfg.RepoRoot, cfg.ManifestPath, cfg.PhaseJournalPath),
+		NewNativePoolCreationAuthority(cfg.RepoRoot),
+	)
 	cursor, err := readIdlePoolCursor(cfg.RepoRoot)
 	if err != nil {
 		return IdlePoolDiscoveryResult{}, err
@@ -714,4 +725,20 @@ func fairOrder(names []string, cursor string) []string {
 	out = append(out, names[start:]...)
 	out = append(out, names[:start]...)
 	return out
+}
+
+// PoolRootKnown reports whether the retirement manifest registry names the
+// pool root at all -- independent of whether its generations are complete
+// or still active. Precedence composites use it to give the manifest's own
+// verdict final authority for pools it names.
+func (a *ManifestRetirementAuthority) PoolRootKnown(poolRootAbs string) (bool, error) {
+	if resolved, err := filepath.EvalSymlinks(poolRootAbs); err == nil {
+		poolRootAbs = resolved
+	}
+	poolRootAbs = filepath.Clean(poolRootAbs)
+	_, known, err := manifestProtectedPools(a.RepoRoot, a.ManifestPath, a.PhaseJournalPath)
+	if err != nil {
+		return false, err
+	}
+	return known[poolRootAbs], nil
 }
