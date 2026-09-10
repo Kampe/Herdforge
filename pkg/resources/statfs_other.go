@@ -11,3 +11,7 @@ type OSBackend struct{}
 func (OSBackend) StatFS(string) (Capacity, error) {
 	return Capacity{}, fmt.Errorf("statfs unsupported")
 }
+
+func statFSUnix(string) (Capacity, error) {
+	return Capacity{}, fmt.Errorf("statfs unsupported")
+}

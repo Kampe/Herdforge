@@ -12,6 +12,14 @@ import (
 type OSBackend struct{}
 
 func (OSBackend) StatFS(path string) (Capacity, error) {
+	cap, err := statFSUnix(path)
+	if err != nil {
+		return Capacity{}, err
+	}
+	return boundWSLCapacity(cap, path)
+}
+
+func statFSUnix(path string) (Capacity, error) {
 	var stat unix.Statfs_t
 	if err := unix.Statfs(path, &stat); err != nil {
 		return Capacity{}, err
