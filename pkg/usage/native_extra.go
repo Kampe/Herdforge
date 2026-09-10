@@ -48,7 +48,7 @@ func ollamaCloudBearerPoll() (ProviderUsage, error) {
 }
 
 func ollamaCloudBearerPollWithURL(endpoint, credential string, now func() time.Time) (ProviderUsage, error) {
-	requestURL := strings.TrimRight(endpoint, "/") + "/api/usage?ts=" + strconv.FormatInt(now().Unix(), 10)
+	requestURL := strings.TrimRight(endpoint, "/") + "?ts=" + strconv.FormatInt(now().Unix(), 10)
 	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
 	if err != nil {
 		return ProviderUsage{}, pollErrf("decode-failed", "ollama-cloud quota URL is invalid")
