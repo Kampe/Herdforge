@@ -152,21 +152,38 @@ func TestRunMutationCheck_CommandDeadlineExcludesPreparation(t *testing.T) {
 	release := make(chan struct{})
 	var mutant atomic.Bool
 	var gate sync.Once
+	var timerArmed atomic.Bool
+	var preparationActive atomic.Bool
+	preparationActive.Store(true)
+
 	v := NewVerifierArgs(mutationOutcomeArgv(marker))
 	v.DiskAdmission = resources.DiskAdmissionFunc(func(resources.DiskRequest) resources.DiskDecision {
 		return resources.DiskDecision{Allowed: true}
 	})
 	v.afterMutationApplied = func() { mutant.Store(true) }
+	v.afterFunc = func(d time.Duration, f func()) *time.Timer {
+		if mutant.Load() {
+			timerArmed.Store(true)
+			if preparationActive.Load() {
+				t.Errorf("command timer armed while preparation was still active")
+			}
+		}
+		return time.AfterFunc(d, f)
+	}
 	v.beforeCommandStart = func(ctx context.Context) {
 		if !mutant.Load() {
 			return
 		}
 		gate.Do(func() {
+			if timerArmed.Load() {
+				t.Errorf("command timer was armed before beforeCommandStart")
+			}
 			if _, hasDeadline := ctx.Deadline(); hasDeadline {
 				t.Errorf("commandCtx has deadline during preparation: preparation must exclude command deadline")
 			}
 			close(ready)
 			<-release
+			preparationActive.Store(false)
 		})
 	}
 
@@ -185,6 +202,9 @@ func TestRunMutationCheck_CommandDeadlineExcludesPreparation(t *testing.T) {
 	result := <-done
 	if result == nil || result.Outcome != OutcomePASS || !result.Killed || !result.Restored {
 		t.Fatalf("command deadline must exclude preparation: %+v", result)
+	}
+	if !timerArmed.Load() {
+		t.Fatalf("expected command timer to be armed during mutant execution")
 	}
 	if result.Baseline.ExitCode != 0 || result.Mutant.ExitCode != 1 || result.Final.ExitCode != 0 {
 		t.Fatalf("expected 0/1/0 exits: baseline=%d mutant=%d final=%d", result.Baseline.ExitCode, result.Mutant.ExitCode, result.Final.ExitCode)
