@@ -439,3 +439,38 @@ func TestTerminalFindingsNeverDriveTheVerdict(t *testing.T) {
 		c.advance(DefaultInterval)
 	}
 }
+
+func TestDiagnosticQuotaHaltsNudges(t *testing.T) {
+	pol := DefaultPolicy()
+	c := newClock()
+	o := obs("working", working(7, "abc", 42))
+	o.Diagnostic = "QUOTA"
+
+	_, a := run(t, nil, o, pol, c, true, pol.NoProgressCycles+1)
+	if a.Cause != CauseRateLimited {
+		t.Fatalf("quota diagnostic must yield RATE_LIMITED, got %s", a.Cause)
+	}
+	if a.NextAction != ActionNone {
+		t.Fatalf("rate limited agent must not be nudged or recovered: got %s", a.NextAction)
+	}
+	if a.Acted {
+		t.Fatalf("rate limited agent must not book an action budget: acted=%v", a.Acted)
+	}
+}
+
+func TestDiagnosticUnknownWithFinishLengthCannotProduceDone(t *testing.T) {
+	pol := DefaultPolicy()
+	c := newClock()
+	o := obs("working", working(7, "abc", 42))
+	o.Diagnostic = "UNKNOWN"
+
+	// When an agent is working and truncated with finish=length, it is diagnosed as UNKNOWN,
+	// not advancing as done or triggering false cleanup.
+	s, a := Assess(nil, o, pol, c.now(), false)
+	if a.NextAction != ActionNone {
+		t.Fatalf("initial observation must not action, got %s", a.NextAction)
+	}
+	if s.Head != "habc" {
+		t.Fatalf("sample head not preserved: got %s", s.Head)
+	}
+}

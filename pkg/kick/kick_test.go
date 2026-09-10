@@ -2,6 +2,7 @@ package kick
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -819,5 +820,38 @@ func TestRun_OccupiedQueuedSurfaceSkipsKickMessage(t *testing.T) {
 	}
 	if len(result.Entries) != 1 || result.Entries[0].Reason != "queued-durable surfaced" {
 		t.Fatalf("entries=%+v", result.Entries)
+	}
+}
+
+func TestAgentEntry_UnmarshalsNativeHerdrRouteKeys(t *testing.T) {
+	raw := `{"result":{"agents":[
+		{
+			"name":"forge-worker",
+			"agent":"opencode",
+			"agent_status":"working",
+			"pane_id":"p-1",
+			"tab_id":"t-1",
+			"workspace_id":"w-1",
+			"cwd":"/repo",
+			"revision":10,
+			"state_change_seq":3,
+			"tab_generation":1,
+			"model":"claude-3-5-sonnet",
+			"provider":"anthropic"
+		}
+	]}}`
+	var res AgentListResult
+	if err := json.Unmarshal([]byte(raw), &res); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(res.Result.Agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(res.Result.Agents))
+	}
+	agent := res.Result.Agents[0]
+	if agent.ExpectedModel != "claude-3-5-sonnet" {
+		t.Errorf("ExpectedModel: want %q, got %q", "claude-3-5-sonnet", agent.ExpectedModel)
+	}
+	if agent.ExpectedProvider != "anthropic" {
+		t.Errorf("ExpectedProvider: want %q, got %q", "anthropic", agent.ExpectedProvider)
 	}
 }
