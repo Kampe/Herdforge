@@ -69,13 +69,24 @@ func TestGoalGuardCLISetCheckAndClear(t *testing.T) {
 
 func TestGoalGuardClearRefusesAgentAndStaleGrantorWithoutMutation(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "goal.json")
+	claims := filepath.Join(t.TempDir(), "leases.db")
+	t.Setenv("HERD_CLAIMS_DB", claims)
+	leaseStore, err := claim.NewSQLiteLeaseStore(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaseStore.Close()
+	lease, err := leaseStore.Acquire(context.Background(), claim.LeaseKey{Repo: "repo", Provider: "memory", Project: "project", TaskRef: "FAC-767"}, "native-owner", "worker", "", time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := goalguard.Open(state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
 	if err := s.Set(goalguard.Goal{
-		Lane: "standing", Task: "FAC-767", Owner: "coordinator", Generation: 9,
+		Lane: "standing", Task: "FAC-767", Owner: "coordinator", Generation: lease.Generation,
 		CreatedAt: now, UpdatedAt: now,
 		Authority: &goalguard.AuthorityEnvelope{Grantor: "coordinator", PacketPath: "packet.md", BoundedAutonomy: "bounded", MutationLimits: "worktree", ForbiddenActions: []string{"merge"}, StopConditions: []string{"stop"}},
 	}); err != nil {
@@ -96,6 +107,12 @@ func TestGoalGuardClearRefusesAgentAndStaleGrantorWithoutMutation(t *testing.T) 
 	}
 	if got, _ := os.ReadFile(state); string(got) != string(original) {
 		t.Fatal("stale refusal mutated goal state")
+	}
+	if err := clearGoal(s, "coordinator", lease.Generation, ""); err == nil || !strings.Contains(err.Error(), "native claim owner/generation mismatch") {
+		t.Fatalf("forged envelope clear error = %v, want native owner refusal", err)
+	}
+	if got, _ := os.ReadFile(state); string(got) != string(original) {
+		t.Fatal("native-owner refusal mutated goal state")
 	}
 }
 
