@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/claim"
@@ -582,18 +583,23 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 		usage.PIDs = append(usage.PIDs, pid)
 	}
 	sortInts(usage.PIDs)
-	allPIDs, processListErr := listProcessIDs(ctx)
+	processCtx, cancelProcesses := context.WithTimeout(ctx, timeout)
+	defer cancelProcesses()
+	allPIDs, processListErr := listProcessIDs(processCtx)
 	if processListErr != nil {
 		return ProcessUsage{}, processListErr
 	}
 	for _, pid := range allPIDs {
+		if processCtx.Err() != nil {
+			break
+		}
 		if _, alreadySeen := seen[pid]; !alreadySeen {
 			usage.PIDs = append(usage.PIDs, pid)
 		}
-		referenced, referenceErr := processReferences(ctx, pid, resolved)
+		referenced, referenceErr := processReferences(processCtx, pid, resolved)
 		if referenceErr != nil {
 			usage.MetadataUnavailable = true
-			break
+			continue
 		}
 		usage.ReferencedPath = usage.ReferencedPath || referenced
 	}
@@ -630,8 +636,10 @@ func listProcessIDs(ctx context.Context) ([]int, error) {
 
 // processReferences closes the gap between filesystem handles and a process
 // that intends to recreate/use a cache through GOCACHE, argv, or a mapped
-// executable/database. An unavailable metadata surface is an error: deleting
-// while that proof is missing is not safe.
+// executable/database. Metadata for a foreign process is not deletion
+// authority for a private target: that process cannot name or open a target
+// whose owner-only permissions have already been proved by the governor. A
+// same-owner or owner-unknown failure remains an error and is fail-closed.
 func processReferences(ctx context.Context, pid int, path string) (bool, error) {
 	needle := []byte(path)
 	if procData, procErr := readProcessProc(pid); procErr == nil {
@@ -641,10 +649,12 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 			}
 		}
 		return false, nil
-	} else if os.IsNotExist(procErr) {
-		if _, procRootErr := os.Stat("/proc"); procRootErr == nil {
-			return false, nil
-		}
+	} else if os.IsNotExist(procErr) && runtime.GOOS != "darwin" {
+		return false, nil
+	} else if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr != nil {
+		return false, ownerErr
+	} else if gone || foreign {
+		return false, nil
 	}
 	ps, err := exec.LookPath("ps")
 	if err != nil {
@@ -652,35 +662,86 @@ func processReferences(ctx context.Context, pid int, path string) (bool, error) 
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(probeCtx, ps, "e", "ww", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	psArgs := []string{"-ww", "-p", strconv.Itoa(pid), "-o", "command="}
+	if runtime.GOOS == "darwin" {
+		// BSD ps requires each of -E and -ww to be an option. The old `e ww`
+		// spelling is accepted by some Linux ps builds but is invalid on macOS.
+		psArgs = []string{"-E", "-ww", "-p", strconv.Itoa(pid), "-o", "command="}
+	}
+	out, err := exec.CommandContext(probeCtx, ps, psArgs...).Output()
 	if err != nil {
+		if foreign, gone, ownerErr := foreignOrGoneProcess(ctx, pid); ownerErr == nil && (foreign || gone) {
+			return false, nil
+		}
 		return false, fmt.Errorf("read process argv/environment for pid %d: %w", pid, err)
 	}
 	if bytes.Contains(out, needle) {
 		return true, nil
 	}
-	if runtime.GOOS == "darwin" {
-		launchctl, launchErr := exec.LookPath("launchctl")
-		if launchErr != nil {
-			return false, fmt.Errorf("process environment unavailable for pid %d: %w", pid, launchErr)
-		}
-		envOut, envErr := exec.CommandContext(probeCtx, launchctl, "procinfo", strconv.Itoa(pid)).Output()
-		if envErr != nil {
-			return false, fmt.Errorf("read process environment for pid %d: %w", pid, envErr)
-		}
-		if bytes.Contains(envOut, needle) {
-			return true, nil
-		}
+	// lsof's `+D` census above includes mapped files (the `mem` descriptor),
+	// so a second Darwin vmmap walk would duplicate that proof while turning
+	// unrelated same-user processes into false metadata failures. Keep vmmap
+	// out of the per-PID path: relevant mapped references are already in
+	// usage.OpenFile and remain a hard guard.
+	return false, nil
+}
+
+// foreignOrGoneProcess distinguishes an inaccessible unrelated process from
+// an inaccessible process owned by this user. The former cannot authorize a
+// reference into an owner-only cache; the latter must retain the target.
+func foreignOrGoneProcess(ctx context.Context, pid int) (foreign, gone bool, err error) {
+	if pid <= 0 {
+		return false, true, nil
 	}
-	vmmap, err := exec.LookPath("vmmap")
-	if err != nil {
-		return false, fmt.Errorf("process maps unavailable for pid %d: %w", pid, err)
+	if runtime.GOOS == "linux" {
+		data, readErr := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+		if errors.Is(readErr, os.ErrNotExist) {
+			return false, true, nil
+		}
+		if readErr != nil {
+			return false, false, fmt.Errorf("read process owner for pid %d: %w", pid, readErr)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if !strings.HasPrefix(line, "Uid:") {
+				continue
+			}
+			fields := strings.Fields(line[len("Uid:"):])
+			if len(fields) == 0 {
+				break
+			}
+			uid, parseErr := strconv.Atoi(fields[0])
+			if parseErr != nil {
+				return false, false, fmt.Errorf("parse process owner for pid %d: %w", pid, parseErr)
+			}
+			return uid != os.Getuid(), false, nil
+		}
+		return false, false, fmt.Errorf("process owner unavailable for pid %d", pid)
 	}
-	out, err = exec.CommandContext(probeCtx, vmmap, "-w", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return false, fmt.Errorf("read process maps for pid %d: %w", pid, err)
+	ps, lookErr := exec.LookPath("ps")
+	if lookErr != nil {
+		return false, false, fmt.Errorf("process owner unavailable for pid %d: %w", pid, lookErr)
 	}
-	return bytes.Contains(out, needle), nil
+	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	out, runErr := exec.CommandContext(probeCtx, ps, "-p", strconv.Itoa(pid), "-o", "uid=").Output()
+	if runErr != nil {
+		if probeCtx.Err() != nil || errors.Is(runErr, os.ErrProcessDone) {
+			return false, true, nil
+		}
+		if killErr := syscall.Kill(pid, 0); errors.Is(killErr, syscall.ESRCH) {
+			return false, true, nil
+		}
+		return false, false, fmt.Errorf("read process owner for pid %d: %w", pid, runErr)
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		return false, true, nil
+	}
+	uid, parseErr := strconv.Atoi(strings.Fields(value)[0])
+	if parseErr != nil {
+		return false, false, fmt.Errorf("parse process owner for pid %d: %w", pid, parseErr)
+	}
+	return uid != os.Getuid(), false, nil
 }
 
 func readProcessProc(pid int) ([][]byte, error) {

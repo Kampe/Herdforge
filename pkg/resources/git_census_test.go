@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -114,5 +116,50 @@ func TestSQLiteLifecycleEvidenceMissingClaimFailsClosed(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !os.IsNotExist(err) {
 		t.Fatalf("read-only census created or changed absent claim store: stat=%v", err)
+	}
+}
+
+// The census must tolerate ordinary non-root hosts. PID 1 and other foreign
+// processes may deny argv/maps access, but that unrelated denial must not turn
+// an owner-only unused cache into a permanent false active-process finding.
+func TestLSOFProcessInspectorUnusedPrivateDirectory(t *testing.T) {
+	if _, err := os.Stat("/proc"); err != nil && runtime.GOOS != "darwin" {
+		t.Skipf("native process census is unavailable: %v", err)
+	}
+	if _, err := exec.LookPath("ps"); err != nil {
+		t.Skipf("ps unavailable: %v", err)
+	}
+	root := t.TempDir()
+	inspector := LSOFProcessInspector{Timeout: 8 * time.Second, MaxOutputBytes: 1 << 20}
+	usage, err := inspector.InUse(context.Background(), root)
+	if err != nil {
+		t.Fatalf("unused private directory census failed: %v", err)
+	}
+	if usage.CWD || usage.OpenFile || usage.ReferencedPath || usage.MetadataUnavailable {
+		t.Fatalf("unused private directory was treated as referenced: %+v", usage)
+	}
+}
+
+func TestLSOFProcessInspectorDetectsChildEnvironmentReference(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("Darwin does not expose child environments through ps; Linux reads /proc")
+	}
+	if _, err := exec.LookPath("ps"); err != nil {
+		t.Skipf("ps unavailable: %v", err)
+	}
+	root := t.TempDir()
+	cmd := exec.Command("sh", "-c", "sleep 5")
+	cmd.Env = append(os.Environ(), "HERD_REFERENCED_TARGET="+root)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	inspector := LSOFProcessInspector{Timeout: 8 * time.Second, MaxOutputBytes: 1 << 20}
+	usage, err := inspector.InUse(context.Background(), root)
+	if err != nil {
+		t.Fatalf("child environment census failed: %v", err)
+	}
+	if !usage.ReferencedPath {
+		t.Fatalf("child environment reference was not preserved: %+v", usage)
 	}
 }

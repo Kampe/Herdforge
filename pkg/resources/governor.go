@@ -644,6 +644,12 @@ func (g *Governor) orphanTargetProof(ctx context.Context, orphan, target, policy
 	if policyTarget == "graph.db" && !info.Mode().IsRegular() {
 		return PhysicalUsage{}, false, "graph_index_not_regular_file"
 	}
+	// Foreign processes whose metadata is inaccessible cannot reference an
+	// owner-only target. Shared permissions would remove that proof, so retain
+	// the target instead of treating an incomplete census as harmless.
+	if info.Mode().Perm()&0o077 != 0 {
+		return PhysicalUsage{}, false, "derived_target_shared_permissions"
+	}
 	resolved, err := filepath.EvalSymlinks(target)
 	root, rootErr := filepath.EvalSymlinks(orphan)
 	if err != nil || rootErr != nil || !containedPath(root, resolved) {
