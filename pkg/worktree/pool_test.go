@@ -125,6 +125,7 @@ func TestPoolGCSucceedsWithoutClaimLeaseHistory(t *testing.T) {
 	store.Close()
 
 	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.ProcessInspector = silentCensusInspector()
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}

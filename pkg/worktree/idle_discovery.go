@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/resources"
@@ -96,25 +97,106 @@ func idlePoolLockPath(repoRoot string) string {
 	return filepath.Join(repoRoot, ".herd", idlePoolDiscoveryLockFile)
 }
 
+// ErrIdlePoolTickBusy reports that a tick could not acquire the discovery
+// lock because the current holder is live or its liveness cannot be disproved
+// from recorded owner/generation identity alone. Losing this race is an
+// expected benign deferral, never a failure.
+var ErrIdlePoolTickBusy = errors.New("tick is busy or lock is stale")
+
+const idlePoolTickLockIdentityVersion = 1
+
+// idlePoolTickLockIdentity is the owner/generation record written into every
+// tick lock. Recovery of a crash-left lock is allowed only when the recorded
+// holder is provably dead: same host and a pid that no longer exists.
+// Lock age is deliberately not consulted -- a stale-looking mtime proves
+// nothing about a live holder.
+type idlePoolTickLockIdentity struct {
+	Version   int       `json:"version"`
+	Host      string    `json:"host"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+}
+
 // withIdlePoolTickLock serializes whole ticks against each other -- reading
 // the cursor, deciding candidates, acting, and persisting the cursor all
 // happen under one lock, the same O_EXCL pattern Pool itself uses for its
 // own state. Without it two concurrent ticks (a manual `herd idle-pool
 // --act` racing the daemon's own pulse cadence) could both read the same
 // starting cursor and silently discard each other's fairness progress, or
-// interleave writes to the cursor file. A concurrent tick returns a plain
-// "busy" error rather than corrupting anything.
+// interleave writes to the cursor file. A concurrent tick returns
+// ErrIdlePoolTickBusy rather than corrupting anything. A lock left behind by
+// a crashed tick is recovered only when its recorded identity proves the
+// holder dead on this host; anything unprovable stays in place and keeps
+// reporting busy.
 func withIdlePoolTickLock(repoRoot string, fn func() error) error {
 	lockPath := idlePoolLockPath(repoRoot)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return fmt.Errorf("idle pool discovery: create lock dir: %w", err)
 	}
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := acquireIdlePoolTickLock(lockPath)
+		if err == nil {
+			defer func() { _ = f.Close(); _ = os.Remove(lockPath) }()
+			return fn()
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("idle pool discovery: acquire tick lock: %w", err)
+		}
+		if !idlePoolTickLockHolderProvenDead(lockPath) {
+			return fmt.Errorf("idle pool discovery: %w: holder is live or identity is unprovable", ErrIdlePoolTickBusy)
+		}
+		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+			return fmt.Errorf("idle pool discovery: remove crashed tick lock: %w", removeErr)
+		}
+	}
+	return fmt.Errorf("idle pool discovery: %w: lock re-contended after recovery", ErrIdlePoolTickBusy)
+}
+
+func acquireIdlePoolTickLock(lockPath string) (*os.File, error) {
 	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("idle pool discovery: tick is busy or lock is stale: %w", err)
+		return nil, err
 	}
-	defer func() { _ = f.Close(); _ = os.Remove(lockPath) }()
-	return fn()
+	identity := idlePoolTickLockIdentity{Version: idlePoolTickLockIdentityVersion, PID: os.Getpid(), StartedAt: time.Now().UTC()}
+	if host, hostErr := os.Hostname(); hostErr == nil {
+		identity.Host = host
+	}
+	data, marshalErr := json.Marshal(identity)
+	if marshalErr != nil {
+		_ = f.Close()
+		_ = os.Remove(lockPath)
+		return nil, marshalErr
+	}
+	if _, writeErr := f.Write(append(data, '\n')); writeErr != nil {
+		_ = f.Close()
+		_ = os.Remove(lockPath)
+		return nil, writeErr
+	}
+	return f, nil
+}
+
+// idlePoolTickLockHolderProvenDead reads the lock's owner/generation record
+// and reports whether it proves the holder cannot still be running. Any
+// unreadable, unparseable, version-mismatched, foreign-host, or live-holder
+// record returns false: recovery is never taken on a guess, and lock age is
+// never used as evidence.
+func idlePoolTickLockHolderProvenDead(lockPath string) bool {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false
+	}
+	var identity idlePoolTickLockIdentity
+	if err := json.Unmarshal(data, &identity); err != nil {
+		return false
+	}
+	if identity.Version != idlePoolTickLockIdentityVersion || identity.PID <= 0 {
+		return false
+	}
+	host, hostErr := os.Hostname()
+	if hostErr != nil || identity.Host == "" || identity.Host != host {
+		return false
+	}
+	return errors.Is(syscall.Kill(identity.PID, 0), syscall.ESRCH)
 }
 
 func readIdlePoolCursor(repoRoot string) (string, error) {

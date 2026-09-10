@@ -607,6 +607,10 @@ type LSOFProcessInspector struct {
 	Executable     string
 	Timeout        time.Duration
 	MaxOutputBytes int
+	// processReferencesFn and processReferencesManyFn are test seams for the
+	// per-PID reference walk. nil selects the production implementations.
+	processReferencesFn     func(ctx context.Context, pid int, path string) (bool, error)
+	processReferencesManyFn func(ctx context.Context, pid int, paths []string, owners map[int]int) (map[string]bool, error)
 }
 
 const maxBatchProcessTargets = 64
@@ -654,12 +658,16 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	}
 	for _, pid := range allPIDs {
 		if processCtx.Err() != nil {
+			// The walk stopped before consulting every pid: the census is
+			// incomplete and must never read as a definitive no-owner
+			// result. Mark it unavailable so consumers fail closed.
+			usage.MetadataUnavailable = true
 			break
 		}
 		if _, alreadySeen := seen[pid]; !alreadySeen {
 			usage.PIDs = append(usage.PIDs, pid)
 		}
-		referenced, referenceErr := processReferences(processCtx, pid, resolved)
+		referenced, referenceErr := p.referenceProbe()(processCtx, pid, resolved)
 		if referenceErr != nil {
 			usage.MetadataUnavailable = true
 			continue
@@ -769,9 +777,15 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 	}
 	for _, pid := range allPIDs {
 		if processCtx.Err() != nil {
-			return nil, processCtx.Err()
+			// An incomplete reference walk must never assert no owner:
+			// mark every entry's census unavailable, then propagate the
+			// cancellation to callers that check the error as well.
+			for path, entry := range usage {
+				usage[path] = markMetadataUnavailable(entry, pid)
+			}
+			return usage, processCtx.Err()
 		}
-		references, referenceErr := processReferencesManyWithOwners(processCtx, pid, resolvedPaths, owners)
+		references, referenceErr := p.referencesManyProbe()(processCtx, pid, resolvedPaths, owners)
 		if referenceErr != nil {
 			for path := range usage {
 				usage[path] = markMetadataUnavailable(usage[path], pid)
@@ -882,6 +896,20 @@ func markMetadataUnavailable(usage ProcessUsage, pid int) ProcessUsage {
 	usage.MetadataUnavailable = true
 	usage.PIDs = append(usage.PIDs, pid)
 	return usage
+}
+
+func (p LSOFProcessInspector) referenceProbe() func(ctx context.Context, pid int, path string) (bool, error) {
+	if p.processReferencesFn != nil {
+		return p.processReferencesFn
+	}
+	return processReferences
+}
+
+func (p LSOFProcessInspector) referencesManyProbe() func(ctx context.Context, pid int, paths []string, owners map[int]int) (map[string]bool, error) {
+	if p.processReferencesManyFn != nil {
+		return p.processReferencesManyFn
+	}
+	return processReferencesManyWithOwners
 }
 
 // lsof uses exit status 1 for both "no matching open files" and diagnostics

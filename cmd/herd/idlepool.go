@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/worktree"
@@ -117,5 +117,5 @@ func reclaimIdlePoolsOnPulse(ctx context.Context, errOut *os.File) bool {
 }
 
 func isIdlePoolTickBusy(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "tick is busy or lock is stale")
+	return errors.Is(err, worktree.ErrIdlePoolTickBusy)
 }

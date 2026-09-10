@@ -244,6 +244,109 @@ func TestSnapshotProcessOwnersUsesBulkPIDUIDFields(t *testing.T) {
 	}
 }
 
+// writeSilentLsofAndSelfPS installs deterministic fake lsof/ps binaries. The
+// fake lsof reports no open-file evidence; the fake ps reports only the test
+// process itself (same uid), so the census walk is tiny and its outcome is
+// fully determined by the test, not the host process table.
+func writeSilentLsofAndSelfPS(t *testing.T) (lsofPath string) {
+	t.Helper()
+	lsofDir := t.TempDir()
+	lsofPath = filepath.Join(lsofDir, "lsof")
+	if err := os.WriteFile(lsofPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	psDir := t.TempDir()
+	// Kept out of the probed path: the ps binary dir lands in the test
+	// process's own PATH environment, which the Linux /proc/self/environ
+	// walk reads, and must never substring-match the probed directory.
+	psScript := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  *\"pid=,uid=\"*) printf '%s %s\\n' \"$FAKE_PS_SELF_PID\" \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"  *-axo*) printf '%s\\n999998\\n' \"$FAKE_PS_SELF_PID\" ;;\n" +
+		"  *\"-o uid=\"*) if [ \"$2\" = \"$FAKE_PS_SELF_PID\" ]; then printf '%s\\n' \"$FAKE_PS_SELF_UID\"; fi ;;\n" +
+		"  *) printf '%s\\n' \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(psDir, "ps"), []byte(psScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", psDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_PS_SELF_PID", strconv.Itoa(os.Getpid()))
+	t.Setenv("FAKE_PS_SELF_UID", strconv.Itoa(os.Getuid()))
+	return lsofPath
+}
+
+// Cancellation landing exactly between PID iterations previously left the
+// walk's partial result reading as a definitive no-owner census. A GC that
+// trusts such a census can remove a slot whose remaining pids were never
+// consulted. The walk must fail closed instead: mark the census
+// unavailable, and a genuinely ownerless candidate must still come back
+// definitively clean so reclamation is not poisoned.
+
+func TestLSOFProcessInspectorInUseCancellationBetweenIterationsMarksMetadataUnavailable(t *testing.T) {
+	lsof := writeSilentLsofAndSelfPS(t)
+	root := t.TempDir()
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	inspector.processReferencesFn = func(ctx context.Context, pid int, path string) (bool, error) {
+		calls++
+		if calls == 1 {
+			cancel() // expiry lands before the next iteration's top-of-loop check
+		}
+		return false, nil
+	}
+	usage, err := inspector.InUse(ctx, root)
+	if err != nil {
+		t.Fatalf("incomplete walk must fail closed via metadata, not a hard error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("reference walk continued past cancellation, probes=%d", calls)
+	}
+	if !usage.MetadataUnavailable {
+		t.Fatalf("cancellation between iterations must mark MetadataUnavailable, got usage=%+v", usage)
+	}
+}
+
+func TestLSOFProcessInspectorInUseManyCancellationBetweenIterationsMarkMetadataUnavailable(t *testing.T) {
+	lsof := writeSilentLsofAndSelfPS(t)
+	root := filepath.Clean(t.TempDir())
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	inspector.processReferencesManyFn = func(ctx context.Context, pid int, paths []string, owners map[int]int) (map[string]bool, error) {
+		calls++
+		if calls == 1 {
+			cancel() // expiry lands before the next iteration's top-of-loop check
+		}
+		return map[string]bool{root: false}, nil
+	}
+	usage, err := inspector.InUseMany(ctx, []string{root})
+	if err == nil {
+		t.Fatalf("incomplete walk must propagate cancellation, got usage=%+v err=<nil>", usage)
+	}
+	if calls != 1 {
+		t.Fatalf("reference walk continued past cancellation, probes=%d", calls)
+	}
+	entry, ok := usage[root]
+	if !ok || !entry.MetadataUnavailable {
+		t.Fatalf("cancellation between iterations must mark MetadataUnavailable, got ok=%t usage=%+v", ok, entry)
+	}
+}
+
+func TestLSOFProcessInspectorCleanCandidateRemainsDefinitive(t *testing.T) {
+	lsof := writeSilentLsofAndSelfPS(t)
+	root := t.TempDir()
+	inspector := LSOFProcessInspector{Executable: lsof, Timeout: 30 * time.Second}
+	usage, err := inspector.InUse(context.Background(), root)
+	if err != nil {
+		t.Fatalf("clean candidate census failed: %v", err)
+	}
+	if usage.CWD || usage.OpenFile || usage.ReferencedPath || usage.MetadataUnavailable {
+		t.Fatalf("genuinely ownerless clean candidate must stay definitively reclaimable, got usage=%+v", usage)
+	}
+}
+
 func TestLsofNoMatchDistinguishesNamespaceDiagnostics(t *testing.T) {
 	noMatch := func(t *testing.T, script string, stdout, stderr []byte, want bool) {
 		t.Helper()

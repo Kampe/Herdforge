@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,17 @@ type poolProcessInspectorFunc func(context.Context, string) (resources.ProcessUs
 
 func (f poolProcessInspectorFunc) InUse(ctx context.Context, path string) (resources.ProcessUsage, error) {
 	return f(ctx, path)
+}
+
+// silentCensusInspector reports a definitive, evidence-free census. It
+// replaces the default native census in tests whose purpose is something
+// other than the census itself (pool-state consistency, reachability,
+// lease-history fences, dry-run purity): the real walk is host-load
+// dependent, and truncation now fails closed as metadata-unavailable.
+func silentCensusInspector() poolProcessInspectorFunc {
+	return poolProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
 }
 
 // writePoolState overwrites pool.json directly so a test can construct a
@@ -198,6 +210,7 @@ func TestPoolGCRefusesHeadNotReachableFromBase(t *testing.T) {
 	initRepo(t, root)
 	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
 	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -251,11 +264,58 @@ func TestPoolGCRefusesWhileAnySlotLeased(t *testing.T) {
 	}
 }
 
+// TestPoolGCRealCensusReclaimsGenuinelyOwnerlessSlot proves the production
+// census path (no injected inspector) still comes back definitively clean
+// for a genuinely ownerless slot: fake lsof/ps binaries report no evidence,
+// so every refusal path -- including the fail-closed metadata guards -- must
+// stay silent and GC must reclaim the slot.
+func TestPoolGCRealCensusReclaimsGenuinelyOwnerlessSlot(t *testing.T) {
+	// The fake ps dir must stay outside the probed tree: it lands in this
+	// process's PATH environment, which the Linux /proc/self/environ walk
+	// reads, and must never substring-match the probed slot path.
+	fakeBin := t.TempDir()
+	lsofScript := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "lsof"), []byte(lsofScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	psScript := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  *\"pid=,uid=\"*) printf '%s %s\\n' \"$FAKE_PS_SELF_PID\" \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"  *-axo*) printf '%s\\n' \"$FAKE_PS_SELF_PID\" ;;\n" +
+		"  *\"-o uid=\"*) if [ \"$2\" = \"$FAKE_PS_SELF_PID\" ]; then printf '%s\\n' \"$FAKE_PS_SELF_UID\"; fi ;;\n" +
+		"  *) printf '%s\\n' \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(psScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_PS_SELF_PID", strconv.Itoa(os.Getpid()))
+	t.Setenv("FAKE_PS_SELF_UID", strconv.Itoa(os.Getuid()))
+
+	root := t.TempDir()
+	initRepo(t, root)
+	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 1)
+	pool.DefaultBase = "main"
+	if err := pool.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	slots, err := pool.Slots()
+	if err != nil || len(slots) != 1 {
+		t.Fatalf("precondition: 1 clean slot, got %d err=%v", len(slots), err)
+	}
+	if err := pool.GC(context.Background()); err != nil {
+		t.Fatalf("genuinely ownerless clean slot must be reclaimable by the real census path: %v", err)
+	}
+	if _, statErr := os.Stat(slots[0].Path); !os.IsNotExist(statErr) {
+		t.Fatalf("slot must be removed after reclaim, stat err=%v", statErr)
+	}
+}
+
 func TestPoolGCSucceedsAndLeavesPoolConsistentForEnsure(t *testing.T) {
 	root := t.TempDir()
 	initRepo(t, root)
 	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 2)
 	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -300,6 +360,7 @@ func TestPoolGCPlanDryRunNeverDeletes(t *testing.T) {
 	initRepo(t, root)
 	pool := NewPool(root, filepath.Join(root, ".herd", "pool"), 2)
 	pool.DefaultBase = "main"
+	pool.ProcessInspector = silentCensusInspector()
 	if err := pool.Ensure(context.Background()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -393,6 +454,28 @@ func TestPoolGCDefaultCensusRefusesLiveProcessWithOwnerEvidence(t *testing.T) {
 		_ = child.Process.Kill()
 		_ = child.Wait()
 	})
+
+	// The real census walks every host pid with one ps exec per pid, so its
+	// completion time is a property of the host, not the test (a truncated
+	// walk now correctly fails closed as metadata-unavailable). Synthesize
+	// the process table instead: exactly this test process and the live
+	// child, whose command line carries the slot path so the walk derives
+	// explicit same-owner reference evidence.
+	fakeBin := t.TempDir()
+	psScript := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  *\"pid=,uid=\"*) printf '%s %s\\n%s %s\\n' \"$FAKE_PS_SELF_PID\" \"$FAKE_PS_SELF_UID\" \"$FAKE_PS_CHILD_PID\" \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"  *-axo*) printf '%s\\n%s\\n' \"$FAKE_PS_SELF_PID\" \"$FAKE_PS_CHILD_PID\" ;;\n" +
+		"  *\"-o uid=\"*) printf '%s\\n' \"$FAKE_PS_SELF_UID\" ;;\n" +
+		"  *) printf '%s\\n' \"$FAKE_PS_COMMAND_LINE\" ;;\n" +
+		"esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(psScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_PS_SELF_PID", strconv.Itoa(os.Getpid()))
+	t.Setenv("FAKE_PS_SELF_UID", strconv.Itoa(os.Getuid()))
+	t.Setenv("FAKE_PS_CHILD_PID", strconv.Itoa(child.Process.Pid))
+	t.Setenv("FAKE_PS_COMMAND_LINE", "sh -c cd-and-sleep "+slotPath)
 
 	err := pool.GC(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "live process owns or references") {
