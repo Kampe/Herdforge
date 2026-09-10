@@ -151,6 +151,7 @@ type Verifier struct {
 	// mutant command is executed. Nil in production.
 	afterMutationApplied func()
 	beforeCommandStart   func(context.Context)
+	afterFunc            func(time.Duration, func()) *time.Timer
 }
 
 func defaultDiskAdmission() resources.DiskAdmission {
@@ -344,7 +345,11 @@ func (v *Verifier) execute(ctx context.Context, dir string, policy EnvironmentPo
 	}
 	if commandTimeout > 0 {
 		owned.commandStart = func() {
-			commandTimer = time.AfterFunc(commandTimeout, func() {
+			timerFn := time.AfterFunc
+			if v.afterFunc != nil {
+				timerFn = v.afterFunc
+			}
+			commandTimer = timerFn(commandTimeout, func() {
 				timedOut.Store(true)
 				_ = cmd.Cancel()
 			})
