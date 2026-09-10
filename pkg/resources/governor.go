@@ -559,13 +559,18 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 		if err != nil {
 			return result, fmt.Errorf("read known orphan root: %w", err)
 		}
-		// Rotate the bounded window by a time bucket. A protected early entry
-		// must not permanently starve later eligible entries across sweeps.
+		// Rotate the bounded window by a batch-sized time stride. A protected
+		// early entry must not permanently starve later eligible entries across
+		// sweeps, while each sweep remains bounded by orphanCensusLimit.
+		limit := g.orphanCensusLimit()
 		if len(entries) > 0 {
-			start := int((g.Now().Unix() / int64(time.Minute/time.Second)) % int64(len(entries)))
+			bucket := (g.Now().Unix() / int64(time.Minute/time.Second)) % int64(len(entries))
+			if bucket < 0 {
+				bucket += int64(len(entries))
+			}
+			start := int((bucket * int64(limit)) % int64(len(entries)))
 			entries = append(append([]os.DirEntry(nil), entries[start:]...), entries[:start]...)
 		}
-		limit := g.orphanCensusLimit()
 		rootProcessUsage := map[string]ProcessUsage(nil)
 		var rootProcessErr error
 		if batch, ok := g.Processes.(BatchProcessInspector); ok {
@@ -685,8 +690,8 @@ func orphanBatchPaths(entries []os.DirEntry, root string, known map[string]struc
 
 func (g *Governor) orphanMeasureLimit() int {
 	limit := g.Policy.MaxScanEntries
-	if limit <= 0 || limit > 1 {
-		return 1
+	if limit <= 0 || limit > 4096 {
+		return 4096
 	}
 	return limit
 }
