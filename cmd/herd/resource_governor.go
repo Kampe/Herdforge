@@ -77,34 +77,45 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 	if err != nil {
 		return nil, fmt.Errorf("resource governor canonical claim directory: %w", err)
 	}
-	return &resources.Governor{
-		Policy: policy, Capacity: resources.OSBackend{}, Measure: resources.OSPhysicalMeasurer{},
-		Worktrees: resources.GitWorktreeEnumerator{
-			Processes: resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20},
-			Now:       time.Now,
-			HostID:    host,
-			Evidence: resources.SQLiteLifecycleEvidence{
-				ClaimsPath:         deps.ResolveLaunchLeasePath(resolved),
-				LaunchClaimsPath:   deps.ResolveLaunchLeasePath(resolved),
-				RecoveryClaimsPath: lifecycle.CanonicalStatePath(resolved),
-				TaskClaimsPath:     filepath.Join(claimDir, "leases.db"),
-				LedgerPath:         reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
-				SignedTarget: func(_ context.Context, worktreePath string, _ resources.RegisteredWorktree) (resources.SignedTarget, error) {
-					tc, readErr := dispatch.ReadTaskContext(worktreePath)
-					if readErr != nil {
-						return resources.SignedTarget{}, readErr
-					}
-					verifier, verifyErr := dispatch.LoadVerifier(resolved)
-					if verifyErr != nil {
-						return resources.SignedTarget{}, verifyErr
-					}
-					if verifyErr = verifier.Verify(tc); verifyErr != nil {
-						return resources.SignedTarget{}, verifyErr
-					}
-					return resources.SignedTarget{LeaseID: tc.LeaseID, LeaseGeneration: tc.LeaseGeneration, LeaseTaskRef: tc.LeaseTaskRef, Repository: tc.Repository, CandidateSHA: tc.CandidateSHA, Authenticated: true}, nil
-				},
+	// One shared per-run process population: the registered census captures
+	// it once and the orphan census reuses it instead of rescanning the
+	// process population and owner table between stages (FAC-613).
+	sharedPopulation := &resources.ProcessPopulation{}
+	// One shared target-probe progress holder: the registered census batch
+	// records its completed/deferred lsof probe counts so the report states
+	// real progress instead of inferring it from scanned counts.
+	probeStats := &resources.BatchProbeStats{}
+	enumerator := resources.GitWorktreeEnumerator{
+		Processes:        resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20},
+		Now:              time.Now,
+		HostID:           host,
+		SharedPopulation: sharedPopulation,
+		ProbeStats:       probeStats,
+		Evidence: resources.SQLiteLifecycleEvidence{
+			ClaimsPath:         deps.ResolveLaunchLeasePath(resolved),
+			LaunchClaimsPath:   deps.ResolveLaunchLeasePath(resolved),
+			RecoveryClaimsPath: lifecycle.CanonicalStatePath(resolved),
+			TaskClaimsPath:     filepath.Join(claimDir, "leases.db"),
+			LedgerPath:         reviewledger.DefaultPath(resolved), RepoID: repoID, HostID: host,
+			SignedTarget: func(_ context.Context, worktreePath string, _ resources.RegisteredWorktree) (resources.SignedTarget, error) {
+				tc, readErr := dispatch.ReadTaskContext(worktreePath)
+				if readErr != nil {
+					return resources.SignedTarget{}, readErr
+				}
+				verifier, verifyErr := dispatch.LoadVerifier(resolved)
+				if verifyErr != nil {
+					return resources.SignedTarget{}, verifyErr
+				}
+				if verifyErr = verifier.Verify(tc); verifyErr != nil {
+					return resources.SignedTarget{}, verifyErr
+				}
+				return resources.SignedTarget{LeaseID: tc.LeaseID, LeaseGeneration: tc.LeaseGeneration, LeaseTaskRef: tc.LeaseTaskRef, Repository: tc.Repository, CandidateSHA: tc.CandidateSHA, Authenticated: true}, nil
 			},
 		},
+	}
+	return &resources.Governor{
+		Policy: policy, Capacity: resources.OSBackend{}, Measure: resources.OSPhysicalMeasurer{},
+		Worktrees: enumerator, SharedPopulation: sharedPopulation, ProbeStats: probeStats,
 		Locks: resources.FileLockProvider{}, Now: time.Now,
 	}, nil
 }
@@ -181,6 +192,14 @@ func runResourceGovernor(asJSON, apply bool, maxReaps int, foreign []string, for
 	defer cancel()
 	report, err := governor.Run(ctx, resources.RunOptions{Apply: apply, BatchLimit: maxReaps, ForeignTargets: foreignTargets})
 	if err != nil {
+		// A failed run must still emit its structured partial report: the
+		// nonzero exit refuses cleanup, while phase timing, scanned and
+		// deferred counts, and the causal stage remain actionable (FAC-613).
+		if asJSON {
+			if data, marshalErr := json.MarshalIndent(report, "", "  "); marshalErr == nil {
+				fmt.Println(string(data))
+			}
+		}
 		return fmt.Errorf("%w; report=%s", err, report.JSON())
 	}
 	if asJSON {

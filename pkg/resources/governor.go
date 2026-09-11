@@ -3,6 +3,7 @@ package resources
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,6 +195,15 @@ type Governor struct {
 	Processes  ProcessInspector
 	OwnerID    func(os.FileInfo) (string, bool)
 	Now        func() time.Time
+	// SharedPopulation is the per-run host-wide process snapshot captured by
+	// the registered census stage and reused by the orphan census stage. It
+	// must alias the same *ProcessPopulation handed to the enumerator so a
+	// run never rescans the population between the two stages.
+	SharedPopulation *ProcessPopulation
+	// ProbeStats aliases the enumerator's target-probe progress holder: the
+	// registered census batch records its completed/deferred lsof probe
+	// counts here so the registered_census stage reports real progress.
+	ProbeStats *BatchProbeStats
 }
 
 type TargetDecision string
@@ -258,12 +268,44 @@ type GovernorReport struct {
 	ReclaimedBytes               uint64               `json:"reclaimed_bytes"`
 	OrphanCensusTruncated        bool                 `json:"orphan_census_truncated,omitempty"`
 	OrphanCensusRemaining        int                  `json:"orphan_census_remaining,omitempty"`
+	// Error is set on a nonzero-exit run so the structured partial report is
+	// actionable on its own: the refusal stays, the cause is retained.
+	Error  string        `json:"error,omitempty"`
+	Stages []CensusStage `json:"census_stages,omitempty"`
+}
+
+// CensusStage records the bounded timing and counts of one census phase so a
+// failed run exposes which stage consumed the budget instead of only where
+// expiry was observed.
+type CensusStage struct {
+	Name       string `json:"name"`
+	DurationMS int64  `json:"duration_ms"`
+	Scanned    int    `json:"scanned"`
+	Deferred   int    `json:"deferred"`
+	// ProbeCompleted and ProbeDeferred carry the real target-probe progress
+	// (targets whose scoped lsof evidence finished vs targets that received
+	// no evidence), so scanned counts cannot overstate completed probes.
+	ProbeCompleted int `json:"probe_completed"`
+	ProbeDeferred  int `json:"probe_deferred"`
+	// CursorError carries a failed durable-cursor advance as a partial
+	// diagnostic: progress persistence broke (e.g. full disk) but the
+	// sweep and every eligibility decision are unaffected.
+	CursorError string `json:"cursor_error,omitempty"`
+	Cause       string `json:"cause,omitempty"`
 }
 
 type orphanCensusResult struct {
 	Orphans   []OrphanWorktree
 	Truncated bool
 	Remaining int
+	// ProbeCompleted/ProbeDeferred aggregate the real target-probe progress
+	// of every batched orphan lsof probe in this census.
+	ProbeCompleted int
+	ProbeDeferred  int
+	// CursorPersistErr records a failed durable-cursor advance as a partial
+	// diagnostic; the sweep itself stays successful and eligibility is
+	// unchanged.
+	CursorPersistErr string
 }
 
 // OrphanWorktree is an unregistered child of a repository-declared known lane
@@ -380,7 +422,13 @@ func (g *Governor) Run(ctx context.Context, options RunOptions) (report Governor
 		return report, fmt.Errorf("resource governor lock: %w", err)
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	return g.runLocked(ctx, options)
+	report, err = g.runLocked(ctx, options)
+	if err != nil {
+		// A failed run still carries its structured partial report: the
+		// refusal and the causal stage evidence travel together (FAC-613).
+		report.Error = err.Error()
+	}
+	return report, err
 }
 
 func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorReport, error) {
@@ -433,35 +481,88 @@ func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorR
 	return report, nil
 }
 
+// now returns the injectable clock, defaulting to the real time.
+func (g *Governor) now() time.Time {
+	if g.Now != nil {
+		return g.Now()
+	}
+	return time.Now()
+}
+
+func (g *Governor) sinceMS(start time.Time) int64 {
+	elapsed := g.now().Sub(start)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return elapsed.Milliseconds()
+}
+
+func (g *Governor) recordStage(report *GovernorReport, stage CensusStage) {
+	report.Stages = append(report.Stages, stage)
+}
+
 func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
+	report := GovernorReport{}
+	start := g.now()
 	before, err := g.Capacity.StatFS(g.Policy.RepositoryRoot)
+	statfsStage := CensusStage{Name: "statfs", DurationMS: g.sinceMS(start)}
 	if err != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor statfs: %w", err)
+		statfsStage.Cause = err.Error()
+		report.Stages = append(report.Stages, statfsStage)
+		report.Error = fmt.Sprintf("resource governor statfs: %v", err)
+		return report, fmt.Errorf("resource governor statfs: %w", err)
 	}
 	if err := validCapacity(before); err != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor statfs: %w", err)
+		statfsStage.Cause = err.Error()
+		report.Stages = append(report.Stages, statfsStage)
+		report.Error = fmt.Sprintf("resource governor statfs: %v", err)
+		return report, fmt.Errorf("resource governor statfs: %w", err)
 	}
-	lanes, err := g.Worktrees.List(ctx, g.Policy.RepositoryRoot, g.Policy.BaseRef)
-	if err != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor registered-worktree census: %w", err)
+	report.Stages = append(report.Stages, statfsStage)
+	report.CapacityBefore, report.CapacityAfter = before, before
+
+	listStart := g.now()
+	lanes, listErr := g.Worktrees.List(ctx, g.Policy.RepositoryRoot, g.Policy.BaseRef)
+	listStage := CensusStage{Name: "registered_census", DurationMS: g.sinceMS(listStart)}
+	if listErr != nil {
+		listStage.Cause = listErr.Error()
+		report.Stages = append(report.Stages, listStage)
+		report.Error = fmt.Sprintf("resource governor registered-worktree census: %v", listErr)
+		return report, fmt.Errorf("resource governor registered-worktree census: %w", listErr)
 	}
+	listStage.Scanned = len(lanes)
+	if g.ProbeStats != nil {
+		// Real target-probe progress of the registered batch, recorded by
+		// the enumerator into the shared holder: scanned counts alone must
+		// not overstate the probes that actually completed.
+		listStage.ProbeCompleted = g.ProbeStats.Completed
+		listStage.ProbeDeferred = g.ProbeStats.Deferred
+	}
+	report.Stages = append(report.Stages, listStage)
 	seen := make(map[string]struct{}, len(lanes))
+	unknownLanes := 0
 	for i := range lanes {
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_realpath_unavailable"
+			unknownLanes++
 			continue
 		}
 		lanes[i].Path = filepath.Clean(resolved)
 		if _, exists := seen[lanes[i].Path]; exists {
-			return GovernorReport{}, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
+			listStage.Cause = fmt.Sprintf("duplicate registered worktree realpath %q", lanes[i].Path)
+			listStage.Deferred = unknownLanes
+			g.recordStage(&report, listStage)
+			report.Error = listStage.Cause
+			return report, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
 		}
 		seen[lanes[i].Path] = struct{}{}
 		usage, measureErr := g.Measure.Measure(lanes[i].Path, g.registeredMeasureLimit())
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_allocation_unavailable"
+			unknownLanes++
 			continue
 		}
 		lanes[i].AllocatedBytes = usage.Bytes
@@ -470,16 +571,37 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			lanes[i].PreserveReason = "worktree_allocation_truncated"
 		}
 	}
+	listStage.Deferred = unknownLanes
+	g.recordStage(&report, listStage)
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].Path < lanes[j].Path })
-	report := GovernorReport{
-		HostID: g.Policy.HostID, RepositoryID: g.Policy.RepositoryID, ObservedAt: g.Now().UTC(), PressureBytes: g.Policy.PressureBytes,
-		RecoveryBytes: g.Policy.RecoveryBytes, TaskReserveBytes: g.Policy.TaskReserveBytes,
-		CapacityBefore: before, CapacityAfter: before, Worktrees: lanes,
-	}
+	report.HostID = g.Policy.HostID
+	report.RepositoryID = g.Policy.RepositoryID
+	report.ObservedAt = g.Now().UTC()
+	report.PressureBytes = g.Policy.PressureBytes
+	report.RecoveryBytes = g.Policy.RecoveryBytes
+	report.TaskReserveBytes = g.Policy.TaskReserveBytes
+	report.Worktrees = lanes
 	for i := range report.Worktrees {
 		report.Worktrees[i].ReportPath = reportPath(g.Policy.RepositoryRoot, report.Worktrees[i].Path)
 	}
+	orphanStart := g.now()
 	orphanResult, orphanErr := g.censusOrphans(ctx, report.Worktrees, before)
+	orphanStage := CensusStage{
+		Name: "unregistered_orphan_census", DurationMS: g.sinceMS(orphanStart),
+		Scanned: len(orphanResult.Orphans), Deferred: orphanResult.Remaining,
+		ProbeCompleted: orphanResult.ProbeCompleted, ProbeDeferred: orphanResult.ProbeDeferred,
+		CursorError: orphanResult.CursorPersistErr,
+	}
+	if orphanErr != nil {
+		orphanStage.Cause = orphanErr.Error()
+		g.recordStage(&report, orphanStage)
+		report.OrphanCensusTruncated = orphanResult.Truncated
+		report.OrphanCensusRemaining = orphanResult.Remaining
+		report.Orphans = orphanResult.Orphans
+		report.Error = fmt.Sprintf("resource governor unregistered-orphan census: %v", orphanErr)
+		return report, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
+	}
+	g.recordStage(&report, orphanStage)
 	orphans := orphanResult.Orphans
 	report.OrphanCensusTruncated = orphanResult.Truncated
 	report.OrphanCensusRemaining = orphanResult.Remaining
@@ -495,8 +617,10 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			}
 		}
 	}
-	if orphanErr != nil {
-		return report, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
+	targetStart := g.now()
+	if err := ctx.Err(); err != nil {
+		report.Error = fmt.Sprintf("registered target inspection cancelled before start: %v", err)
+		return report, err
 	}
 	for _, lane := range lanes {
 		for _, rel := range g.Policy.GeneratedDirectories {
@@ -506,6 +630,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			report.Targets = append(report.Targets, target)
 		}
 	}
+	g.recordStage(&report, CensusStage{Name: "registered_target_inspection", DurationMS: g.sinceMS(targetStart), Scanned: len(report.Targets)})
 	report.EstimatedTaskReserveBytes = report.TaskReserveBytes
 	for _, target := range report.Targets {
 		if target.BeforeBytes > report.EstimatedTaskReserveBytes {
@@ -559,25 +684,38 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 		if err != nil {
 			return result, fmt.Errorf("read known orphan root: %w", err)
 		}
-		// Rotate the bounded window by a batch-sized time stride. A protected
-		// early entry must not permanently starve later eligible entries across
-		// sweeps, while each sweep remains bounded by orphanCensusLimit.
+		// Rotate the bounded window by the per-root durable cursor so
+		// repeated sweeps at the same wall-clock minute still make real
+		// progress through the ring: a protected or unknown early entry
+		// must not permanently starve later eligible entries, while each
+		// sweep remains bounded by orphanCensusLimit. A missing or invalid
+		// cursor falls back to the historical time-bucket stride and never
+		// infers eligibility by itself.
 		limit := g.orphanCensusLimit()
+		rootTruncated := false
+		start := 0
 		if len(entries) > 0 {
-			bucket := (g.Now().Unix() / int64(time.Minute/time.Second)) % int64(len(entries))
-			if bucket < 0 {
-				bucket += int64(len(entries))
-			}
-			start := int((bucket * int64(limit)) % int64(len(entries)))
+			start = g.orphanWindowStart(root, len(entries))
 			entries = append(append([]os.DirEntry(nil), entries[start:]...), entries[:start]...)
 		}
 		rootProcessUsage := map[string]ProcessUsage(nil)
+		var rootProcessProbeStats BatchProbeStats
 		var rootProcessErr error
 		if batch, ok := g.Processes.(BatchProcessInspector); ok {
 			rootProcessUsage = make(map[string]ProcessUsage)
 			batchPaths := orphanBatchPaths(entries, root, known, limit, g.Policy.OrphanDerivedTargets)
 			if len(batchPaths) > 0 {
-				rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
+				// FAC-613: reuse the population snapshot the registered
+				// census stage captured on this run instead of rescanning
+				// the process population and owner table between stages.
+				// The per-path lsof and reference evidence stays fresh.
+				if popAware, shared := batch.(PopulationAwareBatchInspector); shared && g.SharedPopulation != nil && len(g.SharedPopulation.PIDs) > 0 {
+					rootProcessUsage, rootProcessProbeStats, rootProcessErr = popAware.InUseManyPopulation(ctx, batchPaths, g.SharedPopulation)
+					result.ProbeCompleted += rootProcessProbeStats.Completed
+					result.ProbeDeferred += rootProcessProbeStats.Deferred
+				} else {
+					rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
+				}
 				if rootProcessUsage == nil {
 					rootProcessUsage = make(map[string]ProcessUsage)
 				}
@@ -602,6 +740,7 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			}
 			if candidates >= limit {
 				result.Truncated = true
+				rootTruncated = true
 				result.Remaining++
 				continue
 			}
@@ -634,9 +773,76 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			}
 			result.Orphans = append(result.Orphans, orphan)
 		}
+		// Advance the durable cursor by the entries actually examined so
+		// the next sweep - even at the same wall-clock minute - continues
+		// after this window instead of re-reading it. A fully examined ring
+		// resets the cursor; a truncated sweep parks it after the window.
+		// A persistence failure (e.g. a full disk) must not be silent: it
+		// is recorded as a partial diagnostic on the stage while the sweep
+		// itself stays successful, and it never changes any entry's
+		// eligibility.
+		next := 0
+		if rootTruncated {
+			next = start + candidates
+		}
+		if cerr := g.storeOrphanCursor(root, next); cerr != nil {
+			if result.CursorPersistErr != "" {
+				result.CursorPersistErr += "; "
+			}
+			result.CursorPersistErr += fmt.Sprintf("orphan cursor advance for %s: %v", root, cerr)
+		}
 	}
 	sort.Slice(result.Orphans, func(i, j int) bool { return result.Orphans[i].Path < result.Orphans[j].Path })
 	return result, nil
+}
+
+// orphanWindowStart picks where the bounded orphan window starts for one
+// orphan root. A valid durable cursor takes precedence: repeated sweeps at
+// the same wall-clock minute keep advancing through the ring. A missing or
+// unparsable cursor falls back to the historical minute-bucket stride; it
+// never gates or infers any entry's eligibility, which stays a per-entry
+// evidence decision. Cursor IO runs under the run's governor file lock, so
+// read-advance is serialized per repository.
+func (g *Governor) orphanWindowStart(root string, entryCount int) int {
+	bucket := (g.Now().Unix() / int64(time.Minute/time.Second)) % int64(entryCount)
+	if bucket < 0 {
+		bucket += int64(entryCount)
+	}
+	fallback := int((bucket * int64(g.orphanCensusLimit())) % int64(entryCount))
+	raw, err := os.ReadFile(g.orphanCursorPath(root))
+	if err != nil {
+		return fallback
+	}
+	cursor, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || cursor < 0 {
+		return fallback
+	}
+	return cursor % entryCount
+}
+
+// storeOrphanCursor persists the next window start for one orphan root.
+// Best-effort by design: a failed write only drops the progress optimization
+// (the next run falls back to the time-bucket stride); it must never fail
+// the census or alter any entry's eligibility decision. The failure is still
+// returned so the caller can record it as a partial diagnostic instead of
+// silently hiding broken progress persistence (e.g. a full disk).
+func (g *Governor) storeOrphanCursor(root string, next int) error {
+	path := g.orphanCursorPath(root)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("prepare cursor dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(next)), 0o600); err != nil {
+		return fmt.Errorf("write cursor: %w", err)
+	}
+	return nil
+}
+
+// orphanCursorPath maps a resolved orphan root to a fixed per-root cursor
+// file under the repository's canonical state, keyed by a SHA-256 digest of
+// the root path so arbitrary roots cannot escape the directory.
+func (g *Governor) orphanCursorPath(root string) string {
+	digest := sha256.Sum256([]byte(root))
+	return filepath.Join(g.Policy.RepositoryRoot, ".herd", "governor", "orphan-cursors", hex.EncodeToString(digest[:])+".txt")
 }
 
 // orphanCensusLimit bounds expensive recursive accounting and process proof.
