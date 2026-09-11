@@ -475,10 +475,21 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 	last := "unknown"
 	lastPane := ""
 	staged := false
+	// FAC-815: a warm lane resting at "done" before this send is already
+	// paneAdvanced the instant the submitted text renders into the pane --
+	// submission itself guarantees the delta, so "done" alone proves nothing
+	// about THIS delivery. sawWorking is set only by an actual observed
+	// departure into "working" during this poll loop (a real turn start),
+	// never by the resting baseline state (FAC-773 queues an
+	// already-working baseline before this loop is ever reached).
+	sawWorking := false
 	for time.Now().Before(deadline) {
 		st, err := liveStatusScopedIn(resolvedTarget, workspace)
 		if err == nil {
 			last = st
+			if st == "working" {
+				sawWorking = true
+			}
 			pane, paneErr := PaneRead(resolved.PaneID, 120)
 			if paneErr == nil {
 				lastPane = pane
@@ -504,7 +515,18 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 			// running. A pane cannot echo text it never received, and the
 			// baseline comparison still prevents old text from proving a new
 			// delivery, so the status check adds nothing here.
-			if paneErr == nil && observationCount(text, pane) > observationCount(text, baselinePane) {
+			//
+			// FAC-815: this is instant proof ONLY for harnesses that actually
+			// echo the prompt. A non-echo harness (claude, opencode-separate)
+			// can still render the literal submitted text transiently on
+			// SUBMISSION itself -- a compose-time render, a wrapped command
+			// line in the tail, taskTextObserved's own premise that command
+			// text DOES appear in transcripts -- none of which is the agent
+			// accepting the work. Gating on harnessEchoesPrompt keeps the
+			// FAC-589 instant proof for harnesses that genuinely echo, and
+			// sends every non-echo harness through the fresh-working fallback
+			// below regardless of any transient literal-text render.
+			if harnessEchoesPrompt(resolved.Kind) && paneErr == nil && observationCount(text, pane) > observationCount(text, baselinePane) {
 				if st == "" {
 					st = "working"
 				}
@@ -528,7 +550,7 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 				// pane actually changed since before the send: a pane that
 				// ignored the input does not change. That is weaker evidence
 				// than an echo, and it is the strongest this harness exposes.
-				if !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) {
+				if !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) && (st == "working" || sawWorking) {
 					return SendResult{Status: st}, nil
 				}
 			}

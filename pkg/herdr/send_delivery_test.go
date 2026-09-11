@@ -26,8 +26,18 @@ func (r *sendRecorder) run(args ...string) (string, error) {
 	r.mu.Unlock()
 	switch {
 	case len(args) > 1 && args[0] == "agent" && args[1] == "list":
+		// FAC-815 CI repair: AgentEntry.Kind unmarshals from JSON key "agent"
+		// (herdr.go:1615), not "kind" -- this fixture used the wrong key, so
+		// resolved.Kind was always "" and harnessEchoesPrompt("") is false.
+		// Before FAC-815 gated the echo-proof branch on harnessEchoesPrompt,
+		// that mistake had no effect (the branch was unconditional); after
+		// the gate, an unrecognized empty kind correctly fell through to the
+		// non-echo fallback, which this idle-status fixture cannot satisfy
+		// (no fresh working observation), reproducing CI34557835591 exactly.
+		// This fixture models a genuine codex-kind (echoing) agent; fixing
+		// the key restores that intent without touching the gate itself.
 		return `{"result":{"type":"agents","agents":[{"name":"lane","agent_status":"` +
-			r.status + `","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","kind":"codex"}]}}`, nil
+			r.status + `","tab_id":"wK:t1","pane_id":"wK:p1","workspace_id":"wK","agent":"codex"}]}}`, nil
 	case len(args) > 1 && args[0] == "pane" && args[1] == "read":
 		body := r.baselinePane
 		r.mu.Lock()
