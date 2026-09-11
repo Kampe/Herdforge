@@ -490,6 +490,17 @@ func replayReviewedTree(repoDir, base, parent, candidate string) (string, error)
 	return gitOut(repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
 }
 
+// ReplayTree is the one exported definition of the native merge-tree replay
+// primitive: apply the base-to-candidate delta onto parent with the exact
+// merge base and return the resulting tree. The worktree reaper's
+// current-tip containment check (FAC-805) consumes this instead of
+// re-implementing the invocation — the invariant gate rejects a second
+// definition of the same primitive, and the copies would diverge exactly as
+// FAC-562..574 did.
+func ReplayTree(repoDir, base, parent, candidate string) (string, error) {
+	return replayReviewedTree(repoDir, base, parent, candidate)
+}
+
 // validatePriorReceipt does not grant review consent: the normal admission
 // path still runs afterward, and persistence performs a second exact CAS.
 func (g *Gate) validatePriorReceipt(req Request) error {

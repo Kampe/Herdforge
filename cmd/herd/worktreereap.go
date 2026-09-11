@@ -738,15 +738,13 @@ func rangeLandedProof(root, base, branch string) (*mergeadmit.Proof, error) {
 	if err != nil {
 		return nil, err
 	}
-	replay, err := exec.Command("git", "-C", root, "merge-tree", "--write-tree",
-		"--merge-base", mergeBase, base, branch).Output()
+	// The same one definition of the native merge-tree replay primitive the
+	// proofs use (pkg/mergeadmit.ReplayTree). A conflicted replay exits
+	// nonzero and reads as an error, which keeps the worktree.
+	replayed, err := mergeadmit.ReplayTree(root, mergeBase, base, branch)
 	if err != nil {
-		// Exit 1 is a conflicted replay: the delta does not apply cleanly to
-		// the current tip, so containment is unproven. Any other status is a
-		// failed lookup. Both keep the worktree.
 		return nil, fmt.Errorf("merge-tree replay of %s onto %s did not prove containment: %w", branch, base, err)
 	}
-	replayed := strings.TrimSpace(strings.SplitN(strings.TrimSpace(string(replay)), "\n", 2)[0])
 	if replayed != tipTree {
 		return nil, fmt.Errorf("branch %s replays onto %s as tree %s, but the tip is %s; net content is not present now",
 			branch, base, shortSha(replayed), shortSha(tipTree))
