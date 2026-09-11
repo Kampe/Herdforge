@@ -214,3 +214,61 @@ func failFastLsofScript(t *testing.T, spawned *int) string {
 	})
 	return path
 }
+
+// Nested census targets: a repository root and a worktree inside it can both
+// be targets of the same batch. The chunked +D parser attributes every open
+// path to EVERY containing target (containedPath over the whole target set),
+// so a file held deep inside the child protects the parent too. The bulk
+// in-memory path must match that exactly: stopping at the nearest ancestor
+// leaves the outer target with zero evidence, which reads as a definitive
+// observed no-owner result and makes a live directory reap-eligible.
+func TestBulkOpenFileEvidenceProtectsEveryContainingTarget(t *testing.T) {
+	resolvedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedRoot = filepath.Clean(resolvedRoot)
+	child := filepath.Join(resolvedRoot, "nested", "lane")
+	if err := os.MkdirAll(filepath.Join(child, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const heldPID = 4242
+	var spawned int
+	inspector := LSOFProcessInspector{
+		Executable: failFastLsofScript(t, &spawned),
+		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
+			references := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				references[path] = false
+			}
+			return references, nil
+		},
+	}
+	population := &ProcessPopulation{
+		PIDs:   []int{heldPID},
+		Owners: map[int]int{heldPID: os.Getuid()},
+		OpenFiles: map[int][]ProcessOpenFile{heldPID: {
+			{FD: "3", Path: filepath.Join(child, "sub", "graph.db")},
+			{FD: "cwd", Path: filepath.Join(child, "sub")},
+		}},
+	}
+	usage, stats, err := inspector.InUseManyPopulation(context.Background(), []string{resolvedRoot, child}, population)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spawned != 0 {
+		t.Fatalf("bulk evidence must never spawn per-target lsof, got %d spawns", spawned)
+	}
+	if stats.Completed != 2 || stats.Deferred != 0 {
+		t.Fatalf("both targets must be observed, got completed=%d deferred=%d", stats.Completed, stats.Deferred)
+	}
+	for _, target := range []string{resolvedRoot, child} {
+		entry := usage[target]
+		if !entry.OpenFile || !entry.CWD {
+			t.Fatalf("target %s contains a held open file and a cwd and must read open=true cwd=true, got %+v", target, entry)
+		}
+		if len(entry.PIDs) == 0 {
+			t.Fatalf("target %s must carry the holding pid, got %+v", target, entry)
+		}
+	}
+}

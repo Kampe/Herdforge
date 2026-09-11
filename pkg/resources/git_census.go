@@ -907,8 +907,12 @@ func (p LSOFProcessInspector) bulkUsageFromOpenFiles(ctx context.Context, resolv
 		targets[path] = struct{}{}
 	}
 	// Ancestor lookup reproduces containedPath(target, openPath) for every
-	// target: an open path is attributed to the target it equals or sits
-	// under, by walking the open path's own ancestors.
+	// target: an open path is attributed to EVERY target it equals or sits
+	// under, by walking all of the open path's own ancestors. Targets nest
+	// (a repository root and its worktrees can both be census targets), and
+	// stopping at the nearest ancestor would leave every outer target with
+	// zero evidence — indistinguishable from an observed no-owner result,
+	// and therefore reap-eligible while a process holds the subtree.
 	for pid, opens := range population.OpenFiles {
 		for _, open := range opens {
 			openPath := filepath.Clean(open.Path)
@@ -918,31 +922,29 @@ func (p LSOFProcessInspector) bulkUsageFromOpenFiles(ctx context.Context, resolv
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			for {
-				if _, ok := targets[openPath]; ok {
-					break
-				}
-				parent := filepath.Dir(openPath)
-				if parent == openPath {
-					openPath = ""
-					break
-				}
-				openPath = parent
-			}
-			if openPath == "" {
-				continue
-			}
-			entry := usage[openPath]
+			var cwd, openFile bool
 			switch {
 			case open.FD == "cwd":
-				entry.CWD = true
+				cwd = true
 			case open.FD != "rtd" && open.FD != "txt" && open.FD != "mem":
-				entry.OpenFile = true
+				openFile = true
 			default:
 				continue
 			}
-			entry.PIDs = append(entry.PIDs, pid)
-			usage[openPath] = entry
+			for ancestor := openPath; ; {
+				if _, ok := targets[ancestor]; ok {
+					entry := usage[ancestor]
+					entry.CWD = entry.CWD || cwd
+					entry.OpenFile = entry.OpenFile || openFile
+					entry.PIDs = append(entry.PIDs, pid)
+					usage[ancestor] = entry
+				}
+				parent := filepath.Dir(ancestor)
+				if parent == ancestor {
+					break
+				}
+				ancestor = parent
+			}
 		}
 	}
 	for path, entry := range usage {
