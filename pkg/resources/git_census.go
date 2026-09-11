@@ -276,7 +276,34 @@ type GitWorktreeEnumerator struct {
 	// from scanned counts. Consumers own the pointer and hand the same one
 	// to the governor.
 	ProbeStats *BatchProbeStats
+	// Landing, when non-nil, decides landing by CONTENT instead of ancestry
+	// alone. It is injected rather than imported because the whole-range
+	// proof lives above this package and depending on it from here is a
+	// cycle. Nil keeps the ancestry default.
+	Landing LandingPredicate
 }
+
+// LandingProbe is the already-pinned identity one landing decision is made
+// about. HEAD and the base are resolved to object names before the probe
+// runs, so a ref that moves while the probe is in flight cannot change what
+// was proved.
+type LandingProbe struct {
+	WorktreePath string
+	Branch       string
+	HeadSHA      string
+	BaseRef      string
+	BaseSHA      string
+}
+
+// LandingPredicate reports whether the probe's work is contained in the base
+// at its current tip.
+//
+// Ancestry alone cannot answer this: a rebase or squash replays the work
+// under a new object name, so a landed lane is never an ancestor and reports
+// unmerged forever. An error means UNKNOWN, never "not landed" -- both
+// preserve the lane, but the recorded reason must not claim knowledge the
+// probe did not have.
+type LandingPredicate func(ctx context.Context, probe LandingProbe) (bool, error)
 
 type GitTrackedSourceInspector struct{}
 
@@ -412,6 +439,11 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 			*e.ProbeStats = batchStats
 		}
 	}
+	// Pin the base ONCE per enumeration, so every lane in one census is judged
+	// against the same tip. An unpinnable base leaves this empty and each
+	// content probe then fails closed rather than proving against a ref that
+	// may move underneath it.
+	basePin := e.pinBase(ctx, root, baseRef)
 	for i := range lanes {
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
@@ -437,7 +469,7 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 			continue
 		}
 		lanes[i].Dirty, lanes[i].Untracked = dirty, untracked
-		merged, mergeErr := gitMerged(ctx, lanes[i].Path, baseRef)
+		merged, mergeErr := e.landed(ctx, lanes[i], baseRef, basePin)
 		if mergeErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "merge_state_unavailable"
 			continue
@@ -630,6 +662,63 @@ func gitStatus(ctx context.Context, path string) (dirty, untracked bool, err err
 
 func gitMerged(ctx context.Context, path, baseRef string) (bool, error) {
 	return GitCommitIsAncestor(ctx, path, "HEAD", baseRef)
+}
+
+// pinBase resolves the base ref to an object name for this enumeration. It is
+// only needed by a wired content predicate, so an enumerator without one pays
+// nothing. An unresolvable base returns empty and every probe then refuses.
+func (e GitWorktreeEnumerator) pinBase(ctx context.Context, root, baseRef string) string {
+	if e.Landing == nil {
+		return ""
+	}
+	out, err := gitOutput(ctx, root, "rev-parse", "--verify", baseRef+"^{commit}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// landed decides one lane's landing, preserving the ancestry-only default for
+// any consumer that wires no predicate.
+//
+// Ancestry runs first even when a predicate exists: it is cheap, it is
+// authoritative when it says yes, and it keeps the expensive proof for the
+// rewritten cases that actually need it.
+//
+// Cancellation bound, stated honestly: the predicate is one synchronous proof
+// and is NOT interruptible once begun, so the granularity is a whole proof,
+// never part of one. The deadline is observed on both sides -- a cancelled
+// census neither starts a proof nor trusts one that finished after its caller
+// gave up -- and the call is inline, so no goroutine is left running into a
+// result nobody will read.
+func (e GitWorktreeEnumerator) landed(ctx context.Context, lane RegisteredWorktree, baseRef, basePin string) (bool, error) {
+	merged, err := gitMerged(ctx, lane.Path, baseRef)
+	if err != nil || merged || e.Landing == nil {
+		return merged, err
+	}
+	if strings.TrimSpace(basePin) == "" {
+		return false, fmt.Errorf("landing base %q could not be pinned", baseRef)
+	}
+	if strings.TrimSpace(lane.Head) == "" || strings.TrimSpace(lane.Branch) == "" {
+		return false, fmt.Errorf("landing probe for %q requires a pinned head and branch", lane.Path)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	landedNow, probeErr := e.Landing(ctx, LandingProbe{
+		WorktreePath: lane.Path,
+		Branch:       lane.Branch,
+		HeadSHA:      lane.Head,
+		BaseRef:      baseRef,
+		BaseSHA:      basePin,
+	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	if probeErr != nil {
+		return false, probeErr
+	}
+	return landedNow, nil
 }
 
 // activeTaskReceipt remains a parser for diagnostics and legacy tests only.
