@@ -4605,6 +4605,21 @@ func runBoardSyncFix(syncer *hsync.BoardSyncer, projectID string, asJSON bool) i
 
 // runSend ports bin/herd-send: prompt an idle agent, or queue routinely while
 // the recipient works. Authenticated urgent control stays on SendStatus.
+// validateSupersedeInvocation is the explicit opt-in contract for
+// `herd send --supersede-pending`: the replacement payload is mandatory and a
+// drain can never be combined with it, because one operation replaces pending
+// work while the other surfaces it. An empty payload would otherwise silently
+// mean "retire the pending work and deliver nothing".
+func validateSupersedeInvocation(drain bool, text string) error {
+	if drain {
+		return fmt.Errorf("--supersede-pending and --drain are mutually exclusive")
+	}
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("--supersede-pending requires a replacement payload (positional or --file)")
+	}
+	return nil
+}
+
 func runSend() {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	noVerify := fs.Bool("no-verify", false, "Submit without waiting for the agent to flip to working")
@@ -4612,6 +4627,7 @@ func runSend() {
 	timeoutSec := fs.Int("timeout", 30, "Seconds to wait for consumption confirmation")
 	workspace := fs.String("workspace", "", "Explicitly authorize delivery to a peer in this Herdr workspace")
 	drain := fs.Bool("drain", false, "Surface pending durable envelopes at an idle/done turn boundary")
+	supersedePending := fs.Bool("supersede-pending", false, "Retire this issuer's stale pending prompts for the exact live target session and queue the replacement payload instead; the pane is not written to and delivery happens at the next idle boundary")
 	selftestFlag := fs.Bool("selftest", false, "Run status-extraction assertions and exit")
 
 	// Go's flag package stops parsing at the first positional argument. Move
@@ -4623,7 +4639,7 @@ func runSend() {
 	for i := 2; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		switch arg {
-		case "--no-verify", "--selftest", "--drain":
+		case "--no-verify", "--selftest", "--drain", "--supersede-pending":
 			flagArgs = append(flagArgs, arg)
 		case "--file", "--timeout", "--workspace":
 			flagArgs = append(flagArgs, arg)
@@ -4678,6 +4694,40 @@ func runSend() {
 			fmt.Fprintf(os.Stderr, "herd send: no text given (positional or --file)\n")
 			os.Exit(2)
 		}
+	}
+
+	if *supersedePending {
+		if err := validateSupersedeInvocation(*drain, text); err != nil {
+			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
+			os.Exit(2)
+		}
+		if !herdr.IsAvailable() {
+			fmt.Fprintf(os.Stderr, "herd send: herdr CLI not found\n")
+			os.Exit(1)
+		}
+		mailPath, err := controlMailPath("")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd send: mailbox: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.MkdirAll(filepath.Dir(mailPath), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "herd send: mailbox: %v\n", err)
+			os.Exit(1)
+		}
+		restoreMailbox := herdr.SetQueueMailbox(mail.NewMailbox(mailPath))
+		defer restoreMailbox()
+		result, err := herdr.SupersedeAndQueueRoutine(context.Background(), target, strings.TrimSpace(*workspace), text)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)
+			os.Exit(1)
+		}
+		if result.Idempotent {
+			fmt.Printf("herd send: supersession already durable; replacement %s is pending for %s\n", result.EnvelopeID, target)
+			return
+		}
+		fmt.Printf("herd send: superseded %d pending envelope(s) for %s; replacement %s queued-durable for the next idle boundary\n",
+			len(result.SupersededIDs), target, result.EnvelopeID)
+		return
 	}
 
 	if !herdr.IsAvailable() {

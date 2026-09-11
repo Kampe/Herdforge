@@ -440,7 +440,7 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 	if !immediateDeliveryAllowed(resolved.Status) {
 		// FAC-773: routine traffic must not preempt. working/starting/unknown
 		// are not permission to send Escape, Enter, AgentPrompt, or signals.
-		queued, qErr := queueRoutineLocked(context.Background(), resolvedTarget, text)
+		queued, qErr := queueRoutineLocked(context.Background(), resolved, resolvedTarget, text)
 		if qErr != nil {
 			return SendResult{}, qErr
 		}

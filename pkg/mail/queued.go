@@ -13,23 +13,47 @@ import (
 // prefix so control, callback, and help traffic stay on their own paths.
 const QueuedDeliverySubject = "herd.queued/v1"
 
+// AnonymousIssuer is the sender every UNBOUND caller of herd send shares when
+// no lane identity is exported. It is a default, not an identity: two
+// unrelated coordinators both appear as this, so equality on it proves
+// nothing about who queued what. Identity-scoped operations must refuse it,
+// and mail already queued under it is permanently anonymous and preserved.
+const AnonymousIssuer = "herd-send"
+
 // QueuedEnvelopeID is the stable identity of one routine payload to one
-// recipient. Retries of the same sender/recipient/body reuse the id so the
-// mailbox append is idempotent. The seen-set that backs append is NOT a
-// processing acknowledgment.
-func QueuedEnvelopeID(sender, recipient, body string) string {
+// recipient in one target binding. Retries of the same
+// sender/recipient/binding/body reuse the id so the mailbox append is
+// idempotent. The seen-set that backs append is NOT a processing
+// acknowledgment.
+//
+// binding participates in the identity because a recipient NAME is not a
+// recipient. The same lane name relaunched after a reboot is a different
+// session with different work in flight; without the binding, an identical
+// payload addressed to the new session collides with the old session's
+// pending id and the append is silently skipped, losing the new assignment.
+//
+// ponytail: an identical payload already pending from before bindings existed
+// gets one new line rather than deduplicating against the unbound id. That is
+// a one-time rollout cost, and duplicating a live assignment is the safe side
+// of that trade.
+func QueuedEnvelopeID(sender, recipient, binding, body string) string {
 	canonical := strings.Join([]string{
 		strings.TrimSpace(sender),
 		strings.TrimSpace(recipient),
+		strings.TrimSpace(binding),
 		body,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(canonical))
 	return "queued-" + hex.EncodeToString(sum[:16])
 }
 
-// QueueRoutine durably appends one routine payload. A repeated call with the
-// same identity returns the existing envelope without writing a second line.
-func (m *Mailbox) QueueRoutine(ctx context.Context, sender, recipient, body string) (*Envelope, error) {
+// QueueRoutine durably appends one routine payload bound to the exact live
+// target the issuer resolved. A repeated call with the same identity returns
+// the existing envelope without writing a second line. An empty binding is
+// accepted (an issuer that cannot resolve one must still be able to queue),
+// but it permanently marks the envelope as unbound: identity-scoped
+// operations such as supersession will never retire it.
+func (m *Mailbox) QueueRoutine(ctx context.Context, sender, recipient, binding, body string) (*Envelope, error) {
 	if m == nil {
 		return nil, fmt.Errorf("mail: nil mailbox")
 	}
@@ -44,12 +68,14 @@ func (m *Mailbox) QueueRoutine(ctx context.Context, sender, recipient, body stri
 	if body == "" {
 		return nil, fmt.Errorf("mail: queued delivery requires a payload")
 	}
+	binding = strings.TrimSpace(binding)
 	env := &Envelope{
-		ID:        QueuedEnvelopeID(sender, recipient, body),
+		ID:        QueuedEnvelopeID(sender, recipient, binding, body),
 		Sender:    sender,
 		Recipient: recipient,
 		Subject:   QueuedDeliverySubject,
 		Body:      body,
+		Binding:   binding,
 	}
 	if err := m.AppendEnvelopeContext(ctx, env); err != nil {
 		return nil, err
@@ -127,19 +153,41 @@ func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool
 	if err != nil {
 		return nil, err
 	}
+	st, err := loadAck(m.MailFile)
+	if err != nil {
+		return nil, err
+	}
+	present := make(map[string]*Envelope, len(envs))
+	for _, env := range envs {
+		if env != nil {
+			present[env.ID] = env
+		}
+	}
+	handled := make(map[string]struct{}, len(st.Handled[recipient]))
+	for _, id := range st.Handled[recipient] {
+		handled[id] = struct{}{}
+	}
 	out := make([]*Envelope, 0, len(envs))
 	for _, env := range envs {
 		if env == nil || !eligible(env) {
 			continue
 		}
-		handled, hErr := m.Handled(recipient, env.ID)
-		if hErr != nil {
-			return nil, hErr
-		}
-		if handled {
+		if _, ok := handled[env.ID]; ok && markStandsLocal(st, recipient, env, present) {
 			continue
 		}
 		out = append(out, env)
 	}
 	return out, nil
+}
+
+// markStandsLocal answers the same question as Handled — may this mark be
+// honoured? — from a batch already in hand, so listing a mailbox does not
+// re-read it once per envelope. The RULE itself lives in exactly one place,
+// supersessionHonoured; only the lookup differs.
+func markStandsLocal(st *ackState, recipient string, victim *Envelope, present map[string]*Envelope) bool {
+	rec, superseded := st.Superseded[recipient][victim.ID]
+	if !superseded {
+		return true
+	}
+	return supersessionHonoured(rec, victim, present[rec.ReplacementID])
 }

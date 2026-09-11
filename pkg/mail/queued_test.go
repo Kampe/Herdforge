@@ -11,14 +11,14 @@ import (
 func TestQueueRoutineIsIdempotentAndPreservesBytes(t *testing.T) {
 	box := NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
 	body := "line one\n`literal` and $(not expanded)\nline three"
-	first, err := box.QueueRoutine(context.Background(), "herd-send", "worker", body)
+	first, err := box.QueueRoutine(context.Background(), "herd-send", "worker", "tb-test", body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.ID == "" || first.Body != body || first.Subject != QueuedDeliverySubject {
 		t.Fatalf("envelope = %+v", first)
 	}
-	second, err := box.QueueRoutine(context.Background(), "herd-send", "worker", body)
+	second, err := box.QueueRoutine(context.Background(), "herd-send", "worker", "tb-test", body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,11 +36,11 @@ func TestQueueRoutineIsIdempotentAndPreservesBytes(t *testing.T) {
 
 func TestPendingQueuedSkipsHandledAndPreservesOrder(t *testing.T) {
 	box := NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
-	first, err := box.QueueRoutine(context.Background(), "herd-send", "worker", "alpha")
+	first, err := box.QueueRoutine(context.Background(), "herd-send", "worker", "tb-test", "alpha")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := box.QueueRoutine(context.Background(), "herd-send", "worker", "beta")
+	second, err := box.QueueRoutine(context.Background(), "herd-send", "worker", "tb-test", "beta")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestQueueRoutineCancelBeforeAppendLeavesNoEnvelope(t *testing.T) {
 	box := NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := box.QueueRoutine(ctx, "herd-send", "worker", "payload"); err == nil {
+	if _, err := box.QueueRoutine(ctx, "herd-send", "worker", "tb-test", "payload"); err == nil {
 		t.Fatal("canceled context must fail closed")
 	}
 	pending, err := box.PendingQueued("worker")
@@ -105,7 +105,7 @@ func TestQueueRoutineConcurrentSamePayloadWritesOneLine(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			env, err := box.QueueRoutine(ctx, "herd-send", "worker", "same")
+			env, err := box.QueueRoutine(ctx, "herd-send", "worker", "tb-test", "same")
 			if err != nil {
 				t.Errorf("queue: %v", err)
 				return
