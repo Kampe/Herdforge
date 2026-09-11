@@ -601,7 +601,7 @@ func runReceiptRecover() {
 		args = args[1:]
 	}
 	fs.Parse(args)
-	if fs.NArg() < 2 {
+	if fs.NArg() != 2 {
 		fmt.Fprintln(os.Stderr, "usage: herd receipt recover <ref> <worktree>")
 		os.Exit(2)
 	}
@@ -10576,7 +10576,7 @@ func runReceiptIssue() {
 		args = args[1:]
 	}
 	fs.Parse(args)
-	if fs.NArg() < 2 || *role == "" {
+	if fs.NArg() != 2 || *role == "" {
 		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration [--candidate-supersession] <ref> <worktree>")
 		os.Exit(2)
 	}
@@ -10743,7 +10743,7 @@ func runReceiptRelease() {
 		args = args[1:]
 	}
 	fs.Parse(args)
-	if fs.NArg() < 2 || *role == "" {
+	if fs.NArg() != 2 || *role == "" {
 		fmt.Fprintln(os.Stderr, "usage: herd receipt release --role <role> <ref> <worktree>")
 		os.Exit(2)
 	}
