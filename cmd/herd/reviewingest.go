@@ -16,7 +16,9 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/committime"
+	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mail"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
@@ -1314,11 +1316,102 @@ func runHarvestMerge() {
 		}
 	}
 
+	// The staging worktree is about to be kept deliberately, so this is the
+	// last moment at which anything knows it exists. Record the receipt that
+	// makes it provably retirable later. A failure here is FATAL: continuing
+	// would leave exactly the unaccountable worktree this receipt exists to
+	// prevent, and reporting success over a silent leak is how the whole class
+	// of orphans accumulated in the first place.
+	if receiptErr := recordHarvestRetirementReceipt(repoRoot, dir, plan.TempBranch, lane, selectionRange.Base, selectionRange.SHA); receiptErr != nil {
+		cleanup()
+		fmt.Fprintf(os.Stderr, "herd harvest-merge: %v\n", receiptErr)
+		os.Exit(1)
+	}
+
 	fmt.Printf("herd harvest-merge: harvested %d commit(s) clean onto %s at %s\n", len(commits), *base, dir)
 	fmt.Println("herd harvest-merge: gates passed. Publish and merge is the coordinator's explicit action:")
 	fmt.Printf("  git push -u origin %s && gh pr create --title %q\n", plan.TempBranch, *title)
 	// The worktree is intentionally KEPT on success: the coordinator pushes
 	// from it. Cleanup on success is the caller's, after publishing.
+}
+
+// recordHarvestRetirementReceipt mints the registration generation marker for
+// a freshly created staging worktree and journals the receipt bound to it.
+//
+// The marker lives in the registration's PRIVATE git admin directory, so `git
+// worktree remove` destroys it with the registration. That is what stops a
+// receipt from outliving the worktree it describes and authorizing the removal
+// of some later, unrelated worktree that happens to occupy the same path.
+//
+// Extracted as a named function returning an error so the producer contract is
+// testable without subprocess orchestration, for the same reason harvestBody is.
+func recordHarvestRetirementReceipt(repoRoot, dir, tempBranch, lane, baseRef, candidateRef string) error {
+	abs := dir
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(repoRoot, dir)
+	}
+	rel, relErr := filepath.Rel(repoRoot, abs)
+	if relErr != nil {
+		return fmt.Errorf("resolve harvest worktree %s against the repository root: %w", dir, relErr)
+	}
+	identity, idErr := dispatch.AuthenticatedRepositoryIdentity(repoRoot)
+	if idErr != nil {
+		return fmt.Errorf("harvest receipt: repository identity is unproven: %w", idErr)
+	}
+	// Resolve every recorded object name exactly. The caller's base may be a
+	// ref spelling ("origin/main"), and a receipt that records a spelling
+	// records nothing: the ref moves and the evidence silently changes meaning.
+	baseSHA, err := harvestReceiptRevision(repoRoot, baseRef)
+	if err != nil {
+		return fmt.Errorf("harvest receipt: resolve base: %w", err)
+	}
+	candidateSHA, err := harvestReceiptRevision(repoRoot, candidateRef)
+	if err != nil {
+		return fmt.Errorf("harvest receipt: resolve candidate: %w", err)
+	}
+	headSHA, err := harvestReceiptRevision(abs, "HEAD")
+	if err != nil {
+		return fmt.Errorf("harvest receipt: resolve staging head: %w", err)
+	}
+	marker, registrationID, markerErr := herdr.MintHarvestGenerationMarker(abs, rel, time.Now())
+	if markerErr != nil {
+		return fmt.Errorf("harvest receipt: %w", markerErr)
+	}
+	receipt := herdr.NewHarvestRetirementReceipt(time.Now(), herdr.HarvestRetirementReceipt{
+		Repository:     identity,
+		Worktree:       rel,
+		TempBranch:     tempBranch,
+		Lane:           lane,
+		BaseSHA:        baseSHA,
+		CandidateSHA:   candidateSHA,
+		HeadSHA:        headSHA,
+		RegistrationID: registrationID,
+		Generation:     marker.Generation,
+	})
+	registry := herdr.HarvestRetirementRegistry{Path: herdr.HarvestRetirementReceiptsPath(repoRoot)}
+	if err := registry.Record(receipt); err != nil {
+		return fmt.Errorf("harvest receipt: %w", err)
+	}
+	return nil
+}
+
+// harvestReceiptRevision resolves a revision to its exact commit object name.
+// An unresolvable revision is an error, never an empty string that would be
+// written into a receipt as if it were evidence.
+func harvestReceiptRevision(dir, rev string) (string, error) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", fmt.Errorf("empty revision")
+	}
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--verify", "-q", rev+"^{commit}").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", rev, err)
+	}
+	resolved := strings.TrimSpace(string(out))
+	if resolved == "" {
+		return "", fmt.Errorf("resolve %s: empty", rev)
+	}
+	return resolved, nil
 }
 
 // harvestCommits selects only the commits represented by the reviewed range.

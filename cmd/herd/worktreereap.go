@@ -12,12 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/dispatch"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/refname"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/launch"
 	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // reapRow is one classified worktree.
@@ -32,6 +35,11 @@ type reapRow struct {
 	// removal; an empty Base skips the recheck, which only hand-built rows
 	// in tests do.
 	Base string `json:"base,omitempty"`
+	// harvest is set when a DETACHED surface was proved by the harvest
+	// receipt registry to be this repository's own harvest-merge staging
+	// registration. It is deliberately unexported: it is act-routing state,
+	// not reported classification output.
+	harvest *herdr.HarvestRetirementReceipt
 }
 
 // runWorktreeReap retires worktrees whose work has demonstrably LANDED.
@@ -357,6 +365,13 @@ func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, ins
 }
 
 func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector, census *resources.ProcessUsage) error {
+	// A receipt-qualified detached harvest surface has no branch ref to
+	// compare-and-delete and the generic fence below refuses detached
+	// surfaces by design. Its own act-time fence is every bit as strict and
+	// re-runs the receipt binding first.
+	if l.harvest != nil {
+		return retireHarvestDetachedOneWithCensus(root, l, run, inspector, census)
+	}
 	if strings.TrimSpace(l.Head) == "" {
 		return fmt.Errorf("retire %s: observed worktree HEAD is required", l.Path)
 	}
@@ -472,6 +487,142 @@ func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunne
 	}
 	return fmt.Errorf("delete branch %s after worktree removal: %s (%w); worktree restored at %s",
 		l.Branch, strings.TrimSpace(string(branchOut)), branchErr, l.Path)
+}
+
+// retireHarvestDetachedOneWithCensus is the act-time fence for a
+// receipt-qualified detached harvest staging surface. Classification and act
+// are separate processes, so EVERY gate is re-run here against the live
+// repository, and the receipt binding itself is re-proven first: a generation
+// that changed, a marker that vanished, or a digest that no longer matches
+// keeps the surface.
+//
+// There is no branch to compare-and-delete -- the surface is detached by
+// lifecycle -- and there is nothing to restore on failure: a refused or
+// failed removal simply leaves the registration exactly as it was.
+func retireHarvestDetachedOneWithCensus(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector, census *resources.ProcessUsage) error {
+	if strings.TrimSpace(l.Head) == "" {
+		return fmt.Errorf("retire %s: observed worktree HEAD is required", l.Path)
+	}
+	// Act-time receipt rebind. The reaper's classification is old evidence;
+	// only the LIVE marker + registry pair answers "is this still the very
+	// registration that receipt described".
+	identity, identityErr := reapHarvestIdentity(root)
+	if identityErr != nil {
+		return fmt.Errorf("retire %s: act-time repository identity is unproven: %w", l.Path, identityErr)
+	}
+	live, err := reapHarvestAuthorizer(herdr.HarvestRetirementRequest{
+		Root:               root,
+		RepositoryIdentity: identity,
+		WorktreePath:       l.Path,
+	})
+	if err != nil {
+		return fmt.Errorf("retire %s: act-time harvest receipt rebind failed: %w", l.Path, err)
+	}
+	if live.BindingDigest != l.harvest.BindingDigest {
+		return fmt.Errorf("retire %s: act-time harvest receipt changed under the classification (was %s, now %s), refusing",
+			l.Path, shortHarvestGeneration(l.harvest.Generation), shortHarvestGeneration(live.Generation))
+	}
+
+	// Act-time identity fence: same registration, still detached at the same
+	// exact head, still not the main checkout, still unlocked.
+	entries, listErr := listWorktreeRegistrations(root)
+	if listErr != nil {
+		return fmt.Errorf("retire %s: act-time worktree revalidation failed: %w", l.Path, listErr)
+	}
+	current, found := exactWorktreeEntry(entries, l.Path)
+	if !found {
+		return fmt.Errorf("retire %s: act-time worktree identity disappeared", l.Path)
+	}
+	if current.IsMain || !current.Detached {
+		return fmt.Errorf("retire %s: act-time worktree is no longer a detached surface", l.Path)
+	}
+	if current.Locked {
+		return fmt.Errorf("retire %s: act-time worktree is locked: %s", l.Path, current.LockReason)
+	}
+	if strings.TrimSpace(current.Head) != strings.TrimSpace(l.Head) {
+		return fmt.Errorf("retire %s: act-time head identity changed (observed=%q want=%q)",
+			l.Path, strings.TrimSpace(current.Head), strings.TrimSpace(l.Head))
+	}
+	// Act-time durable ownership: a receipt proves who CREATED this
+	// registration, never who holds the surface NOW. A review pool lease or
+	// the pool's own inventory record bound to this path keeps it, and so
+	// does a standing lane's resident home. This re-runs at act because
+	// classification is old evidence and a lease can be taken between the
+	// two.
+	if holdErr := reapHarvestDurableHold(root, current.Path); holdErr != nil {
+		return fmt.Errorf("retire %s: act-time durable ownership hold: %w", l.Path, holdErr)
+	}
+	if isResidentHome("", current.Path) {
+		return fmt.Errorf("retire %s: act-time worktree is a protected resident home", l.Path)
+	}
+
+	// Act-time exact cleanliness, including untracked AND ignored content:
+	// generated evidence is part of the safety boundary even when ordinary
+	// status hides it.
+	status, statusErr := reapStatusRunner(current.Path, "status", "--porcelain", "--untracked-files=all", "--ignored")
+	if statusErr != nil {
+		return fmt.Errorf("retire %s: act-time worktree status is unknown: %v", l.Path, statusErr)
+	}
+	if len(strings.TrimSpace(status)) > 0 {
+		return fmt.Errorf("retire %s: act-time worktree has uncommitted, untracked, or ignored content", l.Path)
+	}
+
+	// Act-time landing recheck against the same base the classification used:
+	// both the receipt's reviewed tip and the live detached head must be
+	// provably on the base at the CURRENT tip. A revert after classification
+	// keeps the surface.
+	if err := harvestDetachedLanded(root, l.Base, *l.harvest, current.Head); err != nil {
+		return fmt.Errorf("retire %s: act-time landing recheck against %s failed: %w", l.Path, l.Base, err)
+	}
+
+	// The owner census semantics are the generic fence's: batched results are
+	// reused, serial probes fail closed.
+	var usage resources.ProcessUsage
+	if census != nil {
+		usage = *census
+	} else {
+		ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
+		oneUsage, ownerErr := inspector.InUse(ownerCtx, current.Path)
+		cancelOwner()
+		if ownerErr != nil {
+			return fmt.Errorf("retire %s: act-time owner census failed: %w", l.Path, ownerErr)
+		}
+		usage = oneUsage
+	}
+	if usage.MetadataUnavailable {
+		cause := usage.MetadataCause
+		if strings.TrimSpace(cause) == "" {
+			cause = "unknown cause (deadline or probe error not reported)"
+		}
+		return fmt.Errorf("retire %s: act-time owner census is incomplete (%s)", l.Path, cause)
+	}
+	if usage.CWD || usage.OpenFile || usage.ReferencedPath {
+		return fmt.Errorf("retire %s: act-time owner census found active use (cwd=%t open=%t referenced=%t pids=%v)", l.Path, usage.CWD, usage.OpenFile, usage.ReferencedPath, usage.PIDs)
+	}
+
+	// Never force removal: Git's normal operation is the final safety check.
+	out, removeErr := run(root, "worktree", "remove", l.Path)
+	if removeErr == nil && worktreeExists(l.Path) {
+		removeErr = fmt.Errorf("git reported success but worktree still exists")
+	}
+	if removeErr != nil {
+		return fmt.Errorf("remove worktree %s: %s (%w)", l.Path, strings.TrimSpace(string(out)), removeErr)
+	}
+
+	// Registration-set readback: git's own registration set must no longer
+	// name the surface, and the generation marker must have died with the
+	// registration. Either survivor is a half-removal, which is an error.
+	after, listAfterErr := listWorktreeRegistrations(root)
+	if listAfterErr != nil {
+		return fmt.Errorf("retire %s: post-removal registration readback failed: %w", l.Path, listAfterErr)
+	}
+	if _, still := exactWorktreeEntry(after, l.Path); still {
+		return fmt.Errorf("retire %s: worktree removed but its registration is still listed", l.Path)
+	}
+	if _, _, markerErr := herdr.ReadHarvestGenerationMarker(l.Path); markerErr == nil {
+		return fmt.Errorf("retire %s: worktree removed but its generation marker survived", l.Path)
+	}
+	return nil
 }
 
 func exactWorktreeEntry(entries []worktreeEntry, path string) (worktreeEntry, bool) {
@@ -719,7 +870,47 @@ func classifyReapEntries(root, base string, byPR bool, entries []worktreeEntry) 
 		case e.Detached:
 			// A pool slot or review surface. Its identity is a lease, not a
 			// branch, and reclaiming it belongs to the pool, not here.
-			r.Class, r.Reason = "detached", "detached surface; reclaimed by the review pool, not by branch state"
+			//
+			// THE ONE EXCEPTION is this repository's own harvest-merge
+			// staging surface: `herd harvest-merge` keeps it on success so
+			// the coordinator can push from it, records a receipt bound to a
+			// live generation marker in the registration's private git admin
+			// dir, and nothing else ever retires it. A detached surface that
+			// the receipt registry PROVES is one of those gets the same
+			// landing/cleanliness classification as any other worktree.
+			// Qualification is ownership evidence only -- landing, exact
+			// cleanliness including ignored files, lock state, and the
+			// act-time rechecks below all still run. Every qualification
+			// failure keeps the historical pool answer.
+			receipt, qualifyErr := qualifyReapHarvestDetached(root, e.Path)
+			if qualifyErr != nil {
+				r.Class, r.Reason = "detached", "detached surface; reclaimed by the review pool, not by branch state"
+			} else if e.Locked {
+				r.Class, r.Reason = "locked", "locked: "+e.LockReason
+			} else if holdErr := reapHarvestDurableHold(root, e.Path); holdErr != nil {
+				// Durable ownership beats landing: a surface a pool lease or
+				// the pool's own inventory holds is never this reaper's to
+				// remove, no matter how provably landed it is. Held is a
+				// KEEP, not a failure, so a scheduled beat stays healthy
+				// while the surface's owner finishes or releases.
+				r.Class, r.Reason = "held", "durable ownership: "+holdErr.Error()
+			} else {
+				dirty, statusErr := reapStatusRunner(e.Path, "status", "--porcelain", "--untracked-files=all", "--ignored")
+				switch {
+				case statusErr != nil:
+					r.Class, r.Reason = "unknown", "status inspection failed: "+statusErr.Error()
+				case len(strings.TrimSpace(dirty)) > 0:
+					r.Class, r.Reason = "dirty", "uncommitted, untracked, or ignored content would be destroyed"
+				case harvestDetachedLanded(root, base, receipt, e.Head) != nil:
+					r.Class, r.Reason = "unmerged",
+						fmt.Sprintf("receipt-qualified harvest staging surface whose reviewed content is not provably on %s now; unmerged work is not garbage", base)
+				default:
+					r.harvest = &receipt
+					r.Class, r.Reason = "landed", fmt.Sprintf(
+						"receipt-qualified harvest staging surface (generation %s): reviewed range %s is provably on %s at the current tip",
+						shortHarvestGeneration(receipt.Generation), shortSha(receipt.HeadSHA), base)
+				}
+			}
 		case e.Locked:
 			r.Class, r.Reason = "locked", "locked: "+e.LockReason
 		case e.Branch == "":
@@ -789,6 +980,149 @@ func classifyReapEntries(root, base string, byPR bool, entries []worktreeEntry) 
 		}
 	}
 	return landed, kept
+}
+
+// qualifyReapHarvestDetached asks the receipt registry whether an exact
+// detached surface is this repository's own harvest-merge staging
+// registration. It answers ONLY ownership: registry receipt + live generation
+// marker bound together. Landing, cleanliness, locks, leases, and owners are
+// separate gates that still run.
+//
+// Seams exist so tests can authenticate a fixed identity without the real
+// repository-identity probe, while the binding itself (marker + registry +
+// journal) always runs for real.
+var (
+	reapHarvestIdentity   = dispatch.AuthenticatedRepositoryIdentity
+	reapHarvestAuthorizer = herdr.AuthorizeHarvestRetirement
+)
+
+// reapHarvestDurableHold is the durable-ownership seam for the harvest
+// retirement fences. Tests substitute it; production consults the
+// repository's own durable ownership adapters directly.
+var reapHarvestDurableHold = harvestDurableOwnershipHold
+
+// harvestDurableOwnershipHold refuses when a DURABLE ownership record of this
+// repository already binds the exact surface. A generation receipt proves who
+// CREATED a registration; it proves nothing about who holds the surface NOW:
+//
+//   - Review-pool slot records (pkg/worktree Pool state, pool.json): a slot
+//     whose record names this path is pool property for as long as the record
+//     exists. A live LeaseID is a lease a review currently holds; a released
+//     record is still the pool's own inventory, reclaimed only by the pool's
+//     own evidence-fenced retirement authority. The default pool root and
+//     every pool root a review retirement manifest ever named are consulted,
+//     because `herd review --pool-root` accepts any directory.
+//   - Standing source lanes are protected by the resident-home adapter, which
+//     the harvest act fence runs. Claim-store leases (pkg/claim
+//     LeaseKey{Repo, Provider, Project, TaskRef}) bind task refs, never
+//     paths, so they cannot hold a worktree surface.
+//
+// Any unreadable ownership state is itself a hold: an unanswerable ownership
+// question must never read as "nothing holds this surface".
+func harvestDurableOwnershipHold(root, path string) error {
+	want, wantErr := canonicalWorktreePath(path)
+	if wantErr != nil {
+		return fmt.Errorf("resolve surface identity: %w", wantErr)
+	}
+	want = filepath.Clean(want)
+	poolRoots := []string{filepath.Join(root, ".herd", "pool")}
+	manifests, err := (herdr.ReviewRetirementRegistry{Path: herdr.ReviewRetirementRegistryPath(root)}).Latest()
+	if err != nil {
+		return fmt.Errorf("review retirement registry is unreadable, so current review pool ownership cannot be ruled out: %w", err)
+	}
+	for _, m := range manifests {
+		recorded := strings.TrimSpace(m.Pool)
+		if recorded == "" {
+			continue
+		}
+		if !filepath.IsAbs(recorded) {
+			recorded = filepath.Join(root, filepath.Clean(recorded))
+		}
+		poolRoots = append(poolRoots, recorded)
+	}
+	for _, poolRoot := range poolRoots {
+		slots, err := worktree.NewPool(root, poolRoot, 0).Slots()
+		if err != nil {
+			return fmt.Errorf("pool inventory %s is unreadable, so current pool ownership cannot be ruled out: %w", poolRoot, err)
+		}
+		for _, slot := range slots {
+			// Slot paths are recorded both repository-relative and absolute
+			// by pool producers; resolve the record against THIS root the
+			// same way the review retirement adapter does.
+			recorded := strings.TrimSpace(slot.Path)
+			if recorded == "" {
+				continue
+			}
+			if !filepath.IsAbs(recorded) {
+				recorded = filepath.Join(root, filepath.Clean(recorded))
+			}
+			resolved, resolveErr := canonicalWorktreePath(recorded)
+			if resolveErr != nil {
+				// An unresolvable slot path cannot be proven different from
+				// the surface; hold rather than guess.
+				return fmt.Errorf("pool slot %s in %s is unresolvable (%v), so pool ownership cannot be ruled out", slot.Name, poolRoot, resolveErr)
+			}
+			if filepath.Clean(resolved) != want {
+				continue
+			}
+			if slot.LeaseID != "" {
+				return fmt.Errorf("durable review pool lease %s (lease %s, purpose %s) holds this surface",
+					filepath.Join(poolRoot, slot.Name), slot.LeaseID, slot.Purpose)
+			}
+			return fmt.Errorf("durable pool inventory %s still records this path as slot %s; only the pool's own retirement authority may reclaim it",
+				filepath.Join(poolRoot, slot.Name), slot.Name)
+		}
+	}
+	return nil
+}
+
+func qualifyReapHarvestDetached(root, path string) (herdr.HarvestRetirementReceipt, error) {
+	var zero herdr.HarvestRetirementReceipt
+	identity, err := reapHarvestIdentity(root)
+	if err != nil {
+		return zero, fmt.Errorf("harvest retirement: repository identity is unproven: %w", err)
+	}
+	return reapHarvestAuthorizer(herdr.HarvestRetirementRequest{
+		Root:               root,
+		RepositoryIdentity: identity,
+		WorktreePath:       path,
+	})
+}
+
+// harvestDetachedLanded proves a receipt-qualified detached harvest surface
+// lossless against the base CURRENT TIP. Both identities must be provably on
+// the base now: the receipt's reviewed tip (the work the coordinator approved
+// and squash-landed) and the surface's live detached head (whatever the
+// installation step left checked out). The receipt head is usually NOT an
+// ancestor of the base -- a squash replays the whole range under a new object
+// name -- so this rides the existing whole-range content proof with its
+// current-tip replay (rangeLandedProof), which a revert at the tip refuses.
+// A missing live head is answered from the receipt head alone; a live head
+// that carries unique content keeps the surface.
+func harvestDetachedLanded(root, base string, receipt herdr.HarvestRetirementReceipt, liveHead string) error {
+	seen := map[string]bool{}
+	for _, head := range []string{strings.TrimSpace(receipt.HeadSHA), strings.TrimSpace(liveHead)} {
+		if head == "" || seen[head] {
+			continue
+		}
+		seen[head] = true
+		if commitsAhead(root, base, head) == 0 {
+			continue
+		}
+		if _, err := rangeLandedProof(root, base, head); err != nil {
+			return fmt.Errorf("head %s is not provably on %s now: %w", shortSha(head), base, err)
+		}
+	}
+	return nil
+}
+
+// shortHarvestGeneration abbreviates a generation nonce for error surfaces,
+// the same presentation rule shortSha applies to object names.
+func shortHarvestGeneration(generation string) string {
+	if len(generation) > 12 {
+		return generation[:12]
+	}
+	return generation
 }
 
 // rangeLandedProof reuses the coordinator's tested whole-range landing proof

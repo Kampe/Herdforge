@@ -15,6 +15,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
+	"github.com/Kampe/Herdforge/pkg/herdr"
 )
 
 // FAC-805 (pulse side): `herd worktree-reap` is a SWEEP that never had a
@@ -118,6 +119,8 @@ var errReapPulseTickBusy = errors.New("another cleanup beat holds the tick lock"
 
 // reapPulseReport is one beat's disposition. Counts are reported rather than
 // inferred so an operator can see the beat did bounded work, not a sweep.
+// Failures are reported by exact identity and reason: a retirement that was
+// attempted and refused must be as visible as one that succeeded.
 type reapPulseReport struct {
 	Registered int
 	Eligible   int
@@ -125,6 +128,9 @@ type reapPulseReport struct {
 	Landed     int
 	Retired    int
 	Failed     int
+	// Failures carries "path: reason" for every refused retirement, so a
+	// beat's keep is never a silent count.
+	Failures   []string
 	NextCursor string
 	Acted      bool
 }
@@ -152,6 +158,9 @@ func reapLandedWorktreesOnPulse(ctx context.Context, errOut *os.File) bool {
 	if report.Inspected > 0 || report.Retired > 0 || report.Failed > 0 {
 		fmt.Fprintf(errOut, "pulse: worktree reap registered=%d eligible=%d inspected=%d landed=%d retired=%d failed=%d\n",
 			report.Registered, report.Eligible, report.Inspected, report.Landed, report.Retired, report.Failed)
+	}
+	for _, failure := range report.Failures {
+		fmt.Fprintf(errOut, "pulse: worktree reap KEPT %s\n", failure)
 	}
 	return report.Failed == 0
 }
@@ -182,7 +191,7 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 	}
 	report.Registered = len(registrations)
 
-	eligible := reapPulseEligible(registrations, reapPulseMainWorktreePath(ctx, root))
+	eligible := reapPulseEligible(root, registrations, reapPulseMainWorktreePath(ctx, root), reapHarvestCandidatesForBeat(root, registrations, ctx))
 	report.Eligible = len(eligible)
 	if len(eligible) == 0 {
 		return report, nil
@@ -233,6 +242,9 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 	if len(landed) > 0 {
 		retired, failed := reapPulseRetirer(root, landed)
 		report.Retired, report.Failed = len(retired), len(failed)
+		for _, f := range failed {
+			report.Failures = append(report.Failures, fmt.Sprintf("%s: %s", f["path"], f["error"]))
+		}
 	}
 	// Advance past everything this beat inspected, not merely what it retired:
 	// a kept worktree that is kept for a durable reason (unmerged work, a
@@ -248,17 +260,37 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 
 // reapPulseEligible drops, from REGISTRATION METADATA ALONE, every class
 // classifyReapEntries can never call landed: the repository's own checkout, a
-// detached review-pool surface (the pool reclaims those, not this), a locked
-// surface, a registration with no branch, and a standing lane's resident home.
-// None of those needs a status call, so a beat never spends its window on a
-// worktree whose answer is already known.
-// mainPath additionally excludes the repository's own checkout by identity,
-// for a beat that was started from inside a linked worktree; an empty mainPath
-// excludes nothing.
-func reapPulseEligible(entries []worktreeEntry, mainPath string) []worktreeEntry {
+// locked surface, a registration with no branch, and a standing lane's
+// resident home. None of those needs a status call, so a beat never spends
+// its window on a worktree whose answer is already known.
+//
+// A detached surface is excluded as review-pool property EXCEPT when the
+// receipt journal names it as this repository's own harvest-merge staging
+// registration. Candidacy is answered from the BULK-LOADED in-memory index
+// the caller passed (one identity probe and one journal read per beat, never
+// per path): a detached surface the index does not name is skipped with no
+// Git subprocess, no marker read, and no journal re-read at all. Candidacy is
+// not authority -- the generation binding is re-proven at full act-grade cost
+// inside the selected window by the classifier, and again at the act fence.
+// An unindexed detached surface keeps the historical pool answer, and a
+// qualification failure inside the window keeps it excluded.
+// mainPath excludes the repository's own checkout by identity, for a beat
+// that was started from inside a linked worktree; an empty mainPath excludes
+// nothing.
+func reapPulseEligible(root string, entries []worktreeEntry, mainPath string, candidates *herdr.HarvestRetirementCandidates) []worktreeEntry {
 	out := make([]worktreeEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsMain || entry.Detached || entry.Locked || entry.Branch == "" {
+		if entry.IsMain || entry.Locked {
+			continue
+		}
+		if entry.Detached {
+			// Admitted only when the bulk-loaded journal index names this
+			// exact surface; any other detached surface is pool property
+			// and stays excluded, at zero probe cost.
+			if !candidates.NamesSurface(entry.Path) {
+				continue
+			}
+		} else if entry.Branch == "" {
 			continue
 		}
 		if mainPath != "" && reapPulseSamePath(entry.Path, mainPath) {
@@ -270,6 +302,39 @@ func reapPulseEligible(entries []worktreeEntry, mainPath string) []worktreeEntry
 		out = append(out, entry)
 	}
 	return out
+}
+
+// reapHarvestCandidatesForBeat bulk-loads the receipt candidacy index for one
+// cleanup beat: ONE repository-identity probe and ONE journal read, however
+// many detached registrations the fleet holds. It runs only when the fleet
+// actually holds a detached surface, and honours cancellation before its one
+// probe, so a cancelled beat never pays for metadata qualification. Any
+// failure yields nil, which keeps every detached surface on its historical
+// pool answer -- the same fail-closed outcome a per-path qualification
+// failure had before the index existed.
+func reapHarvestCandidatesForBeat(root string, registrations []worktreeEntry, ctx context.Context) *herdr.HarvestRetirementCandidates {
+	detached := false
+	for _, entry := range registrations {
+		if entry.Detached {
+			detached = true
+			break
+		}
+	}
+	if !detached {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+	identity, err := reapHarvestIdentity(root)
+	if err != nil {
+		return nil
+	}
+	candidates, err := herdr.LoadHarvestRetirementCandidates(root, identity)
+	if err != nil {
+		return nil
+	}
+	return candidates
 }
 
 func reapPulseSamePath(a, b string) bool {

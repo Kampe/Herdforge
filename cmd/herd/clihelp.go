@@ -285,11 +285,16 @@ Commands:
 		"  Memory it cannot measure is reported unknown, never as a refusal.",
 	"resource-governor": "Usage: herd resource-governor [--json] [--apply] [--max-reaps N] [--foreign owner:kind:path]\n" +
 		"  Inventory host-local registered worktrees and safely reap declared generated data.",
-	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main]\n" +
+	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main] [--target <path>]... [--by-pr]\n" +
 		"  Retire worktrees whose work has LANDED: no unique commits against base, so\n" +
 		"  removal is provably lossless. Never touches unmerged, dirty, locked or\n" +
 		"  detached worktrees -- unmerged work is not garbage. Everything declined is\n" +
-		"  reported by exact identity rather than silently skipped.",
+		"  reported by exact identity rather than silently skipped.\n" +
+		"  --target is repeatable and bounds the operation to exact registered paths.\n" +
+		"  --by-pr additionally retires worktrees whose recorded PR is closed AND whose\n" +
+		"  patch is verifiably in base. The one detached exception: a harvest-merge\n" +
+		"  staging surface proven by its own receipt and live generation marker is\n" +
+		"  retired by the same gates when its reviewed content is on base.",
 	"lane-cut": "Usage: herd lane-cut --branch <lane-branch> --scope <path> [--scope <path>...] [--task <ref>] [--base origin/main] [--name <branch>] [--dry-run]\n" +
 		"  Extract ONE bounded candidate from a long-lived standing-lane branch onto a\n" +
 		"  fresh branch cut from origin/main. Takes the NET DIFF for the scoped paths\n" +
