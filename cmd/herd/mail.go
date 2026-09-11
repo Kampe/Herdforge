@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -39,6 +40,8 @@ func runMail() {
 		runMailAck(args[1:])
 	case "inbox", "read":
 		runMailInbox(args[0], args[1:])
+	case "repair":
+		runMailRepair(args[1:])
 	case "control":
 		runControlArgs(args[1:])
 	case "help", "--help", "-h":
@@ -46,6 +49,53 @@ func runMail() {
 	default:
 		fmt.Fprintf(os.Stderr, "mail: unknown mode %q\n%s\n", args[0], usageFor("mail"))
 		os.Exit(2)
+	}
+}
+
+// runMailRepair is the bounded operator recovery for ONE quarantined row.
+// It is report-only unless --act is given, so the default cannot mutate a
+// mailbox. Exit codes: 0 report or applied, 1 refused or failed, 2 usage.
+func runMailRepair(args []string) {
+	fs := flag.NewFlagSet("mail repair", flag.ContinueOnError)
+	id := fs.String("id", "", "exact message id of the quarantined row")
+	mailPath := fs.String("mail", "", "mailbox path override")
+	fingerprint := fs.String("fingerprint", "", "sha256 of the exact malformed line the operator reviewed")
+	reason := fs.String("reason", "", "why this recovery is being performed")
+	actor := fs.String("actor", "", "operator performing the recovery")
+	act := fs.Bool("act", false, "perform the repair (default is report-only)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*id) == "" {
+		fmt.Fprintln(os.Stderr, "mail repair: --id is required")
+		os.Exit(2)
+	}
+	if *act && strings.TrimSpace(*actor) == "" {
+		fmt.Fprintln(os.Stderr, "mail repair: --actor is required with --act")
+		os.Exit(2)
+	}
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail repair: %v\n", err)
+		os.Exit(1)
+	}
+	plan, err := mail.NewMailbox(path).RepairMalformedRow(context.Background(), mail.RepairRequest{
+		ID:          strings.TrimSpace(*id),
+		Fingerprint: strings.TrimSpace(*fingerprint),
+		Act:         *act,
+		Actor:       strings.TrimSpace(*actor),
+		Reason:      strings.TrimSpace(*reason),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mail repair: %v\n", err)
+		os.Exit(1)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(plan); err != nil {
+		fmt.Fprintf(os.Stderr, "mail repair: encode plan: %v\n", err)
+		os.Exit(1)
+	}
+	if !plan.Applied {
+		fmt.Fprintln(os.Stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor <name> to apply")
 	}
 }
 
