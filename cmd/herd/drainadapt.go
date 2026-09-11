@@ -152,6 +152,8 @@ func (a *drainAdapters) retireReviews(ctx context.Context) (herdr.ReviewRetireme
 		combinedReport.Retired += subResult.Retired
 		combinedReport.Blocked += subResult.Blocked
 		combinedReport.Failed += subResult.Failed
+		combinedReport.Eligible += subResult.Eligible
+		combinedReport.Skipped += subResult.Skipped
 		if subErr != nil {
 			opErrs = append(opErrs, fmt.Sprintf("retire review %s: %v", m.Generation, subErr))
 			continue

@@ -108,6 +108,26 @@ func blockReviewRetirement(reason string) ReviewRetirementDecision {
 	return ReviewRetirementDecision{Reason: "BLOCKED: " + reason}
 }
 
+// supersededRetentionReason is the one blocked disposition that is expected
+// background noise rather than evidence the fleet state is not understood: a
+// retained older manifest for a slot a later incarnation has since taken.
+//
+// It was previously spelled as a literal at BOTH the construction site and the
+// comparison that decides whether a blocked lane fences others. Two spellings
+// of one rule silently change that rule when either is edited, so they are one
+// constant here.
+const supersededRetentionReason = "retained superseded manifest: old proof no longer authorizes cleanup"
+
+// retirementSlotKey identifies the physical pool slot a manifest mutates.
+//
+// Every destructive retirement step is scoped to this slot (pool retire takes
+// the slot plus its exact lease generation) or to an identity only this lane
+// owns (its review ref, its prompt and manifest artifacts, its surface link).
+// Two manifests with different keys therefore cannot touch each other's state.
+func retirementSlotKey(m ReviewRetirementManifest) string {
+	return m.Pool + "\x00" + m.Slot
+}
+
 func exactSHA(s string) bool {
 	s = strings.TrimSpace(s)
 	if len(s) != 40 {
@@ -355,6 +375,11 @@ type ReviewRetirementCandidate struct {
 	Retired   bool                     `json:"retired,omitempty"`
 	Failed    bool                     `json:"failed,omitempty"`
 	Error     string                   `json:"error,omitempty"`
+	// Skipped marks an eligible lane this sweep deliberately did not act on,
+	// with SkipReason naming what withheld it. An eligible lane that is
+	// neither retired nor skipped would be an unexplained no-op.
+	Skipped    bool   `json:"skipped,omitempty"`
+	SkipReason string `json:"skip_reason,omitempty"`
 }
 type ReviewRetirementReport struct {
 	DryRun     bool                        `json:"dry_run"`
@@ -362,6 +387,13 @@ type ReviewRetirementReport struct {
 	Retired    int                         `json:"retired"`
 	Blocked    int                         `json:"blocked"`
 	Failed     int                         `json:"failed"`
+	// Eligible and Skipped close the report's accounting. Every candidate is
+	// exactly one of completed, blocked, failed or eligible, and every
+	// eligible lane is exactly one of retired or skipped. Without these an
+	// operator could not tell "nothing to retire" from "36 lanes to retire
+	// that this sweep refused", because both printed retired=0.
+	Eligible int `json:"eligible"`
+	Skipped  int `json:"skipped"`
 }
 
 // RetireReviewLanes preflights the complete selected set before its first
@@ -406,7 +438,7 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 			decision := blockReviewRetirement("observation failed: " + err.Error())
 			cand := ReviewRetirementCandidate{Manifest: m, Decision: decision}
 			if errors.Is(err, errRetirementSuperseded) {
-				decision = blockReviewRetirement("retained superseded manifest: old proof no longer authorizes cleanup")
+				decision = blockReviewRetirement(supersededRetentionReason)
 				cand.Decision = decision
 				r.Blocked++
 			} else {
@@ -426,21 +458,47 @@ func RetireReviewLanesContext(ctx context.Context, op ReviewRetirementOp, manife
 	if r.Failed > 0 {
 		return r, fmt.Errorf("review retirement: %d observation failures", r.Failed)
 	}
-	eligibleCount := 0
-	unsafeBlocked := false
+	// A lane whose disposition is not understood fences the physical slot it
+	// names, so nothing else mutates that slot while its state is in doubt.
+	//
+	// It deliberately does NOT fence unrelated slots. This gate used to veto
+	// the whole sweep on any non-superseded blocked lane, which is why an
+	// --act run was byte-identical to --dry-run: five lanes whose worktree had
+	// drifted held back 36 eligible lanes in entirely different pools, on
+	// every sweep, permanently. Cross-lane interference is only possible
+	// through a shared slot, and each destructive step is separately
+	// identity-fenced anyway -- the pool retire carries the exact lease
+	// generation, ref deletion carries the exact old value, and artifact
+	// removal re-checks content digests -- so a stale generation still cannot
+	// erase a reused slot. The superseded carve-out already narrowed this gate
+	// once for the same reason; drift is the same shape of permanent freeze.
+	fencedSlots := map[string]string{}
 	for _, c := range r.Candidates {
-		if c.Decision.Eligible && !c.Completed {
-			eligibleCount++
-		} else if !c.Completed && c.Decision.Reason != "BLOCKED: retained superseded manifest: old proof no longer authorizes cleanup" {
-			unsafeBlocked = true
+		if c.Completed || c.Decision.Eligible || c.Decision.Reason == blockReviewRetirement(supersededRetentionReason).Reason {
+			continue
 		}
-	}
-	if dryRun || unsafeBlocked || eligibleCount == 0 {
-		return r, nil
+		fencedSlots[retirementSlotKey(c.Manifest)] = c.Decision.Reason
 	}
 	for i := range r.Candidates {
 		c := &r.Candidates[i]
 		if c.Completed || !c.Decision.Eligible {
+			continue
+		}
+		r.Eligible++
+		if reason, fenced := fencedSlots[retirementSlotKey(c.Manifest)]; fenced {
+			c.Skipped = true
+			c.SkipReason = "slot withheld by an unresolved lane on the same pool slot: " + reason
+			r.Skipped++
+		}
+	}
+	// Dry runs annotate what an act would withhold, so the two modes agree
+	// instead of both reporting a bare retired=0.
+	if dryRun || r.Eligible == r.Skipped {
+		return r, nil
+	}
+	for i := range r.Candidates {
+		c := &r.Candidates[i]
+		if c.Completed || !c.Decision.Eligible || c.Skipped {
 			continue
 		}
 		m := c.Manifest
