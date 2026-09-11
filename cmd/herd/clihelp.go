@@ -163,12 +163,20 @@ var subcommandUsage = map[string]string{
 	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
 	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
 	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
-	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s] [--workspace id] [--drain]
+	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s] [--workspace id] [--drain] [--supersede-pending]
   Deliver a prompt when the recipient is idle, or queue it durably while the recipient works.
 
   --workspace id  explicitly authorize a repo-qualified peer coordinator in another Herdr workspace.
                    Ordinary lane delivery remains workspace-fenced when this is omitted.
   --drain         surface pending durable envelopes at an idle/done turn boundary; no pane writes while busy.
+  --supersede-pending  retire THIS issuer's stale pending prompts for the target and queue the replacement
+                   payload (positional or --file, required) instead. Scoped to the same issuer, canonical repo,
+                   and the exact live TARGET SESSION: a lane relaunched under a new terminal generation cannot
+                   retire the previous session's queued work, and unbound (legacy) envelopes are preserved.
+                   Control and callback mail is never touched; no pane write; the replacement is delivered at
+                   the next idle boundary with the ordinary consumption verification. With nothing stale
+                   pending the replacement is still queued -- a supplied assignment is never discarded.
+                   Default FIFO semantics are unchanged.
 
 Outcomes:
   -> working  task text observed in the pane after consumption; do not re-send.

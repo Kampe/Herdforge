@@ -1,12 +1,14 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // FAC-569: Envelope.Read exists but nothing ever set it, so a "pending" filter
@@ -31,6 +33,21 @@ func ackPath(mailFile string) string { return HandledStatePath(mailFile) }
 type ackState struct {
 	// Handled maps recipient -> envelope ids that reached a disposition.
 	Handled map[string][]string `json:"handled"`
+	// Superseded maps recipient -> envelope id -> the supersession record
+	// that made the envelope ineligible. The envelope line itself is never
+	// rewritten or deleted: the durable disposition lives beside it, so the
+	// historical payload and the reason it stopped being scheduled are both
+	// preserved evidence.
+	Superseded map[string]map[string]SupersessionRecord `json:"superseded,omitempty"`
+}
+
+// SupersessionRecord is the durable reason one queued envelope was made
+// ineligible by an explicit operator supersession.
+type SupersessionRecord struct {
+	SupersededAt  time.Time `json:"superseded_at"`
+	Reason        string    `json:"reason"`
+	ReplacementID string    `json:"replacement_id"`
+	Issuer        string    `json:"issuer"`
 }
 
 func loadAck(mailFile string) (*ackState, error) {
@@ -53,51 +70,87 @@ func loadAck(mailFile string) (*ackState, error) {
 	return &st, nil
 }
 
+// saveAck durably and atomically replaces the handled-state file. Callers
+// MUST hold the mailbox data flock: this is a read-modify-write of shared
+// state, and the flock is what serializes it across processes.
+//
+// The earlier implementation renamed a temp file into place without fsyncing
+// either the temp file or the directory, so an atomic-looking rename could
+// still evaporate in a crash. A disposition that does not survive a crash is
+// not a disposition, so this goes through writeFileAtomic, the same durable
+// primitive the sequence counter and dead-letter state already use.
+func saveAck(mailFile string, st *ackState) error {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := ackPath(mailFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(path, append(data, '\n'), 0o600)
+}
+
 // MarkHandled records that one envelope reached a disposition.
 //
 // This is deliberately NOT "mark read". Reading a handoff is not finishing it,
 // and conflating the two is how a queue silently drains itself: an entry must
 // stay pending until its work has an outcome.
 func (m *Mailbox) MarkHandled(recipient, id string) error {
+	return m.MarkHandledContext(context.Background(), recipient, id)
+}
+
+// MarkHandledContext is MarkHandled with deadline inheritance for lock
+// acquisition.
+//
+// The handled sidecar is shared state and this is a read-modify-write of it.
+// It used to run under the per-instance mutex alone, which serializes nothing
+// across processes: two Mailbox instances acknowledging different envelopes
+// concurrently could each load the same state, add their own id, and write --
+// and the loser's acknowledgement silently vanished, re-delivering settled
+// work. Every disposition writer now takes the same cross-process data flock,
+// so "handled" means the same thing to all of them.
+//
+// Callers must not already hold m.mu or the data flock; the mailbox lock is a
+// ticketed queue, not a reentrant one. In-package callers that already hold
+// both use markHandledLocked instead.
+func (m *Mailbox) MarkHandledContext(ctx context.Context, recipient, id string) error {
+	if m == nil {
+		return fmt.Errorf("mail: nil mailbox")
+	}
 	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
 	if recipient == "" || id == "" {
 		return ErrRecipientAndEnvelopeIDRequired
 	}
-	st, err := loadAck(m.MailFile)
-	if err != nil {
-		return err
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.withFileLockContext(ctx, func() error {
+		st, err := loadAck(m.MailFile)
+		if err != nil {
+			return err
+		}
+		if !markHandledLocked(st, recipient, id) {
+			return nil // idempotent
+		}
+		return saveAck(m.MailFile, st)
+	})
+}
+
+// markHandledLocked adds id to recipient's handled set in st, reporting
+// whether it was newly added. Caller holds m.mu and the data flock and owns
+// persisting st.
+func markHandledLocked(st *ackState, recipient, id string) bool {
 	for _, known := range st.Handled[recipient] {
 		if known == id {
-			return nil // idempotent
+			return false
 		}
 	}
 	st.Handled[recipient] = append(st.Handled[recipient], id)
 	sort.Strings(st.Handled[recipient])
-
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := ackPath(m.MailFile)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".handled-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return true
 }
 
 // Handled reports whether an envelope already reached a disposition.

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/Kampe/Herdforge/pkg/daemon"
@@ -138,4 +139,18 @@ func runMaintenanceCommandContext(ctx context.Context, args []string, out, errOu
 	default:
 		return 0
 	}
+}
+
+// validateSupersedeInvocation is the explicit opt-in contract for
+// `herd send --supersede-pending`: the replacement payload is mandatory and
+// a drain can never be combined with it, because one operation replaces
+// pending work while the other surfaces it.
+func validateSupersedeInvocation(drain bool, text string) error {
+	if drain {
+		return fmt.Errorf("--supersede-pending and --drain are mutually exclusive")
+	}
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("--supersede-pending requires a replacement payload (positional or --file)")
+	}
+	return nil
 }

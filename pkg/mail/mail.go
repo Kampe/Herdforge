@@ -42,6 +42,13 @@ type Envelope struct {
 	Timestamp          time.Time `json:"timestamp"`
 	OriginalSourceHost string    `json:"original_source_host,omitempty"`
 	OriginalSourceID   string    `json:"original_source_id,omitempty"`
+	// Binding is the issuer-resolved identity of the exact live target this
+	// payload was addressed to: an OPAQUE equality token (see
+	// herdr.TargetBinding) covering canonical repository, workspace, agent
+	// name, and the terminal generation. pkg/mail never interprets it, only
+	// compares it. Empty means legacy or unresolvable: such an envelope is
+	// never eligible for an identity-scoped operation like supersession.
+	Binding string `json:"binding,omitempty"`
 }
 
 // QuarantineEntry records one mailbox line that failed to parse as an
