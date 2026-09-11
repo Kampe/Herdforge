@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -334,4 +335,228 @@ func sameEntries(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// extraBundle copies the verified fixture bundle under a new exact name —
+// a valid, verifyable, regular single-linked bundle for multi-entry tests.
+func extraBundle(f reclaimFixture, name string) string {
+	path := filepath.Join(f.bundleDir, name)
+	data := readAll(f.t, f.bundlePath)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		f.t.Fatal(err)
+	}
+	return name
+}
+
+// TestProduceManifestPublicationIsAtomicAndNoReplace proves the manifest is
+// published through a completely written, synced same-parent temporary file
+// and a no-replace atomic publication: write/sync failure leaves no partial
+// final artifact, a destination materialized concurrently is never
+// clobbered, and cleanup touches only the owned temporary file.
+func TestProduceManifestPublicationIsAtomicAndNoReplace(t *testing.T) {
+	f := produceFixtureSetup(t)
+	out := filepath.Join(f.bundleDir, "retention-manifest.json")
+	writePass := func() (ProduceReport, error) {
+		return ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+			o.Write = true
+			o.Out = out
+		}))
+	}
+	tempLeftovers := func() []string {
+		entries, _ := os.ReadDir(f.bundleDir)
+		var found []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".herd-bundle-manifest-") && strings.HasSuffix(e.Name(), ".tmp") {
+				found = append(found, e.Name())
+			}
+		}
+		return found
+	}
+
+	t.Run("write failure leaves no partial artifact", func(t *testing.T) {
+		produceTempWriteHook = func(tempPath string) error {
+			return fmt.Errorf("injected sync failure")
+		}
+		defer func() { produceTempWriteHook = nil }()
+		if _, err := writePass(); err == nil || !contains(err.Error(), "temporary write aborted") {
+			t.Fatalf("injected write failure must fail the pass: %v", err)
+		}
+		if _, statErr := os.Lstat(out); statErr == nil {
+			t.Fatal("no final artifact may exist after a write/sync failure")
+		}
+		if left := tempLeftovers(); len(left) != 0 {
+			t.Fatalf("owned temporary file must be cleaned up: %v", left)
+		}
+	})
+
+	t.Run("concurrent destination is never clobbered", func(t *testing.T) {
+		producePublishHook = func(tempPath, finalPath string) {
+			if err := os.WriteFile(finalPath, []byte("concurrent-owner\n"), 0644); err != nil {
+				t.Errorf("concurrent creation failed: %v", err)
+			}
+		}
+		defer func() { producePublishHook = nil }()
+		if _, err := writePass(); err == nil || !contains(err.Error(), "never overwritten") {
+			t.Fatalf("concurrent destination must be refused, not clobbered: %v", err)
+		}
+		data, readErr := os.ReadFile(out)
+		if readErr != nil || string(data) != "concurrent-owner\n" {
+			t.Fatalf("concurrent owner must survive byte-identical: %q %v", data, readErr)
+		}
+		if left := tempLeftovers(); len(left) != 0 {
+			t.Fatalf("owned temporary file must be cleaned up after refusal: %v", left)
+		}
+	})
+
+	t.Run("pre-existing destination is refused without cleanup side effects", func(t *testing.T) {
+		if err := os.WriteFile(out, []byte("pre-existing\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writePass(); err == nil || !contains(err.Error(), "never overwritten") {
+			t.Fatalf("existing destination must be refused: %v", err)
+		}
+		data, readErr := os.ReadFile(out)
+		if readErr != nil || string(data) != "pre-existing\n" {
+			t.Fatalf("existing artifact must survive byte-identical: %q %v", data, readErr)
+		}
+		if left := tempLeftovers(); len(left) != 0 {
+			t.Fatalf("owned temporary file must be cleaned up after refusal: %v", left)
+		}
+	})
+}
+
+// TestProduceManifestRefusesRootAndParentReplacement pins owned-root and
+// output-parent identity at capture and revalidates them at publication, so
+// a directory swapped in between capture and publish is deterministically
+// refused instead of receiving manifest authority.
+func TestProduceManifestRefusesRootAndParentReplacement(t *testing.T) {
+	f := produceFixtureSetup(t)
+	sub := filepath.Join(f.bundleDir, "manifests")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("output parent swap is refused", func(t *testing.T) {
+		out := filepath.Join(sub, "retention-manifest.json")
+		producePublishHook = func(tempPath, finalPath string) {
+			// Replace the output parent with a fresh directory between
+			// identity capture and publication.
+			away := sub + ".swapped-away"
+			if err := os.Rename(sub, away); err != nil {
+				t.Errorf("parent swap setup failed: %v", err)
+				return
+			}
+			defer os.RemoveAll(away)
+			if err := os.MkdirAll(sub, 0755); err != nil {
+				t.Errorf("parent swap setup failed: %v", err)
+			}
+		}
+		defer func() { producePublishHook = nil }()
+		_, err := ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+			o.Write = true
+			o.Out = out
+		}))
+		if err == nil || !contains(err.Error(), "replaced between identity capture and publication") {
+			t.Fatalf("parent replacement must be refused: %v", err)
+		}
+	})
+
+	t.Run("owned root swap is refused", func(t *testing.T) {
+		out := filepath.Join(f.bundleDir, "retention-manifest.json")
+		producePublishHook = func(tempPath, finalPath string) {
+			// Swap the whole owned root between capture and publication.
+			away := f.bundleDir + ".swapped-away"
+			if err := os.Rename(f.bundleDir, away); err != nil {
+				t.Errorf("root swap setup failed: %v", err)
+				return
+			}
+			if err := os.MkdirAll(f.bundleDir, 0755); err != nil {
+				t.Errorf("root swap setup failed: %v", err)
+			}
+		}
+		defer func() { producePublishHook = nil }()
+		_, err := ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+			o.Write = true
+			o.Out = out
+		}))
+		// Restore the original root for later sub-tests and hygiene.
+		fresh := f.bundleDir + ".fresh"
+		if err := os.Rename(f.bundleDir, fresh); err == nil {
+			if err := os.Rename(f.bundleDir+".swapped-away", f.bundleDir); err == nil {
+				os.RemoveAll(fresh)
+			}
+		}
+		if err == nil || !contains(err.Error(), "replaced between identity capture and publication") {
+			t.Fatalf("owned-root replacement must be refused: %v", err)
+		}
+	})
+}
+
+// TestProduceManifestLoaderContract pins the producer-to-loader contract for
+// every field the v2 consumer validates: the producer refuses metadata its
+// own consumer would reject, before any document is emitted.
+func TestProduceManifestLoaderContract(t *testing.T) {
+	f := produceFixtureSetup(t)
+
+	// Producer side: non-positive integer-nanosecond modification time is
+	// refused at production.
+	if err := os.Chtimes(f.bundlePath, time.Unix(0, 0), time.Unix(0, 0)); err != nil {
+		t.Skipf("mtime pinning unavailable: %v", err)
+	}
+	_, err := ProduceRetentionManifest(context.Background(), produceOpts(f, nil))
+	if err == nil || !contains(err.Error(), "invalid modification time") {
+		t.Fatalf("non-positive mtime must be refused before emission: %v", err)
+	}
+
+	// Loader side: the same contract holds at consumption, so a producer
+	// bug could never silently produce an unloadable manifest.
+	inside := filepath.Join(f.bundleDir, "retention-manifest-zero.json")
+	doc := fmt.Sprintf(`{"version":2,"authority":"forge-orchestrator-test","bundles":[{"name":%q,"digest":"0000000000000000000000000000000000000000000000000000000000000000","size":1,"mod_time_unix_nano":0}]}`, filepath.Base(f.bundlePath))
+	if err := os.WriteFile(inside, []byte(doc), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRetentionManifest(f.bundleDir, inside); err == nil || !contains(err.Error(), "must pin a modification time") {
+		t.Fatalf("loader must reject the same entry the producer refuses: %v", err)
+	}
+}
+
+// TestProduceManifestBoundsAndOverflow proves the explicit selection is
+// still bounded at product level: the entry budget reuses the reclaim
+// enumeration budget, the byte budget reuses the reclaim byte budget, and
+// byte accumulation refuses overflow instead of wrapping.
+func TestProduceManifestBoundsAndOverflow(t *testing.T) {
+	f := produceFixtureSetup(t)
+	origEntries, origBytes := produceMaxEntries, produceMaxTotalBytes
+	defer func() {
+		produceMaxEntries, produceMaxTotalBytes = origEntries, origBytes
+	}()
+	second := extraBundle(f, "second-transfer.bundle")
+
+	produceMaxEntries = 1
+	_, err := ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+		o.Bundles = []string{filepath.Base(f.bundlePath), second}
+	}))
+	if err == nil || !contains(err.Error(), "exceed the manifest bound of 1") {
+		t.Fatalf("entry bound must refuse: %v", err)
+	}
+
+	produceMaxEntries = origEntries
+	produceMaxTotalBytes = f.bundleSize - 1
+	if f.bundleSize <= 1 {
+		t.Fatalf("fixture bundle too small for the byte-bound test: %d", f.bundleSize)
+	}
+	_, err = ProduceRetentionManifest(context.Background(), produceOpts(f, nil))
+	if err == nil || !contains(err.Error(), "byte budget") {
+		t.Fatalf("byte bound must refuse: %v", err)
+	}
+
+	// Overflow arithmetic: a second bundle pushes the accumulation past the
+	// budget; the guard must refuse rather than wrap or underflow.
+	produceMaxTotalBytes = 2*f.bundleSize - 1
+	_, err = ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+		o.Bundles = []string{filepath.Base(f.bundlePath), second}
+	}))
+	if err == nil || !contains(err.Error(), "byte budget") {
+		t.Fatalf("byte accumulation must refuse past the budget: %v", err)
+	}
 }

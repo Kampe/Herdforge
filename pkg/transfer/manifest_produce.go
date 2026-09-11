@@ -13,6 +13,27 @@ import (
 	"github.com/Kampe/Herdforge/pkg/lock"
 )
 
+// Producer bounds are reused from the reclaim pass: a produced manifest can
+// never admit more entries than one bounded reclaim pass may enumerate, nor
+// pin more bytes than one bounded pass may reclaim. Callers may not raise
+// them via flags; tests may lower them.
+var (
+	produceMaxEntries    = DefaultMaxFiles
+	produceMaxTotalBytes = DefaultMaxReclaimBytes
+)
+
+// Deterministic test seams for failure/interleave injection. Production
+// leaves both nil.
+var (
+	// produceTempWriteHook fires after the owned temporary file exists and
+	// before the body is written; a non-nil error aborts with cleanup.
+	produceTempWriteHook func(tempPath string) error
+	// producePublishHook fires after the temporary file is complete and
+	// before the no-replace publication, so tests can swap the output
+	// parent or destination concurrently.
+	producePublishHook func(tempPath, finalPath string)
+)
+
 // ProduceOptions scope one manifest production pass. Bundles are EXPLICIT
 // exact filenames — production never enumerates the root to select bundles,
 // because repository location and a .bundle suffix never prove ownership
@@ -31,8 +52,8 @@ type ProduceOptions struct {
 	Authority string
 	// Bundles lists the exact .bundle filenames to pin.
 	Bundles []string
-	// Write performs the atomic create. Zero value is a dry-run that only
-	// describes the intended manifest.
+	// Write performs the atomic publication. Zero value is a dry-run that
+	// only describes the intended manifest.
 	Write bool
 	// LockDir is the native shared-checkout lock directory. Empty defaults
 	// to the canonical repo's `.git/herd-shared-checkout.lock.d`.
@@ -49,17 +70,18 @@ type ProduceReport struct {
 	Written bool             `json:"written"`
 	Bundles []RetentionEntry `json:"bundles"`
 	// ManifestJSON is the exact intended document in dry-run mode and the
-	// exact bytes written in write mode.
+	// exact bytes published in write mode.
 	ManifestJSON []byte `json:"-"`
 }
 
 // ProduceRetentionManifest captures the content identity of explicitly named
 // bundles under the native shared-checkout lock and — in write mode —
-// atomically creates the version-2 retention manifest the reclaim pass
-// consumes. Every refusal is fail-closed: a bundle that cannot be fully
-// verified fails the whole pass instead of producing partial authority, and
-// the live canonical corpus is never modified (no bundle is deleted, moved,
-// or rewritten).
+// publishes the version-2 retention manifest the reclaim pass consumes
+// through a same-parent temporary file and a no-replace atomic publication.
+// Every refusal is fail-closed: a bundle that cannot be fully verified fails
+// the whole pass instead of producing partial authority, and the live
+// canonical corpus is never modified (no bundle is deleted, moved, or
+// rewritten).
 func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (ProduceReport, error) {
 	report := ProduceReport{DryRun: !opts.Write, Out: opts.Out}
 	if strings.TrimSpace(opts.Authority) == "" {
@@ -67,6 +89,9 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 	}
 	if len(opts.Bundles) == 0 {
 		return report, fmt.Errorf("bundle-manifest: at least one --bundle name is required; bundles are never selected implicitly")
+	}
+	if len(opts.Bundles) > produceMaxEntries {
+		return report, fmt.Errorf("bundle-manifest: %d entries exceed the manifest bound of %d (the reclaim enumeration budget)", len(opts.Bundles), produceMaxEntries)
 	}
 	ordered := make([]string, 0, len(opts.Bundles))
 	seen := make(map[string]bool, len(opts.Bundles))
@@ -88,6 +113,12 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 		return report, fmt.Errorf("bundle-manifest: %w", err)
 	}
 	report.Root = dir
+	// Pin the owned root's identity BEFORE the lock wait, so a root swapped
+	// while this pass blocked on the lock is refused rather than trusted.
+	rootInfo, err := os.Lstat(dir)
+	if err != nil {
+		return report, fmt.Errorf("bundle-manifest: owned root identity: %w", err)
+	}
 	if strings.TrimSpace(opts.LockDir) == "" {
 		opts.LockDir = filepath.Join(opts.RepoRoot, lock.DefaultRelDir)
 	}
@@ -112,6 +143,28 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 	if lockOwned {
 		defer shared.Release()
 	}
+	// Revalidate the pinned root under the lock: the identity that was
+	// scoped before the wait must still own the path that will be read.
+	lockedInfo, err := os.Lstat(dir)
+	if err != nil {
+		return report, fmt.Errorf("bundle-manifest: owned root identity under lock: %w", err)
+	}
+	if !os.SameFile(rootInfo, lockedInfo) {
+		return report, fmt.Errorf("bundle-manifest: owned root replaced while acquiring the native lock")
+	}
+	// Descriptor-anchored pin: the open directory handle keeps the true
+	// inode even if the path is later swapped, so publication revalidation
+	// compares fresh path identity against the descriptor, not against a
+	// stale pathname assumption.
+	rootHandle, err := os.Open(dir)
+	if err != nil {
+		return report, fmt.Errorf("bundle-manifest: owned root descriptor: %w", err)
+	}
+	defer rootHandle.Close()
+	rootHandleInfo, err := rootHandle.Stat()
+	if err != nil {
+		return report, fmt.Errorf("bundle-manifest: owned root descriptor identity: %w", err)
+	}
 
 	entries := make([]RetentionEntry, 0, len(ordered))
 	var totalBytes int64
@@ -120,8 +173,11 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 		if err != nil {
 			return report, fmt.Errorf("bundle-manifest: %w", err)
 		}
-		entries = append(entries, entry)
+		if entry.Size > produceMaxTotalBytes || totalBytes > produceMaxTotalBytes-entry.Size {
+			return report, fmt.Errorf("bundle-manifest: pinned bytes would exceed the manifest bound of %d (the reclaim byte budget)", produceMaxTotalBytes)
+		}
 		totalBytes += entry.Size
+		entries = append(entries, entry)
 	}
 	manifest := RetentionManifest{Version: 2, Authority: opts.Authority, Bundles: entries}
 	body, err := json.MarshalIndent(manifest, "", "  ")
@@ -138,7 +194,7 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 		return report, nil
 	}
 
-	written, err := createManifestAtomically(dir, opts.Out, body)
+	written, err := publishManifestAtomically(dir, rootHandleInfo, opts.Out, body)
 	if err != nil {
 		return report, fmt.Errorf("bundle-manifest: %w", err)
 	}
@@ -167,6 +223,12 @@ func produceEntry(ctx context.Context, repoRoot, dir, name string) (RetentionEnt
 	}
 	if st.Size() <= 0 {
 		return RetentionEntry{}, fmt.Errorf("bundle %s: non-positive size", name)
+	}
+	if modTimeNano := st.ModTime().UnixNano(); modTimeNano <= 0 {
+		// The v2 consumer refuses ModTimeUnixNano <= 0 (LoadRetentionManifest),
+		// so an entry with missing or pre-epoch metadata must fail HERE —
+		// the producer may never emit a document its own consumer rejects.
+		return RetentionEntry{}, fmt.Errorf("bundle %s: invalid modification time %d; the v2 consumer requires a positive integer nanosecond identity", name, modTimeNano)
 	}
 	if !verifyBundle(ctx, repoRoot, path) {
 		return RetentionEntry{}, fmt.Errorf("bundle %s: bundle-verify-failed", name)
@@ -197,12 +259,13 @@ func produceEntry(ctx context.Context, repoRoot, dir, name string) (RetentionEnt
 	}, nil
 }
 
-// createManifestAtomically creates opts.Out inside dir with O_EXCL — an
-// existing artifact is never overwritten, and a symlink destination fails
-// instead of being followed. The destination's parent is resolved through
-// symlinks and must stay inside the owned root, so a parent swap cannot
-// smuggle the write outside it.
-func createManifestAtomically(dir, out string, body []byte) (string, error) {
+// publishManifestAtomically publishes the manifest body at out inside the
+// owned root without ever exposing partial output at the destination: the
+// body is written, synced, and closed in a same-parent owned temporary
+// file, then published through os.Link — a no-replace atomic primitive that
+// fails with EEXIST when the destination exists, on every supported
+// platform. Only the owned temporary file is ever cleaned up.
+func publishManifestAtomically(rootDir string, rootHandleInfo os.FileInfo, out string, body []byte) (string, error) {
 	if strings.TrimSpace(out) == "" {
 		return "", fmt.Errorf("--out is required for writing")
 	}
@@ -215,37 +278,97 @@ func createManifestAtomically(dir, out string, body []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("output destination: %w", err)
 	}
-	rel, err := filepath.Rel(dir, realParent)
+	rel, err := filepath.Rel(rootDir, realParent)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return "", fmt.Errorf("output destination %s is not inside the owned root", out)
 	}
-	if _, err := os.Lstat(absOut); err == nil || !os.IsNotExist(err) {
-		if err == nil {
-			return "", fmt.Errorf("output %s already exists; the manifest is never overwritten", out)
-		}
-		return "", fmt.Errorf("output %s: %w", out, err)
-	}
-	if st, err := os.Lstat(realParent); err != nil || !st.IsDir() {
+	// Pin the output parent's identity now and revalidate it at
+	// publication: a directory swapped in between capture and publish is
+	// refused instead of receiving manifest authority.
+	parentInfo, err := os.Lstat(realParent)
+	if err != nil || !parentInfo.IsDir() {
 		return "", fmt.Errorf("output destination parent must be a real directory inside the owned root")
 	}
-	target := filepath.Join(realParent, filepath.Base(absOut))
-	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	// The owned root itself must still be the descriptor-pinned inode at
+	// publication time.
+	rootNow, err := os.Lstat(rootDir)
 	if err != nil {
-		return "", fmt.Errorf("atomic create refused: %w", err)
+		return "", fmt.Errorf("owned root identity at publication: %w", err)
 	}
-	if _, err := f.Write(body); err != nil {
-		f.Close()
-		return "", fmt.Errorf("atomic create failed: %w", err)
+	if !os.SameFile(rootHandleInfo, rootNow) {
+		return "", fmt.Errorf("owned root replaced between identity capture and publication")
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return "", fmt.Errorf("atomic create failed: %w", err)
+
+	temp, err := os.CreateTemp(realParent, ".herd-bundle-manifest-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("owned temporary file: %w", err)
 	}
-	if err := f.Close(); err != nil {
-		return "", fmt.Errorf("atomic create failed: %w", err)
+	tempPath := temp.Name()
+	tempInfo, err := temp.Stat()
+	if err != nil {
+		temp.Close()
+		return "", fmt.Errorf("owned temporary file identity: %w", err)
 	}
-	if st, err := os.Lstat(target); err != nil || !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("output %s is not a regular non-symlink file after create", out)
+	defer func() {
+		// Clean only the owned temporary file; the destination is never
+		// removed or replaced by cleanup.
+		_ = os.Remove(tempPath)
+	}()
+	if produceTempWriteHook != nil {
+		if hookErr := produceTempWriteHook(tempPath); hookErr != nil {
+			return "", fmt.Errorf("temporary write aborted: %w", hookErr)
+		}
 	}
-	return target, nil
+	if _, err := temp.Write(body); err != nil {
+		return "", fmt.Errorf("temporary write failed: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return "", fmt.Errorf("temporary sync failed: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("temporary close failed: %w", err)
+	}
+	if st, err := os.Lstat(tempPath); err != nil || !st.Mode().IsRegular() || fileLinkCount(st) != 1 {
+		return "", fmt.Errorf("owned temporary file identity broken before publication")
+	}
+	if producePublishHook != nil {
+		producePublishHook(tempPath, absOut)
+	}
+	// Revalidate the pinned parent AND owned-root identities at
+	// publication: a root or parent swapped between capture and publish is
+	// deterministically refused instead of receiving manifest authority.
+	parentNow, err := os.Lstat(realParent)
+	if err != nil || !os.SameFile(parentInfo, parentNow) {
+		return "", fmt.Errorf("output parent replaced between identity capture and publication")
+	}
+	rootNowPub, err := os.Lstat(rootDir)
+	if err != nil {
+		return "", fmt.Errorf("owned root identity at publication: %w", err)
+	}
+	if !os.SameFile(rootHandleInfo, rootNowPub) {
+		return "", fmt.Errorf("owned root replaced between identity capture and publication")
+	}
+	finalPath := filepath.Join(realParent, filepath.Base(absOut))
+	// No-replace atomic publication: os.Link materializes the fully written
+	// inode at the destination and fails when any destination already
+	// exists — a reader observes either the absent destination or the
+	// complete manifest, never a partial file, and an existing artifact is
+	// never clobbered.
+	if err := os.Link(tempPath, finalPath); err != nil {
+		if _, statErr := os.Lstat(finalPath); statErr == nil {
+			return "", fmt.Errorf("output %s already exists; the manifest is never overwritten", out)
+		}
+		return "", fmt.Errorf("atomic publication refused: %w", err)
+	}
+	// Sync the parent directory where the platform supports it, so the
+	// publication survives a crash.
+	if dirFile, err := os.Open(realParent); err == nil {
+		_ = dirFile.Sync()
+		dirFile.Close()
+	}
+	published, err := os.Lstat(finalPath)
+	if err != nil || !published.Mode().IsRegular() || !os.SameFile(tempInfo, published) {
+		return "", fmt.Errorf("published output is not the completely written manifest inode")
+	}
+	return finalPath, nil
 }
