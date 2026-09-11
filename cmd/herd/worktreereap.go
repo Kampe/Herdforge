@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/refname"
 
 	"github.com/Kampe/Herdforge/pkg/config"
@@ -26,6 +27,11 @@ type reapRow struct {
 	Head   string `json:"head,omitempty"`
 	Class  string `json:"class"`
 	Reason string `json:"reason,omitempty"`
+	// Base is the ref the landing classification ran against. The act-time
+	// fence re-proves landing against this same ref immediately before
+	// removal; an empty Base skips the recheck, which only hand-built rows
+	// in tests do.
+	Base string `json:"base,omitempty"`
 }
 
 // runWorktreeReap retires worktrees whose work has demonstrably LANDED.
@@ -90,65 +96,7 @@ func runWorktreeReap(args []string) error {
 	if err != nil {
 		return err
 	}
-	var landed, kept []reapRow
-	for _, e := range entries {
-		r := reapRow{Path: e.Path, Branch: e.Branch, Head: e.Head}
-		switch {
-		case e.IsMain:
-			r.Class, r.Reason = "main", "the repository's own checkout"
-		case e.Detached:
-			// A pool slot or review surface. Its identity is a lease, not a
-			// branch, and reclaiming it belongs to the pool, not here.
-			r.Class, r.Reason = "detached", "detached surface; reclaimed by the review pool, not by branch state"
-		case e.Locked:
-			r.Class, r.Reason = "locked", "locked: "+e.LockReason
-		case e.Branch == "":
-			r.Class, r.Reason = "unknown", "no branch and not detached; unresolved state, left alone"
-		case e.StatusError != "":
-			r.Class, r.Reason = "unknown", "status inspection failed: "+e.StatusError
-		case e.Dirty:
-			r.Class, r.Reason = "dirty", "uncommitted changes would be destroyed"
-		case isResidentHome(e.Branch, e.Path):
-			// FAC-672: a standing lane's RESIDENT HOME tracks main and therefore
-			// has no unique commits, which makes it look landed. It is not a task
-			// worktree: removing it evicts a live lane from the directory it
-			// works in.
-			//
-			// Caught in dry run before any --apply: the coordinator's own home
-			// (standing/orchestrator) was classified removable. A reaper that
-			// takes out the coordinator is worse than one that reclaims nothing,
-			// and "no unique commits" is exactly the signal that cannot tell the
-			// two apart on its own.
-			r.Class, r.Reason = "resident-home", "standing lane home; tracks base by design and is not a task worktree"
-		default:
-			if *byPR {
-				if closed, why := prClosedAndLanded(root, e.Branch, *base); closed {
-					r.Class, r.Reason = "landed", why
-					landed = append(landed, r)
-					continue
-				} else if why != "" {
-					r.Class, r.Reason = "pr-open", why
-					kept = append(kept, r)
-					continue
-				}
-			}
-			ahead := commitsAhead(root, *base, e.Branch)
-			switch {
-			case ahead < 0:
-				r.Class, r.Reason = "unknown", "could not compare against "+*base
-			case ahead == 0:
-				r.Class, r.Reason = "landed", "no unique commits against "+*base+"; removal is lossless"
-			default:
-				r.Class = "unmerged"
-				r.Reason = fmt.Sprintf("%d unique commit(s) not in %s; unmerged work is not garbage", ahead, *base)
-			}
-		}
-		if r.Class == "landed" {
-			landed = append(landed, r)
-		} else {
-			kept = append(kept, r)
-		}
-	}
+	landed, kept := classifyReapEntries(root, *base, *byPR, entries)
 	sort.Slice(landed, func(i, j int) bool { return landed[i].Path < landed[j].Path })
 
 	// FAC-681: DO the work before reporting it.
@@ -376,6 +324,20 @@ func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, ins
 	}
 	if isResidentHome(current.Branch, current.Path) {
 		return fmt.Errorf("retire %s: act-time worktree is a protected resident home", l.Path)
+	}
+	// FAC-805: classification and act are separate processes, so the landing
+	// itself must be re-proven immediately before removal against the same
+	// base the classification used. A squash that was reverted, a base that
+	// was force-moved, or any proof refusal keeps the worktree; receipt files
+	// and stale classifications alone never authorize deletion.
+	if strings.TrimSpace(l.Base) != "" {
+		ahead := commitsAhead(root, l.Base, l.Branch)
+		if ahead != 0 {
+			if _, err := rangeLandedProof(root, l.Base, l.Branch); err != nil {
+				return fmt.Errorf("retire %s: act-time landing recheck against %s failed (ahead=%d): %v",
+					l.Path, l.Base, ahead, err)
+			}
+		}
 	}
 	ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
 	usage, ownerErr := inspector.InUse(ownerCtx, current.Path)
@@ -658,6 +620,169 @@ func gitOutIn(dir string, args ...string) (string, error) {
 		return string(out), fmt.Errorf("git -C %s %s: %w: %s", dir, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
+}
+
+// classifyReapEntries sorts every entry into landed or kept. The split is
+// conservative by construction: a row is landed only when its work is
+// provably on the base, and every uncertain, dirty, locked, detached, or
+// unanswerable surface is kept with its exact identity.
+func classifyReapEntries(root, base string, byPR bool, entries []worktreeEntry) (landed, kept []reapRow) {
+	for _, e := range entries {
+		r := reapRow{Path: e.Path, Branch: e.Branch, Head: e.Head, Base: base}
+		switch {
+		case e.IsMain:
+			r.Class, r.Reason = "main", "the repository's own checkout"
+		case e.Detached:
+			// A pool slot or review surface. Its identity is a lease, not a
+			// branch, and reclaiming it belongs to the pool, not here.
+			r.Class, r.Reason = "detached", "detached surface; reclaimed by the review pool, not by branch state"
+		case e.Locked:
+			r.Class, r.Reason = "locked", "locked: "+e.LockReason
+		case e.Branch == "":
+			r.Class, r.Reason = "unknown", "no branch and not detached; unresolved state, left alone"
+		case e.StatusError != "":
+			r.Class, r.Reason = "unknown", "status inspection failed: "+e.StatusError
+		case e.Dirty:
+			r.Class, r.Reason = "dirty", "uncommitted changes would be destroyed"
+		case isResidentHome(e.Branch, e.Path):
+			// FAC-672: a standing lane's RESIDENT HOME tracks main and therefore
+			// has no unique commits, which makes it look landed. It is not a task
+			// worktree: removing it evicts a live lane from the directory it
+			// works in.
+			//
+			// Caught in dry run before any --apply: the coordinator's own home
+			// (standing/orchestrator) was classified removable. A reaper that
+			// takes out the coordinator is worse than one that reclaims nothing,
+			// and "no unique commits" is exactly the signal that cannot tell the
+			// two apart on its own.
+			r.Class, r.Reason = "resident-home", "standing lane home; tracks base by design and is not a task worktree"
+		default:
+			if byPR {
+				if closed, why := prClosedAndLanded(root, e.Branch, base); closed {
+					r.Class, r.Reason = "landed", why
+					landed = append(landed, r)
+					continue
+				} else if why != "" {
+					r.Class, r.Reason = "pr-open", why
+					kept = append(kept, r)
+					continue
+				}
+			}
+			ahead := commitsAhead(root, base, e.Branch)
+			switch {
+			case ahead < 0:
+				r.Class, r.Reason = "unknown", "could not compare against "+base
+			case ahead == 0:
+				r.Class, r.Reason = "landed", "no unique commits against "+base+"; removal is lossless"
+			default:
+				// FAC-805: ahead counts commits, but a squash-merge collapses
+				// the whole reviewed range into one base commit, so per-commit
+				// patch identity cannot survive it -- git cherry reports the
+				// landed branch's every commit as unique and this reaper
+				// called merged harvests (PR803, PR804) unmerged. Before
+				// declaring unmerged work, ask the coordinator's tested
+				// whole-range proof whether the branch's content is on the
+				// base: squash-range patch identity plus exact replay tree.
+				// Every proof refusal and every failed lookup keeps the
+				// worktree; the proof can only ever add a "landed", never
+				// remove a guard.
+				if proof, proofErr := rangeLandedProof(root, base, e.Branch); proofErr == nil {
+					r.Class, r.Reason = "landed", fmt.Sprintf(
+						"whole range is in %s via %s (merge %s); per-commit uniqueness is meaningless across a squash",
+						base, proof.Method, shortSha(proof.MergeSHA))
+				} else if _, resolveErr := resolveReapRefs(root, base, e.Branch); resolveErr != nil {
+					r.Class, r.Reason = "unknown", fmt.Sprintf("git lookup failed against %s: %v", base, resolveErr)
+				} else {
+					r.Class = "unmerged"
+					r.Reason = fmt.Sprintf("%d unique commit(s) not in %s (whole-range proof refused: %v); unmerged work is not garbage", ahead, base, proofErr)
+				}
+			}
+		}
+		if r.Class == "landed" {
+			landed = append(landed, r)
+		} else {
+			kept = append(kept, r)
+		}
+	}
+	return landed, kept
+}
+
+// rangeLandedProof reuses the coordinator's tested whole-range landing proof
+// (FAC-805): it asks whether the branch's combined base..branch delta and its
+// replayed result tree are genuinely present on the base history, which is the
+// question a squash-merge leaves answerable when per-commit patch ids are not.
+// The base for the proof is the branch's own merge-base with the base ref, so
+// a base that advanced after the merge (PR803 then PR804 on one main) still
+// proves the reviewed range against the base it was reviewed on.
+//
+// A historical proof alone is not reap authority: a landing that main later
+// REVERTED still proves at its merge point while its net content is gone.
+// Retirement must be lossless at the CURRENT tip, so the branch's delta is
+// replayed onto the base tip with the same native merge-tree primitive the
+// proof uses internally, and the result must reproduce the base tip's tree
+// exactly. A conflicting, changing, or failed replay keeps the worktree.
+func rangeLandedProof(root, base, branch string) (*mergeadmit.Proof, error) {
+	mergeBase, err := resolveReapRefs(root, base, branch)
+	if err != nil {
+		return nil, err
+	}
+	proof, err := mergeadmit.ProveEquivalentLanded(root, mergeadmit.ProofRequest{
+		BaseSHA:      mergeBase,
+		CandidateSHA: branch,
+		LandedSHA:    base,
+	})
+	if err != nil {
+		return nil, err
+	}
+	tipTree, err := reapGitTree(root, base)
+	if err != nil {
+		return nil, err
+	}
+	// The same one definition of the native merge-tree replay primitive the
+	// proofs use (pkg/mergeadmit.ReplayTree). A conflicted replay exits
+	// nonzero and reads as an error, which keeps the worktree.
+	replayed, err := mergeadmit.ReplayTree(root, mergeBase, base, branch)
+	if err != nil {
+		return nil, fmt.Errorf("merge-tree replay of %s onto %s did not prove containment: %w", branch, base, err)
+	}
+	if replayed != tipTree {
+		return nil, fmt.Errorf("branch %s replays onto %s as tree %s, but the tip is %s; net content is not present now",
+			branch, base, shortSha(replayed), shortSha(tipTree))
+	}
+	return proof, nil
+}
+
+// reapGitTree resolves a commit-ish to its tree object id. A failed lookup is
+// an error, never an empty string that could compare equal to another empty.
+func reapGitTree(root, ref string) (string, error) {
+	out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", ref+"^{tree}").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve tree of %s: %w", ref, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// resolveReapRefs resolves the proof's three points and returns the merge-base
+// of the branch with the base ref. A failed lookup is an error, never a
+// false "not landed": an unanswerable question must not read as garbage.
+func resolveReapRefs(root, base, branch string) (string, error) {
+	for _, ref := range []string{base, branch} {
+		if err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", ref+"^{commit}").Run(); err != nil {
+			return "", fmt.Errorf("resolve %s: %w", ref, err)
+		}
+	}
+	out, err := exec.Command("git", "-C", root, "merge-base", base, branch).Output()
+	if err != nil {
+		return "", fmt.Errorf("merge-base %s %s: %w", base, branch, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func shortSha(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 // commitsAhead returns how many commits branch has that base does not, or -1
