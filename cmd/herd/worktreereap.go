@@ -196,8 +196,66 @@ func retireLanded(root string, landed []reapRow) (retired, failed []map[string]s
 }
 
 func retireLandedWithInspector(root string, landed []reapRow, inspector resources.ProcessInspector) (retired, failed []map[string]string) {
+	// FAC-809: the act-time owner census runs ONCE for the whole set through
+	// the batched inspector. The per-PID reference walk shares one process
+	// population and one owner snapshot across every target; the serial
+	// per-target path re-paid that walk for each worktree inside its own
+	// two-second budget and on darwin degraded to one `ps` spawn per pid
+	// per target, starving the census deadline on every act.
+	batch, isBatch := inspector.(resources.BatchProcessInspector)
+	var batchUsage map[string]resources.ProcessUsage
+	var batchErr error
+	canonErr := make(map[string]error, len(landed))
+	if isBatch && len(landed) > 0 {
+		paths := make([]string, 0, len(landed))
+		canon := make(map[string]string, len(landed))
+		for _, l := range landed {
+			// The batched inspector keys its result map by
+			// EvalSymlinks+Clean of each sent path, so send and look up the
+			// SAME canonical identity. Removal still fences on the raw
+			// observed path via the act-time revalidation; a symlinked
+			// root only changes the census key, never the retirement
+			// target.
+			c, err := canonicalWorktreePath(l.Path)
+			if err != nil {
+				canonErr[l.Path] = err
+				continue
+			}
+			paths = append(paths, c)
+			canon[c] = l.Path
+		}
+		ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
+		batchUsage, batchErr = batch.InUseMany(ownerCtx, paths)
+		cancelOwner()
+		// Re-key the result onto the raw observed paths the retirement
+		// fences use.
+		rekeyed := make(map[string]resources.ProcessUsage, len(batchUsage))
+		for key, usage := range batchUsage {
+			if raw, ok := canon[key]; ok {
+				rekeyed[raw] = usage
+			}
+		}
+		batchUsage = rekeyed
+	}
 	for _, l := range landed {
-		err := retireLandedOneWithInspector(root, l, runReapGit, inspector)
+		var usage *resources.ProcessUsage
+		if isBatch {
+			u, found := batchUsage[l.Path]
+			if !found {
+				u = resources.ProcessUsage{MetadataUnavailable: true, MetadataCause: "no batch census result for path"}
+			}
+			if err := canonErr[l.Path]; err != nil {
+				u = resources.ProcessUsage{MetadataUnavailable: true, MetadataCause: fmt.Sprintf("census key unresolved: %v", err)}
+			} else if batchErr != nil {
+				// Any batch error fail-closes the census even when a clean
+				// entry is present: a partially-populated result must
+				// never read as a definitive no-owner answer.
+				u.MetadataUnavailable = true
+				u.MetadataCause = fmt.Sprintf("batch census failed: %v", batchErr)
+			}
+			usage = &u
+		}
+		err := retireLandedOneWithInspectorCensus(root, l, runReapGit, inspector, usage)
 		if err != nil {
 			failed = append(failed, map[string]string{
 				"path":   l.Path,
@@ -289,6 +347,10 @@ func (noOpReapProcessInspector) InUse(context.Context, string) (resources.Proces
 }
 
 func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector) error {
+	return retireLandedOneWithInspectorCensus(root, l, run, inspector, nil)
+}
+
+func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector, census *resources.ProcessUsage) error {
 	if strings.TrimSpace(l.Head) == "" {
 		return fmt.Errorf("retire %s: observed worktree HEAD is required", l.Path)
 	}
@@ -339,14 +401,26 @@ func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, ins
 			}
 		}
 	}
-	ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
-	usage, ownerErr := inspector.InUse(ownerCtx, current.Path)
-	cancelOwner()
-	if ownerErr != nil {
-		return fmt.Errorf("retire %s: act-time owner census failed: %w", l.Path, ownerErr)
+	var usage resources.ProcessUsage
+	if census != nil {
+		// The batched act census already ran for this exact path; reuse its
+		// result. No serial re-probe, no fallback scan (FAC-809).
+		usage = *census
+	} else {
+		ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
+		oneUsage, ownerErr := inspector.InUse(ownerCtx, current.Path)
+		cancelOwner()
+		if ownerErr != nil {
+			return fmt.Errorf("retire %s: act-time owner census failed: %w", l.Path, ownerErr)
+		}
+		usage = oneUsage
 	}
 	if usage.MetadataUnavailable {
-		return fmt.Errorf("retire %s: act-time owner census is incomplete", l.Path)
+		cause := usage.MetadataCause
+		if strings.TrimSpace(cause) == "" {
+			cause = "unknown cause (deadline or probe error not reported)"
+		}
+		return fmt.Errorf("retire %s: act-time owner census is incomplete (%s)", l.Path, cause)
 	}
 	if usage.CWD || usage.OpenFile || usage.ReferencedPath {
 		return fmt.Errorf("retire %s: act-time owner census found active use (cwd=%t open=%t referenced=%t pids=%v)", l.Path, usage.CWD, usage.OpenFile, usage.ReferencedPath, usage.PIDs)
