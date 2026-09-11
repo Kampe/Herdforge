@@ -2,10 +2,17 @@
 
 package resources
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 type OSPhysicalMeasurer struct{}
 
-func (OSPhysicalMeasurer) Measure(string, int) (PhysicalUsage, error) {
+func (m OSPhysicalMeasurer) Measure(path string, maxEntries int) (PhysicalUsage, error) {
+	return m.MeasureContext(context.Background(), path, maxEntries)
+}
+
+func (OSPhysicalMeasurer) MeasureContext(context.Context, string, int) (PhysicalUsage, error) {
 	return PhysicalUsage{}, fmt.Errorf("physical-byte accounting unsupported")
 }

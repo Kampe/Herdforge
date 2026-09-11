@@ -178,6 +178,19 @@ type PhysicalMeasurer interface {
 	Measure(string, int) (PhysicalUsage, error)
 }
 
+// ContextPhysicalMeasurer is the optional context-aware form of
+// PhysicalMeasurer. A measurer that implements it has its traversal bounded by
+// the sweep's own context, so the shared deadline reaches inside a walk instead
+// of only between walks. A measurer that does not implement it keeps working
+// unchanged. PhysicalMeasurer stays the required interface, so existing test
+// and custom implementations need no change.
+type ContextPhysicalMeasurer interface {
+	PhysicalMeasurer
+	MeasureContext(context.Context, string, int) (PhysicalUsage, error)
+}
+
+var _ ContextPhysicalMeasurer = OSPhysicalMeasurer{}
+
 type LockProvider interface {
 	Acquire(context.Context, string, time.Duration, time.Duration) (io.Closer, error)
 }
@@ -476,7 +489,7 @@ func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorR
 		return report, errors.New("fresh post-reap statfs changed filesystem identity")
 	}
 	report.CapacityAfter = after
-	report.Foreign = g.inspectForeign(options.ForeignTargets)
+	report.Foreign = g.inspectForeign(ctx, options.ForeignTargets)
 	g.setConcurrency(&report)
 	return report, nil
 }
@@ -531,10 +544,12 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		total := time.Until(dl)
 		if total > 0 {
-			// WithDeadline returns (ctx, CancelFunc): a past deadline is an
-			// already-expired child, which is exactly a fully-consumed
-			// registered phase.
-			rctx, rctxCancel := context.WithDeadline(ctx, g.now().Add(total*4/5))
+			// Derive the registered phase deadline from the PARENT deadline,
+			// not the injected clock: the phase split partitions the wall
+			// clock window the sweep actually has. WithDeadline returns
+			// (ctx, CancelFunc): a past deadline is an already-expired
+			// child, which is exactly a fully-consumed registered phase.
+			rctx, rctxCancel := context.WithDeadline(ctx, dl.Add(-total/5))
 			defer rctxCancel()
 			registeredCtx = rctx
 		}
@@ -579,12 +594,17 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			return report, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
 		}
 		seen[lanes[i].Path] = struct{}{}
-		// The allocation walk is an unbounded fs descent and Measure takes
-		// no context, so this check bounds the lanes that FOLLOW, not the
-		// call in flight: one pathological lane can still overrun the
-		// registered budget. What it does buy is that a long lane list no
-		// longer consumes the orphan phase's budget wholesale. Lanes left
-		// unmeasured stay fail-closed unknown, never reap-eligible.
+		// The allocation walk is an unbounded fs descent. The context-aware
+		// measurer receives the REGISTERED phase deadline, not the outer
+		// sweep context, and observes it at cooperative checkpoints BETWEEN
+		// visited entries. Those checkpoints preserve the phase reservation
+		// across the loop: the walk stops at the next entry boundary once
+		// the deadline fires. They do not cap the call in flight — a single
+		// filesystem syscall is OS-bound, and a legacy context-blind
+		// measurer may run to completion, so no hard wall-clock guarantee
+		// is claimed. What the checkpoints do buy is that a long lane list
+		// no longer consumes the orphan phase's budget wholesale. Lanes
+		// left unmeasured stay fail-closed unknown, never reap-eligible.
 		if registeredCtx.Err() != nil {
 			cause := fmt.Sprintf("census budget exhausted before lane %d/%d: %v", i+1, len(lanes), registeredCtx.Err())
 			if listStage.Cause == "" {
@@ -600,7 +620,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			}
 			break
 		}
-		usage, measureErr := g.Measure.Measure(lanes[i].Path, g.registeredMeasureLimit())
+		usage, measureErr := g.measure(registeredCtx, lanes[i].Path, g.registeredMeasureLimit())
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_allocation_unavailable"
@@ -791,7 +811,7 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			if statErr != nil || !info.IsDir() {
 				continue
 			}
-			usage, measureErr := g.Measure.Measure(path, g.orphanMeasureLimit())
+			usage, measureErr := g.measure(ctx, path, g.orphanMeasureLimit())
 			if measureErr != nil {
 				result.Orphans = append(result.Orphans, OrphanWorktree{Path: path, ReportPath: reportPath(g.Policy.RepositoryRoot, path), PreserveReason: "orphan_allocation_unavailable"})
 				continue
@@ -936,6 +956,31 @@ func orphanBatchPaths(entries []os.DirEntry, root string, known map[string]struc
 	return paths
 }
 
+// measure runs one allocation measurement under the sweep's own context.
+//
+// A measurer that implements ContextPhysicalMeasurer observes the context at
+// cooperative checkpoints between visited entries, so a pathological
+// directory stops extending the cleanup pass at the next entry boundary.
+// The checkpoints cannot interrupt the call in flight: one filesystem
+// syscall, or a legacy context-blind measurer, remains OS-bound and may run
+// to completion — no hard wall-clock guarantee is claimed. A context-blind
+// measurer IS refused up-front on a cancelled sweep, so a cancelled sweep
+// never begins another unbounded walk; that is the same bound the entry
+// budget already gave, no worse than before.
+//
+// Either way the caller gets an error and MUST treat the measurement as
+// unknown. Every call site below does: unknown allocation preserves a lane or
+// blocks a target, and no unknown figure ever becomes reclaimed bytes.
+func (g *Governor) measure(ctx context.Context, path string, maxEntries int) (PhysicalUsage, error) {
+	if aware, ok := g.Measure.(ContextPhysicalMeasurer); ok {
+		return aware.MeasureContext(ctx, path, maxEntries)
+	}
+	if err := ctx.Err(); err != nil {
+		return PhysicalUsage{Truncated: true}, err
+	}
+	return g.Measure.Measure(path, maxEntries)
+}
+
 func (g *Governor) orphanMeasureLimit() int {
 	limit := g.Policy.MaxScanEntries
 	if limit <= 0 || limit > 4096 {
@@ -1033,7 +1078,7 @@ func (g *Governor) orphanTargetProofWithProcess(ctx context.Context, orphan, tar
 	if !private {
 		return PhysicalUsage{}, false, privacyReason
 	}
-	usage, err := g.Measure.Measure(target, g.Policy.MaxScanEntries)
+	usage, err := g.measure(ctx, target, g.Policy.MaxScanEntries)
 	if err != nil || usage.Truncated {
 		return usage, false, "derived_target_allocation_unavailable"
 	}
@@ -1264,10 +1309,27 @@ func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorRepor
 			report.OrphanTargets[i].Decision, report.OrphanTargets[i].Reason = TargetBlocked, "orphan_cache_remove_failed"
 			return fmt.Errorf("remove exact orphan cache %q: %w", report.OrphanTargets[i].Path, err)
 		}
-		after, err := g.Measure.Measure(report.OrphanTargets[i].Path, g.Policy.MaxScanEntries)
+		// The removal is committed and this loop still holds the cache-use
+		// flock. Cancellation must not abandon the readback here: it would
+		// release the lock mid-accounting and leave a reap whose reclaimed
+		// bytes were never proved. The accounting for a finished mutation
+		// therefore outlives the sweep deadline, and every exit below releases
+		// the flock after the readback and never during it -- no interrupt, no
+		// goroutine left running behind it.
+		//
+		// WithoutCancel drops the deadline, not the bound: MaxScanEntries is
+		// still enforced, so the readback is entry-bounded. That bound is
+		// then the only limit left — the walk is not time-capped and a
+		// single syscall stays OS-bound — so a truncated result is refused
+		// instead of counted -- a partial AfterBytes would understate what
+		// survived and overstate reclaimed bytes.
+		after, err := g.measure(context.WithoutCancel(ctx), report.OrphanTargets[i].Path, g.Policy.MaxScanEntries)
 		if errors.Is(err, os.ErrNotExist) {
 			after = PhysicalUsage{}
 			err = nil
+		}
+		if err == nil && after.Truncated {
+			err = fmt.Errorf("readback hit the %d-entry bound; surviving bytes are unproved", g.Policy.MaxScanEntries)
 		}
 		if err != nil {
 			if locked {
@@ -1338,7 +1400,7 @@ func (g *Governor) inspectTarget(ctx context.Context, lane RegisteredWorktree, r
 		target.Decision, target.Reason = TargetBlocked, "target_realpath_escape"
 		return target
 	}
-	usage, err := g.Measure.Measure(target.Path, g.Policy.MaxScanEntries)
+	usage, err := g.measure(ctx, target.Path, g.Policy.MaxScanEntries)
 	if err != nil {
 		target.Decision, target.Reason = TargetBlocked, "target_allocation_unavailable"
 		return target
@@ -1348,7 +1410,7 @@ func (g *Governor) inspectTarget(ctx context.Context, lane RegisteredWorktree, r
 		target.Decision, target.Reason = TargetBlocked, "target_allocation_truncated"
 		return target
 	}
-	canonical, scanErr := containsCanonicalState(target.Path, g.Policy.MaxScanEntries)
+	canonical, scanErr := containsCanonicalState(ctx, target.Path, g.Policy.MaxScanEntries)
 	if scanErr != nil {
 		target.Decision, target.Reason = TargetBlocked, "canonical_state_scan_unavailable"
 		return target
@@ -1435,10 +1497,21 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 			report.Targets[i].Decision, report.Targets[i].Reason = TargetBlocked, "remove_failed"
 			return fmt.Errorf("remove exact generated target %q: %w", again.Path, err)
 		}
-		after, measureErr := g.Measure.Measure(again.Path, g.Policy.MaxScanEntries)
+		// Same rule as the orphan cache readback: the tree is already
+		// quarantined and unlinked, so this is the accounting for a committed
+		// mutation and must not be cancelled out from under it. WithoutCancel
+		// drops the deadline, not MaxScanEntries, so the readback is
+		// entry-bounded (not time-capped; one syscall stays OS-bound); that
+		// bound is then the only limit left, so a truncated result is
+		// refused instead of counted -- a partial AfterBytes would understate
+		// what survived and overstate reclaimed bytes.
+		after, measureErr := g.measure(context.WithoutCancel(ctx), again.Path, g.Policy.MaxScanEntries)
 		if errors.Is(measureErr, os.ErrNotExist) {
 			after = PhysicalUsage{}
 			measureErr = nil
+		}
+		if measureErr == nil && after.Truncated {
+			measureErr = fmt.Errorf("readback hit the %d-entry bound; surviving bytes are unproved", g.Policy.MaxScanEntries)
 		}
 		if measureErr != nil {
 			return fmt.Errorf("post-reap physical-byte readback %q: %w", again.Path, measureErr)
@@ -1454,10 +1527,26 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 	return nil
 }
 
-func containsCanonicalState(root string, maxEntries int) (bool, error) {
+// containsCanonicalState proves an exact generated target holds no nested
+// canonical .git or .herd state. It is a native disk traversal over the same
+// pathological directories the governor measures, so it takes the sweep's
+// context and inspects cancellation at every entry: a cancelled scan stops
+// visiting immediately and returns the context error.
+//
+// Fail-closed is the caller's contract, and inspectTarget is the only caller: a
+// scan that did not finish is "canonical_state_scan_unavailable" and blocks the
+// target. Cancellation is never evidence of absence, and a target already
+// proven to hold canonical state still reports found, so the protection cannot
+// weaken in either direction.
+func containsCanonicalState(ctx context.Context, root string, maxEntries int) (bool, error) {
 	found := false
 	entries := 0
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		// Checked before the entry is accounted, so the entry that observes
+		// cancellation is not counted and no later entry is visited.
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return cancelErr
+		}
 		if err != nil {
 			return err
 		}
@@ -1659,7 +1748,7 @@ func (g *Governor) recoverInterruptedQuarantines(ctx context.Context, report *Go
 		if !owned || owner != record.Owner {
 			return count, reclaimed, errors.New("recovery quarantine owner proof failed")
 		}
-		usage, measureErr := g.Measure.Measure(child, g.Policy.MaxScanEntries)
+		usage, measureErr := g.measure(ctx, child, g.Policy.MaxScanEntries)
 		if measureErr != nil || usage.Truncated {
 			return count, reclaimed, errors.New("recovery quarantine allocation proof unavailable")
 		}
@@ -1745,7 +1834,7 @@ func (g *Governor) setConcurrency(report *GovernorReport) {
 	}
 }
 
-func (g *Governor) inspectForeign(targets []ForeignTarget) []ForeignTelemetry {
+func (g *Governor) inspectForeign(ctx context.Context, targets []ForeignTarget) []ForeignTelemetry {
 	out := make([]ForeignTelemetry, 0, len(targets))
 	for _, target := range targets {
 		row := ForeignTelemetry{ForeignTarget: target, Action: "observe_only_contact_owner"}
@@ -1755,7 +1844,7 @@ func (g *Governor) inspectForeign(targets []ForeignTarget) []ForeignTelemetry {
 			out = append(out, row)
 			continue
 		}
-		usage, err := g.Measure.Measure(target.Path, g.Policy.MaxScanEntries)
+		usage, err := g.measure(ctx, target.Path, g.Policy.MaxScanEntries)
 		if err != nil {
 			row.Error, row.Escalate = err.Error(), true
 		} else {
