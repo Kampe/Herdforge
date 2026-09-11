@@ -475,10 +475,21 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 	last := "unknown"
 	lastPane := ""
 	staged := false
+	// FAC-815: a warm lane resting at "done" before this send is already
+	// paneAdvanced the instant the submitted text renders into the pane --
+	// submission itself guarantees the delta, so "done" alone proves nothing
+	// about THIS delivery. sawWorking is set only by an actual observed
+	// departure into "working" during this poll loop (a real turn start),
+	// never by the resting baseline state (FAC-773 queues an
+	// already-working baseline before this loop is ever reached).
+	sawWorking := false
 	for time.Now().Before(deadline) {
 		st, err := liveStatusScopedIn(resolvedTarget, workspace)
 		if err == nil {
 			last = st
+			if st == "working" {
+				sawWorking = true
+			}
 			pane, paneErr := PaneRead(resolved.PaneID, 120)
 			if paneErr == nil {
 				lastPane = pane
@@ -528,7 +539,7 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 				// pane actually changed since before the send: a pane that
 				// ignored the input does not change. That is weaker evidence
 				// than an echo, and it is the strongest this harness exposes.
-				if !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) {
+				if !harnessEchoesPrompt(resolved.Kind) && paneAdvanced(baselinePane, pane) && (st == "working" || sawWorking) {
 					return SendResult{Status: st}, nil
 				}
 			}

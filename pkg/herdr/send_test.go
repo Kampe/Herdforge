@@ -287,3 +287,73 @@ func TestSendAllowsSameWorkspaceDelivery(t *testing.T) {
 		t.Fatal("same-workspace target must be prompted")
 	}
 }
+
+// FAC-815: a warm claude-kind lane resting at "done" before this send is
+// already paneAdvanced the instant the submitted text renders into the
+// pane -- submission itself guarantees the delta. Status never leaves
+// "done" during the poll (no genuine new turn observed), so this must
+// refuse as queued-but-not-consumed, never confirm on the resting state.
+func TestSendRefusesRestingDoneWithoutFreshWorkingObservation(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	oldRun := runHerdr
+	t.Cleanup(func() { runHerdr = oldRun })
+	paneReads := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","agent":"claude","pane_id":"pane-resting","workspace_id":"wK","agent_status":"done"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			paneReads++
+			if paneReads == 1 {
+				return `{"result":{"text":"idle prompt"}}`, nil
+			}
+			// Claude Code renders a compact transcript, never the literal
+			// submitted text (FAC-579): the pane changes (paneAdvanced)
+			// without the submitted string ever appearing (no echo proof).
+			return `{"result":{"text":"idle prompt\n> Marinating..."}}`, nil
+		}
+		return "{}", nil
+	}
+
+	got, err := Send("worker", "assigned command: go test ./pkg/herdr", true, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "queued-but-not-consumed") {
+		t.Fatalf("Send = %q, %v; want a queued-but-not-consumed refusal, resting done must never confirm", got, err)
+	}
+	if got != "queued" {
+		t.Fatalf("Send status = %q; want queued", got)
+	}
+}
+
+// A genuine new turn (status actually departs into "working" during this
+// delivery's poll, then returns to "done") must still confirm -- the fix
+// must not produce a false negative on real consumption.
+func TestSendAcceptsGenuineFreshWorkingThenDone(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	oldRun := runHerdr
+	t.Cleanup(func() { runHerdr = oldRun })
+	statusCalls := 0
+	paneReads := 0
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			statusCalls++
+			status := "done"
+			if statusCalls == 2 {
+				status = "working"
+			}
+			return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","agent":"claude","pane_id":"pane-fresh","workspace_id":"wK","agent_status":%q}]}}`, status), nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			paneReads++
+			if paneReads == 1 {
+				return `{"result":{"text":"idle prompt"}}`, nil
+			}
+			return `{"result":{"text":"idle prompt\n> Marinating..."}}`, nil
+		}
+		return "{}", nil
+	}
+
+	got, err := Send("worker", "assigned command: go test ./pkg/herdr", true, 5*time.Second)
+	if err != nil || (got != "working" && got != "done") {
+		t.Fatalf("Send = %q, %v; genuine working turn must confirm", got, err)
+	}
+}
