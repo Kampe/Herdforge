@@ -139,6 +139,25 @@ func attachResourceGovernor(d *dispatch.Dispatcher, cfg *config.Config, root str
 	return nil
 }
 
+// lifecycleSweepBudget is the operational budget for one full lifecycle
+// sweep. It matches the direct resource-governor CLI budget so a lifecycle
+// caller can never out-wait that path on the same global lock.
+const lifecycleSweepBudget = 45 * time.Second
+
+// runLifecycleGovernorSweep is the shared lifecycle boundary: every cmd/herd
+// lifecycle sweep reaches governor.Sweep through it, so the sweep always
+// carries a finite deadline. context.WithTimeout clamps to the earliest
+// deadline in the chain: an already-shorter caller deadline is preserved
+// verbatim, while an unbounded caller (e.g. context.Background() at the
+// review pre-refusal census) receives the operational budget. Cancellation
+// propagates unchanged and the error is returned fail-closed; the deferred
+// cancel releases the timer so no goroutine outlives the sweep.
+func runLifecycleGovernorSweep(ctx context.Context, governor *resources.Governor, trigger resources.SweepTrigger) (resources.GovernorReport, error) {
+	sweepCtx, cancel := context.WithTimeout(ctx, lifecycleSweepBudget)
+	defer cancel()
+	return governor.Sweep(sweepCtx, trigger, governor.LifecycleApply())
+}
+
 func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string, trigger resources.SweepTrigger) error {
 	governor, err := newResourceGovernor(cfg, root)
 	if err != nil {
@@ -147,7 +166,7 @@ func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string,
 	if governor == nil {
 		return nil
 	}
-	_, err = governor.Sweep(ctx, trigger, governor.LifecycleApply())
+	_, err = runLifecycleGovernorSweep(ctx, governor, trigger)
 	return err
 }
 
