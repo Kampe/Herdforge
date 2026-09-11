@@ -25,7 +25,12 @@ type ProcessUsage struct {
 	OpenFile            bool
 	ReferencedPath      bool
 	MetadataUnavailable bool
-	PIDs                []int
+	// MetadataCause carries the actionable reason the census was marked
+	// unavailable (deadline vs per-PID probe error, with the pid or phase
+	// that produced it). It never changes fail-closed behavior; consumers
+	// surface it so an incomplete census is diagnosable instead of bare.
+	MetadataCause string
+	PIDs          []int
 }
 
 type ProcessInspector interface {
@@ -615,6 +620,11 @@ type LSOFProcessInspector struct {
 
 const maxBatchProcessTargets = 64
 
+// maxMetadataCauses bounds the per-pid cause sample retained on
+// ProcessUsage.MetadataCause: a churny host can error hundreds of probes and
+// the census report stays bounded while remaining actionable.
+const maxMetadataCauses = 5
+
 func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUsage, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -747,10 +757,10 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 	openUsage, err := p.lsofPaths(ctx, executable, timeout, maxOutput, probePaths)
 	if err != nil {
 		for _, path := range probePaths {
-			usage[path] = ProcessUsage{MetadataUnavailable: true}
+			usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: fmt.Sprintf("lsof target probe failed: %v", err)}
 		}
 		for _, path := range resolvedPaths[len(probePaths):] {
-			usage[path] = ProcessUsage{MetadataUnavailable: true}
+			usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: fmt.Sprintf("lsof target probe failed: %v", err)}
 		}
 	} else {
 		for path, entry := range openUsage {
@@ -763,6 +773,7 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 	if err != nil {
 		for path, entry := range usage {
 			entry.MetadataUnavailable = true
+			entry.MetadataCause = fmt.Sprintf("process list snapshot failed: %v", err)
 			usage[path] = entry
 		}
 		return usage, nil
@@ -771,22 +782,30 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 	if ownerErr != nil {
 		for path, entry := range usage {
 			entry.MetadataUnavailable = true
+			entry.MetadataCause = fmt.Sprintf("process owner snapshot failed: %v", ownerErr)
 			usage[path] = entry
 		}
 		return usage, ownerErr
 	}
+	var probeCauses []string
 	for _, pid := range allPIDs {
 		if processCtx.Err() != nil {
 			// An incomplete reference walk must never assert no owner:
 			// mark every entry's census unavailable, then propagate the
 			// cancellation to callers that check the error as well.
+			cause := fmt.Sprintf("reference walk stopped at budget after %d/%d pids: %v", pid, len(allPIDs), processCtx.Err())
 			for path, entry := range usage {
-				usage[path] = markMetadataUnavailable(entry, pid)
+				entry = markMetadataUnavailable(entry, pid)
+				entry.MetadataCause = cause
+				usage[path] = entry
 			}
 			return usage, processCtx.Err()
 		}
 		references, referenceErr := p.referencesManyProbe()(processCtx, pid, resolvedPaths, owners)
 		if referenceErr != nil {
+			if len(probeCauses) < maxMetadataCauses {
+				probeCauses = append(probeCauses, fmt.Sprintf("pid %d reference probe: %v", pid, referenceErr))
+			}
 			for path := range usage {
 				usage[path] = markMetadataUnavailable(usage[path], pid)
 			}
@@ -797,6 +816,21 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 			entry.ReferencedPath = entry.ReferencedPath || referenced
 			entry.PIDs = append(entry.PIDs, pid)
 			usage[path] = entry
+		}
+	}
+	if len(probeCauses) > 0 {
+		summary := fmt.Sprintf("%d per-pid reference probe error(s)", len(probeCauses))
+		if len(probeCauses) == maxMetadataCauses {
+			summary += " (sample truncated)"
+		}
+		for _, cause := range probeCauses {
+			summary += "; " + cause
+		}
+		for path, entry := range usage {
+			if entry.MetadataUnavailable {
+				entry.MetadataCause = summary
+				usage[path] = entry
+			}
 		}
 	}
 	for path, entry := range usage {
