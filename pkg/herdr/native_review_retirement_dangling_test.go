@@ -433,7 +433,12 @@ func TestNativeRetirementFenceRefusesTargetRecreationBeforeRemoval(t *testing.T)
 // alone cannot see: the string identity matches, but a different inode was
 // installed between authorization and removal. The inode-level SameFile
 // check must still refuse, and the replacement link (not the original) must
-// survive.
+// survive. The fixture renames the original link aside instead of unlinking
+// it: the renamed-aside name still holds the original inode, so the kernel
+// cannot hand that inode back to the replacement (PR812 CI on Linux showed
+// unlink+recreate can reuse the freed inode immediately, making an
+// unlink-based fixture unable to prove it installed a different inode at
+// all). The probe asserts that precondition before the removal action.
 func TestNativeRetirementFenceRefusesSameTargetInodeReplacementBeforeRemoval(t *testing.T) {
 	f := newDanglingFixture(t)
 	sameTarget, err := os.Readlink(f.surface)
@@ -441,12 +446,28 @@ func TestNativeRetirementFenceRefusesSameTargetInodeReplacementBeforeRemoval(t *
 		t.Fatal(err)
 	}
 	withFenceProbe(t, func() {
-		if err := os.Remove(f.surface); err != nil {
+		original, infoErr := os.Lstat(f.surface)
+		if infoErr != nil {
+			t.Error(infoErr)
+			return
+		}
+		aside := f.surface + ".original"
+		if err := os.Rename(f.surface, aside); err != nil {
 			t.Error(err)
 			return
 		}
 		if err := os.Symlink(sameTarget, f.surface); err != nil {
 			t.Error(err)
+			return
+		}
+		replacement, infoErr := os.Lstat(f.surface)
+		if infoErr != nil {
+			t.Error(infoErr)
+			return
+		}
+		if os.SameFile(original, replacement) {
+			t.Error("fixture precondition violated: replacement shares the original inode, so it cannot prove the inode fence")
+			return
 		}
 	})
 	err = f.op.RemoveWorktree(f.manifest)
