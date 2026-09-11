@@ -565,8 +565,16 @@ func main() {
 		}
 
 	case "broker":
-		if len(os.Args) > 2 && os.Args[2] == "ensure" {
-			runBrokerEnsure()
+		if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
+			switch os.Args[2] {
+			case "serve":
+				runBrokerServe()
+			case "ensure":
+				runBrokerEnsure()
+			default:
+				fmt.Fprintf(os.Stderr, "unknown broker subcommand '%s'\nSupported forms: herd broker [serve|ensure] [flags]\nRun 'herd broker serve -h' or 'herd broker ensure -h' for usage.\n", os.Args[2])
+				os.Exit(1)
+			}
 		} else {
 			runBrokerServe()
 		}
@@ -9597,6 +9605,10 @@ func runBrokerServe() {
 		args = args[1:]
 	}
 	fs.Parse(args)
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "herd broker: unexpected argument '%s'\nUsage: herd broker [serve] [--socket <path>]\nRun 'herd broker serve -h' for usage.\n", fs.Arg(0))
+		os.Exit(1)
+	}
 
 	root, err := canonicalHerdRoot()
 	if err != nil {
@@ -10513,6 +10525,10 @@ func runBrokerEnsure() {
 	fs := flag.NewFlagSet("broker ensure", flag.ExitOnError)
 	socketFlag := fs.String("socket", "", "unix socket path override")
 	fs.Parse(os.Args[3:])
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "herd broker ensure: unexpected argument '%s'\nUsage: herd broker ensure [--socket <path>]\nRun 'herd broker ensure -h' for usage.\n", fs.Arg(0))
+		os.Exit(1)
+	}
 	root, err := canonicalHerdRoot()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd broker ensure: %v\n", err)
