@@ -285,9 +285,13 @@ type CensusStage struct {
 	// ProbeCompleted and ProbeDeferred carry the real target-probe progress
 	// (targets whose scoped lsof evidence finished vs targets that received
 	// no evidence), so scanned counts cannot overstate completed probes.
-	ProbeCompleted int    `json:"probe_completed"`
-	ProbeDeferred  int    `json:"probe_deferred"`
-	Cause          string `json:"cause,omitempty"`
+	ProbeCompleted int `json:"probe_completed"`
+	ProbeDeferred  int `json:"probe_deferred"`
+	// CursorError carries a failed durable-cursor advance as a partial
+	// diagnostic: progress persistence broke (e.g. full disk) but the
+	// sweep and every eligibility decision are unaffected.
+	CursorError string `json:"cursor_error,omitempty"`
+	Cause       string `json:"cause,omitempty"`
 }
 
 type orphanCensusResult struct {
@@ -298,6 +302,10 @@ type orphanCensusResult struct {
 	// of every batched orphan lsof probe in this census.
 	ProbeCompleted int
 	ProbeDeferred  int
+	// CursorPersistErr records a failed durable-cursor advance as a partial
+	// diagnostic; the sweep itself stays successful and eligibility is
+	// unchanged.
+	CursorPersistErr string
 }
 
 // OrphanWorktree is an unregistered child of a repository-declared known lane
@@ -582,6 +590,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 		Name: "unregistered_orphan_census", DurationMS: g.sinceMS(orphanStart),
 		Scanned: len(orphanResult.Orphans), Deferred: orphanResult.Remaining,
 		ProbeCompleted: orphanResult.ProbeCompleted, ProbeDeferred: orphanResult.ProbeDeferred,
+		CursorError: orphanResult.CursorPersistErr,
 	}
 	if orphanErr != nil {
 		orphanStage.Cause = orphanErr.Error()
@@ -768,14 +777,20 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 		// the next sweep - even at the same wall-clock minute - continues
 		// after this window instead of re-reading it. A fully examined ring
 		// resets the cursor; a truncated sweep parks it after the window.
-		// Best-effort: a write failure only loses the optimization and the
-		// next run falls back to the time-bucket stride; it never changes
-		// any entry's eligibility.
+		// A persistence failure (e.g. a full disk) must not be silent: it
+		// is recorded as a partial diagnostic on the stage while the sweep
+		// itself stays successful, and it never changes any entry's
+		// eligibility.
 		next := 0
 		if rootTruncated {
 			next = start + candidates
 		}
-		g.storeOrphanCursor(root, next)
+		if cerr := g.storeOrphanCursor(root, next); cerr != nil {
+			if result.CursorPersistErr != "" {
+				result.CursorPersistErr += "; "
+			}
+			result.CursorPersistErr += fmt.Sprintf("orphan cursor advance for %s: %v", root, cerr)
+		}
 	}
 	sort.Slice(result.Orphans, func(i, j int) bool { return result.Orphans[i].Path < result.Orphans[j].Path })
 	return result, nil
@@ -808,13 +823,18 @@ func (g *Governor) orphanWindowStart(root string, entryCount int) int {
 // storeOrphanCursor persists the next window start for one orphan root.
 // Best-effort by design: a failed write only drops the progress optimization
 // (the next run falls back to the time-bucket stride); it must never fail
-// the census or alter any entry's eligibility decision.
-func (g *Governor) storeOrphanCursor(root string, next int) {
+// the census or alter any entry's eligibility decision. The failure is still
+// returned so the caller can record it as a partial diagnostic instead of
+// silently hiding broken progress persistence (e.g. a full disk).
+func (g *Governor) storeOrphanCursor(root string, next int) error {
 	path := g.orphanCursorPath(root)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
+		return fmt.Errorf("prepare cursor dir: %w", err)
 	}
-	_ = os.WriteFile(path, []byte(strconv.Itoa(next)), 0o600)
+	if err := os.WriteFile(path, []byte(strconv.Itoa(next)), 0o600); err != nil {
+		return fmt.Errorf("write cursor: %w", err)
+	}
+	return nil
 }
 
 // orphanCursorPath maps a resolved orphan root to a fixed per-root cursor

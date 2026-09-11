@@ -488,3 +488,66 @@ func seenOrphan(report GovernorReport, suffix string) bool {
 	}
 	return false
 }
+
+// A cursor-persistence failure (e.g. a full disk, or a stray file where the
+// cursor directory must go) must be recorded as a partial diagnostic on the
+// orphan stage, not silently swallowed. The sweep itself stays successful and
+// every entry's eligibility is unchanged. The parent-file conflict fails for
+// root and non-root alike, so the test is hermetic without uid games.
+func TestGovernorOrphanCursorPersistenceFailureIsRecordedNotSilent(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	g.Processes = batchOnlyProcessInspector{}
+	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	g.Policy.OrphanRoots = []string{root}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	for i := 0; i < 17; i++ {
+		orphan := filepath.Join(root, fmt.Sprintf("small-%02d", i))
+		if err := os.MkdirAll(orphan, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(orphan, "graph.db"), []byte("immutable"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Block the cursor DIRECTORY with a regular file: MkdirAll over an
+	// existing non-directory fails for any uid, including root.
+	cursorDir := filepath.Join(g.Policy.RepositoryRoot, ".herd", "governor", "orphan-cursors")
+	if err := os.MkdirAll(filepath.Dir(cursorDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cursorDir, []byte("blocker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	minute := int64(5000)
+	g.Now = func() time.Time { return time.Unix(minute*60, 0) }
+	report, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatalf("cursor persistence failure must not fail the sweep: %v", err)
+	}
+	if report.Error != "" {
+		t.Fatalf("sweep stays successful; failure is diagnostic only: %v", report.Error)
+	}
+	var orphanStage *CensusStage
+	for i := range report.Stages {
+		if report.Stages[i].Name == "unregistered_orphan_census" {
+			orphanStage = &report.Stages[i]
+		}
+	}
+	if orphanStage == nil {
+		t.Fatalf("orphan stage missing: %+v", report.Stages)
+	}
+	if !strings.Contains(orphanStage.CursorError, "orphan cursor advance") {
+		t.Fatalf("failed cursor advance must be recorded on the stage, got %q", orphanStage.CursorError)
+	}
+	// Eligibility unchanged: with 17 entries at limit 16 the fallback window
+	// still reports exactly 16 orphans, identical to a healthy-cursor run.
+	if len(report.Orphans) != 16 {
+		t.Fatalf("eligibility must be unchanged under cursor-persistence failure: %d orphans", len(report.Orphans))
+	}
+	for _, orphan := range report.Orphans {
+		if !strings.HasPrefix(filepath.Base(orphan.Path), "small-") {
+			t.Fatalf("unexpected orphan reported: %s", orphan.Path)
+		}
+	}
+}
