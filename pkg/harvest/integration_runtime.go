@@ -109,7 +109,12 @@ type RuntimeRetentionReport struct {
 	AllocatedBytesRemoved int64                   `json:"allocated_bytes_removed"`
 	Partial               bool                    `json:"partial"`
 	Reason                string                  `json:"reason,omitempty"`
-	Events                []RuntimeRetentionEvent `json:"events,omitempty"`
+	// HeldReasons counts each distinct cause that held a candidate back,
+	// keyed by the same reason string the journal records. Every hold has a
+	// known cause; without this the pass could only report that SOMETHING
+	// was held, which is indistinguishable from a defect in the pass.
+	HeldReasons map[string]int          `json:"held_reasons,omitempty"`
+	Events      []RuntimeRetentionEvent `json:"events,omitempty"`
 }
 
 // HerdRuntimeInstaller installs an already-built, exact landed Herdforge
@@ -853,6 +858,26 @@ func (r HerdRuntimeInstaller) retireRuntimeBackups(ctx context.Context, current,
 	return nil
 }
 
+// heldReasonSummary renders held causes as one bounded, deterministic
+// diagnostic: "held:<reason>=<count>" joined in ascending reason order. The
+// reason set is a fixed set of literals, so the result stays short, and the
+// ordering keeps an otherwise identical pass from rewriting the manifest.
+func heldReasonSummary(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, fmt.Sprintf("%s=%d", reason, counts[reason]))
+	}
+	return "held:" + strings.Join(parts, ",")
+}
+
 func (r HerdRuntimeInstaller) retireRuntimeBackupsWith(ctx context.Context, manifest RuntimeRetentionManifest, journalPath string, maxCandidates int, maxBytes int64, owner func(context.Context, string) (RuntimeOwnerStatus, error)) (RuntimeRetentionReport, error) {
 	var report RuntimeRetentionReport
 	dir := filepath.Join(r.Root, ".herd", "runtime-previous")
@@ -887,10 +912,19 @@ func (r HerdRuntimeInstaller) retireRuntimeBackupsWith(ctx context.Context, mani
 			return report, err
 		}
 		hold := func(reason string, protected bool) {
+			if strings.TrimSpace(reason) == "" {
+				reason = "unspecified"
+			}
 			if protected {
 				report.Protected++
 			} else {
 				report.Held++
+				// Only a non-protected hold leaves maintenance unresolved, so
+				// only these causes can explain the unresolved state.
+				if report.HeldReasons == nil {
+					report.HeldReasons = make(map[string]int, 4)
+				}
+				report.HeldReasons[reason]++
 			}
 			report.Events = append(report.Events, RuntimeRetentionEvent{At: time.Now().UTC(), Event: "held", Path: entry.Name(), Reason: reason})
 			if err := appendRuntimeRetentionEvent(journalPath, RuntimeRetentionEvent{At: time.Now().UTC(), Event: "held", Path: entry.Name(), Reason: reason}); err != nil {
@@ -991,6 +1025,13 @@ func (r HerdRuntimeInstaller) retireRuntimeBackupsWith(ctx context.Context, mani
 		if err := appendRuntimeRetentionEvent(journalPath, RuntimeRetentionEvent{At: time.Now().UTC(), Event: "removed", Path: entry.Name(), LogicalBytes: logical, AllocatedBytes: allocated, Readback: "absent"}); err != nil {
 			return report, err
 		}
+	}
+	// A budget, timeout, or error path already named itself and is the more
+	// urgent diagnostic, so it keeps precedence. Otherwise the holds are the
+	// whole story, and they always know why: report them instead of leaving
+	// the reason empty for a caller to relabel as unknown.
+	if report.Reason == "" {
+		report.Reason = heldReasonSummary(report.HeldReasons)
 	}
 	if err := appendRuntimeRetentionEvent(journalPath, RuntimeRetentionEvent{At: time.Now().UTC(), Event: "complete", Reason: report.Reason}); err != nil {
 		return report, err
