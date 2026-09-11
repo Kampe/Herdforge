@@ -3,12 +3,15 @@ package resources
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -397,4 +400,351 @@ func TestLsofNoMatchDistinguishesNamespaceDiagnostics(t *testing.T) {
 	noMatch(t, "exit 1", nil, []byte("lsof: WARNING: can't stat() mqueue file system /dev/mqueue"), false)
 	noMatch(t, "exit 1", []byte("p123\nf1\n"), nil, false)
 	noMatch(t, "exit 2", nil, nil, false)
+}
+
+// loggingLsof installs a fake lsof that records every invocation's argv.
+// A `+D` invocation is a per-target subtree descent; full-table mode is
+// `-nP -Ffnp` alone. table is emitted only in full-table mode so a
+// regression back into per-target spawning is observable, never silently
+// equivalent.
+func loggingLsof(t *testing.T, table string, failFullTable bool) (path string, argvLog func() []string) {
+	t.Helper()
+	dir := t.TempDir()
+	path = filepath.Join(dir, "lsof")
+	log := filepath.Join(dir, "argv.log")
+	fail := "0"
+	if failFullTable {
+		fail = "1"
+	}
+	script := "#!/bin/sh\n" +
+		"echo \"$*\" >> " + log + "\n" +
+		"for a in \"$@\"; do [ \"$a\" = \"+D\" ] && exit 9; done\n" +
+		"[ " + fail + " = 1 ] && exit 9\n" +
+		"[ -n \"$FAKE_LSOF_STDERR\" ] && printf '%s' \"$FAKE_LSOF_STDERR\" >&2\n" +
+		"printf '%s' \"$FAKE_LSOF_TABLE\"\nexit 0\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_LSOF_TABLE", table)
+	return path, func() []string {
+		data, err := os.ReadFile(log)
+		if err != nil {
+			return nil
+		}
+		trimmed := strings.TrimSpace(string(data))
+		if trimmed == "" {
+			return nil
+		}
+		return strings.Split(trimmed, "\n")
+	}
+}
+
+// Production worktree-reap calls InUseMany directly, with no governor to
+// hand down a captured population. Running the per-target +D chunks before
+// listProcessIDs left the process-list snapshot on an already-expired child
+// context and deferred every target. InUseMany must capture the shared
+// population ONCE up front and derive every target from that one capture,
+// with zero per-target descents.
+func TestInUseManySharesOneFullTableCaptureAcrossTargets(t *testing.T) {
+	writeSelfPS(t)
+	base := t.TempDir()
+	active := filepath.Join(base, "wt-active")
+	clean := filepath.Join(base, "wt-clean")
+	for _, dir := range []string{filepath.Join(active, "sub"), clean} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolve := func(path string) string {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Clean(resolved)
+	}
+	activeResolved, cleanResolved := resolve(active), resolve(clean)
+	table := fmt.Sprintf("p%d\nf3\nn%s\n", os.Getpid(), filepath.Join(activeResolved, "sub", "graph.db"))
+	lsof, argvLog := loggingLsof(t, table, false)
+	inspector := LSOFProcessInspector{
+		Executable: lsof, Timeout: 30 * time.Second,
+		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
+			references := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				references[path] = false
+			}
+			return references, nil
+		},
+	}
+	usage, err := inspector.InUseMany(context.Background(), []string{active, clean})
+	if err != nil {
+		t.Fatalf("bulk census must not hard-error: %v", err)
+	}
+	invocations := argvLog()
+	if len(invocations) != 1 {
+		t.Fatalf("multiple targets must share ONE full-table capture, got %d lsof invocation(s): %v", len(invocations), invocations)
+	}
+	if strings.Contains(invocations[0], "+D") || strings.TrimSpace(invocations[0]) != "-nP -Ffnp" {
+		t.Fatalf("the single capture must be full-table, not a per-target descent, got %q", invocations[0])
+	}
+	activeUsage, ok := usage[activeResolved]
+	if !ok || !activeUsage.OpenFile || activeUsage.MetadataUnavailable {
+		t.Fatalf("held target must read active from the shared table, got ok=%t usage=%+v", ok, activeUsage)
+	}
+	cleanUsage, ok := usage[cleanResolved]
+	if !ok || cleanUsage.MetadataUnavailable || cleanUsage.OpenFile || cleanUsage.CWD {
+		t.Fatalf("unheld target must stay definitively clean, got ok=%t usage=%+v", ok, cleanUsage)
+	}
+}
+
+// The legacy per-target fallback and its fail-closed semantics survive: when
+// no open-file table can be captured, targets are probed the old way and an
+// unobservable target stays unknown, never definitively clean.
+func TestInUseManyFallsBackFailClosedWithoutTable(t *testing.T) {
+	writeSelfPS(t)
+	base := t.TempDir()
+	targets := []string{filepath.Join(base, "a"), filepath.Join(base, "b")}
+	for _, dir := range targets {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lsof, argvLog := loggingLsof(t, "", true)
+	inspector := LSOFProcessInspector{
+		Executable: lsof, Timeout: 30 * time.Second,
+		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
+			references := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				references[path] = false
+			}
+			return references, nil
+		},
+	}
+	usage, err := inspector.InUseMany(context.Background(), targets)
+	if err != nil {
+		t.Fatalf("per-target probe failures are metadata, not batch errors: %v", err)
+	}
+	descents := 0
+	for _, invocation := range argvLog() {
+		if strings.Contains(invocation, "+D") {
+			descents++
+		}
+	}
+	if descents == 0 {
+		t.Fatalf("a failed table capture must still fall back to per-target +D probes, got %v", argvLog())
+	}
+	for _, target := range targets {
+		resolved, resolveErr := filepath.EvalSymlinks(target)
+		if resolveErr != nil {
+			t.Fatal(resolveErr)
+		}
+		entry, ok := usage[filepath.Clean(resolved)]
+		if !ok || !entry.MetadataUnavailable {
+			t.Fatalf("unobservable target %s must stay unknown, never clean, got ok=%t usage=%+v", target, ok, entry)
+		}
+	}
+}
+
+// InUseManyPopulation delegates to InUseMany exactly when the population is
+// nil or carries no PIDs. InUseMany must therefore never hand a PID-less
+// population back to it: that is an unbounded mutual recursion, and the
+// empty-population case has to terminate in the per-target path.
+func TestInUseManyDoesNotRecurseOnPIDLessPopulation(t *testing.T) {
+	writeSelfPS(t)
+	target := t.TempDir()
+	lsof := writeSilentLsofAndSelfPS(t)
+	inspector := LSOFProcessInspector{
+		Executable: lsof, Timeout: 30 * time.Second,
+		populationFn: func(context.Context) ([]int, map[int]int, error) {
+			return nil, map[int]int{}, nil
+		},
+		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
+			references := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				references[path] = false
+			}
+			return references, nil
+		},
+	}
+	if _, err := inspector.InUseMany(context.Background(), []string{target}); err != nil {
+		t.Fatalf("empty population must terminate in the per-target path: %v", err)
+	}
+}
+
+// A full-table capture that exits 0 while reporting an unknown or permission
+// diagnostic has produced a PARTIAL table, and a partial table read as
+// authoritative marks every omitted holder's target definitively unheld. The
+// per-target probes already treat such diagnostics as observation errors; the
+// capture must too — rejecting the table and deferring to those probes, which
+// then leave the target unknown rather than clean.
+func TestFullTableCaptureRejectsPartialTableDiagnostics(t *testing.T) {
+	writeSelfPS(t)
+	base := t.TempDir()
+	target := filepath.Join(base, "held")
+	if err := os.MkdirAll(filepath.Join(target, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved = filepath.Clean(resolved)
+	// The table OMITS the holder of this target, exactly as a truncated or
+	// permission-limited capture would.
+	lsof, argvLog := loggingLsof(t, fmt.Sprintf("p%d\nf3\nn/usr/lib/dyld\n", os.Getpid()), false)
+	t.Setenv("FAKE_LSOF_STDERR", "lsof: WARNING: can't stat() nfs file system /mnt/vol\n      Output information may be incomplete.")
+	inspector := LSOFProcessInspector{
+		Executable: lsof, Timeout: 30 * time.Second,
+		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
+			references := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				references[path] = false
+			}
+			return references, nil
+		},
+	}
+	usage, err := inspector.InUseMany(context.Background(), []string{target})
+	if err != nil {
+		t.Fatalf("a rejected capture defers to the per-target probes, it is not a batch error: %v", err)
+	}
+	descents := 0
+	for _, invocation := range argvLog() {
+		if strings.Contains(invocation, "+D") {
+			descents++
+		}
+	}
+	if descents == 0 {
+		t.Fatalf("a diagnosed partial table must be rejected in favour of per-target probes, got %v", argvLog())
+	}
+	entry, ok := usage[resolved]
+	if !ok || !entry.MetadataUnavailable {
+		t.Fatalf("a target observed only through a diagnosed partial table must stay unknown, got ok=%t usage=%+v", ok, entry)
+	}
+}
+
+// The allowlist must not widen: the two known WSL warnings with their
+// continuation lines are still an ordinary success, so an active target is
+// still protected and a clean target stays decidable.
+func TestFullTableCaptureAcceptsKnownWSLWarnings(t *testing.T) {
+	writeSelfPS(t)
+	base := t.TempDir()
+	active := filepath.Join(base, "wt-active")
+	clean := filepath.Join(base, "wt-clean")
+	for _, dir := range []string{filepath.Join(active, "sub"), clean} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolve := func(path string) string {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Clean(resolved)
+	}
+	activeResolved, cleanResolved := resolve(active), resolve(clean)
+	table := fmt.Sprintf("p%d\nf3\nn%s\n", os.Getpid(), filepath.Join(activeResolved, "sub", "graph.db"))
+	lsof, argvLog := loggingLsof(t, table, false)
+	t.Setenv("FAKE_LSOF_STDERR", "lsof: WARNING: can't stat() mqueue file system /dev/mqueue\n      Output information may be incomplete.")
+	inspector := LSOFProcessInspector{
+		Executable: lsof, Timeout: 30 * time.Second,
+		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
+			references := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				references[path] = false
+			}
+			return references, nil
+		},
+	}
+	usage, err := inspector.InUseMany(context.Background(), []string{active, clean})
+	if err != nil {
+		t.Fatalf("known warnings are not an error: %v", err)
+	}
+	for _, invocation := range argvLog() {
+		if strings.Contains(invocation, "+D") {
+			t.Fatalf("known warnings must not reject the table, got per-target descent %q", invocation)
+		}
+	}
+	if entry := usage[activeResolved]; !entry.OpenFile || entry.MetadataUnavailable {
+		t.Fatalf("held target must still read active, got %+v", entry)
+	}
+	if entry := usage[cleanResolved]; entry.MetadataUnavailable || entry.OpenFile || entry.CWD {
+		t.Fatalf("unheld target must stay definitively clean, got %+v", entry)
+	}
+}
+
+// Every other lsof invocation is bounded by the probe knob. The full-table
+// capture took its deadline solely from the caller's context, and InUseMany
+// is a public entry point that callers do reach with context.Background():
+// a stuck lsof then runs with nothing to stop it. The capture must respect an
+// outer deadline when there is one and impose a finite fallback when there is
+// not, and it must not leave the child behind either way.
+func TestFullTableCaptureBoundsAnUnboundedParentContext(t *testing.T) {
+	hangingLsof := func(t *testing.T) (string, func() int) {
+		t.Helper()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "lsof-hang")
+		pidFile := filepath.Join(dir, "lsof.pid")
+		// exec replaces the shell, so the recorded pid IS the sleeping
+		// process: killing the command kills exactly this pid, and a leak
+		// is observable rather than hidden behind a shell wrapper.
+		script := "#!/bin/sh\necho $$ > " + pidFile + "\nexec sleep 10\n"
+		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path, func() int {
+			data, err := os.ReadFile(pidFile)
+			if err != nil {
+				return 0
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				return 0
+			}
+			return pid
+		}
+	}
+	assertBounded := func(t *testing.T, name string, insp LSOFProcessInspector, ctx context.Context, childPID func() int) {
+		t.Helper()
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			_, err := insp.captureOpenFiles(ctx)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s: a capture that never produced a table must fail, not succeed", name)
+			}
+			t.Logf("%s: bounded after %s: %v", name, time.Since(start), err)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: captureOpenFiles never returned — the capture is unbounded and leaves lsof running", name)
+		}
+		pid := childPID()
+		if pid == 0 {
+			t.Fatalf("%s: fake lsof never recorded its pid", name)
+		}
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+			if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("%s: fake lsof pid %d still running — the bounded capture leaked its child", name, pid)
+	}
+
+	// No outer deadline at all: the probe knob must bound it.
+	noDeadlineLsof, noDeadlinePID := hangingLsof(t)
+	assertBounded(t, "background parent",
+		LSOFProcessInspector{Executable: noDeadlineLsof, Timeout: 300 * time.Millisecond},
+		context.Background(), noDeadlinePID)
+
+	// An outer deadline is still authoritative, including when it is far
+	// shorter than the knob.
+	outerLsof, outerPID := hangingLsof(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	assertBounded(t, "outer deadline",
+		LSOFProcessInspector{Executable: outerLsof, Timeout: time.Hour},
+		ctx, outerPID)
 }

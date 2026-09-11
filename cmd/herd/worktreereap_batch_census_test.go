@@ -293,3 +293,42 @@ func TestRetireLandedBatchRefusesCleanEntryWhenBatchErrored(t *testing.T) {
 		t.Fatal("refused census deleted the worktree")
 	}
 }
+
+// The batched census budget must reach the inspector as a real deadline, and
+// must be the whole set's budget rather than the per-probe two-second knob,
+// which the shared population capture could not finish inside on a loaded
+// host — leaving the census deferring every target.
+func TestRetireLandedBatchCensusCarriesBoundedBudget(t *testing.T) {
+	root := t.TempDir()
+	runGitT(t, root, "init", "-q", "-b", "main", ".")
+	runGitT(t, root, "config", "user.email", "t@t")
+	runGitT(t, root, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, root, "add", ".")
+	runGitT(t, root, "commit", "-qm", "base")
+	lane := reapBatchWorktree(t, root, "wt-budget")
+	var remaining time.Duration
+	var hadDeadline bool
+	insp := &reapBatchInspectorFunc{fn: func(ctx context.Context, paths []string) (map[string]resources.ProcessUsage, error) {
+		deadline, ok := ctx.Deadline()
+		hadDeadline = ok
+		remaining = time.Until(deadline)
+		usage := make(map[string]resources.ProcessUsage, len(paths))
+		for _, p := range paths {
+			usage[p] = resources.ProcessUsage{}
+		}
+		return usage, nil
+	}}
+	retireLandedWithInspector(root, []reapRow{lane}, insp)
+	if !hadDeadline {
+		t.Fatal("the batch census must be bounded: an unbounded owner census can hang the act")
+	}
+	if remaining != batchCensusBudget && (remaining > batchCensusBudget || remaining < batchCensusBudget-2*time.Second) {
+		t.Fatalf("the batch census must carry the whole-set budget %s, got %s remaining", batchCensusBudget, remaining)
+	}
+	if batchCensusBudget < 10*time.Second {
+		t.Fatalf("a batch budget of %s cannot fund one shared population capture on a loaded host (apply 2731 failed at 2s)", batchCensusBudget)
+	}
+}

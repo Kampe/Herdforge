@@ -521,8 +521,27 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	report.Stages = append(report.Stages, statfsStage)
 	report.CapacityBefore, report.CapacityAfter = before, before
 
+	// Phase-budget split: the registered census (worktree list, batch
+	// probes, allocation walks) gets a deadline at 4/5 of the remaining
+	// budget, so the unregistered-orphan phase normally inherits a live
+	// deadline instead of failing immediately after the registered phase
+	// consumed the whole budget. It is a deadline the phase observes at its
+	// own checkpoints, not a hard wall-clock cap: see the lane loop.
+	registeredCtx := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		total := time.Until(dl)
+		if total > 0 {
+			// WithDeadline returns (ctx, CancelFunc): a past deadline is an
+			// already-expired child, which is exactly a fully-consumed
+			// registered phase.
+			rctx, rctxCancel := context.WithDeadline(ctx, g.now().Add(total*4/5))
+			defer rctxCancel()
+			registeredCtx = rctx
+		}
+	}
+
 	listStart := g.now()
-	lanes, listErr := g.Worktrees.List(ctx, g.Policy.RepositoryRoot, g.Policy.BaseRef)
+	lanes, listErr := g.Worktrees.List(registeredCtx, g.Policy.RepositoryRoot, g.Policy.BaseRef)
 	listStage := CensusStage{Name: "registered_census", DurationMS: g.sinceMS(listStart)}
 	if listErr != nil {
 		listStage.Cause = listErr.Error()
@@ -538,7 +557,9 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 		listStage.ProbeCompleted = g.ProbeStats.Completed
 		listStage.ProbeDeferred = g.ProbeStats.Deferred
 	}
-	report.Stages = append(report.Stages, listStage)
+	// The stage is appended exactly once, AFTER the lane loop, so loop
+	// findings (unknown lanes, duplicate realpath refusal) land on the same
+	// single record.
 	seen := make(map[string]struct{}, len(lanes))
 	unknownLanes := 0
 	for i := range lanes {
@@ -558,6 +579,27 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			return report, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
 		}
 		seen[lanes[i].Path] = struct{}{}
+		// The allocation walk is an unbounded fs descent and Measure takes
+		// no context, so this check bounds the lanes that FOLLOW, not the
+		// call in flight: one pathological lane can still overrun the
+		// registered budget. What it does buy is that a long lane list no
+		// longer consumes the orphan phase's budget wholesale. Lanes left
+		// unmeasured stay fail-closed unknown, never reap-eligible.
+		if registeredCtx.Err() != nil {
+			cause := fmt.Sprintf("census budget exhausted before lane %d/%d: %v", i+1, len(lanes), registeredCtx.Err())
+			if listStage.Cause == "" {
+				listStage.Cause = cause
+			}
+			for j := i; j < len(lanes); j++ {
+				if lanes[j].State == LaneUnknown {
+					continue
+				}
+				lanes[j].State = LaneUnknown
+				lanes[j].PreserveReason = "census_budget_exhausted"
+				unknownLanes++
+			}
+			break
+		}
 		usage, measureErr := g.Measure.Measure(lanes[i].Path, g.registeredMeasureLimit())
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
