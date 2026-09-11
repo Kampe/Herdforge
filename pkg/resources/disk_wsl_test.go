@@ -1063,19 +1063,22 @@ func TestWSLProductionRegressionPhysicalBoundIgnoredMustBeRED(t *testing.T) {
 }
 
 func TestOSBackendWSLPhysicalBoundProductionRegressionRED(t *testing.T) {
-	// Directly tests production OSBackend.StatFS in a WSL environment.
-	// When the production code includes boundWSLCapacity, StatFS caps FreeBytes to the host volume (14.3 GB).
-	// Under the regression (bypassing boundWSLCapacity in OSBackend.StatFS), StatFS returns uncapped guest FreeBytes (776 GB).
+	// Exercises the real OSBackend.StatFS -> boundWSLCapacity wiring in a WSL
+	// environment with SYNTHETIC guest and host capacities (FAC-810), so the
+	// assertions hold on every host regardless of live disk space. When the
+	// production code includes boundWSLCapacity, StatFS caps FreeBytes to
+	// min(guest, host). Under the regression (bypassing boundWSLCapacity in
+	// OSBackend.StatFS), StatFS returns the raw guest FreeBytes.
 
 	oldOverride := wslDetectionOverride
 	oldMounts := wslProcMountsReader
 	oldReg := wslRegistryQueryExecutor
-	oldStatFS := wslDriveStatFS
+	oldHost := wslDriveStatFS
 	defer func() {
 		wslDetectionOverride = oldOverride
 		wslProcMountsReader = oldMounts
 		wslRegistryQueryExecutor = oldReg
-		wslDriveStatFS = oldStatFS
+		wslDriveStatFS = oldHost
 	}()
 
 	isWSL := true
@@ -1089,28 +1092,82 @@ func TestOSBackendWSLPhysicalBoundProductionRegressionRED(t *testing.T) {
 	}
 	t.Setenv("WSL_DISTRO_NAME", "Debian") // Backed by C:
 
-	// Physical Windows C: drive has 14,308,425,728 bytes free
+	const hostFree = uint64(14308425728)
+	const hostTotal = uint64(1000000000000)
 	wslDriveStatFS = func(ctx context.Context, mountPath string) (Capacity, error) {
 		return Capacity{
 			FilesystemID: "host:c",
-			TotalBytes:   1000000000000,
-			FreeBytes:    14308425728,
+			TotalBytes:   hostTotal,
+			FreeBytes:    hostFree,
 			TotalInodes:  5000000,
 			FreeInodes:   4000000,
 		}, nil
 	}
 
-	cap, err := (OSBackend{}).StatFS(".")
-	if err != nil {
-		t.Fatalf("StatFS failed: %v", err)
+	cases := []struct {
+		name       string
+		guest      Capacity
+		probeErr   error
+		wantFree   uint64
+		wantTotal  uint64
+		wantErr    bool
+		regression bool
+	}{
+		{
+			name:       "guest above host is capped to host free bytes",
+			guest:      Capacity{FilesystemID: "guest", TotalBytes: 776000000000, FreeBytes: 776000000000, TotalInodes: 5000000, FreeInodes: 4000000},
+			wantFree:   hostFree,
+			wantTotal:  776000000000,
+			regression: true,
+		},
+		{
+			name:      "guest below host keeps guest free bytes",
+			guest:     Capacity{FilesystemID: "guest", TotalBytes: 20000000000, FreeBytes: 5000000000, TotalInodes: 5000000, FreeInodes: 4000000},
+			wantFree:  5000000000,
+			wantTotal: 20000000000,
+		},
+		{
+			name:      "zero guest free stays zero",
+			guest:     Capacity{FilesystemID: "guest", TotalBytes: 20000000000, FreeBytes: 0, TotalInodes: 5000000, FreeInodes: 0},
+			wantFree:  0,
+			wantTotal: 20000000000,
+		},
+		{
+			name:     "guest probe error fails closed",
+			probeErr: errors.New("guest probe unavailable"),
+			wantErr:  true,
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := withGuestStatFSProbe(func(path string) (Capacity, error) {
+				if tc.probeErr != nil {
+					return Capacity{}, tc.probeErr
+				}
+				return tc.guest, nil
+			})
+			t.Cleanup(restore)
 
-	// In WSL, guest FreeBytes must be capped to host FreeBytes (14.3 GB), never uncapped guest free
-	if cap.FreeBytes > 14308425728 {
-		t.Fatalf("REGRESSION DETECTED: OSBackend.StatFS returned uncapped free bytes %d > host free bytes 14308425728", cap.FreeBytes)
-	}
-	if cap.FreeBytes != 14308425728 {
-		t.Fatalf("expected FreeBytes = 14308425728, got %d", cap.FreeBytes)
+			cap, err := (OSBackend{}).StatFS(".")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected guest probe error to fail closed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("StatFS failed: %v", err)
+			}
+			if tc.regression && cap.FreeBytes > hostFree {
+				t.Fatalf("REGRESSION DETECTED: OSBackend.StatFS returned uncapped free bytes %d > host free bytes %d", cap.FreeBytes, hostFree)
+			}
+			if cap.FreeBytes != tc.wantFree {
+				t.Fatalf("expected FreeBytes = %d, got %d", tc.wantFree, cap.FreeBytes)
+			}
+			if cap.TotalBytes != tc.wantTotal {
+				t.Fatalf("expected TotalBytes = %d, got %d", tc.wantTotal, cap.TotalBytes)
+			}
+		})
 	}
 }
 

@@ -15,7 +15,7 @@ func (OSBackend) StatFS(path string) (Capacity, error) {
 	if osBackendStatFSOverride != nil {
 		return osBackendStatFSOverride(path)
 	}
-	cap, err := statFSUnix(path)
+	cap, err := guestStatFSProbe(path)
 	if err != nil {
 		return Capacity{}, err
 	}
