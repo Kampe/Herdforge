@@ -51,20 +51,78 @@ func NewSQLiteLeaseStore(path string) (*SQLiteLeaseStore, error) {
 }
 
 // OpenSQLiteLeaseStoreReadOnly opens canonical lease evidence without creating
-// the database or running migrations. Census and reaping callers must never
-// turn missing authority into a write or a disposable lane.
+// the database or running migrations. It rejects non-regular paths and pings
+// the read-only connection so unavailable authority remains a hard error.
 func OpenSQLiteLeaseStoreReadOnly(path string) (*SQLiteLeaseStore, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("read-only lease store path is required")
 	}
-	if _, err := os.Stat(path); err != nil {
-		return nil, err
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat lease store: %w", err)
 	}
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(1000)", path))
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("lease store is not a regular file")
+	}
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(10000)", path))
 	if err != nil {
 		return nil, fmt.Errorf("open read-only lease store: %w", err)
 	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping read-only lease store: %w", err)
+	}
 	return &SQLiteLeaseStore{db: db}, nil
+}
+
+// WithSQLiteLeaseObservation serializes a read-only recovery observation with
+// lease writers. BEGIN IMMEDIATE acquires SQLite's existing authority lock;
+// the callback is run while that lock is held and no lease row is changed.
+// The transaction is rolled back after the callback, so publication can be
+// coupled to the exact lease snapshot without allowing release/reissue in
+// between. Missing stores are rejected without creation or migration.
+func WithSQLiteLeaseObservation(ctx context.Context, path string, key LeaseKey, leaseID int64, fn func(*Lease) error) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat lease store: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("lease store is not a regular file")
+	}
+	dsn := fmt.Sprintf("file:%s?mode=rw&_pragma=busy_timeout(10000)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open lease observation: %w", err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("connect lease observation: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("lock lease authority for observation: %w", err)
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	lease, err := scanLease(conn.QueryRowContext(ctx, `SELECT `+leaseColumns+` FROM leases WHERE repo=? AND provider=? AND project=? AND task_ref=? AND id=?`, key.Repo, key.Provider, key.Project, key.TaskRef, leaseID))
+	if err == sql.ErrNoRows {
+		lease = nil
+	} else if err != nil {
+		return fmt.Errorf("read exact lease observation: %w", err)
+	}
+	if err := fn(lease); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return fmt.Errorf("release lease observation lock: %w", err)
+	}
+	rollback = false
+	return nil
 }
 
 func (s *SQLiteLeaseStore) Close() error { return s.db.Close() }

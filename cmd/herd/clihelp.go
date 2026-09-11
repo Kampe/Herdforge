@@ -133,7 +133,7 @@ var subcommandUsage = map[string]string{
 	"no-claude":        "Usage: herd no-claude <on|off|status>\n  Legacy alias for herd posture no-claude.",
 	"park":             "Usage: herd park park <slug> <sha> -m <message> | list [--json]\n  Make parked work durable and auditable.",
 	"quota-supervisor": "Usage: herd quota-supervisor [flags]\n  Convert quota and process evidence into surface concurrency caps.",
-	"receipt":          "Usage: herd receipt <issue|recover|release> [flags]\n  Issue, recover, or release signed task receipts.",
+	"receipt":          "Usage: herd receipt <issue|recover|release> [flags]\n  Issue, recover, or release signed task receipts.\n  recover requires --provider-type --project-id --repository --task-id --branch --base-sha --candidate-sha\n           --lease-id --lease-generation --lease-task-ref and role=recovery; --session-id is optional and ambiguity-safe.",
 	"review-classify":  "Usage: herd review-classify <branch> [--tier R0|R1|R2|R3] [--pin SHA] [--json]\n  Classify candidate risk before review dispatch.",
 	"launch-record":    "Usage: herd launch-record --lane <name> --cwd <worktree> --provider <p> [--model <m>]\n  Record that a lane was launched with a provider on a worktree, so the commits\n  it produces have provable authorship. Refuses a provider that maps to no vendor\n  family, and refuses a detached worktree with no branch to join commits through.",
 	"verdict-harvest":  "Usage: herd verdict-harvest [--remote origin] [--dry-run]\n  Pull verdict artifacts other hosts pushed into the local inbox. Never overwrites\n  a local artifact, so an already-ingested verdict cannot be resurrected.",
