@@ -1,33 +1,51 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// brokerArgsSentinelEnv runs the herd binary with cwd set to the supplied
-// non-git temporary directory, so any code path that survives argument
-// validation deterministically exits at canonicalHerdRoot before touching
-// config, provider, socket, or process state. The sentinel file at the
-// socket override path proves no broker startup ever mutated it.
-func brokerArgsSentinelEnvIn(t *testing.T, dir string) (sentinel string, env []string) {
+// brokerArgsTimeout bounds every child run: if argument validation ever
+// regresses far enough to start serving, the context terminates the child
+// instead of hanging the suite, and the test fails on the timeout.
+const brokerArgsTimeout = 60 * time.Second
+
+// brokerArgsEnv execs the herd binary with cwd in the supplied non-git
+// temporary directory and a fully sanitized environment: inherited git,
+// herd root, and broker variables are dropped so the fixture cannot resolve
+// live canonical state, and the only socket override is the sentinel path.
+// Any code path that survives argument validation therefore exits
+// deterministically at canonicalHerdRoot (git common dir lookup) before
+// touching config, provider, socket, or process state.
+func brokerArgsEnvIn(t *testing.T, dir string) (sentinel string, env []string) {
 	t.Helper()
 	sentinel = filepath.Join(dir, "sentinel.sock")
 	if err := os.WriteFile(sentinel, []byte("sentinel-body"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return sentinel, append(os.Environ(), "HERD_BROKER_SOCK="+sentinel)
+	return sentinel, []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=" + dir,
+		"HERD_BROKER_SOCK=" + sentinel,
+	}
 }
 
 func runBrokerArgsCase(t *testing.T, dir string, env []string, args ...string) (string, int) {
 	t.Helper()
-	cmd := exec.Command(buildHerd(t), args...)
+	ctx, cancel := context.WithTimeout(context.Background(), brokerArgsTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, buildHerd(t), args...)
 	cmd.Dir = dir
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("herd %v: exceeded %s — argument validation failed to stop before broker startup\n%s", args, brokerArgsTimeout, out)
+	}
 	code := 0
 	if err != nil {
 		exitErr, ok := err.(*exec.ExitError)
@@ -63,7 +81,7 @@ func TestBrokerArgsRejectsUnknownSubcommands(t *testing.T) {
 	}
 	for _, tc := range cases {
 		dir := t.TempDir()
-		sentinel, env := brokerArgsSentinelEnvIn(t, dir)
+		sentinel, env := brokerArgsEnvIn(t, dir)
 		out, code := runBrokerArgsCase(t, dir, env, tc...)
 		if code == 0 {
 			t.Fatalf("herd %v: exit 0, want nonzero\n%s", tc, out)
@@ -78,16 +96,15 @@ func TestBrokerArgsRejectsUnknownSubcommands(t *testing.T) {
 // TestBrokerArgsRejectsExtraPositionals covers positional arguments before
 // and after valid flags on both serve and ensure paths.
 func TestBrokerArgsRejectsExtraPositionals(t *testing.T) {
-	cases := [][]string{
+	for _, tc := range [][]string{
 		{"broker", "serve", "extra"},
-		{"broker", "serve", "--socket", "/tmp/x.sock", "extra"},
-		{"broker", "--socket", "/tmp/x.sock", "extra"},
+		{"broker", "serve", "--socket", filepath.Join(t.TempDir(), "x.sock"), "extra"},
+		{"broker", "--socket", filepath.Join(t.TempDir(), "x.sock"), "extra"},
 		{"broker", "ensure", "extra"},
-		{"broker", "ensure", "--socket", "/tmp/x.sock", "extra"},
-	}
-	for _, tc := range cases {
+		{"broker", "ensure", "--socket", filepath.Join(t.TempDir(), "x.sock"), "extra"},
+	} {
 		dir := t.TempDir()
-		sentinel, env := brokerArgsSentinelEnvIn(t, dir)
+		sentinel, env := brokerArgsEnvIn(t, dir)
 		out, code := runBrokerArgsCase(t, dir, env, tc...)
 		if code == 0 {
 			t.Fatalf("herd %v: exit 0, want nonzero\n%s", tc, out)
@@ -101,26 +118,30 @@ func TestBrokerArgsRejectsExtraPositionals(t *testing.T) {
 
 // TestBrokerArgsPreservesDocumentedForms proves valid invocation forms keep
 // their routing: bare broker, broker serve, broker ensure, and flags resolve
-// to the serve/ensure paths (no unknown-subcommand rejection). The non-git
-// cwd stops every path at canonicalHerdRoot with a generic root error, so no
-// server starts and no socket is touched.
+// to the serve/ensure paths and stop at the canonical-root lookup. Requiring
+// the git-common-dir failure signature pins the INTENDED stop point, so an
+// unrelated parser regression that rejects valid forms cannot pass. The
+// non-git cwd keeps every path before any server start or socket mutation.
 func TestBrokerArgsPreservesDocumentedForms(t *testing.T) {
-	cases := [][]string{
+	for _, tc := range [][]string{
 		{"broker"},
 		{"broker", "serve"},
-		{"broker", "--socket", "/tmp/x.sock"},
+		{"broker", "--socket", filepath.Join(t.TempDir(), "x.sock")},
 		{"broker", "ensure"},
-	}
-	for _, tc := range cases {
+	} {
 		dir := t.TempDir()
-		_, env := brokerArgsSentinelEnvIn(t, dir)
+		sentinel, env := brokerArgsEnvIn(t, dir)
 		out, code := runBrokerArgsCase(t, dir, env, tc...)
 		if code == 0 {
-			t.Fatalf("herd %v: expected the generic hereditary root error in a non-git cwd, got exit 0\n%s", tc, out)
+			t.Fatalf("herd %v: expected the canonical-root error in a non-git cwd, got exit 0\n%s", tc, out)
+		}
+		if !strings.Contains(out, "git common dir") {
+			t.Fatalf("herd %v: did not stop at the canonical-root lookup (misrouted or rejected):\n%s", tc, out)
 		}
 		if strings.Contains(out, "unknown broker subcommand") || strings.Contains(out, "unexpected argument") {
 			t.Fatalf("herd %v: documented form rejected: %s", tc, out)
 		}
+		assertSentinelUntouched(t, sentinel)
 	}
 }
 
@@ -133,7 +154,7 @@ func TestBrokerArgsHelpPreserved(t *testing.T) {
 		{"broker", "ensure", "-h"},
 	} {
 		dir := t.TempDir()
-		_, env := brokerArgsSentinelEnvIn(t, dir)
+		_, env := brokerArgsEnvIn(t, dir)
 		out, code := runBrokerArgsCase(t, dir, env, tc...)
 		if code != 0 {
 			t.Fatalf("herd %v: help exit %d, want 0\n%s", tc, code, out)
