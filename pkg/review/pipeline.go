@@ -18,6 +18,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvest"
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -332,6 +333,20 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		// therefore individually bounded: a pathological object is reported by
 		// name instead of silently starving every remaining tip.
 		merged, probeErr := harvest.ContentMerged(itemCtx, d.RepoRoot, "origin/main", sha)
+		// FAC-805 (drain side): harvest.ContentMerged is git cherry-pick
+		// equivalence over a SINGLE tip, which cannot survive a squash merge --
+		// the reviewed range's per-commit patches are gone, replaced by one
+		// combined patch on main, so cherry reports every original commit
+		// unique forever. Native worktree retirement already proves this
+		// correctly with a whole-range proof; only ask it when the cheap
+		// per-commit check found nothing and there is still budget left, so
+		// this stays a targeted recheck of one already-suspect tip rather than
+		// a speculative range walk added to every poll.
+		if probeErr == nil && !merged && itemCtx.Err() == nil {
+			if rangeMerged, _ := rangeContentMerged(d.RepoRoot, "origin/main", sha); rangeMerged {
+				merged = true
+			}
+		}
 		// Read the per-item deadline state BEFORE cancelling it. cancel() sets
 		// Err() to Canceled, so checking after cancel reports every fast
 		// failure as a timeout -- which misclassified unprobeable objects as
@@ -562,6 +577,48 @@ func gitOut(ctx context.Context, dir string, args ...string) (string, error) {
 	c.Dir = dir
 	b, e := c.Output()
 	return string(b), e
+}
+
+// rangeContentMerged asks whether sha's reviewed range is on mainRef using
+// the same whole-range landing proof FAC-805 already trusts for native
+// worktree retirement (mergeadmit.ProveEquivalentLanded), instead of
+// reimplementing its ordered-patch, squash-range, and combined-replay
+// matching here (pkg/invariant's duplicate-rule gate rejects a second
+// definition of the same primitive).
+//
+// A proof alone only shows the range landed at SOME point; main may have
+// since reverted it. Current-tip containment is required too: replaying the
+// base..sha delta onto mainRef's own tree with the native merge-tree
+// primitive must reproduce that tree exactly, or the "merge" is stale.
+//
+// Any resolution, proof, or containment failure returns (false, nil): this
+// can only ever ADD a merged verdict to a tip harvest.ContentMerged already
+// called unmerged, never remove that fail-closed default. A candidate that
+// still holds unique or reverted content simply fails every match here and
+// falls through unchanged.
+func rangeContentMerged(repoRoot, mainRef, sha string) (bool, error) {
+	mbOut, err := exec.Command("git", "-C", repoRoot, "merge-base", mainRef, sha).Output()
+	if err != nil {
+		return false, nil
+	}
+	mergeBase := strings.TrimSpace(string(mbOut))
+	if _, err := mergeadmit.ProveEquivalentLanded(repoRoot, mergeadmit.ProofRequest{
+		BaseSHA:      mergeBase,
+		CandidateSHA: sha,
+		LandedSHA:    mainRef,
+	}); err != nil {
+		return false, nil
+	}
+	tipOut, err := exec.Command("git", "-C", repoRoot, "rev-parse", "--verify", "-q", mainRef+"^{tree}").Output()
+	if err != nil {
+		return false, nil
+	}
+	tipTree := strings.TrimSpace(string(tipOut))
+	replayed, err := mergeadmit.ReplayTree(repoRoot, mergeBase, mainRef, sha)
+	if err != nil || strings.TrimSpace(replayed) != tipTree {
+		return false, nil
+	}
+	return true, nil
 }
 
 var mergeTreeCache sync.Map
