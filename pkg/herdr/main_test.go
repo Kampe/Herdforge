@@ -10,7 +10,7 @@ import (
 
 func TestMain(m *testing.M) {
 	laneenv.Strip()
-	restore, err := laneenv.IsolateDefaultSlotDir()
+	restore, err := laneenv.Isolate()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "isolate test heavy-phase slots: %v\n", err)
 		os.Exit(1)

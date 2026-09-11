@@ -14,7 +14,7 @@ import (
 // fleet state. Tests that need either value must set it explicitly.
 func TestMain(m *testing.M) {
 	laneenv.Strip()
-	restore, err := laneenv.IsolateDefaultSlotDir()
+	restore, err := laneenv.Isolate()
 	if err != nil {
 		os.Exit(1)
 	}

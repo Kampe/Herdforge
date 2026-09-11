@@ -43,6 +43,13 @@ var Vars = []string{
 	"HERD_HEAVY_PHASE_SLOT_HELD",
 	"HERD_MODE",
 	"HERD_USE_PI",
+	// FAC-613: family posture is inherited the same way. HERD_CLAUDE_ONLY /
+	// HERD_NO_CLAUDE are single-invocation overrides and HERD_FAMILY_POSTURE
+	// repoints the durable JSON authority; all three reach pkg/posture.Effective,
+	// which every route/resolve/dispatch entry point consults.
+	"HERD_CLAUDE_ONLY",
+	"HERD_NO_CLAUDE",
+	"HERD_FAMILY_POSTURE",
 }
 
 // Prefixes are cleared wholesale: HERDR_* is pane metadata injected by the
@@ -101,32 +108,77 @@ func Leaked() []string {
 	return found
 }
 
-const nestedSlotDirVar = "HERD_HEAVY_PHASE_SLOT_DIR"
+const (
+	nestedSlotDirVar = "HERD_HEAVY_PHASE_SLOT_DIR"
+	stateDirVar      = "HERD_STATE_DIR"
+)
 
-// IsolateDefaultSlotDir points slot.Default at a private directory so
-// in-process tests that Strip the re-entrancy marker cannot wait on a parent
-// managed-verifier host slot. Runtime temp paths are not written into the
-// repository.
+// Isolate redirects the host-owned durable state a test process would otherwise
+// share with the operator, and returns one restore for all of it.
 //
-// The returned restore removes the directory and puts HERD_HEAVY_PHASE_SLOT_DIR
-// back to its previous state. TestMain must call restore before os.Exit;
-// process exit skips defers, including after a failing m.Run.
-func IsolateDefaultSlotDir() (restore func(), err error) {
+//   - HERD_HEAVY_PHASE_SLOT_DIR points slot.Default at a private directory so
+//     in-process tests that Strip the re-entrancy marker cannot wait on a parent
+//     managed-verifier host slot.
+//   - HERD_STATE_DIR points pkg/posture (family posture JSON *and* its legacy
+//     sentinels), pkg/boardfreeze and pkg/lifecycle lane state at a private
+//     directory.
+//
+// FAC-613: posture.StateDir falls back to $HOME/.local/state/herdforge/herd, so
+// a durable `herd posture claude-only` on the operator's machine was read by
+// every fixture that routes — 179 refusals of the shape `claude-only posture
+// forbids requested provider "codex"` across eight packages, in fixtures that
+// had just configured that provider themselves. Stripping the env is not enough:
+// the JSON authority and the legacy sentinel files both live under that
+// directory, and the sentinel is consulted whenever the JSON is missing.
+//
+// Tests that mean to exercise a posture set their own HERD_STATE_DIR or
+// HERD_CLAUDE_ONLY/HERD_NO_CLAUDE with t.Setenv, which still wins for that test
+// and still runs the real implementation.
+//
+// Runtime temp paths are not written into the repository. TestMain must call
+// restore before os.Exit; process exit skips defers, including after a failing
+// m.Run.
+func Isolate() (restore func(), err error) {
 	nop := func() {}
-	prev, hadPrev := os.LookupEnv(nestedSlotDirVar)
-	dir, err := os.MkdirTemp("", "herd-test-heavy-phase-slots-")
+	var undo []func()
+	rollback := func() {
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+	}
+	for _, v := range []struct{ name, pattern string }{
+		{nestedSlotDirVar, "herd-test-heavy-phase-slots-"},
+		{stateDirVar, "herd-test-state-dir-"},
+	} {
+		back, err := isolateDirVar(v.name, v.pattern)
+		if err != nil {
+			rollback()
+			return nop, err
+		}
+		undo = append(undo, back)
+	}
+	return rollback, nil
+}
+
+// isolateDirVar points name at a fresh temp directory, returning a restore that
+// removes it and puts the variable back to its previous state (absent stays
+// absent). Restore is idempotent enough to be called twice.
+func isolateDirVar(name, pattern string) (func(), error) {
+	nop := func() {}
+	prev, hadPrev := os.LookupEnv(name)
+	dir, err := os.MkdirTemp("", pattern)
 	if err != nil {
 		return nop, err
 	}
-	restore = func() {
+	restore := func() {
 		_ = os.RemoveAll(dir)
 		if hadPrev {
-			_ = os.Setenv(nestedSlotDirVar, prev)
+			_ = os.Setenv(name, prev)
 		} else {
-			_ = os.Unsetenv(nestedSlotDirVar)
+			_ = os.Unsetenv(name)
 		}
 	}
-	if err := os.Setenv(nestedSlotDirVar, dir); err != nil {
+	if err := os.Setenv(name, dir); err != nil {
 		restore()
 		return nop, err
 	}

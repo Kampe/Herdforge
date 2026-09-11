@@ -47,9 +47,9 @@ func TestStripSweepsUnknownHerdrVariables(t *testing.T) {
 
 // Stripping must not touch unrelated environment. A test suite that clears the
 // wrong thing trades one invisible failure for another.
-func TestIsolateDefaultSlotDirDoesNotRestoreFleetMetadata(t *testing.T) {
+func TestIsolateDoesNotRestoreFleetMetadata(t *testing.T) {
 	Strip()
-	restore, err := IsolateDefaultSlotDir()
+	restore, err := Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestIsolateDefaultSlotDirDoesNotRestoreFleetMetadata(t *testing.T) {
 	}
 	dir := os.Getenv(nestedSlotDirVar)
 	if dir == "" {
-		t.Fatal("IsolateDefaultSlotDir left HERD_HEAVY_PHASE_SLOT_DIR empty")
+		t.Fatal("Isolate left HERD_HEAVY_PHASE_SLOT_DIR empty")
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("isolated slot dir missing: %v", err)
@@ -70,14 +70,14 @@ func TestIsolateDefaultSlotDirDoesNotRestoreFleetMetadata(t *testing.T) {
 	}
 }
 
-func TestIsolateDefaultSlotDirCreatesUniqueDirectories(t *testing.T) {
-	first, err := IsolateDefaultSlotDir()
+func TestIsolateCreatesUniqueDirectories(t *testing.T) {
+	first, err := Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(first)
 	dirA := os.Getenv(nestedSlotDirVar)
-	second, err := IsolateDefaultSlotDir()
+	second, err := Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,11 +88,11 @@ func TestIsolateDefaultSlotDirCreatesUniqueDirectories(t *testing.T) {
 	}
 }
 
-func TestIsolateDefaultSlotDirRemovesDirectoryAndRestoresEnv(t *testing.T) {
+func TestIsolateRemovesDirectoryAndRestoresEnv(t *testing.T) {
 	prev := filepath.Join(t.TempDir(), "previous-slots")
 	t.Setenv(nestedSlotDirVar, prev)
 
-	restore, err := IsolateDefaultSlotDir()
+	restore, err := Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,11 +119,11 @@ func TestIsolateDefaultSlotDirRemovesDirectoryAndRestoresEnv(t *testing.T) {
 	}
 }
 
-func TestIsolateDefaultSlotDirRestoresAbsentEnv(t *testing.T) {
+func TestIsolateRestoresAbsentEnv(t *testing.T) {
 	if err := os.Unsetenv(nestedSlotDirVar); err != nil {
 		t.Fatal(err)
 	}
-	restore, err := IsolateDefaultSlotDir()
+	restore, err := Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,4 +190,54 @@ func containsName(names []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// FAC-613: Isolate must move HERD_STATE_DIR too. The slot-dir assertions above
+// stayed green for months while durable family posture under the operator's
+// $HOME reached every routing fixture.
+func TestIsolateRedirectsDurableStateDir(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "operator-state")
+	t.Setenv(stateDirVar, host)
+
+	restore, err := Isolate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := os.Getenv(stateDirVar)
+	if dir == "" || filepath.Clean(dir) == filepath.Clean(host) {
+		t.Fatalf("%s still points at host state: %q", stateDirVar, dir)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("isolated state dir is not an empty private directory: %v %v", entries, err)
+	}
+
+	restore()
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("isolated state dir retained after restore: %v", err)
+	}
+	if got := os.Getenv(stateDirVar); got != host {
+		t.Fatalf("restore left %s=%q, want prior %q", stateDirVar, got, host)
+	}
+}
+
+// A failure part-way through must not leave one variable redirected and the
+// other pointing at the operator's directory.
+func TestIsolateRestoresEveryVariableTogether(t *testing.T) {
+	if err := os.Unsetenv(stateDirVar); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv(nestedSlotDirVar); err != nil {
+		t.Fatal(err)
+	}
+	restore, err := Isolate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore()
+	for _, v := range []string{stateDirVar, nestedSlotDirVar} {
+		if _, ok := os.LookupEnv(v); ok {
+			t.Fatalf("restore invented %s after an absent prior value", v)
+		}
+	}
 }

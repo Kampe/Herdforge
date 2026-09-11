@@ -15,7 +15,7 @@ import (
 // override this via t.Setenv.
 func TestMain(m *testing.M) {
 	laneenv.Strip()
-	restore, err := laneenv.IsolateDefaultSlotDir()
+	restore, err := laneenv.Isolate()
 	if err != nil {
 		os.Exit(1)
 	}

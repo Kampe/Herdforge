@@ -111,7 +111,7 @@ func TestMain(m *testing.M) {
 	nestedVerifierSlotHeld = os.Getenv(slot.EnvHeld) == "1"
 	laneenv.Strip()
 	cliTestGit, cliTestGitErr = gitBinaryOnPATH(os.Getenv("PATH"))
-	restoreSlots, err := laneenv.IsolateDefaultSlotDir()
+	restoreSlots, err := laneenv.Isolate()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "isolate test heavy-phase slots: %v\n", err)
 		os.Exit(1)
