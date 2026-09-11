@@ -364,7 +364,10 @@ func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunne
 	// writer can acquire the surface, add evidence, or lock it after the first
 	// scan. Re-read the native worktree state immediately before removal and
 	// refuse every changed or uncertain identity; this is the act-time fence.
-	entries, listErr := listWorktreeEntries(root)
+	// Refresh registrations for identity changes, but inspect status only for
+	// the selected target. Inspecting the full fleet here repeats every
+	// worktree's filesystem walk once per retirement in the batch.
+	entries, listErr := listWorktreeRegistrations(root)
 	if listErr != nil {
 		return fmt.Errorf("retire %s: act-time worktree revalidation failed: %w", l.Path, listErr)
 	}
@@ -372,6 +375,7 @@ func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunne
 	if !found {
 		return fmt.Errorf("retire %s: act-time worktree identity disappeared", l.Path)
 	}
+	current = inspectWorktreeEntries([]worktreeEntry{current})[0]
 	if current.Head != l.Head || current.Branch != l.Branch || current.Detached || current.IsMain {
 		return fmt.Errorf("retire %s: act-time worktree identity changed (head=%q branch=%q)", l.Path, current.Head, current.Branch)
 	}
