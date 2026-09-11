@@ -588,7 +588,11 @@ func revalidateBeforeUnlink(ctx context.Context, opts ReclaimOptions, reader fun
 	if err != nil || dirBefore == nil || !os.SameFile(dirBefore, dirNow) {
 		return "parent-changed-during-reclaim: bundle directory identity moved between census and unlink"
 	}
-	if pinned, pinErr := dirFile.Stat(); pinErr != nil || !os.SameFile(pinned, dirNow) {
+	if pinned, pinErr := dirFile.Stat(); pinErr != nil || !os.SameFile(pinned, dirNow) || fileLinkCount(pinned) == 0 {
+		// A pinned directory descriptor whose link count dropped to 0 was
+		// unlinked from its name: the directory now at the path — even one
+		// that reused the pinned (st_dev, st_ino), which a same-path
+		// recreate routinely does on Linux — is a replacement. Retain.
 		return "parent-changed-during-reclaim: pinned directory descriptor no longer matches the bundle directory"
 	}
 	st, err := os.Lstat(path)

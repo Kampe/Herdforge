@@ -235,13 +235,23 @@ func (l *DirLock) Release() {
 	// before destruction: even a non-compliant (raw mkdir/rm) replacement
 	// installed inside the check/remove interval is never destroyed.
 	if l.dirFile != nil {
-		if pinned, err := l.dirFile.Stat(); err == nil {
-			if now, lerr := os.Lstat(l.dir); lerr != nil || !os.SameFile(pinned, now) {
-				// The directory at the name is not the one this owner
-				// created: a replacement (successor or foreign writer) must
-				// survive.
-				return
-			}
+		pinned, serr := l.dirFile.Stat()
+		if serr != nil {
+			return
+		}
+		if pinnedLinkCount(l.dirFile) == 0 {
+			// The pinned directory was unlinked from its name. Anything now
+			// at the lock path — including a fresh replacement that REUSED
+			// the pinned (st_dev, st_ino), which a same-directory recreate
+			// routinely does on Linux — is not this owner's lock and must
+			// survive.
+			return
+		}
+		if now, lerr := os.Lstat(l.dir); lerr != nil || !os.SameFile(pinned, now) {
+			// The directory at the name is not the one this owner
+			// created: a replacement (successor or foreign writer) must
+			// survive.
+			return
 		}
 	}
 	_ = removeLockDir(l.dir)
@@ -262,13 +272,33 @@ func (l *DirLock) Status() (held bool, holderStr string) {
 // fresh lock installed between the staleness decision and the removal is
 // never destroyed.
 func (l *DirLock) breakIfStale() (removed bool) {
-	info, err := os.Stat(l.dir)
-	if err != nil {
-		return false // dir missing -> not stale
+	// Open FIRST and derive every staleness fact from the held descriptor:
+	// a path stat taken before the pin would leave both the staleness
+	// decision and the final identity comparison unbound from the object
+	// this descriptor holds — a replacement installed inside that pre-pin
+	// window could reuse the observed (st_dev, st_ino) and defeat the
+	// SameFile proof. Failure to open means the directory is missing (not
+	// stale) or the identity is unprovable — either way the stale break
+	// refuses to destroy (fail closed; the lock re-evaluates on the next
+	// acquisition).
+	observed, oerr := os.Open(l.dir)
+	if oerr != nil {
+		return false
+	}
+	defer observed.Close()
+	info, serr := observed.Stat()
+	if serr != nil {
+		return false
 	}
 	breakAndRemove := func() bool {
 		if interleaveHook != nil {
 			interleaveHook("stale-pre-remove")
+		}
+		if pinnedLinkCount(observed) == 0 {
+			// The observed stale lock was replaced inside the interval: a
+			// fresh lock (successor or foreign writer) is now at the path
+			// and must survive.
+			return false
 		}
 		if now, lerr := os.Lstat(l.dir); lerr != nil || !os.SameFile(info, now) {
 			return false
@@ -380,6 +410,21 @@ func username() string {
 // for interleaving reproduction (bundle-interleaving-repair-2306);
 // production leaves it nil.
 var interleaveHook func(stage string)
+
+// pinnedLinkCount reports the link count of an open pinned descriptor via
+// fstat, or 0 when the platform cannot answer. Directory link counts are
+// 2+ while linked and drop to 0 once the directory is unlinked from its
+// name, so a pinned descriptor with link count 0 proves the object at the
+// lock path is a replacement — even when that replacement reused the
+// pinned (st_dev, st_ino). pkg/lock already requires unix syscalls
+// (syscall.Flock anchors the exclusion).
+func pinnedLinkCount(f *os.File) uint64 {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return 0
+	}
+	return uint64(st.Nlink)
+}
 
 // removeLockDir is the removal primitive for the lock directory, a package
 // variable so tests can observe the check/remove boundary.

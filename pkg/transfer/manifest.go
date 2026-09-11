@@ -140,7 +140,12 @@ func readBoundFile(path string, validated os.FileInfo) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(validated, bound) {
+	if !os.SameFile(validated, bound) || fileLinkCount(bound) == 0 {
+		// The open descriptor's link count dropping to 0 means the validated
+		// file was unlinked from its name before the read: the path now
+		// holds a replacement — even when it reused the validated
+		// (st_dev, st_ino), which a same-path recreate routinely does on
+		// Linux. Refuse instead of parsing replacement authority.
 		return nil, fmt.Errorf("retention manifest replaced between validation and read")
 	}
 	return io.ReadAll(f)
