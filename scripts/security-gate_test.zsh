@@ -79,6 +79,12 @@ if [[ -f "$mock_gosec_pid" ]]; then
 		exit 1
 	fi
 fi
+# An explicit environment override bypasses the surface derivation entirely:
+# no derived-budget diagnostic may appear on an overridden run.
+if grep -F -- "gosec budget" "$gosec_timeout_out" >/dev/null 2>&1; then
+	print -u2 "error: gosec budget was derived despite an explicit GOSEC_TIMEOUT override"
+	exit 1
+fi
 
 # Test SECURITY_GATE_TIMEOUT fallback for gosec
 gosec_shared_timeout_out="$tmp/gosec-shared-timeout.out"
@@ -98,7 +104,35 @@ if PATH="$mock_bin:$PATH" GOSEC_TIMEOUT=1 SECURITY_GATE_TIMEOUT=99 ./scripts/sec
 	exit 1
 fi
 grep -F -- "error: gosec timed out after 1s" "$gosec_precedence_out" >/dev/null || {
-	print -u2 "error: missing gosec precedence timeout diagnostic in output"
+	print -u2 "error: missing gosec precedence timeout diagnostic"
+	exit 1
+}
+
+# An INVALID override must fail closed with a diagnostic, never silently
+# degrade to a default (or a derived/unbounded) budget.
+invalid_out="$tmp/gosec-invalid-override.out"
+if GOSEC_TIMEOUT=abc PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$invalid_out" 2>&1; then
+	print -u2 "error: invalid GOSEC_TIMEOUT was accepted instead of failing closed"
+	exit 1
+fi
+grep -F -- 'error: GOSEC_TIMEOUT must be a positive integer number of seconds' "$invalid_out" >/dev/null || {
+	print -u2 "error: missing invalid GOSEC_TIMEOUT diagnostic"
+	exit 1
+}
+if SECURITY_GATE_TIMEOUT=abc PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$invalid_out" 2>&1; then
+	print -u2 "error: invalid SECURITY_GATE_TIMEOUT was accepted instead of failing closed"
+	exit 1
+fi
+grep -F -- 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds' "$invalid_out" >/dev/null || {
+	print -u2 "error: missing invalid SECURITY_GATE_TIMEOUT diagnostic"
+	exit 1
+}
+if GITLEAKS_TIMEOUT=0 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$invalid_out" 2>&1; then
+	print -u2 "error: zero GITLEAKS_TIMEOUT was accepted instead of failing closed"
+	exit 1
+fi
+grep -F -- 'error: GITLEAKS_TIMEOUT must be a positive integer number of seconds' "$invalid_out" >/dev/null || {
+	print -u2 "error: missing invalid GITLEAKS_TIMEOUT diagnostic"
 	exit 1
 }
 
@@ -255,6 +289,14 @@ if ! PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gosec_issues_null_out
 fi
 grep -F -- '==> FAC-251 gosec HIGH/CRITICAL baseline is exact and current' "$gosec_issues_null_out" >/dev/null || {
 	print -u2 "error: missing gosec baseline diagnostic for Issues-null report"
+	exit 1
+}
+# The gosec budget must derive from the measured scan surface. The fixture
+# tracks exactly one shipped Go package (fixture.go), so the 300s floor holds
+# and the derivation diagnostic must name BOTH values exactly — a wrong
+# formula, a lost floor, or a lost cap fails these exact-value assertions.
+grep -F -- '==> gosec budget 300s derived from 1 scanned Go packages' "$gosec_issues_null_out" >/dev/null || {
+	print -u2 "error: gosec budget derivation missing or wrong at fixture scale"
 	exit 1
 }
 
@@ -550,3 +592,62 @@ if (( $+commands[gosec] && $+commands[gitleaks] )); then
 fi
 
 print '==> FAC-251 security negative tests passed'
+
+# FAC-251 budget-derivation scale checks run LAST, after the optional
+# real-scanner section above, so real gosec never sees the scaled fixture:
+# only the mock scanners scan the synthetic package dirs below.
+# Scale-following: 80 additional tracked package directories must raise the
+# derived budget to 90 + 3*81 = 333s — above the floor, below the cap.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Issues":null}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+cat << 'EOF' > "$mock_bin/gitleaks"
+#!/usr/bin/env zsh
+for ((i=1; i<=$#; i++)); do
+	if [[ "${@[i]}" == "--report-path" ]]; then
+		print '[]' > "${@[i+1]}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gitleaks"
+for (( pi=1; pi<=80; pi++ )); do
+	mkdir -p "scalepkg$pi"
+	print "package scalepkg$pi" > "scalepkg$pi/p.go"
+done
+git add -A
+git -c commit.gpgsign=false commit -qm 'test: scale the fixture scan surface to 81 packages'
+scale_out="$tmp/gosec-scale.out"
+if ! PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$scale_out" 2>&1; then
+	print -u2 "error: security-gate failed at 81-package fixture scale"
+	exit 1
+fi
+grep -F -- '==> gosec budget 333s derived from 81 scanned Go packages' "$scale_out" >/dev/null || {
+	print -u2 "error: gosec budget did not follow the measured scan surface at 81 packages"
+	exit 1
+}
+
+# Cap: 1001 packages must cap the derived budget at the strict 900s hang
+# bound, and the diagnostic must name the measured surface.
+for (( pi=81; pi<=1000; pi++ )); do
+	mkdir -p "scalepkg$pi"
+	print "package scalepkg$pi" > "scalepkg$pi/p.go"
+done
+git add -A
+git -c commit.gpgsign=false commit -qm 'test: scale the fixture scan surface to 1001 packages'
+cap_out="$tmp/gosec-cap.out"
+if ! PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$cap_out" 2>&1; then
+	print -u2 "error: security-gate failed at 1001-package fixture scale"
+	exit 1
+fi
+grep -F -- '==> gosec budget 900s derived from 1001 scanned Go packages' "$cap_out" >/dev/null || {
+	print -u2 "error: gosec budget derivation missing the strict 900s hang cap"
+	exit 1
+}
