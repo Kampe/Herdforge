@@ -33,10 +33,10 @@ type RepairPlan struct {
 
 // RepairRequest bounds one operator recovery to one exact row.
 //
-// Fingerprint, when set, is the sha256 of the exact malformed line the
-// operator inspected. It makes the repair a compare-and-swap: if anything
-// replaced that row in the meantime, the repair refuses instead of acting on
-// bytes nobody reviewed.
+// Fingerprint is the sha256 of the exact malformed line the operator reviewed.
+// It is REQUIRED to act: the repair is a compare-and-swap, so an operator can
+// only ever rewrite the exact bytes they read in a report-only run. Report-only
+// runs may omit it, and emit the fingerprint to be used for the act.
 type RepairRequest struct {
 	ID          string
 	Fingerprint string
@@ -52,6 +52,13 @@ var (
 	ErrRepairUnsupported    = errors.New("mail repair: row defect is not a normalizable legacy timestamp")
 	ErrRepairPrivileged     = errors.New("mail repair: privileged signed or control message must not be rewritten")
 	ErrRepairReadbackFailed = errors.New("mail repair: durable readback did not match the repaired row")
+	// ErrRepairFingerprintRequired keeps acting a compare-and-swap: there is no
+	// way to rewrite a row without first naming the exact bytes being replaced.
+	ErrRepairFingerprintRequired = errors.New("mail repair: --act requires the exact --fingerprint from a report-only run")
+	// ErrRepairConflictingOriginals fires when the quarantine record for this id
+	// holds more than one DISTINCT original. Repeated identical copies are
+	// normal reader behaviour and are not a conflict; differing bytes are.
+	ErrRepairConflictingOriginals = errors.New("mail repair: quarantine holds conflicting originals for this id")
 )
 
 // envelopeJSONKeys is every key the Envelope encoder can round-trip. A row
@@ -149,6 +156,9 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 	if strings.TrimSpace(req.ID) == "" {
 		return nil, errors.New("mail repair: an exact message id is required")
 	}
+	if req.Act && strings.TrimSpace(req.Fingerprint) == "" {
+		return nil, ErrRepairFingerprintRequired
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -216,6 +226,9 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 		originalHash := sha256OfLine(original)
 		if fp := strings.TrimSpace(req.Fingerprint); fp != "" && !strings.EqualFold(fp, originalHash) {
 			return fmt.Errorf("%w: have %s", ErrRepairStale, originalHash)
+		}
+		if err := m.checkQuarantineIdentity(req.ID, originalHash); err != nil {
+			return err
 		}
 
 		repaired, rawTimestamp, ts, err := buildRepairedEnvelope(original)
@@ -318,6 +331,57 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 		return nil, err
 	}
 	return plan, nil
+}
+
+// checkQuarantineIdentity compares the live malformed row against what the
+// quarantine artifact recorded for the same id.
+//
+// ReadInbox re-quarantines an unrepaired row on EVERY read, so the artifact
+// legitimately accumulates many copies of the same original. Those are one
+// piece of evidence, not many, and must never make a repair permanently
+// ambiguous — so identity here is the sha256 of the recorded bytes, deduped.
+//
+// What IS a conflict: two DIFFERENT originals recorded under the same id (the
+// row was replaced between reads), or a recorded original that does not match
+// the row currently live in the mailbox. Either means the bytes an operator
+// reviewed are not the bytes on disk, so the repair refuses rather than acting
+// on evidence that has moved. A missing or rotated artifact is not an error:
+// the live row plus the required fingerprint still bound the operation.
+func (m *Mailbox) checkQuarantineIdentity(id, liveHash string) error {
+	data, err := os.ReadFile(m.MailFile + ".quarantine.jsonl")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("mail repair: read quarantine artifact: %w", err)
+	}
+	distinct := map[string]bool{}
+	for _, line := range splitLines(string(data)) {
+		if len(line) == 0 {
+			continue
+		}
+		var entry QuarantineEntry
+		if json.Unmarshal([]byte(line), &entry) != nil {
+			continue
+		}
+		if rawObjectID(entry.Line) != id {
+			continue
+		}
+		distinct[sha256OfLine(entry.Line)] = true
+	}
+	switch len(distinct) {
+	case 0:
+		return nil
+	case 1:
+		for hash := range distinct {
+			if !strings.EqualFold(hash, liveHash) {
+				return fmt.Errorf("%w: quarantined original %s is not the live row %s", ErrRepairStale, hash, liveHash)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %d distinct originals recorded for %q", ErrRepairConflictingOriginals, len(distinct), id)
+	}
 }
 
 // verifyRepairedRow re-reads the durable file and proves the row it just wrote

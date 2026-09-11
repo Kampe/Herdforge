@@ -74,7 +74,7 @@ func TestRepairIsReportOnlyByDefaultAndWritesNothing(t *testing.T) {
 func TestRepairNormalizesLegacyOffsetAndAssignsSequence(t *testing.T) {
 	mb, _ := mailboxWith(t, legacyRow)
 	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op", Reason: "2982",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op", Reason: "2982",
 	})
 	if err != nil {
 		t.Fatalf("repair: %v", err)
@@ -116,7 +116,7 @@ func TestRepairedRowIsVisibleToDedupeScan(t *testing.T) {
 		t.Fatal("fixture precondition: the malformed row was already dedupe-visible")
 	}
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestRepairPreservesEveryOtherRowByteForByte(t *testing.T) {
 	keepB := goodRow(t, "keep-b", "someone-else", 2)
 	mb, path := mailboxWith(t, keepA, legacyRow, keepB)
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestRepairAcceptsMatchingFingerprint(t *testing.T) {
 func TestRepairRefusesAmbiguousDuplicateID(t *testing.T) {
 	mb, _ := mailboxWith(t, legacyRow, legacyRow)
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); !errors.Is(err, ErrRepairAmbiguous) {
 		t.Fatalf("duplicate malformed rows must refuse, got %v", err)
 	}
@@ -185,7 +185,7 @@ func TestRepairRefusesAmbiguousDuplicateID(t *testing.T) {
 func TestRepairRefusesWhenAWellFormedRowAlreadyCarriesTheID(t *testing.T) {
 	mb, _ := mailboxWith(t, goodRow(t, "host-81751-1789141629774", "orchestrator", 7), legacyRow)
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); !errors.Is(err, ErrRepairAmbiguous) {
 		t.Fatalf("an existing well-formed row with the same id must refuse, got %v", err)
 	}
@@ -195,7 +195,7 @@ func TestRepairLeavesUnrelatedMalformedRowsUntouched(t *testing.T) {
 	truncated := `{"id": "other-row", "sender": "x", "timestamp": "2026-09-1`
 	mb, path := mailboxWith(t, truncated, legacyRow)
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); err != nil {
 		t.Fatalf("an unrelated malformed row must not block the targeted repair: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestRepairRefusesUnsupportedDefect(t *testing.T) {
 	truncated := `{"id": "only-row", "sender": "x", "timestamp": "2026-09-1`
 	mb, _ := mailboxWith(t, truncated)
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "only-row", Act: true, Actor: "op",
+		ID: "only-row", Fingerprint: sha256Hex(truncated), Act: true, Actor: "op",
 	}); !errors.Is(err, ErrRepairUnsupported) {
 		t.Fatalf("a defect other than the legacy timestamp must refuse, got %v", err)
 	}
@@ -220,7 +220,7 @@ func TestRepairRefusesPrivilegedSignedControlMessage(t *testing.T) {
 		`"body": "b", "signature": "abc123", "timestamp": "2026-09-11T10:47:09.000000-0500"}`
 	mb, path := mailboxWith(t, privileged)
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "priv-1", Act: true, Actor: "op",
+		ID: "priv-1", Fingerprint: sha256Hex(privileged), Act: true, Actor: "op",
 	}); !errors.Is(err, ErrRepairPrivileged) {
 		t.Fatalf("a signed control message must never be silently rewritten, got %v", err)
 	}
@@ -233,7 +233,7 @@ func TestRepairRefusesPrivilegedSignedControlMessage(t *testing.T) {
 func TestRepairAuditArtifactRetainsOriginalCorruptBytes(t *testing.T) {
 	mb, path := mailboxWith(t, legacyRow)
 	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op", Reason: "2982",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op", Reason: "2982",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -272,7 +272,7 @@ func TestRepairRefusesWhenMailboxLockIsHeld(t *testing.T) {
 	other := NewMailbox(mb.MailFile)
 	other.SetLockTimeout(150 * 1e6)
 	if _, err := other.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); err == nil {
 		t.Fatal("repair proceeded while another holder had the canonical mailbox lock")
 	}
@@ -285,7 +285,7 @@ func TestRepairFailsClosedWhenDurableWriteFails(t *testing.T) {
 	defer func() { fileSyncFn = restore }()
 
 	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); err == nil {
 		t.Fatal("a failed durable write must fail closed")
 	}
@@ -304,7 +304,7 @@ func TestRepairSequenceIsAboveExistingRowsWhenSidecarIsMissing(t *testing.T) {
 		t.Fatal("fixture precondition: sequence sidecar should be absent")
 	}
 	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +342,7 @@ func TestRepairFailsClosedWhenReadbackMismatches(t *testing.T) {
 	defer func() { writeFileAtomicFn = restore }()
 
 	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	})
 	if !errors.Is(err, ErrRepairReadbackFailed) {
 		t.Fatalf("a durable row that differs from the repaired row must fail closed, got plan=%+v err=%v", plan, err)
@@ -355,5 +355,124 @@ func TestRepairFailsClosedWhenReadbackMismatches(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "2026-09-11T10:47:09.000000-0500") {
 		t.Fatal("audit artifact did not retain the original corrupt bytes after a failed repair")
+	}
+}
+
+// Acting without naming the exact bytes is not a repair, it is a guess.
+func TestRepairActRequiresExactFingerprint(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Act: true, Actor: "op",
+	}); !errors.Is(err, ErrRepairFingerprintRequired) {
+		t.Fatalf("--act without a fingerprint must refuse, got %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("a fingerprint-less act mutated the mailbox")
+	}
+	// Report-only still works without one, and hands back the fingerprint to use.
+	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{ID: "host-81751-1789141629774"})
+	if err != nil {
+		t.Fatalf("report-only must not require a fingerprint: %v", err)
+	}
+	if plan.OriginalSHA256 != sha256Hex(legacyRow) {
+		t.Fatalf("report did not emit the fingerprint an act needs: %q", plan.OriginalSHA256)
+	}
+}
+
+// quarantineCopies appends n IDENTICAL quarantine records, exactly as repeated
+// ReadInbox calls over an unrepaired row do.
+func quarantineCopies(t *testing.T, mailPath, line string, n int) {
+	t.Helper()
+	var buf strings.Builder
+	for i := 0; i < n; i++ {
+		rec, err := json.Marshal(QuarantineEntry{Line: line, Reason: "cannot parse", Timestamp: time.Now()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(rec)
+		buf.WriteString("\n")
+	}
+	if err := os.WriteFile(mailPath+".quarantine.jsonl", []byte(buf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Every reader re-quarantines an unrepaired row, so the artifact fills up with
+// identical copies. That is normal and must never make the row permanently
+// unrepairable.
+func TestRepairIgnoresRepeatedIdenticalQuarantineCopies(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	quarantineCopies(t, path, legacyRow, 7)
+	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	})
+	if err != nil {
+		t.Fatalf("7 identical quarantine copies must not block the repair: %v", err)
+	}
+	if !plan.Applied {
+		t.Fatal("repair did not apply")
+	}
+}
+
+// Two DIFFERENT originals under one id means the row moved between reads: the
+// bytes an operator reviewed are not necessarily the bytes on disk.
+func TestRepairRefusesConflictingQuarantinedOriginals(t *testing.T) {
+	variant := strings.Replace(legacyRow, `"body": "two defects"`, `"body": "different body"`, 1)
+	if variant == legacyRow {
+		t.Fatal("fixture did not produce a distinct original")
+	}
+	mb, path := mailboxWith(t, legacyRow)
+	rec1, _ := json.Marshal(QuarantineEntry{Line: legacyRow, Reason: "cannot parse", Timestamp: time.Now()})
+	rec2, _ := json.Marshal(QuarantineEntry{Line: variant, Reason: "cannot parse", Timestamp: time.Now()})
+	if err := os.WriteFile(path+".quarantine.jsonl", append(append(rec1, '\n'), append(rec2, '\n')...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	}); !errors.Is(err, ErrRepairConflictingOriginals) {
+		t.Fatalf("conflicting quarantined originals must refuse, got %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), legacyRow) {
+		t.Fatal("a refused repair mutated the mailbox")
+	}
+}
+
+// A quarantined original that no longer matches the live row is stale evidence.
+func TestRepairRefusesWhenQuarantinedOriginalDiffersFromLiveRow(t *testing.T) {
+	variant := strings.Replace(legacyRow, `"body": "two defects"`, `"body": "older body"`, 1)
+	mb, path := mailboxWith(t, legacyRow)
+	quarantineCopies(t, path, variant, 3)
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	}); !errors.Is(err, ErrRepairStale) {
+		t.Fatalf("a quarantined original that is not the live row must refuse, got %v", err)
+	}
+}
+
+// Quarantine records for OTHER ids, however many, are none of this repair's
+// business.
+func TestRepairIgnoresQuarantineRecordsForOtherIDs(t *testing.T) {
+	otherA := `{"id": "other-a", "sender": "x", "recipient": "y", "subject": "s", "body": "b", "read": false, "timestamp": "2026-09-11T10:47:09.000000-0500"}`
+	otherB := `{"id": "other-b", "sender": "x", "recipient": "y", "subject": "s", "body": "b", "read": false, "timestamp": "2026-09-11T11:47:09.000000-0500"}`
+	mb, path := mailboxWith(t, legacyRow)
+	var buf strings.Builder
+	for _, line := range []string{otherA, otherB, otherA, legacyRow} {
+		rec, _ := json.Marshal(QuarantineEntry{Line: line, Reason: "cannot parse", Timestamp: time.Now()})
+		buf.Write(rec)
+		buf.WriteString("\n")
+	}
+	if err := os.WriteFile(path+".quarantine.jsonl", []byte(buf.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	}); err != nil {
+		t.Fatalf("unrelated quarantined ids must not block the repair: %v", err)
 	}
 }

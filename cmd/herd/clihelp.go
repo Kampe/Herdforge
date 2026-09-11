@@ -345,15 +345,20 @@ Commands:
   herd mail ack --recipient NAME --id ID [--mail path]
   herd mail inbox --recipient NAME [--mail path]
   herd mail read --recipient NAME [--mail path]
-  herd mail repair --id ID [--mail path] [--fingerprint SHA256] [--reason TEXT] [--actor NAME] [--act]
+  herd mail repair --id ID [--mail path] [--reason TEXT]
+  herd mail repair --id ID --fingerprint SHA256 --actor NAME --act [--mail path] [--reason TEXT]
   herd mail control <issue|drain> [flags]
 
 herd mail repair is a bounded operator recovery for ONE quarantined row whose
 only defect is a legacy non-RFC3339 timestamp: it normalizes that timestamp,
 assigns a monotonic sequence under the canonical mailbox lock, and preserves
 the id, payload and every other row. It is REPORT-ONLY unless --act is given.
-It refuses ambiguous ids, a stale --fingerprint, any other defect, and any
-privileged signed message. Original bytes are retained in <mail>.repair.jsonl
+Acting REQUIRES --fingerprint: run report-only first and pass back the
+original_sha256 it reports, so a rewrite can only ever replace the exact bytes
+an operator reviewed. It refuses ambiguous ids, a stale fingerprint, any other
+defect, and any privileged signed message. Repeated identical quarantine
+copies of one row are normal reader behaviour and never block a repair;
+conflicting recorded originals do. Original bytes are retained in <mail>.repair.jsonl
 and in the pre-existing <mail>.quarantine.jsonl. It changes no parsing rule.
 
 Ordinary durable messages use the local mailbox and are not authenticated control.

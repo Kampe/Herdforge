@@ -59,7 +59,7 @@ func runMailRepair(args []string) {
 	fs := flag.NewFlagSet("mail repair", flag.ContinueOnError)
 	id := fs.String("id", "", "exact message id of the quarantined row")
 	mailPath := fs.String("mail", "", "mailbox path override")
-	fingerprint := fs.String("fingerprint", "", "sha256 of the exact malformed line the operator reviewed")
+	fingerprint := fs.String("fingerprint", "", "sha256 of the exact malformed line the operator reviewed (REQUIRED with --act)")
 	reason := fs.String("reason", "", "why this recovery is being performed")
 	actor := fs.String("actor", "", "operator performing the recovery")
 	act := fs.Bool("act", false, "perform the repair (default is report-only)")
@@ -72,6 +72,10 @@ func runMailRepair(args []string) {
 	}
 	if *act && strings.TrimSpace(*actor) == "" {
 		fmt.Fprintln(os.Stderr, "mail repair: --actor is required with --act")
+		os.Exit(2)
+	}
+	if *act && strings.TrimSpace(*fingerprint) == "" {
+		fmt.Fprintln(os.Stderr, "mail repair: --fingerprint is required with --act; run without --act first and use the original_sha256 it reports")
 		os.Exit(2)
 	}
 	path, err := controlMailPath(*mailPath)

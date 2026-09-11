@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +14,11 @@ import (
 
 const cliLegacyRow = `{"id": "cli-81751-1789141629774", "sender": "startup-fix", "recipient": "orchestrator", ` +
 	`"subject": "finding", "body": "two defects", "read": false, "timestamp": "2026-09-11T10:47:09.000000-0500"}`
+
+func cliLegacySHA() string {
+	sum := sha256.Sum256([]byte(cliLegacyRow))
+	return hex.EncodeToString(sum[:])
+}
 
 func cliRepairMailbox(t *testing.T) string {
 	t.Helper()
@@ -60,7 +67,7 @@ func TestMailRepairSubcommandAppliesAndIsIdempotentlyRefused(t *testing.T) {
 	path := cliRepairMailbox(t)
 	mb := mail.NewMailbox(path)
 	plan, err := mb.RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774", Act: true, Actor: "root", Reason: "2982",
+		ID: "cli-81751-1789141629774", Fingerprint: cliLegacySHA(), Act: true, Actor: "root", Reason: "2982",
 	})
 	if err != nil || !plan.Applied {
 		t.Fatalf("apply: plan=%+v err=%v", plan, err)
@@ -73,7 +80,7 @@ func TestMailRepairSubcommandAppliesAndIsIdempotentlyRefused(t *testing.T) {
 		t.Fatalf("repaired row is not deliverable: %+v", envs)
 	}
 	if _, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774", Act: true, Actor: "root",
+		ID: "cli-81751-1789141629774", Fingerprint: cliLegacySHA(), Act: true, Actor: "root",
 	}); err == nil {
 		t.Fatal("a second repair of an already-repaired row must refuse, not duplicate it")
 	}
@@ -112,5 +119,46 @@ func TestMailRepairPlanIsMachineReadable(t *testing.T) {
 	}
 	if decoded["original_line"] != cliLegacyRow {
 		t.Fatal("plan did not carry the original bytes verbatim")
+	}
+}
+
+// TestMailRepairRefusesActWithoutFingerprint pins the operator contract at the
+// package boundary the CLI delegates to: acting is a compare-and-swap, so
+// there is no path that rewrites bytes nobody named.
+func TestMailRepairRefusesActWithoutFingerprint(t *testing.T) {
+	path := cliRepairMailbox(t)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
+		ID: "cli-81751-1789141629774", Act: true, Actor: "root",
+	}); err == nil {
+		t.Fatal("--act without --fingerprint must refuse")
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("a fingerprint-less act mutated the mailbox")
+	}
+}
+
+// The documented operator sequence must actually work end to end: report-only,
+// then act with the fingerprint that report emitted.
+func TestMailRepairReportThenActWithReportedFingerprint(t *testing.T) {
+	path := cliRepairMailbox(t)
+	report, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
+		ID: "cli-81751-1789141629774",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Applied || report.OriginalSHA256 == "" {
+		t.Fatalf("report-only did not hand back a usable fingerprint: %+v", report)
+	}
+	applied, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
+		ID: "cli-81751-1789141629774", Fingerprint: report.OriginalSHA256, Act: true, Actor: "root",
+	})
+	if err != nil || !applied.Applied {
+		t.Fatalf("act with the reported fingerprint failed: plan=%+v err=%v", applied, err)
 	}
 }
