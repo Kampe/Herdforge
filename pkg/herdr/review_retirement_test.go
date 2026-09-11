@@ -304,6 +304,120 @@ func TestRetireReviewLanesFaultMatrixStopsBeforeLaterDestructiveBoundary(t *test
 	}
 }
 
+// retirementManifestInSlot builds a manifest on an exact pool slot so a test
+// can separate lanes that share physical state from lanes that share nothing.
+func retirementManifestInSlot(t *testing.T, generation, pool, slot string) ReviewRetirementManifest {
+	t.Helper()
+	m := retirementManifest(t, generation)
+	m.Pool, m.Slot = pool, slot
+	m.BindingDigest = "" // rebind: the digest covers pool and slot
+	m = NewReviewRetirementManifest(time.Date(2026, 9, 9, 0, 0, 0, 0, time.UTC), m)
+	if err := ValidateReviewRetirementManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// driftedRetirementEvidence is the real shape of the lanes that froze the live
+// fleet: a settled lane whose worktree HEAD no longer matches its manifest.
+// It blocks, and its block is NOT the superseded disposition.
+func driftedRetirementEvidence(m ReviewRetirementManifest) ReviewRetirementEvidence {
+	e := retirementEvidence(m)
+	e.Worktree.Head = strings.Repeat("c", 40)
+	return e
+}
+
+// A lane blocked on one slot must not withhold a lane that shares no physical
+// state with it. The live sweep reported 82 candidates as retired=0 blocked=19
+// failed=0 because 5 drifted lanes on pool-02 slots vetoed 36 eligible lanes on
+// pool-01 slots of unrelated pools -- on every sweep, so those lanes could never
+// reach their terminal receipt and the backlog only grew.
+func TestRetireReviewLanesUnrelatedBlockedLaneDoesNotWithholdOtherSlots(t *testing.T) {
+	eligible := retirementManifestInSlot(t, "g-eligible", ".herd/pool-eligible", "pool-01")
+	blocked := retirementManifestInSlot(t, "g-blocked", ".herd/pool-blocked", "pool-02")
+	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{
+		"g-eligible": retirementEvidence(eligible),
+		"g-blocked":  driftedRetirementEvidence(blocked),
+	}}
+
+	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{eligible, blocked}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Retired != 1 || r.Blocked != 1 || r.Skipped != 0 || r.Eligible != 1 {
+		t.Fatalf("unrelated block froze the sweep: retired=%d blocked=%d eligible=%d skipped=%d",
+			r.Retired, r.Blocked, r.Eligible, r.Skipped)
+	}
+	for _, c := range r.Candidates {
+		if c.Manifest.Generation == "g-eligible" && !c.Retired {
+			t.Fatalf("eligible lane on an unrelated slot was not retired: %+v", c)
+		}
+		if c.Manifest.Generation == "g-blocked" && (c.Retired || c.Decision.Eligible) {
+			t.Fatalf("drifted lane must stay blocked: %+v", c)
+		}
+	}
+	if len(f.events) == 0 {
+		t.Fatal("no mutation was attempted for the eligible lane")
+	}
+}
+
+// The fence is the slot, and a withheld lane must SAY it was withheld. An
+// eligible lane that is neither retired nor skipped is the silent drop that
+// made --act byte-identical to --dry-run.
+func TestRetireReviewLanesWithholdsSameSlotAndAccountsForEveryCandidate(t *testing.T) {
+	eligible := retirementManifestInSlot(t, "g-eligible", ".herd/pool-shared", "pool-01")
+	blocked := retirementManifestInSlot(t, "g-blocked", ".herd/pool-shared", "pool-01")
+	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{
+		"g-eligible": retirementEvidence(eligible),
+		"g-blocked":  driftedRetirementEvidence(blocked),
+	}}
+
+	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{eligible, blocked}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.events) != 0 {
+		t.Fatalf("a lane sharing the blocked slot was mutated: %v", f.events)
+	}
+	if r.Retired != 0 || r.Blocked != 1 || r.Eligible != 1 || r.Skipped != 1 {
+		t.Fatalf("report=%+v", r)
+	}
+	if r.Retired+r.Skipped != r.Eligible {
+		t.Fatalf("eligible lanes unaccounted for: eligible=%d retired=%d skipped=%d",
+			r.Eligible, r.Retired, r.Skipped)
+	}
+	for _, c := range r.Candidates {
+		if c.Manifest.Generation != "g-eligible" {
+			continue
+		}
+		if !c.Skipped || c.SkipReason == "" {
+			t.Fatalf("withheld lane must name what withheld it: %+v", c)
+		}
+		if !strings.Contains(c.SkipReason, "drift") {
+			t.Fatalf("skip reason must carry the withholding cause, got %q", c.SkipReason)
+		}
+	}
+}
+
+// A dry run must predict what an act will withhold; two modes that both print a
+// bare retired=0 cannot be compared.
+func TestRetireReviewLanesDryRunAnnotatesWhatAnActWouldWithhold(t *testing.T) {
+	eligible := retirementManifestInSlot(t, "g-eligible", ".herd/pool-shared", "pool-01")
+	blocked := retirementManifestInSlot(t, "g-blocked", ".herd/pool-shared", "pool-01")
+	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{
+		"g-eligible": retirementEvidence(eligible),
+		"g-blocked":  driftedRetirementEvidence(blocked),
+	}}
+
+	r, err := RetireReviewLanes(f, []ReviewRetirementManifest{eligible, blocked}, true)
+	if err != nil || len(f.events) != 0 {
+		t.Fatalf("dry run mutated: events=%v err=%v", f.events, err)
+	}
+	if r.Eligible != 1 || r.Skipped != 1 {
+		t.Fatalf("dry run did not report the withholding an act would apply: %+v", r)
+	}
+}
+
 func TestRetireReviewLanesDryRunNeverMutates(t *testing.T) {
 	m := retirementManifest(t, "g1")
 	f := &retirementFake{evidence: map[string]ReviewRetirementEvidence{"g1": retirementEvidence(m)}}
