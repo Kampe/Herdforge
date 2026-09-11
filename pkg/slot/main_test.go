@@ -14,7 +14,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "clear inherited %s: %v\n", EnvHeld, err)
 		os.Exit(1)
 	}
-	restore, err := laneenv.IsolateDefaultSlotDir()
+	restore, err := laneenv.Isolate()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "isolate test heavy-phase slots: %v\n", err)
 		os.Exit(1)

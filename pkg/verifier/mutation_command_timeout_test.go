@@ -21,7 +21,7 @@ import (
 func isolateOneTestSlot(t *testing.T) {
 	t.Helper()
 	requireHeldMarkerAbsent(t)
-	restore, err := laneenv.IsolateDefaultSlotDir()
+	restore, err := laneenv.Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}

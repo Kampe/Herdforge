@@ -48,7 +48,7 @@ func TestPackageSlotIsolationAvoidsOuterHeldDefault(t *testing.T) {
 		t.Fatalf("watched RED: in-process acquire returned in %s without waiting on the outer slot", waited)
 	}
 
-	restore, err := laneenv.IsolateDefaultSlotDir()
+	restore, err := laneenv.Isolate()
 	if err != nil {
 		t.Fatal(err)
 	}
