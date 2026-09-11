@@ -199,8 +199,16 @@ func runWorktreeReap(args []string) error {
 // Removal is verified by looking, not by trusting the exit status: the whole
 // defect being fixed here is a command that reported success for work it never
 // did, so the confirmation has to be independent of the claim.
+// reapCensusInspector builds the process inspector for the act-time owner
+// census. Fixtures override it to seal the census population so retirement
+// flows do not depend on the host's process permissions (FAC-215); the
+// production value reads the real host population.
+var reapCensusInspector = func() resources.ProcessInspector {
+	return resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
+}
+
 func retireLanded(root string, landed []reapRow) (retired, failed []map[string]string) {
-	return retireLandedWithInspector(root, landed, resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20})
+	return retireLandedWithInspector(root, landed, reapCensusInspector())
 }
 
 // batchCensusBudget bounds the ONE batched owner census for the whole set.

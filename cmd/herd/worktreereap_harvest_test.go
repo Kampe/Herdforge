@@ -51,6 +51,20 @@ func newHarvestFixture(t *testing.T) harvestFixture {
 	root := t.TempDir()
 	f := harvestFixture{root: root, identity: "test-identity"}
 
+	// Hermetic census population (FAC-215): the act-time owner census must
+	// not depend on the host's process permissions. Runner daemons and other
+	// same-owner processes with cleared dumpable make the kernel refuse the
+	// private /proc metadata read, which fail-closes every retirement on
+	// such hosts — the CI34615968238 failure. The fixture seals the census
+	// to this test process; the per-pid reference probes stay real, so a
+	// census regression still fails the retirement flow here.
+	originalCensusInspector := reapCensusInspector
+	reapCensusInspector = func() resources.ProcessInspector {
+		pid := os.Getpid()
+		return resources.NewSealedPopulationInspector([]int{pid}, map[int]int{pid: os.Getuid()})
+	}
+	t.Cleanup(func() { reapCensusInspector = originalCensusInspector })
+
 	harvestFixtureGit(t, root, "init", "-q", "-b", "main", ".")
 	os.WriteFile(filepath.Join(root, "base.txt"), []byte("base\n"), 0o644)
 	harvestFixtureGit(t, root, "add", ".")

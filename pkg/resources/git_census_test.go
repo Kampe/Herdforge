@@ -760,37 +760,147 @@ func stubProcessProcFn(t *testing.T, fn func(pid int) ([][]byte, error)) {
 	t.Cleanup(func() { readProcessProcFn = original })
 }
 
-// TestSameOwnerMetadataRefusalDegradesToProcessCommandProbe pins the Linux CI
-// contract of the act-time owner census: a same-owner pid whose private /proc
-// metadata (environ, maps) the kernel REFUSES — permission denied, the
-// dumpable-cleared credential state every runner daemon carries — must not
-// render the whole census incomplete and fail-close every retirement. The
-// public command surface (ps -ww argv) stays readable for such a process and
-// is the same reference authority the owner-snapshot-unavailable path already
-// uses. Only a refusal to answer BOTH surfaces may remain an error, so a
-// non-permission metadata failure stays fatal.
-func TestSameOwnerMetadataRefusalDegradesToProcessCommandProbe(t *testing.T) {
-	if _, lookErr := exec.LookPath("ps"); lookErr != nil {
-		t.Skipf("ps is required to prove the degraded reference surface: %v", lookErr)
+// TestSameOwnerMetadataRefusalStaysFailClosed pins the deletion-authority
+// contract of the act-time owner census at the same-owner decision: a
+// same-owner pid whose private /proc metadata the kernel REFUSES — permission
+// denied, the dumpable-cleared credential state many runner daemons carry —
+// is an UNKNOWN observation, not a complete one. The public command surface
+// (ps -ww command=) proves argv only and never the environment, so a path
+// held only in the environment of a live same-owner process would be
+// unobservable if the census accepted an argv-only answer. The refusal must
+// propagate as an error (MetadataUnavailable upstream) so the reaper and pool
+// guards fail closed. The 44cf27cf correction degraded this refusal to the
+// ps probe and was rejected in review for exactly that loss of coverage.
+func TestSameOwnerMetadataRefusalStaysFailClosed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the /proc same-owner refusal surface under test is linux; %s answers the same-owner decision through procargs", runtime.GOOS)
 	}
 	pid := os.Getpid()
 	target := filepath.Join(t.TempDir(), "worktrees", "harvest-stage")
 	procErr := &fs.PathError{Op: "open", Path: fmt.Sprintf("/proc/%d/environ", pid), Err: syscall.EACCES}
+	stubProcessProcFn(t, func(int) ([][]byte, error) { return nil, procErr })
 
-	references, err := sameOwnerProcReferences(context.Background(), pid, map[string]bool{target: false}, procErr)
-	if err != nil {
-		t.Fatalf("a kernel metadata refusal for a same-owner pid failed the census: %v", err)
+	references, err := processReferencesManyWithOwners(context.Background(), pid, []string{target}, map[int]int{pid: os.Getuid()})
+	if err == nil {
+		t.Fatalf("an unreadable same-owner environment must fail the census closed; the census read as complete with %v", references)
 	}
 	if references[target] {
-		t.Fatalf("the probe reported a reference the refused surfaces cannot prove: %v", references)
+		t.Fatalf("the failed probe invented a reference: %v", references)
 	}
 
+	// The same argv-absent shape with a DIFFERENT refusal keeps the same
+	// fail-closed answer: only the classification (gone, foreign) may
+	// complete the census, never the read refusal itself.
 	otherErr := &fs.PathError{Op: "open", Path: fmt.Sprintf("/proc/%d/environ", pid), Err: syscall.EIO}
-	keptReferences, keptErr := sameOwnerProcReferences(context.Background(), pid, map[string]bool{target: false}, otherErr)
-	if keptErr == nil {
+	stubProcessProcFn(t, func(int) ([][]byte, error) { return nil, otherErr })
+	if _, err := processReferencesManyWithOwners(context.Background(), pid, []string{target}, map[int]int{pid: os.Getuid()}); err == nil {
 		t.Fatal("a non-permission metadata failure must stay fail-closed; the census read as complete")
 	}
-	if keptReferences[target] {
-		t.Fatalf("the failed probe invented a reference: %v", keptReferences)
+}
+
+// TestEnvironmentOnlyReferenceIsDetectedWhenReadable pins the reference
+// surface the fail-closed policy above protects: a live same-owner pid that
+// holds the target ONLY in its environment — argv, cwd, open files, and maps
+// all clean — is a real reference and must be reported. An implementation
+// that answers from the argv-bearing surfaces alone (the rejected 44cf27cf
+// fallback) fails this control.
+func TestEnvironmentOnlyReferenceIsDetectedWhenReadable(t *testing.T) {
+	pid := os.Getpid()
+	target := filepath.Join(t.TempDir(), "worktrees", "harvest-stage")
+	stubProcessProcFn(t, func(int) ([][]byte, error) {
+		return [][]byte{
+			[]byte("PATH=/usr/bin\x00GOCACHE=" + target + "\x00"),
+			[]byte("/usr/bin/leaf-daemon\x00"),
+			[]byte("7f0e0000-7f0f0000 rw-p 00000000 00:00 0\x00"),
+		}, nil
+	})
+
+	references, err := processReferencesManyWithOwners(context.Background(), pid, []string{target}, map[int]int{pid: os.Getuid()})
+	if err != nil {
+		t.Fatalf("readable same-owner metadata must answer the census, not fail it: %v", err)
+	}
+	if !references[target] {
+		t.Fatal("an environment-only reference was reported as no reference; the census would clear the reaper guard for a live holder")
+	}
+}
+
+// TestProcessReferencesManyClassifications pins the classifications that may
+// legitimately complete a census answer for a pid the private metadata read
+// failed on: a foreign owner is out of scope for a private target, a process
+// that is gone cannot hold anything, and an owner missing from the snapshot
+// stays fail-closed. The 44cf27cf review requires these refusals preserved
+// rather than replaced by a fallback's success.
+func TestProcessReferencesManyClassifications(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("the /proc-metadata classification under test is the linux surface; darwin answers through procargs")
+	}
+	target := filepath.Join(t.TempDir(), "worktrees", "harvest-stage")
+	procErr := &fs.PathError{Op: "open", Path: "/proc/1/environ", Err: syscall.EACCES}
+	stubProcessProcFn(t, func(int) ([][]byte, error) { return nil, procErr })
+
+	// Foreign owner: not deletion authority for a private target, census
+	// answer completes without the private metadata.
+	references, err := processReferencesManyWithOwners(context.Background(), 1, []string{target}, map[int]int{1: os.Getuid() + 1})
+	if err != nil {
+		t.Fatalf("a foreign owner must be skipped, not fail the census: %v", err)
+	}
+	if references[target] {
+		t.Fatalf("a foreign pid invented a reference: %v", references)
+	}
+
+	// A pid the kernel has already reaped cannot hold a reference: with the
+	// owner table gone, the ESRCH classification completes the answer.
+	stubProcessProcFn(t, func(int) ([][]byte, error) { return nil, os.ErrNotExist })
+	references, err = processReferencesManyWithOwners(context.Background(), 1, []string{target}, nil)
+	if err != nil {
+		t.Fatalf("a reaped pid must classify as gone, not fail the census: %v", err)
+	}
+	if references[target] {
+		t.Fatalf("a reaped pid invented a reference: %v", references)
+	}
+
+	// Owner missing from a present snapshot: the census cannot classify the
+	// pid at all, so it must stay fail-closed.
+	stubProcessProcFn(t, func(int) ([][]byte, error) { return nil, procErr })
+	if _, err := processReferencesManyWithOwners(context.Background(), 1, []string{target}, map[int]int{}); err == nil {
+		t.Fatal("an unclassifiable pid must stay fail-closed; the census read as complete")
+	}
+}
+
+// TestDarwinLiveMetadataRefusalStaysFailClosed pins the darwin twin of the
+// same-owner fail-closed contract: a LIVE same-owner pid whose procargs
+// argv/environment read the kernel refuses (the classifier deliberately keeps
+// live and reused pids protected; only ESRCH resolves as gone) must propagate
+// as an error, never as a complete "no reference" answer from the argv-bearing
+// public surface alone.
+func TestDarwinLiveMetadataRefusalStaysFailClosed(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("the procargs refusal surface under test is darwin; %s answers through /proc", runtime.GOOS)
+	}
+	pid := os.Getpid()
+	target := filepath.Join(t.TempDir(), "worktrees", "harvest-stage")
+	original := readDarwinProcessArgsFn
+	readDarwinProcessArgsFn = func(int) ([]byte, error) {
+		return nil, syscall.EINVAL
+	}
+	t.Cleanup(func() { readDarwinProcessArgsFn = original })
+	stubProcessProcFn(t, func(int) ([][]byte, error) { return nil, os.ErrNotExist })
+
+	// os.ErrNotExist short-circuits only off darwin; on darwin the same-owner
+	// branch runs and the refused procargs read must fail the census closed.
+	references, err := processReferencesManyWithOwners(context.Background(), pid, []string{target}, map[int]int{pid: os.Getuid()})
+	if err == nil {
+		t.Fatalf("a live same-owner pid with a refused procargs read must fail the census closed; the census read as complete with %v", references)
+	}
+	if references[target] {
+		t.Fatalf("the refused probe invented a reference: %v", references)
+	}
+
+	// A pid the kernel has already resolved as gone (ErrProcessDone from the
+	// classifier) still completes the answer: the gone classification is
+	// preserved.
+	readDarwinProcessArgsFn = func(int) ([]byte, error) { return nil, os.ErrProcessDone }
+	if _, err := processReferencesManyWithOwners(context.Background(), pid, []string{target}, map[int]int{pid: os.Getuid()}); err != nil {
+		t.Fatalf("a classifier-resolved gone pid must complete the census, not fail it: %v", err)
 	}
 }
