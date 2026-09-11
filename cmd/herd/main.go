@@ -4605,6 +4605,21 @@ func runBoardSyncFix(syncer *hsync.BoardSyncer, projectID string, asJSON bool) i
 
 // runSend ports bin/herd-send: prompt an idle agent, or queue routinely while
 // the recipient works. Authenticated urgent control stays on SendStatus.
+// validateSupersedeInvocation is the explicit opt-in contract for
+// `herd send --supersede-pending`: the replacement payload is mandatory and a
+// drain can never be combined with it, because one operation replaces pending
+// work while the other surfaces it. An empty payload would otherwise silently
+// mean "retire the pending work and deliver nothing".
+func validateSupersedeInvocation(drain bool, text string) error {
+	if drain {
+		return fmt.Errorf("--supersede-pending and --drain are mutually exclusive")
+	}
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("--supersede-pending requires a replacement payload (positional or --file)")
+	}
+	return nil
+}
+
 func runSend() {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	noVerify := fs.Bool("no-verify", false, "Submit without waiting for the agent to flip to working")
@@ -4681,10 +4696,6 @@ func runSend() {
 		}
 	}
 
-	// Supersession is an explicit opt-in queue operation with its own payload
-	// contract: a replacement is mandatory, it never combines with a drain,
-	// and it never touches the pane. An empty payload here would otherwise
-	// silently mean "retire the pending work and deliver nothing".
 	if *supersedePending {
 		if err := validateSupersedeInvocation(*drain, text); err != nil {
 			fmt.Fprintf(os.Stderr, "herd send: %v\n", err)

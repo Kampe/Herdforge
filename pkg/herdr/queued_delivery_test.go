@@ -21,6 +21,7 @@ type interruptRecorder struct {
 	calls           []string
 	status          string
 	terminal        string
+	session         string
 	pane            string
 	paneAfterPrompt string
 	enterErr        error
@@ -37,7 +38,7 @@ func (r *interruptRecorder) run(args ...string) (string, error) {
 	r.calls = append(r.calls, joined)
 	switch {
 	case len(args) >= 2 && args[0] == "agent" && args[1] == "list":
-		return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","pane_id":"pane-live","workspace_id":"wK","terminal_id":%q,"agent_status":%q}]}}`, r.terminal, r.status), nil
+		return fmt.Sprintf(`{"result":{"agents":[{"name":"worker","pane_id":"pane-live","workspace_id":"wK","terminal_id":%q,"agent_session":{"kind":"id","value":%q},"agent_status":%q}]}}`, r.terminal, r.session, r.status), nil
 	case len(args) >= 2 && args[0] == "pane" && args[1] == "read":
 		return `{"result":{"text":` + jsonQuote(r.pane) + `}}`, nil
 	case len(args) >= 2 && args[0] == "agent" && args[1] == "prompt":
@@ -70,9 +71,9 @@ func (r *interruptRecorder) snapshot() (calls []string, prompted int, keys []str
 func installBusyWorker(t *testing.T, status string) (*interruptRecorder, *mail.Mailbox) {
 	t.Helper()
 	t.Setenv("HERD_WORKSPACE", "wK")
-	// A live herdr row always carries terminal_id; it is the generation token
-	// that separates one session of a lane from the next.
-	rec := &interruptRecorder{status: status, terminal: "term_live_1", pane: "running: sleep 30"}
+	// A bound live row carries BOTH a terminal generation and the harness's
+	// own session value; either alone is not proof of which agent answers.
+	rec := &interruptRecorder{status: status, terminal: "term_live_1", session: "ses_live_1", pane: "running: sleep 30"}
 	t.Cleanup(SetRunHerdrForTest(rec.run))
 	box := mail.NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
 	t.Cleanup(SetQueueMailbox(box))
@@ -407,7 +408,7 @@ func TestBusySendCancelDoesNotClaimConsumption(t *testing.T) {
 	_, box := installBusyWorker(t, "working")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := queueRoutineLocked(ctx, AgentEntry{Name: "worker", Workspace: "wK", TerminalID: "term_live_1"}, "worker", "canceled")
+	_, err := queueRoutineLocked(ctx, liveAgent(), "worker", "canceled")
 	if err == nil {
 		t.Fatal("canceled queue must fail")
 	}
@@ -472,5 +473,16 @@ func TestQueueMailboxIgnoresLaneHERDROOT(t *testing.T) {
 	want := filepath.Join(root, ".herd", "control-mail.jsonl")
 	if box.MailFile != want {
 		t.Fatalf("mailbox = %q, want project root %q (not HERD_ROOT %q)", box.MailFile, want, lane)
+	}
+}
+
+// liveAgent is the fully-identified live row: workspace, terminal generation
+// and the harness's own session value.
+func liveAgent() AgentEntry {
+	return AgentEntry{
+		Name:       "worker",
+		Workspace:  "wK",
+		TerminalID: "term_live_1",
+		Session:    AgentSession{Kind: "id", Value: "ses_live_1"},
 	}
 }

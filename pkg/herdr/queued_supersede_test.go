@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -13,7 +14,7 @@ func TestSupersedeAndQueueRoutineResolvesLiveTargetAndRetiresSameIssuer(t *testi
 	recorder, box := installBusyWorker(t, "working")
 	t.Setenv("HERD_LANE", "forge-orchestrator-1")
 	ctx := context.Background()
-	binding := TargetBinding(AgentEntry{Name: "worker", Workspace: "wK", TerminalID: "term_live_1"})
+	binding := TargetBinding(liveAgent())
 	if binding == "" {
 		t.Fatal("a live row with a terminal id must produce a binding")
 	}
@@ -84,27 +85,114 @@ func TestSupersedeAndQueueRoutineQueuesReplacementWithNothingPending(t *testing.
 	}
 }
 
-// TestSupersedeAndQueueRoutineRefusesAnUnidentifiableTarget is the reboot
-// guard at the resolution boundary: without a terminal generation there is no
-// proof of WHICH session answers to this name, so nothing may be retired.
+// TestSupersedeAndQueueRoutineRefusesAnUnidentifiableTarget is the guard at
+// the resolution boundary. A pane generation alone is not an agent: the same
+// terminal can host a restarted harness that has reported no session yet, so
+// EITHER identity component missing means nothing may be retired.
 func TestSupersedeAndQueueRoutineRefusesAnUnidentifiableTarget(t *testing.T) {
+	for name, blank := range map[string]func(*interruptRecorder){
+		"no terminal generation": func(r *interruptRecorder) { r.terminal = "" },
+		"harness session absent": func(r *interruptRecorder) { r.session = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec, box := installBusyWorker(t, "working")
+			blank(rec)
+			t.Setenv("HERD_LANE", "forge-orchestrator-1")
+			ctx := context.Background()
+			if _, err := box.QueueRoutine(ctx, "forge-orchestrator-1", "worker", "tb-some-old-session", "stale work"); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			if _, err := SupersedeAndQueueRoutine(ctx, "worker", "", "replacement"); err == nil {
+				t.Fatal("an unidentifiable target must refuse supersession, not retire on a partial identity")
+			}
+			pending, err := box.PendingQueued("worker")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 1 || pending[0].Body != "stale work" {
+				t.Fatalf("a refused supersession must change nothing: %+v", pending)
+			}
+		})
+	}
+}
+
+// TestSameTerminalNewHarnessSessionCannotRetirePreviousWork is the exact case
+// root called out: the pane never changed, but the harness inside it
+// restarted. Same terminal generation, different agent, none of the old work.
+func TestSameTerminalNewHarnessSessionCannotRetirePreviousWork(t *testing.T) {
 	rec, box := installBusyWorker(t, "working")
-	rec.terminal = ""
 	t.Setenv("HERD_LANE", "forge-orchestrator-1")
-	ctx := context.Background()
-	if _, err := box.QueueRoutine(ctx, "forge-orchestrator-1", "worker", "tb-some-old-session", "stale work"); err != nil {
-		t.Fatalf("seed: %v", err)
+	if _, err := Send("worker", "work owned by the previous harness session", false, 0); err != nil {
+		t.Fatalf("busy send: %v", err)
 	}
 
-	if _, err := SupersedeAndQueueRoutine(ctx, "worker", "", "replacement"); err == nil {
-		t.Fatal("an unidentifiable target must refuse supersession, not retire on a name")
+	// The pane is untouched; only the harness restarted.
+	rec.session = "ses_restarted_harness"
+	result, err := SupersedeAndQueueRoutine(context.Background(), "worker", "", "current correction")
+	if err != nil {
+		t.Fatalf("supersede from the restarted harness: %v", err)
 	}
-	pending, err := box.PendingQueued("worker")
+	if len(result.SupersededIDs) != 0 {
+		t.Fatalf("a restarted harness in the same terminal retired the previous session's work: %v", result.SupersededIDs)
+	}
+	after, err := box.PendingQueued("worker")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].Body != "stale work" {
-		t.Fatalf("a refused supersession must change nothing: %+v", pending)
+	if len(after) != 2 {
+		t.Fatalf("pending = %d, want the preserved envelope plus the new correction", len(after))
+	}
+}
+
+// TestSupersedeRequiresABoundCoordinatorIssuer closes the fallback hole: an
+// invocation with no lane identity queues as the shared anonymous sender,
+// which every unbound coordinator also uses, so it can never authorize
+// retiring queued work — including work queued anonymously.
+func TestSupersedeRequiresABoundCoordinatorIssuer(t *testing.T) {
+	_, box := installBusyWorker(t, "working")
+	t.Setenv("HERD_LANE", "")
+	ctx := context.Background()
+
+	// Ordinary FIFO send stays compatible while unbound.
+	if _, err := Send("worker", "anonymous legacy assignment", false, 0); err != nil {
+		t.Fatalf("anonymous FIFO send must keep working: %v", err)
+	}
+	pending, err := box.PendingQueued("worker")
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("seed: %d pending, err %v", len(pending), err)
+	}
+	if pending[0].Sender != "herd-send" {
+		t.Fatalf("unbound send must queue as the shared anonymous sender, got %q", pending[0].Sender)
+	}
+
+	_, err = SupersedeAndQueueRoutine(ctx, "worker", "", "replacement")
+	if err == nil {
+		t.Fatal("an unbound invocation must refuse supersession; the fallback sender is not an issuer identity")
+	}
+	// The refusal must come from the COMMAND boundary, where the invocation's
+	// own identity is known, not only from the mailbox's last-ditch rejection
+	// of the shared sender. A caller that silently substitutes the anonymous
+	// default here would still be stopped, but only by accident of depth.
+	if !strings.Contains(err.Error(), "no bound coordinator identity") {
+		t.Fatalf("expected the bound-issuer refusal at the command boundary, got: %v", err)
+	}
+	after, err := box.PendingQueued("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 || after[0].Body != "anonymous legacy assignment" {
+		t.Fatalf("anonymous legacy pending must be preserved untouched: %+v", after)
+	}
+
+	// And a bound coordinator cannot reach across into that anonymous work.
+	t.Setenv("HERD_LANE", "forge-orchestrator-1")
+	result, err := SupersedeAndQueueRoutine(ctx, "worker", "", "bound replacement")
+	if err != nil {
+		t.Fatalf("bound supersede: %v", err)
+	}
+	if len(result.SupersededIDs) != 0 {
+		t.Fatalf("a bound issuer retired anonymous work it does not own: %v", result.SupersededIDs)
 	}
 }
 

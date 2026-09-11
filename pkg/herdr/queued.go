@@ -19,7 +19,9 @@ const (
 	// StatusQueuedDurable is a successful busy-path receipt: the payload is
 	// on the mailbox, and it has not been consumed by the pane.
 	StatusQueuedDurable = "queued-durable"
-	queueSenderDefault  = "herd-send"
+	// queueSenderDefault is the shared UNBOUND sender. One definition, in
+	// pkg/mail, because both layers have to refuse it for the same reason.
+	queueSenderDefault = mail.AnonymousIssuer
 )
 
 // ErrNotIdleBoundary is returned when a drain is asked to surface mail while
@@ -76,10 +78,28 @@ func resolveQueueMailbox() (*mail.Mailbox, error) {
 }
 
 func queueSender() string {
-	if lane := strings.TrimSpace(os.Getenv("HERD_LANE")); lane != "" {
+	if lane := boundIssuer(); lane != "" {
 		return lane
 	}
 	return queueSenderDefault
+}
+
+// boundIssuer is the caller's VERIFIED coordinator identity, or empty when
+// the invocation carries none.
+//
+// HERD_LANE is the native lane binding (role-inject exports it, laneenv
+// carries it, the feedback path already validates replies against it). An
+// invocation without it is anonymous: it queues perfectly well as
+// mail.AnonymousIssuer, which is why ordinary FIFO send stays compatible, but
+// it is not an identity and must never authorize retiring someone else's
+// queued work. A lane that literally names itself the unbound default is
+// treated as unbound too, so the fallback cannot be spoofed into an identity.
+func boundIssuer() string {
+	lane := strings.TrimSpace(os.Getenv("HERD_LANE"))
+	if lane == "" || lane == mail.AnonymousIssuer {
+		return ""
+	}
+	return lane
 }
 
 // immediateDeliveryAllowed reports whether a live agent status is a safe
@@ -111,7 +131,14 @@ func immediateDeliveryAllowed(status string) bool {
 // never authorize retiring another session's queued work.
 func TargetBinding(resolved AgentEntry) string {
 	terminal := strings.TrimSpace(resolved.TerminalID)
-	if terminal == "" {
+	// The harness SESSION is required, not merely folded in when present. A
+	// terminal generation identifies a tab, and the same tab can host a
+	// restarted harness that has not reported a session yet — same
+	// terminal_id, entirely different agent, none of the old work. Without
+	// the agent's own session value there is no proof of WHICH agent answers,
+	// so the target is unbound and scoped operations must refuse it.
+	session := strings.TrimSpace(resolved.Session.Value)
+	if terminal == "" || session == "" {
 		return ""
 	}
 	root, _, err := gitroot.ProjectRoot(context.Background(), ".")
@@ -123,7 +150,7 @@ func TargetBinding(resolved AgentEntry) string {
 		strings.TrimSpace(resolved.Workspace),
 		strings.TrimSpace(resolved.Name),
 		terminal,
-		strings.TrimSpace(resolved.Session.Value),
+		session,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(canonical))
 	return "tb-" + hex.EncodeToString(sum[:12])
@@ -311,9 +338,13 @@ func SupersedeAndQueueRoutine(ctx context.Context, target, workspace, body strin
 	if recipient == "" {
 		recipient = target
 	}
+	issuer := boundIssuer()
+	if issuer == "" {
+		return SupersedeResult{}, fmt.Errorf("herdr supersede for %s: this invocation has no bound coordinator identity (HERD_LANE); refusing to retire queued work as the shared anonymous sender", recipient)
+	}
 	binding := TargetBinding(resolved)
 	if binding == "" {
-		return SupersedeResult{}, fmt.Errorf("herdr supersede for %s: the live target has no resolvable session identity; refusing to retire queued work on a name alone", recipient)
+		return SupersedeResult{}, fmt.Errorf("herdr supersede for %s: the live target reports no harness session for its terminal; refusing to retire queued work on a pane generation alone", recipient)
 	}
 	box, err := resolveQueueMailbox()
 	if err != nil {
@@ -322,7 +353,7 @@ func SupersedeAndQueueRoutine(ctx context.Context, target, workspace, body strin
 	if box == nil {
 		return SupersedeResult{}, fmt.Errorf("herdr supersede for %s: durable queue mailbox is required", recipient)
 	}
-	out, err := box.SupersedePendingRoutine(ctx, queueSender(), recipient, binding, body, "")
+	out, err := box.SupersedePendingRoutine(ctx, issuer, recipient, binding, body, "")
 	if err != nil {
 		return SupersedeResult{}, fmt.Errorf("herdr supersede for %s: %w", recipient, err)
 	}

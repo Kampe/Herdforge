@@ -503,3 +503,146 @@ func TestDispositionStateIsFsyncedNotJustRenamed(t *testing.T) {
 		t.Fatal("the disposition rename was not followed by a directory fsync; the new directory entry can be lost")
 	}
 }
+
+// TestSupersedeRefusesTheSharedAnonymousIssuer closes the fallback hole at the
+// mail layer too: unbound coordinators all queue as the same default sender,
+// so equality on it proves nothing and mail queued under it is permanently
+// preserved.
+func TestSupersedeRefusesTheSharedAnonymousIssuer(t *testing.T) {
+	box := NewMailbox(filepath.Join(t.TempDir(), "mail.jsonl"))
+	ctx := context.Background()
+	if _, err := box.QueueRoutine(ctx, AnonymousIssuer, "worker-p1BB", liveBinding, "anonymous legacy work"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := box.SupersedePendingRoutine(ctx, AnonymousIssuer, "worker-p1BB", liveBinding, supersedeBody, ""); err == nil {
+		t.Fatal("the shared unbound sender must never authorize a supersession")
+	}
+	pending, err := box.PendingQueued("worker-p1BB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Body != "anonymous legacy work" {
+		t.Fatalf("anonymous pending must survive untouched: %+v", pending)
+	}
+
+	// A bound issuer cannot reach into it either.
+	out, err := box.SupersedePendingRoutine(ctx, "forge-orchestrator-1", "worker-p1BB", liveBinding, supersedeBody, "")
+	if err != nil {
+		t.Fatalf("bound supersede: %v", err)
+	}
+	if len(out.SupersededIDs) != 0 {
+		t.Fatalf("a bound issuer retired anonymous work: %v", out.SupersededIDs)
+	}
+}
+
+// TestReaderGateValidatesTheReplacementIdentityNotJustTheID: a present
+// envelope whose id happens to match the record is not a committed
+// supersession. It must be the same queued class, recipient, issuer and target
+// binding, or the retired work stays deliverable.
+func TestReaderGateValidatesTheReplacementIdentityNotJustTheID(t *testing.T) {
+	sender, recipient := "forge-orchestrator-1", "worker-p1BB"
+	victim := &Envelope{ID: "queued-victim", Sender: sender, Recipient: recipient, Subject: QueuedDeliverySubject, Binding: liveBinding, Body: "stale"}
+	rec := SupersessionRecord{ReplacementID: "queued-repl", Issuer: sender, Reason: "r"}
+	good := &Envelope{ID: "queued-repl", Sender: sender, Recipient: recipient, Subject: QueuedDeliverySubject, Binding: liveBinding, Body: "fresh"}
+
+	if !supersessionHonoured(rec, victim, good) {
+		t.Fatal("a fully matching replacement must commit the supersession")
+	}
+	for name, bad := range map[string]*Envelope{
+		"missing entirely":    nil,
+		"ordinary report":     {ID: "queued-repl", Sender: sender, Recipient: recipient, Subject: "review feedback", Binding: liveBinding},
+		"control envelope":    {ID: "queued-repl", Sender: sender, Recipient: recipient, Subject: ControlSubjectPrefix + " stop", Binding: liveBinding},
+		"different recipient": {ID: "queued-repl", Sender: sender, Recipient: "someone-else", Subject: QueuedDeliverySubject, Binding: liveBinding},
+		"different issuer":    {ID: "queued-repl", Sender: "forge-orchestrator-OTHER", Recipient: recipient, Subject: QueuedDeliverySubject, Binding: liveBinding},
+		"different session":   {ID: "queued-repl", Sender: sender, Recipient: recipient, Subject: QueuedDeliverySubject, Binding: oldBinding},
+		"unbound replacement": {ID: "queued-repl", Sender: sender, Recipient: recipient, Subject: QueuedDeliverySubject, Binding: ""},
+		"identity mismatch":   {ID: "queued-something-else", Sender: sender, Recipient: recipient, Subject: QueuedDeliverySubject, Binding: liveBinding},
+	} {
+		if supersessionHonoured(rec, victim, bad) {
+			t.Fatalf("%s was accepted as a committed replacement", name)
+		}
+	}
+}
+
+// TestEveryDispositionReaderHonoursTheGate proves the rule lives at the shared
+// chokepoint: Handled itself reports an uncommitted supersession as still
+// pending, so every caller inherits it rather than each re-implementing it.
+func TestEveryDispositionReaderHonoursTheGate(t *testing.T) {
+	box, sender, recipient := supersedeFixture(t)
+	pending, err := box.PendingQueued(recipient)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("fixture: %d pending, err %v", len(pending), err)
+	}
+	victim := pending[0].ID
+
+	st, err := loadAck(box.MailFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applySupersedeMarks(st, recipient, []string{victim}, sender, "queued-never-written", "torn")
+	if err := saveAck(box.MailFile, st); err != nil {
+		t.Fatal(err)
+	}
+
+	handled, err := box.Handled(recipient, victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("Handled honoured a supersession whose replacement never landed; every read path that asks it would skip deliverable work")
+	}
+	after, err := box.PendingQueued(recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("listing = %d, want the victim still eligible", len(after))
+	}
+}
+
+// TestInterruptedSupersessionSurvivesRestart: the recovery guarantee has to
+// hold for a NEW process reading the same files, not just the instance that
+// was interrupted. No in-memory state, no stale saved state to restore.
+func TestInterruptedSupersessionSurvivesRestart(t *testing.T) {
+	box, sender, recipient := supersedeFixture(t)
+
+	orig := writeFileAtomicFn
+	writeFileAtomicFn = func(path string, data []byte, perm os.FileMode) error {
+		if strings.HasSuffix(path, ".handled.json") {
+			return os.ErrPermission
+		}
+		return orig(path, data, perm)
+	}
+	_, err := box.SupersedePendingRoutine(context.Background(), sender, recipient, liveBinding, supersedeBody, "")
+	writeFileAtomicFn = orig
+	if err == nil {
+		t.Fatal("an uncommitted disposition must return nonzero")
+	}
+
+	// Restart: a cold instance with no seen-set and no cached ack state.
+	restarted := NewMailbox(box.MailFile)
+	pending, err := restarted.PendingQueued(recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("after restart pending = %d, want both old envelopes plus the durable replacement", len(pending))
+	}
+	out, err := restarted.SupersedePendingRoutine(context.Background(), sender, recipient, liveBinding, supersedeBody, "")
+	if err != nil {
+		t.Fatalf("recovery on a restarted process: %v", err)
+	}
+	if len(out.SupersededIDs) != 2 || !out.Idempotent {
+		t.Fatalf("recovery = %+v, want the stale pair retired against the already-durable replacement", out)
+	}
+
+	// And once committed, a further cold instance sees exactly the replacement.
+	final, err := NewMailbox(box.MailFile).PendingQueued(recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final) != 1 || final[0].ID != out.EnvelopeID {
+		t.Fatalf("after recovery a cold reader sees %d pending, want exactly the replacement", len(final))
+	}
+}

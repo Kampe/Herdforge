@@ -13,6 +13,13 @@ import (
 // prefix so control, callback, and help traffic stay on their own paths.
 const QueuedDeliverySubject = "herd.queued/v1"
 
+// AnonymousIssuer is the sender every UNBOUND caller of herd send shares when
+// no lane identity is exported. It is a default, not an identity: two
+// unrelated coordinators both appear as this, so equality on it proves
+// nothing about who queued what. Identity-scoped operations must refuse it,
+// and mail already queued under it is permanently anonymous and preserved.
+const AnonymousIssuer = "herd-send"
+
 // QueuedEnvelopeID is the stable identity of one routine payload to one
 // recipient in one target binding. Retries of the same
 // sender/recipient/binding/body reuse the id so the mailbox append is
@@ -150,10 +157,10 @@ func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool
 	if err != nil {
 		return nil, err
 	}
-	present := make(map[string]struct{}, len(envs))
+	present := make(map[string]*Envelope, len(envs))
 	for _, env := range envs {
 		if env != nil {
-			present[env.ID] = struct{}{}
+			present[env.ID] = env
 		}
 	}
 	handled := make(map[string]struct{}, len(st.Handled[recipient]))
@@ -165,7 +172,7 @@ func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool
 		if env == nil || !eligible(env) {
 			continue
 		}
-		if _, ok := handled[env.ID]; ok && supersessionCommitted(st, recipient, env.ID, present) {
+		if _, ok := handled[env.ID]; ok && markStandsLocal(st, recipient, env, present) {
 			continue
 		}
 		out = append(out, env)
@@ -173,26 +180,14 @@ func (m *Mailbox) pendingRoutine(recipient string, eligible func(*Envelope) bool
 	return out, nil
 }
 
-// supersessionCommitted decides whether a handled mark may be honoured.
-//
-// This is the crash contract, enforced at READ time rather than argued from
-// write ordering. A supersession commits two facts to two files: the
-// replacement envelope, then the disposition that retires the old ones. A
-// mark carrying a supersession record whose replacement is not actually in
-// the mailbox describes a supersession that never completed, so it is
-// ignored and the old envelope stays deliverable. Work is never retired in
-// favour of a replacement that does not exist.
-//
-// Marks with no supersession record are ordinary acknowledgements and always
-// stand.
-func supersessionCommitted(st *ackState, recipient, id string, present map[string]struct{}) bool {
-	rec, ok := st.Superseded[recipient][id]
-	if !ok {
+// markStandsLocal answers the same question as Handled — may this mark be
+// honoured? — from a batch already in hand, so listing a mailbox does not
+// re-read it once per envelope. The RULE itself lives in exactly one place,
+// supersessionHonoured; only the lookup differs.
+func markStandsLocal(st *ackState, recipient string, victim *Envelope, present map[string]*Envelope) bool {
+	rec, superseded := st.Superseded[recipient][victim.ID]
+	if !superseded {
 		return true
 	}
-	if rec.ReplacementID == "" {
-		return false
-	}
-	_, committed := present[rec.ReplacementID]
-	return committed
+	return supersessionHonoured(rec, victim, present[rec.ReplacementID])
 }

@@ -91,6 +91,13 @@ func (m *Mailbox) SupersedePendingRoutine(ctx context.Context, sender, recipient
 	if sender == "" || recipient == "" {
 		return nil, fmt.Errorf("mail: supersession requires sender and recipient")
 	}
+	// The unbound default is shared by every coordinator that exports no lane
+	// identity, so equality on it would let any of them retire any other's
+	// queued work. Refusing it here also permanently preserves mail already
+	// queued anonymously: no issuer can ever match it.
+	if sender == AnonymousIssuer {
+		return nil, fmt.Errorf("mail: %q is the shared unbound sender, not an issuer identity; supersession requires a bound coordinator", AnonymousIssuer)
+	}
 	if binding == "" {
 		return nil, fmt.Errorf("mail: supersession requires a resolved target binding; an unbound target cannot authorize retiring queued work")
 	}
@@ -117,9 +124,9 @@ func (m *Mailbox) SupersedePendingRoutine(ctx context.Context, sender, recipient
 			return fmt.Errorf("supersession: %w", err)
 		}
 
-		present := map[string]struct{}{}
+		present := map[string]*Envelope{}
 		for _, env := range envs {
-			present[env.ID] = struct{}{}
+			present[env.ID] = env
 		}
 		handled := map[string]struct{}{}
 		for _, id := range st.Handled[recipient] {
@@ -149,7 +156,7 @@ func (m *Mailbox) SupersedePendingRoutine(ctx context.Context, sender, recipient
 			if env.Binding == "" || env.Binding != binding {
 				continue
 			}
-			if _, ok := handled[env.ID]; ok && supersessionCommitted(st, recipient, env.ID, present) {
+			if _, ok := handled[env.ID]; ok && markStandsLocal(st, recipient, env, present) {
 				continue
 			}
 			victims = append(victims, env.ID)

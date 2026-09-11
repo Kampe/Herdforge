@@ -154,15 +154,75 @@ func markHandledLocked(st *ackState, recipient, id string) bool {
 }
 
 // Handled reports whether an envelope already reached a disposition.
+//
+// This is the one chokepoint every read and delivery path asks, so the
+// supersession commit gate lives HERE rather than in each caller: a mark that
+// came from an incomplete supersession must read as "still pending"
+// everywhere, not only on the drain. See supersessionHonoured.
 func (m *Mailbox) Handled(recipient, id string) (bool, error) {
+	recipient, id = strings.TrimSpace(recipient), strings.TrimSpace(id)
 	st, err := loadAck(m.MailFile)
 	if err != nil {
 		return false, err
 	}
-	for _, known := range st.Handled[strings.TrimSpace(recipient)] {
-		if known == strings.TrimSpace(id) {
-			return true, nil
+	marked := false
+	for _, known := range st.Handled[recipient] {
+		if known == id {
+			marked = true
+			break
 		}
 	}
-	return false, nil
+	if !marked {
+		return false, nil
+	}
+	rec, superseded := st.Superseded[recipient][id]
+	if !superseded {
+		return true, nil // an ordinary acknowledgement always stands
+	}
+	// Only an envelope that a supersession actually touched pays for the
+	// mailbox read; plain acknowledgements stay a single ack-file load.
+	envs, err := m.ReadInbox(recipient)
+	if err != nil {
+		return false, err
+	}
+	var victim, replacement *Envelope
+	for _, env := range envs {
+		if env == nil {
+			continue
+		}
+		if env.ID == id {
+			victim = env
+		}
+		if env.ID == rec.ReplacementID {
+			replacement = env
+		}
+	}
+	return supersessionHonoured(rec, victim, replacement), nil
+}
+
+// supersessionHonoured is the single definition of "this supersession
+// actually committed", asked by every disposition reader.
+//
+// An id match alone is not proof. The replacement has to BE what the record
+// claims: the same durable queued class, addressed to the same recipient, from
+// the same issuer that retired the work, and carrying the same target session
+// binding as the envelope it replaced. Anything else — a missing replacement
+// from an interrupted commit, a record pointing at an ordinary report or a
+// control envelope, a replacement for some other session — describes a
+// supersession that never completed, so the retired envelope stays
+// deliverable and nothing is lost.
+func supersessionHonoured(rec SupersessionRecord, victim, replacement *Envelope) bool {
+	if victim == nil || replacement == nil || rec.ReplacementID == "" {
+		return false
+	}
+	if replacement.ID != rec.ReplacementID || replacement.Subject != QueuedDeliverySubject {
+		return false
+	}
+	if replacement.Recipient != victim.Recipient {
+		return false
+	}
+	if rec.Issuer == "" || replacement.Sender != rec.Issuer || victim.Sender != rec.Issuer {
+		return false
+	}
+	return replacement.Binding != "" && replacement.Binding == victim.Binding
 }
