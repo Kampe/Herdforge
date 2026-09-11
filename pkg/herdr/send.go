@@ -515,7 +515,18 @@ func deliverRoutine(target, text string, verify bool, timeout time.Duration, wor
 			// running. A pane cannot echo text it never received, and the
 			// baseline comparison still prevents old text from proving a new
 			// delivery, so the status check adds nothing here.
-			if paneErr == nil && observationCount(text, pane) > observationCount(text, baselinePane) {
+			//
+			// FAC-815: this is instant proof ONLY for harnesses that actually
+			// echo the prompt. A non-echo harness (claude, opencode-separate)
+			// can still render the literal submitted text transiently on
+			// SUBMISSION itself -- a compose-time render, a wrapped command
+			// line in the tail, taskTextObserved's own premise that command
+			// text DOES appear in transcripts -- none of which is the agent
+			// accepting the work. Gating on harnessEchoesPrompt keeps the
+			// FAC-589 instant proof for harnesses that genuinely echo, and
+			// sends every non-echo harness through the fresh-working fallback
+			// below regardless of any transient literal-text render.
+			if harnessEchoesPrompt(resolved.Kind) && paneErr == nil && observationCount(text, pane) > observationCount(text, baselinePane) {
 				if st == "" {
 					st = "working"
 				}

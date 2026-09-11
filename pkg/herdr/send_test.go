@@ -324,6 +324,50 @@ func TestSendRefusesRestingDoneWithoutFreshWorkingObservation(t *testing.T) {
 	}
 }
 
+// FAC-815 correction (GLM independent review, mail seq 2974): the
+// observationCount echo-proof branch (send.go:518) is unconditional --
+// it is not scoped to harnessEchoesPrompt. A non-echo harness (claude)
+// can render the literal submitted text transiently on submission itself
+// (a compose-time render, a wrapped command line in the pane tail), which
+// is the exact same resting-done false positive this task exists to
+// kill, one branch over: status never leaves "done", yet the literal
+// text appearing in the pane is (incorrectly, pre-correction) accepted as
+// proof on its own. This must refuse identically to the no-literal-text
+// case above.
+func TestSendRefusesRestingDoneEvenWithLiteralTextRender(t *testing.T) {
+	t.Setenv("HERD_WORKSPACE", "wK")
+	oldRun := runHerdr
+	t.Cleanup(func() { runHerdr = oldRun })
+	paneReads := 0
+	const task = "assigned command: go test ./pkg/herdr"
+	runHerdr = func(args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "agent" && args[1] == "list" {
+			return `{"result":{"agents":[{"name":"worker","agent":"claude","pane_id":"pane-literal","workspace_id":"wK","agent_status":"done"}]}}`, nil
+		}
+		if len(args) >= 2 && args[0] == "pane" && args[1] == "read" {
+			paneReads++
+			if paneReads == 1 {
+				return `{"result":{"text":"idle prompt"}}`, nil
+			}
+			// The literal submitted text DOES render into the pane -- a
+			// compose-time echo of the user's own message -- while status
+			// stays "done" the whole poll: no fresh working was ever
+			// observed. This must NOT be accepted as proof for a
+			// non-echoing harness.
+			return fmt.Sprintf(`{"result":{"text":"idle prompt\n> %s"}}`, task), nil
+		}
+		return "{}", nil
+	}
+
+	got, err := Send("worker", task, true, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "queued-but-not-consumed") {
+		t.Fatalf("Send = %q, %v; want a queued-but-not-consumed refusal even with the literal text rendered, resting done must never confirm", got, err)
+	}
+	if got != "queued" {
+		t.Fatalf("Send status = %q; want queued", got)
+	}
+}
+
 // A genuine new turn (status actually departs into "working" during this
 // delivery's poll, then returns to "done") must still confirm -- the fix
 // must not produce a false negative on real consumption.
