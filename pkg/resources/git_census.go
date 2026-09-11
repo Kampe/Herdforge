@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -667,6 +668,9 @@ type LSOFProcessInspector struct {
 	processReferencesFn     func(ctx context.Context, pid int, path string) (bool, error)
 	processReferencesManyFn func(ctx context.Context, pid int, paths []string, owners map[int]int) (map[string]bool, error)
 	populationFn            func(ctx context.Context) ([]int, map[int]int, error)
+	// openFilesFn is the test seam for the one-shot full-table open-file
+	// capture. nil selects the production implementation.
+	openFilesFn func(ctx context.Context) (map[int][]ProcessOpenFile, error)
 }
 
 const maxBatchProcessTargets = 64
@@ -830,6 +834,41 @@ func (p LSOFProcessInspector) InUseManyPopulation(ctx context.Context, paths []s
 	if len(paths) == 0 {
 		return map[string]ProcessUsage{}, stats, nil
 	}
+	// Bulk evidence path: the population snapshot already carries the
+	// host-wide open-file table, so every target is observed by in-memory
+	// subtree matching — no per-target lsof +D descent, which cannot
+	// complete for hundreds of targets inside a bounded census budget.
+	if len(population.OpenFiles) > 0 {
+		resolvedPaths := make([]string, 0, len(paths))
+		seenResolve := make(map[string]struct{}, len(paths))
+		for _, path := range paths {
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return nil, stats, err
+			}
+			resolved = filepath.Clean(resolved)
+			if _, seen := seenResolve[resolved]; seen {
+				continue
+			}
+			seenResolve[resolved] = struct{}{}
+			resolvedPaths = append(resolvedPaths, resolved)
+		}
+		usage, walkErr := p.bulkUsageFromOpenFiles(ctx, resolvedPaths, population)
+		if walkErr != nil {
+			return nil, stats, walkErr
+		}
+		// Per-target truth: a target whose cross-check walk was cut short
+		// carries MetadataUnavailable and counts as deferred, never as a
+		// completed observation.
+		for _, entry := range usage {
+			if entry.MetadataUnavailable {
+				stats.Deferred++
+			} else {
+				stats.Completed++
+			}
+		}
+		return usage, stats, nil
+	}
 	executable := strings.TrimSpace(p.Executable)
 	if executable == "" {
 		var err error
@@ -852,6 +891,75 @@ func (p LSOFProcessInspector) InUseManyPopulation(ctx context.Context, paths []s
 	}
 	walked, walkErr := p.inUseManyWalk(ctx, timeout, usage, resolvedPaths, population.PIDs, population.Owners)
 	return walked, probeStats, walkErr
+}
+
+// bulkUsageFromOpenFiles derives per-path usage from the captured full-table
+// open files. Every resolved path receives an entry: empty PIDs mean the
+// table showed no open file under the subtree — a definitive observed
+// no-owner result, never a skipped probe. FD semantics mirror the chunked
+// +D parser: cwd entries mark CWD, rtd/txt/mem entries are ignored, every
+// other fd marks OpenFile.
+func (p LSOFProcessInspector) bulkUsageFromOpenFiles(ctx context.Context, resolvedPaths []string, population *ProcessPopulation) (map[string]ProcessUsage, error) {
+	usage := make(map[string]ProcessUsage, len(resolvedPaths))
+	targets := make(map[string]struct{}, len(resolvedPaths))
+	for _, path := range resolvedPaths {
+		usage[path] = ProcessUsage{}
+		targets[path] = struct{}{}
+	}
+	// Ancestor lookup reproduces containedPath(target, openPath) for every
+	// target: an open path is attributed to the target it equals or sits
+	// under, by walking the open path's own ancestors.
+	for pid, opens := range population.OpenFiles {
+		for _, open := range opens {
+			openPath := filepath.Clean(open.Path)
+			if openPath == "." || !filepath.IsAbs(openPath) {
+				continue
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			for {
+				if _, ok := targets[openPath]; ok {
+					break
+				}
+				parent := filepath.Dir(openPath)
+				if parent == openPath {
+					openPath = ""
+					break
+				}
+				openPath = parent
+			}
+			if openPath == "" {
+				continue
+			}
+			entry := usage[openPath]
+			switch {
+			case open.FD == "cwd":
+				entry.CWD = true
+			case open.FD != "rtd" && open.FD != "txt" && open.FD != "mem":
+				entry.OpenFile = true
+			default:
+				continue
+			}
+			entry.PIDs = append(entry.PIDs, pid)
+			usage[openPath] = entry
+		}
+	}
+	for path, entry := range usage {
+		sortInts(entry.PIDs)
+		usage[path] = entry
+	}
+	// Keep the argument-reference cross-check: it is cheap and can only
+	// widen evidence (it never downgrades a completed observation).
+	return p.inUseManyWalk(ctx, p.walkTimeout(), usage, resolvedPaths, population.PIDs, population.Owners)
+}
+
+// walkTimeout is the budget for the cheap per-PID argument cross-check.
+func (p LSOFProcessInspector) walkTimeout() time.Duration {
+	if p.Timeout > 0 {
+		return p.Timeout
+	}
+	return 2 * time.Second
 }
 
 // inUseManyWalk is the shared per-PID reference walk over captured evidence.
@@ -944,6 +1052,7 @@ func (p LSOFProcessInspector) lsofBatch(ctx context.Context, executable string, 
 		resolvedPaths = append(resolvedPaths, resolved)
 	}
 	var stats BatchProbeStats
+	chunksRemaining := (len(resolvedPaths) + maxBatchProcessTargets - 1) / maxBatchProcessTargets
 	for start := 0; start < len(resolvedPaths); start += maxBatchProcessTargets {
 		end := start + maxBatchProcessTargets
 		if end > len(resolvedPaths) {
@@ -960,27 +1069,64 @@ func (p LSOFProcessInspector) lsofBatch(ctx context.Context, executable string, 
 			}
 			break
 		}
-		openUsage, err := p.lsofPaths(ctx, executable, timeout, maxOutput, chunk)
+		// The per-chunk deadline is a fair share of the census budget that
+		// actually remains, not the tiny per-PID walk knob: a fixed 2s
+		// deadline cannot observe a 64-target +D descent on a real host and
+		// silently turned every chunk into a failure. The share is bounded
+		// by the outer ctx, so the phase budget is never inflated. Without
+		// an outer deadline the legacy knob applies.
+		chunkTimeout := timeout
+		if dl, ok := ctx.Deadline(); ok {
+			chunkTimeout = time.Until(dl) / time.Duration(chunksRemaining)
+			if chunkTimeout < time.Second {
+				chunkTimeout = time.Second
+			}
+			if time.Until(dl) < time.Second {
+				cause := fmt.Sprintf("lsof target probe budget exhausted before %d remaining target(s): %v", len(resolvedPaths)-start, ctx.Err())
+				for _, path := range resolvedPaths[start:] {
+					usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: cause}
+					stats.Deferred++
+				}
+				break
+			}
+		}
+		openUsage, err := p.lsofPaths(ctx, executable, chunkTimeout, maxOutput, chunk)
 		if err != nil {
 			cause := fmt.Sprintf("lsof target probe failed: %v", err)
 			for _, path := range chunk {
 				usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: cause}
 			}
 			stats.Deferred += len(chunk)
+			chunksRemaining--
 			continue
 		}
 		for path, entry := range openUsage {
 			usage[path] = entry
 		}
 		stats.Completed += len(chunk)
+		chunksRemaining--
 	}
 	return usage, resolvedPaths, stats, nil
+}
+
+// ProcessOpenFile is one captured open-file entry: the lsof fd field (used
+// to distinguish cwd/rtd/txt/mem from ordinary open files) and the path.
+type ProcessOpenFile struct {
+	FD   string
+	Path string
 }
 
 // ProcessPopulation is one host-wide process/owner snapshot.
 type ProcessPopulation struct {
 	PIDs   []int
 	Owners map[int]int
+	// OpenFiles maps pid -> open-file entries from ONE authoritative
+	// full-table lsof capture. When present it is the bulk evidence source:
+	// per-target subtree lsof +D descents (which cost ~1s per target on a
+	// real host and cannot complete for hundreds of worktrees inside any
+	// honest census budget) are skipped in favor of one in-memory match
+	// over the captured table.
+	OpenFiles map[int][]ProcessOpenFile
 }
 
 // PopulationSnapshooter captures the host-wide population a batch census
@@ -998,14 +1144,23 @@ type PopulationAwareBatchInspector interface {
 }
 
 // SnapshotPopulation captures the bounded process list and owner table once
-// so later census stages can reuse it.
+// so later census stages can reuse it. It also captures the host-wide
+// open-file table in ONE full-table lsof run; a failed capture returns the
+// population without OpenFiles and the caller falls back to per-target
+// probes rather than pretending targets were observed.
 func (p LSOFProcessInspector) SnapshotPopulation(ctx context.Context) (*ProcessPopulation, error) {
 	if p.populationFn != nil {
 		pids, owners, err := p.populationFn(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return &ProcessPopulation{PIDs: pids, Owners: owners}, nil
+		population := &ProcessPopulation{PIDs: pids, Owners: owners}
+		if p.openFilesFn != nil {
+			if opens, err := p.openFilesFn(ctx); err == nil {
+				population.OpenFiles = opens
+			}
+		}
+		return population, nil
 	}
 	timeout := p.Timeout
 	if timeout <= 0 {
@@ -1021,7 +1176,70 @@ func (p LSOFProcessInspector) SnapshotPopulation(ctx context.Context) (*ProcessP
 	if err != nil {
 		return nil, err
 	}
-	return &ProcessPopulation{PIDs: pids, Owners: owners}, nil
+	population := &ProcessPopulation{PIDs: pids, Owners: owners}
+	// One bounded full-table capture: the census budget shares the same
+	// outer ctx, so this can never extend past the run's own deadline.
+	if opens, openErr := p.captureOpenFiles(ctx); openErr == nil {
+		population.OpenFiles = opens
+	}
+	return population, nil
+}
+
+// captureOpenFiles runs ONE full-table lsof (no per-target +D descent) and
+// parses pid -> open paths from the same -Ffnp format the chunked probes
+// use. The output bound is generous because the table covers every process.
+func (p LSOFProcessInspector) captureOpenFiles(ctx context.Context) (map[int][]ProcessOpenFile, error) {
+	if p.openFilesFn != nil {
+		return p.openFilesFn(ctx)
+	}
+	executable := strings.TrimSpace(p.Executable)
+	if executable == "" {
+		var err error
+		executable, err = exec.LookPath("lsof")
+		if err != nil {
+			return nil, fmt.Errorf("open-file table unavailable: %w", err)
+		}
+	}
+	maxOutput := p.MaxOutputBytes
+	if maxOutput <= 0 {
+		maxOutput = 1 << 20
+	}
+	tableBound := maxOutput * 16
+	cmd := exec.CommandContext(ctx, executable, "-nP", "-Ffnp")
+	var stdout limitedOutput
+	stdout.remaining = tableBound
+	cmd.Stdout, cmd.Stderr = &stdout, io.Discard
+	if err := cmd.Run(); err != nil {
+		if stdout.overflow {
+			return nil, fmt.Errorf("open-file table exceeded bound")
+		}
+		return nil, fmt.Errorf("open-file table capture: %w", err)
+	}
+	openFiles := make(map[int][]ProcessOpenFile)
+	currentPID := 0
+	currentDescriptor := ""
+	for _, line := range strings.Split(string(stdout.Bytes()), "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			if pid, err := strconv.Atoi(strings.TrimSpace(line[1:])); err == nil && pid > 0 {
+				currentPID = pid
+			}
+		case 'f':
+			currentDescriptor = strings.TrimSpace(line[1:])
+		case 'n':
+			if currentPID <= 0 || ctx.Err() != nil {
+				continue
+			}
+			openFiles[currentPID] = append(openFiles[currentPID], ProcessOpenFile{FD: currentDescriptor, Path: strings.TrimSpace(line[1:])})
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return openFiles, nil
 }
 
 func (p LSOFProcessInspector) lsofPath(ctx context.Context, executable string, timeout time.Duration, maxOutput int, resolved string) (ProcessUsage, map[int]struct{}, error) {
