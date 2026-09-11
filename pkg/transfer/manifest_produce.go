@@ -32,6 +32,10 @@ var (
 	// before the no-replace publication, so tests can swap the output
 	// parent or destination concurrently.
 	producePublishHook func(tempPath, finalPath string)
+	// produceLockRevalidateHook fires after the native lock is acquired
+	// and before the pinned owned-root revalidation, so tests can swap the
+	// root while the pass was blocked on the lock.
+	produceLockRevalidateHook func()
 )
 
 // ProduceOptions scope one manifest production pass. Bundles are EXPLICIT
@@ -142,6 +146,9 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 	}
 	if lockOwned {
 		defer shared.Release()
+	}
+	if produceLockRevalidateHook != nil {
+		produceLockRevalidateHook()
 	}
 	// Revalidate the pinned root under the lock: the identity that was
 	// scoped before the wait must still own the path that will be read.

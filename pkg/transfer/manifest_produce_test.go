@@ -467,13 +467,20 @@ func TestProduceManifestRefusesRootAndParentReplacement(t *testing.T) {
 		// or disprove the pinned root inode.
 		out := filepath.Join(sub, "retention-manifest-root.json")
 		producePublishHook = func(tempPath, finalPath string) {
-			// Swap the whole owned root between capture and publication.
+			// Swap the whole owned root between capture and publication,
+			// then move the output subdirectory back so the output parent
+			// path resolves normally and only the pinned root inode can
+			// detect the swap.
 			away := f.bundleDir + ".swapped-away"
 			if err := os.Rename(f.bundleDir, away); err != nil {
 				t.Errorf("root swap setup failed: %v", err)
 				return
 			}
 			if err := os.MkdirAll(f.bundleDir, 0755); err != nil {
+				t.Errorf("root swap setup failed: %v", err)
+				return
+			}
+			if err := os.Rename(filepath.Join(away, "manifests"), filepath.Join(f.bundleDir, "manifests")); err != nil {
 				t.Errorf("root swap setup failed: %v", err)
 			}
 		}
@@ -493,6 +500,32 @@ func TestProduceManifestRefusesRootAndParentReplacement(t *testing.T) {
 			t.Fatalf("owned-root replacement must be refused: %v", err)
 		}
 	})
+}
+
+// TestProduceManifestRefusesRootReplacedUnderLock pins the owned-root
+// identity before the lock wait and revalidates it under the lock: a root
+// swapped while the pass was blocked on the native lock is refused.
+func TestProduceManifestRefusesRootReplacedUnderLock(t *testing.T) {
+	f := produceFixtureSetup(t)
+	out := filepath.Join(f.bundleDir, "retention-manifest-lockswap.json")
+	produceLockRevalidateHook = func() {
+		away := f.bundleDir + ".swapped-under-lock"
+		if err := os.Rename(f.bundleDir, away); err != nil {
+			t.Errorf("root swap setup failed: %v", err)
+			return
+		}
+		if err := os.MkdirAll(f.bundleDir, 0755); err != nil {
+			t.Errorf("root swap setup failed: %v", err)
+		}
+	}
+	defer func() { produceLockRevalidateHook = nil }()
+	_, err := ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+		o.Write = true
+		o.Out = out
+	}))
+	if err == nil || !contains(err.Error(), "replaced while acquiring the native lock") {
+		t.Fatalf("root replaced under the lock must be refused: %v", err)
+	}
 }
 
 // TestProduceManifestLoaderContract pins the producer-to-loader contract for
