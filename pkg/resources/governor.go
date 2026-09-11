@@ -596,11 +596,13 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 		seen[lanes[i].Path] = struct{}{}
 		// The allocation walk is an unbounded fs descent. The context-aware
 		// measurer receives the REGISTERED phase deadline, not the outer
-		// sweep context, so a pathological lane can overrun its own phase
-		// budget but can never consume the orphan phase's reservation.
-		// This check bounds the lanes that FOLLOW, not the call in flight;
-		// a single filesystem syscall remains OS-bound and carries no hard
-		// wall-clock guarantee. What it does buy is that a long lane list
+		// sweep context, and observes it at cooperative checkpoints BETWEEN
+		// visited entries. Those checkpoints preserve the phase reservation
+		// across the loop: the walk stops at the next entry boundary once
+		// the deadline fires. They do not cap the call in flight — a single
+		// filesystem syscall is OS-bound, and a legacy context-blind
+		// measurer may run to completion, so no hard wall-clock guarantee
+		// is claimed. What the checkpoints do buy is that a long lane list
 		// no longer consumes the orphan phase's budget wholesale. Lanes
 		// left unmeasured stay fail-closed unknown, never reap-eligible.
 		if registeredCtx.Err() != nil {
@@ -956,11 +958,15 @@ func orphanBatchPaths(entries []os.DirEntry, root string, known map[string]struc
 
 // measure runs one allocation measurement under the sweep's own context.
 //
-// A measurer that implements ContextPhysicalMeasurer has its traversal bounded
-// from the inside, so one pathological directory cannot hold the cleanup pass
-// past its deadline. A context-blind measurer is refused before it starts, so a
-// cancelled sweep never begins another unbounded walk; that is the same bound
-// the entry budget already gave, no worse than before.
+// A measurer that implements ContextPhysicalMeasurer observes the context at
+// cooperative checkpoints between visited entries, so a pathological
+// directory stops extending the cleanup pass at the next entry boundary.
+// The checkpoints cannot interrupt the call in flight: one filesystem
+// syscall, or a legacy context-blind measurer, remains OS-bound and may run
+// to completion — no hard wall-clock guarantee is claimed. A context-blind
+// measurer IS refused up-front on a cancelled sweep, so a cancelled sweep
+// never begins another unbounded walk; that is the same bound the entry
+// budget already gave, no worse than before.
 //
 // Either way the caller gets an error and MUST treat the measurement as
 // unknown. Every call site below does: unknown allocation preserves a lane or
@@ -1312,10 +1318,11 @@ func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorRepor
 		// goroutine left running behind it.
 		//
 		// WithoutCancel drops the deadline, not the bound: MaxScanEntries is
-		// still enforced, so this readback stays finite. That bound is then the
-		// only limit left, so a truncated result is refused instead of counted
-		// -- a partial AfterBytes would understate what survived and overstate
-		// reclaimed bytes.
+		// still enforced, so the readback is entry-bounded. That bound is
+		// then the only limit left — the walk is not time-capped and a
+		// single syscall stays OS-bound — so a truncated result is refused
+		// instead of counted -- a partial AfterBytes would understate what
+		// survived and overstate reclaimed bytes.
 		after, err := g.measure(context.WithoutCancel(ctx), report.OrphanTargets[i].Path, g.Policy.MaxScanEntries)
 		if errors.Is(err, os.ErrNotExist) {
 			after = PhysicalUsage{}
@@ -1493,8 +1500,9 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 		// Same rule as the orphan cache readback: the tree is already
 		// quarantined and unlinked, so this is the accounting for a committed
 		// mutation and must not be cancelled out from under it. WithoutCancel
-		// drops the deadline, not MaxScanEntries, so the readback stays finite;
-		// that bound is then the only limit left, so a truncated result is
+		// drops the deadline, not MaxScanEntries, so the readback is
+		// entry-bounded (not time-capped; one syscall stays OS-bound); that
+		// bound is then the only limit left, so a truncated result is
 		// refused instead of counted -- a partial AfterBytes would understate
 		// what survived and overstate reclaimed bytes.
 		after, measureErr := g.measure(context.WithoutCancel(ctx), again.Path, g.Policy.MaxScanEntries)

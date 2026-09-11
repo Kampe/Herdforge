@@ -291,6 +291,9 @@ func TestGovernorPostReapReadbackSurvivesCancellation(t *testing.T) {
 	}
 }
 
+// Historical pre-cancel proof: an ALREADY cancelled context must refuse the
+// scan before any entry is visited. The true mid-walk proof lives in
+// TestContainsCanonicalStateStopsVisitingEntriesMidWalk below.
 func TestContainsCanonicalStateStopsVisitingOnCancellation(t *testing.T) {
 	root := physicalTree(t, 20)
 	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
@@ -523,4 +526,42 @@ func TestGovernorRegisteredMeasureCannotStealOrphanBudget(t *testing.T) {
 		}
 	}
 	t.Fatal("orphan census stage missing")
+}
+
+// TestContainsCanonicalStateStopsVisitingEntriesMidWalk is the deterministic
+// mid-walk proof the pre-cancel test above cannot give: countdownContext
+// cancels at an exact callback, canonical state sorts strictly LAST in the
+// tree (f019/.git is reached only after every plain entry), so a cancelled
+// scan must visit the entries BEFORE the cancellation and none after it.
+func TestContainsCanonicalStateStopsVisitingEntriesMidWalk(t *testing.T) {
+	root := physicalTree(t, 19)
+	if err := os.Mkdir(filepath.Join(root, "f019"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "f019", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Positive control: without cancellation the scan reaches the late
+	// canonical state, so found=false below means "never reached", not
+	// "absence".
+	if found, err := containsCanonicalState(context.Background(), root, 1000); err != nil || !found {
+		t.Fatalf("uncancelled scan=(%t,%v), want (true,nil): the fixture must detect the late state", found, err)
+	}
+	// Countdown of 5 checkpoints: root, f000..f003 pass; the 6th callback
+	// (f004) observes cancellation BEFORE being accounted. WalkDir visits
+	// entries in lexical order, so f019/.git is never reached.
+	ctx := &countdownContext{Context: context.Background(), n: 5}
+	found, err := containsCanonicalState(ctx, root, 1000)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-walk cancelled scan error = %v, want context.Canceled", err)
+	}
+	if found {
+		t.Fatal("scan cancelled at checkpoint 5 claimed a finding it never reached: entries after cancellation were visited")
+	}
+	// Countdown larger than the whole walk never fires: proves the countdown
+	// granularity tracks visited entries, not something else.
+	ctxFull := &countdownContext{Context: context.Background(), n: 40}
+	if found, err := containsCanonicalState(ctxFull, root, 1000); err != nil || !found {
+		t.Fatalf("full-walk scan=(%t,%v), want (true,nil)", found, err)
+	}
 }
