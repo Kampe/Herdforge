@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -595,4 +596,76 @@ func TestProduceManifestBoundsAndOverflow(t *testing.T) {
 	if err == nil || !contains(err.Error(), "byte budget") {
 		t.Fatalf("byte accumulation must refuse past the budget: %v", err)
 	}
+}
+
+// TestProduceManifestDurabilityAndTempCleanup pins the durability and
+// cleanup error paths of publication: directory open/sync failure is a
+// publication failure that describes the partial publication while
+// preserving the published final file, and a temporary-identity failure
+// cleans the owned temporary pathname.
+func TestProduceManifestDurabilityAndTempCleanup(t *testing.T) {
+	f := produceFixtureSetup(t)
+	writePass := func(out string) error {
+		_, err := ProduceRetentionManifest(context.Background(), produceOpts(f, func(o *ProduceOptions) {
+			o.Write = true
+			o.Out = out
+		}))
+		return err
+	}
+	tempLeftovers := func() []string {
+		entries, _ := os.ReadDir(f.bundleDir)
+		var found []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".herd-bundle-manifest-") && strings.HasSuffix(e.Name(), ".tmp") {
+				found = append(found, e.Name())
+			}
+		}
+		return found
+	}
+
+	t.Run("directory sync failure reports partial publication and preserves the final file", func(t *testing.T) {
+		out := filepath.Join(f.bundleDir, "retention-manifest-durability.json")
+		origSync := produceSyncDirectory
+		produceSyncDirectory = func(dir string) error {
+			return fmt.Errorf("injected directory sync failure")
+		}
+		defer func() { produceSyncDirectory = origSync }()
+		err := writePass(out)
+		if err == nil || !contains(err.Error(), "partial publication") {
+			t.Fatalf("directory durability failure must fail publication: %v", err)
+		}
+		if !contains(err.Error(), "injected directory sync failure") {
+			t.Fatalf("underlying cause must be propagated: %v", err)
+		}
+		data, readErr := os.ReadFile(out)
+		if readErr != nil {
+			t.Fatalf("published final file must be preserved after the durability error: %v", readErr)
+		}
+		var loaded RetentionManifest
+		if jsonErr := json.Unmarshal(data, &loaded); jsonErr != nil || loaded.Version != 2 || len(loaded.Bundles) != 1 {
+			t.Fatalf("preserved final file must remain the complete manifest: %v %v", jsonErr, loaded)
+		}
+		if left := tempLeftovers(); len(left) != 0 {
+			t.Fatalf("owned temporary file must be cleaned up after the durability error: %v", left)
+		}
+	})
+
+	t.Run("temporary identity failure cleans the owned temporary pathname", func(t *testing.T) {
+		out := filepath.Join(f.bundleDir, "retention-manifest-tempstat.json")
+		origStat := produceTempStat
+		produceTempStat = func(f *os.File) (os.FileInfo, error) {
+			return nil, fmt.Errorf("injected temporary identity failure")
+		}
+		defer func() { produceTempStat = origStat }()
+		err := writePass(out)
+		if err == nil || !contains(err.Error(), "owned temporary file identity") {
+			t.Fatalf("temporary identity failure must fail the pass: %v", err)
+		}
+		if _, statErr := os.Lstat(out); statErr == nil {
+			t.Fatal("no final artifact may exist after a temporary identity failure")
+		}
+		if left := tempLeftovers(); len(left) != 0 {
+			t.Fatalf("owned temporary pathname must be removed on the identity failure path: %v", left)
+		}
+	})
 }

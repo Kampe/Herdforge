@@ -36,7 +36,29 @@ var (
 	// and before the pinned owned-root revalidation, so tests can swap the
 	// root while the pass was blocked on the lock.
 	produceLockRevalidateHook func()
+	// produceTempStat is the identity read of the owned temporary file;
+	// tests inject failure here to exercise the post-create cleanup path.
+	produceTempStat = defaultTempStat
+	// produceSyncDirectory establishes durable directory-entry publication
+	// for the output parent; tests inject failure here to prove the
+	// partial-publication error and published-file preservation.
+	produceSyncDirectory = defaultSyncDirectory
 )
+
+func defaultTempStat(f *os.File) (os.FileInfo, error) {
+	return f.Stat()
+}
+
+// defaultSyncDirectory opens the directory and fsyncs it so the published
+// entry survives a crash; the open and the sync are both load-bearing.
+func defaultSyncDirectory(dir string) error {
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer dirFile.Close()
+	return dirFile.Sync()
+}
 
 // ProduceOptions scope one manifest production pass. Bundles are EXPLICIT
 // exact filenames — production never enumerates the root to select bundles,
@@ -311,16 +333,19 @@ func publishManifestAtomically(rootDir string, rootHandleInfo os.FileInfo, out s
 		return "", fmt.Errorf("owned temporary file: %w", err)
 	}
 	tempPath := temp.Name()
-	tempInfo, err := temp.Stat()
-	if err != nil {
-		temp.Close()
-		return "", fmt.Errorf("owned temporary file identity: %w", err)
-	}
+	// Register the owned-temporary cleanup before any post-create failure
+	// path: every return from here on removes the owned temporary pathname
+	// and never touches the destination.
 	defer func() {
 		// Clean only the owned temporary file; the destination is never
 		// removed or replaced by cleanup.
 		_ = os.Remove(tempPath)
 	}()
+	tempInfo, err := produceTempStat(temp)
+	if err != nil {
+		temp.Close()
+		return "", fmt.Errorf("owned temporary file identity: %w", err)
+	}
 	if produceTempWriteHook != nil {
 		if hookErr := produceTempWriteHook(tempPath); hookErr != nil {
 			return "", fmt.Errorf("temporary write aborted: %w", hookErr)
@@ -367,11 +392,15 @@ func publishManifestAtomically(rootDir string, rootHandleInfo os.FileInfo, out s
 		}
 		return "", fmt.Errorf("atomic publication refused: %w", err)
 	}
-	// Sync the parent directory where the platform supports it, so the
-	// publication survives a crash.
-	if dirFile, err := os.Open(realParent); err == nil {
-		_ = dirFile.Sync()
-		dirFile.Close()
+	// Establish durable directory-entry publication where the platform
+	// supports it: the failure to open or sync the containing directory is
+	// a publication failure, not telemetry — the manifest inode exists at
+	// the destination but a crash could lose the directory entry. The
+	// published final file is preserved (it is the reviewed publication,
+	// never deleted or replaced), the owned temporary is cleaned by the
+	// deferred cleanup, and the error describes the partial publication.
+	if err := produceSyncDirectory(realParent); err != nil {
+		return "", fmt.Errorf("manifest %s is published at the destination but directory durability could not be established (partial publication): %w", finalPath, err)
 	}
 	published, err := os.Lstat(finalPath)
 	if err != nil || !published.Mode().IsRegular() || !os.SameFile(tempInfo, published) {
