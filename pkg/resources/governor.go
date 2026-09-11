@@ -199,6 +199,10 @@ type Governor struct {
 	// must alias the same *ProcessPopulation handed to the enumerator so a
 	// run never rescans the population between the two stages.
 	SharedPopulation *ProcessPopulation
+	// ProbeStats aliases the enumerator's target-probe progress holder: the
+	// registered census batch records its completed/deferred lsof probe
+	// counts here so the registered_census stage reports real progress.
+	ProbeStats *BatchProbeStats
 }
 
 type TargetDecision string
@@ -277,13 +281,22 @@ type CensusStage struct {
 	DurationMS int64  `json:"duration_ms"`
 	Scanned    int    `json:"scanned"`
 	Deferred   int    `json:"deferred"`
-	Cause      string `json:"cause,omitempty"`
+	// ProbeCompleted and ProbeDeferred carry the real target-probe progress
+	// (targets whose scoped lsof evidence finished vs targets that received
+	// no evidence), so scanned counts cannot overstate completed probes.
+	ProbeCompleted int    `json:"probe_completed"`
+	ProbeDeferred  int    `json:"probe_deferred"`
+	Cause          string `json:"cause,omitempty"`
 }
 
 type orphanCensusResult struct {
 	Orphans   []OrphanWorktree
 	Truncated bool
 	Remaining int
+	// ProbeCompleted/ProbeDeferred aggregate the real target-probe progress
+	// of every batched orphan lsof probe in this census.
+	ProbeCompleted int
+	ProbeDeferred  int
 }
 
 // OrphanWorktree is an unregistered child of a repository-declared known lane
@@ -509,6 +522,13 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 		return report, fmt.Errorf("resource governor registered-worktree census: %w", listErr)
 	}
 	listStage.Scanned = len(lanes)
+	if g.ProbeStats != nil {
+		// Real target-probe progress of the registered batch, recorded by
+		// the enumerator into the shared holder: scanned counts alone must
+		// not overstate the probes that actually completed.
+		listStage.ProbeCompleted = g.ProbeStats.Completed
+		listStage.ProbeDeferred = g.ProbeStats.Deferred
+	}
 	report.Stages = append(report.Stages, listStage)
 	seen := make(map[string]struct{}, len(lanes))
 	unknownLanes := 0
@@ -560,6 +580,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	orphanStage := CensusStage{
 		Name: "unregistered_orphan_census", DurationMS: g.sinceMS(orphanStart),
 		Scanned: len(orphanResult.Orphans), Deferred: orphanResult.Remaining,
+		ProbeCompleted: orphanResult.ProbeCompleted, ProbeDeferred: orphanResult.ProbeDeferred,
 	}
 	if orphanErr != nil {
 		orphanStage.Cause = orphanErr.Error()
@@ -666,6 +687,7 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			entries = append(append([]os.DirEntry(nil), entries[start:]...), entries[:start]...)
 		}
 		rootProcessUsage := map[string]ProcessUsage(nil)
+		var rootProcessProbeStats BatchProbeStats
 		var rootProcessErr error
 		if batch, ok := g.Processes.(BatchProcessInspector); ok {
 			rootProcessUsage = make(map[string]ProcessUsage)
@@ -676,7 +698,9 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 				// the process population and owner table between stages.
 				// The per-path lsof and reference evidence stays fresh.
 				if popAware, shared := batch.(PopulationAwareBatchInspector); shared && g.SharedPopulation != nil && len(g.SharedPopulation.PIDs) > 0 {
-					rootProcessUsage, rootProcessErr = popAware.InUseManyPopulation(ctx, batchPaths, g.SharedPopulation)
+					rootProcessUsage, rootProcessProbeStats, rootProcessErr = popAware.InUseManyPopulation(ctx, batchPaths, g.SharedPopulation)
+					result.ProbeCompleted += rootProcessProbeStats.Completed
+					result.ProbeDeferred += rootProcessProbeStats.Deferred
 				} else {
 					rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
 				}

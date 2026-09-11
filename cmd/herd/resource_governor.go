@@ -81,11 +81,16 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 	// it once and the orphan census reuses it instead of rescanning the
 	// process population and owner table between stages (FAC-613).
 	sharedPopulation := &resources.ProcessPopulation{}
+	// One shared target-probe progress holder: the registered census batch
+	// records its completed/deferred lsof probe counts so the report states
+	// real progress instead of inferring it from scanned counts.
+	probeStats := &resources.BatchProbeStats{}
 	enumerator := resources.GitWorktreeEnumerator{
 		Processes:        resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20},
 		Now:              time.Now,
 		HostID:           host,
 		SharedPopulation: sharedPopulation,
+		ProbeStats:       probeStats,
 		Evidence: resources.SQLiteLifecycleEvidence{
 			ClaimsPath:         deps.ResolveLaunchLeasePath(resolved),
 			LaunchClaimsPath:   deps.ResolveLaunchLeasePath(resolved),
@@ -110,7 +115,7 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 	}
 	return &resources.Governor{
 		Policy: policy, Capacity: resources.OSBackend{}, Measure: resources.OSPhysicalMeasurer{},
-		Worktrees: enumerator, SharedPopulation: sharedPopulation,
+		Worktrees: enumerator, SharedPopulation: sharedPopulation, ProbeStats: probeStats,
 		Locks: resources.FileLockProvider{}, Now: time.Now,
 	}, nil
 }

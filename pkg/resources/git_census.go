@@ -270,6 +270,12 @@ type GitWorktreeEnumerator struct {
 	// process population and owner table. Consumers own the pointer and
 	// hand the same one to the governor.
 	SharedPopulation *ProcessPopulation
+	// ProbeStats, when non-nil, receives the real target-probe progress of
+	// the registered census batch (completed vs deferred lsof probes) so the
+	// governor's report can state probe progress instead of inferring it
+	// from scanned counts. Consumers own the pointer and hand the same one
+	// to the governor.
+	ProbeStats *BatchProbeStats
 }
 
 type GitTrackedSourceInspector struct{}
@@ -368,6 +374,7 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 	statusResults := batchGitStatus(ctx, lanes)
 	var batchUsage map[string]ProcessUsage
 	var batchErr error
+	var batchStats BatchProbeStats
 	batchAttempted := false
 	if batch, ok := processes.(BatchProcessInspector); ok {
 		batchAttempted = true
@@ -379,25 +386,30 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 			}
 		}
 		reused := false
-		if e.SharedPopulation != nil && len(e.SharedPopulation.PIDs) > 0 {
-			if shared, ok := batch.(PopulationAwareBatchInspector); ok {
-				batchUsage, batchErr = shared.InUseManyPopulation(ctx, paths, e.SharedPopulation)
+		if shared, isPopAware := batch.(PopulationAwareBatchInspector); isPopAware && e.SharedPopulation != nil {
+			if len(e.SharedPopulation.PIDs) > 0 {
+				batchUsage, batchStats, batchErr = shared.InUseManyPopulation(ctx, paths, e.SharedPopulation)
 				reused = true
-			}
-		}
-		if !reused {
-			batchUsage, batchErr = batch.InUseMany(ctx, paths)
-			// Capture the population this walk used so the same run's
-			// orphan stage can reuse it instead of rescanning. A failed
-			// capture leaves the population empty and the orphan stage
-			// falls back to its own bounded snapshot.
-			if e.SharedPopulation != nil && len(e.SharedPopulation.PIDs) == 0 {
-				if snap, ok := processes.(PopulationSnapshooter); ok {
-					if population, snapErr := snap.SnapshotPopulation(ctx); snapErr == nil && population != nil {
-						*e.SharedPopulation = *population
-					}
+			} else if snap, canSnap := processes.(PopulationSnapshooter); canSnap {
+				// FAC-613: capture the population ONCE, before the batch,
+				// so both census stages share this exact snapshot instead
+				// of the batch rescanning and a second capture following.
+				// A failed capture fails the batch closed: no lane may run
+				// on evidence the census could not gather.
+				if population, snapErr := snap.SnapshotPopulation(ctx); snapErr != nil {
+					batchErr = fmt.Errorf("process population snapshot failed: %w", snapErr)
+				} else if population != nil {
+					*e.SharedPopulation = *population
+					batchUsage, batchStats, batchErr = shared.InUseManyPopulation(ctx, paths, e.SharedPopulation)
+					reused = true
 				}
 			}
+		}
+		if !reused && batchErr == nil {
+			batchUsage, batchErr = batch.InUseMany(ctx, paths)
+		}
+		if e.ProbeStats != nil {
+			*e.ProbeStats = batchStats
 		}
 	}
 	for i := range lanes {
@@ -442,6 +454,11 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 			usage, found = batchUsage[filepath.Clean(lanes[i].Path)]
 			if !found || batchErr != nil {
 				processErr = errors.New("batched process evidence unavailable")
+			} else if usage.MetadataUnavailable {
+				// The batch ran but this target's evidence is incomplete
+				// (probe failed or budget expired before it): the lane must
+				// stay unknown, never read as a definitive inactive result.
+				processErr = fmt.Errorf("batched process metadata unavailable: %s", usage.MetadataCause)
 			}
 		} else {
 			usage, processErr = processes.InUse(ctx, lanes[i].Path)
@@ -771,7 +788,7 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 	if maxOutput <= 0 {
 		maxOutput = 1 << 20
 	}
-	usage, resolvedPaths, err := p.lsofBatch(ctx, executable, timeout, maxOutput, paths)
+	usage, resolvedPaths, _, err := p.lsofBatch(ctx, executable, timeout, maxOutput, paths)
 	if err != nil {
 		return nil, err
 	}
@@ -802,20 +819,23 @@ func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (ma
 // host-wide population snapshot, so a later census stage does not rescan the
 // process population and owner table the earlier stage just captured. The
 // per-path lsof and reference evidence is still produced fresh for the given
-// paths; only the shared population is reused.
-func (p LSOFProcessInspector) InUseManyPopulation(ctx context.Context, paths []string, population *ProcessPopulation) (map[string]ProcessUsage, error) {
+// paths; only the shared population is reused. The returned stats carry the
+// real target-probe progress (completed vs deferred lsof probes).
+func (p LSOFProcessInspector) InUseManyPopulation(ctx context.Context, paths []string, population *ProcessPopulation) (map[string]ProcessUsage, BatchProbeStats, error) {
+	stats := BatchProbeStats{}
 	if population == nil || len(population.PIDs) == 0 {
-		return p.InUseMany(ctx, paths)
+		usage, err := p.InUseMany(ctx, paths)
+		return usage, stats, err
 	}
 	if len(paths) == 0 {
-		return map[string]ProcessUsage{}, nil
+		return map[string]ProcessUsage{}, stats, nil
 	}
 	executable := strings.TrimSpace(p.Executable)
 	if executable == "" {
 		var err error
 		executable, err = exec.LookPath("lsof")
 		if err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 	}
 	timeout := p.Timeout
@@ -826,11 +846,12 @@ func (p LSOFProcessInspector) InUseManyPopulation(ctx context.Context, paths []s
 	if maxOutput <= 0 {
 		maxOutput = 1 << 20
 	}
-	usage, resolvedPaths, err := p.lsofBatch(ctx, executable, timeout, maxOutput, paths)
+	usage, resolvedPaths, probeStats, err := p.lsofBatch(ctx, executable, timeout, maxOutput, paths)
 	if err != nil {
-		return nil, err
+		return nil, probeStats, err
 	}
-	return p.inUseManyWalk(ctx, timeout, usage, resolvedPaths, population.PIDs, population.Owners)
+	walked, walkErr := p.inUseManyWalk(ctx, timeout, usage, resolvedPaths, population.PIDs, population.Owners)
+	return walked, probeStats, walkErr
 }
 
 // inUseManyWalk is the shared per-PID reference walk over captured evidence.
@@ -891,16 +912,30 @@ func (p LSOFProcessInspector) inUseManyWalk(ctx context.Context, timeout time.Du
 	return usage, nil
 }
 
-// lsofBatch resolves the sent paths and runs the single target-scoped lsof
-// probe over them, producing the initial per-path usage map both InUseMany
-// and InUseManyPopulation share.
-func (p LSOFProcessInspector) lsofBatch(ctx context.Context, executable string, timeout time.Duration, maxOutput int, paths []string) (map[string]ProcessUsage, []string, error) {
+// BatchProbeStats reports the real target-probe progress of one batched
+// census: Completed counts targets whose target-scoped lsof evidence finished,
+// Deferred counts targets that received no lsof evidence (budget exhausted
+// before the target, or the probe failed). Deferred targets always carry
+// MetadataUnavailable so consumers fail closed; they are never "safe".
+type BatchProbeStats struct {
+	Completed int `json:"completed"`
+	Deferred  int `json:"deferred"`
+}
+
+// lsofBatch resolves the sent paths and runs the target-scoped lsof probe
+// over ALL of them in consecutive bounded chunks (maxBatchProcessTargets
+// paths per spawn), producing the initial per-path usage map both
+// InUseMany and InUseManyPopulation share. Every resolved path receives an
+// entry: probed chunks keep their real evidence; failed or cancelled chunks
+// are marked MetadataUnavailable with the cause — a target whose probe never
+// ran can never read as a definitive no-owner result.
+func (p LSOFProcessInspector) lsofBatch(ctx context.Context, executable string, timeout time.Duration, maxOutput int, paths []string) (map[string]ProcessUsage, []string, BatchProbeStats, error) {
 	usage := make(map[string]ProcessUsage, len(paths))
 	resolvedPaths := make([]string, 0, len(paths))
 	for _, path := range paths {
 		resolved, err := filepath.EvalSymlinks(path)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, BatchProbeStats{}, err
 		}
 		resolved = filepath.Clean(resolved)
 		if _, seen := usage[resolved]; seen {
@@ -908,24 +943,38 @@ func (p LSOFProcessInspector) lsofBatch(ctx context.Context, executable string, 
 		}
 		resolvedPaths = append(resolvedPaths, resolved)
 	}
-	probePaths := resolvedPaths
-	if len(probePaths) > maxBatchProcessTargets {
-		probePaths = probePaths[:maxBatchProcessTargets]
-	}
-	openUsage, err := p.lsofPaths(ctx, executable, timeout, maxOutput, probePaths)
-	if err != nil {
-		for _, path := range probePaths {
-			usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: fmt.Sprintf("lsof target probe failed: %v", err)}
+	var stats BatchProbeStats
+	for start := 0; start < len(resolvedPaths); start += maxBatchProcessTargets {
+		end := start + maxBatchProcessTargets
+		if end > len(resolvedPaths) {
+			end = len(resolvedPaths)
 		}
-		for _, path := range resolvedPaths[len(probePaths):] {
-			usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: fmt.Sprintf("lsof target probe failed: %v", err)}
+		chunk := resolvedPaths[start:end]
+		if ctx.Err() != nil {
+			// The census budget expired before these targets were probed.
+			// They stay metadata-unknown, never "evidence clean".
+			cause := fmt.Sprintf("lsof target probe budget exhausted before %d remaining target(s): %v", len(resolvedPaths)-start, ctx.Err())
+			for _, path := range resolvedPaths[start:] {
+				usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: cause}
+				stats.Deferred++
+			}
+			break
 		}
-		return usage, resolvedPaths, nil
+		openUsage, err := p.lsofPaths(ctx, executable, timeout, maxOutput, chunk)
+		if err != nil {
+			cause := fmt.Sprintf("lsof target probe failed: %v", err)
+			for _, path := range chunk {
+				usage[path] = ProcessUsage{MetadataUnavailable: true, MetadataCause: cause}
+			}
+			stats.Deferred += len(chunk)
+			continue
+		}
+		for path, entry := range openUsage {
+			usage[path] = entry
+		}
+		stats.Completed += len(chunk)
 	}
-	for path, entry := range openUsage {
-		usage[path] = entry
-	}
-	return usage, resolvedPaths, nil
+	return usage, resolvedPaths, stats, nil
 }
 
 // ProcessPopulation is one host-wide process/owner snapshot.
@@ -941,10 +990,11 @@ type PopulationSnapshooter interface {
 }
 
 // PopulationAwareBatchInspector runs the batched census over a caller-provided
-// population snapshot instead of rescanning it.
+// population snapshot instead of rescanning it, reporting the real
+// target-probe progress of the batch.
 type PopulationAwareBatchInspector interface {
 	BatchProcessInspector
-	InUseManyPopulation(ctx context.Context, paths []string, population *ProcessPopulation) (map[string]ProcessUsage, error)
+	InUseManyPopulation(ctx context.Context, paths []string, population *ProcessPopulation) (map[string]ProcessUsage, BatchProbeStats, error)
 }
 
 // SnapshotPopulation captures the bounded process list and owner table once
