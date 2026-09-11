@@ -38,6 +38,7 @@ package herdr
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -50,6 +51,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // HarvestRetirementReceiptsFile is the durable harvest receipt journal. It is
@@ -225,8 +228,18 @@ func (r HarvestRetirementRegistry) All() ([]HarvestRetirementReceipt, error) {
 }
 
 // HarvestRegistrationDir resolves a linked worktree's PRIVATE git admin
-// directory. It refuses the main checkout, whose git dir is not a registration
-// and must never carry a harvest marker.
+// directory. The resolution is pinned to canonical common-git-dir containment
+// (FAC-565): a registration is exactly <common-git-dir>/worktrees/<ID>,
+// resolved from the worktree's own repository through gitroot.CommonDir --
+// never merely a git dir whose parent happens to be NAMED "worktrees". That
+// name-only check accepted a main checkout whose repository sits at a path
+// literally named worktrees, which let the producer mint a marker into an
+// unrelated git admin namespace. The main checkout is refused: its git dir is
+// not a registration and must never carry a harvest marker, whatever its
+// directory layout. The authoritative proof that a surface IS this
+// repository's registration remains git's own registration set (worktree
+// list --porcelain, enforced by the act-time identity fence); this pin bounds
+// where a marker may be minted and read on top of it.
 func HarvestRegistrationDir(worktreePath string) (string, error) {
 	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--absolute-git-dir").Output()
 	if err != nil {
@@ -236,10 +249,26 @@ func HarvestRegistrationDir(worktreePath string) (string, error) {
 	if gitDir == "" {
 		return "", fmt.Errorf("resolve git dir for %s: empty", worktreePath)
 	}
-	if filepath.Base(filepath.Dir(gitDir)) != "worktrees" {
-		return "", fmt.Errorf("%s is not a linked worktree registration", worktreePath)
+	commonDir, err := gitroot.CommonDir(context.Background(), worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve common git dir for %s: %w", worktreePath, err)
 	}
-	return gitDir, nil
+	// Both git answers are real-pathed absolutes; normalize both sides through
+	// the one canonicalization anyway so an environment where either answer
+	// arrives unresolved can never read as a containment failure.
+	resolvedGitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve git dir for %s: %w", worktreePath, err)
+	}
+	resolvedCommon, err := filepath.EvalSymlinks(commonDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve common git dir for %s: %w", worktreePath, err)
+	}
+	registrationID := filepath.Base(resolvedGitDir)
+	if resolvedGitDir != filepath.Join(resolvedCommon, "worktrees", registrationID) {
+		return "", fmt.Errorf("%s is not a linked worktree registration of %s", worktreePath, commonDir)
+	}
+	return resolvedGitDir, nil
 }
 
 // MintHarvestGenerationMarker writes a fresh generation marker into a

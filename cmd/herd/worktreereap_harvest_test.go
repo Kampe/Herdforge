@@ -268,6 +268,15 @@ func TestQualifiedDetachedHarvestRetiresWithReadback(t *testing.T) {
 		t.Fatalf("expected class landed, got %q (%s)", landed[0].Class, landed[0].Reason)
 	}
 
+	// Pin the marker location before the act so the post-removal assertion
+	// observes a real location instead of a read that must fail through the
+	// removed path regardless of whether the marker survived.
+	pinnedDir, err := herdr.HarvestRegistrationDir(f.staging)
+	if err != nil {
+		t.Fatalf("resolve registration dir: %v", err)
+	}
+	pinnedMarker := filepath.Join(pinnedDir, herdr.HarvestGenerationMarkerFile)
+
 	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
 		return resources.ProcessUsage{}, nil
 	})
@@ -291,13 +300,90 @@ func TestQualifiedDetachedHarvestRetiresWithReadback(t *testing.T) {
 			t.Fatal("removed registration is still in git's registration set")
 		}
 	}
-	if _, _, err := herdr.ReadHarvestGenerationMarker(f.staging); err == nil {
-		t.Fatal("generation marker outlived its registration")
+	if _, statErr := os.Lstat(pinnedMarker); !os.IsNotExist(statErr) {
+		t.Fatalf("generation marker must die with its registration at the pinned location %s: %v", pinnedMarker, statErr)
 	}
 	// The journal is append-only evidence; retirement consumes nothing.
 	all, err := (herdr.HarvestRetirementRegistry{Path: herdr.HarvestRetirementReceiptsPath(f.root)}).All()
 	if err != nil || len(all) != 1 {
 		t.Fatalf("receipt journal must survive retirement untouched: %v %v", all, err)
+	}
+}
+
+// The post-removal marker readback must observe a PINNED private admin
+// location, never re-resolve the registration through the removed worktree
+// path: after a successful `git worktree remove` the path is gone, so any
+// git-backed resolution through it fails unconditionally and a surviving
+// marker would be certified as if it had died. This test performs the REAL
+// removal through the native runner and then simulates the half-removal git's
+// success can mask: the worktree is deleted, the registration is unlisted,
+// but the private admin directory and its generation marker survive on disk.
+// The act must refuse and name the survivor.
+func TestActRefusesHarvestRetirementWhenGenerationMarkerSurvivesRemoval(t *testing.T) {
+	f := newHarvestFixture(t)
+
+	// Pin the exact admin directory and the marker bytes BEFORE the act, the
+	// way the fence itself must.
+	pinnedDir, err := herdr.HarvestRegistrationDir(f.staging)
+	if err != nil {
+		t.Fatalf("resolve registration dir: %v", err)
+	}
+	pinnedMarker := filepath.Join(pinnedDir, herdr.HarvestGenerationMarkerFile)
+	originalMarker, err := os.ReadFile(pinnedMarker)
+	if err != nil {
+		t.Fatalf("read marker before the act: %v", err)
+	}
+
+	row := reapRow{Path: f.staging, Head: f.mergeSHA, Base: "main", harvest: &f.receipt}
+	clean := reapProcessInspectorFunc(func(context.Context, string) (resources.ProcessUsage, error) {
+		return resources.ProcessUsage{}, nil
+	})
+
+	// The native runner stays native: every git call runs for real and its raw
+	// result passes through untouched. Only after a real successful removal is
+	// the surviving admin state restored on disk. The removal verb is found by
+	// scanning, never at a fixed argv position.
+	native := runReapGit
+	run := func(root string, args ...string) ([]byte, error) {
+		out, runErr := native(root, args...)
+		if runErr == nil {
+			for i := 1; i < len(args); i++ {
+				if args[i] == "remove" && args[i-1] == "worktree" {
+					if mkErr := os.MkdirAll(pinnedDir, 0o700); mkErr != nil {
+						t.Errorf("simulate surviving admin dir: %v", mkErr)
+					}
+					if wErr := os.WriteFile(pinnedMarker, originalMarker, 0o600); wErr != nil {
+						t.Errorf("simulate surviving marker: %v", wErr)
+					}
+					break
+				}
+			}
+		}
+		return out, runErr
+	}
+
+	err = retireLandedOneWithInspectorCensus(f.root, row, run, clean, nil)
+	if err == nil {
+		t.Fatal("a generation marker that survived a successful removal must refuse the retirement, not certify it")
+	}
+	if !strings.Contains(err.Error(), "marker survived") {
+		t.Fatalf("refusal must name the surviving marker, got: %v", err)
+	}
+
+	// Fixture preconditions: the removal really happened and the registration
+	// really is unlisted -- only the marker survived.
+	if worktreeExists(f.staging) {
+		t.Fatal("fixture precondition: the worktree removal did not happen")
+	}
+	after, listErr := reapRegistrationLister(f.root)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if _, still := exactWorktreeEntry(after, f.staging); still {
+		t.Fatal("fixture precondition: the registration is still listed")
+	}
+	if _, statErr := os.Lstat(pinnedMarker); statErr != nil {
+		t.Fatalf("fixture precondition: the marker did not survive: %v", statErr)
 	}
 }
 

@@ -600,6 +600,28 @@ func retireHarvestDetachedOneWithCensus(root string, l reapRow, run reapGitRunne
 		return fmt.Errorf("retire %s: act-time owner census found active use (cwd=%t open=%t referenced=%t pids=%v)", l.Path, usage.CWD, usage.OpenFile, usage.ReferencedPath, usage.PIDs)
 	}
 
+	// Pin the exact private admin directory and marker path BEFORE removal.
+	// The post-removal readback must observe a pinned location, because after
+	// a successful removal the worktree path is gone and any attempt to
+	// re-resolve the registration through it fails unconditionally -- which
+	// certified a surviving marker as if it had died. The pin is validated
+	// against the live rebind (same registration) and the marker must be a
+	// regular file at the pinned path immediately before the act.
+	pinnedDir, pinErr := herdr.HarvestRegistrationDir(l.Path)
+	if pinErr != nil {
+		return fmt.Errorf("retire %s: act-time private registration directory is unproven: %w", l.Path, pinErr)
+	}
+	if filepath.Base(pinnedDir) != live.RegistrationID {
+		return fmt.Errorf("retire %s: act-time registration identity changed under the rebind (was %s, now %s), refusing",
+			l.Path, live.RegistrationID, filepath.Base(pinnedDir))
+	}
+	pinnedMarkerPath := filepath.Join(pinnedDir, herdr.HarvestGenerationMarkerFile)
+	if pinnedInfo, pinStatErr := os.Lstat(pinnedMarkerPath); pinStatErr != nil {
+		return fmt.Errorf("retire %s: pinned generation marker is unproven before removal: %w", l.Path, pinStatErr)
+	} else if !pinnedInfo.Mode().IsRegular() {
+		return fmt.Errorf("retire %s: pinned generation marker is not a regular file (%s), refusing", l.Path, pinnedInfo.Mode().Type())
+	}
+
 	// Never force removal: Git's normal operation is the final safety check.
 	out, removeErr := run(root, "worktree", "remove", l.Path)
 	if removeErr == nil && worktreeExists(l.Path) {
@@ -610,8 +632,13 @@ func retireHarvestDetachedOneWithCensus(root string, l reapRow, run reapGitRunne
 	}
 
 	// Registration-set readback: git's own registration set must no longer
-	// name the surface, and the generation marker must have died with the
-	// registration. Either survivor is a half-removal, which is an error.
+	// name the surface. The generation marker is read back at the PINNED
+	// location, not re-resolved through the removed path: the worktree is gone
+	// now, so a resolution through it fails unconditionally and could never
+	// prove anything. The marker died with the registration only when its
+	// pinned path is absent; a survivor in any form -- regular, symlink, or
+	// other -- is refused, and an uncertain readback is an error, never a
+	// certification.
 	after, listAfterErr := listWorktreeRegistrations(root)
 	if listAfterErr != nil {
 		return fmt.Errorf("retire %s: post-removal registration readback failed: %w", l.Path, listAfterErr)
@@ -619,8 +646,14 @@ func retireHarvestDetachedOneWithCensus(root string, l reapRow, run reapGitRunne
 	if _, still := exactWorktreeEntry(after, l.Path); still {
 		return fmt.Errorf("retire %s: worktree removed but its registration is still listed", l.Path)
 	}
-	if _, _, markerErr := herdr.ReadHarvestGenerationMarker(l.Path); markerErr == nil {
-		return fmt.Errorf("retire %s: worktree removed but its generation marker survived", l.Path)
+	info, markerStatErr := os.Lstat(pinnedMarkerPath)
+	switch {
+	case markerStatErr == nil && info.Mode().IsRegular():
+		return fmt.Errorf("retire %s: worktree removed but its generation marker survived at %s", l.Path, pinnedMarkerPath)
+	case markerStatErr == nil:
+		return fmt.Errorf("retire %s: worktree removed but a non-regular %s survived at the pinned marker path %s", l.Path, info.Mode().Type(), pinnedMarkerPath)
+	case !os.IsNotExist(markerStatErr):
+		return fmt.Errorf("retire %s: pinned generation marker readback is uncertain: %w", l.Path, markerStatErr)
 	}
 	return nil
 }

@@ -256,6 +256,43 @@ func TestReadHarvestGenerationMarker_RefusesMainCheckout(t *testing.T) {
 	}
 }
 
+// The registration check must pin canonical common-git-dir containment, not
+// merely a parent directory NAMED "worktrees". A repository checked out at a
+// path literally named worktrees has a main-checkout git dir whose immediate
+// parent is exactly that, and the name-only check resolved it as a linked
+// registration: the reader granted marker authority to the main checkout and
+// the producer could mint a marker into an unrelated git admin namespace.
+// The pinned rule is <common-git-dir>/worktrees/<ID>, resolved from the
+// worktree's own repository; nothing else is a registration.
+func TestHarvestRegistrationDir_RefusesMainCheckoutUnderWorktreesNamedParent(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "worktrees")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	harvestGit(t, root, "init", "-q", "-b", "main", ".")
+	harvestGit(t, root, "config", "user.email", "t@example.com")
+	harvestGit(t, root, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(root, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	harvestGit(t, root, "add", "seed.txt")
+	harvestGit(t, root, "commit", "-qm", "seed")
+
+	if _, err := HarvestRegistrationDir(root); err == nil {
+		t.Fatal("a main checkout whose git dir merely sits under a directory named worktrees is not a registration")
+	}
+	if _, _, err := ReadHarvestGenerationMarker(root); err == nil {
+		t.Fatal("no marker authority may come from a directory that is not a linked registration")
+	}
+	if _, _, err := MintHarvestGenerationMarker(root, ".", time.Now()); err == nil {
+		t.Fatal("the producer must not be able to mint a marker into an unrelated git admin namespace")
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, ".git", HarvestGenerationMarkerFile)); !os.IsNotExist(statErr) {
+		t.Fatalf("no marker may be written into the main checkout's git dir: %v", statErr)
+	}
+}
+
 // A marker's authority is the registration's OWN private file. A symlink
 // parked at the marker path names a file the registration does not carry, so
 // it must yield no authority -- even when the target holds a byte-perfect
