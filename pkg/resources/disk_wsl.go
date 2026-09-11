@@ -55,6 +55,23 @@ var (
 // It is set only through SetOSBackendStatFSForTest; nil in production.
 var osBackendStatFSOverride func(path string) (Capacity, error)
 
+// guestStatFSProbe is the guest-side capacity probe OSBackend.StatFS runs
+// before applying the WSL host-volume bound. It defaults to the platform
+// statFSUnix syscall and is replaced only by tests in this package through
+// withGuestStatFSProbe, whose restore func must be deferred. Production call
+// sites are unchanged and no public API is added (FAC-810).
+var guestStatFSProbe = statFSUnix
+
+// withGuestStatFSProbe swaps the guest capacity probe for the duration of a
+// test and returns the restore func. Unlike SetOSBackendStatFSForTest it
+// does not replace OSBackend.StatFS: the real StatFS-to-boundWSLCapacity
+// wiring stays under test with synthetic guest and host capacities.
+func withGuestStatFSProbe(fn func(path string) (Capacity, error)) (restore func()) {
+	prev := guestStatFSProbe
+	guestStatFSProbe = fn
+	return func() { guestStatFSProbe = prev }
+}
+
 // SetOSBackendStatFSForTest pins the filesystem capacity OSBackend reports,
 // for out-of-package tests whose subjects construct the default capacity gate
 // (worktree, harvest, verifier, cmd/herd integration suites). Those tests
