@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // FAC-805 (pulse side): `herd worktree-reap` is a SWEEP that never had a
@@ -88,17 +88,15 @@ func reapPulseBaseRef(root string) string {
 // tree, but a beat that runs on a schedule must not be leaning on that
 // refusal. An unresolvable common dir returns "", which excludes nothing and
 // leaves the existing IsMain check as the only filter.
-func reapPulseMainWorktreePath(root string) string {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
+//
+// The common dir comes from gitroot.CommonDir, the repository's ONE definition
+// of that lookup (FAC-575): a second copy here would be exactly the duplicated
+// rule that gate exists to prevent, and gitroot already normalizes the
+// relative answer older git can return despite --path-format=absolute.
+func reapPulseMainWorktreePath(ctx context.Context, root string) string {
+	common, err := gitroot.CommonDir(ctx, root)
 	if err != nil {
 		return ""
-	}
-	common := strings.TrimSpace(string(out))
-	if common == "" {
-		return ""
-	}
-	if !filepath.IsAbs(common) {
-		common = filepath.Join(root, common)
 	}
 	// <main checkout>/.git -> <main checkout>
 	main := filepath.Dir(filepath.Clean(common))
@@ -184,7 +182,7 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 	}
 	report.Registered = len(registrations)
 
-	eligible := reapPulseEligible(registrations, reapPulseMainWorktreePath(root))
+	eligible := reapPulseEligible(registrations, reapPulseMainWorktreePath(ctx, root))
 	report.Eligible = len(eligible)
 	if len(eligible) == 0 {
 		return report, nil
