@@ -440,6 +440,43 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 	})
 }
 
+// worktreeRegistered answers, from git's own registration metadata alone,
+// whether the exact absolute path is a registered worktree. The porcelain
+// format prefixes each registration with "worktree <abs path>"; the comparison
+// is exact and symlink-resolved — git prints the resolved absolute path while
+// the caller may hold the unresolved one (/var vs /private/var on macOS) —
+// and never a substring match, so a replacement or sibling path cannot read
+// as this one.
+func (p *Pool) worktreeRegistered(ctx context.Context, slotPath string) (bool, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return false, fmt.Errorf("git worktree list --porcelain: %w", err)
+	}
+	want := canonicalDirPath(slotPath)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		if canonicalDirPath(strings.TrimSpace(strings.TrimPrefix(line, "worktree "))) == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// canonicalDirPath resolves the parent chain so the same directory reachable
+// through different symlinks compares equal, while the final element is kept
+// verbatim because the leaf itself may be absent.
+func canonicalDirPath(path string) string {
+	cleaned := filepath.Clean(path)
+	parent := filepath.Dir(cleaned)
+	resolved, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return cleaned
+	}
+	return filepath.Join(resolved, filepath.Base(cleaned))
+}
+
 // RetireExact removes one already-released owned slot and preserves every
 // other slot in the pool. It is intentionally narrower than GC.
 func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeaseID string, expectedGeneration int64) error {
@@ -466,21 +503,59 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || p.repoPath(slot.LastReleasePath) != slotPath {
 				return fmt.Errorf("worktree pool: slot %s release incarnation changed", slotName)
 			}
+			completeSlot := func() error {
+				state.Slots = append(state.Slots[:i], state.Slots[i+1:]...)
+				if err := p.writeState(state); err != nil {
+					return err
+				}
+				if len(state.Slots) == 0 {
+					_ = os.Remove(p.statePath())
+				}
+				return nil
+			}
+			registered, readbackErr := p.worktreeRegistered(ctx, slotPath)
+			if readbackErr != nil {
+				return fmt.Errorf("worktree pool: readback %s: %w", slot.Name, readbackErr)
+			}
+			if _, statErr := os.Lstat(slotPath); statErr != nil {
+				if !errors.Is(statErr, fs.ErrNotExist) {
+					return fmt.Errorf("worktree pool: stat %s: %w", slot.Name, statErr)
+				}
+				// FAC-807: the surface is gone — an earlier exact retirement
+				// may already have removed it, or something external did.
+				// Completion is authorized ONLY by positive evidence that git
+				// no longer registers this exact path; a registered-but-missing
+				// path is a corrupt or ambiguous state and must fail closed.
+				if registered {
+					return fmt.Errorf("worktree pool: slot %s path is absent but still registered; refusing ambiguous retirement", slot.Name)
+				}
+				return completeSlot()
+			}
+			if !registered {
+				// The path exists but git does not register it: either a
+				// leftover of an earlier exact retirement (empty — safe to
+				// finish removing) or content this slot record does not own
+				// (refuse; removal would destroy unowned work).
+				entries, dirErr := os.ReadDir(slotPath)
+				if dirErr != nil {
+					return fmt.Errorf("worktree pool: inspect %s: %w", slot.Name, dirErr)
+				}
+				if len(entries) != 0 {
+					return fmt.Errorf("worktree pool: slot %s path holds unregistered content; refusing possible replacement", slot.Name)
+				}
+				if err := os.RemoveAll(slotPath); err != nil {
+					return err
+				}
+				return completeSlot()
+			}
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slotPath)
-			if out, err := cmd.CombinedOutput(); err != nil && !strings.Contains(string(out), "is not a working tree") {
+			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
 			if err := os.RemoveAll(slotPath); err != nil {
 				return err
 			}
-			state.Slots = append(state.Slots[:i], state.Slots[i+1:]...)
-			if err := p.writeState(state); err != nil {
-				return err
-			}
-			if len(state.Slots) == 0 {
-				_ = os.Remove(p.statePath())
-			}
-			return nil
+			return completeSlot()
 		}
 		return nil
 	})
