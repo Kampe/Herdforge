@@ -281,7 +281,43 @@ type GitWorktreeEnumerator struct {
 	// proof lives above this package and depending on it from here is a
 	// cycle. Nil keeps the ancestry default.
 	Landing LandingPredicate
+	// CensusWindow bounds one sweep's per-lane evidence to a deterministic
+	// rotating window of the registered ring, so an expensive lane can no
+	// longer consume the whole sweep budget before any lane qualifies (the
+	// measured 0/571 failure: batchGitStatus over every registered lane ate
+	// the registered phase's entire deadline). The full registered list is
+	// still enumerated, still returned, and still deduplicated for the
+	// report; unselected lanes are preserved fail-closed as unknown with the
+	// census_window_deferred reason and never reach any expensive probe.
+	// Non-positive uses registeredCensusWindow.
+	CensusWindow int
+	// WindowStart, when non-nil, activates windowing and reports where the
+	// rotating window starts for a registered ring of the given length. The
+	// durable-cursor convention (mirroring the orphan census): a valid
+	// persisted cursor takes precedence; a missing or unparsable one falls
+	// back to a deterministic stride and never infers eligibility. Nil
+	// disables windowing entirely: every existing caller keeps the
+	// evaluate-all-lanes behavior.
+	WindowStart func(entryCount int) int
+	// WindowAdvance, when non-nil, persists the next window start after the
+	// window's lanes were all accounted. The advance runs only after the
+	// per-lane loop completed, so an interrupted sweep re-processes the same
+	// window next time (idempotent) instead of silently skipping it.
+	WindowAdvance func(next int) error
+	// WindowAdvanceErr, when non-nil, receives a failed cursor advance as a
+	// partial diagnostic (same holder pattern as ProbeStats): broken
+	// progress persistence must not be silent, and it must never change any
+	// lane's evidence decision or eligibility.
+	WindowAdvanceErr *string
 }
+
+// registeredCensusWindow is the default bounded window for one registered
+// census sweep: wide enough to make steady progress per sweep, narrow enough
+// that the batch git-status and process population stay a small fraction of
+// the registered phase budget (64 lanes at the measured ~78ms/lane status
+// cost is ~5s, leaving the orphan phase its reserved share). It matches the
+// orphan census limit's maximum.
+const registeredCensusWindow = 64
 
 // LandingProbe is the already-pinned identity one landing decision is made
 // about. HEAD and the base are resolved to object names before the probe
@@ -398,15 +434,55 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 	if processes == nil {
 		processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
 	}
-	statusResults := batchGitStatus(ctx, lanes)
+	// Deterministic bounded rotating window: when the durable-cursor hook is
+	// wired, only the selected slice of the registered ring pays for the
+	// expensive per-lane operations this sweep. Selection happens by index
+	// before any probe runs, and the full ring stays in the returned report.
+	var statusResults map[string]gitStatusResult
+	selectedIdx := map[int]struct{}{}
+	windowActive := false
+	windowStart := 0
+	windowNext := 0
+	if e.WindowStart != nil && len(lanes) > 0 {
+		windowActive = true
+		limit := e.CensusWindow
+		if limit <= 0 {
+			limit = registeredCensusWindow
+		}
+		if limit > len(lanes) {
+			limit = len(lanes)
+		}
+		windowStart = e.WindowStart(len(lanes))
+		if windowStart < 0 || windowStart >= len(lanes) {
+			windowStart %= len(lanes)
+		}
+		for offset := 0; offset < limit; offset++ {
+			selectedIdx[(windowStart+offset)%len(lanes)] = struct{}{}
+		}
+		windowNext = (windowStart + limit) % len(lanes)
+		selected := make([]RegisteredWorktree, 0, len(selectedIdx))
+		for offset := 0; offset < limit; offset++ {
+			selected = append(selected, lanes[(windowStart+offset)%len(lanes)])
+		}
+		statusResults = batchGitStatus(ctx, selected)
+	} else {
+		statusResults = batchGitStatus(ctx, lanes)
+	}
 	var batchUsage map[string]ProcessUsage
 	var batchErr error
 	var batchStats BatchProbeStats
 	batchAttempted := false
 	if batch, ok := processes.(BatchProcessInspector); ok {
 		batchAttempted = true
+		// The population batch pays for the window's paths only: unselected
+		// lanes must not appear in any process probe this sweep.
 		paths := make([]string, 0, len(lanes))
 		for i := range lanes {
+			if windowActive {
+				if _, ok := selectedIdx[i]; !ok {
+					continue
+				}
+			}
 			resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 			if resolveErr == nil {
 				paths = append(paths, filepath.Clean(resolved))
@@ -445,6 +521,17 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 	// may move underneath it.
 	basePin := e.pinBase(ctx, root, baseRef)
 	for i := range lanes {
+		// Unselected lanes of the rotating window are preserved fail-closed
+		// BEFORE any expensive per-lane operation: no status, process,
+		// ownership, landing, or lease evidence call may reach them this
+		// sweep. The full ring stays in the report; their next evidence
+		// comes when the cursor rotates to them.
+		if windowActive {
+			if _, ok := selectedIdx[i]; !ok {
+				lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "census_window_deferred"
+				continue
+			}
+		}
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "worktree_realpath_unavailable"
@@ -520,6 +607,15 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 			lanes[i].State = LaneDone
 		default:
 			lanes[i].State = LaneIdle
+		}
+	}
+	// The cursor advances only after the whole window was accounted: an
+	// interrupted sweep leaves the cursor in place and re-processes the same
+	// window next time. A failed advance is recorded as a partial diagnostic
+	// and never changes any lane's evidence or eligibility.
+	if windowActive && e.WindowAdvance != nil {
+		if err := e.WindowAdvance(windowNext); err != nil && e.WindowAdvanceErr != nil {
+			*e.WindowAdvanceErr = fmt.Sprintf("registered census cursor advance: %v", err)
 		}
 	}
 	return lanes, nil
