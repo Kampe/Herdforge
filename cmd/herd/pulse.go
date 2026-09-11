@@ -112,6 +112,14 @@ func runPulseCommandContext(ctx context.Context, args []string, out, errOut *os.
 		if !reclaimIdlePoolsOnPulse(ctx, errOut) && exitCode == 0 {
 			exitCode = 1
 		}
+		// FAC-805: bounded landed-worktree retirement rides the same heartbeat.
+		// `herd worktree-reap` had no scheduled caller at all, so the leak it
+		// exists to drain accumulated between manual runs. Same contract as
+		// the idle-pool hook above: a deferral or an all-kept beat is success,
+		// and only a genuine failure reaches the exit code.
+		if !reapLandedWorktreesOnPulse(ctx, errOut) && exitCode == 0 {
+			exitCode = 1
+		}
 	}
 	return exitCode
 }
