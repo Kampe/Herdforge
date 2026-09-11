@@ -283,11 +283,16 @@ type StandingRolePolicy struct {
 }
 
 type TaskProvider struct {
-	Type          string `yaml:"type"`
-	ProjectID     string `yaml:"project_id"`
-	WorkspaceID   string `yaml:"workspace_id,omitempty"`
-	APIURL        string `yaml:"api_url,omitempty"`
-	APIKeyEnv     string `yaml:"api_key_env,omitempty"`
+	Type        string `yaml:"type"`
+	ProjectID   string `yaml:"project_id"`
+	WorkspaceID string `yaml:"workspace_id,omitempty"`
+	APIURL      string `yaml:"api_url,omitempty"`
+	APIKeyEnv   string `yaml:"api_key_env,omitempty"`
+	// UserEmail is the account half of a Basic-auth provider credential
+	// (Jira sends email:api_token). It is an identity, not a secret, so it
+	// lives in the reviewed config rather than an env var — the secret half
+	// stays in api_key_env.
+	UserEmail     string `yaml:"user_email,omitempty"`
 	UseCLI        bool   `yaml:"use_cli,omitempty"`
 	CoreTaskReads bool   `yaml:"core_task_reads,omitempty"`
 	// Enabled is the repository's explicit task-provider activation policy
@@ -451,6 +456,18 @@ func (c *Config) Validate() error {
 	}
 	if strings.EqualFold(strings.TrimSpace(c.TaskProvider.Type), "linear") && strings.TrimSpace(c.TaskProvider.ProjectID) == "" {
 		return fmt.Errorf("missing required field: task_provider.project_id for linear")
+	}
+	if strings.EqualFold(strings.TrimSpace(c.TaskProvider.Type), "jira") {
+		for field, value := range map[string]string{
+			"project_id":  c.TaskProvider.ProjectID,
+			"api_url":     c.TaskProvider.APIURL,
+			"user_email":  c.TaskProvider.UserEmail,
+			"api_key_env": c.TaskProvider.APIKeyEnv,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("missing required field: task_provider.%s for jira", field)
+			}
+		}
 	}
 	if _, _, _, _, _, err := c.TaskProvider.Deadlines.Resolved(); err != nil {
 		return err
