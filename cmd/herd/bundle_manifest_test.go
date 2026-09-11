@@ -119,3 +119,115 @@ func TestBundleManifestCLIRefusals(t *testing.T) {
 		t.Fatalf("overwrite must be refused: %v\n%s", err, outBytes)
 	}
 }
+
+// TestBundleManifestCLILinkedWorktreeOwnedState reproduces the PR811
+// production integration regression hermetically: a REAL registered linked
+// worktree's own .herd bundle directory is owned state and must be
+// acceptable from the canonical repo cwd with a RELATIVE --root, while a
+// sibling foreign repository and symlink escapes stay refused.
+func TestBundleManifestCLILinkedWorktreeOwnedState(t *testing.T) {
+	repoRoot, bundleDir, bundleName := bundleManifestFixture(t)
+	data, err := os.ReadFile(filepath.Join(bundleDir, bundleName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Register a real linked worktree and give it its own owned state.
+	wt := filepath.Join(repoRoot, "sibling-wt")
+	if out, err := exec.Command("git", "-C", repoRoot, "worktree", "add", wt, "-b", "wt-owned-state").CombinedOutput(); err != nil {
+		t.Fatalf("worktree add: %v\n%s", err, out)
+	}
+	wtHerd := filepath.Join(wt, ".herd", "coordinator-resume", "linked-transport")
+	if err := os.MkdirAll(wtHerd, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtHerd, "wt-transfer.bundle"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A sibling FOREIGN repository with its own .herd bundle directory.
+	foreignRoot := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", foreignRoot).CombinedOutput(); err != nil {
+		t.Fatalf("foreign init: %v\n%s", err, out)
+	}
+	foreignHerd := filepath.Join(foreignRoot, ".herd", "coordinator-resume", "foreign-transport")
+	if err := os.MkdirAll(foreignHerd, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignHerd, "foreign.bundle"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(t *testing.T, cwd string, args ...string) (string, error) {
+		t.Helper()
+		cmd := exec.Command(buildHerd(t), args...)
+		cmd.Dir = cwd
+		cmd.Env = append(os.Environ(), "HERD_CANONICAL_ROOT="+repoRoot)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	t.Run("relative root into a registered linked worktree is accepted", func(t *testing.T) {
+		out, err := run(t, repoRoot,
+			"bundle-manifest",
+			"--root", filepath.Join("sibling-wt", ".herd", "coordinator-resume", "linked-transport"),
+			"--bundle", "wt-transfer.bundle",
+			"--authority", "linked-worktree-owned-state",
+			"--out", filepath.Join("sibling-wt", ".herd", "coordinator-resume", "linked-transport", "retention-linked.json"),
+			"--dry-run",
+		)
+		if err != nil {
+			t.Fatalf("linked-worktree owned .herd state must be accepted: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, `"version": 2`) || !strings.Contains(out, "wt-transfer.bundle") {
+			t.Fatalf("dry run must describe the exact intended manifest:\n%s", out)
+		}
+		if _, statErr := os.Lstat(filepath.Join(wtHerd, "retention-linked.json")); statErr == nil {
+			t.Fatal("dry run must not create the manifest")
+		}
+	})
+
+	t.Run("sibling foreign repository is refused", func(t *testing.T) {
+		out, err := run(t, repoRoot,
+			"bundle-manifest",
+			"--root", foreignHerd,
+			"--bundle", "foreign.bundle",
+			"--authority", "foreign",
+			"--dry-run",
+		)
+		if err == nil || !strings.Contains(out, "another repository") {
+			t.Fatalf("foreign repository must be refused: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("symlinked leaf is refused", func(t *testing.T) {
+		escape := filepath.Join(wt, ".herd", "coordinator-resume", "escape-leaf")
+		if err := os.Symlink(foreignHerd, escape); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		out, err := run(t, repoRoot,
+			"bundle-manifest",
+			"--root", escape,
+			"--bundle", "foreign.bundle",
+			"--authority", "escape",
+			"--dry-run",
+		)
+		if err == nil || !strings.Contains(out, "real directory") {
+			t.Fatalf("symlinked root must be refused: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("symlinked parent escape is refused", func(t *testing.T) {
+		escape := filepath.Join(wt, ".herd", "coordinator-resume", "escape-parent")
+		if err := os.Symlink(foreignRoot, escape); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		out, err := run(t, repoRoot,
+			"bundle-manifest",
+			"--root", filepath.Join(escape, ".herd", "coordinator-resume", "foreign-transport"),
+			"--bundle", "foreign.bundle",
+			"--authority", "escape",
+			"--dry-run",
+		)
+		if err == nil || !strings.Contains(out, "another repository") {
+			t.Fatalf("parent-symlink escape must be refused: %v\n%s", err, out)
+		}
+	})
+}

@@ -436,7 +436,17 @@ func resolveScope(ctx context.Context, opts ReclaimOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("bundle reclaim: canonical repository identity: %w", err)
 	}
-	dir, err := filepath.EvalSymlinks(opts.Root)
+	dir, err := filepath.Abs(opts.Root)
+	if err != nil {
+		return "", fmt.Errorf("bundle reclaim: bundle directory: %w", err)
+	}
+	// Containment and identity math is absolute-path only: EvalSymlinks
+	// preserves relativity, and a relative --root (legitimate from any
+	// cwd — a linked worktree's own .herd state is owned state) would make
+	// every later Rel/SameFile comparison meaningless or falsely refusing.
+	// Absolute form changes nothing about ownership: the leaf must still
+	// be a real directory, and symlinked components resolve below.
+	dir, err = filepath.EvalSymlinks(dir)
 	if err != nil {
 		return "", fmt.Errorf("bundle reclaim: bundle directory: %w", err)
 	}
