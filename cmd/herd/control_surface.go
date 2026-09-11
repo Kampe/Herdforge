@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 33
+const controlSurfaceVersion = 34
 
 type commandClass string
 
@@ -54,7 +54,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "idle-pool", "install", "kick", "labels", "lane-cut", "worktree-reap", "bundle-reclaim", "bundle-manifest", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resource-governor", "review", "review-host", "integrate", "integration-wake", "review-classify", "review-ingest", "review-bind-evidence", "review-complete-record", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
-		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
+		"clone", "envplan", "hostcreds", "init", "maintenance", "seed-lane-state", "signer-boundary", "stash", "validate-config",
 	},
 	classInternal: {
 		"broker", "fence-broker", "netbroker-serve", "role-inject",
@@ -110,6 +110,11 @@ func controlSurface() controlSurfaceManifest {
 // or reclassifying a command changes the hash and fails tests until the author
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
+	// 34 adds the FAC-805 maintenance operator command: the unattended carrier
+	// for the existing cleanup beat, for repositories where pulse and daemon --
+	// the beat's only callers -- cannot run because both gate on fleet
+	// admission and the daemon also dispatches lanes.
+	34: "0d2bac81f77c58933e7e2479a267351bc94f4c4f32fd8f54aa6fdffbe85ca61a",
 	// 33 adds the FAC-811 bundle-manifest coordinator command: the native
 	// producer of the version-2 content-bound retention manifest that
 	// bundle-reclaim consumes (explicit names, dry-run describe, atomic
