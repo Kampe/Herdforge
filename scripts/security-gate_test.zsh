@@ -136,6 +136,91 @@ grep -F -- 'error: GITLEAKS_TIMEOUT must be a positive integer number of seconds
 	exit 1
 }
 
+# FAC-822: an oversized explicit timeout must be CAPPED at the same finite
+# 900s maximum as the derived budget — never reaching run_with_timeout.
+# Benign scanners so the capped run completes successfully.
+cat << 'EOF' > "$mock_bin/gosec"
+#!/usr/bin/env zsh
+for arg in "$@"; do
+	if [[ "$arg" == -out=* ]]; then
+		print '{"Issues":[]}' > "${arg#-out=}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gosec"
+cat << 'EOF' > "$mock_bin/gitleaks"
+#!/usr/bin/env zsh
+for ((i=1; i<=$#; i++)); do
+	if [[ "${@[i]}" == "--report-path" ]]; then
+		print '[]' > "${@[i+1]}"
+	fi
+done
+exit 0
+EOF
+chmod +x "$mock_bin/gitleaks"
+
+oversize_out="$tmp/gosec-oversize.out"
+if ! GOSEC_TIMEOUT=999999 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$oversize_out" 2>&1; then
+	print -u2 "error: oversize GOSEC_TIMEOUT clamped to the maximum still failed the gate"
+	exit 1
+fi
+grep -F -- '==> gosec timeout 999999s exceeds the finite 900s maximum; using 900s' "$oversize_out" >/dev/null || {
+	print -u2 "error: oversized GOSEC_TIMEOUT was not capped at the finite 900s maximum"
+	exit 1
+}
+if grep -F -- "gosec budget" "$oversize_out" >/dev/null 2>&1; then
+	print -u2 "error: clamped explicit GOSEC_TIMEOUT was treated as a derived budget"
+	exit 1
+fi
+
+gitleaks_oversize_out="$tmp/gitleaks-oversize.out"
+if ! GITLEAKS_TIMEOUT=999999 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$gitleaks_oversize_out" 2>&1; then
+	print -u2 "error: oversize GITLEAKS_TIMEOUT clamped to the maximum still failed the gate"
+	exit 1
+fi
+grep -F -- '==> gitleaks timeout 999999s exceeds the finite 900s maximum; using 900s' "$gitleaks_oversize_out" >/dev/null || {
+	print -u2 "error: oversized GITLEAKS_TIMEOUT was not capped at the finite 900s maximum"
+	exit 1
+}
+
+shared_oversize_out="$tmp/shared-oversize.out"
+if ! SECURITY_GATE_TIMEOUT=999999 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$shared_oversize_out" 2>&1; then
+	print -u2 "error: oversize SECURITY_GATE_TIMEOUT clamped to the maximum still failed the gate"
+	exit 1
+fi
+grep -F -- '==> gosec timeout 999999s exceeds the finite 900s maximum; using 900s' "$shared_oversize_out" >/dev/null || {
+	print -u2 "error: oversized shared SECURITY_GATE_TIMEOUT did not cap the gosec budget"
+	exit 1
+}
+grep -F -- '==> gitleaks timeout 999999s exceeds the finite 900s maximum; using 900s' "$shared_oversize_out" >/dev/null || {
+	print -u2 "error: oversized shared SECURITY_GATE_TIMEOUT did not cap the gitleaks budget"
+	exit 1
+}
+
+# Overflow-shaped values (beyond 9 digits) fail closed instead of wrapping in
+# zsh arithmetic and reaching run_with_timeout.
+overflow_out="$tmp/gosec-overflow.out"
+if GOSEC_TIMEOUT=99999999999999999999 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$overflow_out" 2>&1; then
+	print -u2 "error: overflow-shaped GOSEC_TIMEOUT was accepted instead of failing closed"
+	exit 1
+fi
+grep -F -- 'error: GOSEC_TIMEOUT must be a positive integer number of seconds of at most 9 digits' "$overflow_out" >/dev/null || {
+	print -u2 "error: missing overflow-shaped GOSEC_TIMEOUT diagnostic"
+	exit 1
+}
+
+# Boundary: the exact maximum is a valid override (no clamp, no derivation).
+boundary_out="$tmp/gosec-boundary.out"
+if ! GOSEC_TIMEOUT=900 PATH="$mock_bin:$PATH" ./scripts/security-gate.zsh >"$boundary_out" 2>&1; then
+	print -u2 "error: GOSEC_TIMEOUT at the exact 900s maximum was rejected"
+	exit 1
+fi
+if grep -E "exceeds the finite|gosec budget" "$boundary_out" >/dev/null 2>&1; then
+	print -u2 "error: boundary GOSEC_TIMEOUT=900 was clamped or derived instead of honored"
+	exit 1
+fi
+
 # A gosec crash that leaves an EMPTY subreport must fail closed with a
 # diagnostic naming gosec's report, not pass with zero findings, and not
 # surface as an unrelated jq iteration error.

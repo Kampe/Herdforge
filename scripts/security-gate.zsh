@@ -19,23 +19,40 @@ cd "$repo_root"
 # 34613250905 was killed at the 300s boundary before tests. The derivation
 # keeps the anti-hang property at every scale instead of re-sizing a magic
 # number per growth wave.
+# FAC-822: every budget is bounded by the same finite 900s maximum, explicit
+# overrides included — a hung scanner must die within the declared hang bound
+# no matter what a caller exports. A value outside positive-integer form, or
+# longer than 9 digits (zsh-arithmetic overflow shape), fails closed here; a
+# valid value above the maximum is capped with a diagnostic below. Precedence
+# (GOSEC_TIMEOUT > SECURITY_GATE_TIMEOUT > derivation, and the GITLEAKS
+# counterparts) is unchanged; an explicit override is still never floored,
+# so short diagnostic budgets keep working.
+gate_max_timeout=900
 if [[ -n "${GOSEC_TIMEOUT-}" ]]; then
-	[[ "$GOSEC_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { print -u2 'error: GOSEC_TIMEOUT must be a positive integer number of seconds'; exit 1; }
+	[[ "$GOSEC_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: GOSEC_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
 	gosec_timeout=$GOSEC_TIMEOUT
 elif [[ -n "${SECURITY_GATE_TIMEOUT-}" ]]; then
-	[[ "$SECURITY_GATE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { print -u2 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds'; exit 1; }
+	[[ "$SECURITY_GATE_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
 	gosec_timeout=$SECURITY_GATE_TIMEOUT
 else
 	gosec_timeout=0
 fi
 if [[ -n "${GITLEAKS_TIMEOUT-}" ]]; then
-	[[ "$GITLEAKS_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { print -u2 'error: GITLEAKS_TIMEOUT must be a positive integer number of seconds'; exit 1; }
+	[[ "$GITLEAKS_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: GITLEAKS_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
 	gitleaks_timeout=$GITLEAKS_TIMEOUT
 elif [[ -n "${SECURITY_GATE_TIMEOUT-}" ]]; then
-	[[ "$SECURITY_GATE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { print -u2 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds'; exit 1; }
+	[[ "$SECURITY_GATE_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
 	gitleaks_timeout=$SECURITY_GATE_TIMEOUT
 else
 	gitleaks_timeout=300
+fi
+if (( gosec_timeout > gate_max_timeout )); then
+	print -u2 "==> gosec timeout ${gosec_timeout}s exceeds the finite ${gate_max_timeout}s maximum; using ${gate_max_timeout}s"
+	gosec_timeout=$gate_max_timeout
+fi
+if (( gitleaks_timeout > gate_max_timeout )); then
+	print -u2 "==> gitleaks timeout ${gitleaks_timeout}s exceeds the finite ${gate_max_timeout}s maximum; using ${gate_max_timeout}s"
+	gitleaks_timeout=$gate_max_timeout
 fi
 
 # Copy only paths Git currently tracks.  In particular, do not walk the
