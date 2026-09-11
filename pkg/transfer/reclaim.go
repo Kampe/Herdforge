@@ -149,7 +149,16 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 		return report, err
 	}
 	if strings.TrimSpace(opts.LockDir) == "" {
-		opts.LockDir = filepath.Join(opts.RepoRoot, lock.DefaultRelDir)
+		// One canonical lock identity for the whole repository: the
+		// shared-checkout lock serializes every worktree of the canonical
+		// repository, so the default must resolve to the canonical COMMON
+		// .git — never a linked worktree's .git pointer file, which would
+		// split or break the lock for the same shared repository.
+		canonLock, err := worktree.ResolveCanonicalRoot(ctx, opts.RepoRoot, "")
+		if err != nil {
+			return report, fmt.Errorf("bundle reclaim: canonical repository identity for the shared lock: %w", err)
+		}
+		opts.LockDir = filepath.Join(canonLock, lock.DefaultRelDir)
 	}
 	lockDirAbs, err := filepath.EvalSymlinks(filepath.Dir(opts.LockDir))
 	if err != nil {
