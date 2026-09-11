@@ -41,7 +41,21 @@ func LoadRetentionManifest(root, manifestPath string) (RetentionManifest, error)
 	if strings.TrimSpace(manifestPath) == "" {
 		return m, fmt.Errorf("bundle reclaim: explicit retention manifest is required; path suffix and .bundle name never prove ownership")
 	}
-	absManifest, err := filepath.EvalSymlinks(manifestPath)
+	// The manifest is normalized like every other CLI path (and like the
+	// producer's --out): ABSOLUTE before symlink resolution and containment
+	// math. EvalSymlinks preserves relativity, so a cwd-relative --manifest
+	// (the normal CLI form, and exactly how the producer writes it when
+	// --root/--out are cwd-relative) would otherwise be Rel-compared
+	// against the absolute resolved root and falsely refused as
+	// outside-the-owned-root. Abs changes nothing about ownership: symlink
+	// components still resolve to their real target below, and the
+	// leaf-regularity check below still Lstats the given path without
+	// following symlinks.
+	absGiven, err := filepath.Abs(manifestPath)
+	if err != nil {
+		return m, fmt.Errorf("bundle reclaim: retention manifest: %w", err)
+	}
+	absManifest, err := filepath.EvalSymlinks(absGiven)
 	if err != nil {
 		return m, fmt.Errorf("bundle reclaim: retention manifest: %w", err)
 	}
@@ -53,7 +67,7 @@ func LoadRetentionManifest(root, manifestPath string) (RetentionManifest, error)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return m, fmt.Errorf("bundle reclaim: retention manifest %s is not inside the owned root", manifestPath)
 	}
-	st, err := os.Lstat(manifestPath)
+	st, err := os.Lstat(absGiven)
 	if err != nil || !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
 		return m, fmt.Errorf("bundle reclaim: retention manifest must be a regular non-symlink file")
 	}
