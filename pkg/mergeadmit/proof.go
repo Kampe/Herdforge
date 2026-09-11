@@ -400,6 +400,42 @@ func gitOutBytes(ctx context.Context, repoDir string, args ...string) ([]byte, e
 	return out, nil
 }
 
+// ancestorProven reports whether sha is reachable from ref, through the same
+// owned-process discipline as every other probe in this package:
+// procsignal.CommandContext puts the child in an owned process group, so a
+// caller's deadline or cancellation kills the child AND its descendants. The
+// squash-range proof used to reach this answer through harvest.IsAncestor,
+// whose plain exec.CommandContext kills only the direct child — a slow
+// merge-base --is-ancestor left its process tree alive after the deadline and
+// swallowed the deadline into a "not an ancestor" evidence answer.
+//
+// The git contract is preserved fail-closed: exit 1 is a proven negative
+// ("not an ancestor"); a fired deadline or cancellation is returned as the
+// bare context error so a caller's budget can never read as evidence; every
+// other failure is an unproven answer, never a proven one.
+func ancestorProven(ctx context.Context, repoDir, sha, ref string) (bool, error) {
+	if strings.TrimSpace(sha) == "" || strings.TrimSpace(ref) == "" {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cmd := procsignal.CommandContext(ctx, "git", "merge-base", "--is-ancestor", sha, ref)
+	cmd.Dir = repoDir
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", short(sha), short(ref), err)
+}
+
 func gitOut(ctx context.Context, repoDir string, args ...string) (string, error) {
 	out, err := gitOutBytes(ctx, repoDir, args...)
 	if err != nil {

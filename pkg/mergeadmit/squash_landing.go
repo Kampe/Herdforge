@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/Kampe/Herdforge/pkg/harvest"
 )
 
 // ProveLanded establishes content containment only. It does not admit review
@@ -29,8 +27,17 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 // Require both its complete patch identity and the exact result of replaying
 // the reviewed delta onto its actual parent. Patch-ID whitespace normalization
 // alone cannot authorize different bytes. More than one match is ambiguous.
+//
+// The ancestry gate rides the package's own owned-process probe
+// (ancestorProven), not harvest.IsAncestor: a caller deadline must kill the
+// probe's whole process group and come back as the context error, never as a
+// "not an ancestor" evidence answer or an orphaned child.
 func matchSquashRangeReplay(ctx context.Context, dir, base, candidate string, landed []string) (string, bool, error) {
-	if !harvest.IsAncestor(ctx, dir, base, candidate) {
+	proven, err := ancestorProven(ctx, dir, base, candidate)
+	if err != nil {
+		return "", false, err
+	}
+	if !proven {
 		return "", false, fmt.Errorf("reviewed base ancestry is unproven")
 	}
 	want, err := rangePatchID(ctx, dir, base, candidate)
@@ -51,7 +58,14 @@ func matchSquashRangeReplay(ctx context.Context, dir, base, candidate string, la
 			continue
 		} // A squash endpoint is a single-parent commit.
 		parent := fields[1]
-		if !harvest.IsAncestor(ctx, dir, base, parent) {
+		parentProven, parentErr := ancestorProven(ctx, dir, base, parent)
+		if parentErr != nil {
+			// A fired deadline stops the whole loop: falling through to the
+			// next candidate would keep spawning probes after the budget
+			// died and read the cancellation as "no match found".
+			return "", false, parentErr
+		}
+		if !parentProven {
 			continue
 		}
 		got, err := rangePatchID(ctx, dir, parent, sha)
