@@ -64,9 +64,9 @@ func TestGovernorEnumeratorBulkOpenFileEvidence(t *testing.T) {
 		t.Fatal(resolveErr)
 	}
 	heldResolved = filepath.Clean(heldResolved)
-	var spawned int
+	lsofPath, spawns := failFastLsofScript(t)
 	inspector := LSOFProcessInspector{
-		Executable: failFastLsofScript(t, &spawned),
+		Executable: lsofPath,
 		populationFn: func(context.Context) ([]int, map[int]int, error) {
 			return []int{heldPID}, map[int]int{heldPID: os.Getuid()}, nil
 		},
@@ -102,8 +102,8 @@ func TestGovernorEnumeratorBulkOpenFileEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spawned != 0 {
-		t.Fatalf("bulk evidence must never spawn per-target lsof, got %d spawns", spawned)
+	if got := spawns(); got != 0 {
+		t.Fatalf("bulk evidence must never spawn per-target lsof, got %d spawns", got)
 	}
 	if stats.Completed != 2 || stats.Deferred != 0 {
 		t.Fatalf("bulk open-file evidence must complete every target probe, got completed=%d deferred=%d", stats.Completed, stats.Deferred)
@@ -200,19 +200,29 @@ func (m *cancelingMeasurer) Measure(path string, limit int) (PhysicalUsage, erro
 	return PhysicalUsage{Bytes: 4096}, nil
 }
 
-func failFastLsofScript(t *testing.T, spawned *int) string {
+// failFastLsofScript returns the fake lsof path and a counter that reads the
+// spawn log AT CALL TIME. The count must never be published through a
+// t.Cleanup closure: cleanup runs after the test body, so a zero-spawns
+// assertion against it reads the pre-test zero and passes however many
+// probes the code really ran.
+func failFastLsofScript(t *testing.T) (string, func() int) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "lsof-failfast")
-	script := "#!/bin/sh\necho spawned >> " + path + ".count\nexit 9\n"
+	script := "#!/bin/sh\necho spawn >> " + path + ".count\nexit 9\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if data, err := os.ReadFile(path + ".count"); err == nil {
-			*spawned = len(strings.Split(strings.TrimSpace(string(data)), "\n"))
+	return path, func() int {
+		data, err := os.ReadFile(path + ".count")
+		if err != nil {
+			return 0
 		}
-	})
-	return path
+		trimmed := strings.TrimSpace(string(data))
+		if trimmed == "" {
+			return 0
+		}
+		return len(strings.Split(trimmed, "\n"))
+	}
 }
 
 // Nested census targets: a repository root and a worktree inside it can both
@@ -233,9 +243,9 @@ func TestBulkOpenFileEvidenceProtectsEveryContainingTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	const heldPID = 4242
-	var spawned int
+	lsofPath, spawns := failFastLsofScript(t)
 	inspector := LSOFProcessInspector{
-		Executable: failFastLsofScript(t, &spawned),
+		Executable: lsofPath,
 		processReferencesManyFn: func(_ context.Context, _ int, paths []string, _ map[int]int) (map[string]bool, error) {
 			references := make(map[string]bool, len(paths))
 			for _, path := range paths {
@@ -256,8 +266,8 @@ func TestBulkOpenFileEvidenceProtectsEveryContainingTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spawned != 0 {
-		t.Fatalf("bulk evidence must never spawn per-target lsof, got %d spawns", spawned)
+	if got := spawns(); got != 0 {
+		t.Fatalf("bulk evidence must never spawn per-target lsof, got %d spawns", got)
 	}
 	if stats.Completed != 2 || stats.Deferred != 0 {
 		t.Fatalf("both targets must be observed, got completed=%d deferred=%d", stats.Completed, stats.Deferred)

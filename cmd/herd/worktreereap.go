@@ -195,6 +195,12 @@ func retireLanded(root string, landed []reapRow) (retired, failed []map[string]s
 	return retireLandedWithInspector(root, landed, resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20})
 }
 
+// batchCensusBudget bounds the ONE batched owner census for the whole set.
+// A single bounded population and open-file capture needs its own budget,
+// separate from the per-probe knob sized for one target's probe. It is a
+// ceiling, not a cost: the census returns as soon as the capture completes.
+const batchCensusBudget = 30 * time.Second
+
 func retireLandedWithInspector(root string, landed []reapRow, inspector resources.ProcessInspector) (retired, failed []map[string]string) {
 	// FAC-809: the act-time owner census runs ONCE for the whole set through
 	// the batched inspector. The per-PID reference walk shares one process
@@ -224,7 +230,7 @@ func retireLandedWithInspector(root string, landed []reapRow, inspector resource
 			paths = append(paths, c)
 			canon[c] = l.Path
 		}
-		ownerCtx, cancelOwner := context.WithTimeout(context.Background(), 2*time.Second)
+		ownerCtx, cancelOwner := context.WithTimeout(context.Background(), batchCensusBudget)
 		batchUsage, batchErr = batch.InUseMany(ownerCtx, paths)
 		cancelOwner()
 		// Re-key the result onto the raw observed paths the retirement

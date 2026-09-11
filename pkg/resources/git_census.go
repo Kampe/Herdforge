@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -770,12 +769,37 @@ func lsofPositiveExitOne(err error, stdout, stderr []byte) bool {
 }
 
 // InUseMany keeps the expensive process population and metadata walk shared
-// across a bounded orphan batch. lsof remains target-scoped, so open handles
-// and cwd evidence cannot be confused between targets.
+// across a bounded orphan batch. Production worktree-reap calls it directly,
+// with no governor to hand down a population, so it captures the shared
+// population ONCE up front — process list, owner table, then a single
+// full-table lsof — and derives every target from that one capture. The
+// previous order ran the per-target +D descents first and snapshotted the
+// process list afterwards, by which point the descents had consumed the
+// budget and the snapshot's child context was born expired, deferring every
+// target.
+//
+// Recursion fence: InUseManyPopulation delegates back here exactly when the
+// population is nil or carries no PIDs, so it is only ever called from here
+// with PIDs present. A population without an open-file table still goes
+// through it: the per-target +D probes then run against an already captured
+// population, the same fallback minus the fatal ordering.
 func (p LSOFProcessInspector) InUseMany(ctx context.Context, paths []string) (map[string]ProcessUsage, error) {
 	if len(paths) == 0 {
 		return map[string]ProcessUsage{}, nil
 	}
+	if population, snapErr := p.SnapshotPopulation(ctx); snapErr == nil && population != nil && len(population.PIDs) > 0 {
+		usage, _, popErr := p.InUseManyPopulation(ctx, paths, population)
+		return usage, popErr
+	}
+	return p.inUseManyPerTarget(ctx, paths)
+}
+
+// inUseManyPerTarget is the legacy target-scoped census: one lsof +D probe
+// per target chunk, then the shared reference walk. It is the terminal
+// fallback for a population that could not be captured at all, and keeps
+// the original fail-closed semantics — an unobservable target is marked
+// metadata-unavailable, never reported definitively clean.
+func (p LSOFProcessInspector) inUseManyPerTarget(ctx context.Context, paths []string) (map[string]ProcessUsage, error) {
 	executable := strings.TrimSpace(p.Executable)
 	if executable == "" {
 		var err error
@@ -908,11 +932,11 @@ func (p LSOFProcessInspector) bulkUsageFromOpenFiles(ctx context.Context, resolv
 	}
 	// Ancestor lookup reproduces containedPath(target, openPath) for every
 	// target: an open path is attributed to EVERY target it equals or sits
-	// under, by walking all of the open path's own ancestors. Targets nest
-	// (a repository root and its worktrees can both be census targets), and
+	// under, by walking all of the open path's own ancestors. Targets nest —
+	// a repository root and its worktrees can both be census targets — and
 	// stopping at the nearest ancestor would leave every outer target with
-	// zero evidence — indistinguishable from an observed no-owner result,
-	// and therefore reap-eligible while a process holds the subtree.
+	// zero evidence, indistinguishable from an observed no-owner result and
+	// so reap-eligible while a process holds the subtree.
 	for pid, opens := range population.OpenFiles {
 		for _, open := range opens {
 			openPath := filepath.Clean(open.Path)
@@ -1207,15 +1231,42 @@ func (p LSOFProcessInspector) captureOpenFiles(ctx context.Context) (map[int][]P
 		maxOutput = 1 << 20
 	}
 	tableBound := maxOutput * 16
-	cmd := exec.CommandContext(ctx, executable, "-nP", "-Ffnp")
-	var stdout limitedOutput
-	stdout.remaining = tableBound
-	cmd.Stdout, cmd.Stderr = &stdout, io.Discard
-	if err := cmd.Run(); err != nil {
-		if stdout.overflow {
-			return nil, fmt.Errorf("open-file table exceeded bound")
+	// Bound the capture. An outer deadline stays authoritative; when the
+	// caller set none the probe knob applies, because InUseMany is a public
+	// entry point reached with unbounded contexts and a stuck full-table
+	// lsof would otherwise run with nothing to stop it. Every other lsof
+	// invocation in this file is bounded the same way.
+	if _, ok := ctx.Deadline(); !ok {
+		fallback := p.Timeout
+		if fallback <= 0 {
+			fallback = 2 * time.Second
 		}
-		return nil, fmt.Errorf("open-file table capture: %w", err)
+		bounded, cancel := context.WithTimeout(ctx, fallback)
+		defer cancel()
+		ctx = bounded
+	}
+	cmd := exec.CommandContext(ctx, executable, "-nP", "-Ffnp")
+	var stdout, stderr limitedOutput
+	stdout.remaining, stderr.remaining = tableBound, maxOutput
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	if stdout.overflow {
+		return nil, errors.New("open-file table exceeded bound")
+	}
+	if stderr.overflow {
+		return nil, errors.New("open-file table diagnostics exceeded bound")
+	}
+	if runErr != nil {
+		return nil, fmt.Errorf("open-file table capture: %w", runErr)
+	}
+	// A PARTIAL full table is worse than no table: it is read as authoritative
+	// for every target, so each target the omitted rows would have protected
+	// reads as definitively unheld. lsof reports that partiality on stderr and
+	// can still exit 0, so the same strict diagnostic contract the per-target
+	// probes apply is applied here — anything outside the shared warning
+	// allowlist rejects the capture and defers to those probes.
+	if !lsofIgnorableDiagnostics(stderr.Bytes()) {
+		return nil, fmt.Errorf("open-file table diagnostics: %s", strings.TrimSpace(string(stderr.Bytes())))
 	}
 	openFiles := make(map[int][]ProcessOpenFile)
 	currentPID := 0
@@ -1359,6 +1410,16 @@ func lsofNoMatch(err error, stdout, stderr []byte) bool {
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || len(bytes.TrimSpace(stdout)) != 0 {
 		return false
 	}
+	return lsofIgnorableDiagnostics(stderr)
+}
+
+// lsofIgnorableDiagnostics reports whether lsof's stderr carries nothing but
+// the two known WSL filesystem warnings, each with its continuation line.
+// Every other diagnostic — permission, target, incomplete, unknown — means
+// the output cannot be trusted as a complete observation. This is the single
+// warning allowlist, shared by the per-target probes and the full-table
+// capture so the two cannot drift apart.
+func lsofIgnorableDiagnostics(stderr []byte) bool {
 	lines := strings.Split(strings.TrimSpace(string(stderr)), "\n")
 	if len(lines) == 1 && lines[0] == "" {
 		return true
