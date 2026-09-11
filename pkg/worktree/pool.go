@@ -440,6 +440,13 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 	})
 }
 
+// retireStateFenceProbe is a deterministic test seam invoked at the top of
+// RetireExact's state-write fence, before the fence re-reads identity and
+// absence. Production leaves it a no-op; only tests in this package install
+// a probe, and the fence must detect whatever the probe plants. It is not
+// reachable from any CLI path.
+var retireStateFenceProbe = func(context.Context, *Pool, string) {}
+
 // worktreeRegistered answers, from git's own registration metadata alone,
 // whether the exact absolute path is a registered worktree. The porcelain
 // format prefixes each registration with "worktree <abs path>"; the comparison
@@ -504,6 +511,24 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 				return fmt.Errorf("worktree pool: slot %s release incarnation changed", slotName)
 			}
 			completeSlot := func() error {
+				// FAC-807 state-write fence: identity/absence is re-read
+				// immediately before the record mutation, so a replacement
+				// or re-registration that appeared after the earlier checks
+				// (a raw filesystem writer is not serialized by the pool
+				// lock) is detected here and the transition refuses. The
+				// absent-path completion deletes nothing, so the fence's
+				// refusal is always the safe outcome.
+				retireStateFenceProbe(ctx, p, slotPath)
+				if _, statErr := os.Lstat(slotPath); statErr == nil {
+					return fmt.Errorf("worktree pool: slot %s path reappeared before state completion; refusing ambiguous retirement", slot.Name)
+				} else if !errors.Is(statErr, fs.ErrNotExist) {
+					return fmt.Errorf("worktree pool: fence stat %s: %w", slot.Name, statErr)
+				}
+				if fenceRegistered, fenceErr := p.worktreeRegistered(ctx, slotPath); fenceErr != nil {
+					return fmt.Errorf("worktree pool: fence readback %s: %w", slot.Name, fenceErr)
+				} else if fenceRegistered {
+					return fmt.Errorf("worktree pool: slot %s registration reappeared before state completion; refusing ambiguous retirement", slot.Name)
+				}
 				state.Slots = append(state.Slots[:i], state.Slots[i+1:]...)
 				if err := p.writeState(state); err != nil {
 					return err
@@ -532,21 +557,12 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 				return completeSlot()
 			}
 			if !registered {
-				// The path exists but git does not register it: either a
-				// leftover of an earlier exact retirement (empty — safe to
-				// finish removing) or content this slot record does not own
-				// (refuse; removal would destroy unowned work).
-				entries, dirErr := os.ReadDir(slotPath)
-				if dirErr != nil {
-					return fmt.Errorf("worktree pool: inspect %s: %w", slot.Name, dirErr)
-				}
-				if len(entries) != 0 {
-					return fmt.Errorf("worktree pool: slot %s path holds unregistered content; refusing possible replacement", slot.Name)
-				}
-				if err := os.RemoveAll(slotPath); err != nil {
-					return err
-				}
-				return completeSlot()
+				// The path exists but git does not register it — including an
+				// EMPTY directory. Emptiness is not proof of ownership: a
+				// replacement may have been created after the original
+				// worktree disappeared. Absence-only retirement never deletes
+				// an existing directory, so this refuses unconditionally.
+				return fmt.Errorf("worktree pool: slot %s path holds unregistered content; refusing possible replacement", slot.Name)
 			}
 			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slotPath)
 			if out, err := cmd.CombinedOutput(); err != nil {

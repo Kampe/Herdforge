@@ -120,6 +120,81 @@ func TestRetireExactRefusesUnregisteredReplacementContent(t *testing.T) {
 	}
 }
 
+// An EMPTY unregistered directory must refuse too: emptiness is not proof of
+// ownership. A replacement may have been created after the original worktree
+// disappeared, and absence-only retirement never deletes an existing
+// directory. This is the empty-replacement negative control.
+func TestRetireExactRefusesEmptyUnregisteredReplacement(t *testing.T) {
+	pool, slotName, slotPath, leaseID, generation := retireFixture(t)
+	if err := os.RemoveAll(slotPath); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", pool.RepoRoot, "worktree", "remove", "--force", slotPath).CombinedOutput(); err != nil {
+		t.Fatalf("fixture deregistration failed: %v (%s)", err, out)
+	}
+	if err := os.MkdirAll(slotPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.RetireExact(context.Background(), slotName, slotPath, leaseID, generation); err == nil {
+		t.Fatal("empty unregistered replacement must refuse")
+	}
+	entries, err := os.ReadDir(slotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries == nil {
+		t.Fatal("refused retirement removed the empty replacement directory")
+	}
+	state, err := pool.readState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Slots) != 1 {
+		t.Fatalf("refused retirement must keep the slot, %d remain", len(state.Slots))
+	}
+}
+
+// Deterministic interleave control: a raw filesystem writer plants a
+// replacement AFTER classification's checks and BEFORE the state-write fence
+// (the one window the pool lock cannot serialize, because the writer is not a
+// pool producer). The fence must detect the reappeared path at the mutation
+// boundary, refuse, keep the slot record, and leave the replacement untouched.
+func TestRetireExactFenceRefusesReplacementInterleavedBeforeStateWrite(t *testing.T) {
+	pool, slotName, slotPath, leaseID, generation := retireFixture(t)
+	if err := os.RemoveAll(slotPath); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", pool.RepoRoot, "worktree", "remove", "--force", slotPath).CombinedOutput(); err != nil {
+		t.Fatalf("fixture deregistration failed: %v (%s)", err, out)
+	}
+	prev := retireStateFenceProbe
+	retireStateFenceProbe = func(ctx context.Context, p *Pool, path string) {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Error(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "interleaved.txt"), []byte("unowned\n"), 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { retireStateFenceProbe = prev }()
+
+	if err := pool.RetireExact(context.Background(), slotName, slotPath, leaseID, generation); err == nil {
+		t.Fatal("interleaved replacement must be refused at the state-write fence")
+	} else if !strings.Contains(err.Error(), "reappeared before state completion") {
+		t.Fatalf("refusal must name the fence, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(slotPath, "interleaved.txt")); err != nil {
+		t.Fatal("fence refusal lost the interleaved replacement content")
+	}
+	state, err := pool.readState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Slots) != 1 {
+		t.Fatalf("fence refusal must keep the slot record, %d remain", len(state.Slots))
+	}
+}
+
 // Wrong generation and stale release nonce keep the existing identity
 // refusals; absence never bypasses the release identity checks.
 func TestRetireExactRefusesStaleIdentityEvenWhenAbsent(t *testing.T) {
