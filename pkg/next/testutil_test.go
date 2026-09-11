@@ -2,11 +2,36 @@ package next
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
+	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
+
+// controlledPicker returns a NextPicker isolated from the ambient canonical
+// review corpus (FAC-808). NewNextPicker eagerly resolves the git common-root
+// inbox, so a worktree test would otherwise ingest real pending verdicts and
+// let the priority-1 ingest action win before drain/review/claim evaluation.
+// The fixture instead owns empty inbox, ledger, and artifact paths inside a
+// per-test temp directory; populate the returned picker's InboxDir to exercise
+// verdict handling under controlled conditions. Production canonical
+// resolution itself is untouched.
+func controlledPicker(t *testing.T, cfg *config.Config, tp provider.TaskProvider) *NextPicker {
+	t.Helper()
+	dir := t.TempDir()
+	inbox := filepath.Join(dir, "inbox")
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := NewNextPicker(cfg, tp)
+	p.InboxDir = inbox
+	p.LedgerPath = filepath.Join(dir, "review-ledger.jsonl")
+	p.ReviewArtifact = filepath.Join(dir, "artifacts")
+	return p
+}
 
 type testTask struct {
 	ref         string
