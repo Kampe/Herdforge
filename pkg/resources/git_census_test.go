@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -747,4 +748,49 @@ func TestFullTableCaptureBoundsAnUnboundedParentContext(t *testing.T) {
 	assertBounded(t, "outer deadline",
 		LSOFProcessInspector{Executable: outerLsof, Timeout: time.Hour},
 		ctx, outerPID)
+}
+
+// stubProcessProcFn replaces the /proc metadata read for the duration of one
+// test. The census's per-pid decision must be provable without a real /proc or
+// a dumpable-cleared process on the host.
+func stubProcessProcFn(t *testing.T, fn func(pid int) ([][]byte, error)) {
+	t.Helper()
+	original := readProcessProcFn
+	readProcessProcFn = fn
+	t.Cleanup(func() { readProcessProcFn = original })
+}
+
+// TestSameOwnerMetadataRefusalDegradesToProcessCommandProbe pins the Linux CI
+// contract of the act-time owner census: a same-owner pid whose private /proc
+// metadata (environ, maps) the kernel REFUSES — permission denied, the
+// dumpable-cleared credential state every runner daemon carries — must not
+// render the whole census incomplete and fail-close every retirement. The
+// public command surface (ps -ww argv) stays readable for such a process and
+// is the same reference authority the owner-snapshot-unavailable path already
+// uses. Only a refusal to answer BOTH surfaces may remain an error, so a
+// non-permission metadata failure stays fatal.
+func TestSameOwnerMetadataRefusalDegradesToProcessCommandProbe(t *testing.T) {
+	if _, lookErr := exec.LookPath("ps"); lookErr != nil {
+		t.Skipf("ps is required to prove the degraded reference surface: %v", lookErr)
+	}
+	pid := os.Getpid()
+	target := filepath.Join(t.TempDir(), "worktrees", "harvest-stage")
+	procErr := &fs.PathError{Op: "open", Path: fmt.Sprintf("/proc/%d/environ", pid), Err: syscall.EACCES}
+
+	references, err := sameOwnerProcReferences(context.Background(), pid, map[string]bool{target: false}, procErr)
+	if err != nil {
+		t.Fatalf("a kernel metadata refusal for a same-owner pid failed the census: %v", err)
+	}
+	if references[target] {
+		t.Fatalf("the probe reported a reference the refused surfaces cannot prove: %v", references)
+	}
+
+	otherErr := &fs.PathError{Op: "open", Path: fmt.Sprintf("/proc/%d/environ", pid), Err: syscall.EIO}
+	keptReferences, keptErr := sameOwnerProcReferences(context.Background(), pid, map[string]bool{target: false}, otherErr)
+	if keptErr == nil {
+		t.Fatal("a non-permission metadata failure must stay fail-closed; the census read as complete")
+	}
+	if keptReferences[target] {
+		t.Fatalf("the failed probe invented a reference: %v", keptReferences)
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1606,6 +1607,21 @@ func snapshotProcessOwners(ctx context.Context) (map[int]int, error) {
 	return owners, nil
 }
 
+// sameOwnerProcReferences answers the reference question for a same-owner pid
+// whose /proc metadata read failed. A kernel read-AUTHORITY refusal (EACCES —
+// the dumpable-cleared credential state that runner daemons and any process
+// after a credential change carry, while the ps owner field still reads
+// same-owner) is not an unknown census gap: the public command surface stays
+// readable for such a process, and it is the same reference authority the
+// owner-snapshot-unavailable path already treats as a complete answer.
+// Every other failure remains an error and is fail-closed.
+func sameOwnerProcReferences(ctx context.Context, pid int, references map[string]bool, procErr error) (map[string]bool, error) {
+	if !errors.Is(procErr, fs.ErrPermission) {
+		return references, fmt.Errorf("read same-owner process metadata for pid %d: %w", pid, procErr)
+	}
+	return probeReferencesByProcessCommand(ctx, pid, references)
+}
+
 // processReferences closes the gap between filesystem handles and a process
 // that intends to recreate/use a cache through GOCACHE, argv, or a mapped
 // executable/database. Metadata for a foreign process is not deletion
@@ -1626,7 +1642,7 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 	for _, path := range paths {
 		references[path] = false
 	}
-	if procData, procErr := readProcessProc(pid); procErr == nil {
+	if procData, procErr := readProcessProcFn(pid); procErr == nil {
 		for path := range references {
 			needle := []byte(path)
 			for _, data := range procData {
@@ -1656,7 +1672,7 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 			}
 			return references, nil
 		}
-		return references, fmt.Errorf("read same-owner process metadata for pid %d: %w", pid, procErr)
+		return sameOwnerProcReferences(ctx, pid, references, procErr)
 	} else if owners != nil {
 		if killErr := syscall.Kill(pid, 0); errors.Is(killErr, syscall.ESRCH) {
 			return references, nil
@@ -1667,6 +1683,17 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 	} else if gone || foreign {
 		return references, nil
 	}
+	return probeReferencesByProcessCommand(ctx, pid, references)
+}
+
+// probeReferencesByProcessCommand answers the reference question from the
+// PUBLIC command surface alone (ps -ww argv, plus the Darwin procargs
+// environment when the platform serves it). It is the one reference authority
+// for a pid whose private /proc metadata cannot be read: the
+// owner-snapshot-unavailable path and the kernel read-authority refusal path
+// share it, so the two cannot drift into different answers for the same
+// process.
+func probeReferencesByProcessCommand(ctx context.Context, pid int, references map[string]bool) (map[string]bool, error) {
 	ps, err := exec.LookPath("ps")
 	if err != nil {
 		return references, fmt.Errorf("process metadata unavailable for pid %d: %w", pid, err)
@@ -1782,6 +1809,11 @@ func processOwnerViaPS(ctx context.Context, pid int) (foreign, gone bool, err er
 	}
 	return uid != os.Getuid(), false, nil
 }
+
+// readProcessProcFn is the /proc metadata seam. A stub decides between the
+// kernel's definitive read-authority refusals and every other failure without
+// depending on a real /proc or a dumpable-cleared process being present.
+var readProcessProcFn = readProcessProc
 
 func readProcessProc(pid int) ([][]byte, error) {
 	base := filepath.Join("/proc", strconv.Itoa(pid))

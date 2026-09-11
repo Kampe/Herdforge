@@ -47,11 +47,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/confinement"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
@@ -241,13 +241,12 @@ func (r HarvestRetirementRegistry) All() ([]HarvestRetirementReceipt, error) {
 // list --porcelain, enforced by the act-time identity fence); this pin bounds
 // where a marker may be minted and read on top of it.
 func HarvestRegistrationDir(worktreePath string) (string, error) {
-	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--absolute-git-dir").Output()
+	// The one shared --absolute-git-dir authority (pkg/confinement): FAC-575's
+	// duplicate-rule gate fired when this file grew its own copy beside
+	// pkg/confinement and pkg/harvest.
+	gitDir, err := confinement.AbsoluteGitDir(worktreePath)
 	if err != nil {
 		return "", fmt.Errorf("resolve git dir for %s: %w", worktreePath, err)
-	}
-	gitDir := strings.TrimSpace(string(out))
-	if gitDir == "" {
-		return "", fmt.Errorf("resolve git dir for %s: empty", worktreePath)
 	}
 	commonDir, err := gitroot.CommonDir(context.Background(), worktreePath)
 	if err != nil {
