@@ -478,6 +478,8 @@ func main() {
 
 	case "bundle-reclaim":
 		runBundleReclaim()
+	case "bundle-manifest":
+		runBundleManifest()
 
 	case "idle-pool":
 		runIdlePool()

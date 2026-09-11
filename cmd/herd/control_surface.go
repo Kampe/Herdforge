@@ -14,7 +14,7 @@ import (
 // FAC-240: controlSurfaceVersion is a compatibility boundary, not a display
 // number. Any command-contract change must add its new fingerprint below and
 // increment this value; ValidateControlSurfaceManifest rejects silent drift.
-const controlSurfaceVersion = 32
+const controlSurfaceVersion = 33
 
 type commandClass string
 
@@ -51,7 +51,7 @@ var commandNamesByClass = map[commandClass][]string{
 		"board-audit", "candidate", "capacity", "handoffs", "utilization", "control-surface", "mail", "preflight", "preflight-static", "process", "resources", "route", "scope", "selftest", "status", "tests-for", "throughput", "timeline", "tool-probe", "transcript", "unmerged", "verify", "worktrees",
 	},
 	classCoordinatorOnly: {
-		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "idle-pool", "install", "kick", "labels", "lane-cut", "worktree-reap", "bundle-reclaim", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resource-governor", "review", "review-host", "integrate", "integration-wake", "review-classify", "review-ingest", "review-bind-evidence", "review-complete-record", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
+		"activate", "approve", "attention", "board-done", "board-freeze", "board-frozen", "board-sync", "claude-only", "cleanup", "command", "commands", "containers", "control", "daemon", "deps", "dispatch", "doctor-models", "drain", "feedback", "fence-provision", "finish", "forge", "fresh-build", "goal-guard", "harvest", "harvest-merge", "hooks-pin", "herdr-deliver", "hold", "idle-pool", "install", "kick", "labels", "lane-cut", "worktree-reap", "bundle-reclaim", "bundle-manifest", "legacy-receipts", "lifecycle", "lock", "lost", "merge-admit", "merge-complete", "next", "no-claude", "overlap", "park", "posture", "pool", "pulse", "quota", "quota-supervisor", "receipt", "repl", "rescue", "reset-safe", "resolve-lane", "resource-governor", "review", "review-host", "integrate", "integration-wake", "review-classify", "review-ingest", "review-bind-evidence", "review-complete-record", "launch-record", "review-ledger", "verdict-harvest", "verdict-push", "send", "sh", "shoot", "shot", "slot", "spin", "standing", "stop", "task", "up", "usage", "watch", "wave", "wind-down", "verify-fac151",
 	},
 	classOperatorOnly: {
 		"clone", "envplan", "hostcreds", "init", "seed-lane-state", "signer-boundary", "stash", "validate-config",
@@ -110,6 +110,11 @@ func controlSurface() controlSurfaceManifest {
 // or reclassifying a command changes the hash and fails tests until the author
 // explicitly increments controlSurfaceVersion and records the new hash.
 var controlSurfaceCompatibility = map[int]string{
+	// 33 adds the FAC-811 bundle-manifest coordinator command: the native
+	// producer of the version-2 content-bound retention manifest that
+	// bundle-reclaim consumes (explicit names, dry-run describe, atomic
+	// no-overwrite write).
+	33: "1176a9ac2d53a30e9ac46a49d8a60c7b8ee2ea34a2ccf15ba2b8c54d4aecc6c6",
 	// 32 is the installer + bundle + idle-pool command union: main's native
 	// install registration composed with the reviewed bundle-reclaim,
 	// worktree-reap, and lane-cut coordinator commands.
