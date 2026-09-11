@@ -4,8 +4,14 @@ package lock
 // serializes MUTATIONS of the shared checkout. A mid-repair in-place hotfix
 // was raced out TWICE while the deployable was DOWN by concurrent
 // `git pull --autostash` in that same checkout (2026-07-24, platform-ops).
-// mkdir is atomic and portable, so no flock (absent on macOS). WITH a lock
-// never blocks our raw git command.
+// mkdir is atomic and portable and carries the visible holder state; the
+// MUTUAL EXCLUSION itself is anchored by a kernel-held advisory flock
+// (LOCK_EX) on a persistent sibling lock file that is created once and
+// never unlinked — the same primitive pkg/harvestmerge and pkg/security
+// already rely on (the historical note that flock is absent on macOS is
+// wrong). A waiter may never stale-break a lock while the flock is held
+// (the holder is provably live), and Release removes only the directory
+// inode it pinned. WITH a lock never blocks our raw git command.
 //
 // A crashed holder never wedges the fleet: a lock whose `holder` pid is
 // dead, or whose directory is older than maxAge (HERD_SHARED_LOCK_MAX_AGE,
@@ -14,6 +20,8 @@ package lock
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -46,11 +54,15 @@ const (
 	DefaultMaxAge = 300 * time.Second
 )
 
-// DirLock is an advisory mkdir-based file-system lock.
+// DirLock is an advisory mkdir-based file-system lock whose exclusion is
+// anchored by a kernel-held advisory flock on a persistent lock file.
 type DirLock struct {
-	dir    string
-	holder string
-	maxAge time.Duration
+	dir       string
+	holder    string
+	token     string
+	maxAge    time.Duration
+	flockFile *os.File
+	dirFile   *os.File
 }
 
 // NewDirLock returns a lock rooted at dir with the default stale-age bound.
@@ -78,18 +90,71 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 	}
 	waited := 0
 	waitSecs := int(wait.Seconds())
+	flockHeld := false
 	for {
+		if !flockHeld {
+			held, err := l.tryFlock()
+			if err != nil {
+				// Fail closed: ANY open or flock error (EACCES, EMFILE,
+				// ENFILE, EIO, ENOLCK, a truly unsupported filesystem, ...)
+				// means the kernel exclusion is NOT held, and mkdir-only
+				// semantics would silently lose the mutual exclusion the
+				// directory lock exists to provide. There is no equally
+				// safe atomic fallback, so the acquisition fails with the
+				// error and takes no ownership: no lock directory is
+				// created, replaced, or removed.
+				l.releaseFlock()
+				return fmt.Errorf("shared checkout lock: kernel exclusion unavailable, refusing unsafe mkdir-only fallback: %w", err)
+			}
+			if !held {
+				// EWOULDBLOCK: a live holder owns the kernel exclusion. Its
+				// lock directory must never be stale-broken by a waiter.
+				if waited >= waitSecs {
+					return fmt.Errorf("shared checkout locked by [%s], waited %ds", l.holderStr(), waitSecs)
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Second):
+				}
+				waited++
+				continue
+			}
+			flockHeld = true
+		}
 		l.breakIfStale()
 		if err := os.Mkdir(l.dir, 0o755); err == nil {
+			// owner token: Release must never remove a lock that a successor
+			// took over in the meantime.
+			l.token = newOwnerToken()
 			// holder write is best-effort (zsh `> "$holder" ... || true`).
 			l.writeHolder(reason)
+			// Pin the directory inode this owner created: Release removes
+			// only the directory it pinned, never a replacement. A pinned
+			// descriptor is REQUIRED: without it Release could not bind the
+			// removal to the created inode, so failing to open it is an
+			// acquisition failure. The just-created directory is removed
+			// again while the flock is still held (no compliant successor
+			// can exist yet, and the token in the holder file is ours), so
+			// the failed acquirer leaves no orphan ownership behind.
+			dirFile, openErr := pinLockDir(l.dir)
+			if openErr != nil {
+				if now, lerr := os.Lstat(l.dir); lerr == nil && now.IsDir() {
+					_ = removeLockDir(l.dir)
+				}
+				l.releaseFlock()
+				return fmt.Errorf("shared checkout lock: acquired directory could not be pinned: %w", openErr)
+			}
+			l.dirFile = dirFile
 			return nil
 		}
 		if waited >= waitSecs {
+			l.releaseFlock()
 			return fmt.Errorf("shared checkout locked by [%s], waited %ds", l.holderStr(), waitSecs)
 		}
 		select {
 		case <-ctx.Done():
+			l.releaseFlock()
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
@@ -97,9 +162,99 @@ func (l *DirLock) Acquire(ctx context.Context, wait time.Duration, reason string
 	}
 }
 
-// Release removes the lock. Advisory-only: ownership is by convention.
+// flockPath returns the persistent advisory lock file path: a SIBLING of the
+// lock directory that is created once and NEVER unlinked, so its inode is
+// stable and kernel-held for the lifetime of the checkout. The historical
+// comment claiming flock is absent on macOS is wrong — darwin has BSD
+// flock, and pkg/harvestmerge already relies on it.
+func (l *DirLock) flockPath() string { return l.dir + ".flock" }
+
+// tryFlock takes LOCK_EX|LOCK_NB on the persistent lock file. Returns
+// (true, nil) when exclusion is held, (false, nil) when a live holder owns
+// it (EWOULDBLOCK), and an error for every open or flock failure: there is
+// no silent degrade-to-mkdir path, because every such error means the
+// kernel exclusion that anchors the lock is not held.
+func (l *DirLock) tryFlock() (bool, error) {
+	if l.flockFile != nil {
+		return true, nil
+	}
+	f, err := os.OpenFile(l.flockPath(), os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return false, err
+	}
+	if err := flockFn(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return false, nil
+		}
+		return false, err
+	}
+	l.flockFile = f
+	return true, nil
+}
+
+// releaseFlock drops the kernel exclusion and closes the descriptors.
+func (l *DirLock) releaseFlock() {
+	if l.flockFile != nil {
+		_ = syscall.Flock(int(l.flockFile.Fd()), syscall.LOCK_UN)
+		_ = l.flockFile.Close()
+		l.flockFile = nil
+	}
+	if l.dirFile != nil {
+		_ = l.dirFile.Close()
+		l.dirFile = nil
+	}
+}
+
+// Release removes the lock — but only when this owner still owns it. If a
+// successor took the lock over (stale break, takeover) and wrote its own
+// holder token, the stale owner's release is a no-op instead of destroying
+// the successor's exclusion. Holder files from before owner tokens existed
+// (no token line) keep the historical remove behavior.
+//
+// The removal is additionally bound to the PINNED directory inode: the
+// kernel-held flock guarantees no compliant acquirer could have replaced
+// the directory while this owner held the exclusion, and the SameFile check
+// refuses even a non-compliant (raw mkdir/rm) replacement installed inside
+// the check/remove interval. Releasing the flock is the LAST action: a
+// successor cannot exist between the token/identity check and the removal.
 func (l *DirLock) Release() {
-	_ = os.RemoveAll(l.dir)
+	// This owner's kernel exclusion and pinned descriptor are dropped on
+	// EVERY path — including the no-op paths: a stale owner must never keep
+	// the flock its successor now needs. The deferred release also means
+	// the flock is still held while the directory is removed, so no
+	// compliant successor can appear between the checks and the removal.
+	defer l.releaseFlock()
+	if current := holderToken(l.holder); current != "" && current != l.token {
+		return
+	}
+	if interleaveHook != nil {
+		interleaveHook("release-pre-remove")
+	}
+	// Bind the removal to the PINNED directory inode as the last action
+	// before destruction: even a non-compliant (raw mkdir/rm) replacement
+	// installed inside the check/remove interval is never destroyed.
+	if l.dirFile != nil {
+		pinned, serr := l.dirFile.Stat()
+		if serr != nil {
+			return
+		}
+		if pinnedLinkCount(l.dirFile) == 0 {
+			// The pinned directory was unlinked from its name. Anything now
+			// at the lock path — including a fresh replacement that REUSED
+			// the pinned (st_dev, st_ino), which a same-directory recreate
+			// routinely does on Linux — is not this owner's lock and must
+			// survive.
+			return
+		}
+		if now, lerr := os.Lstat(l.dir); lerr != nil || !os.SameFile(pinned, now) {
+			// The directory at the name is not the one this owner
+			// created: a replacement (successor or foreign writer) must
+			// survive.
+			return
+		}
+	}
+	_ = removeLockDir(l.dir)
 }
 
 // Status reports whether the lock is held and, if so, the holder string.
@@ -112,10 +267,44 @@ func (l *DirLock) Status() (held bool, holderStr string) {
 
 // breakIfStale removes the lockdir when the holder pid is dead or the
 // directory is older than maxAge. The two and only two auto-release rules.
+// Callers that hold the kernel flock (all compliant acquirers) run this
+// under exclusion; the removal itself is bound to the OBSERVED inode — a
+// fresh lock installed between the staleness decision and the removal is
+// never destroyed.
 func (l *DirLock) breakIfStale() (removed bool) {
-	info, err := os.Stat(l.dir)
-	if err != nil {
-		return false // dir missing -> not stale
+	// Open FIRST and derive every staleness fact from the held descriptor:
+	// a path stat taken before the pin would leave both the staleness
+	// decision and the final identity comparison unbound from the object
+	// this descriptor holds — a replacement installed inside that pre-pin
+	// window could reuse the observed (st_dev, st_ino) and defeat the
+	// SameFile proof. Failure to open means the directory is missing (not
+	// stale) or the identity is unprovable — either way the stale break
+	// refuses to destroy (fail closed; the lock re-evaluates on the next
+	// acquisition).
+	observed, oerr := os.Open(l.dir)
+	if oerr != nil {
+		return false
+	}
+	defer observed.Close()
+	info, serr := observed.Stat()
+	if serr != nil {
+		return false
+	}
+	breakAndRemove := func() bool {
+		if interleaveHook != nil {
+			interleaveHook("stale-pre-remove")
+		}
+		if pinnedLinkCount(observed) == 0 {
+			// The observed stale lock was replaced inside the interval: a
+			// fresh lock (successor or foreign writer) is now at the path
+			// and must survive.
+			return false
+		}
+		if now, lerr := os.Lstat(l.dir); lerr != nil || !os.SameFile(info, now) {
+			return false
+		}
+		_ = removeLockDir(l.dir)
+		return true
 	}
 	// dead/invalid holder pid -> stale. A pid is ALIVE only when kill(pid,0)
 	// returns nil or EPERM; ESRCH (gone) and EINVAL (above PID_MAX on macOS)
@@ -124,15 +313,13 @@ func (l *DirLock) breakIfStale() (removed bool) {
 		if n, err := strconv.Atoi(pid); err == nil {
 			kerr := syscall.Kill(n, 0)
 			if !(kerr == nil || errors.Is(kerr, syscall.EPERM)) {
-				_ = os.RemoveAll(l.dir)
-				return true
+				return breakAndRemove()
 			}
 		}
 	}
 	// too old -> stale
 	if time.Since(info.ModTime()) > l.maxAge {
-		_ = os.RemoveAll(l.dir)
-		return true
+		return breakAndRemove()
 	}
 	return false
 }
@@ -176,11 +363,36 @@ func (l *DirLock) writeHolder(reason string) {
 	if agent == "" {
 		agent = username()
 	}
-	content := fmt.Sprintf("pid=%d\nagent=%s\nreason=%s\n", os.Getpid(), agent, reason)
+	content := fmt.Sprintf("pid=%d\nagent=%s\nreason=%s\ntoken=%s\n", os.Getpid(), agent, reason, l.token)
 	if f, err := os.OpenFile(l.holder, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err == nil {
 		_, _ = f.WriteString(content)
 		_ = f.Close()
 	}
+}
+
+// holderToken returns the `token=` value in the holder file, or "".
+func holderToken(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "token=") {
+			return strings.TrimPrefix(line, "token=")
+		}
+	}
+	return ""
+}
+
+func newOwnerToken() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("fallback-%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf[:])
 }
 
 func username() string {
@@ -192,3 +404,38 @@ func username() string {
 	}
 	return "unknown"
 }
+
+// interleaveHook, when non-nil, fires at the exact check-then-remove
+// boundaries of Release and breakIfStale. It is a deterministic test seam
+// for interleaving reproduction (bundle-interleaving-repair-2306);
+// production leaves it nil.
+var interleaveHook func(stage string)
+
+// pinnedLinkCount reports the link count of an open pinned descriptor via
+// fstat, or 0 when the platform cannot answer. Directory link counts are
+// 2+ while linked and drop to 0 once the directory is unlinked from its
+// name, so a pinned descriptor with link count 0 proves the object at the
+// lock path is a replacement — even when that replacement reused the
+// pinned (st_dev, st_ino). pkg/lock already requires unix syscalls
+// (syscall.Flock anchors the exclusion).
+func pinnedLinkCount(f *os.File) uint64 {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		return 0
+	}
+	return uint64(st.Nlink)
+}
+
+// removeLockDir is the removal primitive for the lock directory, a package
+// variable so tests can observe the check/remove boundary.
+var removeLockDir = os.RemoveAll
+
+// flockFn is the kernel advisory-flock primitive, a package variable so
+// injected-error tests can fail the syscall deterministically. Production
+// leaves it as syscall.Flock.
+var flockFn = syscall.Flock
+
+// pinLockDir opens the lock directory for inode pinning, a package variable
+// so injected-error tests can fail the open deterministically. Production
+// leaves it as os.Open.
+var pinLockDir = os.Open
