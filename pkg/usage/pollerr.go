@@ -97,3 +97,16 @@ func pollErrorCode(err error) string {
 	}
 	return s
 }
+
+// pollErrorCodeFromDetail extracts the stable code from an ALREADY-CLASSIFIED
+// detail string, as carried in UsageSnapshot.Errors. The snapshot stores the
+// rendered "<code>: <detail>" form rather than the error value, so consumers
+// downstream of a fetch have only the string to classify from.
+func pollErrorCodeFromDetail(detail string) string {
+	for i := 0; i < len(detail); i++ {
+		if detail[i] == ':' {
+			return detail[:i]
+		}
+	}
+	return detail
+}
