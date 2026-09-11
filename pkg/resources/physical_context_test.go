@@ -107,8 +107,9 @@ type measureCall struct {
 
 // recordingMeasurer wraps a measurer and records how the governor reached it.
 type recordingMeasurer struct {
-	inner PhysicalMeasurer
-	fail  error
+	inner           PhysicalMeasurer
+	fail            error
+	truncateMissing bool
 
 	mu    sync.Mutex
 	calls []measureCall
@@ -134,6 +135,12 @@ func (r *recordingMeasurer) Measure(path string, maxEntries int) (PhysicalUsage,
 func (r *recordingMeasurer) MeasureContext(ctx context.Context, path string, maxEntries int) (PhysicalUsage, error) {
 	_, hasDeadline := ctx.Deadline()
 	r.record(measureCall{path: path, contextual: true, hasDeadline: hasDeadline, ctxErr: ctx.Err()})
+	if r.truncateMissing {
+		if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+			// A survivor the bounded readback could not finish reading.
+			return PhysicalUsage{Bytes: 512, Truncated: true}, nil
+		}
+	}
 	if r.fail != nil {
 		return PhysicalUsage{Truncated: true}, r.fail
 	}
@@ -281,5 +288,108 @@ func TestGovernorPostReapReadbackSurvivesCancellation(t *testing.T) {
 	}
 	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("target survived: %v", statErr)
+	}
+}
+
+func TestContainsCanonicalStateStopsVisitingOnCancellation(t *testing.T) {
+	root := physicalTree(t, 20)
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	found, err := containsCanonicalState(ctx, root, 1000)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled canonical scan error = %v, want context.Canceled", err)
+	}
+	if found {
+		t.Fatal("a scan that never visited an entry must not claim a finding")
+	}
+}
+
+func TestContainsCanonicalStateProtectionUnchanged(t *testing.T) {
+	root := physicalTree(t, 4)
+	live, err := containsCanonicalState(context.Background(), root, 1000)
+	if err != nil || live {
+		t.Fatalf("clean tree scan=(%t,%v), want (false,nil)", live, err)
+	}
+	if err := os.Mkdir(filepath.Join(root, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested, err := containsCanonicalState(context.Background(), root, 1000)
+	if err != nil || !nested {
+		t.Fatalf("nested canonical state scan=(%t,%v), want (true,nil)", nested, err)
+	}
+	if _, err := containsCanonicalState(context.Background(), root, 1); err == nil {
+		t.Fatal("entry bound is no longer enforced")
+	}
+}
+
+func TestGovernorBlocksTargetWhenCanonicalScanIsCancelled(t *testing.T) {
+	g, target, _ := governorFor(t, "host", 900000, 850000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The target's own allocation measurement succeeds; the sweep is cancelled
+	// the instant afterwards, so the canonical-state walk is the step that runs
+	// out of time. It must not report a clean tree it never finished reading.
+	g.Measure = &cancellingMeasurer{inner: OSPhysicalMeasurer{}, when: "node_modules", cancel: cancel}
+	report, err := g.Run(ctx, RunOptions{Apply: true})
+	if len(report.Targets) != 1 {
+		t.Fatalf("targets=%+v (err=%v)", report.Targets, err)
+	}
+	if report.Targets[0].Decision != TargetBlocked || report.Targets[0].Reason != "canonical_state_scan_unavailable" {
+		t.Fatalf("cancelled canonical scan target=%+v, want blocked canonical_state_scan_unavailable", report.Targets[0])
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Reaped != 0 || report.ReclaimedBytes != 0 {
+		t.Fatalf("cancelled canonical scan produced reclaim: %+v", report)
+	}
+	if _, statErr := os.Stat(target); statErr != nil {
+		t.Fatalf("target was mutated behind an unfinished canonical scan: %v", statErr)
+	}
+}
+
+// cancellingMeasurer measures normally, then cancels the sweep once it has
+// measured a path whose base name matches when.
+type cancellingMeasurer struct {
+	inner  OSPhysicalMeasurer
+	when   string
+	cancel context.CancelFunc
+}
+
+func (m *cancellingMeasurer) Measure(path string, maxEntries int) (PhysicalUsage, error) {
+	return m.MeasureContext(context.Background(), path, maxEntries)
+}
+
+func (m *cancellingMeasurer) MeasureContext(ctx context.Context, path string, maxEntries int) (PhysicalUsage, error) {
+	usage, err := m.inner.MeasureContext(ctx, path, maxEntries)
+	if filepath.Base(path) == m.when {
+		m.cancel()
+	}
+	return usage, err
+}
+
+func TestGovernorRefusesTruncatedPostReapReadback(t *testing.T) {
+	g, target, _ := governorFor(t, "host", 900000, 850000, 840000)
+	// WithoutCancel keeps the readback alive past the deadline, so the entry
+	// bound is the only limit left on it. A readback that hits that bound has
+	// not proved what survived and must never be counted as reclaimed.
+	g.Measure = &recordingMeasurer{inner: OSPhysicalMeasurer{}, truncateMissing: true}
+	report, err := g.Run(context.Background(), RunOptions{Apply: true, BatchLimit: 1})
+	if err == nil {
+		t.Fatalf("truncated readback was accepted: %+v", report)
+	}
+	if report.ReclaimedBytes != 0 {
+		t.Fatalf("truncated readback reported %d reclaimed bytes it could not prove", report.ReclaimedBytes)
+	}
+	for _, row := range report.Targets {
+		if row.Decision == TargetReaped {
+			t.Fatalf("truncated readback still recorded a proved reap: %+v", row)
+		}
+	}
+	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("removal did not commit: %v", statErr)
 	}
 }

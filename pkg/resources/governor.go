@@ -1304,12 +1304,23 @@ func (g *Governor) applyOrphanTargets(ctx context.Context, report *GovernorRepor
 		// The removal is committed and this loop still holds the cache-use
 		// flock. Cancellation must not abandon the readback here: it would
 		// release the lock mid-accounting and leave a reap whose reclaimed
-		// bytes were never proved. Bookkeeping for a finished mutation
-		// outlives the sweep deadline.
+		// bytes were never proved. The accounting for a finished mutation
+		// therefore outlives the sweep deadline, and every exit below releases
+		// the flock after the readback and never during it -- no interrupt, no
+		// goroutine left running behind it.
+		//
+		// WithoutCancel drops the deadline, not the bound: MaxScanEntries is
+		// still enforced, so this readback stays finite. That bound is then the
+		// only limit left, so a truncated result is refused instead of counted
+		// -- a partial AfterBytes would understate what survived and overstate
+		// reclaimed bytes.
 		after, err := g.measure(context.WithoutCancel(ctx), report.OrphanTargets[i].Path, g.Policy.MaxScanEntries)
 		if errors.Is(err, os.ErrNotExist) {
 			after = PhysicalUsage{}
 			err = nil
+		}
+		if err == nil && after.Truncated {
+			err = fmt.Errorf("readback hit the %d-entry bound; surviving bytes are unproved", g.Policy.MaxScanEntries)
 		}
 		if err != nil {
 			if locked {
@@ -1390,7 +1401,7 @@ func (g *Governor) inspectTarget(ctx context.Context, lane RegisteredWorktree, r
 		target.Decision, target.Reason = TargetBlocked, "target_allocation_truncated"
 		return target
 	}
-	canonical, scanErr := containsCanonicalState(target.Path, g.Policy.MaxScanEntries)
+	canonical, scanErr := containsCanonicalState(ctx, target.Path, g.Policy.MaxScanEntries)
 	if scanErr != nil {
 		target.Decision, target.Reason = TargetBlocked, "canonical_state_scan_unavailable"
 		return target
@@ -1478,12 +1489,19 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 			return fmt.Errorf("remove exact generated target %q: %w", again.Path, err)
 		}
 		// Same rule as the orphan cache readback: the tree is already
-		// quarantined and unlinked, so this measurement is the accounting for
-		// a committed mutation and must not be cancelled out from under it.
+		// quarantined and unlinked, so this is the accounting for a committed
+		// mutation and must not be cancelled out from under it. WithoutCancel
+		// drops the deadline, not MaxScanEntries, so the readback stays finite;
+		// that bound is then the only limit left, so a truncated result is
+		// refused instead of counted -- a partial AfterBytes would understate
+		// what survived and overstate reclaimed bytes.
 		after, measureErr := g.measure(context.WithoutCancel(ctx), again.Path, g.Policy.MaxScanEntries)
 		if errors.Is(measureErr, os.ErrNotExist) {
 			after = PhysicalUsage{}
 			measureErr = nil
+		}
+		if measureErr == nil && after.Truncated {
+			measureErr = fmt.Errorf("readback hit the %d-entry bound; surviving bytes are unproved", g.Policy.MaxScanEntries)
 		}
 		if measureErr != nil {
 			return fmt.Errorf("post-reap physical-byte readback %q: %w", again.Path, measureErr)
@@ -1499,10 +1517,26 @@ func (g *Governor) applyTargets(ctx context.Context, report *GovernorReport, lim
 	return nil
 }
 
-func containsCanonicalState(root string, maxEntries int) (bool, error) {
+// containsCanonicalState proves an exact generated target holds no nested
+// canonical .git or .herd state. It is a native disk traversal over the same
+// pathological directories the governor measures, so it takes the sweep's
+// context and inspects cancellation at every entry: a cancelled scan stops
+// visiting immediately and returns the context error.
+//
+// Fail-closed is the caller's contract, and inspectTarget is the only caller: a
+// scan that did not finish is "canonical_state_scan_unavailable" and blocks the
+// target. Cancellation is never evidence of absence, and a target already
+// proven to hold canonical state still reports found, so the protection cannot
+// weaken in either direction.
+func containsCanonicalState(ctx context.Context, root string, maxEntries int) (bool, error) {
 	found := false
 	entries := 0
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		// Checked before the entry is accounted, so the entry that observes
+		// cancellation is not counted and no later entry is visited.
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return cancelErr
+		}
 		if err != nil {
 			return err
 		}
