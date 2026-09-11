@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -29,19 +30,21 @@ func (lifecycleCapacityBackend) StatFS(string) (resources.Capacity, error) {
 // governor lock is held by contending on it, and then blocks until the
 // sweep context deadline or an explicit test release.
 type lifecycleBlockingWorktrees struct {
-	mu          sync.Mutex
-	lockPath    string
-	release     chan struct{}
-	observedOK  bool
-	observedDL  time.Time
-	contentErr  error
-	listEntered chan struct{}
-	once        sync.Once
+	mu             sync.Mutex
+	lockPath       string
+	released       chan struct{}
+	releaseOnce    sync.Once
+	observedOK     bool
+	observedDL     time.Time
+	contentErr     error
+	contentionLock io.Closer
+	listEntered    chan struct{}
+	once           sync.Once
 }
 
 func newLifecycleBlockingWorktrees(lockPath string) *lifecycleBlockingWorktrees {
 	return &lifecycleBlockingWorktrees{
-		lockPath: lockPath, release: make(chan struct{}), listEntered: make(chan struct{}),
+		lockPath: lockPath, released: make(chan struct{}), listEntered: make(chan struct{}),
 	}
 }
 
@@ -49,24 +52,31 @@ func (w *lifecycleBlockingWorktrees) List(ctx context.Context, _, _ string) ([]r
 	// The sweep must hold the global governor lock while the census blocks:
 	// a short contending acquire from inside the census has to fail. This
 	// runs before listEntered so the observing test reads settled evidence.
-	_, err := (resources.FileLockProvider{}).Acquire(context.Background(), w.lockPath, 50*time.Millisecond, 10*time.Millisecond)
+	// The closer is retained so an unexpectedly acquired lock (a regression
+	// the assertions will report) can still be released by cleanup.
+	lock, err := (resources.FileLockProvider{}).Acquire(context.Background(), w.lockPath, 50*time.Millisecond, 10*time.Millisecond)
 	w.mu.Lock()
 	w.observedDL, w.observedOK = ctx.Deadline()
 	w.contentErr = err
+	w.contentionLock = lock
 	w.mu.Unlock()
 	w.once.Do(func() { close(w.listEntered) })
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-w.release:
+	case <-w.released:
 		return nil, errCensusReleasedByTest
 	}
 }
 
-func (w *lifecycleBlockingWorktrees) observation() (bool, time.Time, error) {
+func (w *lifecycleBlockingWorktrees) releaseDependency() {
+	w.releaseOnce.Do(func() { close(w.released) })
+}
+
+func (w *lifecycleBlockingWorktrees) observation() (bool, time.Time, error, io.Closer) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.observedOK, w.observedDL, w.contentErr
+	return w.observedOK, w.observedDL, w.contentErr, w.contentionLock
 }
 
 func lifecycleTestPolicy(t *testing.T, allowApply bool) resources.GovernorPolicy {
@@ -94,16 +104,38 @@ func TestLifecycleSweepGivesUnboundedCallerAFiniteDeadline(t *testing.T) {
 		Worktrees: blocker, Locks: resources.FileLockProvider{},
 	}
 	done := make(chan error, 1)
+	finished := make(chan struct{})
 	go func() {
 		_, err := runLifecycleGovernorSweep(context.Background(), governor, resources.SweepReviewBeforeRefusal)
 		done <- err
+		close(finished)
 	}()
+	// Every failure path below may return before the body releases the
+	// dependency. Cleanup must therefore release it exactly once, join the
+	// sweep with a bound, and close any lock the contention probe
+	// unexpectedly acquired, so a regression can never strand the spawned
+	// sweep holding the global governor lock past the test's lifetime.
+	// Termination is broadcast via the closed finished channel because the
+	// body consumes the single buffered done value on the success path.
+	t.Cleanup(func() {
+		blocker.releaseDependency()
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Errorf("sweep goroutine did not terminate after release; its file lock would strand")
+		}
+		if _, _, _, lock := blocker.observation(); lock != nil {
+			if err := lock.Close(); err != nil {
+				t.Errorf("close unexpectedly acquired contention lock: %v", err)
+			}
+		}
+	})
 	select {
 	case <-blocker.listEntered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("census dependency never observed the sweep context")
 	}
-	ok, observed, contentionErr := blocker.observation()
+	ok, observed, contentionErr, _ := blocker.observation()
 	if !ok {
 		t.Fatal("lifecycle sweep handed the blocking dependency an unbounded context (no deadline)")
 	}
@@ -118,7 +150,7 @@ func TestLifecycleSweepGivesUnboundedCallerAFiniteDeadline(t *testing.T) {
 	if contentionErr == nil {
 		t.Fatal("global governor lock was not held during the blocked census; held-then-released evidence would be vacuous")
 	}
-	close(blocker.release)
+	blocker.releaseDependency()
 	select {
 	case err := <-done:
 		if err == nil {
@@ -156,7 +188,7 @@ func TestLifecycleSweepPreservesEarlierCallerDeadline(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("caller deadline must stop the sweep fail-closed with context.DeadlineExceeded, got %v", err)
 	}
-	ok, observed, _ := blocker.observation()
+	ok, observed, _, _ := blocker.observation()
 	if !ok {
 		t.Fatal("census dependency observed no deadline despite the caller supplying one")
 	}
@@ -165,33 +197,24 @@ func TestLifecycleSweepPreservesEarlierCallerDeadline(t *testing.T) {
 	}
 }
 
-// TestLifecycleSweepCanceledCallerPreventsDownstreamMutation proves a
-// canceled caller context reaches the dependency fail-closed and no reap
-// mutation runs after cancellation.
-func TestLifecycleSweepCanceledCallerPreventsDownstreamMutation(t *testing.T) {
-	policy := lifecycleTestPolicy(t, true)
+// TestLifecycleSweepCanceledCallerFailsClosed proves a canceled caller
+// context reaches the census dependency fail-closed through the boundary.
+// This fixture carries no eligible reap target, so it makes no downstream
+// mutation claim of its own: the no-work-after-cancellation property is
+// owned by pkg/resources, whose TestLandingSeamObservesCancellationAroundThe
+// Proof (git_census_landing_test.go) proves a cancelled census refuses with
+// the probe predicate never invoked.
+func TestLifecycleSweepCanceledCallerFailsClosed(t *testing.T) {
+	policy := lifecycleTestPolicy(t, false)
 	parent, cancel := context.WithCancel(context.Background())
 	cancel()
-	var mu sync.Mutex
-	removals := 0
 	governor := &resources.Governor{
 		Policy: policy, Capacity: lifecycleCapacityBackend{},
 		Worktrees: lifecycleCanceledAwareWorktrees{}, Locks: resources.FileLockProvider{},
-		RemoveTree: func(string) error {
-			mu.Lock()
-			defer mu.Unlock()
-			removals++
-			return nil
-		},
 	}
 	_, err := runLifecycleGovernorSweep(parent, governor, resources.SweepReviewBeforeRefusal)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-canceled caller must fail closed with context.Canceled, got %v", err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if removals != 0 {
-		t.Fatalf("post-cancellation mutation observed: %d RemoveTree calls", removals)
 	}
 }
 
