@@ -393,3 +393,134 @@ func TestGovernorRefusesTruncatedPostReapReadback(t *testing.T) {
 		t.Fatalf("removal did not commit: %v", statErr)
 	}
 }
+
+// phaseMeasurer records the deadline each measurement receives so a test can
+// prove the registered lane loop hands the measurer the REGISTERED phase
+// deadline (outer budget minus the orphan reservation), not the outer sweep
+// deadline.
+type phaseMeasurer struct {
+	inner PhysicalMeasurer
+
+	mu       sync.Mutex
+	deadline time.Time
+	calls    int
+}
+
+func (p *phaseMeasurer) Measure(path string, maxEntries int) (PhysicalUsage, error) {
+	return p.inner.Measure(path, maxEntries)
+}
+
+func (p *phaseMeasurer) MeasureContext(ctx context.Context, path string, maxEntries int) (PhysicalUsage, error) {
+	p.mu.Lock()
+	p.calls++
+	if dl, ok := ctx.Deadline(); ok {
+		if p.deadline.IsZero() || dl.Before(p.deadline) {
+			p.deadline = dl
+		}
+	}
+	p.mu.Unlock()
+	return p.inner.Measure(path, maxEntries)
+}
+
+func (p *phaseMeasurer) snapshot() (time.Time, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deadline, p.calls
+}
+
+// TestGovernorRegisteredMeasureGetsPhaseDeadlineNotSweepBudget proves both
+// halves of the integration correction: the context-aware measurer receives a
+// deadline strictly earlier than the sweep deadline (the one-fifth orphan
+// reservation is withheld from the registered phase), and a healthy sweep
+// still measures every lane through that bounded deadline.
+func TestGovernorRegisteredMeasureGetsPhaseDeadlineNotSweepBudget(t *testing.T) {
+	g, _, lanes := governorFor(t, "host", 900000, 850000)
+	g.Measure = &phaseMeasurer{inner: OSPhysicalMeasurer{}}
+	const sweep = 2 * time.Second
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), sweep)
+	defer cancel()
+	report, err := g.Run(ctx, RunOptions{})
+	if err != nil {
+		t.Fatalf("healthy sweep failed: %v", err)
+	}
+	p := g.Measure.(*phaseMeasurer)
+	gotDeadline, calls := p.snapshot()
+	if calls == 0 {
+		t.Fatal("measurer never invoked")
+	}
+	for i := range lanes.lanes {
+		if report.Worktrees[i].AllocatedBytes == 0 {
+			t.Fatalf("lane %d unmeasured on a healthy sweep: %+v", i, report.Worktrees[i])
+		}
+		if report.Worktrees[i].PreserveReason == "census_budget_exhausted" {
+			t.Fatalf("lane %d marked budget-exhausted on a healthy sweep", i)
+		}
+	}
+	for _, stage := range report.Stages {
+		if stage.Name == "unregistered_orphan_census" && stage.Cause != "" {
+			t.Fatalf("orphan phase starved on a healthy sweep: %q", stage.Cause)
+		}
+	}
+	// Every recorded measurement deadline must sit strictly inside the
+	// registered phase: at least 1/5 of the sweep budget (minus slack for
+	// clock skew) reserved for the orphan phase after it.
+	outerDeadline, _ := ctx.Deadline()
+	if gotDeadline.IsZero() {
+		t.Fatal("measurer never recorded a deadline; the registered walk cannot be sweep-bounded")
+	}
+	if !gotDeadline.Before(outerDeadline.Add(-sweep/5 + 50*time.Millisecond)) {
+		t.Fatalf("measurer received sweep-level deadline %v (outer %v): the registered walk can consume the orphan reservation", gotDeadline, outerDeadline)
+	}
+	if elapsed := time.Since(start); elapsed > sweep+time.Second {
+		t.Fatalf("sweep overran its own budget: %v", elapsed)
+	}
+}
+
+// blockerMeasurer holds each measurement until ITS OWN received deadline
+// fires. Under the corrected wiring it releases at the registered phase
+// deadline, leaving the orphan phase its reservation; under the old wiring
+// (outer sweep context) it would hold until the sweep deadline and starve the
+// orphan phase.
+type blockerMeasurer struct{ inner OSPhysicalMeasurer }
+
+func (b *blockerMeasurer) Measure(path string, maxEntries int) (PhysicalUsage, error) {
+	return b.inner.Measure(path, maxEntries)
+}
+
+func (b *blockerMeasurer) MeasureContext(ctx context.Context, path string, maxEntries int) (PhysicalUsage, error) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(10 * time.Second):
+	}
+	if ctx.Err() != nil {
+		return PhysicalUsage{Truncated: true}, ctx.Err()
+	}
+	return b.inner.Measure(path, maxEntries)
+}
+
+func TestGovernorRegisteredMeasureCannotStealOrphanBudget(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000, 850000)
+	g.Measure = &blockerMeasurer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	report, err := g.Run(ctx, RunOptions{})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if report.Worktrees[0].PreserveReason != "worktree_allocation_unavailable" {
+		t.Fatalf("blocked measurement must fail closed, got %+v", report.Worktrees[0])
+	}
+	for _, stage := range report.Stages {
+		if stage.Name == "unregistered_orphan_census" {
+			if stage.Cause != "" {
+				t.Fatalf("registered walk consumed the orphan reservation: %q", stage.Cause)
+			}
+			if stage.DurationMS > 1000 {
+				t.Fatalf("orphan phase itself overran: %dms", stage.DurationMS)
+			}
+			return
+		}
+	}
+	t.Fatal("orphan census stage missing")
+}

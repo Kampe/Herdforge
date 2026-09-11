@@ -544,10 +544,12 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		total := time.Until(dl)
 		if total > 0 {
-			// WithDeadline returns (ctx, CancelFunc): a past deadline is an
-			// already-expired child, which is exactly a fully-consumed
-			// registered phase.
-			rctx, rctxCancel := context.WithDeadline(ctx, g.now().Add(total*4/5))
+			// Derive the registered phase deadline from the PARENT deadline,
+			// not the injected clock: the phase split partitions the wall
+			// clock window the sweep actually has. WithDeadline returns
+			// (ctx, CancelFunc): a past deadline is an already-expired
+			// child, which is exactly a fully-consumed registered phase.
+			rctx, rctxCancel := context.WithDeadline(ctx, dl.Add(-total/5))
 			defer rctxCancel()
 			registeredCtx = rctx
 		}
