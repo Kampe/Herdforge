@@ -14,7 +14,7 @@ import (
 func TestEval_NoTasks(t *testing.T) {
 	cfg := testConfig()
 	tp := newTestProvider([]testTask{})
-	p := NewNextPicker(cfg, tp)
+	p := controlledPicker(t, cfg, tp)
 	act, err := p.Eval(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -27,12 +27,13 @@ func TestEval_NoTasks(t *testing.T) {
 func TestEval_VerdictArtifacts(t *testing.T) {
 	cfg := testConfig()
 	tp := newTestProvider([]testTask{})
-	tmp, _ := os.MkdirTemp("", "next-test-*")
-	defer os.RemoveAll(tmp)
-	p := NewNextPicker(cfg, tp)
-	p.InboxDir = tmp
+	p := controlledPicker(t, cfg, tp)
 
-	os.WriteFile(tmp+"/test-verdict.md", []byte("verdict"), 0644)
+	// Controlled populated fixture: the intended pending-verdict priority is
+	// exercised against a fixture-owned inbox, never the ambient canonical one.
+	if err := os.WriteFile(filepath.Join(p.InboxDir, "test-verdict.md"), []byte("verdict"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	act, err := p.Eval(context.Background())
 	if err != nil {
@@ -133,7 +134,7 @@ func TestEval_ReviewAtCap(t *testing.T) {
 		{ref: "FAC-2", status: "review", priority: "medium"},
 		{ref: "FAC-3", status: "review", priority: "medium"},
 	})
-	p := NewNextPicker(cfg, tp)
+	p := controlledPicker(t, cfg, tp)
 	act, err := p.Eval(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +149,7 @@ func TestEval_NeedReview(t *testing.T) {
 	tp := newTestProvider([]testTask{
 		{ref: "FAC-1", status: "in-progress", priority: "high"},
 	})
-	p := NewNextPicker(cfg, tp)
+	p := controlledPicker(t, cfg, tp)
 	act, err := p.Eval(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +283,7 @@ func TestEvalClaimActionNamesBrokerDecisionTask(t *testing.T) {
 		{ref: "FAC-9", status: "to-do", priority: "urgent", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-9\",\"task_id\":\"t9\",\"edges\":[]}\n```"},
 		{ref: "FAC-10", status: "to-do", priority: "high", description: "```herd-deps-v1\n{\"version\":1,\"task_ref\":\"FAC-10\",\"task_id\":\"t10\",\"edges\":[]}\n```"},
 	}
-	p := NewNextPicker(cfg, newTestProvider(tasks))
+	p := controlledPicker(t, cfg, newTestProvider(tasks))
 	acts, err := p.EvalAll(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +310,7 @@ func TestEvalClaimActionConsumesBrokerWait(t *testing.T) {
 	tasks := []testTask{
 		{ref: "FAC-9", status: "to-do", priority: "high", description: "missing fence"},
 	}
-	p := NewNextPicker(cfg, newTestProvider(tasks))
+	p := controlledPicker(t, cfg, newTestProvider(tasks))
 	acts, err := p.EvalAll(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -336,5 +337,80 @@ func TestEvalClaimActionConsumesBrokerWait(t *testing.T) {
 	}
 	if !strings.Contains(claim.Description, "FAC-9") {
 		t.Fatalf("claim action must still name the blocking event, got %q", claim.Description)
+	}
+}
+
+// FAC-808 reproduction: the PRIOR fixture construction (no injection, ambient
+// canonical resolution) fails under a controlled polluted inbox — the eagerly
+// resolved inbox makes the priority-1 ingest action win and NoTasks can never
+// select ActionClaim. Hermetic: the cwd is a non-git temp directory, so the
+// review-root resolver falls back to the cwd-relative .herd/review/inbox that
+// this test populates; the live canonical inbox is never read, moved, or
+// modified. HERD_PROJECT_ROOT is cleared so an ambient override cannot redirect
+// resolution. If the resolver ever stops being eager, this takeover assertion
+// fails and the injection rationale must be revisited.
+func TestEvalPriorFixtureTakesControlledPollution(t *testing.T) {
+	dir := t.TempDir()
+	inbox := filepath.Join(dir, ".herd", "review", "inbox")
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "7b547543-controlled-verdict.md"), []byte("sha: 3333333333333333333333333333333333333333\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Chdir(dir)
+
+	// Prior-fixture construction: no controlled injection.
+	p := NewNextPicker(testConfig(), newTestProvider([]testTask{}))
+	act, err := p.Eval(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if act.Type != ActionIngest {
+		t.Fatalf("controlled pollution did not take over the prior fixture: got %s, want ingest-verdicts takeover", act.Type)
+	}
+}
+
+// FAC-808: repaired fixtures are independent of the ambient canonical inbox.
+// An unrelated canonical-style verdict sits at the resolver's ambient fallback
+// location — OUTSIDE each picker's injected inbox — and the intended
+// NoTasks/ReviewAtCap/NeedReview actions still win.
+func TestEvalRepairedFixturesIgnoreAmbientCanonicalVerdicts(t *testing.T) {
+	dir := t.TempDir()
+	ambientInbox := filepath.Join(dir, ".herd", "review", "inbox")
+	if err := os.MkdirAll(ambientInbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ambientInbox, "ambient-unrelated-verdict.md"), []byte("sha: 4444444444444444444444444444444444444444\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Chdir(dir)
+
+	cases := []struct {
+		name  string
+		tasks []testTask
+		want  ActionType
+	}{
+		{name: "NoTasks", tasks: []testTask{}, want: ActionClaim},
+		{name: "ReviewAtCap", tasks: []testTask{
+			{ref: "FAC-1", status: "review", priority: "high"},
+			{ref: "FAC-2", status: "review", priority: "medium"},
+			{ref: "FAC-3", status: "review", priority: "medium"},
+		}, want: ActionReview},
+		{name: "NeedReview", tasks: []testTask{
+			{ref: "FAC-1", status: "in-progress", priority: "high"},
+		}, want: ActionClaim},
+	}
+	for _, tc := range cases {
+		p := controlledPicker(t, testConfig(), newTestProvider(tc.tasks))
+		act, err := p.Eval(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if act.Type != tc.want {
+			t.Errorf("%s: ambient verdict hijacked the action: got %s, want %s", tc.name, act.Type, tc.want)
+		}
 	}
 }

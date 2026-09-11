@@ -13,7 +13,7 @@ func TestEval_ProviderTimeout_NotFreeCapacity(t *testing.T) {
 	cfg := testConfig()
 	inner := &hangListProvider{}
 	tp := provider.NewBoundClient(inner, provider.Deadlines{List: 30 * time.Millisecond})
-	p := NewNextPicker(cfg, tp)
+	p := controlledPicker(t, cfg, tp)
 	act, err := p.Eval(context.Background())
 	if err == nil {
 		t.Fatalf("timeout must not return success action: %+v", act)
@@ -33,7 +33,7 @@ func TestEval_ProviderTimeout_NotFreeCapacity(t *testing.T) {
 func TestEvalAll_ProviderTimeout_EmptySliceForbidden(t *testing.T) {
 	cfg := testConfig()
 	tp := provider.NewBoundClient(&hangListProvider{}, provider.Deadlines{List: 30 * time.Millisecond})
-	p := NewNextPicker(cfg, tp)
+	p := controlledPicker(t, cfg, tp)
 	actions, err := p.EvalAll(context.Background())
 	if err == nil {
 		t.Fatalf("want error, got actions=%v", actions)
