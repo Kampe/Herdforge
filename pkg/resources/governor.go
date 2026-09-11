@@ -3,6 +3,7 @@ package resources
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -674,16 +675,18 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 		if err != nil {
 			return result, fmt.Errorf("read known orphan root: %w", err)
 		}
-		// Rotate the bounded window by a batch-sized time stride. A protected
-		// early entry must not permanently starve later eligible entries across
-		// sweeps, while each sweep remains bounded by orphanCensusLimit.
+		// Rotate the bounded window by the per-root durable cursor so
+		// repeated sweeps at the same wall-clock minute still make real
+		// progress through the ring: a protected or unknown early entry
+		// must not permanently starve later eligible entries, while each
+		// sweep remains bounded by orphanCensusLimit. A missing or invalid
+		// cursor falls back to the historical time-bucket stride and never
+		// infers eligibility by itself.
 		limit := g.orphanCensusLimit()
+		rootTruncated := false
+		start := 0
 		if len(entries) > 0 {
-			bucket := (g.Now().Unix() / int64(time.Minute/time.Second)) % int64(len(entries))
-			if bucket < 0 {
-				bucket += int64(len(entries))
-			}
-			start := int((bucket * int64(limit)) % int64(len(entries)))
+			start = g.orphanWindowStart(root, len(entries))
 			entries = append(append([]os.DirEntry(nil), entries[start:]...), entries[:start]...)
 		}
 		rootProcessUsage := map[string]ProcessUsage(nil)
@@ -728,6 +731,7 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			}
 			if candidates >= limit {
 				result.Truncated = true
+				rootTruncated = true
 				result.Remaining++
 				continue
 			}
@@ -760,9 +764,65 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			}
 			result.Orphans = append(result.Orphans, orphan)
 		}
+		// Advance the durable cursor by the entries actually examined so
+		// the next sweep - even at the same wall-clock minute - continues
+		// after this window instead of re-reading it. A fully examined ring
+		// resets the cursor; a truncated sweep parks it after the window.
+		// Best-effort: a write failure only loses the optimization and the
+		// next run falls back to the time-bucket stride; it never changes
+		// any entry's eligibility.
+		next := 0
+		if rootTruncated {
+			next = start + candidates
+		}
+		g.storeOrphanCursor(root, next)
 	}
 	sort.Slice(result.Orphans, func(i, j int) bool { return result.Orphans[i].Path < result.Orphans[j].Path })
 	return result, nil
+}
+
+// orphanWindowStart picks where the bounded orphan window starts for one
+// orphan root. A valid durable cursor takes precedence: repeated sweeps at
+// the same wall-clock minute keep advancing through the ring. A missing or
+// unparsable cursor falls back to the historical minute-bucket stride; it
+// never gates or infers any entry's eligibility, which stays a per-entry
+// evidence decision. Cursor IO runs under the run's governor file lock, so
+// read-advance is serialized per repository.
+func (g *Governor) orphanWindowStart(root string, entryCount int) int {
+	bucket := (g.Now().Unix() / int64(time.Minute/time.Second)) % int64(entryCount)
+	if bucket < 0 {
+		bucket += int64(entryCount)
+	}
+	fallback := int((bucket * int64(g.orphanCensusLimit())) % int64(entryCount))
+	raw, err := os.ReadFile(g.orphanCursorPath(root))
+	if err != nil {
+		return fallback
+	}
+	cursor, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || cursor < 0 {
+		return fallback
+	}
+	return cursor % entryCount
+}
+
+// storeOrphanCursor persists the next window start for one orphan root.
+// Best-effort by design: a failed write only drops the progress optimization
+// (the next run falls back to the time-bucket stride); it must never fail
+// the census or alter any entry's eligibility decision.
+func (g *Governor) storeOrphanCursor(root string, next int) {
+	path := g.orphanCursorPath(root)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(strconv.Itoa(next)), 0o600)
+}
+
+// orphanCursorPath maps a resolved orphan root to a fixed per-root cursor
+// file under the repository's canonical state, keyed by a SHA-256 digest of
+// the root path so arbitrary roots cannot escape the directory.
+func (g *Governor) orphanCursorPath(root string) string {
+	digest := sha256.Sum256([]byte(root))
+	return filepath.Join(g.Policy.RepositoryRoot, ".herd", "governor", "orphan-cursors", hex.EncodeToString(digest[:])+".txt")
 }
 
 // orphanCensusLimit bounds expensive recursive accounting and process proof.

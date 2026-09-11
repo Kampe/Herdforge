@@ -379,3 +379,112 @@ type stubLifecycleEvidence struct{}
 func (stubLifecycleEvidence) Read(context.Context, string, string, RegisteredWorktree) (LifecycleEvidence, error) {
 	return LifecycleEvidence{}, nil
 }
+
+// FAC-613 correction: repeated orphan sweeps at the SAME wall-clock minute
+// must still make real progress through the ring. The durable per-root
+// cursor (written best-effort under the run's lock) picks the window start;
+// a missing or invalid cursor falls back to the historical minute-bucket
+// stride and never infers eligibility by itself.
+func TestGovernorOrphanCursorAdvancesAcrossSameMinuteSweeps(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	g.Processes = batchOnlyProcessInspector{}
+	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	g.Policy.OrphanRoots = []string{root}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	for i := 0; i < 20; i++ {
+		orphan := filepath.Join(root, fmt.Sprintf("cursor-%02d", i))
+		if err := os.MkdirAll(orphan, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(orphan, "graph.db"), []byte("immutable"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	minute := int64(3000)
+	g.Now = func() time.Time { return time.Unix(minute*60, 0) }
+	seen := func(report GovernorReport, path string) bool {
+		for _, orphan := range report.Orphans {
+			if strings.HasSuffix(orphan.Path, path) {
+				return true
+			}
+		}
+		return false
+	}
+	first, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.OrphanCensusTruncated {
+		t.Fatalf("20 entries at limit 16 must truncate: %+v", first)
+	}
+	// Second sweep at the SAME fixed Now: the cursor must have advanced past
+	// the first window, so entries beyond it are finally examined.
+	second, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen(second, "cursor-16") {
+		return
+	}
+	t.Fatalf("fixed-Now cursor rotation must reach later entries on the second sweep (truncated=%t remaining=%d)", second.OrphanCensusTruncated, second.OrphanCensusRemaining)
+}
+
+// A corrupt cursor must be inert: the sweep falls back to the historical
+// minute-bucket stride (no eligibility inference from garbage state) and the
+// run stays clean. With 17 entries and limit 16 the fallback window start is
+// (minute%17 * 16) % 17 = 15, so the reported set proves the fallback rather
+// than a zero start.
+func TestGovernorOrphanInvalidCursorFallsBackAndNeverInfersEligibility(t *testing.T) {
+	g, _, _ := governorFor(t, "host", 900000)
+	g.Processes = batchOnlyProcessInspector{}
+	root := filepath.Join(g.Policy.RepositoryRoot, ".herd", "worktrees")
+	g.Policy.OrphanRoots = []string{root}
+	g.Policy.OrphanDerivedTargets = []string{"graph.db"}
+	g.Policy.OrphanCacheTTL, g.Policy.OrphanCacheBudgetBytes = time.Hour, 1<<20
+	for i := 0; i < 17; i++ {
+		orphan := filepath.Join(root, fmt.Sprintf("small-%02d", i))
+		if err := os.MkdirAll(orphan, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(orphan, "graph.db"), []byte("immutable"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	minute := int64(5000)
+	g.Now = func() time.Time { return time.Unix(minute*60, 0) }
+	// The census digests the RESOLVED orphan root (EvalSymlinks+Clean, like
+	// the production loop); write the corrupt cursor exactly there.
+	resolvedRoot, resolveErr := filepath.EvalSymlinks(root)
+	if resolveErr != nil {
+		t.Fatal(resolveErr)
+	}
+	resolvedCursorPath := g.orphanCursorPath(filepath.Clean(resolvedRoot))
+	if err := os.MkdirAll(filepath.Dir(resolvedCursorPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resolvedCursorPath, []byte("not-a-cursor"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := g.Run(context.Background(), RunOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Error != "" || len(report.Orphans) != 16 {
+		t.Fatalf("invalid cursor must fall back cleanly without eligibility inference: error=%q orphans=%d", report.Error, len(report.Orphans))
+	}
+	// Fallback signature: the minute-bucket window starts at entry 15, so
+	// small-14 is deferred and small-15 is reported.
+	if seenOrphan(report, "small-14") || !seenOrphan(report, "small-15") {
+		t.Fatalf("invalid cursor must fall back to the minute-bucket window (start 15), got %d orphans", len(report.Orphans))
+	}
+}
+
+func seenOrphan(report GovernorReport, suffix string) bool {
+	for _, orphan := range report.Orphans {
+		if strings.HasSuffix(orphan.Path, suffix) {
+			return true
+		}
+	}
+	return false
+}
