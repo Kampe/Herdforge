@@ -428,3 +428,58 @@ func TestNativeRetirementFenceRefusesTargetRecreationBeforeRemoval(t *testing.T)
 		t.Fatal("fence refusal destroyed the unowned replacement content")
 	}
 }
+
+// A same-raw-target replacement is the case the raw-link-text comparison
+// alone cannot see: the string identity matches, but a different inode was
+// installed between authorization and removal. The inode-level SameFile
+// check must still refuse, and the replacement link (not the original) must
+// survive.
+func TestNativeRetirementFenceRefusesSameTargetInodeReplacementBeforeRemoval(t *testing.T) {
+	f := newDanglingFixture(t)
+	sameTarget, err := os.Readlink(f.surface)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withFenceProbe(t, func() {
+		if err := os.Remove(f.surface); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Symlink(sameTarget, f.surface); err != nil {
+			t.Error(err)
+		}
+	})
+	err = f.op.RemoveWorktree(f.manifest)
+	if err == nil || !strings.Contains(err.Error(), "identity changed before removal") {
+		t.Fatalf("same-target inode replacement must refuse at the final fence, got %v", err)
+	}
+	f.requireSurfacePresent(t)
+	raw, readErr := os.Readlink(f.surface)
+	if readErr != nil || raw != sameTarget {
+		t.Fatalf("replacement link must survive with its own raw target: raw=%q err=%v", raw, readErr)
+	}
+}
+
+// An unexpected (non-ENOENT) resolution failure between authorization and
+// removal is neither proof of the authorized dangling premise nor of the
+// authorized resolving premise; it must refuse rather than compare
+// false==false and proceed. Injected hermetically through the dedicated
+// seam, since a real non-ENOENT EvalSymlinks failure (e.g. ELOOP, EACCES) is
+// not reliably reproducible across hosts.
+func TestNativeRetirementFenceRefusesUnexpectedResolutionErrorBeforeRemoval(t *testing.T) {
+	f := newDanglingFixture(t)
+	prev := reviewSurfaceFenceEvalSymlinks
+	t.Cleanup(func() { reviewSurfaceFenceEvalSymlinks = prev })
+	injected := errors.New("injected non-ENOENT resolution failure")
+	withFenceProbe(t, func() {
+		reviewSurfaceFenceEvalSymlinks = func(string) (string, error) { return "", injected }
+	})
+	err := f.op.RemoveWorktree(f.manifest)
+	if err == nil || !strings.Contains(err.Error(), "resolution unreadable before removal") {
+		t.Fatalf("unexpected resolution error must refuse at the final fence, got %v", err)
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("refusal must wrap the actual resolution error, got %v", err)
+	}
+	f.requireSurfacePresent(t)
+}

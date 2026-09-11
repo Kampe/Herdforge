@@ -473,64 +473,65 @@ func (n *NativeReviewRetirementOp) boundPath(rel string) (string, error) {
 // may be a symlink, and its resolved target must remain below the owned pool.
 // A dangling leaf resolves only through authorizeDanglingSurface: the exact
 // authenticated pool slot target must be proven absent and unregistered. The
-// returned authorized raw link target and resolution premise must be
-// re-verified at the mutation boundary; between authorization and removal
-// the link may have been replaced, its parent swapped, or its target
-// recreated.
-func (n *NativeReviewRetirementOp) boundSurfacePath(m ReviewRetirementManifest) (string, string, bool, error) {
+// returned authorized link identity (raw target, inode via FileInfo, and
+// resolution premise) must be re-verified at the mutation boundary; between
+// authorization and removal the link may have been replaced (including by a
+// different inode carrying the identical raw target), its parent swapped, or
+// its target recreated.
+func (n *NativeReviewRetirementOp) boundSurfacePath(m ReviewRetirementManifest) (string, string, os.FileInfo, bool, error) {
 	rel, poolRel := m.Surface, m.Pool
 	if filepath.IsAbs(rel) || filepath.Clean(rel) == "." || strings.HasPrefix(filepath.Clean(rel), ".."+string(filepath.Separator)) {
-		return "", "", false, errors.New("review surface is not repository-relative")
+		return "", "", nil, false, errors.New("review surface is not repository-relative")
 	}
 	root, err := filepath.Abs(n.Root)
 	if err != nil {
-		return "", "", false, err
+		return "", "", nil, false, err
 	}
 	p := filepath.Join(root, filepath.Clean(rel))
 	relPath, err := filepath.Rel(root, p)
 	if err != nil {
-		return "", "", false, err
+		return "", "", nil, false, err
 	}
 	parentRel := filepath.Dir(relPath)
 	if _, err := n.boundPath(parentRel); err != nil {
-		return "", "", false, err
+		return "", "", nil, false, err
 	}
 	info, err := os.Lstat(p)
 	if os.IsNotExist(err) {
-		return p, "", false, nil
+		return p, "", nil, false, nil
 	}
 	if err != nil {
-		return "", "", false, err
+		return "", "", nil, false, err
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		return "", "", false, errors.New("review surface is not an owned symlink")
+		return "", "", nil, false, errors.New("review surface is not an owned symlink")
 	}
 	raw, err := os.Readlink(p)
 	if err != nil {
-		return "", "", false, err
+		return "", "", nil, false, err
 	}
 	target, err := filepath.EvalSymlinks(p)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return "", "", false, err
+			return "", "", nil, false, err
 		}
 		// The surface dangles because its exact pool slot was already
 		// retired on disk. Removing that link requires the full
 		// dangling-surface ownership proof; every other dangling target
 		// stays refused.
 		if authErr := n.authorizeDanglingSurface(m, p); authErr != nil {
-			return "", "", false, authErr
+			return "", "", nil, false, authErr
 		}
-		return p, raw, true, nil
+		return p, raw, info, true, nil
 	}
 	poolRoot, err := filepath.EvalSymlinks(filepath.Join(root, filepath.Clean(poolRel)))
 	if err != nil {
-		return "", "", false, err
+		return "", "", nil, false, err
 	}
 	if target == poolRoot || !strings.HasPrefix(target, poolRoot+string(filepath.Separator)) {
-		return "", "", false, errors.New("review surface target escaped the owned pool")
+		return "", "", nil, false, errors.New("review surface target escaped the owned pool")
 	}
-	return p, raw, false, nil
+	return p, raw, info, false, nil
 }
 
 // reviewSurfaceFenceProbe, when non-nil, runs between surface authorization
@@ -538,6 +539,12 @@ func (n *NativeReviewRetirementOp) boundSurfacePath(m ReviewRetirementManifest) 
 // deterministically inject the replacement, parent-escape, and recreation
 // window the boundary fence closes. Production leaves it nil.
 var reviewSurfaceFenceProbe func()
+
+// reviewSurfaceFenceEvalSymlinks resolves the final-fence resolution premise.
+// A package-level seam so a test can deterministically inject an unexpected
+// (non-ENOENT) resolution error at that exact boundary; production always
+// resolves to the real filepath.EvalSymlinks.
+var reviewSurfaceFenceEvalSymlinks = filepath.EvalSymlinks
 
 // hasExactIdentityPhase reports whether the phase journal holds a record
 // carrying the manifest's complete identity in one of the given phases.
@@ -769,7 +776,7 @@ func (n *NativeReviewRetirementOp) ReleaseLease(ctx context.Context, m ReviewRet
 
 func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) error {
 	if m.Surface != "" {
-		p, authorizedRaw, authorizedDangling, err := n.boundSurfacePath(m)
+		p, authorizedRaw, authorizedInfo, authorizedDangling, err := n.boundSurfacePath(m)
 		if err != nil {
 			return err
 		}
@@ -785,18 +792,34 @@ func (n *NativeReviewRetirementOp) RemoveWorktree(m ReviewRetirementManifest) er
 		}
 		if err == nil {
 			// Final identity fence: between authorization and this removal
-			// the link may have been replaced, its parent swapped out of the
-			// repository, or its target recreated. Re-verify the parent
-			// bound, the exact raw link identity, and the resolution premise
-			// that was authorized; any drift refuses without mutation.
+			// the link may have been replaced (including by a different
+			// inode carrying the identical raw target), its parent swapped
+			// out of the repository, or its target recreated. Re-verify the
+			// parent bound, the exact link inode, the exact raw link
+			// identity, and the resolution premise that was authorized; any
+			// drift refuses without mutation.
 			if _, pErr := n.boundPath(filepath.Dir(m.Surface)); pErr != nil {
 				return pErr
+			}
+			if authorizedInfo != nil && !os.SameFile(authorizedInfo, info) {
+				// Same raw target, different inode: a deterministic
+				// replacement that the raw-target string comparison below
+				// alone cannot see.
+				return errors.New("review surface identity changed before removal")
 			}
 			rawNow, rawErr := os.Readlink(p)
 			if rawErr != nil || rawNow != authorizedRaw {
 				return errors.New("review surface identity changed before removal")
 			}
-			if _, evalErr := filepath.EvalSymlinks(p); authorizedDangling != os.IsNotExist(evalErr) {
+			_, evalErr := reviewSurfaceFenceEvalSymlinks(p)
+			if evalErr != nil && !os.IsNotExist(evalErr) {
+				// An unexpected resolution failure (not "target absent") is
+				// never proof either way of the authorized premise; refuse
+				// rather than let a non-ENOENT/non-ENOENT comparison read as
+				// unchanged.
+				return fmt.Errorf("review surface resolution unreadable before removal: %w", evalErr)
+			}
+			if authorizedDangling != os.IsNotExist(evalErr) {
 				return errors.New("review surface resolution changed before removal")
 			}
 			if err := os.Remove(p); err != nil {
