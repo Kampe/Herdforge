@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lock"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // Producer bounds are reused from the reclaim pass: a produced manifest can
@@ -146,7 +147,14 @@ func ProduceRetentionManifest(ctx context.Context, opts ProduceOptions) (Produce
 		return report, fmt.Errorf("bundle-manifest: owned root identity: %w", err)
 	}
 	if strings.TrimSpace(opts.LockDir) == "" {
-		opts.LockDir = filepath.Join(opts.RepoRoot, lock.DefaultRelDir)
+		// The shared-checkout lock serializes every worktree of the
+		// canonical repository, so the default must live in the canonical
+		// COMMON .git — never in a linked worktree's .git pointer file.
+		canonLock, err := worktree.ResolveCanonicalRoot(ctx, opts.RepoRoot, "")
+		if err != nil {
+			return report, fmt.Errorf("bundle-manifest: canonical repository identity for the shared lock: %w", err)
+		}
+		opts.LockDir = filepath.Join(canonLock, lock.DefaultRelDir)
 	}
 	lockDirAbs, err := filepath.EvalSymlinks(filepath.Dir(opts.LockDir))
 	if err != nil {

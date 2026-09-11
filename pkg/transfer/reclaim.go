@@ -149,7 +149,16 @@ func Reclaim(ctx context.Context, opts ReclaimOptions) (ReclaimReport, error) {
 		return report, err
 	}
 	if strings.TrimSpace(opts.LockDir) == "" {
-		opts.LockDir = filepath.Join(opts.RepoRoot, lock.DefaultRelDir)
+		// One canonical lock identity for the whole repository: the
+		// shared-checkout lock serializes every worktree of the canonical
+		// repository, so the default must resolve to the canonical COMMON
+		// .git — never a linked worktree's .git pointer file, which would
+		// split or break the lock for the same shared repository.
+		canonLock, err := worktree.ResolveCanonicalRoot(ctx, opts.RepoRoot, "")
+		if err != nil {
+			return report, fmt.Errorf("bundle reclaim: canonical repository identity for the shared lock: %w", err)
+		}
+		opts.LockDir = filepath.Join(canonLock, lock.DefaultRelDir)
 	}
 	lockDirAbs, err := filepath.EvalSymlinks(filepath.Dir(opts.LockDir))
 	if err != nil {
@@ -436,7 +445,17 @@ func resolveScope(ctx context.Context, opts ReclaimOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("bundle reclaim: canonical repository identity: %w", err)
 	}
-	dir, err := filepath.EvalSymlinks(opts.Root)
+	dir, err := filepath.Abs(opts.Root)
+	if err != nil {
+		return "", fmt.Errorf("bundle reclaim: bundle directory: %w", err)
+	}
+	// Containment and identity math is absolute-path only: EvalSymlinks
+	// preserves relativity, and a relative --root (legitimate from any
+	// cwd — a linked worktree's own .herd state is owned state) would make
+	// every later Rel/SameFile comparison meaningless or falsely refusing.
+	// Absolute form changes nothing about ownership: the leaf must still
+	// be a real directory, and symlinked components resolve below.
+	dir, err = filepath.EvalSymlinks(dir)
 	if err != nil {
 		return "", fmt.Errorf("bundle reclaim: bundle directory: %w", err)
 	}
