@@ -72,12 +72,18 @@ type windowSeamEvidence struct {
 	mu     sync.Mutex
 	read   []string
 	failFor map[string]bool
+	// onReadHook, when set, runs after a read is recorded: the cancellation
+	// fixture uses it to fire the sweep's context mid-window.
+	onReadHook func(branch string)
 }
 
 func (e *windowSeamEvidence) Read(ctx context.Context, repoRoot, hostID string, lane RegisteredWorktree) (LifecycleEvidence, error) {
 	e.mu.Lock()
 	e.read = append(e.read, lane.Branch)
 	e.mu.Unlock()
+	if e.onReadHook != nil {
+		e.onReadHook(lane.Branch)
+	}
 	if e.failFor[lane.Branch] {
 		return LifecycleEvidence{}, errors.New("seam lifecycle evidence failure")
 	}
@@ -112,6 +118,7 @@ type windowSeamEnumerator struct {
 	evidence   *windowSeamEvidence
 	cursor     int
 	advances   []int
+	onRead     func(branch string)
 }
 
 func newWindowSeamEnumerator(t *testing.T, root string, window int) *windowSeamEnumerator {
@@ -260,6 +267,85 @@ func TestRegisteredCensusWindowSelectedEvidenceFailureStaysUnknown(t *testing.T)
 	}
 	if got[1].State != LaneUnknown || got[1].PreserveReason != "canonical_lifecycle_evidence_unavailable" {
 		t.Fatalf("selected lane with failed evidence must stay unknown, got state=%v reason=%q", got[1].State, got[1].PreserveReason)
+	}
+}
+
+// A cancellation that lands mid-window must advance the cursor by the lanes
+// actually accounted, never by the window's full width: the unexamined
+// remainder stays conservatively unknown this sweep and is RE-PROCESSED by
+// the next sweep instead of being skipped.
+func TestRegisteredCensusWindowCancellationAdvancesByAccountedLanes(t *testing.T) {
+	root, lanes := windowSeamRepo(t, 5)
+	seam := newWindowSeamEnumerator(t, root, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seam.evidence.onReadHook = func(branch string) {
+		if branch == "lane-0" {
+			cancel()
+		}
+	}
+
+	got, err := seam.enumerator.evaluate(ctx, root, lanes, "main")
+	if err != nil {
+		t.Fatalf("a cancelled sweep must still answer with the partial census: %v", err)
+	}
+	// lane-0 completed its whole evidence pipeline before cancellation.
+	if got[0].State != LaneDone {
+		t.Fatalf("the lane accounted before cancellation must keep its definitive state, got %v (%q)", got[0].State, got[0].PreserveReason)
+	}
+	// lane-1 was selected but never examined: conservative unknown, and NOT
+	// the deferred reason (it is the next sweep's first lane, not skipped).
+	if got[1].State != LaneUnknown || got[1].PreserveReason != "census_budget_exhausted" {
+		t.Fatalf("unexamined remainder must stay census_budget_exhausted unknown, got state=%v reason=%q", got[1].State, got[1].PreserveReason)
+	}
+	for _, lane := range got[2:] {
+		if lane.State != LaneUnknown || lane.PreserveReason != "census_window_deferred" {
+			t.Fatalf("unselected lane %s must defer, got state=%v reason=%q", lane.Branch, lane.State, lane.PreserveReason)
+		}
+	}
+	if len(seam.advances) != 1 || seam.advances[0] != 1 {
+		t.Fatalf("cursor must advance by the one accounted lane only, got %v", seam.advances)
+	}
+
+	// The next sweep re-processes the unexamined remainder: lane-1 pays for
+	// its evidence this time and reaches its definitive state.
+	seam.evidence.read = nil
+	seam.evidence.onReadHook = nil
+	got, err = seam.enumerator.evaluate(context.Background(), root, lanes, "main")
+	if err != nil {
+		t.Fatalf("second sweep must answer: %v", err)
+	}
+	if len(seam.evidence.read) != 2 || seam.evidence.read[0] != "lane-1" || seam.evidence.read[1] != "lane-2" {
+		t.Fatalf("next sweep must account the unexamined remainder first, got %v", seam.evidence.read)
+	}
+	if got[1].State != LaneIdle {
+		t.Fatalf("the previously unexamined lane must reach a definitive state on reprocessing, got %v (%q)", got[1].State, got[1].PreserveReason)
+	}
+}
+
+// The default window (CensusWindow unset) is the defensible small bound: a
+// 20-lane ring pays for exactly 16 lanes per sweep and the rest defer.
+func TestRegisteredCensusWindowDefaultBoundsWorkPerSweep(t *testing.T) {
+	root, lanes := windowSeamRepo(t, 20)
+	seam := newWindowSeamEnumerator(t, root, 0)
+
+	got, err := seam.enumerator.evaluate(context.Background(), root, lanes, "main")
+	if err != nil {
+		t.Fatalf("default-window evaluate must answer: %v", err)
+	}
+	if len(seam.evidence.read) != 16 {
+		t.Fatalf("default window must bound expensive evidence to exactly 16 lanes, got %d: %v", len(seam.evidence.read), seam.evidence.read)
+	}
+	if len(seam.processes.probed) != 16 {
+		t.Fatalf("default window must bound the process batch to exactly 16 paths, got %d", len(seam.processes.probed))
+	}
+	for _, lane := range got[16:] {
+		if lane.State != LaneUnknown || lane.PreserveReason != "census_window_deferred" {
+			t.Fatalf("lanes beyond the default window must defer, lane %s got state=%v reason=%q", lane.Branch, lane.State, lane.PreserveReason)
+		}
+	}
+	if seam.advances[len(seam.advances)-1] != 16 {
+		t.Fatalf("default window must advance the cursor by 16, got %v", seam.advances)
 	}
 }
 
