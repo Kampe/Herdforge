@@ -462,7 +462,10 @@ func TestProduceManifestRefusesRootAndParentReplacement(t *testing.T) {
 	})
 
 	t.Run("owned root swap is refused", func(t *testing.T) {
-		out := filepath.Join(f.bundleDir, "retention-manifest.json")
+		// Out in a subdirectory isolates the root-identity revalidation:
+		// the output parent inside the swapped root does not itself prove
+		// or disprove the pinned root inode.
+		out := filepath.Join(sub, "retention-manifest-root.json")
 		producePublishHook = func(tempPath, finalPath string) {
 			// Swap the whole owned root between capture and publication.
 			away := f.bundleDir + ".swapped-away"
