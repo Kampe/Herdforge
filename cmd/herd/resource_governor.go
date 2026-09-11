@@ -91,6 +91,11 @@ func newResourceGovernor(cfg *config.Config, root string) (*resources.Governor, 
 		HostID:           host,
 		SharedPopulation: sharedPopulation,
 		ProbeStats:       probeStats,
+		// Recognize squash- and rebase-landed lanes by content. Without this
+		// the census judges landing by ancestry, which a replayed range never
+		// satisfies, so every such lane stays "unmerged" and keeps its
+		// regenerable artifacts forever.
+		Landing: governorLandingPredicate(resolved),
 		Evidence: resources.SQLiteLifecycleEvidence{
 			ClaimsPath:         deps.ResolveLaunchLeasePath(resolved),
 			LaunchClaimsPath:   deps.ResolveLaunchLeasePath(resolved),
