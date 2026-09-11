@@ -27,10 +27,14 @@ package mergeadmit
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
-	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"os/exec"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
 // Mode is how the forge published the candidate onto the base. It selects the
@@ -114,19 +118,23 @@ type Proof struct {
 // pipeline whose tail can mask a failed producer, and no predicate whose
 // result is captured into a variable and then printed unconditionally.
 func Prove(repoDir string, req ProofRequest) (*Proof, error) {
+	return proveContext(context.Background(), repoDir, req)
+}
+
+func proveContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof, error) {
 	mode, err := ParseMode(string(req.Mode))
 	if err != nil {
 		return nil, err
 	}
-	base, err := resolveCommit(repoDir, req.BaseSHA, "base")
+	base, err := resolveCommit(ctx, repoDir, req.BaseSHA, "base")
 	if err != nil {
 		return nil, err
 	}
-	candidate, err := resolveCommit(repoDir, req.CandidateSHA, "candidate")
+	candidate, err := resolveCommit(ctx, repoDir, req.CandidateSHA, "candidate")
 	if err != nil {
 		return nil, err
 	}
-	landed, err := resolveCommit(repoDir, req.LandedSHA, "landed")
+	landed, err := resolveCommit(ctx, repoDir, req.LandedSHA, "landed")
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +143,7 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 	// landed. This is the FAC-156 empty-branch shape: a branch holding only
 	// its worktree anchor merged a zero-line diff and every downstream check
 	// passed, because there was nothing there to be wrong.
-	candidateCommits, err := rangeCommits(repoDir, base, candidate)
+	candidateCommits, err := rangeCommits(ctx, repoDir, base, candidate)
 	if err != nil {
 		return nil, err
 	}
@@ -162,22 +170,22 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 		// The SHAs were rewritten. Ordered per-commit patch identity proves
 		// the same changes landed in the same order; tree identity proves the
 		// result is byte-for-byte the reviewed tree.
-		landedCommits, err := rangeCommits(repoDir, base, landed)
+		landedCommits, err := rangeCommits(ctx, repoDir, base, landed)
 		if err != nil {
 			return nil, err
 		}
-		want, err := patchIDs(repoDir, candidateCommits)
+		want, err := patchIDs(ctx, repoDir, candidateCommits)
 		if err != nil {
 			return nil, err
 		}
-		got, err := patchIDs(repoDir, landedCommits)
+		got, err := patchIDs(ctx, repoDir, landedCommits)
 		if err != nil {
 			return nil, err
 		}
 		if err := sameOrderedPatches(want, got); err != nil {
 			return nil, fmt.Errorf("rebase-mode proof failed: %w", err)
 		}
-		if err := sameTree(repoDir, candidate, landed); err != nil {
+		if err := sameTree(ctx, repoDir, candidate, landed); err != nil {
 			return nil, fmt.Errorf("rebase-mode proof failed: %w", err)
 		}
 		p.MergeSHA = landed
@@ -186,7 +194,7 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 	case ModeSquash:
 		// One commit replaces the range, so per-commit ids are gone. The
 		// combined range diff and the resulting tree are what survive.
-		landedCommits, err := rangeCommits(repoDir, base, landed)
+		landedCommits, err := rangeCommits(ctx, repoDir, base, landed)
 		if err != nil {
 			return nil, err
 		}
@@ -194,11 +202,11 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 			return nil, fmt.Errorf("squash-mode proof failed: base..landed holds %d commits, not the single squashed commit "+
 				"(the base was overtaken by unrelated work, so this range is not the squash)", len(landedCommits))
 		}
-		want, err := rangePatchID(repoDir, base, candidate)
+		want, err := rangePatchID(ctx, repoDir, base, candidate)
 		if err != nil {
 			return nil, err
 		}
-		got, err := rangePatchID(repoDir, base, landed)
+		got, err := rangePatchID(ctx, repoDir, base, landed)
 		if err != nil {
 			return nil, err
 		}
@@ -206,7 +214,7 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 			return nil, fmt.Errorf("squash-mode proof failed: candidate range carries patch %s, landed range carries %s",
 				short(want), short(got))
 		}
-		if err := sameTree(repoDir, candidate, landed); err != nil {
+		if err := sameTree(ctx, repoDir, candidate, landed); err != nil {
 			return nil, fmt.Errorf("squash-mode proof failed: %w", err)
 		}
 		p.MergeSHA = landed
@@ -216,7 +224,7 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 	// The receipt binds content to MergeSHA's own patch, so compute it here
 	// rather than leaving the caller to re-derive (and possibly re-derive it
 	// from a different commit than the one that was proved).
-	pid, err := commitPatchID(repoDir, p.MergeSHA)
+	pid, err := commitPatchID(ctx, repoDir, p.MergeSHA)
 	if err != nil {
 		return nil, fmt.Errorf("patch id for proved merge commit %s: %w", short(p.MergeSHA), err)
 	}
@@ -245,12 +253,12 @@ func sameOrderedPatches(want, got []string) error {
 // it is the one that catches a patch-identical range that nonetheless produced
 // a different result (a conflict resolved differently, a dropped commit
 // re-added, a stray file left behind).
-func sameTree(repoDir, a, b string) error {
-	ta, err := gitOut(repoDir, "rev-parse", "--verify", "-q", a+"^{tree}")
+func sameTree(ctx context.Context, repoDir, a, b string) error {
+	ta, err := gitOut(ctx, repoDir, "rev-parse", "--verify", "-q", a+"^{tree}")
 	if err != nil {
 		return fmt.Errorf("resolve tree of %s: %w", short(a), err)
 	}
-	tb, err := gitOut(repoDir, "rev-parse", "--verify", "-q", b+"^{tree}")
+	tb, err := gitOut(ctx, repoDir, "rev-parse", "--verify", "-q", b+"^{tree}")
 	if err != nil {
 		return fmt.Errorf("resolve tree of %s: %w", short(b), err)
 	}
@@ -264,8 +272,8 @@ func sameTree(repoDir, a, b string) error {
 // rangeCommits lists base..tip oldest-first. An error is an error; it is never
 // flattened into an empty range, because "no commits" and "could not tell" are
 // the same value to a length check and only one of them is safe.
-func rangeCommits(repoDir, base, tip string) ([]string, error) {
-	out, err := gitOut(repoDir, "rev-list", "--reverse", base+".."+tip)
+func rangeCommits(ctx context.Context, repoDir, base, tip string) ([]string, error) {
+	out, err := gitOut(ctx, repoDir, "rev-list", "--reverse", base+".."+tip)
 	if err != nil {
 		return nil, fmt.Errorf("rev-list %s..%s: %w", short(base), short(tip), err)
 	}
@@ -278,10 +286,10 @@ func rangeCommits(repoDir, base, tip string) ([]string, error) {
 	return commits, nil
 }
 
-func patchIDs(repoDir string, commits []string) ([]string, error) {
+func patchIDs(ctx context.Context, repoDir string, commits []string) ([]string, error) {
 	out := make([]string, 0, len(commits))
 	for _, c := range commits {
-		pid, err := commitPatchID(repoDir, c)
+		pid, err := commitPatchID(ctx, repoDir, c)
 		if err != nil {
 			return nil, fmt.Errorf("patch id for %s: %w", short(c), err)
 		}
@@ -293,33 +301,36 @@ func patchIDs(repoDir string, commits []string) ([]string, error) {
 // commitPatchID is the stable patch id of a single commit's diff. An empty
 // commit is an error rather than an empty id — an empty id would compare equal
 // to another empty id and let two contentless commits "prove" each other.
-func commitPatchID(repoDir, sha string) (string, error) {
-	diff, err := gitOutBytes(repoDir, "diff-tree", "-p", "--no-color", sha)
+func commitPatchID(ctx context.Context, repoDir, sha string) (string, error) {
+	diff, err := gitOutBytes(ctx, repoDir, "diff-tree", "-p", "--no-color", sha)
 	if err != nil {
 		return "", fmt.Errorf("git diff-tree: %w", err)
 	}
-	return stablePatchID(repoDir, diff)
+	return stablePatchID(ctx, repoDir, diff)
 }
 
 // rangePatchID is the stable patch id of the whole base..tip diff, which is
 // what a squash collapses to.
-func rangePatchID(repoDir, base, tip string) (string, error) {
-	diff, err := gitOutBytes(repoDir, "diff", "--no-color", base, tip)
+func rangePatchID(ctx context.Context, repoDir, base, tip string) (string, error) {
+	diff, err := gitOutBytes(ctx, repoDir, "diff", "--no-color", base, tip)
 	if err != nil {
 		return "", fmt.Errorf("git diff %s %s: %w", short(base), short(tip), err)
 	}
-	return stablePatchID(repoDir, diff)
+	return stablePatchID(ctx, repoDir, diff)
 }
 
-func stablePatchID(repoDir string, diff []byte) (string, error) {
+func stablePatchID(ctx context.Context, repoDir string, diff []byte) (string, error) {
 	if len(bytes.TrimSpace(diff)) == 0 {
 		return "", fmt.Errorf("no patch content (empty diff)")
 	}
-	cmd := exec.Command("git", "patch-id", "--stable")
+	cmd := procsignal.CommandContext(ctx, "git", "patch-id", "--stable")
 	cmd.Dir = repoDir
 	cmd.Stdin = bytes.NewReader(diff)
 	out, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("git patch-id: %w", err)
 	}
 	fields := strings.Fields(string(out))
@@ -331,18 +342,35 @@ func stablePatchID(repoDir string, diff []byte) (string, error) {
 
 // resolveCommit turns a caller-supplied revision into a full object id, or
 // fails. An unresolvable revision never degrades to the empty string.
-func resolveCommit(repoDir, rev, role string) (string, error) {
+func resolveCommit(ctx context.Context, repoDir, rev, role string) (string, error) {
 	if strings.TrimSpace(rev) == "" {
 		return "", fmt.Errorf("%s revision is required", role)
 	}
-	out, err := gitOut(repoDir, "rev-parse", "--verify", "-q", rev+"^{commit}")
+	out, err := gitOut(ctx, repoDir, "rev-parse", "--verify", "-q", rev+"^{commit}")
 	if err != nil {
+		if c := ctxFailure(ctx, err); c != nil {
+			return "", c
+		}
 		return "", fmt.Errorf("%s revision %q does not resolve to a commit in %s", role, rev, repoDir)
 	}
 	if out == "" {
 		return "", fmt.Errorf("%s revision %q resolved to nothing", role, rev)
 	}
 	return out, nil
+}
+
+// ctxFailure reports whether err is the caller's context giving up (a deadline
+// or cancellation that killed a child) rather than evidence about the
+// repository, and returns the bare context error so callers can distinguish
+// "the budget ran out" from a legitimate proof refusal.
+func ctxFailure(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return ctx.Err()
 }
 
 // -- git helpers: every one of these surfaces the process exit status --
@@ -353,22 +381,31 @@ func runGit(repoDir string, args ...string) error {
 	return cmd.Run()
 }
 
-func gitOut(repoDir string, args ...string) (string, error) {
-	out, err := gitOutBytes(repoDir, args...)
+// gitOutBytes executes git under ctx. A context deadline or cancellation kills
+// the child and its process group and is returned as the bare context error;
+// any other failure keeps the exit-status wrapping the package relies on.
+func gitOutBytes(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cmd := procsignal.CommandContext(ctx, "git", args...)
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return out, nil
+}
+
+func gitOut(ctx context.Context, repoDir string, args ...string) (string, error) {
+	out, err := gitOutBytes(ctx, repoDir, args...)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-func gitOutBytes(repoDir string, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = repoDir
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	return out, nil
 }
 
 func short(s string) string {

@@ -22,25 +22,28 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ProveEquivalentLanded(g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
+	return ProveEquivalentLandedContext(context.Background(), g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
 }
 
 // A squash has the aggregate reviewed patch, not any intermediate patch.
 // Require both its complete patch identity and the exact result of replaying
 // the reviewed delta onto its actual parent. Patch-ID whitespace normalization
 // alone cannot authorize different bytes. More than one match is ambiguous.
-func matchSquashRangeReplay(dir, base, candidate string, landed []string) (string, bool, error) {
-	if !harvest.IsAncestor(context.Background(), dir, base, candidate) {
+func matchSquashRangeReplay(ctx context.Context, dir, base, candidate string, landed []string) (string, bool, error) {
+	if !harvest.IsAncestor(ctx, dir, base, candidate) {
 		return "", false, fmt.Errorf("reviewed base ancestry is unproven")
 	}
-	want, err := rangePatchID(dir, base, candidate)
+	want, err := rangePatchID(ctx, dir, base, candidate)
 	if err != nil {
 		return "", false, err
 	}
 	var matches []string
 	for _, sha := range landed {
-		parents, err := gitOut(dir, "rev-list", "--parents", "-n", "1", sha)
+		parents, err := gitOut(ctx, dir, "rev-list", "--parents", "-n", "1", sha)
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			return "", false, err
 		}
 		fields := strings.Fields(parents)
@@ -48,22 +51,31 @@ func matchSquashRangeReplay(dir, base, candidate string, landed []string) (strin
 			continue
 		} // A squash endpoint is a single-parent commit.
 		parent := fields[1]
-		if !harvest.IsAncestor(context.Background(), dir, base, parent) {
+		if !harvest.IsAncestor(ctx, dir, base, parent) {
 			continue
 		}
-		got, err := rangePatchID(dir, parent, sha)
+		got, err := rangePatchID(ctx, dir, parent, sha)
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			return "", false, err
 		}
 		if got != want {
 			continue
 		}
-		replayed, err := replayReviewedTree(dir, base, parent, candidate)
+		replayed, err := replayReviewedTree(ctx, dir, base, parent, candidate)
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			continue
 		} // A conflicting replay proves no equivalence.
-		tree, err := gitOut(dir, "rev-parse", "--verify", sha+"^{tree}")
+		tree, err := gitOut(ctx, dir, "rev-parse", "--verify", sha+"^{tree}")
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			return "", false, err
 		}
 		if replayed == tree {
