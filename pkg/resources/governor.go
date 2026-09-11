@@ -194,6 +194,11 @@ type Governor struct {
 	Processes  ProcessInspector
 	OwnerID    func(os.FileInfo) (string, bool)
 	Now        func() time.Time
+	// SharedPopulation is the per-run host-wide process snapshot captured by
+	// the registered census stage and reused by the orphan census stage. It
+	// must alias the same *ProcessPopulation handed to the enumerator so a
+	// run never rescans the population between the two stages.
+	SharedPopulation *ProcessPopulation
 }
 
 type TargetDecision string
@@ -258,6 +263,21 @@ type GovernorReport struct {
 	ReclaimedBytes               uint64               `json:"reclaimed_bytes"`
 	OrphanCensusTruncated        bool                 `json:"orphan_census_truncated,omitempty"`
 	OrphanCensusRemaining        int                  `json:"orphan_census_remaining,omitempty"`
+	// Error is set on a nonzero-exit run so the structured partial report is
+	// actionable on its own: the refusal stays, the cause is retained.
+	Error  string        `json:"error,omitempty"`
+	Stages []CensusStage `json:"census_stages,omitempty"`
+}
+
+// CensusStage records the bounded timing and counts of one census phase so a
+// failed run exposes which stage consumed the budget instead of only where
+// expiry was observed.
+type CensusStage struct {
+	Name       string `json:"name"`
+	DurationMS int64  `json:"duration_ms"`
+	Scanned    int    `json:"scanned"`
+	Deferred   int    `json:"deferred"`
+	Cause      string `json:"cause,omitempty"`
 }
 
 type orphanCensusResult struct {
@@ -380,7 +400,13 @@ func (g *Governor) Run(ctx context.Context, options RunOptions) (report Governor
 		return report, fmt.Errorf("resource governor lock: %w", err)
 	}
 	defer func() { err = errors.Join(err, lock.Close()) }()
-	return g.runLocked(ctx, options)
+	report, err = g.runLocked(ctx, options)
+	if err != nil {
+		// A failed run still carries its structured partial report: the
+		// refusal and the causal stage evidence travel together (FAC-613).
+		report.Error = err.Error()
+	}
+	return report, err
 }
 
 func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorReport, error) {
@@ -433,35 +459,81 @@ func (g *Governor) runLocked(ctx context.Context, options RunOptions) (GovernorR
 	return report, nil
 }
 
+// now returns the injectable clock, defaulting to the real time.
+func (g *Governor) now() time.Time {
+	if g.Now != nil {
+		return g.Now()
+	}
+	return time.Now()
+}
+
+func (g *Governor) sinceMS(start time.Time) int64 {
+	elapsed := g.now().Sub(start)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return elapsed.Milliseconds()
+}
+
+func (g *Governor) recordStage(report *GovernorReport, stage CensusStage) {
+	report.Stages = append(report.Stages, stage)
+}
+
 func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
+	report := GovernorReport{}
+	start := g.now()
 	before, err := g.Capacity.StatFS(g.Policy.RepositoryRoot)
+	statfsStage := CensusStage{Name: "statfs", DurationMS: g.sinceMS(start)}
 	if err != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor statfs: %w", err)
+		statfsStage.Cause = err.Error()
+		report.Stages = append(report.Stages, statfsStage)
+		report.Error = fmt.Sprintf("resource governor statfs: %v", err)
+		return report, fmt.Errorf("resource governor statfs: %w", err)
 	}
 	if err := validCapacity(before); err != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor statfs: %w", err)
+		statfsStage.Cause = err.Error()
+		report.Stages = append(report.Stages, statfsStage)
+		report.Error = fmt.Sprintf("resource governor statfs: %v", err)
+		return report, fmt.Errorf("resource governor statfs: %w", err)
 	}
-	lanes, err := g.Worktrees.List(ctx, g.Policy.RepositoryRoot, g.Policy.BaseRef)
-	if err != nil {
-		return GovernorReport{}, fmt.Errorf("resource governor registered-worktree census: %w", err)
+	report.Stages = append(report.Stages, statfsStage)
+	report.CapacityBefore, report.CapacityAfter = before, before
+
+	listStart := g.now()
+	lanes, listErr := g.Worktrees.List(ctx, g.Policy.RepositoryRoot, g.Policy.BaseRef)
+	listStage := CensusStage{Name: "registered_census", DurationMS: g.sinceMS(listStart)}
+	if listErr != nil {
+		listStage.Cause = listErr.Error()
+		report.Stages = append(report.Stages, listStage)
+		report.Error = fmt.Sprintf("resource governor registered-worktree census: %v", listErr)
+		return report, fmt.Errorf("resource governor registered-worktree census: %w", listErr)
 	}
+	listStage.Scanned = len(lanes)
+	report.Stages = append(report.Stages, listStage)
 	seen := make(map[string]struct{}, len(lanes))
+	unknownLanes := 0
 	for i := range lanes {
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_realpath_unavailable"
+			unknownLanes++
 			continue
 		}
 		lanes[i].Path = filepath.Clean(resolved)
 		if _, exists := seen[lanes[i].Path]; exists {
-			return GovernorReport{}, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
+			listStage.Cause = fmt.Sprintf("duplicate registered worktree realpath %q", lanes[i].Path)
+			listStage.Deferred = unknownLanes
+			g.recordStage(&report, listStage)
+			report.Error = listStage.Cause
+			return report, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
 		}
 		seen[lanes[i].Path] = struct{}{}
 		usage, measureErr := g.Measure.Measure(lanes[i].Path, g.registeredMeasureLimit())
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_allocation_unavailable"
+			unknownLanes++
 			continue
 		}
 		lanes[i].AllocatedBytes = usage.Bytes
@@ -470,16 +542,35 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			lanes[i].PreserveReason = "worktree_allocation_truncated"
 		}
 	}
+	listStage.Deferred = unknownLanes
+	g.recordStage(&report, listStage)
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].Path < lanes[j].Path })
-	report := GovernorReport{
-		HostID: g.Policy.HostID, RepositoryID: g.Policy.RepositoryID, ObservedAt: g.Now().UTC(), PressureBytes: g.Policy.PressureBytes,
-		RecoveryBytes: g.Policy.RecoveryBytes, TaskReserveBytes: g.Policy.TaskReserveBytes,
-		CapacityBefore: before, CapacityAfter: before, Worktrees: lanes,
-	}
+	report.HostID = g.Policy.HostID
+	report.RepositoryID = g.Policy.RepositoryID
+	report.ObservedAt = g.Now().UTC()
+	report.PressureBytes = g.Policy.PressureBytes
+	report.RecoveryBytes = g.Policy.RecoveryBytes
+	report.TaskReserveBytes = g.Policy.TaskReserveBytes
+	report.Worktrees = lanes
 	for i := range report.Worktrees {
 		report.Worktrees[i].ReportPath = reportPath(g.Policy.RepositoryRoot, report.Worktrees[i].Path)
 	}
+	orphanStart := g.now()
 	orphanResult, orphanErr := g.censusOrphans(ctx, report.Worktrees, before)
+	orphanStage := CensusStage{
+		Name: "unregistered_orphan_census", DurationMS: g.sinceMS(orphanStart),
+		Scanned: len(orphanResult.Orphans), Deferred: orphanResult.Remaining,
+	}
+	if orphanErr != nil {
+		orphanStage.Cause = orphanErr.Error()
+		g.recordStage(&report, orphanStage)
+		report.OrphanCensusTruncated = orphanResult.Truncated
+		report.OrphanCensusRemaining = orphanResult.Remaining
+		report.Orphans = orphanResult.Orphans
+		report.Error = fmt.Sprintf("resource governor unregistered-orphan census: %v", orphanErr)
+		return report, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
+	}
+	g.recordStage(&report, orphanStage)
 	orphans := orphanResult.Orphans
 	report.OrphanCensusTruncated = orphanResult.Truncated
 	report.OrphanCensusRemaining = orphanResult.Remaining
@@ -495,8 +586,10 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			}
 		}
 	}
-	if orphanErr != nil {
-		return report, fmt.Errorf("resource governor unregistered-orphan census: %w", orphanErr)
+	targetStart := g.now()
+	if err := ctx.Err(); err != nil {
+		report.Error = fmt.Sprintf("registered target inspection cancelled before start: %v", err)
+		return report, err
 	}
 	for _, lane := range lanes {
 		for _, rel := range g.Policy.GeneratedDirectories {
@@ -506,6 +599,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			report.Targets = append(report.Targets, target)
 		}
 	}
+	g.recordStage(&report, CensusStage{Name: "registered_target_inspection", DurationMS: g.sinceMS(targetStart), Scanned: len(report.Targets)})
 	report.EstimatedTaskReserveBytes = report.TaskReserveBytes
 	for _, target := range report.Targets {
 		if target.BeforeBytes > report.EstimatedTaskReserveBytes {
@@ -577,7 +671,15 @@ func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWor
 			rootProcessUsage = make(map[string]ProcessUsage)
 			batchPaths := orphanBatchPaths(entries, root, known, limit, g.Policy.OrphanDerivedTargets)
 			if len(batchPaths) > 0 {
-				rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
+				// FAC-613: reuse the population snapshot the registered
+				// census stage captured on this run instead of rescanning
+				// the process population and owner table between stages.
+				// The per-path lsof and reference evidence stays fresh.
+				if popAware, shared := batch.(PopulationAwareBatchInspector); shared && g.SharedPopulation != nil && len(g.SharedPopulation.PIDs) > 0 {
+					rootProcessUsage, rootProcessErr = popAware.InUseManyPopulation(ctx, batchPaths, g.SharedPopulation)
+				} else {
+					rootProcessUsage, rootProcessErr = batch.InUseMany(ctx, batchPaths)
+				}
 				if rootProcessUsage == nil {
 					rootProcessUsage = make(map[string]ProcessUsage)
 				}
