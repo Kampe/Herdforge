@@ -692,15 +692,30 @@ func (e GitWorktreeEnumerator) pinBase(ctx context.Context, root, baseRef string
 // gave up -- and the call is inline, so no goroutine is left running into a
 // result nobody will read.
 func (e GitWorktreeEnumerator) landed(ctx context.Context, lane RegisteredWorktree, baseRef, basePin string) (bool, error) {
-	merged, err := gitMerged(ctx, lane.Path, baseRef)
-	if err != nil || merged || e.Landing == nil {
-		return merged, err
+	if e.Landing == nil {
+		// Unwired: live HEAD against the live ref, exactly as this census has
+		// always asked. Preserved deliberately; only the wired branch changes.
+		return gitMerged(ctx, lane.Path, baseRef)
+	}
+	// Wired: EVERY answer must be about the identity the census reported.
+	// Validate the pins before trusting either path -- the cheap ancestry
+	// answer included. Asking git about live HEAD and a live ref here would
+	// let a branch that moved after enumeration bless a lane whose pinned
+	// candidate never landed, and the report would name a probe the yes was
+	// not about.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
 	}
 	if strings.TrimSpace(basePin) == "" {
 		return false, fmt.Errorf("landing base %q could not be pinned", baseRef)
 	}
 	if strings.TrimSpace(lane.Head) == "" || strings.TrimSpace(lane.Branch) == "" {
 		return false, fmt.Errorf("landing probe for %q requires a pinned head and branch", lane.Path)
+	}
+	// Ancestry stays the cheap authoritative yes, now asked about the pinned
+	// pair rather than whatever the refs point at this instant.
+	if merged, err := GitCommitIsAncestor(ctx, lane.Path, lane.Head, basePin); err != nil || merged {
+		return merged, err
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return false, ctxErr

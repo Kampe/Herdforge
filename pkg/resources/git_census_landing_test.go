@@ -89,11 +89,12 @@ func TestLandingSeamSkipsPredicateWhenAncestryAlreadyProves(t *testing.T) {
 	head := strings.TrimSpace(landingSeamGit(t, dir, "rev-parse", "HEAD"))
 	lane := RegisteredWorktree{Path: dir, Branch: "ancestor-lane", Head: head}
 
+	basePin := strings.TrimSpace(landingSeamGit(t, root, "rev-parse", "main"))
 	called := 0
 	merged, err := landingSeamEnumerator(func(context.Context, LandingProbe) (bool, error) {
 		called++
 		return false, errors.New("predicate must not run for an ancestor")
-	}).landed(context.Background(), lane, "main", "deadbeef")
+	}).landed(context.Background(), lane, "main", basePin)
 	if err != nil || !merged {
 		t.Fatalf("ancestry must answer yes without the predicate: merged=%v err=%v", merged, err)
 	}
@@ -123,6 +124,81 @@ func TestLandingSeamPinsHeadAndBaseIntoTheProbe(t *testing.T) {
 	if seen.Branch != lane.Branch || seen.WorktreePath != lane.Path || seen.BaseRef != "main" {
 		t.Fatalf("probe identity is incomplete: %+v", seen)
 	}
+}
+
+// The ancestry fast path must answer about the PINNED candidate, not about
+// whatever the refs happen to point at when the question is asked.
+//
+// Both halves are the same defect: the census reports a probe (pinned head,
+// pinned base) while a cheap live-ref lookup supplies the yes. A lane whose
+// pinned candidate never landed would then have its artifacts reclaimed on the
+// strength of an identity nobody inspected.
+func TestLandingSeamFastPathCannotBlessAMovedIdentity(t *testing.T) {
+	t.Run("live HEAD moved after registration", func(t *testing.T) {
+		root := landingSeamRepo(t)
+		lane := landingSeamLane(t, root, "moved-head-lane")
+		basePin := strings.TrimSpace(landingSeamGit(t, root, "rev-parse", "main"))
+
+		// The registration still names the unique, unlanded commit; the live
+		// worktree HEAD is moved onto the base afterwards. Only the pinned
+		// candidate is a legitimate subject for a landing verdict.
+		landingSeamGit(t, lane.Path, "checkout", "-q", "--detach", basePin)
+		if live := strings.TrimSpace(landingSeamGit(t, lane.Path, "rev-parse", "HEAD")); live != basePin {
+			t.Fatalf("fixture did not move live HEAD: %s", live)
+		}
+		if lane.Head == basePin {
+			t.Fatal("fixture is vacuous: the pinned head equals the base")
+		}
+
+		consulted := 0
+		merged, err := landingSeamEnumerator(func(_ context.Context, probe LandingProbe) (bool, error) {
+			consulted++
+			if probe.HeadSHA != lane.Head || probe.BaseSHA != basePin {
+				t.Fatalf("probe lost the pinned identity: %+v", probe)
+			}
+			return false, nil
+		}).landed(context.Background(), lane, "main", basePin)
+		if err != nil {
+			t.Fatalf("a moved live HEAD is not an error: %v", err)
+		}
+		if merged {
+			t.Fatal("the fast path blessed a lane whose PINNED candidate never landed, using the moved live HEAD")
+		}
+		if consulted != 1 {
+			t.Fatalf("the content proof must decide the pinned candidate; it ran %d time(s)", consulted)
+		}
+	})
+
+	t.Run("live base moved after the pin", func(t *testing.T) {
+		root := landingSeamRepo(t)
+		lane := landingSeamLane(t, root, "moved-base-lane")
+		// Pin the base as the census saw it, THEN let the live ref advance to
+		// contain the lane's work.
+		basePin := strings.TrimSpace(landingSeamGit(t, root, "rev-parse", "main"))
+		landingSeamGit(t, root, "merge", "--no-ff", "-q", "-m", "trunk absorbs the lane", "moved-base-lane")
+		live := strings.TrimSpace(landingSeamGit(t, root, "rev-parse", "main"))
+		if live == basePin {
+			t.Fatal("fixture did not advance the live base")
+		}
+
+		consulted := 0
+		merged, err := landingSeamEnumerator(func(_ context.Context, probe LandingProbe) (bool, error) {
+			consulted++
+			if probe.BaseSHA != basePin {
+				t.Fatalf("probe lost the pinned base: %+v", probe)
+			}
+			return false, nil
+		}).landed(context.Background(), lane, "main", basePin)
+		if err != nil {
+			t.Fatalf("a moved live base is not an error: %v", err)
+		}
+		if merged {
+			t.Fatal("the fast path blessed the lane against a base newer than the pin the census reported")
+		}
+		if consulted != 1 {
+			t.Fatalf("the content proof must decide against the pinned base; it ran %d time(s)", consulted)
+		}
+	})
 }
 
 // An unpinnable base refuses rather than proving against a ref that may move.
