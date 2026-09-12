@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Bounded incremental reads for the control mailbox.
@@ -70,14 +71,21 @@ type Cursor struct {
 	Recipient string
 	Source    string
 	Control   int64
-	// ControlAnchor identifies the first record of the control store, and
-	// FeedbackAnchor the first record of the feedback store. Path binding
-	// alone cannot notice a store REPLACED by a different stream that happens
-	// to reach the same or higher numbers; the first record can. Appends
-	// never change it, and acknowledgement writes the handled sidecar rather
-	// than the mailbox, so an ack-only rewrite keeps a cursor usable. A
-	// repair that rewrites the first record does invalidate it, which is the
-	// conservative direction.
+	// ControlAnchor and FeedbackAnchor are PREFIX WATERMARKS: a rolling
+	// digest over the stable identity and content of every record up to and
+	// including the mark, folded in order.
+	//
+	// An anchor on the FIRST record alone did not detect the class this
+	// claims to. A replacement can keep record one and rewrite everything
+	// after it, and the feedback anchor hashed only the counter, so different
+	// content at the same id produced an identical value. A prefix watermark
+	// covers every record the cursor has already consumed, so any change to
+	// any of them is visible on resume.
+	//
+	// Mutable acknowledgement state is deliberately EXCLUDED -- Envelope.Read
+	// on the control side, read_at on the feedback side -- so a supported
+	// ack rewrite leaves a cursor resumable while a content replacement does
+	// not. The full scan this costs is already the documented price of a page.
 	ControlAnchor  string
 	Feedback       int64
 	FeedbackAnchor string
@@ -113,10 +121,33 @@ func canonicalStoragePath(path string) string {
 	return abs
 }
 
-// RecordAnchor identifies a store's first record.
-func RecordAnchor(id string, seq int64) string {
-	sum := sha256.Sum256([]byte(id + "\x00" + strconv.FormatInt(seq, 10)))
-	return hex.EncodeToString(sum[:8])
+// FoldWatermark folds one record's stable identity and content into a rolling
+// prefix digest. Fields are length-prefixed so no combination of values can
+// be re-partitioned into a different record and collide.
+func FoldWatermark(previous string, fields ...string) string {
+	h := sha256.New()
+	h.Write([]byte(previous))
+	for _, f := range fields {
+		h.Write([]byte(strconv.Itoa(len(f))))
+		h.Write([]byte{0})
+		h.Write([]byte(f))
+	}
+	return hex.EncodeToString(h.Sum(nil)[:12])
+}
+
+// ControlWatermarkFields is the stable projection of a control record.
+// Envelope.Read is omitted: it is acknowledgement state, and a supported ack
+// must not invalidate a cursor.
+func ControlWatermarkFields(env *Envelope) []string {
+	return []string{
+		env.ID,
+		strconv.FormatInt(env.Sequence, 10),
+		env.Sender,
+		env.Recipient,
+		env.Subject,
+		env.Body,
+		env.Timestamp.UTC().Format(time.RFC3339Nano),
+	}
 }
 
 // String renders the cursor. The recipient is hex-encoded because it is
@@ -290,12 +321,28 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	// A Cursor handed in directly must have its SOURCE checked too. Accepting
 	// whatever the caller put there let a struct literal bypass the binding
 	// the parsed path enforces.
-	if opts.Source != "" && cur.Source != "" && cur.Source != opts.Source {
+	// The binding is enforced, not merely compared when both sides happen to
+	// be populated. An empty opts.Source or an empty cur.Source used to skip
+	// the check entirely, so the documented invariant was bypassable by
+	// omission -- which is exactly how a struct literal got through.
+	if strings.TrimSpace(opts.Source) == "" {
+		return page, errors.New("mail: bounded read requires the caller's resolved storage fingerprint")
+	}
+	if cur.Control > 0 || cur.Feedback > 0 {
+		if cur.Source == "" {
+			return page, errors.New("mail: a cursor with a position must carry its storage fingerprint")
+		}
+		if cur.ControlAnchor == "" || cur.FeedbackAnchor == "" {
+			return page, errors.New("mail: a cursor with a position must carry both store watermarks")
+		}
+	}
+	if cur.Source != "" && cur.Source != opts.Source {
 		return page, errors.New("mail: cursor source does not identify the stores being read")
 	}
+	cur.Source = opts.Source
 	high := cur.Control
 
-	file, err := os.Open(m.MailFile)
+	file, err := OpenRegularStore(m.MailFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if cur.Control > 0 {
@@ -308,23 +355,23 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	}
 	defer file.Close()
 
-	// Stat the OPEN HANDLE, not the path. A stat before the open leaves a
-	// window in which the regular file it approved is replaced by something
-	// unbounded, so the check would have described a file this read never had.
-	info, err := file.Stat()
-	if err != nil {
-		return page, fmt.Errorf("mail: stat mailbox: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return page, errors.New("mail: control mailbox is not a regular file; a bounded read cannot bound a stream")
-	}
-
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), MaxBoundedRecordBytes)
 	var quarantineErrs []error
 	quarantineFailures := 0
 	var maxSeen int64
-	anchor := EmptyAnchor
+	// watermark folds every record AT OR BELOW the emitted mark; resumeSeen
+	// is the same fold taken at exactly the incoming cursor, which is what
+	// the cursor's own watermark must equal.
+	watermark := EmptyAnchor
+	// emittedWatermark is the fold taken at exactly the sequence this page
+	// last emitted. The running fold keeps going to EOF for validation, so it
+	// covers records ABOVE the mark and must never be the one published.
+	emittedWatermark := cur.ControlAnchor
+	if cur.Control == 0 {
+		emittedWatermark = EmptyAnchor
+	}
+	resumeChecked := cur.Control == 0
 	sawAny := false
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -355,14 +402,20 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 		if sawAny && env.Sequence <= maxSeen {
 			return page, fmt.Errorf("%w: sequence %d does not exceed %d", ErrStorageUnordered, env.Sequence, maxSeen)
 		}
-		if !sawAny {
-			anchor = RecordAnchor(env.ID, env.Sequence)
-			if cur.Control > 0 && cur.ControlAnchor != EmptyAnchor && cur.ControlAnchor != anchor {
-				return page, fmt.Errorf("%w: the control store's first record changed", ErrStorageRewound)
-			}
-		}
 		maxSeen = env.Sequence
 		sawAny = true
+		watermark = FoldWatermark(watermark, ControlWatermarkFields(&env)...)
+		if env.Sequence <= cur.Control {
+			if env.Sequence == cur.Control {
+				// Every record the cursor already consumed has now been
+				// folded. If the prefix differs, some record at or below the
+				// mark was rewritten or replaced and resuming would skip it.
+				if cur.ControlAnchor != watermark {
+					return page, fmt.Errorf("%w: control records at or below sequence %d changed since the cursor was issued", ErrStorageRewound, cur.Control)
+				}
+				resumeChecked = true
+			}
+		}
 
 		if env.Recipient != recipient && env.Recipient != "all" {
 			continue
@@ -390,6 +443,9 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 		page.Bytes += size
 		if env.Sequence > high {
 			high = env.Sequence
+			// Sequences ascend strictly, so the running fold at this instant
+			// covers exactly the records at or below this mark.
+			emittedWatermark = watermark
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -410,7 +466,11 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	if sawAny && cur.Control > maxSeen {
 		return page, fmt.Errorf("%w: cursor at %d, highest stored sequence is %d", ErrStorageRewound, cur.Control, maxSeen)
 	}
-	page.Next = cur.withControl(high, anchor).String()
+	// The cursor named a sequence the store no longer contains at all.
+	if !resumeChecked {
+		return page, fmt.Errorf("%w: control sequence %d is no longer present", ErrStorageRewound, cur.Control)
+	}
+	page.Next = cur.withControl(high, emittedWatermark).String()
 	return page, nil
 }
 

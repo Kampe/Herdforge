@@ -190,7 +190,7 @@ func TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage(t *testing.T) {
 // Cursor encoding must be injective: "a.b" and "a_b" are different lanes.
 func TestBoundedInboxCursorEncodingIsInjective(t *testing.T) {
 	source := mail.SourceFingerprint("/x", "/y")
-	dotted := mail.Cursor{Recipient: "a.b", Source: source, Control: 1, ControlAnchor: mail.RecordAnchor("x", 1)}.String()
+	dotted := mail.Cursor{Recipient: "a.b", Source: source, Control: 1, ControlAnchor: mail.FoldWatermark(mail.EmptyAnchor, "x", "1")}.String()
 	if _, err := mail.ParseCursor(dotted, "a_b", source); err == nil {
 		t.Fatal("a cursor for a.b was accepted for a_b; the encoding is not injective")
 	}
@@ -338,32 +338,105 @@ func TestBoundedInboxRefusesNonPositiveIdentities(t *testing.T) {
 	})
 }
 
-// Replacement by a DIFFERENT stream that reaches the same numbers must not
-// resume silently, while an ack-only rewrite must stay usable. Acknowledgement
-// writes the handled sidecar, not the mailbox, so the anchor survives it.
-func TestBoundedInboxDetectsReplacementButToleratesAck(t *testing.T) {
-	f := newBoundsFixture(t, []int64{1, 2}, nil)
+// A replacement that keeps the FIRST record and rewrites later ones at or
+// below the cursor must still be refused. An anchor on record one accepted
+// exactly this, which is why the watermark covers the whole consumed prefix.
+func TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord(t *testing.T) {
+	f := newBoundsFixture(t, []int64{1, 2, 3}, nil)
 	live := boundsRead(t, f, "", 10, 1<<20).NextCursor
 
-	// Ack-only: the mailbox is untouched, so the cursor still resumes.
-	if err := f.box.MarkHandled(boundsRecipient, "c-1"); err != nil {
-		t.Fatalf("ack: %v", err)
-	}
-	if err := boundsReadErr(f, live, 10, 1<<20); err != nil {
-		t.Fatalf("an ack-only rewrite must leave the cursor usable: %v", err)
-	}
-
-	// Replacement: a different stream reaching the same sequences.
+	// Same first record, same highest sequence, different record 2.
 	replaced := strings.Join([]string{
-		controlLine(1, boundsRecipient, "different stream"),
-		controlLine(2, boundsRecipient, "different stream"),
+		controlLine(1, boundsRecipient, "control body 1"),
+		controlLine(2, boundsRecipient, "REWRITTEN under the cursor"),
+		controlLine(3, boundsRecipient, "control body 3"),
 		"",
 	}, "\n")
-	if err := os.WriteFile(f.box.MailFile, []byte(strings.Replace(replaced, `"id":"c-`, `"id":"z-`, -1)), 0o600); err != nil {
+	if err := os.WriteFile(f.box.MailFile, []byte(replaced), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
-		t.Fatal("a replaced stream at the same sequences resumed silently")
+		t.Fatal("a rewritten record beneath the cursor resumed silently behind an unchanged first record")
+	}
+}
+
+// Feedback content replaced at the SAME id must be refused. Hashing the
+// counter alone made different content at one id indistinguishable.
+func TestBoundedInboxDetectsSameIDDifferentFeedbackContent(t *testing.T) {
+	f := newBoundsFixture(t, nil, []int64{1, 2})
+	path := filepath.Join(f.feedbackDir, boundsRecipient+".jsonl")
+	live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+
+	swapped := strings.Join([]string{
+		fmt.Sprintf(`{"id":1,"type":"message","from":"someone-else","to":%q,"timestamp":"2026-09-12T00:00:00Z","summary":"different","message":"different content at the same id"}`, boundsRecipient),
+		feedbackLine(2, boundsRecipient),
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(swapped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
+		t.Fatal("different feedback content at the same id resumed silently")
+	}
+}
+
+// The supported rewrites must stay resumable: appending to either store, and
+// the feedback producer stamping read_at, which is acknowledgement state the
+// watermark deliberately excludes.
+func TestBoundedInboxToleratesAppendAndAckRewrites(t *testing.T) {
+	f := newBoundsFixture(t, []int64{1, 2}, []int64{1})
+	path := filepath.Join(f.feedbackDir, boundsRecipient+".jsonl")
+	live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+
+	// Control ack writes the handled sidecar, not the mailbox.
+	if err := f.box.MarkHandled(boundsRecipient, "c-1"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	// Feedback ack rewrites the record in place with read_at stamped.
+	acked := fmt.Sprintf(`{"id":1,"type":"message","from":"coordinator","to":%q,"timestamp":"2026-09-12T00:00:00Z","summary":"feedback 1","message":"feedback body 1","read_at":"2026-09-12T01:00:00Z"}`, boundsRecipient) + "\n"
+	if err := os.WriteFile(path, []byte(acked), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Appends to both stores.
+	appendLineTo(t, f.box.MailFile, controlLine(3, boundsRecipient, "appended"))
+	appendLineTo(t, path, feedbackLine(2, boundsRecipient))
+
+	resp, err := readBoundedInbox(context.Background(), f.box, boundsRecipient, boundsRequest(live, 10, 1<<20))
+	if err != nil {
+		t.Fatalf("append and ack rewrites must leave the cursor resumable: %v", err)
+	}
+	got := boundsIDs(resp)
+	if len(got) != 2 {
+		t.Fatalf("resumed page = %v, want the two appended records", got)
+	}
+}
+
+// A cursor whose storage binding or watermark is MISSING must be refused for
+// a nonzero position. Comparing two possibly-empty strings meant omission
+// bypassed the binding entirely.
+func TestBoundedControlRejectsOmittedBindings(t *testing.T) {
+	f := newBoundsFixture(t, []int64{1, 2}, nil)
+	source := mail.SourceFingerprint(f.box.MailFile, f.feedbackDir)
+	opts := mail.BoundedOptions{Limit: 10, MaxBytes: 1 << 20, Source: source}
+
+	for name, cur := range map[string]mail.Cursor{
+		"no source":          {Recipient: boundsRecipient, Control: 1, ControlAnchor: "aa", FeedbackAnchor: "0"},
+		"no control anchor":  {Recipient: boundsRecipient, Source: source, Control: 1, FeedbackAnchor: "0"},
+		"no feedback anchor": {Recipient: boundsRecipient, Source: source, Control: 1, ControlAnchor: "aa"},
+		"wrong source":       {Recipient: boundsRecipient, Source: "deadbeefdeadbeef", Control: 1, ControlAnchor: "aa", FeedbackAnchor: "0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := f.box.ReadBoundedControl(context.Background(), boundsRecipient, cur, opts); err == nil {
+				t.Fatalf("cursor %+v was accepted despite an omitted or wrong binding", cur)
+			}
+		})
+	}
+	// The caller must supply its own fingerprint; an empty one is not a
+	// licence to skip the check.
+	fresh := mail.Cursor{Recipient: boundsRecipient}
+	if _, err := f.box.ReadBoundedControl(context.Background(), boundsRecipient, fresh,
+		mail.BoundedOptions{Limit: 10, MaxBytes: 1 << 20}); err == nil {
+		t.Fatal("a read without the caller's storage fingerprint was accepted")
 	}
 }
 

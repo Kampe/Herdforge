@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -171,7 +172,7 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 		return nil, highest, storeAnchor, false, err
 	}
 	path := filepath.Join(dir, recipient+".jsonl")
-	file, err := os.Open(path)
+	file, err := mail.OpenRegularStore(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// A lane never polled for feedback has no store, which is normal
@@ -187,20 +188,16 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 	}
 	defer file.Close()
 
-	// Stat the OPEN HANDLE: a stat on the path first leaves a window in which
-	// the regular file it approved is replaced by something unbounded.
-	info, err := file.Stat()
-	if err != nil {
-		return nil, highest, storeAnchor, false, fmt.Errorf("mail: stat feedback mailbox: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, highest, storeAnchor, false, errors.New("mail: feedback mailbox is not a regular file; a bounded read cannot bound a stream")
-	}
-
 	var out []*mail.Envelope
 	used := 0
 	truncated := false
 	var maxSeen int64
+	watermark := mail.EmptyAnchor
+	emitted := mail.EmptyAnchor
+	if after > 0 {
+		emitted = anchor
+	}
+	resumeChecked := after == 0
 	sawAny := false
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), mail.MaxBoundedRecordBytes)
@@ -235,14 +232,23 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 		if sawAny && fb.ID <= maxSeen {
 			return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback id %d does not exceed %d", mail.ErrStorageUnordered, fb.ID, maxSeen)
 		}
-		if !sawAny {
-			storeAnchor = mail.RecordAnchor(fmt.Sprintf("feedback-%d", fb.ID), fb.ID)
-			if after > 0 && anchor != mail.EmptyAnchor && anchor != storeAnchor {
-				return nil, highest, storeAnchor, false, fmt.Errorf("%w: the feedback store's first record changed", mail.ErrStorageRewound)
-			}
-		}
 		maxSeen = fb.ID
 		sawAny = true
+		// read_at is EXCLUDED: it is acknowledgement state that the producer
+		// rewrites, and a supported ack must leave a cursor resumable. An
+		// earlier version hashed the counter alone, so entirely different
+		// content at the same id produced an identical value and the
+		// replacement it claimed to detect went through.
+		watermark = mail.FoldWatermark(watermark,
+			strconv.FormatInt(fb.ID, 10), fb.From, fb.To, fb.When, fb.Summary, fb.Message)
+		if fb.ID <= after {
+			if fb.ID == after {
+				if anchor != watermark {
+					return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback records at or below id %d changed since the cursor was issued", mail.ErrStorageRewound, after)
+				}
+				resumeChecked = true
+			}
+		}
 		if fb.ID <= after {
 			continue
 		}
@@ -277,6 +283,7 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 		used += size
 		if fb.ID > highest {
 			highest = fb.ID
+			emitted = watermark
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -292,5 +299,8 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 	if sawAny && after > maxSeen {
 		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback cursor at %d, highest stored id is %d", mail.ErrStorageRewound, after, maxSeen)
 	}
-	return out, highest, storeAnchor, truncated, nil
+	if !resumeChecked {
+		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback id %d is no longer present", mail.ErrStorageRewound, after)
+	}
+	return out, highest, emitted, truncated, nil
 }
