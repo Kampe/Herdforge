@@ -83,7 +83,12 @@ func TestCoordinatorControlBindingSurvivesCompletedCoordinatorTab(t *testing.T) 
 // package inside the suite's timeout; every caller only ever runs it, so a
 // shared artifact is equivalent to a per-test one.
 var (
-	herdBinaryOnce    sync.Once
+	herdBinaryOnce sync.Once
+	// ownedBinaryDirs holds every temp directory this package created for a
+	// test binary, recorded at CREATION so a build that fails afterwards still
+	// leaves a tracked directory instead of an orphan.
+	ownedBinaryDirs   []string
+	ownedBinaryDirsMu sync.Mutex
 	herdFixtureOnce   sync.Once
 	herdFixtureBinary string
 	herdFixtureErr    error
@@ -158,12 +163,7 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
-	if dir := filepath.Dir(herdBinary); herdBinary != "" {
-		_ = os.RemoveAll(dir)
-	}
-	if dir := filepath.Dir(herdFixtureBinary); herdFixtureBinary != "" {
-		_ = os.RemoveAll(dir)
-	}
+	removeOwnedBinaryDirs()
 	restoreSlots()
 	os.Exit(code)
 }
@@ -404,7 +404,7 @@ func applyNestedSlotReentry(cmd *exec.Cmd) *exec.Cmd {
 func buildHerd(t *testing.T) string {
 	t.Helper()
 	herdBinaryOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "herd-cli-bin")
+		dir, err := newOwnedBinaryDir("herd-cli-bin")
 		if err != nil {
 			herdBinaryErr = err
 			return
@@ -896,7 +896,7 @@ func TestCloneHelpInUsage(t *testing.T) {
 func buildHerdFixtureAdmission(t *testing.T) string {
 	t.Helper()
 	herdFixtureOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "herd-cli-fixture-bin")
+		dir, err := newOwnedBinaryDir("herd-cli-fixture-bin")
 		if err != nil {
 			herdFixtureErr = err
 			return
@@ -918,4 +918,35 @@ func buildHerdFixtureAdmission(t *testing.T) string {
 		t.Fatalf("fixture build failed: %v, output: %s", herdFixtureErr, herdFixtureOut)
 	}
 	return herdFixtureBinary
+}
+
+// newOwnedBinaryDir creates a temp directory for a test binary and records it
+// for removal IMMEDIATELY, before anything that can fail runs.
+//
+// The previous shape derived the directory from the built binary's path, so a
+// failure in cliTestRevision or in the compile itself left the binary empty and
+// the directory unreferenced: TestMain then had nothing to remove and the
+// partial output survived the run.
+func newOwnedBinaryDir(prefix string) (string, error) {
+	dir, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		return "", err
+	}
+	ownedBinaryDirsMu.Lock()
+	ownedBinaryDirs = append(ownedBinaryDirs, dir)
+	ownedBinaryDirsMu.Unlock()
+	return dir, nil
+}
+
+// removeOwnedBinaryDirs removes only the directories newOwnedBinaryDir created,
+// on both the success and the failure path. It never touches a parent, a global
+// temp root, or any path a caller chose.
+func removeOwnedBinaryDirs() {
+	ownedBinaryDirsMu.Lock()
+	dirs := ownedBinaryDirs
+	ownedBinaryDirs = nil
+	ownedBinaryDirsMu.Unlock()
+	for _, dir := range dirs {
+		_ = os.RemoveAll(dir)
+	}
 }
