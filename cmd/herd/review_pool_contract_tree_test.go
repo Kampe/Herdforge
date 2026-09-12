@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -532,16 +533,16 @@ func TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation(t *testing.T) {
 // TestFixtureCensusPinsEveryPostAdmissionInput proves the herdfixture census
 // seam reaches the consumer, using a diagnostic the product ALREADY emits.
 //
-// The earlier attempt asserted a "mem_available=" line on the --no-launch
-// output. review --pool goes through acquirePoolCapacityLeaseOrRefuse, which
-// never prints that summary -- only the other, unused gate does -- so the
-// assertion demanded output the production path does not produce. Adding a
-// print for a test would be noise in normal product output. `herd capacity
-// --json` is an existing consumer of the SAME observation, so it can be asked
-// instead.
+// review --pool goes through acquirePoolCapacityLeaseOrRefuse, which never
+// prints a capacity summary -- only the other, unused gate does -- so asserting
+// on its output would demand something production does not produce, and adding
+// a print for a test would be noise. `herd capacity --json` is an existing
+// consumer of the SAME observation, so it is asked instead.
 //
 // Every field here is one the arms decideCapacity evaluates AFTER the shared
-// admission actually read from the runner before this seam existed.
+// admission read from the runner before this seam existed. Presence is checked
+// separately from value: two of the pinned values are zero, so a missing or
+// null field would otherwise satisfy the assertion by decoding to zero.
 func TestFixtureCensusPinsEveryPostAdmissionInput(t *testing.T) {
 	binary := buildHerdFixtureAdmission(t)
 
@@ -556,58 +557,99 @@ func TestFixtureCensusPinsEveryPostAdmissionInput(t *testing.T) {
 	// No stub PATH: fixtureStubDir is populated by poolContractFixture, which
 	// this test does not call, and CI runs with -shuffle so relying on another
 	// test to have set it would be a race. `herd capacity` needs no stubs.
-	// The exit status is deliberately ignored. `herd capacity` prints the
-	// record and THEN exits 3 when it refuses, and whether it refuses depends
-	// on herdr liveness and the reviewer census, neither of which this test is
-	// about. The subject is the OBSERVATION the record was built from.
-	out, _ := cmd.CombinedOutput()
+	out, runErr := cmd.CombinedOutput()
+	requireCapacityRunOutcome(t, runErr, out)
 
-	var got struct {
-		PressurePct  float64 `json:"memory_pressure_pct"`
-		SwapUsedMiB  int64   `json:"swap_used_mib"`
-		SwapTotalMiB int64   `json:"swap_total_mib"`
-		MemTotalMiB  int64   `json:"mem_total_mib"`
-		MemAvailMiB  int64   `json:"mem_available_mib"`
-	}
-	if err := json.NewDecoder(bytes.NewReader(capacityJSONPayload(t, out))).Decode(&got); err != nil {
-		t.Fatalf("decode capacity json: %v; output:\n%s", err, out)
-	}
-
-	for _, field := range []struct {
+	fields := decodeCapacityCensus(t, out)
+	for _, want := range []struct {
 		name string
-		got  int64
-		want int64
+		want float64
 	}{
-		{"memory_pressure_pct", int64(got.PressurePct), int64(fixturePressurePctWant)},
-		{"swap_used_mib", got.SwapUsedMiB, fixtureSwapUsedWant},
-		{"swap_total_mib", got.SwapTotalMiB, fixtureSwapTotalWant},
-		{"mem_total_mib", got.MemTotalMiB, fixtureMemTotalWant},
-		{"mem_available_mib", got.MemAvailMiB, fixtureMemAvailWant},
+		{"memory_pressure_pct", fixturePressurePctWant},
+		{"swap_used_mib", fixtureSwapUsedWant},
+		{"swap_total_mib", fixtureSwapTotalWant},
+		{"mem_total_mib", fixtureMemTotalWant},
+		{"mem_available_mib", fixtureMemAvailWant},
 	} {
-		if field.got != field.want {
-			t.Errorf("%s = %d, want the pinned %d; this arm still reads the runner's census", field.name, field.got, field.want)
+		// float64 throughout: truncating to int64 would let a pressure of 0.5
+		// satisfy a pinned 0.
+		if got := fields[want.name]; got != want.want {
+			t.Errorf("%s = %v, want the pinned %v; the fixture census did not reach this arm", want.name, got, want.want)
 		}
 	}
 }
 
-// The expected values are duplicated here deliberately: the constants they
-// mirror live in a herdfixture-tagged file this test binary does not compile,
-// and a test that imported them could not fail when the pin was removed.
-const (
-	fixturePressurePctWant = 0
-	fixtureSwapUsedWant    = 0
-	fixtureSwapTotalWant   = 8192
-	fixtureMemTotalWant    = 65536
-	fixtureMemAvailWant    = 49152
-)
+// requireCapacityRunOutcome permits only the two documented outcomes: success,
+// or the fail-closed refusal exit after a record has already been printed.
+// Whether this host refuses depends on herdr liveness and the reviewer census,
+// neither of which this test is about -- but a spawn failure, a signal or any
+// other status must not pass merely because a record happened to reach stdout.
+func requireCapacityRunOutcome(t *testing.T, runErr error, out []byte) {
+	t.Helper()
+	if runErr == nil {
+		return
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) {
+		t.Fatalf("herd capacity --json could not run: %v; output:\n%s", runErr, out)
+	}
+	// ExitCode reports -1 when the process was signalled.
+	if code := exitErr.ExitCode(); code != capacityRefusalExit {
+		t.Fatalf("herd capacity --json exited %d (want 0 or the documented refusal %d); output:\n%s",
+			code, capacityRefusalExit, out)
+	}
+}
 
-// capacityJSONPayload trims anything the CLI logged before the record. The
-// command emits one JSON object last; stub chatter can precede it.
-func capacityJSONPayload(t *testing.T, out []byte) []byte {
+// decodeCapacityCensus parses ONE complete record and returns the five census
+// numbers, failing if any is absent, null, or not a number, and failing if
+// anything follows the record.
+func decodeCapacityCensus(t *testing.T, out []byte) map[string]float64 {
 	t.Helper()
 	start := bytes.IndexByte(out, '{')
 	if start < 0 {
 		t.Fatalf("no json object in capacity output:\n%s", out)
 	}
-	return out[start:]
+	dec := json.NewDecoder(bytes.NewReader(out[start:]))
+	var raw map[string]json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		t.Fatalf("decode capacity json: %v; output:\n%s", err, out)
+	}
+	if dec.More() {
+		t.Fatalf("capacity output carried more than one record; output:\n%s", out)
+	}
+
+	values := make(map[string]float64, 5)
+	for _, name := range []string{
+		"memory_pressure_pct", "swap_used_mib", "swap_total_mib",
+		"mem_total_mib", "mem_available_mib",
+	} {
+		payload, present := raw[name]
+		if !present {
+			t.Fatalf("capacity record has no %q field, so the pinned value cannot be proven; output:\n%s", name, out)
+		}
+		if string(bytes.TrimSpace(payload)) == "null" {
+			t.Fatalf("capacity record reported %q as null; output:\n%s", name, out)
+		}
+		var value float64
+		if err := json.Unmarshal(payload, &value); err != nil {
+			t.Fatalf("capacity field %q is not a number (%s): %v", name, payload, err)
+		}
+		values[name] = value
+	}
+	return values
 }
+
+// The expected values are duplicated here deliberately: the constants they
+// mirror live in a herdfixture-tagged file this test binary does not compile,
+// and a test that imported them could not fail when the pin changed.
+const (
+	fixturePressurePctWant = 0.0
+	fixtureSwapUsedWant    = 0.0
+	fixtureSwapTotalWant   = 8192.0
+	fixtureMemTotalWant    = 65536.0
+	fixtureMemAvailWant    = 49152.0
+
+	// capacityRefusalExit is the fail-closed status `herd capacity` returns
+	// AFTER emitting its record.
+	capacityRefusalExit = 3
+)

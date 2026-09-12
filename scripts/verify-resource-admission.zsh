@@ -34,7 +34,11 @@
 # The pool-side controls do not depend on runner load: the herdfixture census
 # seam pins the PSI, swap and headroom inputs those arms read, so a mutant
 # cannot be refused by a busy runner instead of by the guard under test.
-# fixture-census-pin-removed is the control for that seam itself.
+# fixture-census-pin-wrong-value is the control for that seam, and its claim is
+# narrow: it proves the census test REJECTS A WRONG PIN for one field
+# (mem_available), with a deterministic wrong constant rather than the runner's
+# own value. It does NOT prove that removing any of the other four pins is
+# caught; those are asserted by the same test but are not separately mutated.
 #
 # LIMIT worth knowing: that one control mutates a herdfixture-TAGGED file, which
 # `go test -c` does not compile without the tag. Its compile step therefore
@@ -361,7 +365,7 @@ mutations=(
 "capacity-ignores-unknown-host${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/not-a-known-host${sep}an unsafe host must refuse the launch"
 "capacity-ignores-memory-pressure${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/memory-pressure${sep}an unsafe host must refuse the launch"
 "capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: paired, so the nil case cannot be dereferenced${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted"
-"fixture-census-pin-removed${sep}cmd/herd/capacity_shared_admission_fixture.go${sep}	o.MemAvailMiB = fixtureMemAvailMiB${sep}	_ = fixtureMemAvailMiB // MUTANT: headroom pin removed, the arm reads the runner again${sep}${sep}${sep}${herd_pkg}${sep}TestFixtureCensusPinsEveryPostAdmissionInput${sep}this arm still reads the runner's census"
+"fixture-census-pin-wrong-value${sep}cmd/herd/capacity_shared_admission_fixture.go${sep}	o.MemAvailMiB = fixtureMemAvailMiB${sep}	o.MemAvailMiB = 1234 // MUTANT: a DETERMINISTIC wrong pin, never the runner value${sep}${sep}${sep}${herd_pkg}${sep}TestFixtureCensusPinsEveryPostAdmissionInput${sep}the fixture census did not reach this arm"
 )
 
 note "pin $pin"
