@@ -1220,12 +1220,76 @@ func fixedGitArchiveArgs(root, candidateSHA string) []string {
 }
 
 const (
-	maxSourceManifestFileBytes          = 16 << 20
-	maxSourceManifestTotalBytes         = 16 << 20
+	maxSourceManifestFileBytes = 16 << 20
+	// maxSourceManifestTotalBytes bounds the WHOLE source manifest, and it is
+	// the only bound this repository's own tree was ever close to.
+	//
+	// It was 16 MiB, and the tracked tree reached 16,749,519 bytes -- 27,697
+	// bytes of headroom, 0.17%. CI validates the pull request's MERGE ref, not
+	// its head, so a merge tree at 16,809,993 bytes failed the total check
+	// while both parents passed it individually. At that margin the next
+	// merge of any size breaks the hermetic profile for whoever happens to
+	// author it, which is a property of the budget, not of their change.
+	//
+	// 64 MiB restores ~47 MiB of real headroom against the measured merge
+	// tree -- on the order of hundreds of merges at the growth rate those
+	// trees show -- while staying a finite, audited ceiling. Peak cost is
+	// bounded by the derived transport ceiling plus the record slice, a few
+	// hundred MiB at the member cap, so the validator still refuses long
+	// before it could pressure a build host.
+	//
+	// The PER-FILE bound is deliberately NOT raised with it: the largest blob
+	// in this tree is under half a megabyte, so 16 MiB already leaves a single
+	// file more than an order of magnitude of room, and keeping it where it is
+	// preserves a meaningful single-member ceiling underneath the total.
+	maxSourceManifestTotalBytes         = 64 << 20
 	maxHermeticSourceTransportMembers   = 16384
 	maxHermeticSourceTransportPathBytes = 4096
 	maxHermeticSourceTransportBytes     = maxSourceManifestTotalBytes + int64(maxHermeticSourceTransportMembers+1)*(1024+2*maxHermeticSourceTransportPathBytes)
 )
+
+// sourceManifestBudget is the ONE admission policy for manifest members,
+// shared by the archive producer and the filesystem readback so the two can
+// never drift apart and disagree about what a legal source tree is.
+//
+// It is a value rather than a package-level knob on purpose: production reads
+// the constants above, tests construct a tiny budget and drive the real
+// admission path with a few bytes instead of allocating megabytes to reach a
+// ceiling. There is no setter, no environment override, and no way for a
+// caller to widen a budget at run time.
+type sourceManifestBudget struct {
+	fileBytes  int64
+	totalBytes int64
+}
+
+func defaultSourceManifestBudget() sourceManifestBudget {
+	return sourceManifestBudget{fileBytes: maxSourceManifestFileBytes, totalBytes: maxSourceManifestTotalBytes}
+}
+
+// admit reports whether one member of the given size fits, both on its own and
+// against the running total. surface names the policy site ("candidate
+// archive" or "copied source") and kind names the member class, so a refusal
+// says WHICH budget stopped WHICH member at WHAT size against WHAT limit.
+//
+// name is the manifest path: archive-relative and repository-relative by
+// construction, never a host path, so the diagnostic stays safe to publish in
+// CI output.
+func (b sourceManifestBudget) admit(surface, kind, name string, size, total int64) error {
+	if size < 0 {
+		return fmt.Errorf("%s %s %q declares a negative size %d", surface, kind, name, size)
+	}
+	if size > b.fileBytes {
+		return fmt.Errorf("%s %s %q is %d bytes, over the %d-byte per-file source manifest budget",
+			surface, kind, name, size, b.fileBytes)
+	}
+	// Checked before the addition so a hostile or corrupt size can never wrap
+	// the accumulator into looking small.
+	if total > b.totalBytes-size {
+		return fmt.Errorf("%s %s %q of %d bytes would bring the manifest to %d bytes, over the %d-byte total source manifest budget",
+			surface, kind, name, size, total+size, b.totalBytes)
+	}
+	return nil
+}
 
 type sourceManifestRecord struct {
 	name   string
@@ -1236,6 +1300,13 @@ type sourceManifestRecord struct {
 }
 
 func sourceManifestDigestFromArchive(archiveBytes []byte) (string, error) {
+	return sourceManifestDigestFromArchiveWithBudget(archiveBytes, defaultSourceManifestBudget())
+}
+
+// sourceManifestDigestFromArchiveWithBudget is the real implementation. The
+// budget is a parameter so a test can exercise the genuine admission path at a
+// few bytes instead of building a multi-megabyte archive to reach a ceiling.
+func sourceManifestDigestFromArchiveWithBudget(archiveBytes []byte, budget sourceManifestBudget) (string, error) {
 	reader := tar.NewReader(bytes.NewReader(archiveBytes))
 	records := make([]sourceManifestRecord, 0)
 	seen := make(map[string]struct{})
@@ -1282,8 +1353,8 @@ func sourceManifestDigestFromArchive(archiveBytes []byte) (string, error) {
 		case tar.TypeDir:
 			continue
 		case tar.TypeReg, tar.TypeRegA:
-			if header.Size < 0 || header.Size > maxSourceManifestFileBytes || total+header.Size > maxSourceManifestTotalBytes {
-				return "", errors.New("candidate archive exceeds source manifest bounds")
+			if err := budget.admit("candidate archive", "file", name, header.Size, total); err != nil {
+				return "", err
 			}
 			hash := sha256.New()
 			count, copyErr := io.CopyN(hash, reader, header.Size)
@@ -1297,8 +1368,8 @@ func sourceManifestDigestFromArchive(archiveBytes []byte) (string, error) {
 				return "", err
 			}
 			target := []byte(header.Linkname)
-			if len(target) > maxSourceManifestFileBytes || total+int64(len(target)) > maxSourceManifestTotalBytes {
-				return "", errors.New("candidate archive symlink exceeds source manifest bounds")
+			if err := budget.admit("candidate archive", "symlink target", name, int64(len(target)), total); err != nil {
+				return "", err
 			}
 			sum := sha256.Sum256(target)
 			total += int64(len(target))
@@ -1365,6 +1436,14 @@ func collectFilesystemReadbackMembers(root string) ([]filesystemManifestMember, 
 }
 
 func sourceManifestDigestFromFilesystemMembers(root string, members []filesystemManifestMember) (string, error) {
+	return sourceManifestDigestFromFilesystemMembersWithBudget(root, members, defaultSourceManifestBudget())
+}
+
+// sourceManifestDigestFromFilesystemMembersWithBudget is the readback twin of
+// sourceManifestDigestFromArchiveWithBudget. Both take the SAME budget type and
+// call the SAME admit method, which is what keeps producer and readback from
+// disagreeing about which source trees are legal.
+func sourceManifestDigestFromFilesystemMembersWithBudget(root string, members []filesystemManifestMember, budget sourceManifestBudget) (string, error) {
 	records := make([]sourceManifestRecord, 0)
 	seen := make(map[string]struct{})
 	var total int64
@@ -1384,15 +1463,15 @@ func sourceManifestDigestFromFilesystemMembers(root string, members []filesystem
 		}
 		switch {
 		case info.Mode().IsRegular():
-			if info.Size() < 0 || info.Size() > maxSourceManifestFileBytes || total+info.Size() > maxSourceManifestTotalBytes {
-				return "", errors.New("copied source exceeds source manifest bounds")
+			if err := budget.admit("copied source", "file", clean, info.Size(), total); err != nil {
+				return "", err
 			}
 			file, err := os.Open(filepath.Join(root, filepath.FromSlash(clean)))
 			if err != nil {
 				return "", err
 			}
 			hash := sha256.New()
-			count, copyErr := io.Copy(hash, io.LimitReader(file, maxSourceManifestFileBytes+1))
+			count, copyErr := io.Copy(hash, io.LimitReader(file, budget.fileBytes+1))
 			closeErr := file.Close()
 			if copyErr != nil || closeErr != nil || count != info.Size() {
 				return "", errors.New("copied source regular file is truncated or changed")
@@ -1403,8 +1482,8 @@ func sourceManifestDigestFromFilesystemMembers(root string, members []filesystem
 			if err := validateSymlinkTarget(clean, member.target); err != nil {
 				return "", err
 			}
-			if len(member.target) > maxSourceManifestFileBytes || total+int64(len(member.target)) > maxSourceManifestTotalBytes {
-				return "", errors.New("copied source symlink exceeds source manifest bounds")
+			if err := budget.admit("copied source", "symlink target", clean, int64(len(member.target)), total); err != nil {
+				return "", err
 			}
 			sum := sha256.Sum256([]byte(member.target))
 			total += int64(len(member.target))
