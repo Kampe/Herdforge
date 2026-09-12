@@ -999,3 +999,105 @@ func TestNextSequenceValueIsChecked(t *testing.T) {
 		t.Fatalf("negative counter was accepted: %v", err)
 	}
 }
+
+// A map decode keeps only the last value for a repeated key, so a row carrying
+// two different bodies would be "normalized" into one with the other silently
+// discarded. Such a row is ambiguous and must be refused, not repaired.
+func TestRepairRefusesRowsWithDuplicateTopLevelKeys(t *testing.T) {
+	const targetID = "dup-row-1"
+	base := `"sender": "agent", "recipient": "orchestrator", "subject": "s", "read": false, ` +
+		`"timestamp": "2026-09-11T10:47:09.000000-0500"`
+	for _, tc := range []struct {
+		name string
+		row  string
+	}{
+		{
+			"duplicate body",
+			`{"id": "` + targetID + `", ` + base + `, "body": "first", "body": "second"}`,
+		},
+		{
+			"duplicate id",
+			`{"id": "` + targetID + `", "id": "` + targetID + `-other", ` + base + `, "body": "b"}`,
+		},
+		{
+			// "body" decodes to "body": an escaped spelling must collide
+			// with the plain one, or the check is bypassed by rewriting a key.
+			"escaped duplicate key",
+			`{"id": "` + targetID + `", ` + base + `, "body": "first", "body": "second"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mb, path := mailboxWith(t, tc.row)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, act := range []bool{false, true} {
+				req := RepairRequest{ID: targetID}
+				if act {
+					req.Act, req.Actor, req.Fingerprint = true, "op", sha256Hex(tc.row)
+				}
+				_, err := mb.RepairMalformedRow(context.Background(), req)
+				if !errors.Is(err, ErrRepairDuplicateKeys) {
+					t.Fatalf("act=%v: a duplicate-key row was not refused: %v", act, err)
+				}
+			}
+			after, _ := os.ReadFile(path)
+			if string(after) != string(before) {
+				t.Fatal("a refused duplicate-key row was still mutated")
+			}
+			if _, statErr := os.Stat(path + ".repair.jsonl"); !os.IsNotExist(statErr) {
+				t.Fatal("a refused duplicate-key row produced an audit record")
+			}
+		})
+	}
+}
+
+// Positive control: the same fixture shape with single keys repairs normally,
+// so the refusals above are about duplication and not about the fixture.
+func TestRepairAcceptsTheSameRowWithSingleKeys(t *testing.T) {
+	const targetID = "dup-row-1"
+	row := `{"id": "` + targetID + `", "sender": "agent", "recipient": "orchestrator", "subject": "s", ` +
+		`"read": false, "timestamp": "2026-09-11T10:47:09.000000-0500", "body": "first"}`
+	mb, _ := mailboxWith(t, row)
+	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: targetID, Fingerprint: sha256Hex(row), Act: true, Actor: "op",
+	})
+	if err != nil || plan == nil || !plan.Applied {
+		t.Fatalf("single-key row did not repair: plan=%+v err=%v", plan, err)
+	}
+}
+
+// A duplicate-key row must not be addressable by id either, or the selection
+// scan would pick whichever value the map happened to keep.
+func TestDuplicateKeyRowIsNotAddressableByID(t *testing.T) {
+	row := `{"id": "a", "id": "b", "body": "x"}`
+	if got := rawObjectID(row); got != "" {
+		t.Fatalf("a row with two ids resolved to %q instead of refusing", got)
+	}
+	if got := rawObjectID(`{"id": "only", "body": "x"}`); got != "only" {
+		t.Fatalf("a single-id row failed to resolve: %q", got)
+	}
+}
+
+func TestJSONObjectKeysDetectsEscapedDuplicates(t *testing.T) {
+	keys, ok := jsonObjectKeys([]byte(`{"body": 1, "body": 2}`))
+	if !ok {
+		t.Fatal("a well-formed object was rejected")
+	}
+	if dup, found := duplicateKey(keys); !found || dup != "body" {
+		t.Fatalf("escaped duplicate not detected: keys=%v dup=%q found=%v", keys, dup, found)
+	}
+	if _, ok := jsonObjectKeys([]byte(`["not","an","object"]`)); ok {
+		t.Fatal("an array was accepted as an object")
+	}
+	// Nested duplicates are the message's own content, not a top-level
+	// ambiguity this operation has to resolve.
+	nested, ok := jsonObjectKeys([]byte(`{"id":"x","body":{"k":1,"k":2}}`))
+	if !ok {
+		t.Fatal("an object with a nested value was rejected")
+	}
+	if _, found := duplicateKey(nested); found {
+		t.Fatal("a nested duplicate was treated as a top-level one")
+	}
+}

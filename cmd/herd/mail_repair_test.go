@@ -157,6 +157,11 @@ func TestMailRepairCLIProviderRefusalExitsOne(t *testing.T) {
 	}
 }
 
+// routingArgsEnv carries the child's argv as JSON. Word-splitting an env string
+// would turn a mailbox path containing spaces into several flags, making this
+// test depend on how the host spells its temp directory.
+const routingArgsEnv = "HERD_MAIL_REPAIR_ROUTING_ARGV"
+
 // TestMailRepairRoutingHelper is the child half of the routing test. It runs
 // the real runMail dispatch, which may call os.Exit, so it must be a separate
 // process or a usage exit would abort the whole suite.
@@ -164,7 +169,11 @@ func TestMailRepairRoutingHelper(t *testing.T) {
 	if os.Getenv("HERD_MAIL_REPAIR_ROUTING_HELPER") != "1" {
 		t.Skip("parent role: spawned by TestRunMailRoutesRepairSubcommand")
 	}
-	os.Args = append([]string{"herd", "mail", "repair"}, strings.Fields(os.Getenv("HERD_MAIL_REPAIR_ARGS"))...)
+	var argv []string
+	if err := json.Unmarshal([]byte(os.Getenv(routingArgsEnv)), &argv); err != nil {
+		t.Fatalf("child could not decode its argv: %v", err)
+	}
+	os.Args = append([]string{"herd", "mail", "repair"}, argv...)
 	runMail()
 }
 
@@ -175,20 +184,37 @@ func TestRunMailRoutesRepairSubcommand(t *testing.T) {
 	if os.Getenv("HERD_MAIL_REPAIR_ROUTING_HELPER") == "1" {
 		t.Skip("child role")
 	}
-	path := cliRepairMailbox(t)
+	// A directory with spaces, so argv handling is exercised rather than the
+	// host's temp-path spelling.
+	spaced := filepath.Join(t.TempDir(), "a mail dir")
+	if err := os.MkdirAll(spaced, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(spaced, "control mail.jsonl")
+	if err := os.WriteFile(path, []byte(cliLegacyRow+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(path, " ") {
+		t.Fatal("fixture precondition: the mailbox path must contain a space")
+	}
+
 	for _, tc := range []struct {
 		name     string
-		args     string
+		argv     []string
 		wantCode int
 	}{
-		{"report-only routes and succeeds", "--id " + cliRepairID + " --mail " + path, 0},
-		{"usage error routes and exits 2", "--mail " + path, 2},
+		{"report-only routes and succeeds", []string{"--id", cliRepairID, "--mail", path}, 0},
+		{"usage error routes and exits 2", []string{"--mail", path}, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := json.Marshal(tc.argv)
+			if err != nil {
+				t.Fatal(err)
+			}
 			cmd := exec.Command(os.Args[0], "-test.run", "^TestMailRepairRoutingHelper$")
 			cmd.Env = append(os.Environ(),
 				"HERD_MAIL_REPAIR_ROUTING_HELPER=1",
-				"HERD_MAIL_REPAIR_ARGS="+tc.args,
+				routingArgsEnv+"="+string(encoded),
 			)
 			out, err := cmd.CombinedOutput()
 			code := 0

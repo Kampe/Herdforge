@@ -94,6 +94,10 @@ var (
 	// is reported as a failure rather than a success, because an operator who
 	// is told "applied" must be able to find the record that says so.
 	ErrRepairCompletionUnrecorded = errors.New("mail repair: row was repaired and verified but the completion record could not be written")
+	// ErrRepairDuplicateKeys fires when a row repeats a top-level key. Decoding
+	// keeps only the last value, so normalizing such a row would silently
+	// discard an original the operator never saw.
+	ErrRepairDuplicateKeys = errors.New("mail repair: row carries repeated top-level keys")
 )
 
 // envelopeJSONKeys is every key the Envelope encoder can round-trip. A row
@@ -222,6 +226,7 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 
 		targetIdx := -1
 		malformedHits := 0
+		ambiguousKeys := 0
 		for i, line := range lines {
 			if len(line) == 0 {
 				continue
@@ -235,11 +240,26 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 				}
 				continue
 			}
+			// A row with repeated top-level keys has no single id to match on,
+			// so it can neither be selected nor skipped quietly when it names
+			// the requested id: count it and refuse below.
+			if keys, isObject := jsonObjectKeys([]byte(line)); isObject {
+				if _, dup := duplicateKey(keys); dup {
+					if strings.Contains(line, req.ID) {
+						ambiguousKeys++
+					}
+					continue
+				}
+			}
 			if rawObjectID(line) != req.ID {
 				continue
 			}
 			malformedHits++
 			targetIdx = i
+		}
+		if targetIdx < 0 && ambiguousKeys > 0 {
+			return fmt.Errorf("%w: %d row(s) mentioning %q carry repeated top-level keys, so the value to keep is ambiguous",
+				ErrRepairDuplicateKeys, ambiguousKeys, req.ID)
 		}
 		if malformedHits > 1 {
 			return fmt.Errorf("%w: %d malformed rows carry id %q", ErrRepairAmbiguous, malformedHits, req.ID)
@@ -520,18 +540,9 @@ func (m *Mailbox) checkQuarantineIdentity(id, liveHash string) error {
 // is there and parses to the intended envelope. A write that cannot be read
 // back is a failure, not a success.
 // verifyRepairedMailbox proves the durable file is byte-for-byte the file this
-// repair intended to write.
-//
-// Comparing a handful of Envelope fields on the target row was not enough. A
-// writer that flipped Read, or rewrote OriginalSourceHost/ID or Binding, or
-// corrupted a completely unrelated row, passed that check and the repair
-// reported Applied=true. Whole-file equality is the only comparison that
-// covers both the target's every field and the one-row-only promise, and it is
-// exactly what the splice already computed.
-//
-// The target row is then re-parsed as well. Byte equality already implies it,
-// but an explicit binding check turns "the bytes differ somewhere" into "the
-// row this repair was about is wrong", which is what an operator needs first.
+// repair intended to write, which covers every field of the target row and the
+// one-row-only promise in a single comparison. The target row is then re-parsed
+// so a failure names that row rather than only a byte count.
 func (m *Mailbox) verifyRepairedMailbox(expected []byte, want *Envelope) error {
 	got, err := os.ReadFile(m.MailFile)
 	if err != nil {
@@ -555,8 +566,8 @@ func (m *Mailbox) verifyRepairedMailbox(expected []byte, want *Envelope) error {
 	return nil
 }
 
-// sameEnvelope compares EVERY field an Envelope carries. Adding a field to
-// Envelope without adding it here is the bug this replaced.
+// sameEnvelope compares every field an Envelope carries. A new Envelope field
+// must be added here too.
 func sameEnvelope(a, b *Envelope) bool {
 	return a.ID == b.ID &&
 		a.Sequence == b.Sequence &&
@@ -593,8 +604,8 @@ func findLineByID(data []byte, id string) ([]byte, bool) {
 // terminating newline when it has one.
 type lineSpan struct{ start, end int }
 
-// lineSpans splits on the same rule splitLines uses, so a line index means the
-// same thing in both, but keeps the offsets needed to edit one row in place.
+// lineSpans splits on the same rule as splitLines, keeping the offsets needed
+// to edit one row in place.
 func lineSpans(data []byte) []lineSpan {
 	var spans []lineSpan
 	start := 0
@@ -616,6 +627,15 @@ func lineSpans(data []byte) []lineSpan {
 // compact `"id":"..."` needle that a hand-written spacing style does not
 // produce.
 func buildRepairedEnvelope(line string) (*Envelope, string, time.Time, error) {
+	keys, isObject := jsonObjectKeys([]byte(line))
+	if !isObject {
+		return nil, "", time.Time{}, fmt.Errorf("%w: row is not a well-formed JSON object", ErrRepairUnsupported)
+	}
+	// Refuse before decoding: the map below keeps only the last value for a
+	// repeated key, so repairing such a row would discard an original value.
+	if key, dup := duplicateKey(keys); dup {
+		return nil, "", time.Time{}, fmt.Errorf("%w: key %q appears more than once", ErrRepairDuplicateKeys, key)
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
 		return nil, "", time.Time{}, fmt.Errorf("%w: row is not a well-formed JSON object: %v", ErrRepairUnsupported, err)
@@ -667,8 +687,16 @@ func buildRepairedEnvelope(line string) (*Envelope, string, time.Time, error) {
 
 // rawObjectID reads the id of a row that does NOT parse as an Envelope,
 // tolerating any JSON spacing style, so a malformed row can still be addressed
-// by its exact id.
+// by its exact id. A row with repeated top-level keys is not addressable: see
+// jsonObjectKeys.
 func rawObjectID(line string) string {
+	keys, ok := jsonObjectKeys([]byte(line))
+	if !ok {
+		return ""
+	}
+	if _, dup := duplicateKey(keys); dup {
+		return ""
+	}
 	var raw map[string]json.RawMessage
 	if json.Unmarshal([]byte(line), &raw) != nil {
 		return ""
@@ -678,6 +706,53 @@ func rawObjectID(line string) string {
 		return ""
 	}
 	return id
+}
+
+// jsonObjectKeys returns a JSON object's top-level key names in order, or
+// ok=false if the bytes are not a JSON object.
+//
+// It walks a token stream rather than decoding into a map. A map keeps only the
+// last value for a repeated key, so a row carrying two different bodies decodes
+// to one and the other is gone — and this operation would then "normalize" the
+// row while discarding an original value it never showed anyone. Escape forms
+// are decoded by the tokenizer, so "body" and "body" are the same key.
+func jsonObjectKeys(line []byte) ([]string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, false
+	}
+	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '{' {
+		return nil, false
+	}
+	var keys []string
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, isString := keyTok.(string)
+		if !isString {
+			return nil, false
+		}
+		keys = append(keys, key)
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, false
+		}
+	}
+	return keys, true
+}
+
+func duplicateKey(keys []string) (string, bool) {
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if seen[key] {
+			return key, true
+		}
+		seen[key] = true
+	}
+	return "", false
 }
 
 // maxSequenceInLines reports the highest sequence any well-formed row already
