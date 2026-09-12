@@ -151,6 +151,11 @@ func TestBoundedInboxKeepsIndependentSequenceSpacesWhole(t *testing.T) {
 func TestBoundedInboxQuarantinesMalformedRowPastAFullPage(t *testing.T) {
 	f := newBoundsFixture(t, []int64{1}, nil)
 	appendLineTo(t, f.box.MailFile, controlLine(2, boundsRecipient, "second"))
+	// A THIRD valid record after the page fills. Without it the only line
+	// beyond the boundary is the malformed one, which short-circuits at the
+	// decode-failure continue and never reaches the post-truncation branch --
+	// so a mutant that abandoned the scan there was never executed at all.
+	appendLineTo(t, f.box.MailFile, controlLine(3, boundsRecipient, "third"))
 	appendLineTo(t, f.box.MailFile, "{not json")
 
 	before := f.box.QuarantineCount()
