@@ -353,6 +353,103 @@ func TestRepairAuditRecordsFailureAfterPrepare(t *testing.T) {
 	}
 }
 
+// TestRepairAuditNeverPersistsHostAbsolutePaths is the redaction guard. The
+// causes that reach the failure record wrap *os.PathError carrying the mailbox
+// path, and the record is durable, so an unredacted reason would write a
+// host-absolute path into an artifact the rest of this package is careful never
+// to leak one into.
+//
+// The assertion uses the package's OWN containsAbsPath, so the test agrees with
+// redactErr about what a host-absolute path is instead of inventing a second,
+// weaker definition that could drift.
+func TestRepairAuditNeverPersistsHostAbsolutePaths(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	if !containsAbsPath(path) {
+		t.Fatalf("fixture precondition: %q is not recognized as a host-absolute path, so this test would pass vacuously", path)
+	}
+	restore := writeFileAtomicFn
+	writeFileAtomicFn = func(p string, data []byte, perm os.FileMode) error {
+		if p == path {
+			// A real filesystem error shape, carrying the absolute path.
+			return &os.PathError{Op: "write", Path: p, Err: errors.New("permission denied")}
+		}
+		return restore(p, data, perm)
+	}
+	defer func() { writeFileAtomicFn = restore }()
+
+	_, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	})
+	if err == nil {
+		t.Fatal("a path error must not report success")
+	}
+
+	raw, readErr := os.ReadFile(path + ".repair.jsonl")
+	if readErr != nil {
+		t.Fatalf("audit artifact missing: %v", readErr)
+	}
+	// The fixture payload contains no path of its own, so NOTHING in the
+	// artifact may look like one.
+	if containsAbsPath(string(raw)) {
+		t.Fatalf("audit artifact persisted a host-absolute path:\n%s", raw)
+	}
+
+	records := readRepairRecords(t, path)
+	if len(records) != 2 {
+		t.Fatalf("want prepare + failed result, got %d", len(records))
+	}
+	prepare, result := records[0], records[1]
+	if containsAbsPath(prepare.Failure) || containsAbsPath(result.Failure) {
+		t.Fatalf("a recorded failure reason carries a host-absolute path: %q / %q", prepare.Failure, result.Failure)
+	}
+	// Redaction must not reduce the reason to nothing: op, basename and the
+	// underlying cause all have to survive, or the record stops being evidence.
+	if !strings.Contains(result.Failure, "permission denied") {
+		t.Fatalf("redaction dropped the underlying cause: %q", result.Failure)
+	}
+	if !strings.Contains(result.Failure, filepath.Base(path)) {
+		t.Fatalf("redaction dropped the basename, leaving the reason unattributable: %q", result.Failure)
+	}
+
+	// The original message payload must survive byte-for-byte, and its
+	// fingerprints must be unchanged — redaction touches the failure reason
+	// only, never the evidence the repair is bound to.
+	if prepare.OriginalLine != legacyRow {
+		t.Fatal("redaction altered the original bytes")
+	}
+	if prepare.OriginalSHA256 != sha256Hex(legacyRow) {
+		t.Fatalf("original fingerprint changed: %q", prepare.OriginalSHA256)
+	}
+	if result.OriginalLine != prepare.OriginalLine || result.OriginalSHA256 != prepare.OriginalSHA256 {
+		t.Fatal("result record no longer binds the same original bytes as prepare")
+	}
+	if result.RepairedSHA256 != prepare.RepairedSHA256 {
+		t.Fatal("repaired fingerprint changed between prepare and result")
+	}
+}
+
+// A payload that genuinely contains an absolute path is the operator's own
+// content and must be preserved verbatim. Redaction applies to failure reasons
+// this package generates, never to the message being recovered.
+func TestRepairPreservesAbsolutePathsInsideTheMessagePayload(t *testing.T) {
+	payloadRow := `{"id": "host-pathy-1", "sender": "agent", "recipient": "orchestrator", ` +
+		`"subject": "log", "body": "failed at ` + absUsersPrefix() + `someone/project/file.go", ` +
+		`"read": false, "timestamp": "2026-09-11T10:47:09.000000-0500"}`
+	mb, path := mailboxWith(t, payloadRow)
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-pathy-1", Fingerprint: sha256Hex(payloadRow), Act: true, Actor: "op",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	records := readRepairRecords(t, path)
+	if len(records) == 0 || records[0].OriginalLine != payloadRow {
+		t.Fatal("an operator payload containing an absolute path was not preserved verbatim")
+	}
+	if !strings.Contains(records[0].RepairedLine, absUsersPrefix()+"someone/project/file.go") {
+		t.Fatalf("the repaired row lost the payload's own path text: %q", records[0].RepairedLine)
+	}
+}
+
 // A readback mismatch is a failure like any other and must be recorded as one.
 func TestRepairAuditRecordsReadbackMismatchAsFailure(t *testing.T) {
 	mb, path := mailboxWith(t, legacyRow)

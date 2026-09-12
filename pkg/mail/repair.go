@@ -401,21 +401,40 @@ func (m *Mailbox) appendRepairRecord(plan *RepairPlan) error {
 // recordRepairFailure writes the RESULT record for an attempt that did not
 // succeed, then returns the original cause.
 //
+// The recorded reason is REDACTED. The causes that reach here wrap
+// *os.PathError — verifyRepairedRow's reread and the mailbox write both carry
+// the mailbox path — and this record is durable, so storing the raw error
+// would persist a host-absolute path into an artifact. redactErr is the
+// package's existing answer to exactly that (see its use on the outbox path
+// error in mail.go); it reduces a path error to op, basename and underlying
+// cause. The only host-absolute text an audit record may carry is whatever was
+// already inside the operator's own message payload.
+//
+// The RETURNED error is deliberately NOT redacted: redactErr rebuilds the
+// error and so drops the sentinel chain, and callers match on
+// ErrRepairReadbackFailed. Redaction is about what is persisted, not about
+// what the caller may inspect in memory.
+//
 // If the failure record itself cannot be written, both errors are returned
 // together rather than one masking the other: the operator needs to know the
 // repair failed AND that the artifact is now incomplete. Either way the
 // prepare record and the original bytes are already durable, so nothing is
 // unrecoverable and nothing reports success.
 func (m *Mailbox) recordRepairFailure(plan *RepairPlan, cause error) error {
+	if cause == nil {
+		// Reaching here means a caller decided the repair failed. A nil cause
+		// would record "failed" with no reason, which is worse than saying the
+		// reason was lost, so make that explicit rather than storing nothing
+		// and %w-wrapping a nil below.
+		cause = errors.New("mail repair: failure recorded without a cause")
+	}
 	plan.Phase = RepairPhaseResult
 	plan.Outcome = RepairOutcomeFailed
 	plan.Applied = false
 	plan.CompletedAt = time.Now().UTC()
-	if cause != nil {
-		plan.Failure = cause.Error()
-	}
+	plan.Failure = redactErr(cause).Error()
 	if err := m.appendRepairRecord(plan); err != nil {
-		return fmt.Errorf("%w (and the failure record could not be written: %v)", cause, err)
+		return fmt.Errorf("%w (and the failure record could not be written: %v)", cause, redactErr(err))
 	}
 	return cause
 }
