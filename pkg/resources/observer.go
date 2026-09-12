@@ -659,6 +659,12 @@ func ObserverUsable(status ObserverStatus, at time.Time) (bool, string) {
 	if !status.Latest.Report.Admits {
 		return false, "latest decision was " + status.Latest.Report.Decision
 	}
+	// The sample's own stamps must be present and ordered. A missing or
+	// out-of-order start/complete/publish chain cannot establish that anything
+	// observed is current, whatever the metrics say.
+	if why := sampleChronologyProblem(status, at); why != "" {
+		return false, why
+	}
 	// A consumer must not take Admits on trust. The published booleans and the
 	// published observations are two separate claims, and a report whose
 	// decision contradicts its own metrics is evidence of a bug, not of
@@ -669,68 +675,209 @@ func ObserverUsable(status ObserverStatus, at time.Time) (bool, string) {
 	return true, ""
 }
 
-// reportSelfConsistent revalidates a published decision against the metrics
-// published beside it, at consumer time.
+// sampleChronologyProblem returns why a status's own timeline is not credible,
+// or "" when it is. Absent stamps are refused rather than skipped: a status
+// that does not say when it was taken cannot be current.
+func sampleChronologyProblem(status ObserverStatus, at time.Time) string {
+	limits, _ := status.Latest.Report.Limits.sane()
+	stamps := []struct {
+		what  string
+		value string
+	}{
+		{"started_at", status.Latest.StartedAt},
+		{"completed_at", status.Latest.CompletedAt},
+		{"published_at", status.PublishedAt},
+	}
+	parsed := make([]time.Time, 0, len(stamps))
+	for _, s := range stamps {
+		if s.value == "" {
+			return "status " + s.what + " is missing"
+		}
+		when, err := time.Parse(time.RFC3339Nano, s.value)
+		if err != nil {
+			return "status " + s.what + " is unparseable"
+		}
+		if when.After(at.Add(limits.ClockSkew)) {
+			return "status " + s.what + " is in the future"
+		}
+		parsed = append(parsed, when)
+	}
+	for i := 1; i < len(parsed); i++ {
+		if parsed[i].Before(parsed[i-1]) {
+			return "status " + stamps[i].what + " precedes " + stamps[i-1].what
+		}
+	}
+	return ""
+}
+
+// reportSelfConsistent revalidates a published decision by REBUILDING the
+// typed readings from the wire shape and running the real Decide over them.
 //
-// It applies the SAME staleness and skew limits the decision carried, so this
-// is not a second policy: it is the same policy, checked again by the reader,
-// because the reader's clock is not the writer's clock.
+// The first version of this checked a couple of fields by hand -- normalized
+// finite, pressure known -- which was a second, incomplete threshold policy. It
+// admitted a report carrying Normalized=2 against a 0.75 limit, and it refused
+// a healthy Linux host that legitimately gates on MemAvailable with no kernel
+// pressure signal at all. A partial copy of a decision is worse than no copy:
+// it disagrees with the real one in both directions.
+//
+// So nothing here decides anything. It validates that the published numbers can
+// be trusted as inputs -- present, finite, internally consistent, and honestly
+// stamped -- and then hands them to the same Decide the writer used. Staleness,
+// skew and the thresholds are all Decide's, checked again only because the
+// reader's clock is not the writer's clock.
 func reportSelfConsistent(report AdmissionReport, at time.Time) (bool, string) {
 	if report.Admits && report.Decision != string(DecisionAdmit) {
 		return false, "report admits but its decision is " + report.Decision
 	}
-	limits := report.Limits
-	stale := limits.StaleAfter
-	if stale <= 0 {
-		stale = defaultStaleAfter
+	// A decision must not claim to have been made after it was rendered, and
+	// neither stamp may be in the future. A report whose own chronology is
+	// impossible cannot establish that anything is fresh.
+	limits, _ := report.Limits.sane()
+	for _, stamp := range []struct {
+		what  string
+		value string
+	}{{"decided_at", report.DecidedAt}, {"rendered_at", report.RenderedAt}} {
+		if stamp.value == "" {
+			continue
+		}
+		when, err := time.Parse(time.RFC3339Nano, stamp.value)
+		if err != nil {
+			return false, "report " + stamp.what + " is unparseable"
+		}
+		if when.After(at.Add(limits.ClockSkew)) {
+			return false, "report " + stamp.what + " is in the future"
+		}
 	}
-	skew := limits.ClockSkew
-	if skew <= 0 {
-		skew = defaultClockSkew
+	if report.DecidedAt != "" && report.RenderedAt != "" {
+		decided, derr := time.Parse(time.RFC3339Nano, report.DecidedAt)
+		rendered, rerr := time.Parse(time.RFC3339Nano, report.RenderedAt)
+		if derr == nil && rerr == nil && rendered.Before(decided) {
+			return false, "report was rendered before it was decided"
+		}
 	}
 
-	checked := 0
-	for _, named := range []struct {
-		what    string
-		reading ReadingReport
-	}{
-		{"cpu", report.CPU.ReadingReport},
-		{"memory", report.Memory.ReadingReport},
-	} {
-		r := named.reading
-		if !r.Known {
-			return false, named.what + " observation is not known; an admit cannot rest on it"
-		}
-		if r.State != string(freshness.StateFresh) {
-			return false, named.what + " observation state is " + r.State
-		}
-		if r.ObservedAt == "" {
-			return false, named.what + " observation carries no time"
-		}
-		observed, err := time.Parse(time.RFC3339Nano, r.ObservedAt)
-		if err != nil {
-			return false, named.what + " observation time is unparseable"
-		}
-		if observed.After(at.Add(skew)) {
-			return false, named.what + " observation is in the future; chronology is impossible"
-		}
-		if at.Sub(observed) > stale {
-			return false, named.what + " observation is older than the " + stale.String() + " staleness limit"
-		}
-		checked++
+	cpu, why := rebuildCPUReading(report.CPU)
+	if why != "" {
+		return false, why
 	}
-	if checked == 0 {
-		return false, "no observation was checked"
+	mem, why := rebuildMemoryReading(report.Memory)
+	if why != "" {
+		return false, why
 	}
-	// An admitting CPU report must actually carry the number it decided on.
-	if report.CPU.Normalized == nil {
-		return false, "cpu report carries no normalized load behind its admit"
-	}
-	if !finite(*report.CPU.Normalized) || *report.CPU.Normalized < 0 {
-		return false, "cpu normalized load is not a usable number"
-	}
-	if !report.Memory.PressureKnown {
-		return false, "memory pressure is not known behind its admit"
+
+	// The same decision, over the same numbers, at the reader's clock.
+	again := Decide(at, cpu, mem, limits)
+	if !again.Admits() {
+		return false, "re-deciding the published readings refuses: " + again.Explain()
 	}
 	return true, ""
+}
+
+// rebuildCPUReading turns the wire shape back into the typed reading Decide
+// expects, refusing anything it cannot reconstruct faithfully.
+func rebuildCPUReading(r CPUReport) (freshness.Reading[CPULoad], string) {
+	var empty freshness.Reading[CPULoad]
+	if !r.Known {
+		return empty, "cpu observation is not known; an admit cannot rest on it"
+	}
+	if r.State != string(freshness.StateFresh) {
+		return empty, "cpu observation state is " + r.State
+	}
+	observed, err := time.Parse(time.RFC3339Nano, r.ObservedAt)
+	if err != nil {
+		return empty, "cpu observation time is missing or unparseable"
+	}
+	if r.Load1 == nil || r.CPUs == nil || r.Normalized == nil {
+		return empty, "cpu report omits a raw number the decision rested on"
+	}
+	if !finite(*r.Load1) || *r.Load1 < 0 {
+		return empty, "cpu load1 is not a usable number"
+	}
+	if *r.CPUs <= 0 {
+		return empty, "cpu count is not positive"
+	}
+	if !finite(*r.Normalized) || *r.Normalized < 0 {
+		return empty, "cpu normalized load is not a usable number"
+	}
+	// The published normalized value must match the raw numbers beside it. A
+	// disagreement means one of the three is wrong, and nothing here can say
+	// which, so the reading is refused rather than half-believed.
+	load := CPULoad{Load1: *r.Load1, CPUs: *r.CPUs, Normalized: *r.Normalized}
+	derived, derr := normalizedFrom(load)
+	if derr != nil {
+		return empty, "cpu reading is internally inconsistent: " + derr.Error()
+	}
+	load.Normalized = derived
+	return freshness.Fresh(orPublished(r.Source, "published cpu"), observed, load), ""
+}
+
+// rebuildMemoryReading does the same for memory, WITHOUT demanding a kernel
+// pressure level. Linux legitimately admits on gating headroom with no pressure
+// signal; requiring one would refuse a healthy platform.
+func rebuildMemoryReading(r MemoryReport) (freshness.Reading[MemHeadroom], string) {
+	var empty freshness.Reading[MemHeadroom]
+	if !r.Known {
+		return empty, "memory observation is not known; an admit cannot rest on it"
+	}
+	if r.State != string(freshness.StateFresh) {
+		return empty, "memory observation state is " + r.State
+	}
+	observed, err := time.Parse(time.RFC3339Nano, r.ObservedAt)
+	if err != nil {
+		return empty, "memory observation time is missing or unparseable"
+	}
+	level, ok := parsePressureLevel(r.Pressure)
+	if !ok {
+		return empty, "memory pressure level " + r.Pressure + " is not a recognised level"
+	}
+	// The enum and the boolean beside it must agree. A report claiming a known
+	// pressure while naming an unknown level, or the reverse, is not a reading.
+	if level.Known() != r.PressureKnown {
+		return empty, "memory pressure_known does not match the published level " + r.Pressure
+	}
+	head := MemHeadroom{Pressure: level, FreePct: -1, FreePctGates: r.FreePctGates}
+	if r.FreePct != nil {
+		head.FreePct = *r.FreePct
+	}
+	if r.FreePctGates {
+		// A percentage that may REFUSE must be a real percentage.
+		if r.FreePct == nil {
+			return empty, "memory report gates on a free percentage it does not carry"
+		}
+		if *r.FreePct < 0 || *r.FreePct > 100 {
+			return empty, "gating free percentage is outside 0-100"
+		}
+	}
+	if !r.PressureKnown && !r.FreePctGates {
+		// Neither signal can refuse, so nothing observed could ever have
+		// produced a refusal. That is an absence of measurement, not headroom.
+		return empty, "memory report carries neither a known pressure level nor a gating headroom figure"
+	}
+	if r.SwapMB != nil {
+		head.SwapMB, head.SwapKnown = *r.SwapMB, true
+	}
+	return freshness.Fresh(orPublished(r.Source, "published memory"), observed, head), ""
+}
+
+// parsePressureLevel is the inverse of PressureLevel.String, kept beside the
+// consumer that needs it so the two stay in step.
+func parsePressureLevel(s string) (PressureLevel, bool) {
+	switch s {
+	case "normal":
+		return PressureNormal, true
+	case "warning":
+		return PressureWarn, true
+	case "critical":
+		return PressureCritical, true
+	case "unknown", "":
+		return PressureUnknown, true
+	}
+	return PressureUnknown, false
+}
+
+func orPublished(source, fallback string) string {
+	if source == "" {
+		return fallback
+	}
+	return source
 }

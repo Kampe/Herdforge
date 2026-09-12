@@ -111,6 +111,24 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: FAC-829 resource observer non-vacuity controls
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-resource-observer.zsh
+
+      # Same hidden-directory trap as above: without these two settings the run
+      # reports green while retaining none of the evidence it claims.
+      - name: Upload resource observer control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-resource-observer-logs
+          path: .verify-observer-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."

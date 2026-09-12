@@ -88,6 +88,20 @@ func admittingReport(at time.Time) AdmissionReport {
 	}
 }
 
+// linuxAdmittingReport is the OTHER healthy platform shape: no kernel pressure
+// signal at all, admitting on gating MemAvailable headroom. A consumer check
+// that demanded a pressure level would refuse this host, which is why it has a
+// positive control of its own.
+func linuxAdmittingReport(at time.Time) AdmissionReport {
+	r := admittingReport(at)
+	r.Memory.Pressure = "unknown"
+	r.Memory.PressureKnown = false
+	gating := 40
+	r.Memory.FreePct = &gating
+	r.Memory.FreePctGates = true
+	return r
+}
+
 // TestObserverDropsOverrunTicksWithoutCatchUp is the cadence contract.
 //
 // A sample that runs longer than the interval must cause the intervening ticks
@@ -295,13 +309,7 @@ func TestObserverConfigAcceptsDefaults(t *testing.T) {
 // TestObserverUsableFailsClosed proves no absence reads as permission.
 func TestObserverUsableFailsClosed(t *testing.T) {
 	now := time.Date(2026, 9, 12, 22, 0, 0, 0, time.UTC)
-	fresh := func() ObserverStatus {
-		return ObserverStatus{
-			SchemaVersion: ObserverSchemaVersion,
-			ExpiresAt:     stampUTC(now.Add(time.Minute)),
-			Latest:        ObserverSample{Report: admittingReport(now)},
-		}
-	}
+	fresh := func() ObserverStatus { return usableStatus(now, admittingReport(now)) }
 	if ok, why := ObserverUsable(fresh(), now); !ok {
 		t.Fatalf("a fresh admitting status was rejected: %s", why)
 	}
@@ -343,6 +351,144 @@ func TestObserverUsableFailsClosed(t *testing.T) {
 			}
 			if strings.TrimSpace(why) == "" {
 				t.Fatalf("%s was refused without a stated reason", tc.name)
+			}
+		})
+	}
+}
+
+// TestObserverUsableAcceptsBothHealthyPlatformShapes is the positive half of
+// the consumer check. Darwin admits on a known kernel pressure level; Linux
+// admits on gating headroom with no pressure signal. Both are healthy, and a
+// revalidation that refused either would be wrong about a real host.
+func TestObserverUsableAcceptsBothHealthyPlatformShapes(t *testing.T) {
+	now := time.Date(2026, 9, 12, 22, 0, 0, 0, time.UTC)
+	for name, report := range map[string]AdmissionReport{
+		"darwin kernel pressure": admittingReport(now),
+		"linux gating headroom":  linuxAdmittingReport(now),
+	} {
+		t.Run(name, func(t *testing.T) {
+			status := usableStatus(now, report)
+			if ok, why := ObserverUsable(status, now); !ok {
+				t.Fatalf("%s was refused: %s", name, why)
+			}
+		})
+	}
+}
+
+// usableStatus wraps a report in an otherwise-valid status, so a test that
+// mutates one field is testing that field.
+func usableStatus(now time.Time, report AdmissionReport) ObserverStatus {
+	return ObserverStatus{
+		SchemaVersion: ObserverSchemaVersion,
+		PublishedAt:   stampUTC(now),
+		ExpiresAt:     stampUTC(now.Add(time.Minute)),
+		Latest: ObserverSample{
+			StartedAt:   stampUTC(now.Add(-time.Second)),
+			CompletedAt: stampUTC(now),
+			Report:      report,
+		},
+	}
+}
+
+// TestObserverUsableRefusesContradictoryReports is the negative half: a report
+// whose booleans say ADMIT while its numbers say otherwise must refuse, because
+// the numbers are what the host actually did.
+func TestObserverUsableRefusesContradictoryReports(t *testing.T) {
+	now := time.Date(2026, 9, 12, 22, 0, 0, 0, time.UTC)
+	cases := map[string]func(*AdmissionReport){
+		"saturated cpu with admit booleans": func(r *AdmissionReport) {
+			load := 16.0
+			norm := 2.0
+			r.CPU.Load1 = &load
+			r.CPU.Normalized = &norm
+		},
+		"critical pressure with admit booleans": func(r *AdmissionReport) {
+			r.Memory.Pressure = "critical"
+		},
+		"warning pressure with admit booleans": func(r *AdmissionReport) {
+			r.Memory.Pressure = "warning"
+		},
+		"low gating headroom": func(r *AdmissionReport) {
+			r.Memory.Pressure = "unknown"
+			r.Memory.PressureKnown = false
+			low := 3
+			r.Memory.FreePct = &low
+			r.Memory.FreePctGates = true
+		},
+		"raw and derived cpu disagree": func(r *AdmissionReport) {
+			forged := 0.9
+			r.CPU.Normalized = &forged
+		},
+		"cpu raw numbers missing": func(r *AdmissionReport) {
+			r.CPU.Load1 = nil
+		},
+		"cpu count not positive": func(r *AdmissionReport) {
+			zero := 0
+			r.CPU.CPUs = &zero
+		},
+		"pressure enum contradicts pressure_known": func(r *AdmissionReport) {
+			r.Memory.PressureKnown = false
+		},
+		"unrecognised pressure level": func(r *AdmissionReport) {
+			r.Memory.Pressure = "spicy"
+		},
+		"neither pressure nor gating headroom": func(r *AdmissionReport) {
+			r.Memory.Pressure = "unknown"
+			r.Memory.PressureKnown = false
+			r.Memory.FreePctGates = false
+		},
+		"gating without a percentage": func(r *AdmissionReport) {
+			r.Memory.Pressure = "unknown"
+			r.Memory.PressureKnown = false
+			r.Memory.FreePct = nil
+			r.Memory.FreePctGates = true
+		},
+		"rendered before decided": func(r *AdmissionReport) {
+			r.DecidedAt = stampUTC(now)
+			r.RenderedAt = stampUTC(now.Add(-time.Minute))
+		},
+		"decided in the future": func(r *AdmissionReport) {
+			r.DecidedAt = stampUTC(now.Add(time.Hour))
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			report := admittingReport(now)
+			mutate(&report)
+			// The booleans still claim an admit; only the numbers changed.
+			report.Admits = true
+			report.Decision = string(DecisionAdmit)
+			status := usableStatus(now, report)
+			ok, why := ObserverUsable(status, now)
+			if ok {
+				t.Fatalf("%s was reported usable; published booleans must not outrank published numbers", name)
+			}
+			if strings.TrimSpace(why) == "" {
+				t.Fatalf("%s refused without a stated reason", name)
+			}
+		})
+	}
+}
+
+// TestObserverUsableRefusesBrokenChronology keeps a status that cannot say when
+// it happened from establishing that anything is fresh.
+func TestObserverUsableRefusesBrokenChronology(t *testing.T) {
+	now := time.Date(2026, 9, 12, 22, 0, 0, 0, time.UTC)
+	cases := map[string]func(*ObserverStatus){
+		"missing started_at":          func(s *ObserverStatus) { s.Latest.StartedAt = "" },
+		"missing completed_at":        func(s *ObserverStatus) { s.Latest.CompletedAt = "" },
+		"missing published_at":        func(s *ObserverStatus) { s.PublishedAt = "" },
+		"completed before started":    func(s *ObserverStatus) { s.Latest.CompletedAt = stampUTC(now.Add(-time.Hour)) },
+		"published before completed":  func(s *ObserverStatus) { s.PublishedAt = stampUTC(now.Add(-time.Hour)) },
+		"published in the future":     func(s *ObserverStatus) { s.PublishedAt = stampUTC(now.Add(time.Hour)) },
+		"unparseable completed stamp": func(s *ObserverStatus) { s.Latest.CompletedAt = "recently" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			status := usableStatus(now, admittingReport(now))
+			mutate(&status)
+			if ok, _ := ObserverUsable(status, now); ok {
+				t.Fatalf("%s was reported usable", name)
 			}
 		})
 	}
@@ -429,8 +575,11 @@ func TestObserverRecordsSampleFailureWithoutAdmitting(t *testing.T) {
 	deps := observerDeps{
 		now:  clock.Now,
 		wait: clock.wait,
-		sample: func(_ context.Context, _ time.Time) (AdmissionReport, error) {
-			return AdmissionReport{Decision: string(DecisionRefuse)}, errors.New("probe unavailable")
+		sample: func(_ context.Context, at time.Time) (AdmissionReport, error) {
+			// An ADMITTING report beside a failure: the loop must overrule it.
+			// Returning an already-refusing report here would let the forced
+			// refusal be removed without any test noticing.
+			return admittingReport(at), errors.New("probe unavailable")
 		},
 		publish: func(ObserverStatus) error { return nil },
 	}

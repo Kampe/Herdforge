@@ -45,6 +45,16 @@ func cliAdmittingReport(at time.Time) resources.AdmissionReport {
 	}
 }
 
+// cliSample wraps the report with the stamps a credible status must carry: a
+// status that cannot say when it was taken establishes nothing.
+func cliSample(at time.Time) resources.ObserverSample {
+	return resources.ObserverSample{
+		StartedAt:   at.Add(-time.Second).UTC().Format(time.RFC3339Nano),
+		CompletedAt: at.UTC().Format(time.RFC3339Nano),
+		Report:      cliAdmittingReport(at),
+	}
+}
+
 func writeObserverFixture(t *testing.T, status resources.ObserverStatus) string {
 	t.Helper()
 	path := resources.ObserverStatusPath()
@@ -79,7 +89,7 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			SchemaVersion: resources.ObserverSchemaVersion,
 			PublishedAt:   now.Add(-time.Hour).Format(time.RFC3339Nano),
 			ExpiresAt:     now.Add(-time.Minute).Format(time.RFC3339Nano),
-			Latest:        resources.ObserverSample{Report: cliAdmittingReport(now)},
+			Latest:        cliSample(now),
 		})
 		if code := runResourcesObserverStatus(false); code != observerExitRefused {
 			t.Fatalf("an expired observer status exited %d, expected %d: a dead observer must authorize nothing",
@@ -93,7 +103,7 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			SchemaVersion: resources.ObserverSchemaVersion,
 			ExpiresAt:     now.Add(time.Hour).Format(time.RFC3339Nano),
 			Terminated:    "lifetime reached",
-			Latest:        resources.ObserverSample{Report: cliAdmittingReport(now)},
+			Latest:        cliSample(now),
 		})
 		if code := runResourcesObserverStatus(false); code != observerExitRefused {
 			t.Fatalf("a terminated observer exited %d, expected %d", code, observerExitRefused)
@@ -106,7 +116,7 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			SchemaVersion: resources.ObserverSchemaVersion,
 			PublishedAt:   now.Format(time.RFC3339Nano),
 			ExpiresAt:     now.Add(time.Hour).Format(time.RFC3339Nano),
-			Latest:        resources.ObserverSample{Report: cliAdmittingReport(now)},
+			Latest:        cliSample(now),
 		})
 		if code := runResourcesObserverStatus(false); code != 0 {
 			t.Fatalf("a current admitting status exited %d, expected 0", code)
@@ -120,7 +130,9 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			PublishedAt:   now.Format(time.RFC3339Nano),
 			ExpiresAt:     now.Add(time.Hour).Format(time.RFC3339Nano),
 			Latest: resources.ObserverSample{
-				Report: resources.AdmissionReport{Decision: "REFUSE", Admits: false},
+				StartedAt:   now.Add(-time.Second).Format(time.RFC3339Nano),
+				CompletedAt: now.Format(time.RFC3339Nano),
+				Report:      resources.AdmissionReport{Decision: "REFUSE", Admits: false},
 			},
 		})
 		if code := runResourcesObserverStatus(false); code != observerExitRefused {
