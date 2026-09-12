@@ -729,6 +729,8 @@ func printUsage() {
 	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
 	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
+	fmt.Println("                  --watch runs a bounded foreground observer on a native clock;")
+	fmt.Println("                  --observer-status reads its snapshot and exits 3 once it expires")
 	fmt.Println("  lock           Advisory shared-checkout lock: with, acquire, release, status")
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
 	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
@@ -7800,7 +7802,34 @@ func runResources() {
 	asJSON := fs.Bool("json", false, "Output JSON")
 	gate := fs.Bool("gate", false, "Exit 3 on ALERT (refuses heavy ops); HERD_RESOURCES_GATE=0 disables")
 	selftest := fs.Bool("selftest", false, "Run verdict assertions and exit")
+	// FAC-829: opt-in observer mode. Absent these flags, everything below is
+	// the original one-shot command, unchanged.
+	watch := fs.Bool("watch", false,
+		"Foreground observer: sample on a native clock and publish a bounded snapshot until stopped")
+	observerStatus := fs.Bool("observer-status", false,
+		"Read the published observer snapshot; exit 3 when it is expired, terminated or refusing")
+	interval := fs.Duration("interval", 0,
+		"Observer sampling interval (default 30s; bounded, a zero or negative value is refused, not repaired)")
+	lifetime := fs.Duration("lifetime", 0,
+		"Observer total lifetime before it exits on its own (default 12h)")
+	sampleTimeout := fs.Duration("sample-timeout", 0,
+		"Per-sample deadline (default half the interval); may not exceed half the interval")
 	fs.Parse(os.Args[2:])
+
+	if *watch && *observerStatus {
+		fmt.Fprintln(os.Stderr, "resources: --watch and --observer-status are different jobs; pick one")
+		os.Exit(2)
+	}
+	if *observerStatus {
+		os.Exit(runResourcesObserverStatus(*asJSON))
+	}
+	if *watch {
+		os.Exit(runResourcesObserver(observerFlags{
+			interval:      *interval,
+			lifetime:      *lifetime,
+			sampleTimeout: *sampleTimeout,
+		}))
+	}
 
 	if *selftest {
 		results := resources.SelfTest()

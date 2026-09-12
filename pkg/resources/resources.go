@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -199,20 +198,27 @@ func runProbe(name string, args ...string) (string, error) {
 // runProbeCtx runs one probe under the caller's context and a hard timeout,
 // whichever fires first. A timeout is an ERROR, never an empty string a parser
 // could read as a healthy default.
+//
+// FAC-829: the capture is now bounded as well as cancelled. The previous
+// implementation was exec.CommandContext(...).Output(), which accumulated
+// stdout without a ceiling and, worse, could block in Wait past its own
+// deadline whenever a descendant kept the stdout pipe open. Both edges are
+// closed in boundedProbeOutput; the error contract here is unchanged, so every
+// failure still becomes UNKNOWN and refuses rather than admitting.
 func runProbeCtx(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
 	if timeout <= 0 {
 		timeout = defaultProbeTimeout
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(probeCtx, name, args...).Output()
+	out, err := boundedProbeOutput(probeCtx, name, args...)
 	if err != nil {
 		if probeCtx.Err() != nil {
 			return "", fmt.Errorf("probe %s timed out or was cancelled after %s: %w", name, timeout, probeCtx.Err())
 		}
 		return "", fmt.Errorf("probe %s failed: %w", name, err)
 	}
-	return string(out), nil
+	return out, nil
 }
 
 // snapshotWithProbes derives a snapshot through injectable probe funcs so the
