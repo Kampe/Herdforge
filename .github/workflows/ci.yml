@@ -87,6 +87,23 @@ jobs:
         env:
           CHAINSEER_BIN: chainseer/bin
 
+      # FAC-827: the budget guards are covered by tests that had never been
+      # shown to fail. This driver mutates the real source one guard at a time
+      # and requires a named assertion failure for each, so the receipt cannot
+      # claim controls that never ran. It makes its own ephemeral worktree
+      # under RUNNER_TEMP and removes it on every exit path.
+      - name: FAC-827 manifest budget non-vacuity controls
+        run: scripts/verify-manifest-budget.zsh
+
+      - name: Upload manifest budget control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-manifest-budget-logs
+          path: .verify-budget-logs/
+          if-no-files-found: warn
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
