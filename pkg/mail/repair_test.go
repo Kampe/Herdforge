@@ -1,11 +1,13 @@
 package mail
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -758,5 +760,242 @@ func TestRepairIgnoresQuarantineRecordsForOtherIDs(t *testing.T) {
 		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
 	}); err != nil {
 		t.Fatalf("unrelated quarantined ids must not block the repair: %v", err)
+	}
+}
+
+// rawMailbox writes exact bytes, so framing tests control the trailing
+// newline and blank lines instead of inheriting a helper's opinion of them.
+func rawMailbox(t *testing.T, content string) (*Mailbox, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "control-mail.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return NewMailbox(path), path
+}
+
+// tamperWriter lands mutate(intended) instead of the bytes the repair computed.
+func tamperWriter(t *testing.T, mailPath string, mutate func([]byte) []byte) {
+	t.Helper()
+	restore := writeFileAtomicFn
+	writeFileAtomicFn = func(p string, data []byte, perm os.FileMode) error {
+		if p == mailPath {
+			data = mutate(data)
+		}
+		return restore(p, data, perm)
+	}
+	t.Cleanup(func() { writeFileAtomicFn = restore })
+}
+
+func actOnLegacyRow(t *testing.T, mb *Mailbox) (*RepairPlan, error) {
+	t.Helper()
+	return mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	})
+}
+
+// Positive control for the whole tamper suite: an untampered writer applies.
+// Without this, every case below could pass because the repair never works.
+func TestRepairAppliesWhenTheWriterIsFaithful(t *testing.T) {
+	mb, _ := mailboxWith(t, legacyRow)
+	plan, err := actOnLegacyRow(t, mb)
+	if err != nil || plan == nil || !plan.Applied {
+		t.Fatalf("faithful write did not apply: plan=%+v err=%v", plan, err)
+	}
+}
+
+// A writer that alters ANY field of the target row must be caught. Comparing a
+// handful of fields let Read, OriginalSourceHost/ID and Binding through while
+// still reporting Applied=true.
+func TestRepairReadbackCatchesEveryAlteredTargetField(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Envelope)
+	}{
+		{"read flag", func(e *Envelope) { e.Read = true }},
+		{"original source host", func(e *Envelope) { e.OriginalSourceHost = "attacker-host" }},
+		{"original source id", func(e *Envelope) { e.OriginalSourceID = "attacker-id" }},
+		{"binding", func(e *Envelope) { e.Binding = "attacker-binding" }},
+		{"sender", func(e *Envelope) { e.Sender = "attacker" }},
+		{"sequence", func(e *Envelope) { e.Sequence = 99 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mb, path := mailboxWith(t, legacyRow)
+			tamperWriter(t, path, func(intended []byte) []byte {
+				var env Envelope
+				line := bytes.TrimRight(intended, "\n")
+				if err := json.Unmarshal(line, &env); err != nil {
+					t.Fatalf("fixture could not decode the intended row: %v", err)
+				}
+				tc.mutate(&env)
+				out, err := json.Marshal(&env)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return append(out, '\n')
+			})
+			plan, err := actOnLegacyRow(t, mb)
+			if !errors.Is(err, ErrRepairReadbackFailed) {
+				t.Fatalf("a writer that changed %s was accepted: plan=%+v err=%v", tc.name, plan, err)
+			}
+			if plan != nil && plan.Applied {
+				t.Fatalf("a tampered write still reported applied: %+v", plan)
+			}
+		})
+	}
+}
+
+// Collateral damage to a row this repair was not about must fail the repair.
+func TestRepairReadbackCatchesUnrelatedRowCorruption(t *testing.T) {
+	keep := goodRow(t, "keep-me", "orchestrator", 1)
+	mb, path := mailboxWith(t, keep, legacyRow)
+	tamperWriter(t, path, func(intended []byte) []byte {
+		return bytes.Replace(intended, []byte(`"id":"keep-me"`), []byte(`"id":"clobbered"`), 1)
+	})
+	plan, err := actOnLegacyRow(t, mb)
+	if !errors.Is(err, ErrRepairReadbackFailed) {
+		t.Fatalf("corruption of an unrelated row was accepted: plan=%+v err=%v", plan, err)
+	}
+}
+
+// One-row-only means byte-for-byte outside the target span. Re-joining split
+// lines dropped trailing blank rows and invented a terminal newline.
+func TestRepairPreservesExactFileFraming(t *testing.T) {
+	keep := goodRow(t, "keep-me", "orchestrator", 1)
+	crlfRow := goodRow(t, "crlf-row", "orchestrator", 2) + "\r"
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{"unterminated final row", keep + "\n" + legacyRow},
+		{"multiple trailing empty lines", keep + "\n" + legacyRow + "\n\n\n"},
+		{"crlf on an untouched row", crlfRow + "\n" + legacyRow + "\n"},
+		{"target is the first row", legacyRow + "\n" + keep + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mb, path := rawMailbox(t, tc.content)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := actOnLegacyRow(t, mb); err != nil {
+				t.Fatalf("repair refused a legitimately framed mailbox: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			idx := bytes.Index(before, []byte(legacyRow))
+			if idx < 0 {
+				t.Fatal("fixture does not contain the target row")
+			}
+			// Everything before the target span must be identical.
+			if !bytes.Equal(before[:idx], after[:idx]) {
+				t.Fatalf("bytes before the target row changed\nbefore=%q\nafter=%q", before[:idx], after[:idx])
+			}
+			// And so must everything after it.
+			wantSuffix := before[idx+len(legacyRow):]
+			if !bytes.HasSuffix(after, wantSuffix) {
+				t.Fatalf("bytes after the target row changed\nwant suffix=%q\nafter=%q", wantSuffix, after)
+			}
+			if bytes.Contains(after, []byte(legacyRow)) {
+				t.Fatal("the target row was not replaced")
+			}
+		})
+	}
+}
+
+func writeSeq(t *testing.T, mailPath, value string) {
+	t.Helper()
+	if err := os.WriteFile(mailPath+".seq", []byte(value), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An unusable counter must be refused BEFORE anything is reserved, audited or
+// written — in report mode too, so an operator never reads a negative sequence
+// from a report and then acts on it.
+func TestRepairRefusesUnusableSequenceBeforeAnyMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		seq   string
+		wantI bool
+	}{
+		{"counter at the int64 maximum", "9223372036854775807", false},
+		{"negative counter", "-5", true},
+		{"non-numeric counter", "not-a-number", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, act := range []bool{false, true} {
+				mb, path := mailboxWith(t, legacyRow)
+				writeSeq(t, path, tc.seq)
+				before, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := RepairRequest{ID: "host-81751-1789141629774"}
+				if act {
+					req.Act, req.Actor, req.Fingerprint = true, "op", sha256Hex(legacyRow)
+				}
+				_, err = mb.RepairMalformedRow(context.Background(), req)
+				if err == nil {
+					t.Fatalf("act=%v: an unusable sequence counter was accepted", act)
+				}
+				wantSentinel := ErrSequenceExhausted
+				if tc.wantI {
+					wantSentinel = ErrSequenceInvalid
+				}
+				if !errors.Is(err, wantSentinel) {
+					t.Fatalf("act=%v: want %v, got %v", act, wantSentinel, err)
+				}
+				after, _ := os.ReadFile(path)
+				if string(after) != string(before) {
+					t.Fatalf("act=%v: a refused repair mutated the mailbox", act)
+				}
+				if _, statErr := os.Stat(path + ".repair.jsonl"); !os.IsNotExist(statErr) {
+					t.Fatalf("act=%v: a refused repair wrote an audit record", act)
+				}
+				if got, _ := os.ReadFile(path + ".seq"); string(got) != tc.seq {
+					t.Fatalf("act=%v: a refused repair advanced the counter to %q", act, got)
+				}
+			}
+		})
+	}
+}
+
+// The floor is derived from the live rows, so a live row already at the
+// maximum leaves no successor either.
+func TestRepairRefusesWhenAnExistingRowHoldsTheMaximumSequence(t *testing.T) {
+	maxed := goodRow(t, "maxed-row", "orchestrator", math.MaxInt64)
+	mb, path := mailboxWith(t, maxed, legacyRow)
+	before, _ := os.ReadFile(path)
+	if _, err := actOnLegacyRow(t, mb); !errors.Is(err, ErrSequenceExhausted) {
+		t.Fatalf("a live row at the int64 maximum was accepted: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("a refused repair mutated the mailbox")
+	}
+}
+
+// The checked increment is shared with ordinary delivery, so an exhausted
+// counter must refuse a normal send too rather than wrapping negative.
+func TestOrdinarySendRefusesAnExhaustedSequenceCounter(t *testing.T) {
+	mb, path := rawMailbox(t, "")
+	writeSeq(t, path, "9223372036854775807")
+	if _, err := mb.SendMessage("sender", "recipient", "subject", "body"); !errors.Is(err, ErrSequenceExhausted) {
+		t.Fatalf("an ordinary send wrapped an exhausted counter instead of refusing: %v", err)
+	}
+}
+
+func TestNextSequenceValueIsChecked(t *testing.T) {
+	if got, err := nextSequenceValue(41); err != nil || got != 42 {
+		t.Fatalf("ordinary increment broke: %d %v", got, err)
+	}
+	if _, err := nextSequenceValue(math.MaxInt64); !errors.Is(err, ErrSequenceExhausted) {
+		t.Fatalf("MaxInt64 did not report exhaustion: %v", err)
+	}
+	if _, err := nextSequenceValue(-1); !errors.Is(err, ErrSequenceInvalid) {
+		t.Fatalf("negative counter was accepted: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -131,13 +132,16 @@ func (m *Mailbox) peekNextSequence() (int64, error) {
 	case err == nil:
 		cur, parseErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
 		if parseErr != nil {
-			return 0, fmt.Errorf("corrupt sequence file: %w", parseErr)
+			return 0, fmt.Errorf("%w: corrupt sequence file: %v", ErrSequenceInvalid, parseErr)
 		}
-		return cur + 1, nil
+		// Checked, and checked HERE: a report must refuse an unusable counter
+		// rather than print a negative sequence that a later act would then
+		// silently replace with 1, filing the row beneath the whole history.
+		return nextSequenceValue(cur)
 	case os.IsNotExist(err):
 		return 1, nil
 	default:
-		return 0, fmt.Errorf("failed to read sequence file: %w", err)
+		return 0, fmt.Errorf("failed to read sequence file: %w", redactErr(err))
 	}
 }
 
@@ -204,9 +208,17 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 	err := m.withFileLockContext(ctx, func() error {
 		data, err := os.ReadFile(m.MailFile)
 		if err != nil {
-			return fmt.Errorf("mail repair: read mailbox: %w", err)
+			return fmt.Errorf("mail repair: read mailbox: %w", redactErr(err))
 		}
-		lines := splitLines(string(data))
+		// Spans, not just split strings: the repair replaces one exact byte
+		// range and leaves every other byte of the file alone, so it needs the
+		// offsets rather than a re-joined approximation of them. lines is
+		// derived from the same spans, so every index below refers to both.
+		spans := lineSpans(data)
+		lines := make([]string, len(spans))
+		for i, sp := range spans {
+			lines[i] = string(data[sp.start:sp.end])
+		}
 
 		targetIdx := -1
 		malformedHits := 0
@@ -281,9 +293,14 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 		// sidecar is the normal authority, but it can be absent or behind (a
 		// copied mailbox, a lost sidecar), and a repaired row that sorts under
 		// 3000 existing messages is not a recovery. Floor it on what the file
-		// actually holds.
+		// actually holds, through the same checked increment: an existing row
+		// already at the int64 maximum leaves no successor to assign.
 		if maxSeq := maxSequenceInLines(lines); maxSeq >= nextSeq {
-			nextSeq = maxSeq + 1
+			floored, err := nextSequenceValue(maxSeq)
+			if err != nil {
+				return fmt.Errorf("%w (highest existing row)", err)
+			}
+			nextSeq = floored
 		}
 		repaired.Sequence = nextSeq
 		encoded, err := json.Marshal(repaired)
@@ -349,14 +366,23 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 
 		// From here on every exit writes a RESULT record, so a failed attempt
 		// is legible in the artifact rather than merely absent.
-		out := make([]string, len(lines))
-		copy(out, lines)
-		out[targetIdx] = repairedLine
-		body := strings.Join(trimTrailingEmpty(out), "\n") + "\n"
-		if err := writeFileAtomic(m.MailFile, []byte(body), 0644); err != nil {
+		//
+		// Splice, do not rebuild. An earlier version re-joined the split lines
+		// and appended a newline, which silently dropped trailing blank rows
+		// and invented a terminal newline the file never had — a one-row repair
+		// editing bytes outside its row. Everything before the target span and
+		// everything after it is carried through untouched, including the
+		// original newline framing and any CR bytes on other rows.
+		target := spans[targetIdx]
+		expected := make([]byte, 0, len(data)-(target.end-target.start)+len(repairedLine))
+		expected = append(expected, data[:target.start]...)
+		expected = append(expected, repairedLine...)
+		expected = append(expected, data[target.end:]...)
+
+		if err := writeFileAtomic(m.MailFile, expected, 0644); err != nil {
 			return m.recordRepairFailure(plan, fmt.Errorf("mail repair: durable mailbox write: %w", err))
 		}
-		if err := m.verifyRepairedRow(targetIdx, repaired); err != nil {
+		if err := m.verifyRepairedMailbox(expected, repaired); err != nil {
 			return m.recordRepairFailure(plan, err)
 		}
 
@@ -493,25 +519,95 @@ func (m *Mailbox) checkQuarantineIdentity(id, liveHash string) error {
 // verifyRepairedRow re-reads the durable file and proves the row it just wrote
 // is there and parses to the intended envelope. A write that cannot be read
 // back is a failure, not a success.
-func (m *Mailbox) verifyRepairedRow(idx int, want *Envelope) error {
-	data, err := os.ReadFile(m.MailFile)
+// verifyRepairedMailbox proves the durable file is byte-for-byte the file this
+// repair intended to write.
+//
+// Comparing a handful of Envelope fields on the target row was not enough. A
+// writer that flipped Read, or rewrote OriginalSourceHost/ID or Binding, or
+// corrupted a completely unrelated row, passed that check and the repair
+// reported Applied=true. Whole-file equality is the only comparison that
+// covers both the target's every field and the one-row-only promise, and it is
+// exactly what the splice already computed.
+//
+// The target row is then re-parsed as well. Byte equality already implies it,
+// but an explicit binding check turns "the bytes differ somewhere" into "the
+// row this repair was about is wrong", which is what an operator needs first.
+func (m *Mailbox) verifyRepairedMailbox(expected []byte, want *Envelope) error {
+	got, err := os.ReadFile(m.MailFile)
 	if err != nil {
-		return fmt.Errorf("%w: reread: %v", ErrRepairReadbackFailed, err)
+		return fmt.Errorf("%w: reread: %v", ErrRepairReadbackFailed, redactErr(err))
 	}
-	lines := splitLines(string(data))
-	if idx >= len(lines) {
-		return fmt.Errorf("%w: repaired row index %d is beyond the durable file", ErrRepairReadbackFailed, idx)
+	if !bytes.Equal(got, expected) {
+		return fmt.Errorf("%w: durable mailbox is not the exact bytes this repair wrote (%d bytes on disk, %d intended)",
+			ErrRepairReadbackFailed, len(got), len(expected))
 	}
-	var got Envelope
-	if err := json.Unmarshal([]byte(lines[idx]), &got); err != nil {
+	line, ok := findLineByID(got, want.ID)
+	if !ok {
+		return fmt.Errorf("%w: repaired row %q is not present in the durable mailbox", ErrRepairReadbackFailed, want.ID)
+	}
+	var durable Envelope
+	if err := json.Unmarshal(line, &durable); err != nil {
 		return fmt.Errorf("%w: repaired row does not parse: %v", ErrRepairReadbackFailed, err)
 	}
-	if got.ID != want.ID || got.Sender != want.Sender || got.Recipient != want.Recipient ||
-		got.Subject != want.Subject || got.Body != want.Body || got.Sequence != want.Sequence ||
-		!got.Timestamp.Equal(want.Timestamp) {
+	if !sameEnvelope(&durable, want) {
 		return fmt.Errorf("%w: durable row differs from the repaired row", ErrRepairReadbackFailed)
 	}
 	return nil
+}
+
+// sameEnvelope compares EVERY field an Envelope carries. Adding a field to
+// Envelope without adding it here is the bug this replaced.
+func sameEnvelope(a, b *Envelope) bool {
+	return a.ID == b.ID &&
+		a.Sequence == b.Sequence &&
+		a.Sender == b.Sender &&
+		a.Recipient == b.Recipient &&
+		a.Subject == b.Subject &&
+		a.Body == b.Body &&
+		a.Read == b.Read &&
+		a.Timestamp.Equal(b.Timestamp) &&
+		a.OriginalSourceHost == b.OriginalSourceHost &&
+		a.OriginalSourceID == b.OriginalSourceID &&
+		a.Binding == b.Binding
+}
+
+// findLineByID returns the first well-formed row carrying id.
+func findLineByID(data []byte, id string) ([]byte, bool) {
+	for _, sp := range lineSpans(data) {
+		line := data[sp.start:sp.end]
+		if len(line) == 0 {
+			continue
+		}
+		var env Envelope
+		if json.Unmarshal(line, &env) != nil {
+			continue
+		}
+		if env.ID == id {
+			return line, true
+		}
+	}
+	return nil, false
+}
+
+// lineSpan is one line's byte range within the mailbox, excluding its
+// terminating newline when it has one.
+type lineSpan struct{ start, end int }
+
+// lineSpans splits on the same rule splitLines uses, so a line index means the
+// same thing in both, but keeps the offsets needed to edit one row in place.
+func lineSpans(data []byte) []lineSpan {
+	var spans []lineSpan
+	start := 0
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\n' {
+			spans = append(spans, lineSpan{start: start, end: i})
+			start = i + 1
+		}
+	}
+	if start < len(data) {
+		spans = append(spans, lineSpan{start: start, end: len(data)})
+	}
+	return spans
 }
 
 // buildRepairedEnvelope proves the ONLY defect is the legacy timestamp. It
@@ -601,11 +697,4 @@ func maxSequenceInLines(lines []string) int64 {
 		}
 	}
 	return max
-}
-
-func trimTrailingEmpty(lines []string) []string {
-	for len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
-		lines = lines[:len(lines)-1]
-	}
-	return lines
 }

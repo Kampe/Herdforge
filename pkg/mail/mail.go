@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -492,11 +493,35 @@ func (m *Mailbox) nextSequenceLocked() (int64, error) {
 		return 0, fmt.Errorf("failed to read sequence file: %w", err)
 	}
 
-	next := cur + 1
+	next, err := nextSequenceValue(cur)
+	if err != nil {
+		return 0, err
+	}
 	if err := writeFileAtomic(seqPath, []byte(strconv.FormatInt(next, 10)), 0644); err != nil {
 		return 0, fmt.Errorf("failed to reserve sequence: %w", err)
 	}
 	return next, nil
+}
+
+// Sequence allocation faults. A counter that is negative or already at the
+// int64 maximum cannot yield a usable successor, and silently wrapping would
+// hand out a sequence below the existing history.
+var (
+	ErrSequenceInvalid   = errors.New("mail: sequence counter is invalid")
+	ErrSequenceExhausted = errors.New("mail: sequence space is exhausted")
+)
+
+// nextSequenceValue is the single checked increment every sequence allocation
+// goes through. Unchecked cur+1 wraps MaxInt64 to a negative number, which
+// would file the next message beneath every message already in the mailbox.
+func nextSequenceValue(cur int64) (int64, error) {
+	if cur < 0 {
+		return 0, fmt.Errorf("%w: %d", ErrSequenceInvalid, cur)
+	}
+	if cur == math.MaxInt64 {
+		return 0, fmt.Errorf("%w: counter is at the int64 maximum", ErrSequenceExhausted)
+	}
+	return cur + 1, nil
 }
 
 // appendLine appends data plus a trailing newline to path, fsync'ing before

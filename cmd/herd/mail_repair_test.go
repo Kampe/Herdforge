@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,7 +14,15 @@ import (
 	"github.com/Kampe/Herdforge/pkg/mail"
 )
 
-const cliLegacyRow = `{"id": "cli-81751-1789141629774", "sender": "startup-fix", "recipient": "orchestrator", ` +
+// These tests cover the CLI seam only: argument handling, exit codes and the
+// JSON contract. The provider's own behaviour is covered in pkg/mail, and is
+// deliberately not duplicated here — an earlier version of this file called
+// pkg/mail directly and so would have passed even if `herd mail repair` had
+// never been wired up or had stopped parsing --act.
+
+const cliRepairID = "cli-81751-1789141629774"
+
+const cliLegacyRow = `{"id": "` + cliRepairID + `", "sender": "startup-fix", "recipient": "orchestrator", ` +
 	`"subject": "finding", "body": "two defects", "read": false, "timestamp": "2026-09-11T10:47:09.000000-0500"}`
 
 func cliLegacySHA() string {
@@ -29,136 +39,170 @@ func cliRepairMailbox(t *testing.T) string {
 	return path
 }
 
-// TestMailRepairSubcommandIsReportOnlyByDefault exercises the CLI seam the
-// operator actually types, not the package call underneath it: the default
-// must emit a plan and leave the mailbox byte-identical.
-func TestMailRepairSubcommandIsReportOnlyByDefault(t *testing.T) {
+// runRepairCLI invokes the real handler with captured streams.
+func runRepairCLI(args ...string) (code int, stdout, stderr string) {
+	var out, errOut bytes.Buffer
+	code = mailRepairMain(args, &out, &errOut)
+	return code, out.String(), errOut.String()
+}
+
+func TestMailRepairCLIUsageErrorsExitTwo(t *testing.T) {
+	path := cliRepairMailbox(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no id", []string{"--mail", path}, "--id is required"},
+		{"act without actor", []string{"--id", cliRepairID, "--mail", path, "--act", "--fingerprint", cliLegacySHA()}, "--actor is required"},
+		{"act without fingerprint", []string{"--id", cliRepairID, "--mail", path, "--act", "--actor", "root"}, "--fingerprint is required"},
+		{"unknown flag", []string{"--id", cliRepairID, "--mail", path, "--nope"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runRepairCLI(tc.args...)
+			if code != 2 {
+				t.Fatalf("exit = %d, want 2 (stderr: %s)", code, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("a usage error still printed a plan: %s", stdout)
+			}
+			if tc.want != "" && !strings.Contains(stderr, tc.want) {
+				t.Fatalf("stderr does not explain the problem: %q", stderr)
+			}
+		})
+	}
+}
+
+// A stray positional is a typo. Ignoring it silently would let
+// `mail repair --act FAC-1` read as a report-only run of something else.
+func TestMailRepairCLIRejectsPositionalArguments(t *testing.T) {
+	path := cliRepairMailbox(t)
+	code, stdout, stderr := runRepairCLI("--id", cliRepairID, "--mail", path, "stray-arg")
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr, "stray-arg") {
+		t.Fatalf("stderr does not name the rejected argument: %q", stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("a rejected invocation still printed a plan: %s", stdout)
+	}
+	// And it must not have been treated as a silent report-only run.
+	if _, err := os.Stat(path + ".repair.jsonl"); !os.IsNotExist(err) {
+		t.Fatal("a rejected invocation touched the audit artifact")
+	}
+}
+
+func TestMailRepairCLIReportOnlyEmitsPlanAndChangesNothing(t *testing.T) {
 	path := cliRepairMailbox(t)
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774",
-	})
-	if err != nil {
-		t.Fatalf("report-only: %v", err)
+	code, stdout, stderr := runRepairCLI("--id", cliRepairID, "--mail", path)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	var plan mail.RepairPlan
+	if err := json.Unmarshal([]byte(stdout), &plan); err != nil {
+		t.Fatalf("stdout is not a decodable plan: %v\n%s", err, stdout)
 	}
 	if plan.Applied {
-		t.Fatal("default mode reported the repair as applied")
+		t.Fatal("report-only reported the repair as applied")
 	}
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	if plan.OriginalSHA256 != cliLegacySHA() {
+		t.Fatalf("plan does not carry the fingerprint an act needs: %q", plan.OriginalSHA256)
 	}
-	if string(after) != string(before) {
-		t.Fatal("default mode mutated the mailbox")
-	}
-	if _, err := os.Stat(path + ".seq"); !os.IsNotExist(err) {
-		t.Fatal("report-only consumed a sequence number")
-	}
-}
-
-// TestMailRepairSubcommandAppliesAndIsIdempotentlyRefused proves the applied
-// path lands and that re-running it cannot double-apply: once repaired, the
-// row is well-formed, so a second attempt refuses as ambiguous rather than
-// producing a duplicate delivery.
-func TestMailRepairSubcommandAppliesAndIsIdempotentlyRefused(t *testing.T) {
-	path := cliRepairMailbox(t)
-	mb := mail.NewMailbox(path)
-	plan, err := mb.RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774", Fingerprint: cliLegacySHA(), Act: true, Actor: "root", Reason: "2982",
-	})
-	if err != nil || !plan.Applied {
-		t.Fatalf("apply: plan=%+v err=%v", plan, err)
-	}
-	envs, err := mail.NewMailbox(path).ReadInbox("orchestrator")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(envs) != 1 || envs[0].ID != "cli-81751-1789141629774" {
-		t.Fatalf("repaired row is not deliverable: %+v", envs)
-	}
-	if _, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774", Fingerprint: cliLegacySHA(), Act: true, Actor: "root",
-	}); err == nil {
-		t.Fatal("a second repair of an already-repaired row must refuse, not duplicate it")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(string(data), "cli-81751-1789141629774"); got != 1 {
-		t.Fatalf("mailbox carries the id %d times after a refused second repair", got)
-	}
-}
-
-// TestMailRepairPlanIsMachineReadable pins the operator-facing contract: the
-// emitted plan carries both exact byte forms and their digests, so a reviewer
-// can verify what changed without trusting the tool's prose.
-func TestMailRepairPlanIsMachineReadable(t *testing.T) {
-	path := cliRepairMailbox(t)
-	plan, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, err := json.Marshal(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range []string{"original_line", "original_sha256", "repaired_line", "repaired_sha256", "assigned_sequence", "applied"} {
-		if _, ok := decoded[key]; !ok {
-			t.Fatalf("repair plan JSON is missing %q: %s", key, encoded)
-		}
-	}
-	if decoded["original_line"] != cliLegacyRow {
-		t.Fatal("plan did not carry the original bytes verbatim")
-	}
-}
-
-// TestMailRepairRefusesActWithoutFingerprint pins the operator contract at the
-// package boundary the CLI delegates to: acting is a compare-and-swap, so
-// there is no path that rewrites bytes nobody named.
-func TestMailRepairRefusesActWithoutFingerprint(t *testing.T) {
-	path := cliRepairMailbox(t)
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774", Act: true, Actor: "root",
-	}); err == nil {
-		t.Fatal("--act without --fingerprint must refuse")
+	if !strings.Contains(stderr, "REPORT ONLY") {
+		t.Fatalf("report-only did not say so on stderr: %q", stderr)
 	}
 	after, _ := os.ReadFile(path)
 	if string(after) != string(before) {
-		t.Fatal("a fingerprint-less act mutated the mailbox")
+		t.Fatal("report-only mutated the mailbox")
 	}
 }
 
-// The documented operator sequence must actually work end to end: report-only,
-// then act with the fingerprint that report emitted.
-func TestMailRepairReportThenActWithReportedFingerprint(t *testing.T) {
+func TestMailRepairCLIActAppliesAndReportsApplied(t *testing.T) {
 	path := cliRepairMailbox(t)
-	report, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774",
-	})
-	if err != nil {
-		t.Fatal(err)
+	code, stdout, stderr := runRepairCLI("--id", cliRepairID, "--mail", path,
+		"--fingerprint", cliLegacySHA(), "--actor", "root", "--reason", "824", "--act")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
 	}
-	if report.Applied || report.OriginalSHA256 == "" {
-		t.Fatalf("report-only did not hand back a usable fingerprint: %+v", report)
+	var plan mail.RepairPlan
+	if err := json.Unmarshal([]byte(stdout), &plan); err != nil {
+		t.Fatalf("stdout is not a decodable plan: %v", err)
 	}
-	applied, err := mail.NewMailbox(path).RepairMalformedRow(t.Context(), mail.RepairRequest{
-		ID: "cli-81751-1789141629774", Fingerprint: report.OriginalSHA256, Act: true, Actor: "root",
-	})
-	if err != nil || !applied.Applied {
-		t.Fatalf("act with the reported fingerprint failed: plan=%+v err=%v", applied, err)
+	if !plan.Applied || plan.Actor != "root" {
+		t.Fatalf("act did not report an attributed application: %+v", plan)
+	}
+	if strings.Contains(stderr, "REPORT ONLY") {
+		t.Fatal("an applied repair still printed the report-only notice")
+	}
+}
+
+// A provider refusal is exit 1, distinct from a usage error's 2.
+func TestMailRepairCLIProviderRefusalExitsOne(t *testing.T) {
+	path := cliRepairMailbox(t)
+	code, stdout, stderr := runRepairCLI("--id", cliRepairID, "--mail", path,
+		"--fingerprint", strings.Repeat("0", 64), "--actor", "root", "--act")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr: %s)", code, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("a refused repair still printed a plan: %s", stdout)
+	}
+	if !strings.Contains(stderr, "mail repair:") {
+		t.Fatalf("stderr does not attribute the refusal: %q", stderr)
+	}
+}
+
+// TestMailRepairRoutingHelper is the child half of the routing test. It runs
+// the real runMail dispatch, which may call os.Exit, so it must be a separate
+// process or a usage exit would abort the whole suite.
+func TestMailRepairRoutingHelper(t *testing.T) {
+	if os.Getenv("HERD_MAIL_REPAIR_ROUTING_HELPER") != "1" {
+		t.Skip("parent role: spawned by TestRunMailRoutesRepairSubcommand")
+	}
+	os.Args = append([]string{"herd", "mail", "repair"}, strings.Fields(os.Getenv("HERD_MAIL_REPAIR_ARGS"))...)
+	runMail()
+}
+
+// `herd mail repair` must actually be routed. Every other test here calls the
+// handler directly, so all of them would still pass if the dispatch case were
+// removed; this is the one that would not.
+func TestRunMailRoutesRepairSubcommand(t *testing.T) {
+	if os.Getenv("HERD_MAIL_REPAIR_ROUTING_HELPER") == "1" {
+		t.Skip("child role")
+	}
+	path := cliRepairMailbox(t)
+	for _, tc := range []struct {
+		name     string
+		args     string
+		wantCode int
+	}{
+		{"report-only routes and succeeds", "--id " + cliRepairID + " --mail " + path, 0},
+		{"usage error routes and exits 2", "--mail " + path, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run", "^TestMailRepairRoutingHelper$")
+			cmd.Env = append(os.Environ(),
+				"HERD_MAIL_REPAIR_ROUTING_HELPER=1",
+				"HERD_MAIL_REPAIR_ARGS="+tc.args,
+			)
+			out, err := cmd.CombinedOutput()
+			code := 0
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				code = exitErr.ExitCode()
+			} else if err != nil {
+				t.Fatalf("helper failed to run: %v\n%s", err, out)
+			}
+			if code != tc.wantCode {
+				t.Fatalf("routed exit = %d, want %d\n%s", code, tc.wantCode, out)
+			}
+			if tc.wantCode == 0 && !strings.Contains(string(out), cliRepairID) {
+				t.Fatalf("routed report did not emit a plan for the requested id:\n%s", out)
+			}
+		})
 	}
 }
