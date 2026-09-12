@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/process"
@@ -26,18 +27,18 @@ func agentIn(name, pane, status string) herdr.AgentEntry {
 }
 
 // stubProcessSources replaces the three read-only seams for one test.
-func stubProcessSources(t *testing.T, available bool, agents []herdr.AgentEntry, listErr error, read func(pane string, lines int) (string, error)) *int32 {
+func stubProcessSources(t *testing.T, available bool, agents []herdr.AgentEntry, listErr error, read func(ctx context.Context, pane string, lines int) (herdr.PaneObservation, error)) *int32 {
 	t.Helper()
 	var reads int32
 	prevAvail, prevList, prevRead := processHerdrAvailable, processAgentList, processPaneRead
 	processHerdrAvailable = func() bool { return available }
 	processAgentList = func(context.Context) ([]herdr.AgentEntry, error) { return agents, listErr }
-	processPaneRead = func(pane string, lines int) (string, error) {
+	processPaneRead = func(ctx context.Context, pane string, lines int) (herdr.PaneObservation, error) {
 		atomic.AddInt32(&reads, 1)
 		if read == nil {
-			return "", nil
+			return herdr.PaneObservation{}, nil
 		}
-		return read(pane, lines)
+		return read(ctx, pane, lines)
 	}
 	t.Cleanup(func() {
 		processHerdrAvailable, processAgentList, processPaneRead = prevAvail, prevList, prevRead
@@ -58,8 +59,8 @@ func TestProcessDigestReportsEveryRealPaneIdentity(t *testing.T) {
 		agentIn("reviewer-b", "wT:p2", "idle"),
 		agentIn("scout-c", "wT:p3", "done"),
 	}
-	reads := stubProcessSources(t, true, agents, nil, func(pane string, _ int) (string, error) {
-		return "tail for " + pane, nil
+	reads := stubProcessSources(t, true, agents, nil, func(_ context.Context, pane string, _ int) (herdr.PaneObservation, error) {
+		return herdr.PaneObservation{Text: "tail for " + pane}, nil
 	})
 	result, err := scan(t, defaultProcessScanLimits())
 	if err != nil {
@@ -148,11 +149,11 @@ func TestProcessDigestRosterFailureIsNotEmptySuccess(t *testing.T) {
 // quiet.
 func TestProcessDigestPaneReadFailureIsReportedNotSwallowed(t *testing.T) {
 	agents := []herdr.AgentEntry{agentIn("a", "wT:p1", "idle"), agentIn("b", "wT:p2", "idle")}
-	stubProcessSources(t, true, agents, nil, func(pane string, _ int) (string, error) {
+	stubProcessSources(t, true, agents, nil, func(_ context.Context, pane string, _ int) (herdr.PaneObservation, error) {
 		if pane == "wT:p2" {
-			return "", fmt.Errorf("herdr pane read %s: exit 1", pane)
+			return herdr.PaneObservation{}, fmt.Errorf("herdr pane read %s: exit 1", pane)
 		}
-		return "ok", nil
+		return herdr.PaneObservation{Text: "ok"}, nil
 	})
 	result, err := scan(t, defaultProcessScanLimits())
 	if err != nil {
@@ -169,38 +170,83 @@ func TestProcessDigestPaneReadFailureIsReportedNotSwallowed(t *testing.T) {
 	}
 }
 
-// A tool's JSON error envelope is not agent output. Classifying it would let a
-// TOOL failure be read as an AGENT verdict.
-func TestProcessDigestRejectsToolErrorEnvelopes(t *testing.T) {
-	for _, body := range []string{
-		`{"error":"pane not found"}`,
-		`{"ok":false,"result":null}`,
-		`  {"error":{"code":7,"message":"herdr failed"}}  `,
-	} {
-		t.Run(body, func(t *testing.T) {
-			if !isToolErrorEnvelope(body) {
-				t.Fatalf("envelope not recognised: %s", body)
-			}
-			stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
-				func(string, int) (string, error) { return body, nil })
+// A TRANSPORT failure is not agent output, and the distinction is made where
+// the envelope is decoded (pkg/herdr), not by sniffing decoded agent text here.
+//
+// The earlier version of this adapter inspected pane text for an "error" key.
+// That was wrong in both directions, so this fixture asserts both: a typed
+// transport error is reported and never classified, while a healthy pane whose
+// literal output IS {"error":...} stays ordinary agent content.
+func TestProcessDigestReportsTransportFailuresDistinctly(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"envelope", fmt.Errorf("herdr pane read wT:p1: %w: pane not found", herdr.ErrReadTransportEnvelope),
+			"pane read returned a transport error envelope"},
+		{"contradiction", fmt.Errorf("herdr pane read wT:p1: %w: boom", herdr.ErrReadTransportContradiction),
+			"pane read returned an error and a result together"},
+		{"oversized", fmt.Errorf("herdr pane read wT:p1: %w: stopped", herdr.ErrReadTransportOversized),
+			"pane read exceeded the transport byte bound and was stopped"},
+		{"ordinary", errors.New("exit status 1"), "pane read failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "done")}, nil,
+				func(context.Context, string, int) (herdr.PaneObservation, error) {
+					return herdr.PaneObservation{}, tc.err
+				})
 			result, err := scan(t, defaultProcessScanLimits())
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("one failed pane must not fail the sweep: %v", err)
 			}
 			if !result.Partial {
-				t.Fatal("a tool error envelope was accepted as agent output")
+				t.Fatal("a transport failure was not reported as partial")
 			}
-			if item := result.Digest.Items[0]; item.Tail != "" {
-				t.Fatalf("the envelope text reached classification as a tail: %+v", item)
+			if got := strings.Join(result.Unknowns, "; "); !strings.Contains(got, tc.want) {
+				t.Fatalf("reason = %q, want it to contain %q", got, tc.want)
+			}
+			// Irrespective of the roster still claiming "done", an unreadable
+			// pane classifies UNKNOWN: "I could not look" is not a verdict.
+			item := result.Digest.Items[0]
+			if item.Class != process.Unknown {
+				t.Fatalf("unreadable pane classified %s, want UNKNOWN", item.Class)
+			}
+			if item.Tail != "" {
+				t.Fatalf("transport failure text reached classification: %+v", item)
 			}
 		})
 	}
-	// The converse: ordinary agent output, and a plain JSON result envelope,
-	// must NOT be mistaken for an error.
-	for _, body := range []string{"build passed", `{"result":{"text":"done"}}`, `{"ok":true}`, ""} {
-		if isToolErrorEnvelope(body) {
-			t.Fatalf("ordinary output misread as a tool error: %q", body)
-		}
+}
+
+// The converse, at this layer: a pane whose own output is literally an error
+// object is agent content. It is classified, not reported as a tool failure.
+func TestProcessDigestLiteralErrorJSONFromAPaneIsAgentContent(t *testing.T) {
+	const body = `{"error":"example from the agent's own output"}`
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: body}, nil
+		})
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Partial {
+		t.Fatalf("literal agent JSON was misread as a transport failure: %v", result.Unknowns)
+	}
+	if len(result.Digest.Items) != 1 || result.Digest.Items[0].Tail == "" {
+		t.Fatalf("agent content did not reach classification: %+v", result.Digest.Items)
+	}
+}
+
+// transportFailureReason must classify by typed error, never by message text.
+func TestTransportFailureReasonIgnoresUntypedErrors(t *testing.T) {
+	if _, ok := transportFailureReason(nil); ok {
+		t.Fatal("nil reported as a transport failure")
+	}
+	if _, ok := transportFailureReason(errors.New("herdr read: transport reported an error")); ok {
+		t.Fatal("an untyped error with a matching MESSAGE was accepted as typed")
 	}
 }
 
@@ -248,7 +294,9 @@ func TestProcessDigestCapsPaneTextBeforeClassification(t *testing.T) {
 	limits := defaultProcessScanLimits()
 	limits.MaxTailBytes = 64
 	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
-		func(string, int) (string, error) { return huge, nil })
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: huge}, nil
+		})
 	result, err := scan(t, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +315,9 @@ func TestProcessDigestBoundsFanoutByPaneCap(t *testing.T) {
 	}
 	limits := defaultProcessScanLimits()
 	limits.MaxPanes = 5
-	reads := stubProcessSources(t, true, agents, nil, func(string, int) (string, error) { return "ok", nil })
+	reads := stubProcessSources(t, true, agents, nil, func(context.Context, string, int) (herdr.PaneObservation, error) {
+		return herdr.PaneObservation{Text: "ok"}, nil
+	})
 	result, err := scan(t, limits)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +336,9 @@ func TestProcessDigestCanceledSweepStopsAndReportsPartial(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		agents = append(agents, agentIn(fmt.Sprintf("agent-%d", i), fmt.Sprintf("wT:p%d", i), "idle"))
 	}
-	reads := stubProcessSources(t, true, agents, nil, func(string, int) (string, error) { return "ok", nil })
+	reads := stubProcessSources(t, true, agents, nil, func(context.Context, string, int) (herdr.PaneObservation, error) {
+		return herdr.PaneObservation{Text: "ok"}, nil
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := collectProcessDigest(ctx, testWorkspace, defaultProcessScanLimits())
@@ -308,7 +360,9 @@ func TestProcessDigestCanceledSweepStopsAndReportsPartial(t *testing.T) {
 // reported reason.
 func TestProcessDigestExpiredDeadlineStopsAndReportsPartial(t *testing.T) {
 	agents := []herdr.AgentEntry{agentIn("a", "wT:p1", "idle"), agentIn("b", "wT:p2", "idle")}
-	reads := stubProcessSources(t, true, agents, nil, func(string, int) (string, error) { return "ok", nil })
+	reads := stubProcessSources(t, true, agents, nil, func(context.Context, string, int) (herdr.PaneObservation, error) {
+		return herdr.PaneObservation{Text: "ok"}, nil
+	})
 	limits := defaultProcessScanLimits()
 	limits.Deadline = -time.Second // already expired before the first read
 	result, err := scan(t, limits)
@@ -331,7 +385,9 @@ func TestProcessDigestScopeIsExplicitAndNarrow(t *testing.T) {
 		{Name: "other-workspace", PaneID: "wB:p1", Status: "idle", Workspace: "wB"},
 		{Name: "unreported", PaneID: "wX:p1", Status: "idle"},
 	}
-	reads := stubProcessSources(t, true, agents, nil, func(string, int) (string, error) { return "ok", nil })
+	reads := stubProcessSources(t, true, agents, nil, func(context.Context, string, int) (herdr.PaneObservation, error) {
+		return herdr.PaneObservation{Text: "ok"}, nil
+	})
 	result, err := scan(t, defaultProcessScanLimits())
 	if err != nil {
 		t.Fatal(err)
@@ -375,5 +431,240 @@ func TestRenderProcessDigestTextStatesPartial(t *testing.T) {
 	}
 	if !strings.Contains(complete, "no agents in scope") {
 		t.Fatalf("an empty digest should say so:\n%s", complete)
+	}
+}
+
+// Truncation must not corrupt text. Slicing bytes mid-rune yields invalid
+// UTF-8, which json.Marshal silently rewrites to U+FFFD — the operator would
+// see mangled evidence with nothing saying so.
+func TestTruncateTailPreservesUTF8OrReportsIncomplete(t *testing.T) {
+	const multibyte = "αβγ日本語" // 2+2+2+3+3+3 = 15 bytes
+	if len(multibyte) != 15 {
+		t.Fatalf("fixture is %d bytes, expected 15", len(multibyte))
+	}
+
+	// A cap landing mid-rune moves the cut FORWARD to a rune boundary, so the
+	// result is shorter than the cap but always valid.
+	for _, capBytes := range []int{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14} {
+		got, truncated := truncateTail(multibyte, capBytes)
+		if !truncated {
+			t.Fatalf("cap %d: oversized text not reported truncated", capBytes)
+		}
+		if got == "" {
+			t.Fatalf("cap %d: a boundary exists within the cap but text was refused", capBytes)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("cap %d: truncation produced invalid UTF-8 %q", capBytes, got)
+		}
+		if len(got) > capBytes {
+			t.Fatalf("cap %d: kept %d bytes", capBytes, len(got))
+		}
+		if !strings.HasSuffix(multibyte, got) {
+			t.Fatalf("cap %d: %q is not a suffix of the pane text", capBytes, got)
+		}
+	}
+
+	// No boundary within the cap: report incomplete rather than emit a
+	// fragment of a rune.
+	for _, capBytes := range []int{1, 2} {
+		got, truncated := truncateTail(multibyte, capBytes)
+		if !truncated || got != "" {
+			t.Fatalf("cap %d: want incomplete (\"\", true), got (%q, %v)", capBytes, got, truncated)
+		}
+	}
+
+	// The sweep reports that case as partial and as an explicit incomplete
+	// value, not as a quietly short tail.
+	limits := defaultProcessScanLimits()
+	limits.MaxTailBytes = 1
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: multibyte}, nil
+		})
+	result, err := scan(t, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial {
+		t.Fatal("an unusable truncation did not mark the digest partial")
+	}
+	if got := strings.Join(result.Unknowns, "; "); !strings.Contains(got, "no UTF-8 boundary within 1 bytes") {
+		t.Fatalf("incomplete tail not reported explicitly: %q", got)
+	}
+}
+
+// --lines is user input. An arbitrary positive integer would walk past the
+// bound the sweep exists to hold, and a negative one is a mistake, not a hint.
+func TestResolveProcessLinesRejectsInvalidAndCapsDepth(t *testing.T) {
+	if _, _, err := resolveProcessLines(-1, 50); !errors.Is(err, errProcessBadLines) {
+		t.Fatalf("negative --lines accepted: %v", err)
+	}
+	got, clamped, err := resolveProcessLines(0, 50)
+	if err != nil || clamped || got != 50 {
+		t.Fatalf("unset --lines = (%d, %v, %v), want the default", got, clamped, err)
+	}
+	got, clamped, err = resolveProcessLines(10, 50)
+	if err != nil || clamped || got != 10 {
+		t.Fatalf("narrowing --lines = (%d, %v, %v)", got, clamped, err)
+	}
+	got, clamped, err = resolveProcessLines(100000, 50)
+	if err != nil || !clamped || got != maxProcessPaneLines {
+		t.Fatalf("oversized --lines = (%d, %v, %v), want a clamp to %d", got, clamped, err, maxProcessPaneLines)
+	}
+}
+
+// The sweep bound must be finite on every path through the flag.
+func TestResolveProcessDeadlineIsAlwaysFiniteAndBounded(t *testing.T) {
+	if _, _, err := resolveProcessDeadline(-time.Second, 30*time.Second); !errors.Is(err, errProcessBadDeadline) {
+		t.Fatalf("negative --deadline accepted: %v", err)
+	}
+	for _, requested := range []time.Duration{0, time.Millisecond, time.Second, 30 * time.Second, time.Hour, 1 << 62} {
+		got, _, err := resolveProcessDeadline(requested, 30*time.Second)
+		if err != nil {
+			t.Fatalf("--deadline %s: %v", requested, err)
+		}
+		if got <= 0 || got > maxProcessDeadline {
+			t.Fatalf("--deadline %s resolved to %s, outside (0, %s]", requested, got, maxProcessDeadline)
+		}
+	}
+}
+
+// The failure REASON names the class; the detail is herdr's own message and is
+// the operator's only clue about why. It is carried, bounded and on one line.
+func TestProcessDigestCarriesTheTransportDetail(t *testing.T) {
+	readErr := fmt.Errorf("herdr pane read wT:p1: %w: pane wT:p1 is gone\nexit status 3",
+		herdr.ErrReadTransportEnvelope)
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{}, readErr
+		})
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(result.Unknowns, "; ")
+	if !strings.Contains(got, "pane wT:p1 is gone") {
+		t.Fatalf("the transport message was dropped: %q", got)
+	}
+	if !strings.Contains(got, "exit status 3") {
+		t.Fatalf("the exit status was dropped: %q", got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("a multi-line reason would break the one-unknown-per-line report: %q", got)
+	}
+}
+
+// errDetail bounds an arbitrarily long message and never emits invalid UTF-8.
+func TestErrDetailIsBoundedSingleLineAndValid(t *testing.T) {
+	if got := errDetail(nil); got != "" {
+		t.Fatalf("errDetail(nil) = %q", got)
+	}
+	if got := errDetail(errors.New("a\nb\tc   d")); got != "a b c d" {
+		t.Fatalf("whitespace not collapsed: %q", got)
+	}
+	long := errors.New(strings.Repeat("日", 400)) // 1200 bytes
+	got := errDetail(long)
+	if len(got) > maxUnknownDetailBytes+len("...") {
+		t.Fatalf("detail is %d bytes, past the %d bound", len(got), maxUnknownDetailBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("detail is not valid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("a truncated detail must say so: %q", got)
+	}
+}
+
+// Legacy raw text is classified — dropping real evidence would be worse — but
+// the digest says the classification is unverified and refuses to call itself
+// complete. A silent healthy verdict from an unverified payload is exactly the
+// failure the envelope validation exists to prevent.
+func TestProcessDigestMarksUnverifiedPaneTextPartial(t *testing.T) {
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: "PASS: 12 tests", Unverified: true}, nil
+		})
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial {
+		t.Fatal("unverified pane text produced a digest that called itself complete")
+	}
+	if got := strings.Join(result.Unknowns, "; "); !strings.Contains(got, "classification is unverified") {
+		t.Fatalf("the ambiguity was not made explicit: %q", got)
+	}
+	// The text is still classified: refusing it would discard real evidence.
+	if len(result.Digest.Items) != 1 || result.Digest.Items[0].Tail == "" {
+		t.Fatalf("unverified text was dropped instead of flagged: %+v", result.Digest.Items)
+	}
+}
+
+// herdr's OWN truncation flag is separate from this sweep's byte cap, and is
+// reported rather than dropped: a verdict may be missing for that reason alone.
+func TestProcessDigestReportsHerdrsOwnTruncation(t *testing.T) {
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: "...tail", Truncated: true}, nil
+		})
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial {
+		t.Fatal("a herdr-truncated tail produced a complete digest")
+	}
+	if got := strings.Join(result.Unknowns, "; "); !strings.Contains(got, "herdr reported the pane tail as truncated") {
+		t.Fatalf("herdr's truncation flag was dropped: %q", got)
+	}
+}
+
+// A verified, untruncated read stays clean — the flags above must not make
+// every sweep partial.
+func TestProcessDigestVerifiedReadStaysComplete(t *testing.T) {
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: "PASS: 12 tests"}, nil
+		})
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Partial || len(result.Unknowns) != 0 {
+		t.Fatalf("a clean read was reported partial: %v", result.Unknowns)
+	}
+}
+
+// The new transport failure kinds each get a distinct reason, and each leaves
+// the pane UNKNOWN rather than letting stale roster status stand in for one.
+func TestProcessDigestNamesStructuredTransportFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"malformed", herdr.ErrReadTransportMalformed, "structured response that could not be decoded"},
+		{"unsupported body", herdr.ErrReadTransportUnsupportedResult, "unsupported result body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			readErr := fmt.Errorf("herdr pane read wT:p1: %w: detail", tc.err)
+			stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "done")}, nil,
+				func(context.Context, string, int) (herdr.PaneObservation, error) {
+					return herdr.PaneObservation{}, readErr
+				})
+			result, err := scan(t, defaultProcessScanLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Partial {
+				t.Fatal("a structured transport failure was not reported as partial")
+			}
+			if got := strings.Join(result.Unknowns, "; "); !strings.Contains(got, tc.want) {
+				t.Fatalf("reason = %q, want it to contain %q", got, tc.want)
+			}
+			if item := result.Digest.Items[0]; item.Class != process.Unknown {
+				t.Fatalf("classified %s despite a failed read, want UNKNOWN", item.Class)
+			}
+		})
 	}
 }

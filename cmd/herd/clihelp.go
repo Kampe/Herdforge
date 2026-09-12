@@ -329,7 +329,7 @@ Commands:
 		"  Warm review-surface pool. release frees a held lease; list shows current holders.\n" +
 		"  A lease taken for a review must be released when that review settles, or the\n" +
 		"  surface stays held and the next exact SHA on the same branch cannot get one.",
-	"process":      "Usage: herd process [flags]\n  Process-engine inspection.",
+	"process":      "Usage: herd process [--json] [--workspace WS] [--lines N] [--deadline D]\n  Read-only fleet digest: classifies live pane text as advisory evidence.\n  --workspace  herdr workspace scope (default: fleet.herdr_workspace; required)\n  --lines      pane tail depth per agent (capped at 50)\n  --deadline   hard bound on the whole sweep (capped at 5m, default 30s)\n  Exits nonzero when the sweep is partial. A classification is evidence\n  about text, never authority to act on the agent it describes.",
 	"resolve-lane": "Usage: herd resolve-lane [flags]\n  Resolve canonical lane identity.",
 	"route":        "Usage: herd route [flags]\n  Model / surface routing helpers.",
 	"kick":         "Usage: herd kick [flags]\n  Nudge a stalled lane / agent; --cadence throttles repeat kicks and --repair bypasses freeze.",

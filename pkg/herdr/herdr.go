@@ -1572,23 +1572,37 @@ func IsAvailable() bool {
 
 // AgentListContext returns all agents managed by herdr bounded by the provided context.
 func AgentListContext(ctx context.Context) ([]AgentEntry, error) {
-	output, err := runHerdrContext(ctx, "agent", "list")
+	// Bounded read transport (FAC-36): the roster is an observation, so it gets
+	// the same finite byte ceiling and owned-child cancellation as a pane read.
+	output, err := runHerdrReadContext(ctx, DefaultReadTransportLimit, "agent", "list")
 	if err != nil {
 		return nil, fmt.Errorf("herdr agent list: %w", err)
 	}
-	var resp struct {
-		Result struct {
-			Agents []AgentEntry `json:"agents"`
-			Type   string       `json:"type"`
-		} `json:"result"`
+	// Validate the TRANSPORT before trusting anything inside it. Checking only
+	// that result.agents was non-nil let an error envelope that also carried a
+	// result array be consumed as a roster.
+	result, isEnvelope, decodeErr := decodeHerdrTransport(output)
+	if decodeErr != nil {
+		return nil, fmt.Errorf("herdr agent list: %w", decodeErr)
 	}
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing agent list: %s: %w", output, err)
+	if !isEnvelope {
+		// Output that never claimed to be a structured reply. A pane read can
+		// still use such text (flagged unverified); a ROSTER cannot, because
+		// there is nothing to parse and an empty result here would read as an
+		// empty fleet.
+		return nil, fmt.Errorf("herdr agent list: %w: response is not a transport envelope", ErrReadTransportEnvelope)
 	}
-	if resp.Result.Agents == nil {
+	var body struct {
+		Agents []AgentEntry `json:"agents"`
+		Type   string       `json:"type"`
+	}
+	if err := json.Unmarshal(result, &body); err != nil {
+		return nil, fmt.Errorf("parsing agent list: %w: %v", ErrReadTransportUnsupportedResult, err)
+	}
+	if body.Agents == nil {
 		return nil, fmt.Errorf("herdr agent list returned no agents inventory")
 	}
-	return resp.Result.Agents, nil
+	return body.Agents, nil
 }
 
 // AgentList returns all agents managed by herdr.

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/process"
@@ -32,7 +33,7 @@ import (
 var (
 	processHerdrAvailable = herdr.IsAvailable
 	processAgentList      = herdr.AgentListContext
-	processPaneRead       = herdr.PaneRead
+	processPaneRead       = herdr.PaneReadContext
 )
 
 // processScanLimits bounds the sweep. Every field is a hard ceiling, not a
@@ -45,10 +46,33 @@ type processScanLimits struct {
 	Lines int
 	// MaxTailBytes truncates each pane tail before classification.
 	MaxTailBytes int
-	// Deadline bounds the whole sweep. It is checked before each pane read;
-	// herdr.PaneRead itself takes no context, so this stops issuing further
-	// reads rather than cancelling one already in flight.
+	// Deadline bounds the whole sweep. The single sweep context carrying it is
+	// passed through the roster read AND every pane read, so a read that hangs
+	// is cancelled inside the child rather than merely skipped afterwards.
 	Deadline time.Duration
+}
+
+// processDigestEnvelope is the JSON surface: the existing Digest fields
+// verbatim, plus additive machine-readable partial/error information. The
+// original keys are unchanged so existing consumers keep working, and a
+// consumer that only reads them still sees exactly what it saw before — but
+// nothing forces an operator to parse stderr to learn the sweep was incomplete.
+type processDigestEnvelope struct {
+	process.Digest
+	Partial   bool     `json:"partial,omitempty"`
+	PaneReads int      `json:"pane_reads"`
+	Skipped   int      `json:"skipped,omitempty"`
+	Unknowns  []string `json:"unknowns,omitempty"`
+}
+
+func newProcessDigestEnvelope(result processScanResult) processDigestEnvelope {
+	return processDigestEnvelope{
+		Digest:    result.Digest,
+		Partial:   result.Partial,
+		PaneReads: result.PaneReads,
+		Skipped:   result.Skipped,
+		Unknowns:  result.Unknowns,
+	}
 }
 
 func defaultProcessScanLimits() processScanLimits {
@@ -88,43 +112,95 @@ func resolveProcessWorkspace(flagValue, configured string) (string, error) {
 	return "", errProcessNoWorkspace
 }
 
-// isToolErrorEnvelope reports whether pane text is a tool's JSON error payload
-// rather than agent output.
+// transportFailureReason names a TRANSPORT failure, as distinct from an agent
+// whose own output merely looks like one.
 //
-// herdr.PaneRead falls back to returning the raw body when it cannot decode a
-// known envelope, so an error envelope arrives looking exactly like agent text.
-// Classifying it would let a TOOL failure be read as an AGENT verdict — the
-// error string mentioning "failed" would classify FAIL for an agent that may be
-// perfectly healthy.
-func isToolErrorEnvelope(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	if !strings.HasPrefix(trimmed, "{") {
-		return false
+// An earlier version inspected the decoded AGENT TEXT for an "error" key, which
+// is the wrong layer in both directions: a healthy pane whose literal output is
+// {"error":"example"} was mislabelled a tool failure, while a real error
+// envelope carrying a result array was consumed as data. The distinction now
+// lives in pkg/herdr, where the envelope is decoded before any agent text is
+// extracted, and arrives here as a typed error.
+func transportFailureReason(err error) (string, bool) {
+	switch {
+	case err == nil:
+		return "", false
+	case errors.Is(err, herdr.ErrReadTransportContradiction):
+		return "pane read returned an error and a result together", true
+	case errors.Is(err, herdr.ErrReadTransportEnvelope):
+		return "pane read returned a transport error envelope", true
+	case errors.Is(err, herdr.ErrReadTransportOversized):
+		return "pane read exceeded the transport byte bound and was stopped", true
+	case errors.Is(err, herdr.ErrReadTransportMalformed):
+		return "pane read returned a structured response that could not be decoded", true
+	case errors.Is(err, herdr.ErrReadTransportUnsupportedResult):
+		return "pane read returned an unsupported result body", true
 	}
-	var envelope struct {
-		Error  json.RawMessage `json:"error"`
-		OK     *bool           `json:"ok"`
-		Result json.RawMessage `json:"result"`
-	}
-	if json.Unmarshal([]byte(trimmed), &envelope) != nil {
-		return false
-	}
-	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
-		return true
-	}
-	if envelope.OK != nil && !*envelope.OK {
-		return true
-	}
-	return false
+	return "", false
 }
 
-// truncateTail bounds one pane's text. The cap is applied before
-// classification so a runaway pane cannot make the digest unbounded.
+// maxProcessPaneLines is the ceiling on user-supplied tail depth. --lines may
+// narrow the default, never widen past it: an arbitrary positive integer would
+// otherwise walk straight past the bound the sweep is supposed to hold.
+const maxProcessPaneLines = 50
+
+// maxUnknownDetailBytes bounds the transport message carried alongside a
+// failure reason. The reason names the CLASS of failure; the detail is herdr's
+// own message, and it is often the only clue an operator has about WHY a pane
+// could not be read. Dropping it to keep the digest tidy would be tidiness
+// bought with the operator's diagnosis.
+const maxUnknownDetailBytes = 240
+
+// errDetail renders an error as one bounded, single-line, valid-UTF-8 string.
+func errDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if len(msg) <= maxUnknownDetailBytes {
+		return msg
+	}
+	cut := msg[:maxUnknownDetailBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "..."
+}
+
+var errProcessBadLines = errors.New("herd process: --lines must be a positive integer")
+
+// resolveProcessLines validates and caps the requested depth.
+func resolveProcessLines(requested, def int) (int, bool, error) {
+	if requested == 0 {
+		return def, false, nil
+	}
+	if requested < 0 {
+		return 0, false, errProcessBadLines
+	}
+	if requested > maxProcessPaneLines {
+		return maxProcessPaneLines, true, nil
+	}
+	return requested, false, nil
+}
+
+// truncateTail bounds one pane's text before classification, keeping the END
+// where a verdict appears.
+//
+// The cut is moved back to a rune boundary. Slicing bytes mid-rune produces
+// invalid UTF-8, which json.Marshal silently rewrites to U+FFFD — a quiet
+// corruption of the operator's evidence. If a boundary cannot be found within
+// the cap the text is reported as unusable rather than emitted corrupt.
 func truncateTail(text string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len(text) <= maxBytes {
 		return text, false
 	}
-	return text[len(text)-maxBytes:], true
+	cut := text[len(text)-maxBytes:]
+	for i := 0; i < len(cut) && i < utf8.UTFMax; i++ {
+		if utf8.ValidString(cut[i:]) {
+			return cut[i:], true
+		}
+	}
+	return "", true
 }
 
 // inScope reports whether an agent belongs to the requested workspace. An agent
@@ -201,25 +277,58 @@ func collectProcessDigest(ctx context.Context, workspace string, limits processS
 		}
 
 		result.PaneReads++
-		text, readErr := processPaneRead(agent.PaneID, limits.Lines)
+		observation, readErr := processPaneRead(ctx, agent.PaneID, limits.Lines)
+		text := observation.Text
 		switch {
 		case readErr != nil:
+			reason, isTransport := transportFailureReason(readErr)
+			if !isTransport {
+				reason = "pane read failed"
+			}
 			result.Partial = true
-			result.Unknowns = append(result.Unknowns, fmt.Sprintf("%s: pane read failed", agent.Name))
-			text = ""
-		case isToolErrorEnvelope(text):
-			result.Partial = true
-			result.Unknowns = append(result.Unknowns, fmt.Sprintf("%s: pane read returned a tool error envelope", agent.Name))
+			note := fmt.Sprintf("%s: %s", agent.Name, reason)
+			if detail := errDetail(readErr); detail != "" {
+				note = fmt.Sprintf("%s (%s)", note, detail)
+			}
+			result.Unknowns = append(result.Unknowns, note)
 			text = ""
 		default:
+			// A reply that never claimed to be a structured herdr response is
+			// usable text with nothing behind it. It is classified — dropping
+			// it would lose real evidence — but the digest says so and does
+			// not call itself complete. A silent healthy classification from
+			// an unverified payload is exactly the failure mode the envelope
+			// validation exists to prevent.
+			if observation.Unverified {
+				result.Partial = true
+				result.Unknowns = append(result.Unknowns,
+					fmt.Sprintf("%s: pane text was not a herdr transport response; classification is unverified", agent.Name))
+			}
+			// herdr's OWN truncation flag, distinct from this sweep's cap: the
+			// tail is short because herdr cut it, and a verdict may be missing
+			// for that reason alone.
+			if observation.Truncated {
+				result.Partial = true
+				result.Unknowns = append(result.Unknowns,
+					fmt.Sprintf("%s: herdr reported the pane tail as truncated", agent.Name))
+			}
 			var truncated bool
 			text, truncated = truncateTail(text, limits.MaxTailBytes)
 			if truncated {
-				result.Unknowns = append(result.Unknowns, fmt.Sprintf("%s: pane tail truncated to %d bytes", agent.Name, limits.MaxTailBytes))
+				note := fmt.Sprintf("%s: pane tail truncated to %d bytes", agent.Name, limits.MaxTailBytes)
+				if text == "" {
+					// No rune boundary inside the cap: report incomplete rather
+					// than hand the classifier corrupt bytes.
+					note = fmt.Sprintf("%s: pane tail incomplete; no UTF-8 boundary within %d bytes", agent.Name, limits.MaxTailBytes)
+					result.Partial = true
+				}
+				result.Unknowns = append(result.Unknowns, note)
 			}
 		}
 		// Classification stays advisory and unchanged: the same function the
-		// unit tests already cover, fed real text instead of a fixture.
+		// unit tests already cover, fed real text instead of a fixture. An
+		// unreadable pane reaches it with empty text, so it classifies UNKNOWN
+		// regardless of whatever the roster's status field still claims.
 		result.Digest.Items = append(result.Digest.Items,
 			process.ClassifyTarget(agent.PaneID, agent.Name, agent.Status, text))
 	}
@@ -245,4 +354,29 @@ func renderProcessDigestText(result processScanResult) string {
 		fmt.Fprintf(&b, "PARTIAL: this digest does not describe every in-scope pane\n")
 	}
 	return b.String()
+}
+
+// maxProcessDeadline is the ceiling on the sweep bound. --deadline exists so an
+// operator (and the subprocess fixtures) can tighten the sweep; it may never
+// widen it past this, because the point of the bound is that it is finite and
+// known, not caller-supplied.
+const maxProcessDeadline = 5 * time.Minute
+
+var errProcessBadDeadline = errors.New("herd process: --deadline must be a positive duration")
+
+// resolveProcessDeadline validates and caps the requested sweep bound. The
+// returned duration always satisfies 0 < d <= maxProcessDeadline, so the single
+// sweep context handed to the roster read and every pane read is finite on
+// every path through the flag.
+func resolveProcessDeadline(requested, def time.Duration) (time.Duration, bool, error) {
+	if requested == 0 {
+		return def, false, nil
+	}
+	if requested < 0 {
+		return 0, false, errProcessBadDeadline
+	}
+	if requested > maxProcessDeadline {
+		return maxProcessDeadline, true, nil
+	}
+	return requested, false, nil
 }
