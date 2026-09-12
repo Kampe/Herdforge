@@ -114,6 +114,32 @@ jobs:
           command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
           scripts/verify-process-digest-guards.zsh
 
+      # Same bounded retention pattern as the manifest budget controls, and the
+      # same trap it fell into: .verify-process-digest-logs/ is a HIDDEN
+      # directory, and upload-artifact excludes hidden paths by default, so
+      # without include-hidden-files every run would upload nothing, warn
+      # instead of failing, and leave a green receipt describing controls whose
+      # raw output survived nowhere.
+      #
+      # if: always() is the point of the step -- the summary and the raw
+      # `go test -json` streams are worth most precisely when the controls
+      # FAILED. A missing log set is an error, not a warning: evidence that did
+      # not survive must not be reportable as green.
+      #
+      # Bounded by construction: the driver writes one summary plus, per
+      # mutant, one compile log and one focused event stream, and the selectors
+      # exclude the subprocess fixtures, so the set stays small. Seven-day
+      # retention, one already-controlled path, no glob broadened.
+      - name: Upload process digest control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-process-digest-logs
+          path: .verify-process-digest-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
