@@ -34,6 +34,12 @@
 # The pool-side controls do not depend on runner load: the herdfixture census
 # seam pins the PSI, swap and headroom inputs those arms read, so a mutant
 # cannot be refused by a busy runner instead of by the guard under test.
+# fixture-census-pin-removed is the control for that seam itself.
+#
+# LIMIT worth knowing: that one control mutates a herdfixture-TAGGED file, which
+# `go test -c` does not compile without the tag. Its compile step therefore
+# proves the untagged package builds, not the mutant; a syntax error there would
+# surface as BROKEN-RUN from the subprocess build instead of COMPILE-FAIL.
 #
 # All mutation happens in one ephemeral detached worktree this invocation
 # creates and owns. The invoking checkout is never written to, and this script
@@ -56,13 +62,13 @@ resources_pkg=./pkg/resources/
 herd_pkg=./cmd/herd/
 
 resources_run='TestCPUAndMemoryRefuseIndependently|TestHealthyAdmitsAtTheReserveBoundary|TestKernelPressureRefusesRegardlessOfFreePercent|TestConsumerPolicyEnforcesWhatFreshnessDoesNot|TestUnknownObservationsRefuse|TestStaleObservationsRefuse'
-herd_run='TestCapacityRefusesWithoutAnAdmission|TestCapacityAndResourcesRefuseTogether|TestCapacityAdmitsHealthyHost|TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation|TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease'
+herd_run='TestCapacityRefusesWithoutAnAdmission|TestCapacityAndResourcesRefuseTogether|TestCapacityAdmitsHealthyHost|TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation|TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease|TestFixtureCensusPinsEveryPostAdmissionInput'
 
 # Every baseline run must show these EXACT tests passing at top level. Exit 0
 # alone is not a baseline: a selector that matched nothing, or a run whose
 # positive control skipped, also exits 0.
 resources_expect='TestCPUAndMemoryRefuseIndependently TestHealthyAdmitsAtTheReserveBoundary TestKernelPressureRefusesRegardlessOfFreePercent TestConsumerPolicyEnforcesWhatFreshnessDoesNot TestUnknownObservationsRefuse TestStaleObservationsRefuse'
-herd_expect='TestCapacityRefusesWithoutAnAdmission TestCapacityAndResourcesRefuseTogether TestCapacityAdmitsHealthyHost TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease'
+herd_expect='TestCapacityRefusesWithoutAnAdmission TestCapacityAndResourcesRefuseTogether TestCapacityAdmitsHealthyHost TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease TestFixtureCensusPinsEveryPostAdmissionInput'
 
 # Finite, explicit, and bounded at both ends before any arithmetic: an absurd or
 # overflowing override must be rejected, not added to.
@@ -355,6 +361,7 @@ mutations=(
 "capacity-ignores-unknown-host${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/not-a-known-host${sep}an unsafe host must refuse the launch"
 "capacity-ignores-memory-pressure${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/memory-pressure${sep}an unsafe host must refuse the launch"
 "capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: paired, so the nil case cannot be dereferenced${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted"
+"fixture-census-pin-removed${sep}cmd/herd/capacity_shared_admission_fixture.go${sep}	o.MemAvailMiB = fixtureMemAvailMiB${sep}	_ = fixtureMemAvailMiB // MUTANT: headroom pin removed, the arm reads the runner again${sep}${sep}${sep}${herd_pkg}${sep}TestFixtureCensusPinsEveryPostAdmissionInput${sep}this arm still reads the runner's census"
 )
 
 note "pin $pin"
