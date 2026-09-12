@@ -87,6 +87,27 @@ jobs:
         env:
           CHAINSEER_BIN: chainseer/bin
 
+      # FAC-36: the `herd process` read path is defended almost entirely by
+      # NEGATIVE assertions -- the sweep is bounded, a broken roster is not an
+      # empty fleet, a transport error is not a verdict, a cut tail is not a
+      # complete digest. A negative assertion that never sees its guard removed
+      # proves nothing, so this step removes each one from the REAL source, in
+      # its own ephemeral worktree, and requires the named test to fail on its
+      # named assertion. A mutant that does not compile is BROKEN-RUN, not a
+      # kill.
+      #
+      # Finite and explicit. The driver bounds each compile and each serial
+      # package run itself; this is the outer ceiling so a wedged step cannot
+      # hold a runner. Five mutants, each one compile plus one anchored run,
+      # plus two package baselines and two restored runs, all serial. The
+      # subprocess CLI fixtures are deliberately outside its selectors: they
+      # build the whole binary, and the ordinary test job already runs them.
+      - name: Verify process digest guard controls
+        timeout-minutes: 45
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-process-digest-guards.zsh
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
