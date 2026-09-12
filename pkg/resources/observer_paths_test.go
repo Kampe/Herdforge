@@ -60,7 +60,7 @@ func TestObserverLockScopeIsReportedHonestly(t *testing.T) {
 	})
 
 	t.Run("every scope explains itself", func(t *testing.T) {
-		for _, scope := range []ObserverScope{ScopeSameUserHost, ScopeStateRoot, ScopeRepository} {
+		for _, scope := range []ObserverScope{ScopeSameUserHost, ScopeStateRoot, ScopePerCheckout, ScopeInjected} {
 			explanation := ObserverScopeExplanation(scope)
 			if strings.TrimSpace(explanation) == "" {
 				t.Fatalf("scope %q has no explanation to publish", scope)
@@ -68,6 +68,18 @@ func TestObserverLockScopeIsReportedHonestly(t *testing.T) {
 			if strings.Contains(explanation, "unknown scope") {
 				t.Fatalf("scope %q fell through to the unknown-scope text", scope)
 			}
+		}
+	})
+
+	t.Run("the per-checkout label does not claim a canonical root", func(t *testing.T) {
+		// The fallback path is relative, so it resolves inside whichever
+		// checkout runs it. Calling that "canonical-repository" would imply a
+		// single resolved root that does not exist.
+		if strings.Contains(string(ScopePerCheckout), "canonical") {
+			t.Fatalf("scope %q claims a canonical root it does not resolve", ScopePerCheckout)
+		}
+		if !strings.Contains(ObserverScopeExplanation(ScopePerCheckout), "another checkout") {
+			t.Fatalf("the per-checkout explanation does not say another checkout gets its own lock")
 		}
 	})
 
@@ -86,6 +98,12 @@ func TestObserverLockScopeIsReportedHonestly(t *testing.T) {
 func TestObserverPathsHaveNoCallerOverride(t *testing.T) {
 	t.Setenv("HERD_STATE_DIR", t.TempDir())
 	cfg := DefaultObserverConfig()
+	if ObserverLockID() == cfg.LockPath {
+		t.Fatalf("the published lock id %q is the runtime path; it must be logical", ObserverLockID())
+	}
+	if filepath.IsAbs(ObserverLockID()) {
+		t.Fatalf("the published lock id %q is absolute", ObserverLockID())
+	}
 	if cfg.LockPath != ObserverLockPath() {
 		t.Fatalf("default lock path %q is not the canonical %q", cfg.LockPath, ObserverLockPath())
 	}

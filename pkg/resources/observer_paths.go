@@ -40,11 +40,20 @@ const (
 	// gives: exclusivity across everything sharing that root, and nothing
 	// beyond it. Two shells exporting different roots get two observers.
 	ScopeStateRoot ObserverScope = "configured-state-root"
-	// ScopeRepository is the narrow fallback used when no home directory can
-	// be resolved. Exclusivity covers this checkout only. It is reported as
-	// such rather than dressed up.
-	ScopeRepository ObserverScope = "canonical-repository"
+	// ScopePerCheckout is the narrow fallback used when no home directory can
+	// be resolved. The path is relative, so it resolves inside whichever
+	// checkout the process runs in: exclusivity covers THAT checkout and
+	// nothing else. It is named for what it does rather than for the
+	// canonical root it is not.
+	ScopePerCheckout ObserverScope = "per-checkout"
+	// ScopeInjected is what a caller-supplied path buys: exclusivity over that
+	// exact file and no claim beyond it. Tests inject; production does not.
+	ScopeInjected ObserverScope = "injected-path"
 )
+
+// ObserverLockID is the LOGICAL name of the observer lock, safe to publish.
+// It identifies which lock is meant without disclosing where the host keeps it.
+func ObserverLockID() string { return observerDirName + "/" + observerLockName }
 
 // observerRoot resolves the canonical observer directory and says which scope
 // that resolution actually bought.
@@ -64,7 +73,7 @@ func observerRoot() (string, ObserverScope) {
 	// home directory. A relative path is per-checkout, so the honest scope is
 	// the narrow one.
 	if !filepath.IsAbs(base) {
-		return filepath.Join(observerFallbackSubdir, observerDirName), ScopeRepository
+		return filepath.Join(observerFallbackSubdir, observerDirName), ScopePerCheckout
 	}
 	return dir, ScopeSameUserHost
 }
@@ -89,9 +98,10 @@ func ObserverStatusPath() string {
 	return filepath.Join(dir, observerStatusName)
 }
 
-// ObserverLockScope reports the exclusivity actually in force, for publication
-// alongside the observation. A consumer reading "canonical-repository" knows a
-// second observer may be running elsewhere on this host.
+// ObserverLockScope reports the exclusivity actually in force for the CANONICAL
+// paths, for publication alongside the observation. Any scope other than
+// same-user-host tells a consumer that a second observer may be running
+// elsewhere on this host.
 func ObserverLockScope() ObserverScope {
 	_, scope := observerRoot()
 	return scope
@@ -104,8 +114,10 @@ func ObserverScopeExplanation(scope ObserverScope) string {
 		return "exclusive for this user on this host: every worktree and clone resolves the same lock"
 	case ScopeStateRoot:
 		return "exclusive across the configured HERD_STATE_DIR/XDG_STATE_HOME root only; a different root elsewhere would run a second observer"
-	case ScopeRepository:
-		return "exclusive for this checkout only: no home directory could be resolved, so the lock is repository-relative"
+	case ScopePerCheckout:
+		return "exclusive for the checkout this process runs in: no home directory could be resolved, so the lock path is relative and another checkout gets its own"
+	case ScopeInjected:
+		return "exclusive over the injected path only: no host-wide or cross-worktree singleton is claimed"
 	}
 	return "unknown scope: treat exclusivity as unproven"
 }

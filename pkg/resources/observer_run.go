@@ -38,6 +38,15 @@ func RunObserver(ctx context.Context, cfg ObserverConfig, lockProvider LockProvi
 		lockProvider = FileLockProvider{}
 	}
 
+	// The scope published with every observation must describe the path that
+	// is actually locked. A configuration carrying anything other than the
+	// canonical paths is reported as injected, with no singleton claim: a test
+	// seam must never be able to publish a stronger guarantee than it bought.
+	scope := ObserverLockScope()
+	if cfg.LockPath != ObserverLockPath() || cfg.StatusPath != ObserverStatusPath() {
+		scope = ScopeInjected
+	}
+
 	lock, err := lockProvider.Acquire(ctx, cfg.LockPath, cfg.LockWait, observerLockRetry)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -46,8 +55,8 @@ func RunObserver(ctx context.Context, cfg ObserverConfig, lockProvider LockProvi
 		// The lock is held, unsupported, or unusable. Every one of those is a
 		// refusal to start, never a reason to run unlocked: an unlocked
 		// observer would publish over whichever one already owns the file.
-		return ObserverStatus{}, fmt.Errorf("%w (%s, %s): %v",
-			ErrObserverBusy, cfg.LockPath, ObserverScopeExplanation(ObserverLockScope()), err)
+		return ObserverStatus{}, fmt.Errorf("%w (%s, scope %s: %s): %v",
+			ErrObserverBusy, ObserverLockID(), scope, ObserverScopeExplanation(scope), err)
 	}
 	defer func() {
 		if lock != nil {
@@ -55,26 +64,34 @@ func RunObserver(ctx context.Context, cfg ObserverConfig, lockProvider LockProvi
 		}
 	}()
 
-	scope := ObserverLockScope()
 	id := ObserverIdentity{
 		PID:           os.Getpid(),
 		StartedAt:     stampUTC(time.Now()),
-		LockPath:      cfg.LockPath,
+		LockID:        ObserverLockID(),
 		LockScope:     string(scope),
 		IntervalMS:    millis(cfg.Interval),
 		LifetimeMS:    millis(cfg.Lifetime),
 		SampleTimeout: millis(cfg.SampleTimeout),
 	}
 
+	// The lifetime is a real deadline on the context, not only a loop
+	// condition: without it a delayed wake could start a sample after the
+	// operator's window had already closed.
+	runCtx, cancelRun := context.WithDeadline(ctx, time.Now().Add(cfg.Lifetime))
+	defer cancelRun()
+
 	deps := observerDeps{
 		now:  func() time.Time { return time.Now().UTC() },
 		wait: waitFor,
-		sample: func(sampleCtx context.Context, at time.Time) (AdmissionReport, error) {
-			// Admit performs the native OS probes. Its own clock reads happen
-			// per probe; Report(at) then revalidates the decision against this
-			// tick, so an observation that aged out renders as a refusal
-			// rather than a stale admit.
-			report := Admit(sampleCtx).Report(at)
+		sample: func(sampleCtx context.Context, _ time.Time) (AdmissionReport, error) {
+			// Admit performs the native OS probes, reading its own clock per
+			// probe. The decision is then rendered against the clock AFTER
+			// those probes ran, never against the tick's start time: rendering
+			// at a past timestamp would make every observation look fresher
+			// than it is by exactly the probe duration, and an observation
+			// that aged out during probing must render as a refusal.
+			admission := Admit(sampleCtx)
+			report := admission.Report(time.Now().UTC())
 			if sampleCtx.Err() != nil {
 				// The decision above is already fail-closed on missing probes;
 				// the context error is recorded so the cause is visible rather
@@ -88,10 +105,11 @@ func RunObserver(ctx context.Context, cfg ObserverConfig, lockProvider LockProvi
 		},
 	}
 
-	status, err := runObserverLoop(ctx, cfg, id, deps)
-	if err != nil && errors.Is(err, context.Canceled) {
-		// Operator-initiated shutdown is a normal exit, and the terminal
-		// status has already been published by the loop.
+	status, err := runObserverLoop(runCtx, cfg, id, deps)
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		// Operator-initiated shutdown and lifetime expiry are both normal
+		// exits, and the terminal status has already been published by the
+		// loop.
 		return status, nil
 	}
 	return status, err

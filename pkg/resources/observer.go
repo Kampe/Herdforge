@@ -26,9 +26,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/freshness"
 )
 
 // ObserverSchemaVersion is bumped when the published shape changes
@@ -116,12 +119,20 @@ func (c ObserverConfig) Validate() (ObserverConfig, error) {
 		return c, fmt.Errorf("observer lifetime %s is outside [%s, %s]",
 			c.Lifetime, MinObserverLifetime, MaxObserverLifetime)
 	}
-	if c.Lifetime < c.Interval {
-		return c, fmt.Errorf("observer lifetime %s is shorter than one interval %s: it would publish nothing",
-			c.Lifetime, c.Interval)
+	// The first tick falls one interval after the start, so a lifetime of
+	// exactly one interval exits having sampled nothing. Requiring room for at
+	// least one completed sample makes that impossible to configure, rather
+	// than leaving a run that validates and then does nothing.
+	if c.Lifetime < 2*c.Interval {
+		return c, fmt.Errorf("observer lifetime %s leaves no room for a sample at a %s interval; at least %s is required",
+			c.Lifetime, c.Interval, 2*c.Interval)
 	}
+	// A non-positive timeout is an invalid VALUE, not an absent one. The
+	// caller distinguishes "flag not given" (fill the default before calling)
+	// from "flag given as 0 or negative", which is refused here.
 	if c.SampleTimeout <= 0 {
-		c.SampleTimeout = c.Interval / 2
+		return c, fmt.Errorf("per-sample timeout %s is not positive; an explicit zero or negative value is refused, not repaired",
+			c.SampleTimeout)
 	}
 	if c.SampleTimeout < MinSampleTimeout {
 		return c, fmt.Errorf("per-sample timeout %s is below the %s floor", c.SampleTimeout, MinSampleTimeout)
@@ -175,9 +186,13 @@ type ObserverSample struct {
 
 // ObserverIdentity says who published, so a stale file names its author.
 type ObserverIdentity struct {
-	PID           int    `json:"pid"`
-	StartedAt     string `json:"started_at"`
-	LockPath      string `json:"lock_path"`
+	PID       int    `json:"pid"`
+	StartedAt string `json:"started_at"`
+	// LockID is a LOGICAL identifier, never the runtime path. A published
+	// absolute path leaks the host's directory layout into an artifact that
+	// may be copied elsewhere, and tells a reader nothing the scope does not
+	// already say.
+	LockID        string `json:"lock_id"`
 	LockScope     string `json:"lock_scope"`
 	IntervalMS    int64  `json:"interval_ms"`
 	LifetimeMS    int64  `json:"lifetime_ms"`
@@ -263,6 +278,22 @@ func runObserverLoop(ctx context.Context, cfg ObserverConfig, id ObserverIdentit
 		}
 
 		started := deps.now()
+		// The wake could have been delayed past the lifetime. Sampling then
+		// would spend a probe the operator's deadline had already ended, so
+		// the clock is re-read here rather than trusted from before the wait.
+		if !started.Before(deadline) {
+			status.Terminated = "lifetime reached"
+			return status, publishFinal(deps, &status)
+		}
+		// Backward or impossible chronology is a fault, not a timing detail. A
+		// clock that moved backwards makes every age and every staleness
+		// comparison meaningless, so the run stops and says so instead of
+		// clamping the numbers into something that looks healthy.
+		if started.Before(scheduled.Add(-cfg.Interval)) {
+			status.Terminated = "impossible chronology: sample started before its own schedule"
+			return status, publishFinal(deps, &status)
+		}
+
 		seq++
 
 		sampleCtx, cancel := context.WithTimeout(ctx, cfg.SampleTimeout)
@@ -270,8 +301,12 @@ func runObserverLoop(ctx context.Context, cfg ObserverConfig, id ObserverIdentit
 		cancel()
 
 		completed := deps.now()
+		if completed.Before(started) {
+			status.Terminated = "impossible chronology: sample completed before it started"
+			return status, publishFinal(deps, &status)
+		}
 		skipped := uint64(0)
-		if lastIndex > 0 {
+		if lastIndex > 0 && tickIndex > lastIndex+1 {
 			// Ticks between the previous sample and this one were DROPPED.
 			skipped = uint64(tickIndex - lastIndex - 1)
 		}
@@ -289,6 +324,14 @@ func runObserverLoop(ctx context.Context, cfg ObserverConfig, id ObserverIdentit
 		}
 		if sampleErr != nil {
 			sample.SampleError = sampleErr.Error()
+			// A sample that failed cannot keep an admitting decision. Whatever
+			// the probe path produced before the failure is not a measurement
+			// of the host now, and publishing it as ADMIT would be the
+			// fail-open shape this package exists to remove.
+			sample.Report.Admits = false
+			sample.Report.Decision = string(DecisionRefuse)
+			sample.Report.Reasons = append(sample.Report.Reasons,
+				"sample failed: "+sampleErr.Error())
 		}
 
 		status.TotalTicks++
@@ -303,12 +346,20 @@ func runObserverLoop(ctx context.Context, cfg ObserverConfig, id ObserverIdentit
 			return status, err
 		}
 
-		// Advance to the first scheduled tick strictly in the future. No
-		// catch-up burst: elapsed ticks are skipped, not replayed.
+		// Advance to the first scheduled tick strictly in the future, by
+		// ARITHMETIC rather than by stepping once per missed tick: a long
+		// overrun must cost one division, not one loop iteration per elapsed
+		// interval. No catch-up burst either way -- elapsed ticks are skipped,
+		// never replayed.
 		now := deps.now()
-		next := tickIndex + 1
-		for !base.Add(time.Duration(next) * cfg.Interval).After(now) {
-			next++
+		elapsed := now.Sub(base)
+		if elapsed < 0 {
+			status.Terminated = "impossible chronology: clock moved behind the observer's start"
+			return status, publishFinal(deps, &status)
+		}
+		next := int64(elapsed/cfg.Interval) + 1
+		if next <= tickIndex {
+			next = tickIndex + 1
 		}
 		tickIndex = next
 	}
@@ -332,8 +383,59 @@ func publishAt(deps observerDeps, status *ObserverStatus, at time.Time, interval
 		}
 	}
 	status.PublishedAt = stampUTC(at)
-	status.ExpiresAt = stampUTC(at.Add(time.Duration(ObserverExpiryTicks) * interval))
+	status.ExpiresAt = stampUTC(observerExpiry(at, interval, status.Latest))
 	return deps.publish(*status)
+}
+
+// observerExpiry is the earlier of two deadlines, never the later.
+//
+// A cadence-only expiry (publish + N intervals) would let a slow publication
+// renew observations that had already aged out: with a 30s staleness limit and
+// a 90s artifact expiry, a stale ADMIT stays readable for a minute after the
+// decision behind it stopped being true. The artifact therefore expires no
+// later than the underlying metric window.
+//
+// When no metric is usable there is no window to bound, so the status expires
+// at the instant it is written: an observation of nothing authorizes nothing.
+func observerExpiry(at time.Time, interval time.Duration, latest ObserverSample) time.Time {
+	cadence := at.Add(time.Duration(ObserverExpiryTicks) * interval)
+	window, ok := metricWindowEnd(latest.Report)
+	if !ok {
+		return at
+	}
+	if window.Before(cadence) {
+		return window
+	}
+	return cadence
+}
+
+// metricWindowEnd is when the OLDEST metric behind a decision stops being
+// current, using the same staleness limit the decision itself applied.
+func metricWindowEnd(report AdmissionReport) (time.Time, bool) {
+	stale := report.Limits.StaleAfter
+	if stale <= 0 {
+		stale = defaultStaleAfter
+	}
+	var oldest time.Time
+	found := false
+	for _, reading := range []ReadingReport{report.CPU.ReadingReport, report.Memory.ReadingReport} {
+		if !reading.Known || reading.ObservedAt == "" {
+			continue
+		}
+		observed, err := time.Parse(time.RFC3339Nano, reading.ObservedAt)
+		if err != nil {
+			// An unparseable observation time is not a usable window.
+			return time.Time{}, false
+		}
+		if !found || observed.Before(oldest) {
+			oldest = observed
+			found = true
+		}
+	}
+	if !found {
+		return time.Time{}, false
+	}
+	return oldest.Add(stale), true
 }
 
 // publishFinal writes the terminal status. It keeps the existing expiry rather
@@ -355,6 +457,67 @@ func appendBounded(history []ObserverSample, sample ObserverSample) []ObserverSa
 	return append(out, sample)
 }
 
+// String bounds. Free-form text reaches the artifact from probe errors and
+// decision reasons, neither of which this package controls the length of.
+const (
+	maxObserverStringBytes = 512
+	maxObserverReasons     = 8
+)
+
+// capString truncates to a byte bound and SAYS it truncated, so a reader is
+// never shown a shortened message that looks complete.
+func capString(s string) string {
+	if len(s) <= maxObserverStringBytes {
+		return s
+	}
+	return s[:maxObserverStringBytes] + "...[truncated]"
+}
+
+func capReasons(reasons []string) []string {
+	if len(reasons) == 0 {
+		return reasons
+	}
+	limit := len(reasons)
+	truncated := false
+	if limit > maxObserverReasons {
+		limit = maxObserverReasons
+		truncated = true
+	}
+	out := make([]string, 0, limit+1)
+	for _, r := range reasons[:limit] {
+		out = append(out, capString(r))
+	}
+	if truncated {
+		out = append(out, "...[further reasons truncated]")
+	}
+	return out
+}
+
+func capObserverSample(s ObserverSample) ObserverSample {
+	s.SampleError = capString(s.SampleError)
+	s.Report.Explanation = capString(s.Report.Explanation)
+	s.Report.Reasons = capReasons(s.Report.Reasons)
+	s.Report.CPU.Error = capString(s.Report.CPU.Error)
+	s.Report.CPU.Recovery = capString(s.Report.CPU.Recovery)
+	s.Report.Memory.Error = capString(s.Report.Memory.Error)
+	s.Report.Memory.Recovery = capString(s.Report.Memory.Recovery)
+	return s
+}
+
+func capObserverStrings(status ObserverStatus) ObserverStatus {
+	status.Terminated = capString(status.Terminated)
+	status.Latest = capObserverSample(status.Latest)
+	if len(status.History) > ObserverHistoryMax {
+		status.History = status.History[len(status.History)-ObserverHistoryMax:]
+	}
+	capped := make([]ObserverSample, 0, len(status.History))
+	for _, s := range status.History {
+		capped = append(capped, capObserverSample(s))
+	}
+	status.History = capped
+	return status
+}
+
 func stampUTC(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
 func millis(d time.Duration) int64 {
@@ -370,9 +533,18 @@ func millis(d time.Duration) int64 {
 // Same shape as the durable writes elsewhere in the tree (temp in the target
 // directory, restrictive mode, write, sync, close, rename).
 func writeObserverStatus(path string, status ObserverStatus) error {
+	// Cap every free-form string BEFORE marshalling. A 24-entry ring bounds the
+	// COUNT of samples, not the length of the strings inside them: one probe
+	// error echoing a long command line would make the artifact unbounded
+	// without adding a single entry.
+	status = capObserverStrings(status)
 	body, err := json.MarshalIndent(status, "", "  ")
 	if err != nil {
 		return fmt.Errorf("observer: encode status: %w", err)
+	}
+	if len(body) > MaxObserverStatusBytes {
+		return fmt.Errorf("observer: encoded status is %d bytes, beyond the %d-byte bound; refusing to write it",
+			len(body), MaxObserverStatusBytes)
 	}
 	body = append(body, '\n')
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -407,24 +579,42 @@ func writeObserverStatus(path string, status ObserverStatus) error {
 
 // ReadObserverStatus loads a published status with a bounded read.
 //
-// The cap is deliberate: a status file larger than a full ring cannot have been
-// written by this observer, so it is refused rather than parsed. An unbounded
-// read of an attacker- or bug-grown file is exactly the memory cost this
-// artifact was shaped to avoid.
+// A size check taken on the PATH before reading is not a bound: the file can be
+// replaced or can keep growing between the check and the read, and a FIFO has
+// no size at all while blocking the open forever. So the sequence here is the
+// other way round -- open without blocking, verify the mode on the DESCRIPTOR
+// actually held, and read at most one byte past the limit so an oversized file
+// is detected by the read itself rather than by a stale prediction about it.
 func ReadObserverStatus(path string) (ObserverStatus, error) {
 	var status ObserverStatus
-	info, err := os.Stat(path)
+
+	file, err := openRegularNonBlocking(path)
 	if err != nil {
-		return status, fmt.Errorf("observer: stat status: %w", err)
+		return status, fmt.Errorf("observer: open status: %w", err)
 	}
-	if info.Size() > MaxObserverStatusBytes {
-		return status, fmt.Errorf("observer: status file is %d bytes, beyond the %d-byte bound; refusing to read it",
-			info.Size(), MaxObserverStatusBytes)
+	defer file.Close()
+
+	// Mode is checked on the descriptor, not the path: whatever this fd refers
+	// to is what will be read, whatever the path points at now.
+	info, err := file.Stat()
+	if err != nil {
+		return status, fmt.Errorf("observer: stat status descriptor: %w", err)
 	}
-	body, err := os.ReadFile(path)
+	if !info.Mode().IsRegular() {
+		return status, fmt.Errorf("observer: status path is not a regular file (mode %s); refusing to read it", info.Mode())
+	}
+
+	// Max+1 so "exactly at the limit" and "beyond the limit" are
+	// distinguishable, and neither can allocate more than the bound.
+	body, err := io.ReadAll(io.LimitReader(file, MaxObserverStatusBytes+1))
 	if err != nil {
 		return status, fmt.Errorf("observer: read status: %w", err)
 	}
+	if len(body) > MaxObserverStatusBytes {
+		return status, fmt.Errorf("observer: status exceeds the %d-byte bound; refusing to parse it",
+			MaxObserverStatusBytes)
+	}
+
 	if err := json.Unmarshal(body, &status); err != nil {
 		return status, fmt.Errorf("observer: decode status: %w", err)
 	}
@@ -468,6 +658,79 @@ func ObserverUsable(status ObserverStatus, at time.Time) (bool, string) {
 	}
 	if !status.Latest.Report.Admits {
 		return false, "latest decision was " + status.Latest.Report.Decision
+	}
+	// A consumer must not take Admits on trust. The published booleans and the
+	// published observations are two separate claims, and a report whose
+	// decision contradicts its own metrics is evidence of a bug, not of
+	// headroom -- so it refuses here rather than being believed.
+	if ok, why := reportSelfConsistent(status.Latest.Report, at); !ok {
+		return false, why
+	}
+	return true, ""
+}
+
+// reportSelfConsistent revalidates a published decision against the metrics
+// published beside it, at consumer time.
+//
+// It applies the SAME staleness and skew limits the decision carried, so this
+// is not a second policy: it is the same policy, checked again by the reader,
+// because the reader's clock is not the writer's clock.
+func reportSelfConsistent(report AdmissionReport, at time.Time) (bool, string) {
+	if report.Admits && report.Decision != string(DecisionAdmit) {
+		return false, "report admits but its decision is " + report.Decision
+	}
+	limits := report.Limits
+	stale := limits.StaleAfter
+	if stale <= 0 {
+		stale = defaultStaleAfter
+	}
+	skew := limits.ClockSkew
+	if skew <= 0 {
+		skew = defaultClockSkew
+	}
+
+	checked := 0
+	for _, named := range []struct {
+		what    string
+		reading ReadingReport
+	}{
+		{"cpu", report.CPU.ReadingReport},
+		{"memory", report.Memory.ReadingReport},
+	} {
+		r := named.reading
+		if !r.Known {
+			return false, named.what + " observation is not known; an admit cannot rest on it"
+		}
+		if r.State != string(freshness.StateFresh) {
+			return false, named.what + " observation state is " + r.State
+		}
+		if r.ObservedAt == "" {
+			return false, named.what + " observation carries no time"
+		}
+		observed, err := time.Parse(time.RFC3339Nano, r.ObservedAt)
+		if err != nil {
+			return false, named.what + " observation time is unparseable"
+		}
+		if observed.After(at.Add(skew)) {
+			return false, named.what + " observation is in the future; chronology is impossible"
+		}
+		if at.Sub(observed) > stale {
+			return false, named.what + " observation is older than the " + stale.String() + " staleness limit"
+		}
+		checked++
+	}
+	if checked == 0 {
+		return false, "no observation was checked"
+	}
+	// An admitting CPU report must actually carry the number it decided on.
+	if report.CPU.Normalized == nil {
+		return false, "cpu report carries no normalized load behind its admit"
+	}
+	if !finite(*report.CPU.Normalized) || *report.CPU.Normalized < 0 {
+		return false, "cpu normalized load is not a usable number"
+	}
+	if !report.Memory.PressureKnown {
+		return false, "memory pressure is not known behind its admit"
 	}
 	return true, ""
 }

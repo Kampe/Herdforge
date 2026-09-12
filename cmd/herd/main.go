@@ -7824,10 +7824,16 @@ func runResources() {
 		os.Exit(runResourcesObserverStatus(*asJSON))
 	}
 	if *watch {
+		// fs.Visit reports only the flags the operator actually gave, so an
+		// explicit `--interval 0` reaches validation and is refused instead of
+		// being indistinguishable from not passing --interval at all.
+		provided := map[string]bool{}
+		fs.Visit(func(fl *flag.Flag) { provided[fl.Name] = true })
 		os.Exit(runResourcesObserver(observerFlags{
 			interval:      *interval,
 			lifetime:      *lifetime,
 			sampleTimeout: *sampleTimeout,
+			provided:      provided,
 		}))
 	}
 

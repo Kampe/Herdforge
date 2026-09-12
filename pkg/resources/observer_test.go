@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/freshness"
 )
 
 // fakeObserverClock advances only when the loop asks to wait, or when a sample
@@ -40,12 +42,49 @@ func baseObserverConfig() ObserverConfig {
 	}
 }
 
-// admittingReport is a decision shaped like a real one, without any probe.
+// admittingReport is a REAL-SHAPED admitting decision: fresh readings with
+// their own observation times, the derived numbers the decision rested on, and
+// the limits it applied. Tests age or mutate this rather than hand-building a
+// half-populated report, because a consumer check that passes on a skeleton
+// proves nothing about a published one.
 func admittingReport(at time.Time) AdmissionReport {
+	normalized := 0.25
+	load1 := 2.0
+	cpus := 8
+	freePct := 55
+	swap := 0
+	limits := DefaultLimits()
 	return AdmissionReport{
 		Decision:   string(DecisionAdmit),
 		Admits:     true,
+		Verdict:    "OK",
+		DecidedAt:  stampUTC(at),
 		RenderedAt: stampUTC(at),
+		Limits:     limits,
+		CPU: CPUReport{
+			ReadingReport: ReadingReport{
+				State:      string(freshness.StateFresh),
+				Known:      true,
+				ObservedAt: stampUTC(at),
+				Source:     "test cpu",
+			},
+			Load1:      &load1,
+			CPUs:       &cpus,
+			Normalized: &normalized,
+		},
+		Memory: MemoryReport{
+			ReadingReport: ReadingReport{
+				State:      string(freshness.StateFresh),
+				Known:      true,
+				ObservedAt: stampUTC(at),
+				Source:     "test memory",
+			},
+			Pressure:      "normal",
+			PressureKnown: true,
+			FreePct:       &freePct,
+			FreePctGates:  false,
+			SwapMB:        &swap,
+		},
 	}
 }
 
@@ -140,7 +179,10 @@ func TestObserverStampsPublishTimeAtWriteTime(t *testing.T) {
 	}
 	status := ObserverStatus{
 		PublishedAt: stampUTC(time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)), // a stale carry-over
-		Latest:      ObserverSample{CompletedAt: stampUTC(observed)},
+		Latest: ObserverSample{
+			CompletedAt: stampUTC(observed),
+			Report:      admittingReport(observed),
+		},
 	}
 	if err := publishAt(deps, &status, written, 30*time.Second); err != nil {
 		t.Fatalf("writing after observing is correct chronology and must be accepted: %v", err)
@@ -148,8 +190,16 @@ func TestObserverStampsPublishTimeAtWriteTime(t *testing.T) {
 	if status.PublishedAt != stampUTC(written) {
 		t.Fatalf("publish stamp %q was not taken at write time %q", status.PublishedAt, stampUTC(written))
 	}
-	if status.ExpiresAt != stampUTC(written.Add(ObserverExpiryTicks*30*time.Second)) {
-		t.Fatalf("expiry %q was not derived from the write time", status.ExpiresAt)
+	// Expiry is the EARLIER of the cadence deadline and the metric window. The
+	// metrics here were observed at 22:30:50 with a 30s staleness limit, so the
+	// artifact must expire at 22:31:20 rather than at write+90s: a slow publish
+	// must never renew an observation that has already aged out.
+	wantExpiry := stampUTC(observed.Add(DefaultLimits().StaleAfter))
+	if status.ExpiresAt != wantExpiry {
+		t.Fatalf("expiry %q outlives the metric window %q", status.ExpiresAt, wantExpiry)
+	}
+	if status.ExpiresAt >= stampUTC(written.Add(ObserverExpiryTicks*30*time.Second)) {
+		t.Fatalf("expiry %q reached the cadence deadline; the metric window did not bound it", status.ExpiresAt)
 	}
 }
 
@@ -206,7 +256,10 @@ func TestObserverConfigRefusesBusyLoopBounds(t *testing.T) {
 		{"zero lifetime", func(c *ObserverConfig) { c.Lifetime = 0 }},
 		{"negative lifetime", func(c *ObserverConfig) { c.Lifetime = -time.Hour }},
 		{"lifetime shorter than interval", func(c *ObserverConfig) { c.Lifetime = time.Minute; c.Interval = 5 * time.Minute }},
+		{"lifetime leaves no room for a sample", func(c *ObserverConfig) { c.Interval = time.Minute; c.Lifetime = time.Minute }},
 		{"sample timeout beyond half interval", func(c *ObserverConfig) { c.SampleTimeout = c.Interval }},
+		{"explicit zero sample timeout", func(c *ObserverConfig) { c.SampleTimeout = 0 }},
+		{"explicit negative sample timeout", func(c *ObserverConfig) { c.SampleTimeout = -time.Second }},
 		{"empty status path", func(c *ObserverConfig) { c.StatusPath = "" }},
 		{"empty lock path", func(c *ObserverConfig) { c.LockPath = "" }},
 		{"status and lock collide", func(c *ObserverConfig) { c.LockPath = c.StatusPath }},
@@ -267,6 +320,18 @@ func TestObserverUsableFailsClosed(t *testing.T) {
 			s.Latest.Report.Decision = string(DecisionRefuse)
 		}},
 		{"wrong schema", func(s *ObserverStatus) { s.SchemaVersion = ObserverSchemaVersion + 1 }},
+		{"cpu observation unknown", func(s *ObserverStatus) { s.Latest.Report.CPU.Known = false }},
+		{"memory observation unknown", func(s *ObserverStatus) { s.Latest.Report.Memory.Known = false }},
+		{"cpu observation stale at consumer time", func(s *ObserverStatus) {
+			s.Latest.Report.CPU.ObservedAt = stampUTC(now.Add(-time.Hour))
+		}},
+		{"memory observation in the future", func(s *ObserverStatus) {
+			s.Latest.Report.Memory.ObservedAt = stampUTC(now.Add(time.Hour))
+		}},
+		{"cpu carries no normalized load", func(s *ObserverStatus) { s.Latest.Report.CPU.Normalized = nil }},
+		{"memory pressure unknown", func(s *ObserverStatus) { s.Latest.Report.Memory.PressureKnown = false }},
+		{"decision contradicts admits", func(s *ObserverStatus) { s.Latest.Report.Decision = string(DecisionRefuse) }},
+		{"reading state not fresh", func(s *ObserverStatus) { s.Latest.Report.CPU.State = string(freshness.StateStale) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

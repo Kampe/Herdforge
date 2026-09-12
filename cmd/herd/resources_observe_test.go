@@ -15,6 +15,36 @@ import (
 	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
+// cliAdmittingReport mirrors a real published decision: fresh readings with
+// their own observation times and the numbers behind them. A skeleton report
+// would pass the consumer check for the wrong reason.
+func cliAdmittingReport(at time.Time) resources.AdmissionReport {
+	normalized := 0.2
+	load1 := 1.6
+	cpus := 8
+	freePct := 60
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	return resources.AdmissionReport{
+		Decision:   "ADMIT",
+		Admits:     true,
+		Verdict:    "OK",
+		RenderedAt: stamp,
+		Limits:     resources.DefaultLimits(),
+		CPU: resources.CPUReport{
+			ReadingReport: resources.ReadingReport{State: "FRESH", Known: true, ObservedAt: stamp, Source: "test cpu"},
+			Load1:         &load1,
+			CPUs:          &cpus,
+			Normalized:    &normalized,
+		},
+		Memory: resources.MemoryReport{
+			ReadingReport: resources.ReadingReport{State: "FRESH", Known: true, ObservedAt: stamp, Source: "test memory"},
+			Pressure:      "normal",
+			PressureKnown: true,
+			FreePct:       &freePct,
+		},
+	}
+}
+
 func writeObserverFixture(t *testing.T, status resources.ObserverStatus) string {
 	t.Helper()
 	path := resources.ObserverStatusPath()
@@ -49,9 +79,7 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			SchemaVersion: resources.ObserverSchemaVersion,
 			PublishedAt:   now.Add(-time.Hour).Format(time.RFC3339Nano),
 			ExpiresAt:     now.Add(-time.Minute).Format(time.RFC3339Nano),
-			Latest: resources.ObserverSample{
-				Report: resources.AdmissionReport{Decision: "ADMIT", Admits: true},
-			},
+			Latest:        resources.ObserverSample{Report: cliAdmittingReport(now)},
 		})
 		if code := runResourcesObserverStatus(false); code != observerExitRefused {
 			t.Fatalf("an expired observer status exited %d, expected %d: a dead observer must authorize nothing",
@@ -65,9 +93,7 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			SchemaVersion: resources.ObserverSchemaVersion,
 			ExpiresAt:     now.Add(time.Hour).Format(time.RFC3339Nano),
 			Terminated:    "lifetime reached",
-			Latest: resources.ObserverSample{
-				Report: resources.AdmissionReport{Decision: "ADMIT", Admits: true},
-			},
+			Latest:        resources.ObserverSample{Report: cliAdmittingReport(now)},
 		})
 		if code := runResourcesObserverStatus(false); code != observerExitRefused {
 			t.Fatalf("a terminated observer exited %d, expected %d", code, observerExitRefused)
@@ -80,9 +106,7 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			SchemaVersion: resources.ObserverSchemaVersion,
 			PublishedAt:   now.Format(time.RFC3339Nano),
 			ExpiresAt:     now.Add(time.Hour).Format(time.RFC3339Nano),
-			Latest: resources.ObserverSample{
-				Report: resources.AdmissionReport{Decision: "ADMIT", Admits: true},
-			},
+			Latest:        resources.ObserverSample{Report: cliAdmittingReport(now)},
 		})
 		if code := runResourcesObserverStatus(false); code != 0 {
 			t.Fatalf("a current admitting status exited %d, expected 0", code)
@@ -111,12 +135,22 @@ func TestObserverWatchRefusesBadBoundsBeforeSampling(t *testing.T) {
 	// Every case here MUST fail validation. A case that validated would start a
 	// real observer against the host for its full lifetime, which is exactly
 	// what must never happen in a unit test.
+	set := func(names ...string) map[string]bool {
+		m := map[string]bool{}
+		for _, n := range names {
+			m[n] = true
+		}
+		return m
+	}
 	cases := map[string]observerFlags{
-		"interval below floor": {interval: time.Millisecond},
-		"interval above ceil":  {interval: 24 * time.Hour},
-		"lifetime below floor": {lifetime: time.Second},
-		"lifetime above ceil":  {lifetime: 30 * 24 * time.Hour},
-		"timeout beyond half":  {interval: 30 * time.Second, sampleTimeout: 25 * time.Second},
+		"interval below floor":    {interval: time.Millisecond, provided: set("interval")},
+		"interval above ceil":     {interval: 24 * time.Hour, provided: set("interval")},
+		"lifetime below floor":    {lifetime: time.Second, provided: set("lifetime")},
+		"lifetime above ceil":     {lifetime: 30 * 24 * time.Hour, provided: set("lifetime")},
+		"timeout beyond half":     {interval: 30 * time.Second, sampleTimeout: 25 * time.Second, provided: set("interval", "sample-timeout")},
+		"explicit zero interval":  {interval: 0, provided: set("interval")},
+		"explicit zero timeout":   {interval: 30 * time.Second, sampleTimeout: 0, provided: set("interval", "sample-timeout")},
+		"explicit negative tmout": {interval: 30 * time.Second, sampleTimeout: -time.Second, provided: set("interval", "sample-timeout")},
 	}
 	for name, flags := range cases {
 		t.Run(name, func(t *testing.T) {

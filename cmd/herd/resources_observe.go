@@ -48,23 +48,32 @@ type observerFlags struct {
 	interval      time.Duration
 	lifetime      time.Duration
 	sampleTimeout time.Duration
+	// provided records which duration flags the operator actually set. An
+	// ABSENT flag takes the default; a flag SET to zero or a negative value is
+	// an explicit mistake and is refused. Collapsing those two cases is how a
+	// deliberate `--interval 0` gets silently turned into 30s.
+	provided map[string]bool
 }
+
+func (f observerFlags) was(name string) bool { return f.provided[name] }
 
 // runResourcesObserver runs the bounded observer until the lifetime elapses or
 // a signal arrives. It prints nothing per tick: the status file is the output,
 // and a chatty sampler would be its own log-volume problem.
 func runResourcesObserver(f observerFlags) int {
 	cfg := resources.DefaultObserverConfig()
-	if f.interval > 0 {
+	if f.was("interval") {
 		cfg.Interval = f.interval
 		// Keep the default relationship between interval and per-sample
 		// timeout when the operator moved only the interval.
-		cfg.SampleTimeout = f.interval / 2
+		if !f.was("sample-timeout") {
+			cfg.SampleTimeout = f.interval / 2
+		}
 	}
-	if f.lifetime > 0 {
+	if f.was("lifetime") {
 		cfg.Lifetime = f.lifetime
 	}
-	if f.sampleTimeout > 0 {
+	if f.was("sample-timeout") {
 		cfg.SampleTimeout = f.sampleTimeout
 	}
 
