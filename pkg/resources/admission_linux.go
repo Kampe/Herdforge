@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"math"
+	"math/bits"
 	"os"
 	"runtime"
 	"strconv"
@@ -182,16 +182,27 @@ func parseMeminfoHeadroom(raw string) (MemHeadroom, error) {
 	return head, nil
 }
 
-// percentOf computes part*100/whole without overflowing int64. part<=whole is
-// the caller's guarantee, so the result is always 0-100.
+// percentOf computes part*100/whole exactly for 0 <= part <= whole, using a
+// 128-bit intermediate so the product cannot overflow.
+//
+// The previous overflow arm divided first -- (part/whole)*100 -- which is 0 for
+// every part < whole regardless of the real ratio. Halfway through a maximal
+// total it reported 0% free rather than 49%.
+//
+// bits.Div64 requires hi < whole, which holds here: part <= whole bounds the
+// quotient at 100, so part*100 < 101*whole and hi = (part*100)>>64 <= 50; when
+// whole <= 50 the product fits in 64 bits and hi is 0.
 func percentOf(part, whole int64) (int, error) {
 	if whole <= 0 {
-		return 0, fmt.Errorf("cannot take a percentage of %d", whole)
+		return 0, fmt.Errorf("cannot take a percentage of a total of %d", whole)
 	}
-	if part > math.MaxInt64/100 {
-		// Divide first. Precision loss here is irrelevant at these magnitudes,
-		// and an overflowed product is not.
-		return int((part / whole) * 100), nil
+	if part < 0 {
+		return 0, fmt.Errorf("cannot take a percentage of a negative part %d", part)
 	}
-	return int(part * 100 / whole), nil
+	if part > whole {
+		return 0, fmt.Errorf("part %d exceeds whole %d", part, whole)
+	}
+	hi, lo := bits.Mul64(uint64(part), 100)
+	quo, _ := bits.Div64(hi, lo, uint64(whole))
+	return int(quo), nil
 }

@@ -634,3 +634,71 @@ func TestPureHelpersUseNoHiddenClock(t *testing.T) {
 		t.Fatalf("DecidedAt = %v, want the supplied clock", a.DecidedAt)
 	}
 }
+
+// The probes are sequential, so the time they spend must be visible to the
+// staleness check. Admit used to stamp one instant BEFORE them and decide at
+// it, and TakeSnapshot rendered at that same instant -- so a slow probe
+// sequence was free: an early CPU sample still looked current at the end of a
+// long memory probe, and the snapshot admitted on it.
+func TestSlowProbeSequenceCannotAdmitOnAnEarlySample(t *testing.T) {
+	limits := testLimits()
+	// A clock that jumps past the window between the cpu probe and the memory
+	// probe, exactly as a long memory probe would.
+	ticks := []time.Time{
+		admissionNow,
+		admissionNow.Add(limits.StaleAfter + time.Second),
+		admissionNow.Add(limits.StaleAfter + 2*time.Second),
+	}
+	i := 0
+	clock := func() time.Time {
+		at := ticks[i]
+		if i < len(ticks)-1 {
+			i++
+		}
+		return at
+	}
+
+	a := admitFrom(limits, clock,
+		func(at time.Time) freshness.Reading[CPULoad] {
+			return freshness.Fresh("cpu", at, CPULoad{Load1: 0.8, CPUs: 8, Normalized: 0.1})
+		},
+		func(at time.Time) freshness.Reading[MemHeadroom] {
+			return freshness.Fresh("mem", at, MemHeadroom{Pressure: PressureNormal, FreePct: 80, FreePctGates: true})
+		})
+
+	if a.Admits() {
+		t.Fatalf("a probe sequence longer than the window admitted on its early cpu sample: %s", a.Explain())
+	}
+	if !reasonsMentioning(a, "beyond the") {
+		t.Fatalf("refusal did not cite the age of the early sample: %v", a.Reasons)
+	}
+	// Each observation keeps its OWN timestamp; they are not collapsed onto one.
+	if !a.CPU.ObservedAt.Before(a.Memory.ObservedAt) {
+		t.Fatalf("observations were stamped with one instant: cpu=%v mem=%v", a.CPU.ObservedAt, a.Memory.ObservedAt)
+	}
+	// And the decision is taken after both probes, not before them.
+	if !a.DecidedAt.After(a.CPU.ObservedAt) {
+		t.Fatalf("decided at %v, before the cpu probe at %v", a.DecidedAt, a.CPU.ObservedAt)
+	}
+
+	// Positive control: the same sequence inside the window admits.
+	j := 0
+	fast := []time.Time{admissionNow, admissionNow.Add(time.Second), admissionNow.Add(2 * time.Second)}
+	quick := func() time.Time {
+		at := fast[j]
+		if j < len(fast)-1 {
+			j++
+		}
+		return at
+	}
+	ok := admitFrom(limits, quick,
+		func(at time.Time) freshness.Reading[CPULoad] {
+			return freshness.Fresh("cpu", at, CPULoad{Load1: 0.8, CPUs: 8, Normalized: 0.1})
+		},
+		func(at time.Time) freshness.Reading[MemHeadroom] {
+			return freshness.Fresh("mem", at, MemHeadroom{Pressure: PressureNormal, FreePct: 80, FreePctGates: true})
+		})
+	if !ok.Admits() {
+		t.Fatalf("a prompt probe sequence refused: %s", ok.Explain())
+	}
+}

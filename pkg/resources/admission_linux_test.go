@@ -5,6 +5,7 @@ package resources
 import (
 	"context"
 	"io/fs"
+	"math"
 	"testing"
 	"time"
 
@@ -151,5 +152,43 @@ func TestMeminfoRejectsImpossibleAndHugeValues(t *testing.T) {
 	}
 	if head.FreePct != 50 {
 		t.Fatalf("FreePct = %d, want 50; the percentage overflowed", head.FreePct)
+	}
+}
+
+// percentOf must be EXACT for every 0 <= part <= whole. The previous overflow
+// arm divided first, so any part < whole reported 0% however large it really
+// was: halfway through a maximal total it said 0 rather than 49.
+func TestPercentOfIsExactIncludingNearTheLimit(t *testing.T) {
+	const maxInt64 = int64(math.MaxInt64)
+	for _, c := range []struct {
+		part, whole int64
+		want        int
+	}{
+		{0, 100, 0},
+		{50, 100, 50},
+		{100, 100, 100},
+		{1, 3, 33},
+		{8192000, 16384000, 50},
+		// The case the old arm got wrong: a nonzero fraction of a maximal total.
+		{maxInt64 / 2, maxInt64, 49},
+		{maxInt64 / 4, maxInt64, 24},
+		{maxInt64 - 1, maxInt64, 99},
+		{maxInt64, maxInt64, 100},
+		{maxInt64 / 100, maxInt64, 0},
+	} {
+		got, err := percentOf(c.part, c.whole)
+		if err != nil {
+			t.Errorf("percentOf(%d, %d): %v", c.part, c.whole, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("percentOf(%d, %d) = %d, want %d", c.part, c.whole, got, c.want)
+		}
+	}
+	// Range is validated at this boundary, not assumed from the caller.
+	for _, c := range [][2]int64{{1, 0}, {1, -5}, {-1, 100}, {101, 100}} {
+		if got, err := percentOf(c[0], c[1]); err == nil {
+			t.Errorf("percentOf(%d, %d) = %d with no error", c[0], c[1], got)
+		}
 	}
 }

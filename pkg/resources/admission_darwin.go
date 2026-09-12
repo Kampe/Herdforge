@@ -26,24 +26,16 @@ func observeCPU(ctx context.Context, at time.Time, limits Limits) freshness.Read
 	return cpuReadingFrom(darwinCPUSource, at, out, runtime.NumCPU())
 }
 
-// observeMemory asks the Darwin kernel directly.
+// observeMemory reads the Darwin kernel's own pressure level:
+// kern.memorystatus_vm_pressure_level, 1 normal / 2 warning / 4 critical, the
+// value the memorystatus subsystem notifies on. That OID is not listed by
+// `sysctl -a` and must be queried by name.
 //
-// The AUTHORITATIVE signal is kern.memorystatus_vm_pressure_level: 1 normal,
-// 2 warning, 4 critical. That is the same value the memorystatus subsystem
-// notifies on, so it is what the OS itself means by "under memory pressure".
-//
-// It is NOT the free percentage, and the first version of this file got that
-// wrong (followup-3022). memory_pressure -Q reports "System-wide memory free
-// percentage", which is a page count: the file cache and the compressor both
-// count against it, so it sits near zero on a perfectly healthy Mac. The
-// performance guard measured exactly that at 2026-09-12T18:26:31Z -- 1993MiB
-// unused with 10GiB in the compressor and zero swap, while the pressure level
-// read 1. Any reserve worth having would have refused that host.
-//
-// So the percentage is carried for the report with FreePctGates false, beside
-// swap, which has never been allowed to decide since FAC-693. If the pressure
-// probe fails there is NO fallback: the percentage cannot stand in for a signal
-// it does not measure, and an unknown memory reading refuses.
+// The free percentage from memory_pressure -Q is a PAGE COUNT -- file cache and
+// compressor count against it, so it sits near zero on a healthy Mac -- and is
+// carried for the report with FreePctGates false, beside swap. A failed
+// pressure probe has NO fallback: the percentage cannot stand in for a signal
+// it does not measure, so the reading is unknown and refuses.
 func observeMemory(ctx context.Context, at time.Time, limits Limits) freshness.Reading[MemHeadroom] {
 	out, err := runProbeCtx(ctx, limits.ProbeTimeout, "sysctl", "-n", "kern.memorystatus_vm_pressure_level")
 	if err != nil {

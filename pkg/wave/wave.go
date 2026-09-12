@@ -421,11 +421,9 @@ func collectGates(ctx context.Context, src Sources) []Gate {
 			d = "verdict=" + v
 		}
 		switch {
-		// FAC-826: OK alone admits. TIGHT used to be grouped here as a warning,
-		// but it now names a REFUSAL backed by a measurement -- a saturated cpu or
-		// kernel memory pressure -- and grouping it with OK let wave raise work
-		// the resources gate had already refused. resources.GatePasses is the one
-		// definition of which verdicts admit.
+		// Only OK admits. TIGHT and ALERT both name refusals (see
+		// pkg/resources), and resources.GatePasses is the one definition of which
+		// verdicts admit.
 		case resources.GatePasses(v):
 			gates = append(gates, Gate{Name: "resources", Status: StatusOK, Detail: d, BlocksRaise: true})
 		case v == resources.VerdictTight, v == resources.VerdictAlert:

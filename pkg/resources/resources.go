@@ -134,9 +134,10 @@ func GatePasses(verdict string) bool {
 // for callers that want the informational reading.
 func TakeSnapshot() Snapshot {
 	a := Admit(context.Background())
-	// Rendered at the clock it was decided at: a snapshot is the decision, not
-	// a reuse of one.
-	return SnapshotFrom(a, a.DecidedAt)
+	// Rendered at the ACTUAL reporting boundary, not at DecidedAt: the probes
+	// and the decision are already behind us, and Report revalidates against
+	// this clock. Copying DecidedAt here would pretend revalidation happened.
+	return SnapshotFrom(a, time.Now())
 }
 
 // SnapshotFrom renders an already-made decision. Split out so a fixture can

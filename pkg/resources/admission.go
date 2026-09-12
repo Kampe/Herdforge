@@ -456,12 +456,33 @@ func AdmissionVerdict(a Admission) string {
 	return VerdictTight
 }
 
-// Admit observes this host and decides at one clock. The context bounds every
-// probe, and cancellation reaches the child process.
+// Admit observes this host and decides AFTER the probes finish. The context
+// bounds every probe and cancellation reaches the child process.
 func Admit(ctx context.Context) Admission {
 	limits := DefaultLimits()
-	now := time.Now()
-	return Decide(now, observeCPU(ctx, now, limits), observeMemory(ctx, now, limits), limits)
+	return admitFrom(limits, time.Now,
+		func(at time.Time) freshness.Reading[CPULoad] { return observeCPU(ctx, at, limits) },
+		func(at time.Time) freshness.Reading[MemHeadroom] { return observeMemory(ctx, at, limits) })
+}
+
+// admitFrom sequences observation and decision against an injectable clock.
+//
+// The clock is read three times on purpose. Each observation keeps its OWN
+// timestamp, and the DECISION is taken after both probes return -- so the time
+// the probes themselves spend is visible to the staleness check. Stamping
+// everything with one pre-probe instant made a slow probe sequence free: a CPU
+// sample taken before a long memory probe still looked current at the end of
+// it, and the snapshot rendered at that same old instant admitted on it.
+//
+// A probe sequence longer than StaleAfter therefore refuses on its own first
+// reading, which is the intended behaviour: if measuring took that long, the
+// measurement is no longer about the host we are deciding for.
+func admitFrom(limits Limits, clock func() time.Time,
+	cpuProbe func(time.Time) freshness.Reading[CPULoad],
+	memProbe func(time.Time) freshness.Reading[MemHeadroom]) Admission {
+	cpu := cpuProbe(clock())
+	mem := memProbe(clock())
+	return Decide(clock(), cpu, mem, limits)
 }
 
 // ObserveCPU exposes this package's CPU observation to callers outside it, so
