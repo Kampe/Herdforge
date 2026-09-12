@@ -12,11 +12,11 @@ import (
 
 // An unsupported platform reports UNKNOWN and therefore REFUSES.
 //
-// This is the whole point of the card stated in one file: the honest answer on
-// a platform nobody wrote a probe for is "nothing is known", and nothing known
-// is not headroom. The alternative -- what this package did before -- was to
-// return 100% free and admit, which is a measurement claim about a machine that
-// was never measured.
+// This is the whole card in one file: the honest answer on a platform nobody
+// wrote a probe for is "nothing is known", and nothing known is not headroom.
+// The alternative -- what this package did before FAC-826 -- was to return 100%
+// free and admit, which is a measurement claim about a machine that was never
+// measured.
 func observeCPU(ctx context.Context, at time.Time, limits Limits) freshness.Reading[CPULoad] {
 	return unknownReading[CPULoad](unsupportedSource, errUnsupportedPlatform, unsupportedRecovery)
 }

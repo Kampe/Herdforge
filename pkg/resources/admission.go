@@ -34,8 +34,8 @@ import (
 // reason, and there is exactly one decision function that every heavy caller
 // routes through.
 type Admission struct {
-	Decision Decision                      `json:"decision"`
-	CPU      freshness.Reading[CPULoad]    `json:"cpu"`
+	Decision Decision                       `json:"decision"`
+	CPU      freshness.Reading[CPULoad]     `json:"cpu"`
 	Memory   freshness.Reading[MemHeadroom] `json:"memory"`
 	// Reasons are operator-facing and actionable: each one says what was
 	// observed, what the limit is, and what would clear it. Empty on ADMIT.
@@ -62,20 +62,115 @@ type CPULoad struct {
 	Normalized float64 `json:"normalized"`
 }
 
-// MemHeadroom is free headroom as a percentage, from the platform's TRUTHFUL
-// signal.
+// PressureLevel is the platform's OWN answer to "is memory hurting right now",
+// which is not the same question as "how many pages are free".
 //
-// On Darwin that is the kernel's own memory-pressure figure, NOT "Pages free":
-// macOS keeps free pages near zero by design because the file cache counts
-// against them, so a low pagesfree is normal steady state and not danger. That
-// lesson is already recorded at cmd/herd/capacity.go (Darwin pagesfree sits
-// ~87% while the host is completely healthy) and FAC-693 (a sticky swap scar
-// read as a wound refused every launch on a fine host). Neither is re-broken
-// here: swap is carried for the report and never decides.
+// followup-3022 caught this, and the performance guard's own telemetry proves
+// it: at 2026-09-12T18:26:31Z this host reported unused memory of 1993MiB with
+// the compressor holding 10GiB and swap at 0, while
+// kern.memorystatus_vm_pressure_level read 1 (normal). Roughly 4% free, and
+// completely healthy. A percentage gate with any sane reserve refuses that
+// host; the kernel, asked directly, says there is nothing wrong with it.
+//
+// This is the FAC-693 mistake wearing a different hat, and the first version of
+// this file walked into it: it took memory_pressure -Q's "System-wide memory
+// free percentage" -- a FREE-PAGE figure -- and gated on it while the comment
+// above it claimed to be avoiding exactly that.
+type PressureLevel int
+
+const (
+	// PressureUnknown means the platform was not asked or did not answer. It is
+	// never healthy.
+	PressureUnknown PressureLevel = 0
+	// PressureNormal is Darwin's level 1 / Linux PSI below the stall threshold.
+	PressureNormal PressureLevel = 1
+	// PressureWarn is Darwin's level 2: the kernel is asking processes to free
+	// memory. Heavy work does not start here.
+	PressureWarn PressureLevel = 2
+	// PressureCritical is Darwin's level 4.
+	PressureCritical PressureLevel = 4
+)
+
+func (p PressureLevel) String() string {
+	switch p {
+	case PressureNormal:
+		return "normal"
+	case PressureWarn:
+		return "warning"
+	case PressureCritical:
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
+// Known reports whether the level came from the platform rather than from a
+// zero value nobody set.
+func (p PressureLevel) Known() bool {
+	return p == PressureNormal || p == PressureWarn || p == PressureCritical
+}
+
+// Unsafe reports whether the kernel itself is signalling memory trouble.
+func (p PressureLevel) Unsafe() bool {
+	return p == PressureWarn || p == PressureCritical
+}
+
+// parseDarwinPressureLevel reads kern.memorystatus_vm_pressure_level.
+//
+// Note for whoever maintains this: the OID does NOT appear in `sysctl -a`, so
+// it has to be queried by name. An empty, non-numeric or unrecognised value is
+// an ERROR, never PressureNormal -- "the kernel did not answer" must not be
+// able to impersonate "the kernel said it is fine".
+func parseDarwinPressureLevel(out string) (PressureLevel, error) {
+	field := strings.TrimSpace(out)
+	if field == "" {
+		return PressureUnknown, fmt.Errorf("pressure level probe returned nothing")
+	}
+	n, err := strconv.Atoi(field)
+	if err != nil {
+		return PressureUnknown, fmt.Errorf("pressure level %q is not a number: %w", field, err)
+	}
+	switch PressureLevel(n) {
+	case PressureNormal:
+		return PressureNormal, nil
+	case PressureWarn:
+		return PressureWarn, nil
+	case PressureCritical:
+		return PressureCritical, nil
+	}
+	return PressureUnknown, fmt.Errorf("pressure level %d is not one of 1 (normal), 2 (warning), 4 (critical)", n)
+}
+
+// MemHeadroom is what the platform knows about memory, in the two forms that
+// mean different things.
 type MemHeadroom struct {
-	FreePct   int  `json:"free_pct"`
+	// Pressure is the authoritative signal where the platform has one.
+	Pressure PressureLevel `json:"pressure"`
+
+	// FreePct is headroom as a percentage, or -1 when the platform has no
+	// figure that means what a percentage implies.
+	FreePct int `json:"free_pct"`
+
+	// FreePctGates says whether FreePct may REFUSE, and it is the whole point
+	// of carrying two fields.
+	//
+	// Linux MemAvailable is the kernel's own answer to "how much can a new
+	// workload get without swapping", so a reserve against it is meaningful and
+	// this is true. Darwin's free percentage is a page count that sits near
+	// zero by design because the file cache and the compressor count against
+	// it, so a reserve against THAT is the FAC-693 error; it is carried for the
+	// report and this is false.
+	FreePctGates bool `json:"free_pct_gates"`
+
+	// SwapMB is informational on every platform and never decides.
 	SwapMB    int  `json:"swap_mb"`
 	SwapKnown bool `json:"swap_known"`
+}
+
+// Usable reports whether this reading carries at least one signal that is
+// allowed to decide. A reading with neither is not an observation.
+func (m MemHeadroom) Usable() bool {
+	return m.Pressure.Known() || m.FreePctGates
 }
 
 // Limits are the thresholds a decision was made against.
@@ -157,9 +252,16 @@ func Decide(now time.Time, cpu freshness.Reading[CPULoad], mem freshness.Reading
 		a.refuse("memory headroom is not known, which is NOT the same as memory being free: " + mem.MustExplain(now))
 	} else if mem.StaleBeyond(now, limits.StaleAfter) {
 		a.refuse("memory headroom is stale beyond " + limits.StaleAfter.String() + "; refusing on history rather than admitting on it: " + mem.MustExplain(now))
-	} else if head.FreePct < 0 || head.FreePct > 100 {
+	} else if !head.Usable() {
+		a.refuse("memory was read but carries no signal allowed to decide: the platform reported neither a kernel pressure level nor a gating headroom figure")
+	} else if head.Pressure.Unsafe() {
+		a.refuse(fmt.Sprintf(
+			"the kernel reports memory pressure %s (level %d). This is the platform's own signal, not a page count. "+
+				"Let running work finish or reap idle lanes; starting more here is what the operator's host was crashing under.",
+			head.Pressure, int(head.Pressure)))
+	} else if head.FreePctGates && (head.FreePct < 0 || head.FreePct > 100) {
 		a.refuse(fmt.Sprintf("memory headroom %d%% is outside 0-100 and cannot be believed; treating an impossible reading as unknown, not as room", head.FreePct))
-	} else if head.FreePct < limits.MemReservePct {
+	} else if head.FreePctGates && head.FreePct < limits.MemReservePct {
 		a.refuse(fmt.Sprintf(
 			"memory headroom %d%% is below the %d%% OS reserve. Heavy work started here competes with the system itself. "+
 				"Free memory or reap idle lanes first.",
@@ -183,8 +285,17 @@ func (a Admission) Explain() string {
 	if a.Admits() {
 		load, _ := a.CPU.Value()
 		head, _ := a.Memory.Value()
-		return fmt.Sprintf("admitted: normalized cpu load %.2f (limit %.2f), memory headroom %d%% (reserve %d%%)",
-			load.Normalized, a.Limits.CPURefuseLoad, head.FreePct, a.Limits.MemReservePct)
+		mem := "kernel memory pressure " + head.Pressure.String()
+		if head.FreePctGates {
+			// Only quote the percentage where it was allowed to decide.
+			// Printing Darwin's free-page figure as "headroom" is how a healthy
+			// host at 4% free reads as an emergency.
+			mem += fmt.Sprintf(", headroom %d%% (reserve %d%%)", head.FreePct, a.Limits.MemReservePct)
+		} else if head.FreePct >= 0 {
+			mem += fmt.Sprintf(" (free %d%%, informational on this platform)", head.FreePct)
+		}
+		return fmt.Sprintf("admitted: normalized cpu load %.2f (limit %.2f), %s",
+			load.Normalized, a.Limits.CPURefuseLoad, mem)
 	}
 	out := "refusing heavy work:"
 	for _, r := range a.Reasons {

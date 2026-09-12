@@ -63,7 +63,6 @@ type Snapshot struct {
 	// bare word.
 	Admission *Admission `json:"admission,omitempty"`
 }
-}
 
 type SelfTestResult struct {
 	Name   string

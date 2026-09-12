@@ -20,7 +20,8 @@ func freshCPU(normalized float64) freshness.Reading[CPULoad] {
 }
 
 func freshMem(freePct int) freshness.Reading[MemHeadroom] {
-	return freshness.Fresh("test", admissionNow, MemHeadroom{FreePct: freePct})
+	// Linux-shaped: MemAvailable means what a percentage implies, so it gates.
+	return freshness.Fresh("test", admissionNow, MemHeadroom{FreePct: freePct, FreePctGates: true})
 }
 
 func unknownCPU() freshness.Reading[CPULoad] {
@@ -167,7 +168,7 @@ func TestImpossibleReadingsRefuse(t *testing.T) {
 // FAC-693 must not be re-broken: swap residue is a scar, not a wound. A host
 // with a large sticky swap reading and real headroom still admits.
 func TestStickySwapAloneNeverRefuses(t *testing.T) {
-	mem := freshness.Fresh("test", admissionNow, MemHeadroom{FreePct: 80, SwapMB: 30720, SwapKnown: true})
+	mem := freshness.Fresh("test", admissionNow, MemHeadroom{Pressure: PressureNormal, FreePct: 80, FreePctGates: true, SwapMB: 30720, SwapKnown: true})
 	a := Decide(admissionNow, freshCPU(0.2), mem, testLimits())
 	if !a.Admits() {
 		t.Fatalf("30GB of historical swap refused a healthy host: %s", a.Explain())
@@ -248,5 +249,86 @@ func TestParseFreePctStrict(t *testing.T) {
 	// between the reporting parser and the deciding parser stays visible.
 	if legacy := parseMemoryPressureFreePct("nothing relevant here\n"); legacy != 100 {
 		t.Fatalf("legacy parser = %d, want its documented 100; the split is intentional", legacy)
+	}
+}
+
+// darwinMem is the Darwin shape: the kernel pressure level decides and the free
+// percentage is along for the report only.
+func darwinMem(level PressureLevel, freePct int) freshness.Reading[MemHeadroom] {
+	return freshness.Fresh("test", admissionNow, MemHeadroom{Pressure: level, FreePct: freePct, FreePctGates: false})
+}
+
+// TestDarwinLowFreePercentIsNotDanger is the followup-3022 regression, and it
+// is taken from a real measurement rather than an invented one.
+//
+// The performance guard observed this host at 2026-09-12T18:26:31Z: 1993MiB
+// unused, 10GiB held by the compressor, swap 0, and
+// kern.memorystatus_vm_pressure_level reading 1. That is roughly 4% free and
+// entirely healthy. The first version of this package gated on the free
+// percentage and would have refused it -- the FAC-693 mistake in new clothes,
+// committed in the same file whose comments claimed to be avoiding it.
+func TestDarwinLowFreePercentIsNotDanger(t *testing.T) {
+	guardObserved := darwinMem(PressureNormal, 4)
+	a := Decide(admissionNow, freshCPU(0.256), guardObserved, testLimits())
+	if !a.Admits() {
+		t.Fatalf("a healthy Mac at 4%% free was refused: %s", a.Explain())
+	}
+	if strings.Contains(a.Explain(), "reserve") {
+		t.Fatalf("the reserve was applied to a non-gating free percentage: %s", a.Explain())
+	}
+}
+
+// The kernel's own warning refuses, no matter how much memory looks free.
+func TestKernelPressureRefusesRegardlessOfFreePercent(t *testing.T) {
+	for _, level := range []PressureLevel{PressureWarn, PressureCritical} {
+		t.Run(level.String(), func(t *testing.T) {
+			a := Decide(admissionNow, freshCPU(0.1), darwinMem(level, 95), testLimits())
+			if a.Admits() {
+				t.Fatalf("kernel pressure %s admitted at 95%% free: %s", level, a.Explain())
+			}
+			if !reasonsMentioning(a, "kernel reports memory pressure") {
+				t.Fatalf("refusal did not cite the kernel signal: %v", a.Reasons)
+			}
+		})
+	}
+}
+
+// A reading with neither an authoritative pressure level nor a gating headroom
+// figure is not an observation, and must not be treated as one.
+func TestMemoryWithNoDecidingSignalRefuses(t *testing.T) {
+	empty := freshness.Fresh("test", admissionNow, MemHeadroom{Pressure: PressureUnknown, FreePct: 99, FreePctGates: false})
+	a := Decide(admissionNow, freshCPU(0.1), empty, testLimits())
+	if a.Admits() {
+		t.Fatalf("a reading with no deciding signal admitted at 99%% free: %s", a.Explain())
+	}
+	if !reasonsMentioning(a, "no signal allowed to decide") {
+		t.Fatalf("refusal did not explain the missing signal: %v", a.Reasons)
+	}
+}
+
+// The kernel level is a fixed vocabulary. Anything else -- including silence --
+// is unknown, never "normal".
+func TestParseDarwinPressureLevel(t *testing.T) {
+	ok := map[string]PressureLevel{"1": PressureNormal, "2\n": PressureWarn, " 4 ": PressureCritical}
+	for in, want := range ok {
+		got, err := parseDarwinPressureLevel(in)
+		if err != nil || got != want {
+			t.Errorf("parseDarwinPressureLevel(%q) = %v, %v; want %v, nil", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "   ", "normal", "0", "3", "-1", "7"} {
+		got, err := parseDarwinPressureLevel(bad)
+		if err == nil {
+			t.Errorf("parseDarwinPressureLevel(%q) = %v with no error; silence must not read as normal", bad, got)
+		}
+		if got != PressureUnknown {
+			t.Errorf("parseDarwinPressureLevel(%q) = %v, want PressureUnknown on error", bad, got)
+		}
+	}
+	if PressureUnknown.Known() || PressureUnknown.Unsafe() {
+		t.Fatal("PressureUnknown must be neither known nor unsafe")
+	}
+	if !PressureNormal.Known() || PressureNormal.Unsafe() {
+		t.Fatal("PressureNormal must be known and safe")
 	}
 }
