@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -226,11 +227,30 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 
 		targetIdx := -1
 		malformedHits := 0
-		ambiguousKeys := 0
 		for i, line := range lines {
 			if len(line) == 0 {
 				continue
 			}
+			scan, isObject := scanJSONObject([]byte(line))
+
+			// Duplicate keys are checked BEFORE the Envelope decode, because
+			// that decode keeps only the last value: a row declaring id TARGET
+			// and then id OTHER would look like an unrelated well-formed row
+			// and be skipped, while still carrying TARGET. Identity here is the
+			// DECODED id values, so an escaped spelling matches and a mere
+			// mention of the id inside some other row's body does not.
+			if isObject {
+				if dupKey, dup := duplicateKey(scan.Keys); dup {
+					if containsString(scan.IDs, req.ID) {
+						return fmt.Errorf("%w: a row carrying id %q repeats top-level key %q, so which value to keep is ambiguous",
+							ErrRepairDuplicateKeys, req.ID, dupKey)
+					}
+					// An unrelated duplicate-key row is left strictly alone and
+					// must not block a legitimate repair elsewhere.
+					continue
+				}
+			}
+
 			var env Envelope
 			if json.Unmarshal([]byte(line), &env) == nil {
 				if env.ID == req.ID {
@@ -240,26 +260,11 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 				}
 				continue
 			}
-			// A row with repeated top-level keys has no single id to match on,
-			// so it can neither be selected nor skipped quietly when it names
-			// the requested id: count it and refuse below.
-			if keys, isObject := jsonObjectKeys([]byte(line)); isObject {
-				if _, dup := duplicateKey(keys); dup {
-					if strings.Contains(line, req.ID) {
-						ambiguousKeys++
-					}
-					continue
-				}
-			}
-			if rawObjectID(line) != req.ID {
+			if !isObject || len(scan.IDs) != 1 || scan.IDs[0] != req.ID {
 				continue
 			}
 			malformedHits++
 			targetIdx = i
-		}
-		if targetIdx < 0 && ambiguousKeys > 0 {
-			return fmt.Errorf("%w: %d row(s) mentioning %q carry repeated top-level keys, so the value to keep is ambiguous",
-				ErrRepairDuplicateKeys, ambiguousKeys, req.ID)
 		}
 		if malformedHits > 1 {
 			return fmt.Errorf("%w: %d malformed rows carry id %q", ErrRepairAmbiguous, malformedHits, req.ID)
@@ -448,7 +453,7 @@ func (m *Mailbox) appendRepairRecord(plan *RepairPlan) error {
 // succeed, then returns the original cause.
 //
 // The recorded reason is REDACTED. The causes that reach here wrap
-// *os.PathError — verifyRepairedRow's reread and the mailbox write both carry
+// *os.PathError — verifyRepairedMailbox's reread and the mailbox write both carry
 // the mailbox path — and this record is durable, so storing the raw error
 // would persist a host-absolute path into an artifact. redactErr is the
 // package's existing answer to exactly that (see its use on the outbox path
@@ -536,9 +541,6 @@ func (m *Mailbox) checkQuarantineIdentity(id, liveHash string) error {
 	}
 }
 
-// verifyRepairedRow re-reads the durable file and proves the row it just wrote
-// is there and parses to the intended envelope. A write that cannot be read
-// back is a failure, not a success.
 // verifyRepairedMailbox proves the durable file is byte-for-byte the file this
 // repair intended to write, which covers every field of the target row and the
 // one-row-only promise in a single comparison. The target row is then re-parsed
@@ -627,13 +629,13 @@ func lineSpans(data []byte) []lineSpan {
 // compact `"id":"..."` needle that a hand-written spacing style does not
 // produce.
 func buildRepairedEnvelope(line string) (*Envelope, string, time.Time, error) {
-	keys, isObject := jsonObjectKeys([]byte(line))
+	scan, isObject := scanJSONObject([]byte(line))
 	if !isObject {
 		return nil, "", time.Time{}, fmt.Errorf("%w: row is not a well-formed JSON object", ErrRepairUnsupported)
 	}
 	// Refuse before decoding: the map below keeps only the last value for a
 	// repeated key, so repairing such a row would discard an original value.
-	if key, dup := duplicateKey(keys); dup {
+	if key, dup := duplicateKey(scan.Keys); dup {
 		return nil, "", time.Time{}, fmt.Errorf("%w: key %q appears more than once", ErrRepairDuplicateKeys, key)
 	}
 	var raw map[string]json.RawMessage
@@ -687,61 +689,88 @@ func buildRepairedEnvelope(line string) (*Envelope, string, time.Time, error) {
 
 // rawObjectID reads the id of a row that does NOT parse as an Envelope,
 // tolerating any JSON spacing style, so a malformed row can still be addressed
-// by its exact id. A row with repeated top-level keys is not addressable: see
-// jsonObjectKeys.
+// by its exact id. A row with repeated top-level keys, or without exactly one
+// id, is not addressable.
 func rawObjectID(line string) string {
-	keys, ok := jsonObjectKeys([]byte(line))
+	scan, ok := scanJSONObject([]byte(line))
 	if !ok {
 		return ""
 	}
-	if _, dup := duplicateKey(keys); dup {
+	if _, dup := duplicateKey(scan.Keys); dup {
 		return ""
 	}
-	var raw map[string]json.RawMessage
-	if json.Unmarshal([]byte(line), &raw) != nil {
+	if len(scan.IDs) != 1 {
 		return ""
 	}
-	var id string
-	if json.Unmarshal(raw["id"], &id) != nil {
-		return ""
-	}
-	return id
+	return scan.IDs[0]
 }
 
-// jsonObjectKeys returns a JSON object's top-level key names in order, or
-// ok=false if the bytes are not a JSON object.
+// objectScan is the narrow top-level view this recovery needs of one row:
+// every top-level key name, and every top-level "id" whose value is a string.
 //
-// It walks a token stream rather than decoding into a map. A map keeps only the
-// last value for a repeated key, so a row carrying two different bodies decodes
-// to one and the other is gone — and this operation would then "normalize" the
-// row while discarding an original value it never showed anyone. Escape forms
-// are decoded by the tokenizer, so "body" and "body" are the same key.
-func jsonObjectKeys(line []byte) ([]string, bool) {
+// Both are collected because a row may repeat a key. IDs is a list, not one
+// value, so a row declaring id TARGET and then id OTHER is known to carry
+// TARGET even though every map-based decode — including Envelope's — keeps only
+// the last.
+type objectScan struct {
+	Keys []string
+	IDs  []string
+}
+
+// scanJSONObject walks a token stream rather than decoding into a map. A map
+// keeps only the last value for a repeated key, so a row carrying two different
+// bodies decodes to one and the other is gone — and this operation would then
+// "normalize" the row while discarding an original value it never showed
+// anyone. Escape forms are decoded by the tokenizer, so "body" and "body"
+// are the same key, and an escaped id value compares equal to its plain form.
+//
+// ok is true only for a COMPLETE object: the closing brace is consumed and
+// nothing but whitespace may follow, so a truncated or trailing-garbage row is
+// reported as not an object rather than as a valid one.
+func scanJSONObject(line []byte) (objectScan, bool) {
+	var scan objectScan
 	dec := json.NewDecoder(bytes.NewReader(line))
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, false
+		return objectScan{}, false
 	}
 	if delim, isDelim := tok.(json.Delim); !isDelim || delim != '{' {
-		return nil, false
+		return objectScan{}, false
 	}
-	var keys []string
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return nil, false
+			return objectScan{}, false
 		}
 		key, isString := keyTok.(string)
 		if !isString {
-			return nil, false
+			return objectScan{}, false
 		}
-		keys = append(keys, key)
+		scan.Keys = append(scan.Keys, key)
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
-			return nil, false
+			return objectScan{}, false
+		}
+		if key == "id" {
+			var id string
+			if json.Unmarshal(value, &id) == nil {
+				scan.IDs = append(scan.IDs, id)
+			}
 		}
 	}
-	return keys, true
+	// Consume the closing brace.
+	closeTok, err := dec.Token()
+	if err != nil {
+		return objectScan{}, false
+	}
+	if delim, isDelim := closeTok.(json.Delim); !isDelim || delim != '}' {
+		return objectScan{}, false
+	}
+	// Require end of input; JSON whitespace, including a trailing CR, is fine.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return objectScan{}, false
+	}
+	return scan, true
 }
 
 func duplicateKey(keys []string) (string, bool) {
@@ -753,6 +782,15 @@ func duplicateKey(keys []string) (string, bool) {
 		seen[key] = true
 	}
 	return "", false
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // maxSequenceInLines reports the highest sequence any well-formed row already

@@ -27,6 +27,25 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// jsonUnicodeEscape returns a JSON \uXXXX escape, assembled from a backslash
+// byte rather than written literally. Authoring tools in this path normalize a
+// literal escape sequence into the character it denotes, which silently turned
+// an "escaped duplicate key" fixture into a plain duplicate — a test that no
+// longer tested what it claimed. Callers assert on the result rather than
+// trusting it: see requireEscaped.
+func jsonUnicodeEscape(codepointHex string) string {
+	return string([]byte{'\\'}) + "u" + codepointHex
+}
+
+// requireEscaped fails if a fixture lost its escape sequence, so a fixture can
+// never quietly degrade into the plain form it is supposed to contrast with.
+func requireEscaped(t *testing.T, fixture string) {
+	t.Helper()
+	if !strings.Contains(fixture, string([]byte{'\\'})+"u") {
+		t.Fatalf("fixture precondition: expected a JSON unicode escape, got %s", fixture)
+	}
+}
+
 // mailboxWith writes rows (in order) to a temp mailbox and returns it.
 func mailboxWith(t *testing.T, rows ...string) (*Mailbox, string) {
 	t.Helper()
@@ -1020,13 +1039,24 @@ func TestRepairRefusesRowsWithDuplicateTopLevelKeys(t *testing.T) {
 			`{"id": "` + targetID + `", "id": "` + targetID + `-other", ` + base + `, "body": "b"}`,
 		},
 		{
-			// "body" decodes to "body": an escaped spelling must collide
-			// with the plain one, or the check is bypassed by rewriting a key.
+			// An escaped key spelling must collide with the plain one, or the
+			// check is bypassed by rewriting the key.
 			"escaped duplicate key",
-			`{"id": "` + targetID + `", ` + base + `, "body": "first", "body": "second"}`,
+			`{"id": "` + targetID + `", ` + base + `, "body": "first", "` +
+				jsonUnicodeEscape("0062") + `ody": "second"}`,
+		},
+		{
+			// The requested id written in escaped form, with a DIFFERENT id
+			// last. Matching raw bytes would miss it and any map decode keeps
+			// only "other".
+			"escaped target id, other id last",
+			`{"id": "` + jsonUnicodeEscape("0064") + `up-row-1", "id": "other", ` + base + `, "body": "b"}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if strings.HasPrefix(tc.name, "escaped") {
+				requireEscaped(t, tc.row)
+			}
 			mb, path := mailboxWith(t, tc.row)
 			before, err := os.ReadFile(path)
 			if err != nil {
@@ -1080,24 +1110,135 @@ func TestDuplicateKeyRowIsNotAddressableByID(t *testing.T) {
 	}
 }
 
-func TestJSONObjectKeysDetectsEscapedDuplicates(t *testing.T) {
-	keys, ok := jsonObjectKeys([]byte(`{"body": 1, "body": 2}`))
+func TestScanJSONObjectDetectsEscapedDuplicatesAndIDs(t *testing.T) {
+	escapedBody := `{"body": 1, "` + jsonUnicodeEscape("0062") + `ody": 2}`
+	requireEscaped(t, escapedBody)
+	scan, ok := scanJSONObject([]byte(escapedBody))
 	if !ok {
 		t.Fatal("a well-formed object was rejected")
 	}
-	if dup, found := duplicateKey(keys); !found || dup != "body" {
-		t.Fatalf("escaped duplicate not detected: keys=%v dup=%q found=%v", keys, dup, found)
+	if dup, found := duplicateKey(scan.Keys); !found || dup != "body" {
+		t.Fatalf("escaped duplicate not detected: keys=%v dup=%q found=%v", scan.Keys, dup, found)
 	}
-	if _, ok := jsonObjectKeys([]byte(`["not","an","object"]`)); ok {
+
+	// Every top-level id is retained, in order, with escapes decoded.
+	escapedID := `{"id":"` + jsonUnicodeEscape("0054") + `ARGET","id":"OTHER"}`
+	requireEscaped(t, escapedID)
+	scan, ok = scanJSONObject([]byte(escapedID))
+	if !ok {
+		t.Fatal("a duplicate-id object was rejected as malformed")
+	}
+	if len(scan.IDs) != 2 || scan.IDs[0] != "TARGET" || scan.IDs[1] != "OTHER" {
+		t.Fatalf("ids not retained exactly: %#v", scan.IDs)
+	}
+
+	if _, ok := scanJSONObject([]byte(`["not","an","object"]`)); ok {
 		t.Fatal("an array was accepted as an object")
 	}
 	// Nested duplicates are the message's own content, not a top-level
 	// ambiguity this operation has to resolve.
-	nested, ok := jsonObjectKeys([]byte(`{"id":"x","body":{"k":1,"k":2}}`))
+	scan, ok = scanJSONObject([]byte(`{"id":"x","body":{"k":1,"k":2}}`))
 	if !ok {
 		t.Fatal("an object with a nested value was rejected")
 	}
-	if _, found := duplicateKey(nested); found {
+	if _, found := duplicateKey(scan.Keys); found {
 		t.Fatal("a nested duplicate was treated as a top-level one")
+	}
+}
+
+// ok must mean "a complete object and nothing else", or a truncated row would
+// be reported as a valid one and treated as addressable.
+func TestScanJSONObjectRequiresACompleteObjectAndEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"complete", `{"id":"x"}`, true},
+		{"trailing whitespace and CR", "{\"id\":\"x\"}  \r\n", true},
+		{"unterminated object", `{"id":"x"`, false},
+		{"trailing garbage", `{"id":"x"} not-json`, false},
+		{"two concatenated objects", `{"id":"x"}{"id":"y"}`, false},
+		{"empty", ``, false},
+	} {
+		if _, ok := scanJSONObject([]byte(tc.in)); ok != tc.want {
+			t.Errorf("%s: ok = %v, want %v", tc.name, ok, tc.want)
+		}
+	}
+}
+
+// The concrete bypass: a repairable row and a duplicate-key row that BOTH carry
+// the requested id. The duplicate-key row was only refused when no repairable
+// row existed, so the presence of the good row let the repair proceed.
+func TestRepairRefusesDuplicateKeyRowEvenWhenARepairableRowExists(t *testing.T) {
+	const targetID = "two-row-target"
+	base := `"sender": "agent", "recipient": "orchestrator", "subject": "s", "read": false, ` +
+		`"timestamp": "2026-09-11T10:47:09.000000-0500"`
+	repairable := `{"id": "` + targetID + `", ` + base + `, "body": "clean"}`
+	duplicate := `{"id": "` + targetID + `", ` + base + `, "body": "first", "body": "second"}`
+
+	for _, order := range []struct {
+		name string
+		rows []string
+	}{
+		{"duplicate after the repairable row", []string{repairable, duplicate}},
+		{"duplicate before the repairable row", []string{duplicate, repairable}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			mb, path := mailboxWith(t, order.rows...)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = mb.RepairMalformedRow(context.Background(), RepairRequest{
+				ID: targetID, Fingerprint: sha256Hex(repairable), Act: true, Actor: "op",
+			})
+			if !errors.Is(err, ErrRepairDuplicateKeys) {
+				t.Fatalf("a duplicate-key row carrying the target id did not block the repair: %v", err)
+			}
+			after, _ := os.ReadFile(path)
+			if string(after) != string(before) {
+				t.Fatal("the mailbox was mutated despite an ambiguous duplicate-key row")
+			}
+		})
+	}
+}
+
+// A duplicate-key row whose LAST id is someone else's still carries the target
+// in an earlier id. Envelope decoding keeps only the last, so checking the
+// duplicate keys after that decode skipped the row entirely.
+func TestRepairRefusesDuplicateIDRowWhoseLastIDIsAnother(t *testing.T) {
+	const targetID = "first-id-target"
+	row := `{"id": "` + targetID + `", "id": "someone-else", "sender": "agent", ` +
+		`"recipient": "orchestrator", "subject": "s", "read": false, "body": "b", ` +
+		`"timestamp": "2026-09-11T10:47:09Z"}`
+	// Note the CANONICAL timestamp: this row decodes as a valid Envelope, so it
+	// takes the well-formed path unless duplicate keys are checked first.
+	mb, path := mailboxWith(t, row)
+	before, _ := os.ReadFile(path)
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{ID: targetID}); !errors.Is(err, ErrRepairDuplicateKeys) {
+		t.Fatalf("a well-formed duplicate-id row carrying the target was not refused: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("mailbox mutated")
+	}
+}
+
+// A duplicate-key row that merely MENTIONS the target in its body is unrelated.
+// It must neither be touched nor block a legitimate repair, which a raw
+// substring match on the line would have got wrong.
+func TestUnrelatedDuplicateKeyRowDoesNotBlockARepair(t *testing.T) {
+	unrelated := `{"id": "other-row", "sender": "a", "recipient": "b", "subject": "s", ` +
+		`"read": false, "body": "mentions host-81751-1789141629774 in passing", ` +
+		`"body": "twice", "timestamp": "2026-09-11T10:47:09Z"}`
+	mb, path := mailboxWith(t, unrelated, legacyRow)
+	plan, err := actOnLegacyRow(t, mb)
+	if err != nil || plan == nil || !plan.Applied {
+		t.Fatalf("an unrelated duplicate-key row blocked a valid repair: plan=%+v err=%v", plan, err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), unrelated) {
+		t.Fatal("the unrelated duplicate-key row was modified")
 	}
 }
