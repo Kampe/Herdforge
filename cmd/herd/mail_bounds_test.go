@@ -735,3 +735,47 @@ func TestBoundedInboxCLIRejectsCorruptCursor(t *testing.T) {
 		t.Fatalf("stderr must name the cursor problem, got: %s", stderr)
 	}
 }
+
+// A store under SEVERAL not-yet-created directories must still fingerprint.
+// Resolving only the immediate parent turned the documented normal case -- a
+// fleet member with no mailbox yet -- into a hard error.
+func TestSourceFingerprintResolvesNestedMissingStores(t *testing.T) {
+	root := t.TempDir()
+	nestedMail := filepath.Join(root, "a", "b", "c", "control-mail.jsonl")
+	nestedFeedback := filepath.Join(root, "x", "y", "feedback-mail")
+
+	got, err := mail.SourceFingerprint(nestedMail, nestedFeedback)
+	if err != nil {
+		t.Fatalf("a store under missing ancestors must still resolve: %v", err)
+	}
+	if got == "" {
+		t.Fatal("empty fingerprint for a resolvable missing store")
+	}
+	// Creating the directories must not change the identity, or a store would
+	// fingerprint differently before and after its first write.
+	if err := os.MkdirAll(filepath.Dir(nestedMail), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nestedFeedback, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	after, err := mail.SourceFingerprint(nestedMail, nestedFeedback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != got {
+		t.Fatalf("fingerprint changed once the directories existed: %s then %s", got, after)
+	}
+}
+
+// An empty control store with a FRESH cursor is normal, not a rewind.
+func TestBoundedInboxEmptyStoreWithFreshCursorIsNormal(t *testing.T) {
+	f := newBoundsFixture(t, nil, nil)
+	resp := boundsRead(t, f, "", 10, 1<<20)
+	if len(resp.Envelopes) != 0 || resp.Truncated {
+		t.Fatalf("empty store returned %v truncated=%v", boundsIDs(resp), resp.Truncated)
+	}
+	if resp.NextCursor == "" {
+		t.Fatal("an empty store must still return a resumable cursor")
+	}
+}

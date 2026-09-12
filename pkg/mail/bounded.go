@@ -57,8 +57,8 @@ var ErrStorageRewound = errors.New("mail: cursor is ahead of the store; it was r
 var ErrStorageUnordered = errors.New("mail: store sequences do not ascend in file order; a high-water mark would skip records")
 
 // Cursor is a versioned position carrying, per source, a high-water mark AND
-// an anchor on that store's first record. It is bound to the recipient and to
-// the resolved identity of the stores it was issued against.
+// a prefix watermark over that store's consumed records. It is bound to the
+// recipient and to the resolved identity of the stores it was issued against.
 //
 // Two marks, not one, because the control bus and the feedback store number
 // records with SEPARATE counters -- feedback conversion sets Sequence from
@@ -139,12 +139,30 @@ func canonicalStoragePath(path string) (string, error) {
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
-	parent, leaf := filepath.Split(abs)
-	resolvedParent, err := filepath.EvalSymlinks(filepath.Clean(parent))
-	if err != nil {
-		return "", err
+	// Walk up to the NEAREST EXISTING ancestor and re-append the missing
+	// suffix. Resolving only the immediate parent failed the moment a store
+	// lived under more than one not-yet-created directory, which turned the
+	// documented normal case -- a fleet member with no mailbox yet -- into a
+	// hard error. A genuine resolution failure is still propagated: only
+	// not-exist walks further up, and running out of ancestors is an error.
+	missing := []string{}
+	current := abs
+	for {
+		parent, leaf := filepath.Split(current)
+		parent = filepath.Clean(parent)
+		if leaf == "" || parent == current {
+			return "", fmt.Errorf("mail: no existing ancestor resolves %q", path)
+		}
+		missing = append([]string{leaf}, missing...)
+		resolved, resolveErr := filepath.EvalSymlinks(parent)
+		if resolveErr == nil {
+			return filepath.Join(append([]string{resolved}, missing...)...), nil
+		}
+		if !os.IsNotExist(resolveErr) {
+			return "", resolveErr
+		}
+		current = parent
 	}
-	return filepath.Join(resolvedParent, leaf), nil
 }
 
 // FoldWatermark folds one record's stable identity and content into a rolling

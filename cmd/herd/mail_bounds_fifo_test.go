@@ -129,14 +129,71 @@ func TestBoundedInboxCLIRefusesFIFOFeedbackStore(t *testing.T) {
 // child behind, which the joined Wait above guarantees.
 func TestBoundedInboxCLITimeoutCleansUpItsChild(t *testing.T) {
 	f := newBoundsFixture(t, []int64{1}, nil)
-	makeFIFO(t, f.box.MailFile)
 
-	_, _, err := boundsCLIBounded(t, f, 50*time.Millisecond, "--limit", "10", "--timeout", "10s")
-	if err == nil {
-		// Refusing faster than the harness deadline is the healthy outcome.
-		return
+	// A DETERMINISTICALLY blocked child. `mail send` with neither --body nor
+	// --file reads its payload from stdin; given a pipe nothing ever writes
+	// to and nothing closes, it blocks in that read and cannot make progress.
+	// Everything it might touch is pinned into the fixture tree, so a child
+	// that somehow ran to completion still reaches no live fleet state.
+	//
+	// The FIFO refusal tests are the wrong vehicle for this property: the
+	// refusal is fast, so they take the early-success path and assert nothing
+	// about cancellation or cleanup.
+	binary := buildHerd(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binary, "mail", "send",
+		"--from", "timeout-fixture", "--to", boundsRecipient, "--mail", f.box.MailFile)
+	cmd.Dir = f.root
+	cmd.Env = append(os.Environ(),
+		"HERD_ROOT="+f.root,
+		"HERD_REPO_ROOT="+f.root,
+		feedbackEnvMailDir+"="+f.feedbackDir,
+	)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected a deadline, got: %v", err)
+	// Deliberately never written to and never closed: closing it would end
+	// the read and defeat the blocked state this test exists to create.
+	defer func() { _ = stdin.Close() }()
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start herd: %v", err)
+	}
+	if cmd.Process == nil || cmd.Process.Pid <= 0 {
+		t.Fatal("child did not start; there is nothing to clean up and nothing to prove")
+	}
+
+	// Join on every exit path, including the t.Fatal calls below.
+	joined := false
+	waitErr := error(nil)
+	join := func() {
+		if joined {
+			return
+		}
+		joined = true
+		waitErr = cmd.Wait()
+	}
+	t.Cleanup(join)
+
+	join()
+
+	// 1. The deadline actually fired: the child was still blocked when it did.
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("the child was expected to block until the deadline, got ctx err %v (wait %v)", ctx.Err(), waitErr)
+	}
+	// 2. Wait returned, so the child was reaped rather than left running.
+	if waitErr == nil {
+		t.Fatal("a child killed by its deadline must not report a clean exit")
+	}
+	// 3. The process is accounted for: ProcessState is only populated once
+	//    Wait has collected it, which is the join this test is about.
+	if cmd.ProcessState == nil {
+		t.Fatal("no ProcessState after Wait; the child was not joined")
+	}
+	if cmd.ProcessState.Exited() {
+		t.Fatalf("child exited on its own rather than being terminated by the deadline: %v", cmd.ProcessState)
 	}
 }
