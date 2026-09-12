@@ -12,45 +12,46 @@ import (
 	"github.com/Kampe/Herdforge/pkg/freshness"
 )
 
-// Admission is the ONE decision about whether this host can accept new heavy
-// work right now. cmd/herd's resources gate, wave, backfill and capacity all
-// route through Decide; none of them keeps a second copy of the policy.
+// Admission is the one decision about whether this host can accept new heavy
+// work. cmd/herd's resources gate, wave, backfill and capacity all route
+// through Decide; none keeps a second copy of the policy.
 //
-// What was wrong before FAC-826, as plain implementation facts:
-//
-//   - gatherMetrics returned free_pct=100, swap_mb=0 on ANY probe failure, and
-//     every parser returned 100 on malformed input. On Linux the Darwin probes
-//     do not exist, so a Linux host reported 100% free from probes that never
-//     ran.
-//   - Verdict could only ever return OK or TIGHT and GatePasses accepted TIGHT,
-//     so `herd resources --gate` could not exit nonzero and the ALERT arm of
-//     pkg/backfill's gate was unreachable.
-//   - cmd/herd/capacity.go admitted on unmeasurable memory by explicit doctrine
-//     and carried no CPU signal.
-//
-// Those are the defects this package fixes. Whether any specific host failure
-// coincided with a specific gate evaluation is NOT something we measured, and
-// this file does not claim it.
+// Timing is explicit. Decide resolves both observations at the clock it is
+// given and stores the results, so Verdict, Explain and NormalizedCPU are pure
+// and cannot disagree with the decision by consulting a different wall clock.
+// A decision is only valid for the freshness window of the readings behind it:
+// Report revalidates at its own supplied instant, and a decision reused after
+// its observations aged out reports a refusal rather than a stale ADMIT.
 type Admission struct {
 	Decision Decision `json:"decision"`
 
-	// CPU and Memory hold the readings the decision was made from. They are
-	// json:"-" because freshness.Reading keeps its value PRIVATE and defines no
-	// MarshalJSON, so encoding them emits posture metadata and drops every
-	// number that mattered. Report() is the wire shape; see AdmissionReport.
+	// DecidedAt is the clock Decide was given. It is the only time this
+	// decision is known to hold.
+	DecidedAt time.Time `json:"decided_at"`
+
+	// CPU and Memory are json:"-" because freshness.Reading keeps its value
+	// private and defines no MarshalJSON: encoding them emits posture and drops
+	// every number. Report is the wire shape.
 	CPU    freshness.Reading[CPULoad]     `json:"-"`
 	Memory freshness.Reading[MemHeadroom] `json:"-"`
 
-	// Reasons are operator-facing and actionable: each says what was observed,
-	// what the limit is, and what would clear it. Empty on ADMIT.
+	// Reasons are operator-facing and actionable. Empty on ADMIT.
 	Reasons []string `json:"reasons,omitempty"`
 
 	// Limits are echoed so a refusal can be argued with rather than guessed at.
 	Limits Limits `json:"limits"`
+
+	// Resolved observations, computed once at DecidedAt. Unexported so no
+	// caller can construct an Admission that claims more than it measured.
+	cpuUsable     bool
+	cpuNormalized float64
+	cpuLoad       CPULoad
+	memUsable     bool
+	mem           MemHeadroom
 }
 
-// Decision is deliberately two-valued. "Probably fine" is what the old TIGHT
-// meant, and TIGHT admitted.
+// Decision is two-valued. "Probably fine" is what the old TIGHT meant, and
+// TIGHT admitted.
 type Decision string
 
 const (
@@ -59,35 +60,26 @@ const (
 )
 
 // CPULoad is normalized run-queue pressure. Raw loadavg is meaningless without
-// the core count: 8.0 is unremarkable on a 32-core host and severe on a 2-core
-// one, and this fleet runs on both a Mac and a WSL box.
-//
-// Normalized is DERIVED, never trusted from a caller. See normalizedFrom.
+// the core count: this fleet runs on a Mac and a WSL box with different widths.
+// Normalized is DERIVED by normalizedFrom, never trusted from a caller.
 type CPULoad struct {
 	Load1      float64 `json:"load1"`
 	CPUs       int     `json:"cpus"`
 	Normalized float64 `json:"normalized"`
 }
 
-// PressureLevel is the platform's OWN answer to "is memory hurting right now",
-// which is a different question from "how many pages are free".
-//
-// The performance guard measured the difference on this host at
-// 2026-09-12T18:26:31Z: 1993MiB unused with 10GiB held by the compressor and
-// swap at 0, while kern.memorystatus_vm_pressure_level read 1 (normal).
-// Roughly 4% free, and the kernel reports nothing wrong. A reserve applied to
-// that percentage refuses a healthy host -- which is the FAC-693 shape, and
-// what the first draft of this file did.
+// PressureLevel is the platform's own answer to "is memory hurting now", which
+// is a different question from "how many pages are free". Darwin keeps free
+// pages near zero by design (file cache and compressor count against them), so
+// a percentage gate refuses healthy hosts; the kernel level does not.
 type PressureLevel int
 
 const (
-	// PressureUnknown means the platform was not asked or did not answer. Never
-	// healthy.
+	// PressureUnknown means the platform was not asked or did not answer.
 	PressureUnknown PressureLevel = 0
 	// PressureNormal is Darwin level 1 / Linux PSI below the stall threshold.
 	PressureNormal PressureLevel = 1
-	// PressureWarn is Darwin level 2: the kernel is asking processes to free
-	// memory.
+	// PressureWarn is Darwin level 2: the kernel is asking for memory back.
 	PressureWarn PressureLevel = 2
 	// PressureCritical is Darwin level 4.
 	PressureCritical PressureLevel = 4
@@ -106,13 +98,13 @@ func (p PressureLevel) String() string {
 	}
 }
 
-// Known reports whether the level came from the platform rather than from a
-// zero value nobody set.
+// Known reports whether the level came from the platform rather than a zero
+// value nobody set.
 func (p PressureLevel) Known() bool {
 	return p == PressureNormal || p == PressureWarn || p == PressureCritical
 }
 
-// Unsafe reports whether the kernel itself is signalling memory trouble.
+// Unsafe reports whether the kernel is signalling memory trouble.
 func (p PressureLevel) Unsafe() bool {
 	return p == PressureWarn || p == PressureCritical
 }
@@ -123,16 +115,14 @@ type MemHeadroom struct {
 	// Pressure is the authoritative signal where the platform has one.
 	Pressure PressureLevel `json:"pressure"`
 
-	// FreePct is headroom as a percentage, or -1 when the platform has no
+	// FreePct is headroom as a percentage, or -1 where the platform has no
 	// figure that means what a percentage implies.
 	FreePct int `json:"free_pct"`
 
-	// FreePctGates says whether FreePct may REFUSE, and it is why two fields
-	// exist. Linux MemAvailable is the kernel's answer to "how much can a new
-	// workload get without swapping", so a reserve against it is meaningful and
-	// this is true. Darwin's free percentage is a page count that sits near
-	// zero by design because the file cache and the compressor count against
-	// it, so this is false there and the figure is carried for the report only.
+	// FreePctGates says whether FreePct may REFUSE. Linux MemAvailable is the
+	// kernel's answer to what a new workload can get without swapping, so a
+	// reserve against it is meaningful. Darwin's free percentage is a page
+	// count, so it is carried for the report only.
 	FreePctGates bool `json:"free_pct_gates"`
 
 	// SwapMB is informational on every platform and never decides (FAC-693).
@@ -148,34 +138,26 @@ func (m MemHeadroom) Usable() bool {
 
 // Limits are the thresholds a decision was made against.
 type Limits struct {
-	// CPURefuseLoad is normalized load (load1/cpus) at or above which heavy work
-	// is refused.
+	// CPURefuseLoad is normalized load (load1/cpus) at or above which heavy
+	// work is refused.
 	//
-	// The default is 0.75, NOT 1.0. At 1.0 the run queue is already as long as
-	// the machine is wide, so admitting there reserves nothing: the work we are
-	// about to start has to contend with a machine that is already fully
-	// subscribed, and so does everything interactive on it. 0.75 keeps a
-	// quarter of the machine's width as headroom for the admitted work and for
-	// whatever else the host has to keep doing. It is a reserve chosen for the
-	// same reason MemReservePct exists, not a number derived from any measured
-	// failure threshold, and this file makes no claim about what value would or
-	// would not have prevented a particular host incident.
+	// The default is 0.75, not 1.0: at 1.0 the run queue is already as long as
+	// the machine is wide, so admitting there reserves nothing for the work
+	// about to start. It is a chosen reserve, like MemReservePct, not a
+	// measured failure threshold.
 	CPURefuseLoad float64 `json:"cpu_refuse_load"`
 
-	// MemReservePct is the OS reserve: gating headroom must be at least this
-	// before heavy work is admitted.
+	// MemReservePct is the OS reserve gating headroom must clear.
 	MemReservePct int `json:"mem_reserve_pct"`
 
-	// StaleAfter is how old an observation may be and still be acted on. It is
-	// enforced against ObservedAt for EVERY posture, not only STALE ones; see
-	// checkReading.
+	// StaleAfter is how old an observation may be and still be acted on,
+	// enforced for EVERY posture by checkReading.
 	StaleAfter time.Duration `json:"stale_after"`
 
 	// ProbeTimeout bounds each platform probe.
 	ProbeTimeout time.Duration `json:"probe_timeout"`
 
-	// ClockSkew is how far in the future an ObservedAt may sit before the
-	// reading is rejected as untrustworthy rather than merely early.
+	// ClockSkew is how far ahead an ObservedAt may sit before it is rejected.
 	ClockSkew time.Duration `json:"clock_skew"`
 }
 
@@ -187,13 +169,10 @@ const (
 	defaultClockSkew     = 2 * time.Second
 )
 
-// DefaultLimits reads the operator overrides once.
-//
-// A malformed, non-finite, negative or out-of-range override falls back to the
-// compiled default rather than disabling a limit. An unparsable threshold must
-// not silently become "no threshold": strconv.ParseFloat accepts "NaN" and
-// "+Inf", and either one turns `normalized >= limit` into a comparison that is
-// false for every possible load.
+// DefaultLimits reads the operator overrides once. A malformed, non-finite,
+// negative or out-of-range override falls back to the compiled default rather
+// than disabling a limit: ParseFloat accepts "NaN" and "+Inf", either of which
+// makes `normalized >= limit` false for every possible load.
 func DefaultLimits() Limits {
 	return Limits{
 		CPURefuseLoad: envFloat("HERD_CPU_REFUSE_LOAD", defaultCPURefuseLoad),
@@ -204,8 +183,8 @@ func DefaultLimits() Limits {
 	}
 }
 
-// finite reports whether f is a real number we may compare against. NaN fails
-// every comparison, and infinities make a threshold meaningless.
+// finite reports whether f may be compared against a threshold. NaN fails every
+// comparison; infinities make a threshold meaningless.
 func finite(f float64) bool {
 	return !math.IsNaN(f) && !math.IsInf(f, 0)
 }
@@ -234,13 +213,9 @@ func envPct(key string, def int) int {
 	return v
 }
 
-// sane returns limits safe to decide against, and says what it had to repair.
-//
-// Decide is public, so its inputs are not all produced by DefaultLimits. A
-// caller that passes a zero Limits, a NaN threshold or a non-positive
-// StaleAfter must not thereby switch a check off -- a zero StaleAfter would
-// disable the age check entirely, which is how an arbitrarily old reading
-// becomes a current one.
+// sane returns limits safe to decide against and says what it repaired. Decide
+// is public, so a caller may pass a zero Limits or a NaN threshold; a
+// non-positive StaleAfter in particular would switch the age check off.
 func (l Limits) sane() (Limits, []string) {
 	var repaired []string
 	if !finite(l.CPURefuseLoad) || l.CPURefuseLoad <= 0 {
@@ -269,13 +244,10 @@ func (l Limits) sane() (Limits, []string) {
 }
 
 // normalizedFrom derives normalized load from the raw pair, and is the only way
-// a Normalized value reaches a comparison.
-//
-// Decide is public and CPULoad is a plain struct, so Normalized is
-// caller-supplied data, not a fact. A reading whose Normalized disagrees with
-// its own Load1 and CPUs is inconsistent, and an inconsistent reading is not
-// evidence -- it is rejected rather than reconciled, because there is no way to
-// know which of the two fields was the lie.
+// a Normalized value reaches a comparison. CPULoad is a public struct, so the
+// field is caller data: a reading whose Normalized disagrees with its own Load1
+// and CPUs is rejected rather than reconciled, because there is no way to know
+// which field was wrong.
 func normalizedFrom(load CPULoad) (float64, error) {
 	if !finite(load.Load1) {
 		return 0, fmt.Errorf("load average %v is not a finite number", load.Load1)
@@ -290,29 +262,24 @@ func normalizedFrom(load CPULoad) (float64, error) {
 	if !finite(derived) {
 		return 0, fmt.Errorf("normalizing %.2f over %d cpus did not produce a finite number", load.Load1, load.CPUs)
 	}
-	if finite(load.Normalized) && math.Abs(load.Normalized-derived) > 1e-6 {
+	if !finite(load.Normalized) {
+		return 0, fmt.Errorf("normalized load %v is not a finite number", load.Normalized)
+	}
+	if math.Abs(load.Normalized-derived) > 1e-6 {
 		return 0, fmt.Errorf(
 			"reading is inconsistent: normalized %v does not match load1 %.2f over %d cpus (%.4f); refusing rather than picking one",
 			load.Normalized, load.Load1, load.CPUs, derived)
 	}
-	if !finite(load.Normalized) {
-		return 0, fmt.Errorf("normalized load %v is not a finite number", load.Normalized)
-	}
 	return derived, nil
 }
 
-// checkReading enforces what pkg/freshness deliberately does not.
+// checkReading enforces what pkg/freshness deliberately does not: Value()
+// returns ok for the ZERO State, and StaleBeyond() returns false for a FRESH
+// reading at any age and whenever the limit is non-positive. Tightened here
+// rather than in the shared package other callers depend on.
 //
-// Reading.Value() returns ok=true for the ZERO State, so a zero-valued Reading
-// yields a zero T that reads as a real observation. Reading.StaleBeyond returns
-// false for StateFresh no matter how old ObservedAt is, and false whenever the
-// limit is non-positive. Those are reasonable defaults for the package's other
-// consumers, so this policy layer tightens them here rather than changing a
-// shared API that other callers depend on.
-//
-// Enforced for EVERY posture: the state is one we recognize, it is not UNKNOWN,
-// ObservedAt is set, it is not in the future beyond the skew allowance, and it
-// is not older than the window.
+// Enforced for every posture: a recognized state, a set ObservedAt, not ahead
+// of now beyond the skew allowance, and not older than the window.
 func checkReading(now time.Time, state freshness.State, observedAt time.Time, explain string, limits Limits, what string) string {
 	switch state {
 	case freshness.StateFresh, freshness.StateStale:
@@ -322,10 +289,10 @@ func checkReading(now time.Time, state freshness.State, observedAt time.Time, ex
 		return fmt.Sprintf("%s carries an unrecognized freshness state %q; an unset posture is not an observation", what, string(state))
 	}
 	if observedAt.IsZero() {
-		return what + " carries no observation time, so its age cannot be established; a reading that cannot be dated cannot be trusted"
+		return what + " carries no observation time, so its age cannot be established"
 	}
 	if observedAt.After(now.Add(limits.ClockSkew)) {
-		return fmt.Sprintf("%s is timestamped %s in the future, beyond the %s skew allowance; refusing rather than trusting a clock we cannot explain",
+		return fmt.Sprintf("%s is timestamped %s in the future, beyond the %s skew allowance",
 			what, observedAt.Sub(now).Round(time.Millisecond), limits.ClockSkew)
 	}
 	if age := now.Sub(observedAt); age > limits.StaleAfter {
@@ -335,22 +302,21 @@ func checkReading(now time.Time, state freshness.State, observedAt time.Time, ex
 	return ""
 }
 
-// Decide is the pure core: observations in, decision out, no I/O and no clock
-// of its own. Every fixture drives this directly.
+// Decide is the pure core: observations and a clock in, decision out. No I/O
+// and no clock of its own, so a fixture drives it deterministically.
 //
 // CPU and memory are evaluated INDEPENDENTLY and both reasons are reported: an
-// operator who fixed only the one checked first would otherwise retry straight
-// into the other.
+// operator who fixed only the one checked first would retry into the other.
 func Decide(now time.Time, cpu freshness.Reading[CPULoad], mem freshness.Reading[MemHeadroom], limits Limits) Admission {
 	limits, repaired := limits.sane()
-	a := Admission{Decision: DecisionAdmit, CPU: cpu, Memory: mem, Limits: limits}
+	a := Admission{Decision: DecisionAdmit, DecidedAt: now, CPU: cpu, Memory: mem, Limits: limits}
 	for _, r := range repaired {
-		// A configuration we had to repair is reported, never silent. It does
-		// not by itself refuse: the repaired limit is the compiled default, and
-		// the observation is still judged against it.
+		// A repaired configuration is reported, never silent. It does not
+		// itself refuse: the repaired limit is the compiled default and the
+		// observation is still judged against it.
 		a.Reasons = append(a.Reasons, "configuration repaired: "+r)
 	}
-	configRepairs := len(a.Reasons)
+	configNotes := len(a.Reasons)
 
 	if problem := checkReading(now, cpu.State, cpu.ObservedAt, cpu.MustExplain(now), limits, "CPU load"); problem != "" {
 		a.refuse(problem)
@@ -358,11 +324,14 @@ func Decide(now time.Time, cpu freshness.Reading[CPULoad], mem freshness.Reading
 		a.refuse("CPU load is not known: " + cpu.MustExplain(now))
 	} else if normalized, err := normalizedFrom(load); err != nil {
 		a.refuse("CPU load is not usable: " + err.Error())
-	} else if normalized >= limits.CPURefuseLoad {
-		a.refuse(fmt.Sprintf(
-			"CPU is saturated: normalized load %.2f (load1 %.2f over %d cpus) is at or above the %.2f limit. "+
-				"Let running work drain, or reduce concurrency, before starting more.",
-			normalized, load.Load1, load.CPUs, limits.CPURefuseLoad))
+	} else {
+		a.cpuUsable, a.cpuNormalized, a.cpuLoad = true, normalized, load
+		if normalized >= limits.CPURefuseLoad {
+			a.refuse(fmt.Sprintf(
+				"CPU is saturated: normalized load %.2f (load1 %.2f over %d cpus) is at or above the %.2f limit. "+
+					"Let running work drain, or reduce concurrency, before starting more.",
+				normalized, load.Load1, load.CPUs, limits.CPURefuseLoad))
+		}
 	}
 
 	if problem := checkReading(now, mem.State, mem.ObservedAt, mem.MustExplain(now), limits, "memory headroom"); problem != "" {
@@ -371,22 +340,25 @@ func Decide(now time.Time, cpu freshness.Reading[CPULoad], mem freshness.Reading
 		a.refuse("memory headroom is not known: " + mem.MustExplain(now))
 	} else if !head.Usable() {
 		a.refuse("memory was read but carries no signal allowed to decide: the platform reported neither a kernel pressure level nor a gating headroom figure")
-	} else if head.Pressure.Unsafe() {
-		a.refuse(fmt.Sprintf(
-			"the kernel reports memory pressure %s (level %d). This is the platform's own signal, not a page count. "+
-				"Let running work finish or reap idle lanes before starting more.",
-			head.Pressure, int(head.Pressure)))
-	} else if head.FreePctGates && (head.FreePct < 0 || head.FreePct > 100) {
-		a.refuse(fmt.Sprintf("memory headroom %d%% is outside 0-100 and cannot be believed; treating an impossible reading as unknown, not as room", head.FreePct))
-	} else if head.FreePctGates && head.FreePct < limits.MemReservePct {
-		a.refuse(fmt.Sprintf(
-			"memory headroom %d%% is below the %d%% OS reserve. Heavy work started here competes with the system itself. "+
-				"Free memory or reap idle lanes first.",
-			head.FreePct, limits.MemReservePct))
+	} else {
+		a.memUsable, a.mem = true, head
+		switch {
+		case head.Pressure.Unsafe():
+			a.refuse(fmt.Sprintf(
+				"the kernel reports memory pressure %s (level %d). This is the platform's own signal, not a page count. "+
+					"Let running work finish or reap idle lanes before starting more.",
+				head.Pressure, int(head.Pressure)))
+		case head.FreePctGates && (head.FreePct < 0 || head.FreePct > 100):
+			a.refuse(fmt.Sprintf("memory headroom %d%% is outside 0-100 and cannot be believed; treating an impossible reading as unknown, not as room", head.FreePct))
+		case head.FreePctGates && head.FreePct < limits.MemReservePct:
+			a.refuse(fmt.Sprintf(
+				"memory headroom %d%% is below the %d%% OS reserve. Heavy work started here competes with the system itself. "+
+					"Free memory or reap idle lanes first.",
+				head.FreePct, limits.MemReservePct))
+		}
 	}
 
-	if len(a.Reasons) == configRepairs {
-		// Only configuration notes were recorded; nothing refused.
+	if len(a.Reasons) == configNotes {
 		a.Decision = DecisionAdmit
 	}
 	return a
@@ -397,29 +369,52 @@ func (a *Admission) refuse(reason string) {
 	a.Reasons = append(a.Reasons, reason)
 }
 
-// Admits reports whether heavy work may start.
+// Admits reports whether heavy work may start, as judged at DecidedAt. A
+// consumer acting later must call Report with its own clock first.
 func (a Admission) Admits() bool { return a.Decision == DecisionAdmit }
 
-// NormalizedCPU returns the derived normalized load and whether it is usable.
-// Consumers that report the number must go through here rather than reading
-// CPULoad.Normalized, which is caller-supplied until it is validated.
+// NormalizedCPU returns the derived normalized load resolved at DecidedAt, and
+// whether it is usable. Pure: no clock of its own.
 func (a Admission) NormalizedCPU() (float64, bool) {
-	if problem := checkReading(time.Now(), a.CPU.State, a.CPU.ObservedAt, "", a.Limits, "cpu"); problem != "" {
-		return 0, false
-	}
-	load, ok := a.CPU.Value()
-	if !ok {
-		return 0, false
-	}
-	normalized, err := normalizedFrom(load)
-	if err != nil {
-		return 0, false
-	}
-	return normalized, true
+	return a.cpuNormalized, a.cpuUsable
 }
 
-// Explain renders the refusal for an operator, or states the admission with the
-// numbers it rests on. Never empty, so no caller can print a blank refusal.
+// Headroom returns the memory reading resolved at DecidedAt and whether it was
+// usable. Pure.
+func (a Admission) Headroom() (MemHeadroom, bool) {
+	return a.mem, a.memUsable
+}
+
+// expiredAt reports whether the observations behind this decision have aged out
+// by at, and says why. Empty means the decision still holds.
+func (a Admission) expiredAt(at time.Time) []string {
+	var stale []string
+	if problem := checkReading(at, a.CPU.State, a.CPU.ObservedAt, a.CPU.MustExplain(at), a.Limits, "CPU load"); problem != "" && a.cpuUsable {
+		stale = append(stale, problem)
+	}
+	if problem := checkReading(at, a.Memory.State, a.Memory.ObservedAt, a.Memory.MustExplain(at), a.Limits, "memory headroom"); problem != "" && a.memUsable {
+		stale = append(stale, problem)
+	}
+	return stale
+}
+
+// RevalidateAt returns this decision as it stands at at. A decision whose
+// observations aged out becomes a REFUSAL rather than a stale ADMIT: a
+// consumer that held one for a minute is not entitled to the answer it got.
+func (a Admission) RevalidateAt(at time.Time) Admission {
+	stale := a.expiredAt(at)
+	if len(stale) == 0 {
+		return a
+	}
+	a.cpuUsable, a.memUsable = false, false
+	for _, s := range stale {
+		a.refuse("the decision is no longer current: " + s)
+	}
+	return a
+}
+
+// Explain renders the refusal, or the admission with the numbers it rests on.
+// Pure, and never empty.
 func (a Admission) Explain() string {
 	if a.Admits() {
 		cpu := "cpu load unavailable"
@@ -427,11 +422,11 @@ func (a Admission) Explain() string {
 			cpu = fmt.Sprintf("normalized cpu load %.2f (limit %.2f)", normalized, a.Limits.CPURefuseLoad)
 		}
 		mem := "memory unavailable"
-		if head, ok := a.Memory.Value(); ok {
+		if head, ok := a.Headroom(); ok {
 			mem = "kernel memory pressure " + head.Pressure.String()
 			if head.FreePctGates {
-				// Only quote the percentage where it was allowed to decide.
-				// Printing a non-gating free-page figure as "headroom" is how a
+				// Only quote the percentage where it was allowed to decide;
+				// printing a non-gating free-page figure as "headroom" is how a
 				// healthy host at 4% free reads as an emergency.
 				mem += fmt.Sprintf(", headroom %d%% (reserve %d%%)", head.FreePct, a.Limits.MemReservePct)
 			} else if head.FreePct >= 0 {
@@ -447,59 +442,45 @@ func (a Admission) Explain() string {
 	return out
 }
 
-// AdmissionVerdict maps a decision onto this package's reporting vocabulary so
-// `herd resources` keeps its shape.
+// AdmissionVerdict maps a decision onto the reporting vocabulary. Pure.
 //
-// The mapping CHANGES what TIGHT means. It used to be a warning that still
-// admitted; it now names a refusal backed by a measurement, while ALERT names a
-// refusal because nothing usable could be measured. Not being able to tell is
-// the more serious of the two, because that is the state that used to render as
-// 100% free and OK.
+// TIGHT names a refusal backed by a measurement; ALERT names a refusal because
+// nothing usable could be measured. Only OK admits; see GatePasses.
 func AdmissionVerdict(a Admission) string {
 	if a.Admits() {
 		return VerdictOK
 	}
-	if _, ok := a.NormalizedCPU(); !ok {
-		return VerdictAlert
-	}
-	if head, ok := a.Memory.Value(); !ok || !head.Usable() {
+	if !a.cpuUsable || !a.memUsable {
 		return VerdictAlert
 	}
 	return VerdictTight
 }
 
-// Admit observes this host and decides. The context bounds every probe: a hung
-// probe can neither run unbounded nor be abandoned, and cancellation reaches the
-// child process. It adds no host-wide scan of its own.
+// Admit observes this host and decides at one clock. The context bounds every
+// probe, and cancellation reaches the child process.
 func Admit(ctx context.Context) Admission {
 	limits := DefaultLimits()
 	now := time.Now()
 	return Decide(now, observeCPU(ctx, now, limits), observeMemory(ctx, now, limits), limits)
 }
 
-// ObserveCPU exposes this package's CPU observation to callers outside it.
-//
-// FAC-826 asked for one policy, not one policy plus a second opinion: a caller
-// that probed load itself would carry its own parsing, its own timeout and its
-// own idea of what "busy" means, and the copies would drift.
+// ObserveCPU exposes this package's CPU observation to callers outside it, so
+// no caller carries its own parsing, timeout or idea of "busy".
 func ObserveCPU(ctx context.Context) freshness.Reading[CPULoad] {
 	return observeCPU(ctx, time.Now(), DefaultLimits())
 }
 
-// unknownReading is the single shape for "this platform or probe told us
-// nothing". It carries no value, so freshness.Value() returns ok=false.
+// unknownReading is the one shape for "this platform or probe told us nothing".
+// It carries no value, so freshness.Value() returns ok=false.
 func unknownReading[T any](source string, err error, recovery string) freshness.Reading[T] {
 	return freshness.Degrade(freshness.Reading[T]{}, source, err, recovery)
 }
 
 // parseLoad1 reads the 1-minute load average from either platform's format:
-// Darwin's `sysctl -n vm.loadavg` prints "{ 1.23 1.45 1.67 }" and Linux's
-// /proc/loadavg prints "1.23 1.45 1.67 2/345 6789". One parser, because two
-// copies of "how do we read load" is how the copies come to disagree.
+// Darwin's "{ 1.23 1.45 1.67 }" and Linux's "1.23 1.45 1.67 2/345 6789".
 //
-// A missing, non-numeric, negative or NON-FINITE field is an ERROR, never zero.
-// strconv.ParseFloat accepts "NaN", "Inf" and "+Inf"; NaN in particular is
-// false in every comparison, so a NaN load would clear any threshold.
+// Missing, non-numeric, negative or NON-FINITE is an error, never zero:
+// ParseFloat accepts "NaN" and "Inf", and a NaN load clears every threshold.
 func parseLoad1(out string) (float64, error) {
 	fields := strings.Fields(strings.NewReplacer("{", " ", "}", " ").Replace(out))
 	if len(fields) == 0 {
@@ -518,8 +499,8 @@ func parseLoad1(out string) (float64, error) {
 	return v, nil
 }
 
-// cpuReadingFrom builds the CPU reading from a raw load string. Split out so a
-// fixture can drive it without a host.
+// cpuReadingFrom builds the CPU reading from a raw load string, so a fixture
+// can drive it without a host.
 func cpuReadingFrom(source string, at time.Time, out string, cpus int) freshness.Reading[CPULoad] {
 	load1, err := parseLoad1(out)
 	if err != nil {
@@ -534,10 +515,8 @@ func cpuReadingFrom(source string, at time.Time, out string, cpus int) freshness
 // parseFreePctStrict is the truthful counterpart to parseMemoryPressureFreePct,
 // which answers 100 to every malformed shape.
 //
-// It reads the WHOLE token before the percent sign rather than scanning
-// backwards for trailing digits. Scanning backwards silently rewrites input
-// into a healthy-looking number: "-50%" yields 50, and "1.50%" yields 50. A
-// signed, fractional or junk-bearing token is an error here.
+// It reads the WHOLE token after the label rather than scanning backwards for
+// trailing digits, which silently rewrote "-50%" into 50 and "1.50%" into 50.
 func parseFreePctStrict(output, label string) (int, error) {
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)

@@ -193,19 +193,20 @@ type CapacityObservation struct {
 	// PressurePct is PSI "some avg10" for memory: the share of the last 10s
 	// that work stalled waiting on memory. -1 where PSI is unavailable.
 	PressurePct float64 `json:"memory_pressure_pct"` // -1 unknown
-	// Admission is the SHARED resource decision from pkg/resources, carried
-	// whole rather than as copied numbers.
+
+	// admission is the SHARED resource decision, carried whole so it can be
+	// REVALIDATED at the capacity decision boundary. A pre-rendered bool is a
+	// claim about the past; decideCapacity re-asks it at DecidedAt.
 	//
-	// FAC-826 first landed a COPY here: capacity read a normalized load into
-	// its own field and switched on it with its own threshold, beside its own
-	// independent memory observer. That is two policies, and they could
-	// disagree -- Darwin critical kernel pressure refused `herd resources`
-	// while capacity, which had no pressure signal at all, still admitted. One
-	// decision, evaluated once, consumed by both.
-	//
-	// It is a POINTER and nil means "not evaluated", which refuses. An
-	// observation that never asked the shared policy has not been cleared by
-	// it.
+	// nil means the shared policy was never consulted, which refuses.
+	admission *resources.Admission
+
+	// DecidedAt is the clock this capacity decision is made at. Explicit so a
+	// fixture is deterministic and a held decision cannot silently look fresh.
+	DecidedAt time.Time `json:"decided_at,omitempty"`
+
+	// Admission is the revalidated report, filled in by decideCapacity so the
+	// JSON carries the numbers the refusal or admission actually used.
 	Admission *resources.AdmissionReport `json:"resource_admission,omitempty"`
 	// Processes/Threads/FDs, not RSS, are the plausible binding constraints
 	// here -- see the note on hostProcessLoad. -1 means unmeasured.
@@ -313,6 +314,18 @@ const memoryPressurePct = 20
 const swapExhaustedPct = 75
 
 func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB int64) Capacity {
+	// Revalidate the shared decision at THIS boundary. The report is derived
+	// here, never trusted from whenever the observation was taken: an admission
+	// whose readings have aged out comes back a refusal.
+	decidedAt := o.DecidedAt
+	if decidedAt.IsZero() {
+		decidedAt = time.Now()
+		o.DecidedAt = decidedAt
+	}
+	if o.admission != nil {
+		revalidated := o.admission.Report(decidedAt)
+		o.Admission = &revalidated
+	}
 	c := Capacity{
 		SchemaVersion:       capacitySchemaVersion,
 		ObservedAt:          time.Now().UTC().Format(time.RFC3339Nano),
@@ -346,12 +359,11 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 			c.Reason += fmt.Sprintf("; %d of them are idle and reapable: %s",
 				o.ReviewersIdle, strings.Join(o.IdleReviewerID, " "))
 		}
-	case o.Admission == nil:
-		c.Reason = "resource admission was not evaluated for this observation, so nothing has cleared this host for heavy work; " +
+	case o.admission == nil || o.Admission == nil:
+		c.Reason = "the shared resource policy was never consulted for this observation, so nothing has cleared this host for heavy work; " +
 			"refusing rather than treating an unasked question as a pass"
 	case !o.Admission.Admits:
-		// The SAME sentence the resources gate prints, from the same decision.
-		// If these two ever disagree it is because someone reintroduced a copy.
+		// revalidated at this instant.
 		c.Reason = "resource admission refuses this host: " + o.Admission.Explanation
 		if o.ReviewersIdle > 0 {
 			c.Reason += fmt.Sprintf("; reap %d idle reviewer(s) first", o.ReviewersIdle)
@@ -392,11 +404,6 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 
 func observeCapacity() CapacityObservation {
 	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, SwapTotalMiB: -1, PressurePct: -1, Processes: -1, Threads: -1, FDLimit: -1}
-	// FAC-826: ONE resource decision, evaluated once here and consumed by both
-	// this gate and `herd resources`. Not a copy of its inputs, and not a
-	// second threshold of our own -- those are what let the two disagree.
-	admission := resources.Admit(context.Background()).Report(time.Now())
-	o.Admission = &admission
 	o.HerdrRunning, o.HerdrDetail = herdrServerRunning()
 	// FAC-690: the memory reading now goes through pkg/freshness rather than
 	// three hand-rolled -1 sentinels. That package exists so an UNKNOWN cannot
@@ -418,7 +425,7 @@ func observeCapacity() CapacityObservation {
 	agents, err := herdr.AgentList()
 	if err != nil {
 		o.HerdrDetail = strings.TrimSpace(o.HerdrDetail + " " + err.Error())
-		return o
+		return withSharedAdmission(o)
 	}
 	o.AgentsListed = true
 	o.Agents = len(agents)
@@ -442,7 +449,7 @@ func observeCapacity() CapacityObservation {
 			o.BlockedReviewerID = append(o.BlockedReviewerID, a.Name)
 		}
 	}
-	return o
+	return withSharedAdmission(o)
 }
 
 // isReviewerAgent matches the launch convention (review-<ref>) on a hyphen
@@ -1227,4 +1234,20 @@ func hostSwapTotalMiB() int64 {
 		return n / 1024
 	}
 	return -1
+}
+
+// withSharedAdmission attaches the shared resource decision LAST, after the
+// herdr, memory and process probes above have already run.
+//
+// Order matters: taken first, the decision would be minutes old by the time the
+// slow probes finished, and capacity would gate on a host state that had moved.
+// decideCapacity revalidates it again at its own boundary, so a decision that
+// ages out between here and there refuses rather than admitting on history.
+func withSharedAdmission(o CapacityObservation) CapacityObservation {
+	admission := resources.Admit(context.Background())
+	o.admission = &admission
+	// DecidedAt is deliberately LEFT ZERO here: decideCapacity stamps its own
+	// boundary. Copying the observation time would make every revalidation
+	// trivially fresh, which is the check this is meant to perform.
+	return o
 }

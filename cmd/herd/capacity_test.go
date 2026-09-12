@@ -152,18 +152,17 @@ func TestCapacityClaimRefreshFailureStillReleasesItsOwnLease(t *testing.T) {
 // Fixtures must not hand-roll a verdict here. The point of FAC-826 is that
 // there is ONE decision; a test that invented its own would stop proving that
 // capacity and the resources gate agree, which is the property under test.
-func capacityAdmission(cpu freshness.Reading[resources.CPULoad], mem freshness.Reading[resources.MemHeadroom]) *resources.AdmissionReport {
-	now := time.Now()
-	report := resources.Decide(now, cpu, mem, resources.DefaultLimits()).Report(now)
-	return &report
+func capacityAdmission(cpu freshness.Reading[resources.CPULoad], mem freshness.Reading[resources.MemHeadroom]) *resources.Admission {
+	decision := resources.Decide(capacityNow, cpu, mem, resources.DefaultLimits())
+	return &decision
 }
 
 func healthyCPU() freshness.Reading[resources.CPULoad] {
-	return freshness.Fresh("test", time.Now(), resources.CPULoad{Load1: 1.6, CPUs: 8, Normalized: 0.2})
+	return freshness.Fresh("test", capacityNow, resources.CPULoad{Load1: 1.6, CPUs: 8, Normalized: 0.2})
 }
 
 func healthyMem() freshness.Reading[resources.MemHeadroom] {
-	return freshness.Fresh("test", time.Now(), resources.MemHeadroom{Pressure: resources.PressureNormal, FreePct: 80, FreePctGates: true})
+	return freshness.Fresh("test", capacityNow, resources.MemHeadroom{Pressure: resources.PressureNormal, FreePct: 80, FreePctGates: true})
 }
 
 func unknownCPUReading() freshness.Reading[resources.CPULoad] {
@@ -175,14 +174,19 @@ func unknownMemReading() freshness.Reading[resources.MemHeadroom] {
 }
 
 func pressureMem(level resources.PressureLevel) freshness.Reading[resources.MemHeadroom] {
-	return freshness.Fresh("test", time.Now(), resources.MemHeadroom{Pressure: level, FreePct: 95, FreePctGates: false})
+	return freshness.Fresh("test", capacityNow, resources.MemHeadroom{Pressure: level, FreePct: 95, FreePctGates: false})
 }
+
+// capacityNow is the fixed clock every capacity fixture decides at, so a
+// revalidation boundary is deterministic instead of racing the wall clock.
+var capacityNow = time.Now()
 
 func healthy() CapacityObservation {
 	return CapacityObservation{
 		HerdrRunning: true, AgentsListed: true, MemAvailMiB: 36000, SwapUsedMiB: 0,
 		SwapTotalMiB: 8192, PressurePct: 0.2,
-		Admission: capacityAdmission(healthyCPU(), healthyMem()),
+		admission: capacityAdmission(healthyCPU(), healthyMem()),
+		DecidedAt: capacityNow,
 	}
 }
 
@@ -257,12 +261,12 @@ func TestCapacityAndResourcesRefuseTogether(t *testing.T) {
 		{"memory unknown", healthyCPU(), unknownMemReading()},
 		{"kernel pressure warning", healthyCPU(), pressureMem(resources.PressureWarn)},
 		{"kernel pressure critical", healthyCPU(), pressureMem(resources.PressureCritical)},
-		{"cpu saturated", freshness.Fresh("test", time.Now(), resources.CPULoad{Load1: 32, CPUs: 8, Normalized: 4}), healthyMem()},
+		{"cpu saturated", freshness.Fresh("test", capacityNow, resources.CPULoad{Load1: 32, CPUs: 8, Normalized: 4}), healthyMem()},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			now := time.Now()
-			shared := resources.Decide(now, c.cpu, c.mem, resources.DefaultLimits())
+
+			shared := resources.Decide(capacityNow, c.cpu, c.mem, resources.DefaultLimits())
 
 			// The public resources gate refuses.
 			if resources.GatePasses(resources.AdmissionVerdict(shared)) {
@@ -270,8 +274,9 @@ func TestCapacityAndResourcesRefuseTogether(t *testing.T) {
 			}
 			// And capacity refuses, on an otherwise perfectly healthy host.
 			o := healthy()
-			report := shared.Report(now)
-			o.Admission = &report
+
+			o.admission = &shared
+			o.DecidedAt = capacityNow
 			cap := decideCapacity(o, 4, 512, 2048)
 			if cap.Admit {
 				t.Fatalf("capacity admitted what resources refused: %s", cap.Reason)
@@ -837,5 +842,31 @@ func TestAdmissionLeaseLockIsCrossProcessAndSidecarIsPermanent(t *testing.T) {
 	}
 	if _, err := os.Stat(admissionLeaseLockPath(path)); err != nil {
 		t.Fatalf("sidecar vanished: %v", err)
+	}
+}
+
+// Capacity must re-ask the shared decision at ITS boundary, not trust a bool
+// rendered whenever the observation happened to be taken. observeCapacity runs
+// herdr, memory and process probes that can take a while; a decision made
+// before them and trusted after them is a claim about a host state that moved.
+func TestCapacityRevalidatesTheSharedDecisionAtItsOwnBoundary(t *testing.T) {
+	// Positive control first: at the decision instant the same fixture admits.
+	if c := decideCapacity(healthy(), 4, 512, 2048); !c.Admit {
+		t.Fatalf("the fresh control refused: %s", c.Reason)
+	}
+
+	stale := healthy()
+	stale.DecidedAt = capacityNow.Add(resources.DefaultLimits().StaleAfter + time.Minute)
+	c := decideCapacity(stale, 4, 512, 2048)
+	if c.Admit {
+		t.Fatalf("capacity admitted on an aged-out decision: %s", c.Reason)
+	}
+	if !strings.Contains(c.Reason, "no longer current") {
+		t.Fatalf("refusal did not name the staleness: %s", c.Reason)
+	}
+	// The report published on the observation is the revalidated one, so the
+	// JSON cannot show an ADMIT the decision no longer supports.
+	if c.Admission == nil || c.Admission.Admits {
+		t.Fatalf("the published report still claims admission: %+v", c.Admission)
 	}
 }

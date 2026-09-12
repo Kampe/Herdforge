@@ -488,7 +488,7 @@ func TestStrictPercentRejectsRewrittenTokens(t *testing.T) {
 func TestPublicJSONCarriesTheObservedNumbers(t *testing.T) {
 	clearEnv(t)
 	healthy := Decide(admissionNow, freshCPU(0.25), darwinMem(PressureNormal, 4), testLimits())
-	decoded := decodeSnapshot(t, SnapshotFrom(healthy))
+	decoded := decodeSnapshot(t, SnapshotFrom(healthy, admissionNow))
 
 	admission, ok := decoded["admission"].(map[string]any)
 	if !ok {
@@ -521,7 +521,7 @@ func TestPublicJSONCarriesTheObservedNumbers(t *testing.T) {
 func TestPublicJSONOmitsUnknownsRatherThanZeroingThem(t *testing.T) {
 	clearEnv(t)
 	refused := Decide(admissionNow, unknownCPU(), unknownMem(), testLimits())
-	decoded := decodeSnapshot(t, SnapshotFrom(refused))
+	decoded := decodeSnapshot(t, SnapshotFrom(refused, admissionNow))
 
 	if decoded["verdict"] != VerdictAlert {
 		t.Fatalf("verdict = %v, want ALERT", decoded["verdict"])
@@ -562,4 +562,75 @@ func decodeSnapshot(t *testing.T, s Snapshot) map[string]any {
 		t.Fatalf("decode snapshot json: %v", err)
 	}
 	return decoded
+}
+
+// Timing is explicit end to end: Decide, Report and every pure helper use the
+// clock they are GIVEN. Before this, SnapshotFrom called Report(time.Now()) and
+// NormalizedCPU/AdmissionVerdict each consulted the wall clock again, so a
+// fixed-clock decision rendered at the real current time silently lost its
+// observations -- and worse, a held decision could render admits=true with
+// known=false and no numbers behind it.
+func TestReportRendersAtTheClockItIsGiven(t *testing.T) {
+	healthy := Decide(admissionNow, freshCPU(0.25), freshMem(80), testLimits())
+	if !healthy.Admits() {
+		t.Fatalf("precondition: %s", healthy.Explain())
+	}
+
+	// Rendered at the decision instant: everything is present.
+	fresh := healthy.Report(admissionNow)
+	if !fresh.Admits || fresh.Verdict != VerdictOK {
+		t.Fatalf("a fresh decision did not render as admitted: %+v", fresh)
+	}
+	if !fresh.CPU.Known || fresh.CPU.Normalized == nil || !fresh.Memory.Known {
+		t.Fatalf("a fresh decision dropped its observations: cpu=%+v mem=%+v", fresh.CPU, fresh.Memory)
+	}
+	if fresh.DecidedAt == "" || fresh.RenderedAt == "" {
+		t.Fatalf("report did not state its own timing: %+v", fresh)
+	}
+
+	// The SAME decision, rendered after its observations aged out, must not
+	// still claim ADMIT. This is the combination root caught: admits=true with
+	// known=false and nothing behind it.
+	expired := healthy.Report(admissionNow.Add(testLimits().StaleAfter + time.Second))
+	if expired.Admits || expired.Verdict == VerdictOK {
+		t.Fatalf("an expired decision still admitted: %+v", expired)
+	}
+	if expired.CPU.Known || expired.CPU.Normalized != nil {
+		t.Fatalf("an expired decision published cpu numbers: %+v", expired.CPU)
+	}
+	if expired.Memory.Known || expired.Memory.FreePct != nil {
+		t.Fatalf("an expired decision published memory numbers: %+v", expired.Memory)
+	}
+	if len(expired.Reasons) == 0 || !strings.Contains(expired.Explanation, "no longer current") {
+		t.Fatalf("an expired decision did not say why: %+v", expired)
+	}
+
+	// Revalidation never turns a refusal into an admission.
+	refused := Decide(admissionNow, freshCPU(4), freshMem(80), testLimits())
+	if r := refused.Report(admissionNow); r.Admits {
+		t.Fatalf("a refusal rendered as admitted: %+v", r)
+	}
+}
+
+// The pure helpers must not consult a clock of their own, or a fixed-time
+// fixture and the decision it made would disagree.
+func TestPureHelpersUseNoHiddenClock(t *testing.T) {
+	// admissionNow is far in the past relative to any real run. If these
+	// consulted time.Now() they would report the reading as aged out.
+	a := Decide(admissionNow, freshCPU(0.25), freshMem(80), testLimits())
+	if normalized, ok := a.NormalizedCPU(); !ok || math.Abs(normalized-0.25) > 1e-9 {
+		t.Fatalf("NormalizedCPU = %v, %v; want the value resolved at DecidedAt", normalized, ok)
+	}
+	if _, ok := a.Headroom(); !ok {
+		t.Fatal("Headroom lost the reading resolved at DecidedAt")
+	}
+	if AdmissionVerdict(a) != VerdictOK {
+		t.Fatalf("AdmissionVerdict = %q; a pure helper consulted a different clock", AdmissionVerdict(a))
+	}
+	if !strings.Contains(a.Explain(), "normalized cpu load 0.25") {
+		t.Fatalf("Explain lost its numbers: %q", a.Explain())
+	}
+	if !a.DecidedAt.Equal(admissionNow) {
+		t.Fatalf("DecidedAt = %v, want the supplied clock", a.DecidedAt)
+	}
 }

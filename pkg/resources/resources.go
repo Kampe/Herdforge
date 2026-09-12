@@ -133,13 +133,16 @@ func GatePasses(verdict string) bool {
 // travel with it. The legacy free-percentage grade stays available as Verdict()
 // for callers that want the informational reading.
 func TakeSnapshot() Snapshot {
-	return SnapshotFrom(Admit(context.Background()))
+	a := Admit(context.Background())
+	// Rendered at the clock it was decided at: a snapshot is the decision, not
+	// a reuse of one.
+	return SnapshotFrom(a, a.DecidedAt)
 }
 
 // SnapshotFrom renders an already-made decision. Split out so a fixture can
 // assert the reporting shape without observing a host.
-func SnapshotFrom(a Admission) Snapshot {
-	report := a.Report(time.Now())
+func SnapshotFrom(a Admission, at time.Time) Snapshot {
+	report := a.Report(at)
 	s := Snapshot{FreePct: -1, Verdict: report.Verdict, Admission: &report}
 	// Only a reading the DECISION accepted may populate the legacy numeric
 	// fields; the report is the authority on what was actually observed.

@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // Status is the ternary outcome of one readiness gate.
@@ -418,10 +420,15 @@ func collectGates(ctx context.Context, src Sources) []Gate {
 		if d == "" {
 			d = "verdict=" + v
 		}
-		switch v {
-		case "OK", "TIGHT":
+		switch {
+		// FAC-826: OK alone admits. TIGHT used to be grouped here as a warning,
+		// but it now names a REFUSAL backed by a measurement -- a saturated cpu or
+		// kernel memory pressure -- and grouping it with OK let wave raise work
+		// the resources gate had already refused. resources.GatePasses is the one
+		// definition of which verdicts admit.
+		case resources.GatePasses(v):
 			gates = append(gates, Gate{Name: "resources", Status: StatusOK, Detail: d, BlocksRaise: true})
-		case "ALERT":
+		case v == resources.VerdictTight, v == resources.VerdictAlert:
 			gates = append(gates, Gate{Name: "resources", Status: StatusBlocked, Detail: d, BlocksRaise: true})
 		default:
 			gates = append(gates, Gate{Name: "resources", Status: StatusUnknown, Detail: d, BlocksRaise: true})
@@ -477,7 +484,7 @@ func collectGates(ctx context.Context, src Sources) []Gate {
 		} else {
 			gates = append(gates, Gate{
 				Name: "standing_roster", Status: StatusOK,
-				Detail: fmt.Sprintf("%d standing lane(s)", len(lanes)),
+				Detail:      fmt.Sprintf("%d standing lane(s)", len(lanes)),
 				BlocksRaise: true,
 			})
 		}
