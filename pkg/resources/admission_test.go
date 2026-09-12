@@ -180,7 +180,7 @@ func TestStickySwapAloneNeverRefuses(t *testing.T) {
 // The reporting shape must never render an unknown as a number.
 func TestSnapshotFromUnknownReportsMinusOne(t *testing.T) {
 	clearEnv(t)
-	s := SnapshotFrom(Decide(admissionNow, unknownCPU(), unknownMem(), testLimits()))
+	s := SnapshotFrom(Decide(admissionNow, unknownCPU(), unknownMem(), testLimits()), admissionNow)
 	if s.FreePct != -1 {
 		t.Fatalf("FreePct = %d, want -1", s.FreePct)
 	}

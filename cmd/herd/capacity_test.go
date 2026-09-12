@@ -292,7 +292,9 @@ func TestCapacityAndResourcesRefuseTogether(t *testing.T) {
 // An observation that never asked the shared policy has not been cleared by it.
 func TestCapacityRefusesWithoutAnAdmission(t *testing.T) {
 	o := healthy()
-	o.Admission = nil
+	// The DECISION is what must be absent. Clearing only the rendered report
+	// would be overwritten at the top of decideCapacity, which re-derives it.
+	o.admission, o.Admission = nil, nil
 	if c := decideCapacity(o, 4, 512, 2048); c.Admit {
 		t.Fatalf("an unevaluated observation admitted: %s", c.Reason)
 	}
