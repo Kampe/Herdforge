@@ -116,29 +116,58 @@ run_focused() {
 	print -r -- "$exit_code"
 }
 
-# events_valid proves the whole stream parses BEFORE anything reads it. A parse
-# error inside a `jq | grep` conditional is indistinguishable from "no match",
-# which would let a truncated stream read as a clean result.
+# events_valid proves the whole stream parses BEFORE any predicate reads it. A
+# parse failure and a genuine no-match are otherwise the same status, which
+# would let a truncated stream read as a clean result.
 events_valid() {
 	jq -e -s 'type == "array" and length > 0' -- "$1" >/dev/null 2>&1
 }
 
-# stream_broken looks for build, panic, timeout and tool failures across the
-# ENTIRE stream, not just the killer's own events: an expected assertion
-# followed by a crash somewhere else is not a successful control.
-stream_broken() {
-	jq -r 'select(.Action == "output") | .Output // ""' -- "$1" \
-		| grep -qE 'panic: |test timed out|\[build failed\]|^# |^signal: |fatal error: '
+# jq_predicate runs one complete jq test over the validated stream and maps its
+# status onto 0 match / 1 no match / 2 evaluation failed.
+#
+# It is a whole predicate rather than `jq | grep -q` on purpose. Under
+# `set -o pipefail` grep exits at its FIRST match, jq dies on SIGPIPE, and the
+# pipeline reports 141 even though the match succeeded -- so a long panic
+# stream, which is exactly the failure condition, would have been classified
+# clean. A predicate consumes all of its input and cannot invert that way.
+jq_predicate() {
+	local filter=$1 events=$2
+	shift 2
+	local predicate_exit=0
+	jq -s -e "$filter" "$@" -- "$events" >/dev/null 2>&1 || predicate_exit=$?
+	if (( predicate_exit == 0 )); then return 0; fi
+	if (( predicate_exit == 1 )); then return 1; fi
+	print -u2 "error: jq could not evaluate the event stream (exit $predicate_exit)"
+	return 2
 }
 
-# events_for emits one field of every event bound to the named test or one of
-# its subtests, so an assertion can never be credited to a different test.
-events_for() {
-	local events=$1 test_name=$2 action=$3 field=$4
-	jq -r --arg t "$test_name" --arg a "$action" --arg f "$field" \
-		'select(.Action == $a and ((.Test // "") == $t or ((.Test // "") | startswith($t + "/")))) | .[$f] // ""' \
-		-- "$events"
+# stream_broken looks for build, panic, timeout and tool failures across the
+# ENTIRE stream, not just the killer's own events: an expected assertion
+# followed by a crash somewhere else is not a successful control. Oniguruma
+# anchors ^ at line starts, so a marker inside a multi-line Output still hits.
+stream_broken() {
+	jq_predicate 'any(.[]; (.Action == "output")
+		and (((.Output // "") | test("panic: |test timed out|\\[build failed\\]|^# |^signal: |fatal error: "))))' "$1"
 }
+
+# test_emitted reports whether the named test or one of its subtests produced
+# an event of this action, optionally carrying text. Literal substring, so no
+# assertion has to be regex-escaped.
+test_emitted() {
+	local events=$1 test_name=$2 action=$3 want=${4-}
+	if [[ -z "$want" ]]; then
+		jq_predicate 'any(.[]; (.Action == $a)
+			and (((.Test // "") == $t) or (((.Test // "") | startswith($t + "/")))))' \
+			"$events" --arg t "$test_name" --arg a "$action"
+		return $?
+	fi
+	jq_predicate 'any(.[]; (.Action == $a)
+		and (((.Test // "") == $t) or (((.Test // "") | startswith($t + "/"))))
+		and (((.Output // "") | contains($w))))' \
+		"$events" --arg t "$test_name" --arg a "$action" --arg w "$want"
+}
+
 
 patch_source() {
 	local anchor=$1 replacement=$2 file=$work/$source_rel found content mutated
@@ -161,21 +190,40 @@ restore_source() {
 }
 
 # classify_run maps one mutant onto the contract, given a compile that already
-# passed. Only a named assertion failure in the named test counts.
-# classify_run maps one mutant onto the contract, given a compile that already
 # passed. Only an exact go test exit 1, over a stream with no tool failure
 # anywhere in it, naming the killer and carrying the expected text, is a kill.
 classify_run() {
-	local run_exit=$1 events=$2 killer=$3 want=$4
+	local run_exit=$1 events=$2 killer=$3 want=$4 probe
 	if ! events_valid "$events"; then print -r -- 'INVALID-EVENTS'; return; fi
 	if (( run_exit == 0 )); then print -r -- 'SURVIVED'; return; fi
 	if (( run_exit != 1 )); then print -r -- "TOOLFAIL(exit $run_exit)"; return; fi
-	if stream_broken "$events"; then print -r -- 'BROKEN-RUN'; return; fi
-	if [[ -n "$(events_for "$events" "$killer" skip Test)" ]]; then print -r -- 'SKIPPED'; return; fi
-	if [[ -z "$(events_for "$events" "$killer" fail Test)" ]]; then print -r -- 'WRONG-TEST'; return; fi
-	if ! events_for "$events" "$killer" output Output | grep -qF -- "$want"; then
-		print -r -- 'WRONG-ASSERTION'; return
-	fi
+
+	# probe is reset before every predicate: a leftover status from the previous
+	# question would answer the next one.
+	probe=0; stream_broken "$events" || probe=$?
+	case $probe in
+		0) print -r -- 'BROKEN-RUN'; return ;;
+		2) print -r -- 'EVENTS-UNREADABLE'; return ;;
+	esac
+
+	probe=0; test_emitted "$events" "$killer" skip || probe=$?
+	case $probe in
+		0) print -r -- 'SKIPPED'; return ;;
+		2) print -r -- 'EVENTS-UNREADABLE'; return ;;
+	esac
+
+	probe=0; test_emitted "$events" "$killer" fail || probe=$?
+	case $probe in
+		1) print -r -- 'WRONG-TEST'; return ;;
+		2) print -r -- 'EVENTS-UNREADABLE'; return ;;
+	esac
+
+	probe=0; test_emitted "$events" "$killer" output "$want" || probe=$?
+	case $probe in
+		1) print -r -- 'WRONG-ASSERTION'; return ;;
+		2) print -r -- 'EVENTS-UNREADABLE'; return ;;
+	esac
+
 	print -r -- 'KILLED'
 }
 
