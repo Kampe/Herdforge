@@ -12,6 +12,14 @@
 # A compile error, a timeout, a skip, or an unrelated assertion is not a kill.
 # Counting any of them is how a vacuous control passes.
 #
+# UNKNOWN clause: a genuinely UNKNOWN reading is refused at three independent
+# sites (checkReading rejects the posture, freshness.Value reports ok=false, and
+# the zero value then fails Usable/normalizedFrom), so no single compiling
+# mutation admits one. The control here instead pins the UNKNOWN REPORTING
+# guard: an unmeasured host must verdict ALERT, not TIGHT. The UNKNOWN REFUSAL
+# clause is therefore left explicitly unverified rather than covered by a
+# three-site mutation that would not resemble any plausible regression.
+#
 # All mutation happens in one ephemeral detached worktree this invocation
 # creates and owns. The invoking checkout is never written to, and this script
 # deletes nothing it did not create.
@@ -33,7 +41,13 @@ resources_pkg=./pkg/resources/
 herd_pkg=./cmd/herd/
 
 resources_run='TestCPUAndMemoryRefuseIndependently|TestHealthyAdmitsAtTheReserveBoundary|TestKernelPressureRefusesRegardlessOfFreePercent|TestConsumerPolicyEnforcesWhatFreshnessDoesNot|TestUnknownObservationsRefuse|TestStaleObservationsRefuse'
-herd_run='TestCapacityRefusesWithoutAnAdmission|TestCapacityAndResourcesRefuseTogether|TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation|TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease'
+herd_run='TestCapacityRefusesWithoutAnAdmission|TestCapacityAndResourcesRefuseTogether|TestCapacityAdmitsHealthyHost|TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation|TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease'
+
+# Every baseline run must show these EXACT tests passing at top level. Exit 0
+# alone is not a baseline: a selector that matched nothing, or a run whose
+# positive control skipped, also exits 0.
+resources_expect='TestCPUAndMemoryRefuseIndependently TestHealthyAdmitsAtTheReserveBoundary TestKernelPressureRefusesRegardlessOfFreePercent TestConsumerPolicyEnforcesWhatFreshnessDoesNot TestUnknownObservationsRefuse TestStaleObservationsRefuse'
+herd_expect='TestCapacityRefusesWithoutAnAdmission TestCapacityAndResourcesRefuseTogether TestCapacityAdmitsHealthyHost TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease'
 
 # Finite, explicit, and bounded at both ends before any arithmetic: an absurd or
 # overflowing override must be rejected, not added to.
@@ -57,6 +71,9 @@ summary=$run_dir/summary.txt
 
 work=""
 work_owned=0
+# work_attempted records that a path was reserved for the checkout. Ownership is
+# a stronger claim, set only once `git worktree add` completed.
+work_attempted=0
 cleanup_failed=0
 
 cleanup() {
@@ -71,6 +88,13 @@ cleanup() {
 			print -r -- 'cleanup FAILED: the mutation checkout was left in place (see stderr for its path)' >> "$summary"
 			cleanup_failed=1
 		fi
+	elif (( work_attempted )) && [[ -n "$work" && -e "$work" ]]; then
+		# Reserved but never owned: the add did not complete, so this run has
+		# no claim on what is there. Report the exact residual and fail; do not
+		# delete a path whose ownership was never established.
+		print -u2 "error: $work exists but this run never took ownership of it; leaving it in place for inspection"
+		print -r -- 'residual: a path from an incomplete worktree add was left in place (see stderr for its path)' >> "$summary"
+		cleanup_failed=1
 	fi
 	if (( cleanup_failed )) && (( code == 0 )); then
 		code=1
@@ -89,7 +113,11 @@ work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/verify-admission-XXXXXX")
 # mktemp made the directory; `git worktree add` needs the path absent. rmdir
 # refuses a non-empty directory, which is the guard we want.
 rmdir -- "$work"
-git -C "$repo_root" worktree add --detach --quiet -- "$work" "$pin"
+work_attempted=1
+if ! git -C "$repo_root" worktree add --detach --quiet -- "$work" "$pin"; then
+	print -u2 "error: git worktree add did not complete for $work"
+	exit 1
+fi
 work_owned=1
 
 work_pin=$(git -C "$work" rev-parse HEAD)
@@ -174,16 +202,34 @@ test_emitted() {
 		"$events" --arg t "$test_name" --arg a "$action" --arg w "$want"
 }
 
+# count_occurrences counts LITERAL occurrences, not matching lines.
+#
+# grep -c counts lines, so an anchor appearing twice on one line counted as 1
+# and both copies were then replaced -- a silently doubled mutation that the
+# drift guard was supposed to prevent.
+count_occurrences() {
+	local rest=$1 needle=$2 n=0
+	while [[ "$rest" == *"$needle"* ]]; do
+		rest=${rest#*"$needle"}
+		(( n += 1 ))
+	done
+	print -r -- "$n"
+}
+
 # patch_source replaces exactly one occurrence of anchor. Any other count is a
-# hard failure, so source drift cannot become a silent no-op mutant.
+# hard failure, so source drift cannot become a silent no-op or doubled mutant.
+# A read failure is reported distinctly from a count mismatch.
 patch_source() {
-	local src=$1 anchor=$2 replacement=$3 file=$work/$1 found content mutated
-	found=$(grep -F -c -- "$anchor" "$file" || true)
-	if [[ "$found" != 1 ]]; then
-		print -u2 "error: anchor matched ${found:-0} times in $src, want exactly 1 (source drifted): $anchor"
+	local src=$1 anchor=$2 replacement=$3 file=$work/$1 content found mutated
+	if ! content=$(<"$file"); then
+		print -u2 "error: cannot read $src for mutation"
 		return 1
 	fi
-	content=$(<"$file")
+	found=$(count_occurrences "$content" "$anchor")
+	if [[ "$found" != 1 ]]; then
+		print -u2 "error: anchor occurs $found time(s) in $src, want exactly 1 (source drifted): $anchor"
+		return 1
+	fi
 	print -r -- "${content//"$anchor"/"$replacement"}" >| "$file"
 	mutated=$(git -C "$work" hash-object -- "$src")
 	[[ "$mutated" != "${pristine[$src]}" ]] || { print -u2 "error: mutation did not change $src"; return 1; }
@@ -201,6 +247,37 @@ restore_all() {
 	for src in "$admission_src" "$capacity_src"; do
 		restore_source "$src"
 	done
+}
+
+# baseline_ok requires a validated stream in which every EXPECTED test emitted a
+# top-level pass, and none of them skipped or failed. Exit 0 is not enough: a
+# selector that matched nothing exits 0, and so does a run whose positive
+# control skipped itself.
+baseline_ok() {
+	local events=$1 expected=$2 name probe missing=0
+	if ! events_valid "$events"; then
+		note "  stream is not valid JSON"
+		return 1
+	fi
+	for name in ${=expected}; do
+		probe=0; test_emitted_exact "$events" "$name" pass || probe=$?
+		case $probe in
+			1) note "  $name did not pass at top level"; missing=1 ;;
+			2) note "  $name could not be evaluated"; missing=1 ;;
+		esac
+		probe=0; test_emitted "$events" "$name" skip || probe=$?
+		if (( probe == 0 )); then note "  $name skipped"; missing=1; fi
+		probe=0; test_emitted "$events" "$name" fail || probe=$?
+		if (( probe == 0 )); then note "  $name failed"; missing=1; fi
+	done
+	return $missing
+}
+
+# test_emitted_exact binds to the test itself, never a subtest: a baseline is
+# about the named test passing, not about one of its cases doing so.
+test_emitted_exact() {
+	jq_predicate 'any(.[]; (.Action == $a) and ((.Test // "") == $t))' \
+		"$1" --arg t "$2" --arg a "$3"
 }
 
 # classify_run maps one mutant onto the contract, given a compile that already
@@ -241,21 +318,21 @@ classify_run() {
 	print -r -- 'KILLED'
 }
 
-# id | source | anchor | replacement | package | killer test | required assertion
+# id | source | anchor | replacement | anchor2 | replacement2 | package | killer | assertion
 #
-# Each control removes ONE guard and names the test that must notice. The four
-# card requirements map on as: CPU (1), memory reserve and kernel pressure
-# (2, 3), stale and unrecognised observation posture (4, 5), and pool admission
-# before any mutation (6, 7).
+# anchor2 is empty for a single-site mutation. A pair is used only where the
+# guard is genuinely defended in two places and removing one would panic or be
+# caught by the other: that is still ONE introduced regression, not two.
 sep=$'\x1f'
 mutations=(
-"cpu-threshold-removed${sep}${admission_src}${sep}		if normalized >= limits.CPURefuseLoad {${sep}		if false { // MUTANT: cpu threshold removed${sep}${resources_pkg}${sep}TestCPUAndMemoryRefuseIndependently${sep}saturated cpu with healthy memory admitted"
-"memory-reserve-removed${sep}${admission_src}${sep}		case head.FreePctGates && head.FreePct < limits.MemReservePct:${sep}		case false: // MUTANT: os reserve removed${sep}${resources_pkg}${sep}TestHealthyAdmitsAtTheReserveBoundary${sep}headroom one point below the reserve admitted"
-"kernel-pressure-ignored${sep}${admission_src}${sep}		case head.Pressure.Unsafe():${sep}		case false: // MUTANT: kernel pressure ignored${sep}${resources_pkg}${sep}TestKernelPressureRefusesRegardlessOfFreePercent${sep}admitted at 95% free"
-"stale-age-never-expires${sep}${admission_src}${sep}	if age := now.Sub(observedAt); age > limits.StaleAfter {${sep}	if age := now.Sub(observedAt); false { // MUTANT: age never expires${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an hour-old FRESH reading admitted"
-"unrecognized-posture-accepted${sep}${admission_src}${sep}		return fmt.Sprintf(\"%s carries an unrecognized freshness state %q; an unset posture is not an observation\", what, string(state))${sep}		return \"\" // MUTANT: unrecognised posture accepted${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an unrecognized freshness state admitted"
-"capacity-ignores-refusal${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation${sep}an unsafe host must refuse the launch"
-"capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted"
+"cpu-threshold-removed${sep}${admission_src}${sep}		if normalized >= limits.CPURefuseLoad {${sep}		if false { // MUTANT: cpu threshold removed${sep}${sep}${sep}${resources_pkg}${sep}TestCPUAndMemoryRefuseIndependently${sep}saturated cpu with healthy memory admitted"
+"memory-reserve-removed${sep}${admission_src}${sep}		case head.FreePctGates && head.FreePct < limits.MemReservePct:${sep}		case false: // MUTANT: os reserve removed${sep}${sep}${sep}${resources_pkg}${sep}TestHealthyAdmitsAtTheReserveBoundary${sep}headroom one point below the reserve admitted"
+"kernel-pressure-ignored${sep}${admission_src}${sep}		case head.Pressure.Unsafe():${sep}		case false: // MUTANT: kernel pressure ignored${sep}${sep}${sep}${resources_pkg}${sep}TestKernelPressureRefusesRegardlessOfFreePercent${sep}admitted at 95% free"
+"stale-age-never-expires${sep}${admission_src}${sep}	if age := now.Sub(observedAt); age > limits.StaleAfter {${sep}	if age := now.Sub(observedAt); false { // MUTANT: age never expires${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an hour-old FRESH reading admitted"
+"unrecognized-posture-accepted${sep}${admission_src}${sep}		return fmt.Sprintf(\"%s carries an unrecognized freshness state %q; an unset posture is not an observation\", what, string(state))${sep}		return \"\" // MUTANT: unrecognised posture accepted${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an unrecognized freshness state admitted"
+"unmeasured-host-not-alert${sep}${admission_src}${sep}	if !a.cpuUsable || !a.memUsable {${sep}	if false { // MUTANT: an unmeasured host stops reporting ALERT${sep}${sep}${sep}${resources_pkg}${sep}TestUnknownObservationsRefuse${sep}want \"ALERT\" for an unmeasured host"
+"capacity-ignores-refusal${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/cpu-saturated${sep}an unsafe host must refuse the launch"
+"capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: paired, so the nil case cannot be dereferenced${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted"
 )
 
 note "pin $pin"
@@ -268,15 +345,19 @@ for src in "$admission_src" "$capacity_src"; do
 	note "source $src (${pristine[$src]})"
 done
 
+
 baseline_failed=0
-for spec in "${resources_pkg}${sep}${resources_run}${sep}resources" "${herd_pkg}${sep}${herd_run}${sep}herd"; do
+for spec in "${resources_pkg}${sep}${resources_run}${sep}resources${sep}${resources_expect}" "${herd_pkg}${sep}${herd_run}${sep}herd${sep}${herd_expect}"; do
 	fields=("${(@ps:$sep:)spec}")
 	baseline_exit=$(run_focused "$fields[1]" "$fields[2]" "$run_dir/baseline-$fields[3].json" "$run_dir/baseline-$fields[3].err")
 	if (( baseline_exit != 0 )); then
 		note "baseline $fields[3] FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
 		baseline_failed=1
+	elif ! baseline_ok "$run_dir/baseline-$fields[3].json" "$fields[4]"; then
+		note "baseline $fields[3] FAILED - exit 0 but the required tests did not all pass"
+		baseline_failed=1
 	else
-		note "baseline $fields[3] PASS"
+		note "baseline $fields[3] PASS (every expected test passed at top level)"
 	fi
 done
 (( baseline_failed == 0 )) || exit 1
@@ -287,10 +368,14 @@ for record in "${mutations[@]}"; do
 	(( index += 1 ))
 	fields=("${(@ps:$sep:)record}")
 	id=$fields[1]; src=$fields[2]; anchor=$fields[3]; replacement=$fields[4]
-	pkg=$fields[5]; killer=$fields[6]; want=$fields[7]
+	anchor2=$fields[5]; replacement2=$fields[6]
+	pkg=$fields[7]; killer=$fields[8]; want=$fields[9]
 	stem=$run_dir/$(printf 'm%02d-%s' "$index" "$id")
 
 	patch_source "$src" "$anchor" "$replacement"
+	if [[ -n "$anchor2" ]]; then
+		patch_source "$src" "$anchor2" "$replacement2"
+	fi
 	compile_exit=$(compile_check "$pkg" "$stem.compile.log")
 	if (( compile_exit != 0 )); then
 		restore_source "$src"
@@ -312,14 +397,17 @@ done
 
 restore_all
 restored_failed=0
-for spec in "${resources_pkg}${sep}${resources_run}${sep}resources" "${herd_pkg}${sep}${herd_run}${sep}herd"; do
+for spec in "${resources_pkg}${sep}${resources_run}${sep}resources${sep}${resources_expect}" "${herd_pkg}${sep}${herd_run}${sep}herd${sep}${herd_expect}"; do
 	fields=("${(@ps:$sep:)spec}")
 	restored_exit=$(run_focused "$fields[1]" "$fields[2]" "$run_dir/restored-$fields[3].json" "$run_dir/restored-$fields[3].err")
 	if (( restored_exit != 0 )); then
 		note "restored baseline $fields[3] FAILED (exit $restored_exit) - the source did not come back clean"
 		restored_failed=1
+	elif ! baseline_ok "$run_dir/restored-$fields[3].json" "$fields[4]"; then
+		note "restored baseline $fields[3] FAILED - exit 0 but the required tests did not all pass"
+		restored_failed=1
 	else
-		note "restored baseline $fields[3] PASS"
+		note "restored baseline $fields[3] PASS (every expected test passed at top level)"
 	fi
 done
 (( restored_failed == 0 )) || exit 1
