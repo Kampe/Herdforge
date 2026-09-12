@@ -224,7 +224,10 @@ expected_passes=(
 	TestBoundedInboxRejectsUnorderedStorage
 	TestBoundedInboxRefusesDuplicateIdentities
 	TestBoundedInboxRefusesNonPositiveIdentities
-	TestBoundedInboxDetectsReplacementButToleratesAck
+	TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord
+	TestBoundedInboxDetectsSameIDDifferentFeedbackContent
+	TestBoundedInboxToleratesAppendAndAckRewrites
+	TestBoundedControlRejectsOmittedBindings
 	TestBoundedInboxQuarantinesMalformedRowPastAFullPage
 	TestBoundedInboxOversizedRecordFailsInsteadOfStalling
 	TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage
@@ -278,6 +281,9 @@ mutations=(
 	}${sep}	if page.Truncated || controlErr != nil {
 		return out, controlErr // MUTANT: return before validating feedback
 	}${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage${sep}full control page hid an unreadable feedback store"
+"prefix-watermark-unchecked${sep}${source_rel}${sep}				if cur.ControlAnchor != watermark {${sep}				if false { // MUTANT: consumed prefix not verified${sep}TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord${sep}resumed silently behind an unchanged first record"
+"feedback-watermark-unchecked${sep}${cli_rel}${sep}				if anchor != watermark {${sep}				if false { // MUTANT: feedback prefix not verified${sep}TestBoundedInboxDetectsSameIDDifferentFeedbackContent${sep}same id resumed silently"
+"binding-omission-allowed${sep}${source_rel}${sep}	if strings.TrimSpace(opts.Source) == "" {${sep}	if false { // MUTANT: missing caller fingerprint tolerated${sep}TestBoundedControlRejectsOmittedBindings${sep}storage fingerprint was accepted"
 "feedback-bytes-uncounted${sep}${cli_rel}${sep}		out.RetainedBytes += size${sep}		_ = size // MUTANT: feedback bytes not counted${sep}TestBoundedInboxBytesAccountForBothSources${sep}feedback bytes were not counted"
 )
 
