@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -478,7 +477,7 @@ func herdrServerRunning() (bool, string) {
 // Returns (-1, -1) where neither exists, which the decision treats as
 // unmeasured rather than as zero.
 func hostMemoryMiB() (total, avail, swapUsed int64) {
-	raw, err := os.ReadFile("/proc/meminfo")
+	raw, err := os.ReadFile(resources.LinuxMeminfoPath)
 	if err != nil {
 		if runtime.GOOS == "darwin" {
 			return darwinMemoryMiB()
@@ -1167,7 +1166,7 @@ func readHostMemory() freshness.Reading[hostMemory] {
 	// defect as every other mislabelled source this control plane has been
 	// bitten by -- an operator checking why a cap moved would go read a file
 	// that does not exist on the host that produced the number.
-	source := "/proc/meminfo"
+	source := resources.LinuxMeminfoPath
 	if runtime.GOOS == "darwin" {
 		source = "sysctl hw.memsize + vm_stat"
 	}
@@ -1188,7 +1187,7 @@ func readHostMemory() freshness.Reading[hostMemory] {
 // and therefore NOT a refusal. A kernel without PSI must not be fenced for
 // lacking an instrument.
 func hostMemoryPressurePct() float64 {
-	raw, err := os.ReadFile("/proc/pressure/memory")
+	raw, err := os.ReadFile(resources.LinuxPressureMemoryPath)
 	if err != nil {
 		return -1
 	}
@@ -1214,7 +1213,7 @@ func hostMemoryPressurePct() float64 {
 // hostSwapTotalMiB reports configured swap. -1 where unreadable, so the
 // backstop below cannot divide by an invented total.
 func hostSwapTotalMiB() int64 {
-	raw, err := os.ReadFile("/proc/meminfo")
+	raw, err := os.ReadFile(resources.LinuxMeminfoPath)
 	if err != nil {
 		return -1
 	}
@@ -1234,20 +1233,4 @@ func hostSwapTotalMiB() int64 {
 		return n / 1024
 	}
 	return -1
-}
-
-// withSharedAdmission attaches the shared resource decision LAST, after the
-// herdr, memory and process probes above have already run.
-//
-// Order matters: taken first, the decision would be minutes old by the time the
-// slow probes finished, and capacity would gate on a host state that had moved.
-// decideCapacity revalidates it again at its own boundary, so a decision that
-// ages out between here and there refuses rather than admitting on history.
-func withSharedAdmission(o CapacityObservation) CapacityObservation {
-	admission := resources.Admit(context.Background())
-	o.admission = &admission
-	// DecidedAt is deliberately LEFT ZERO here: decideCapacity stamps its own
-	// boundary. Copying the observation time would make every revalidation
-	// trivially fresh, which is the check this is meant to perform.
-	return o
 }

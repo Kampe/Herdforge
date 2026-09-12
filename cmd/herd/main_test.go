@@ -394,6 +394,11 @@ func applyNestedSlotReentry(cmd *exec.Cmd) *exec.Cmd {
 	return cmd
 }
 
+// buildHerd compiles the CLI under test with the herdfixture tag, which swaps
+// ONE function -- the capacity census's shared-admission attachment -- for a
+// twin that can decide against fixture readings instead of the runner's real
+// load. The tag is never used for a release build, so the shipped binary has no
+// such seam; see cmd/herd/capacity_shared_admission_fixture.go.
 func buildHerd(t *testing.T) string {
 	t.Helper()
 	herdBinaryOnce.Do(func() {
@@ -408,7 +413,7 @@ func buildHerd(t *testing.T) string {
 			herdBinaryErr = err
 			return
 		}
-		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+revision, "-o", binary, ".").CombinedOutput()
+		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-tags", "herdfixture", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+revision, "-o", binary, ".").CombinedOutput()
 		if herdBinaryErr == nil {
 			herdBinary = binary
 		}

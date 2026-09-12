@@ -197,6 +197,14 @@ func poolReviewCmd(t *testing.T, binary, dir, keyDir string, args ...string) ([]
 		// operator's fleet: the reviewer budget is a fixture fact here.
 		"HERD_REVIEWER_RSS_MIB=64",
 		"HERD_MEM_FLOOR_MIB=64",
+		// Same reason, for the resource admission the census now consults:
+		// these fixtures assert contract ownership and pool mutation, and a
+		// loaded runner refused them at the CPU gate before they reached their
+		// own assertions. The seam substitutes the READINGS, not the policy --
+		// they still run through the real resources.Decide -- and it exists
+		// only in the herdfixture build. Refusal paths are covered separately
+		// in capacity_pool_gate_test.go.
+		"HERD_FIXTURE_ADMISSION=healthy",
 	)
 	if seal := readMintedSeal(dir); seal != "" {
 		cmd.Env = append(cmd.Env, "HERD_FENCE_VOLUME_ID="+seal)

@@ -20,7 +20,7 @@ import (
 const (
 	linuxCPUSource = "linux /proc/loadavg"
 	linuxMemSource = "linux /proc/meminfo"
-	linuxPSIPath   = "/proc/pressure/memory"
+	linuxPSIPath   = LinuxPressureMemoryPath
 	// linuxPSIStallPct is the share of the last 10s that work stalled waiting on
 	// memory, above which the kernel is reporting memory trouble. It matches the
 	// threshold cmd/herd/capacity.go already uses, so the two cannot drift.
@@ -31,7 +31,7 @@ const (
 // leak. Build tags keep them off the Darwin probes, which do not exist here and
 // whose failure used to return a fabricated 100% free.
 func observeCPU(ctx context.Context, at time.Time, limits Limits) freshness.Reading[CPULoad] {
-	raw, err := readFileCtx(ctx, "/proc/loadavg")
+	raw, err := readFileCtx(ctx, LinuxLoadavgPath)
 	if err != nil {
 		return unknownReading[CPULoad](linuxCPUSource, err, "verify /proc is mounted and readable")
 	}
@@ -55,13 +55,13 @@ func observeMemory(ctx context.Context, at time.Time, limits Limits) freshness.R
 // observeLinuxMemory takes its readers injected so a fixture can drive every
 // branch without depending on the host it runs on.
 func observeLinuxMemory(ctx context.Context, at time.Time, limits Limits, readMeminfo, readPSI func(string) (string, error)) freshness.Reading[MemHeadroom] {
-	raw, err := readMeminfo("/proc/meminfo")
+	raw, err := readMeminfo(LinuxMeminfoPath)
 	if err != nil {
 		return unknownReading[MemHeadroom](linuxMemSource, err, "verify /proc is mounted and readable")
 	}
 	head, err := parseMeminfoHeadroom(raw)
 	if err != nil {
-		return unknownReading[MemHeadroom](linuxMemSource, err, "/proc/meminfo was not in the expected shape")
+		return unknownReading[MemHeadroom](linuxMemSource, err, LinuxMeminfoPath+" was not in the expected shape")
 	}
 
 	psi, psiErr := readPSI(linuxPSIPath)
@@ -157,16 +157,16 @@ func parseMeminfoHeadroom(raw string) (MemHeadroom, error) {
 	total, okTotal := fields["MemTotal"]
 	avail, okAvail := fields["MemAvailable"]
 	if !okTotal || !okAvail {
-		return MemHeadroom{}, fmt.Errorf("/proc/meminfo lacked MemTotal and/or MemAvailable")
+		return MemHeadroom{}, fmt.Errorf("%s lacked MemTotal and/or MemAvailable", LinuxMeminfoPath)
 	}
 	if total <= 0 {
-		return MemHeadroom{}, fmt.Errorf("/proc/meminfo reported MemTotal=%d", total)
+		return MemHeadroom{}, fmt.Errorf("%s reported MemTotal=%d", LinuxMeminfoPath, total)
 	}
 	if avail < 0 {
-		return MemHeadroom{}, fmt.Errorf("/proc/meminfo reported MemAvailable=%d", avail)
+		return MemHeadroom{}, fmt.Errorf("%s reported MemAvailable=%d", LinuxMeminfoPath, avail)
 	}
 	if avail > total {
-		return MemHeadroom{}, fmt.Errorf("/proc/meminfo reported MemAvailable=%d above MemTotal=%d", avail, total)
+		return MemHeadroom{}, fmt.Errorf("%s reported MemAvailable=%d above MemTotal=%d", LinuxMeminfoPath, avail, total)
 	}
 	pct, err := percentOf(avail, total)
 	if err != nil {

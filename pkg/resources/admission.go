@@ -497,6 +497,15 @@ func unknownReading[T any](source string, err error, recovery string) freshness.
 	return freshness.Degrade(freshness.Reading[T]{}, source, err, recovery)
 }
 
+// Canonical Linux telemetry paths. ONE definition each, because two files
+// naming the same file is how they come to read different ones. cmd/herd's
+// capacity census and this package's admission observer both use these.
+const (
+	LinuxMeminfoPath        = "/proc/meminfo"
+	LinuxLoadavgPath        = "/proc/loadavg"
+	LinuxPressureMemoryPath = "/proc/pressure/memory"
+)
+
 // parseLoad1 reads the 1-minute load average from either platform's format:
 // Darwin's "{ 1.23 1.45 1.67 }" and Linux's "1.23 1.45 1.67 2/345 6789".
 //
