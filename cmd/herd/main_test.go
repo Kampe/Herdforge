@@ -83,10 +83,14 @@ func TestCoordinatorControlBindingSurvivesCompletedCoordinatorTab(t *testing.T) 
 // package inside the suite's timeout; every caller only ever runs it, so a
 // shared artifact is equivalent to a per-test one.
 var (
-	herdBinaryOnce sync.Once
-	herdBinary     string
-	herdBinaryErr  error
-	herdBinaryOut  []byte
+	herdBinaryOnce    sync.Once
+	herdFixtureOnce   sync.Once
+	herdFixtureBinary string
+	herdFixtureErr    error
+	herdFixtureOut    []byte
+	herdBinary        string
+	herdBinaryErr     error
+	herdBinaryOut     []byte
 	// nestedVerifierSlotHeld is captured before Strip so nested herd CLI
 	// children can retain only the managed-verifier re-entrancy authority.
 	nestedVerifierSlotHeld bool
@@ -155,6 +159,9 @@ func TestMain(m *testing.M) {
 		}
 	}
 	if dir := filepath.Dir(herdBinary); herdBinary != "" {
+		_ = os.RemoveAll(dir)
+	}
+	if dir := filepath.Dir(herdFixtureBinary); herdFixtureBinary != "" {
 		_ = os.RemoveAll(dir)
 	}
 	restoreSlots()
@@ -394,11 +401,6 @@ func applyNestedSlotReentry(cmd *exec.Cmd) *exec.Cmd {
 	return cmd
 }
 
-// buildHerd compiles the CLI under test with the herdfixture tag, which swaps
-// ONE function -- the capacity census's shared-admission attachment -- for a
-// twin that can decide against fixture readings instead of the runner's real
-// load. The tag is never used for a release build, so the shipped binary has no
-// such seam; see cmd/herd/capacity_shared_admission_fixture.go.
 func buildHerd(t *testing.T) string {
 	t.Helper()
 	herdBinaryOnce.Do(func() {
@@ -413,7 +415,7 @@ func buildHerd(t *testing.T) string {
 			herdBinaryErr = err
 			return
 		}
-		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-tags", "herdfixture", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+revision, "-o", binary, ".").CombinedOutput()
+		herdBinaryOut, herdBinaryErr = exec.Command("go", "build", "-buildvcs=false", "-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+revision, "-o", binary, ".").CombinedOutput()
 		if herdBinaryErr == nil {
 			herdBinary = binary
 		}
@@ -880,4 +882,40 @@ func TestCloneHelpInUsage(t *testing.T) {
 	if !strings.Contains(string(out), "clone") {
 		t.Errorf("help should list clone command, got %s", string(out))
 	}
+}
+
+// buildHerdFixtureAdmission builds a SECOND CLI binary with the herdfixture
+// tag, for the handful of subprocess tests whose subject is not resource
+// admission and which therefore need a known host instead of the runner's real
+// load.
+//
+// It is separate from buildHerd on purpose. buildHerd stays the SHIPPED,
+// untagged binary, so every other CLI integration test keeps exercising exactly
+// what is released; only the pool contract fixtures opt in here. The two are
+// cached independently so neither pays for the other's build.
+func buildHerdFixtureAdmission(t *testing.T) string {
+	t.Helper()
+	herdFixtureOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "herd-cli-fixture-bin")
+		if err != nil {
+			herdFixtureErr = err
+			return
+		}
+		binary := filepath.Join(dir, "herd")
+		revision, err := cliTestRevision()
+		if err != nil {
+			herdFixtureErr = err
+			return
+		}
+		herdFixtureOut, herdFixtureErr = exec.Command("go", "build", "-buildvcs=false", "-tags", "herdfixture",
+			"-ldflags", "-X github.com/Kampe/Herdforge/pkg/provenance.BinaryRevision="+revision,
+			"-o", binary, ".").CombinedOutput()
+		if herdFixtureErr == nil {
+			herdFixtureBinary = binary
+		}
+	})
+	if herdFixtureErr != nil {
+		t.Fatalf("fixture build failed: %v, output: %s", herdFixtureErr, herdFixtureOut)
+	}
+	return herdFixtureBinary
 }

@@ -492,12 +492,9 @@ func TestResourcesVerdictGatesRaise(t *testing.T) {
 					t.Fatalf("OK must be ready: %+v", rep.Gates)
 				}
 				// RaiseStanding activates ONE standing lane per configured
-				// lane, so the expected count is the fixture's own lane
-				// count. The production behaviour was right and this
-				// expectation was wrong: readySources configures two standing
-				// lanes (coordinator, smith) and my first draft asserted 1.
-				// Derived, not hardcoded, so it stays exact if the fixture
-				// gains a lane -- and never an unbounded "> 0".
+				// lane, so the expected count is the fixture's own lane count.
+				// Derived rather than hardcoded, so it stays exact if the
+				// fixture gains a lane, and never an unbounded "> 0".
 				wantRaises := len(src.StandingLanes())
 				if wantRaises == 0 {
 					t.Fatal("the positive control must configure at least one standing lane")

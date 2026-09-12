@@ -182,7 +182,18 @@ func poolContractFixture(t *testing.T, binary string) (dir, keyDir string, shas 
 // fixtureStubDir is set by poolContractFixture for poolReviewCmd.
 var fixtureStubDir string
 
+// poolReviewCmd runs the pool path against a KNOWN healthy host. These fixtures
+// assert contract ownership and pool mutation, not resource admission, and the
+// runner's own load is not their subject.
 func poolReviewCmd(t *testing.T, binary, dir, keyDir string, args ...string) ([]byte, error) {
+	t.Helper()
+	return poolReviewCmdOnHost(t, "healthy", binary, dir, keyDir, args...)
+}
+
+// poolReviewCmdOnHost runs the pool path against the named fixture host. The
+// readings still go through the real admission policy in the herdfixture build,
+// so "cpu-saturated" and "memory-pressure" produce production refusals.
+func poolReviewCmdOnHost(t *testing.T, host, binary, dir, keyDir string, args ...string) ([]byte, error) {
 	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
@@ -197,14 +208,9 @@ func poolReviewCmd(t *testing.T, binary, dir, keyDir string, args ...string) ([]
 		// operator's fleet: the reviewer budget is a fixture fact here.
 		"HERD_REVIEWER_RSS_MIB=64",
 		"HERD_MEM_FLOOR_MIB=64",
-		// Same reason, for the resource admission the census now consults:
-		// these fixtures assert contract ownership and pool mutation, and a
-		// loaded runner refused them at the CPU gate before they reached their
-		// own assertions. The seam substitutes the READINGS, not the policy --
-		// they still run through the real resources.Decide -- and it exists
-		// only in the herdfixture build. Refusal paths are covered separately
-		// in capacity_pool_gate_test.go.
-		"HERD_FIXTURE_ADMISSION=healthy",
+		// The host readings the capacity census decides against. Honoured only
+		// by the herdfixture build; see capacity_shared_admission_fixture.go.
+		"HERD_FIXTURE_ADMISSION="+host,
 	)
 	if seal := readMintedSeal(dir); seal != "" {
 		cmd.Env = append(cmd.Env, "HERD_FENCE_VOLUME_ID="+seal)
@@ -241,7 +247,7 @@ func assertZeroPoolMutation(t *testing.T, out []byte, poolRoot, surfaceRoot, pac
 // provenance-admitted on a retry. Same public entry, ledger absence as the
 // observable.
 func TestPoolReviewRefusesMalformedContractBeforeAssertedProvenance(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 	ledgerPath := reviewledger.DefaultPath(dir)
 
@@ -266,7 +272,7 @@ func TestPoolReviewRefusesMalformedContractBeforeAssertedProvenance(t *testing.T
 }
 
 func TestPoolReviewRefusesUnownedContractBeforePoolMutation(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 
 	for name, sha := range shas {
@@ -297,7 +303,7 @@ func TestPoolReviewRefusesUnownedContractBeforePoolMutation(t *testing.T) {
 // regular blobs passes the pre-pool gate, prepares the surface, and — under
 // --no-launch — keeps BOTH the surface and the lease (FAC-626).
 func TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 	sha := shas["valid"]
 	poolRoot := filepath.Join(t.TempDir(), "pool")
@@ -362,7 +368,7 @@ func TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease(t *testing.T) {
 // provisional surface must be removed and the lease released, leaving no
 // ownerless surface behind (finding 1, explicit provisional cleanup).
 func TestPoolReviewPostPreparationFailureCleansProvisionalSurface(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 	sha := shas["valid"]
 	poolRoot := filepath.Join(t.TempDir(), "pool")
@@ -460,4 +466,63 @@ func TestVerifyCandidateTreeContract(t *testing.T) {
 			t.Fatal("a sha that is not a commit here must refuse, not pass vacuously")
 		}
 	})
+}
+
+// TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation is the counterpart
+// to the healthy path above, through the SAME subprocess seam.
+//
+// It matters that this goes through the subprocess: capacity_pool_gate_test.go
+// substitutes poolCapacityObserve in-process and therefore never reaches
+// withSharedAdmission at all. These cases do, so the attachment, the real
+// resources.Decide and the pool gate's refusal are exercised together.
+//
+// A refusal must land BEFORE any candidate or pool mutation, and it must name
+// the resource that refused, so an operator is not left guessing which ceiling
+// stopped the launch.
+func TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation(t *testing.T) {
+	binary := buildHerdFixtureAdmission(t)
+	dir, keyDir, shas, calls := poolContractFixture(t, binary)
+	sha := shas["valid"]
+
+	for _, tc := range []struct {
+		host  string
+		wants []string
+	}{
+		{
+			host: "cpu-saturated",
+			// The production sentence, not a fixture paraphrase.
+			wants: []string{"REFUSING before candidate preparation", "CPU is saturated", "normalized load 2.00"},
+		},
+		{
+			host:  "memory-pressure",
+			wants: []string{"REFUSING before candidate preparation", "kernel reports memory pressure critical"},
+		},
+		{
+			// An unset or misspelled request must refuse deterministically
+			// rather than inherit whatever the runner was doing.
+			host:  "not-a-known-host",
+			wants: []string{"REFUSING before candidate preparation", "not known"},
+		},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			poolRoot := filepath.Join(t.TempDir(), "pool")
+			surfaceRoot := filepath.Join(t.TempDir(), "review-surfaces")
+			packetRoot := filepath.Join(t.TempDir(), "review-packets")
+
+			out, err := poolReviewCmdOnHost(t, tc.host, binary, dir, keyDir, "review", "FAC-1", "--pool", "--no-launch",
+				"--sha", sha, "--pool-root", poolRoot, "--surface-root", surfaceRoot, "--packet-root", packetRoot)
+			if err == nil {
+				t.Fatalf("an unsafe host must refuse the launch; output:\n%s", out)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("refusal must name %q so the operator knows which ceiling stopped it. Output:\n%s", want, out)
+				}
+			}
+			// The candidate here OWNS its contract, so nothing but the resource
+			// gate can be refusing: the same sha admits on a healthy host in
+			// TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease.
+			assertZeroPoolMutation(t, out, poolRoot, surfaceRoot, packetRoot, calls)
+		})
+	}
 }
