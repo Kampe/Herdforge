@@ -394,9 +394,20 @@ func runMailInbox(mode string, args []string) {
 	afterCursor := fs.String("after-cursor", "", "resume after an opaque cursor from a previous page")
 	limit := fs.Int("limit", 0, "maximum records to retain in one page (enables bounded mode)")
 	maxBytes := fs.Int("max-bytes", 0, "maximum encoded bytes to retain in one page")
+	timeout := fs.Duration("timeout", 0, "finite deadline for one bounded page")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
+	// PRESENCE, not value. Deciding on value alone meant `--limit -1` was
+	// indistinguishable from an absent flag and silently fell through to the
+	// unbounded read this command exists to replace.
+	paging := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "after-cursor", "limit", "max-bytes", "timeout":
+			paging = true
+		}
+	})
 	if strings.TrimSpace(*recipient) == "" {
 		fmt.Fprintf(os.Stderr, "mail %s: --recipient is required\n", mode)
 		os.Exit(2)
@@ -406,19 +417,21 @@ func runMailInbox(mode string, args []string) {
 		fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, err)
 		os.Exit(1)
 	}
-	if req := (boundedInboxRequest{
-		Active:   strings.TrimSpace(*afterCursor) != "" || *limit > 0 || *maxBytes > 0,
-		Cursor:   strings.TrimSpace(*afterCursor),
-		Limit:    *limit,
-		MaxBytes: *maxBytes,
-	}); req.Active {
-		if req.Limit <= 0 {
-			req.Limit = defaultBoundedLimit
+	if paging {
+		req := boundedInboxRequest{
+			Active:   true,
+			Cursor:   strings.TrimSpace(*afterCursor),
+			Limit:    *limit,
+			MaxBytes: *maxBytes,
+			Timeout:  *timeout,
 		}
-		if req.MaxBytes <= 0 {
-			req.MaxBytes = defaultBoundedMaxBytes
+		if verr := req.validate(); verr != nil {
+			fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, verr)
+			os.Exit(2)
 		}
-		resp, berr := readBoundedInbox(context.Background(), mail.NewMailbox(path), strings.TrimSpace(*recipient), req)
+		ctx, cancel := context.WithTimeout(context.Background(), req.Timeout)
+		defer cancel()
+		resp, berr := readBoundedInbox(ctx, mail.NewMailbox(path), strings.TrimSpace(*recipient), req)
 		if berr != nil {
 			fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, berr)
 			os.Exit(1)
