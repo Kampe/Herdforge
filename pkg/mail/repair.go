@@ -90,11 +90,20 @@ var (
 	// package boundary, so no caller can apply an unattributed mutation.
 	ErrRepairActorRequired = errors.New("mail repair: acting requires an actor")
 	// ErrRepairCompletionUnrecorded is returned when the mailbox was repaired
-	// and verified but the completion record could not be durably written. The
-	// repair DID happen; what is missing is the evidence that it happened. That
-	// is reported as a failure rather than a success, because an operator who
-	// is told "applied" must be able to find the record that says so.
-	ErrRepairCompletionUnrecorded = errors.New("mail repair: row was repaired and verified but the completion record could not be written")
+	// and verified but the completion record could not be durably recorded.
+	//
+	// The repair DID happen: the mailbox write and the readback both succeeded
+	// before this. What is unconfirmed is the RECORD of it. appendLine writes
+	// the bytes and only then fsyncs, so a sync failure leaves a completion
+	// record that is present on the live filesystem but not proven to survive a
+	// crash. A reader may therefore see a result row saying applied — and that
+	// row is TRUE, not a fabrication; only its durability is unconfirmed.
+	//
+	// This is reported as a failure because the caller is the only party that
+	// knows the record is unconfirmed: that fact exists in the returned error
+	// and nowhere in the artifact, and no later consumer can recover it by
+	// reading bytes.
+	ErrRepairCompletionUnrecorded = errors.New("mail repair: row was repaired and verified, but its completion record is not durably recorded and any result row present must be treated as durability-unconfirmed")
 	// ErrRepairDuplicateKeys fires when a row repeats a top-level key. Decoding
 	// keeps only the last value, so normalizing such a row would silently
 	// discard an original the operator never saw.
@@ -459,11 +468,30 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 		plan.Applied = true
 		plan.CompletedAt = time.Now().UTC()
 		if err := m.appendRepairRecord(plan); err != nil {
-			// The row IS repaired and verified, but the evidence saying so is
-			// missing. Reporting success here would be the exact lie this
-			// phase split exists to prevent: an operator told "applied" must be
-			// able to find the record. The prepare record and the original
-			// bytes both remain on disk, so the state is recoverable.
+			// The row IS repaired and verified; what is unconfirmed is the
+			// record of it. Reporting success here would tell an operator
+			// "applied" while the evidence they would go looking for may not
+			// survive a crash.
+			//
+			// Deliberately NOT done here, and why:
+			//
+			//   - No rollback of the appended bytes. appendLine writes before
+			//     it fsyncs, so a sync failure usually leaves the result row on
+			//     the live filesystem. Truncating an append-only audit log to
+			//     "undo" it would destroy real evidence to make a failure look
+			//     tidy, and would itself need a durable write to be safe.
+			//
+			//   - No separate commit marker. It would not help: the marker is
+			//     another append with the same failure mode, and the degraded
+			//     state is already reconcilable without it. If the result row
+			//     is lost to a crash, what remains is the prepare record plus a
+			//     mailbox that demonstrably holds the repaired row — which is
+			//     exactly enough to see what happened.
+			//
+			// So the honest contract is: the caller is told, through this
+			// error, that the completion is not durably recorded. That fact
+			// lives in the returned error and nowhere in the artifact, because
+			// no sequence of bytes in an append-only file can express it.
 			plan.Applied = false
 			plan.Outcome = RepairOutcomeFailed
 			return fmt.Errorf("%w: %v", ErrRepairCompletionUnrecorded, err)

@@ -647,14 +647,81 @@ func TestRepairFailsWhenCompletionRecordCannotBeWritten(t *testing.T) {
 	if sha256Hex(prepare.OriginalLine) != prepare.OriginalSHA256 {
 		t.Fatal("prepare record's bytes and fingerprint disagree, so it cannot be trusted for recovery")
 	}
-	// And the failed repair must not have reported success anywhere.
 	if prepare.Applied {
 		t.Fatal("the prepare record claims the repair was applied")
 	}
-	for _, rec := range records[1:] {
-		if rec.Applied || rec.Outcome == RepairOutcomeApplied {
-			t.Fatalf("a record claims success after an unrecorded completion: %+v", rec)
+
+	// Non-vacuity: the injected fault must have fired on the SECOND audit
+	// append, not on the first and not at all. Without this the assertions
+	// below could be satisfied by a run that never failed.
+	if writes < 2 {
+		t.Fatalf("the completion-record fault never fired: %d audit syncs observed", writes)
+	}
+
+	// What this injection can and cannot establish.
+	//
+	// appendLine writes the bytes and only then fsyncs, so a sync failure does
+	// NOT remove them: a result row saying applied is expected to be present on
+	// the live filesystem. An earlier version of this test asserted no record
+	// claimed success, which the fault cannot establish and which CI correctly
+	// caught.
+	//
+	// The row is also not a lie. The mailbox write and the readback both
+	// succeeded before the result append, so the repair really did happen; only
+	// the durability of the RECORD is unconfirmed, and that fact lives in the
+	// returned error rather than in any byte of the artifact.
+	//
+	// So what is asserted here is what is provable: the caller reported the
+	// failure, the returned plan is nil rather than a success, the original is
+	// recoverable, and any result row that IS present describes THIS repair
+	// rather than some fabricated other outcome.
+	if plan != nil {
+		t.Fatalf("a failed completion returned a plan the caller could read as success: %+v", plan)
+	}
+	for i, rec := range records[1:] {
+		if rec.Phase != RepairPhaseResult {
+			t.Fatalf("record %d after prepare is not a result record: %+v", i+1, rec)
 		}
+		if rec.OriginalSHA256 != prepare.OriginalSHA256 || rec.RepairedSHA256 != prepare.RepairedSHA256 {
+			t.Fatalf("a result row describes a different repair than the prepare record: %+v", rec)
+		}
+	}
+
+	// And the truth the result row would be reporting: the mailbox really is
+	// repaired, because the write and readback happened before the record did.
+	// This is what makes "durability-unconfirmed" the honest label rather than
+	// "possibly false".
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if bytes.Contains(data, []byte(legacyRow)) {
+		t.Fatal("the mailbox still holds the original row, so the completion failure came before the repair")
+	}
+	if !bytes.Contains(data, []byte(`"id":"host-81751-1789141629774"`)) {
+		t.Fatal("the repaired row is not in the mailbox")
+	}
+}
+
+// The contract boundary the fixture above rests on: appendLine writes before it
+// fsyncs, so a sync failure leaves the bytes on the live filesystem. Anything
+// that assumes a failed append means absent bytes is assuming something this
+// package does not provide.
+func TestAppendLineWriteSurvivesAFailedSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "artifact.jsonl")
+	restore := fileSyncFn
+	fileSyncFn = func(*os.File) error { return errors.New("injected sync failure") }
+	defer func() { fileSyncFn = restore }()
+
+	if err := appendLine(path, []byte(`{"k":"v"}`)); err == nil {
+		t.Fatal("a failed fsync must be reported as an error")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the artifact is absent after a failed sync, so the bytes were not written: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`{"k":"v"}`)) {
+		t.Fatalf("expected the written bytes to be present despite the sync failure, got %q", data)
 	}
 }
 
