@@ -301,8 +301,14 @@ func TestProcessDigestCapsPaneTextBeforeClassification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(result.Unknowns, "; "), "truncated to 64 bytes") {
+	if !strings.Contains(strings.Join(result.Unknowns, "; "), "truncated to 64 bytes by this sweep") {
 		t.Fatalf("the sweep did not report applying its cap: %v", result.Unknowns)
+	}
+	// A cut tail is incomplete evidence, so the digest must not call itself
+	// complete. Reporting the truncation in Unknowns while still exiting 0 is
+	// how a sweep that dropped the verdict reads as "nothing to see".
+	if !result.Partial {
+		t.Fatal("a sweep-truncated tail left the digest claiming to be complete")
 	}
 }
 

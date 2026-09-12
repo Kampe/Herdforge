@@ -95,6 +95,14 @@ case "$1 $2" in
       literal)  printf '{"id":1,"result":{"text":"{\\"error\\":\\"the agent printed this object itself\\"}","truncated":false}}\n' ;;
       # herdr states that it cut the tail itself.
       cut)      printf '{"id":1,"result":{"text":"PASS: 12 tests, 0 failures","truncated":true}}\n' ;;
+      # A transport payload well INSIDE the 1MiB byte bound whose result.text
+      # is larger than the sweep's own 16KiB tail cap. Nothing about this read
+      # fails: it is the sweep that drops bytes, and it must say so.
+      bigtail)
+        b=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        b=$b$b$b$b ; b=$b$b$b$b ; b=$b$b$b$b ; b=$b$b$b$b
+        printf '{"id":1,"result":{"text":"%s%s%sVERDICT-AT-THE-END","truncated":false}}\n' "$b" "$b" "$b"
+        ;;
       # No envelope at all: legacy raw text.
       rawtext)  printf 'PASS: 12 tests, 0 failures\n' ;;
       empty)    printf '{"id":1,"result":{"text":"","truncated":false}}\n' ;;
@@ -581,4 +589,59 @@ func TestProcessCLIReportsHerdrsOwnTruncation(t *testing.T) {
 	if got := strings.Join(envelope.Unknowns, "; "); !strings.Contains(got, "herdr reported the pane tail as truncated") {
 		t.Fatalf("herdr's truncation flag was dropped: %q", got)
 	}
+}
+
+// A pane tail this sweep truncates is incomplete evidence, end to end.
+//
+// The helper test on truncateTail proves the cut is UTF-8 safe; it cannot
+// prove the COMMAND reports the loss. This drives the compiled binary against
+// a transport payload well inside the 1MiB byte bound whose result.text is
+// larger than the 16KiB tail cap: nothing about the read failed, so only the
+// sweep's own truncation can make the digest partial. Before this, Unknowns
+// carried "truncated" while partial stayed false and the CLI exited 0.
+func TestProcessCLISweepTruncatedTailIsPartialAndNonzero(t *testing.T) {
+	dir := t.TempDir()
+	env, _ := installProcessFake(t, processFakeRoster, "bigtail")
+	out, err := runHerd(t, dir, env, "process", "--json", "--workspace", fakeProcessWorkspace)
+	if err == nil {
+		t.Fatalf("a sweep that dropped pane bytes exited 0:\n%s", firstBytes(out, 512))
+	}
+	if code := exitCode(err); code != 1 {
+		t.Fatalf("truncated sweep exited %d, want 1", code)
+	}
+	envelope := decodeProcessJSON(t, out)
+	if !envelope.Partial {
+		t.Fatal("a sweep-truncated tail produced a digest claiming to be complete")
+	}
+	got := strings.Join(envelope.Unknowns, "; ")
+	if !strings.Contains(got, "truncated to 16384 bytes by this sweep") {
+		t.Fatalf("the sweep did not name its own cap: %q", got)
+	}
+	// The read itself succeeded, so no transport failure may be claimed.
+	for _, reason := range []string{"transport", "unverified", "could not be decoded"} {
+		if strings.Contains(got, reason) {
+			t.Fatalf("a healthy read was reported as %q: %q", reason, got)
+		}
+	}
+	// Tail bytes stay bounded: the cap is applied BEFORE classification, and
+	// pkg/process then applies its own display cap. Neither the digest nor the
+	// emitted JSON may carry the oversize pane.
+	for _, item := range envelope.Items {
+		if len(item.Tail) > 1024 {
+			t.Fatalf("%s carried a %d-byte tail into the digest", item.Name, len(item.Tail))
+		}
+	}
+	if len(out) > 64<<10 {
+		t.Fatalf("the command emitted %d bytes for two panes; the tail cap did not reach the output", len(out))
+	}
+}
+
+// firstBytes bounds what a failure message pastes into the test log. An
+// oversize-payload fixture whose failure prints the payload is its own
+// resource problem.
+func firstBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "...(truncated)"
 }

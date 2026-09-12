@@ -315,12 +315,19 @@ func collectProcessDigest(ctx context.Context, workspace string, limits processS
 			var truncated bool
 			text, truncated = truncateTail(text, limits.MaxTailBytes)
 			if truncated {
-				note := fmt.Sprintf("%s: pane tail truncated to %d bytes", agent.Name, limits.MaxTailBytes)
+				// EVERY sweep-caused truncation is incomplete, not only the
+				// case where no rune boundary was found. Classifying a tail
+				// this sweep cut is classifying evidence it knows is missing:
+				// the verdict may have been in the bytes that were dropped.
+				// Reporting it in Unknowns while still exiting 0 is the exact
+				// shape of "nothing needs attention" being believed, and it is
+				// the same fact herdr states with its own truncated flag.
+				result.Partial = true
+				note := fmt.Sprintf("%s: pane tail truncated to %d bytes by this sweep", agent.Name, limits.MaxTailBytes)
 				if text == "" {
 					// No rune boundary inside the cap: report incomplete rather
 					// than hand the classifier corrupt bytes.
 					note = fmt.Sprintf("%s: pane tail incomplete; no UTF-8 boundary within %d bytes", agent.Name, limits.MaxTailBytes)
-					result.Partial = true
 				}
 				result.Unknowns = append(result.Unknowns, note)
 			}
