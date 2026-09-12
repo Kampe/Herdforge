@@ -132,7 +132,7 @@ func sha256OfLine(line string) string {
 // peekNextSequence reports the sequence a repair WOULD take without reserving
 // it. Report-only must not consume a sequence number.
 func (m *Mailbox) peekNextSequence() (int64, error) {
-	data, err := os.ReadFile(m.MailFile + ".seq")
+	data, err := os.ReadFile(m.SequencePath())
 	switch {
 	case err == nil:
 		cur, parseErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
@@ -155,7 +155,7 @@ func (m *Mailbox) peekNextSequence() (int64, error) {
 // forward: the same reserve-before-use ordering nextSequenceLocked relies on,
 // so a crash can leave a gap but never a duplicate.
 func (m *Mailbox) setSequenceFloorLocked(seq int64) error {
-	return writeFileAtomic(m.MailFile+".seq", []byte(strconv.FormatInt(seq, 10)), 0644)
+	return writeFileAtomic(m.SequencePath(), []byte(strconv.FormatInt(seq, 10)), 0644)
 }
 
 // normalizeLegacyTimestamp parses a non-RFC3339 but unambiguous timestamp,
@@ -446,7 +446,7 @@ func (m *Mailbox) appendRepairRecord(plan *RepairPlan) error {
 	if err != nil {
 		return fmt.Errorf("encode audit record: %w", err)
 	}
-	return appendLine(m.MailFile+".repair.jsonl", data)
+	return appendLine(m.RepairAuditPath(), data)
 }
 
 // recordRepairFailure writes the RESULT record for an attempt that did not
@@ -505,7 +505,7 @@ func (m *Mailbox) recordRepairFailure(plan *RepairPlan, cause error) error {
 // on evidence that has moved. A missing or rotated artifact is not an error:
 // the live row plus the required fingerprint still bound the operation.
 func (m *Mailbox) checkQuarantineIdentity(id, liveHash string) error {
-	data, err := os.ReadFile(m.MailFile + ".quarantine.jsonl")
+	data, err := os.ReadFile(m.QuarantinePath())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil

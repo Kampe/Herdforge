@@ -198,6 +198,16 @@ func TestRunMailRoutesRepairSubcommand(t *testing.T) {
 		t.Fatal("fixture precondition: the mailbox path must contain a space")
 	}
 
+	// os.Executable, not os.Args[0]. os.Args is mutable process state that other
+	// CLI fixtures in this package rewrite to drive main-style entry points —
+	// one of them left it as "herd", and this test then tried to exec an
+	// installed binary CI does not have. os.Executable is the authoritative
+	// path of the RUNNING test binary, and no fixture can move it.
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("cannot locate the running test binary: %v", err)
+	}
+
 	for _, tc := range []struct {
 		name     string
 		argv     []string
@@ -211,7 +221,7 @@ func TestRunMailRoutesRepairSubcommand(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command(os.Args[0], "-test.run", "^TestMailRepairRoutingHelper$")
+			cmd := exec.Command(self, "-test.run", "^TestMailRepairRoutingHelper$")
 			cmd.Env = append(os.Environ(),
 				"HERD_MAIL_REPAIR_ROUTING_HELPER=1",
 				routingArgsEnv+"="+string(encoded),

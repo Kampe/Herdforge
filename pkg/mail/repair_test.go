@@ -523,13 +523,43 @@ func TestRepairFailsWhenCompletionRecordCannotBeWritten(t *testing.T) {
 	if !errors.Is(err, ErrRepairCompletionUnrecorded) {
 		t.Fatalf("an unrecorded completion must fail clearly, got plan=%+v err=%v", plan, err)
 	}
-	// Recoverability: the prepare record with the original bytes is still there.
-	raw, readErr := os.ReadFile(auditPath)
-	if readErr != nil {
+	// Recoverability, checked the way an operator would actually recover: DECODE
+	// the retained prepare record and compare the original it carries. A raw
+	// substring search fails here for the wrong reason — the record embeds the
+	// row as a JSON string, so its quotes are escaped and the unescaped fixture
+	// never appears verbatim in the file — and would also have passed on a
+	// record that merely mentioned the bytes without preserving them.
+	if _, readErr := os.ReadFile(auditPath); readErr != nil {
 		t.Fatalf("prepare record lost: %v", readErr)
 	}
-	if !strings.Contains(string(raw), legacyRow) {
-		t.Fatal("original bytes are not recoverable from the audit artifact")
+	records := readRepairRecords(t, path)
+	if len(records) == 0 {
+		t.Fatal("no prepare record was retained, so the original is unrecoverable")
+	}
+	prepare := records[0]
+	if prepare.Phase != RepairPhasePrepare {
+		t.Fatalf("first retained record is not the prepare record: %+v", prepare)
+	}
+	if prepare.OriginalLine != legacyRow {
+		t.Fatalf("prepare record does not carry the original bytes exactly:\n got %q\nwant %q",
+			prepare.OriginalLine, legacyRow)
+	}
+	if prepare.OriginalSHA256 != sha256Hex(legacyRow) {
+		t.Fatalf("prepare record fingerprint %q does not bind the original bytes", prepare.OriginalSHA256)
+	}
+	// The retained record must be usable for recovery, not merely present: the
+	// bytes it carries have to hash to the fingerprint it claims.
+	if sha256Hex(prepare.OriginalLine) != prepare.OriginalSHA256 {
+		t.Fatal("prepare record's bytes and fingerprint disagree, so it cannot be trusted for recovery")
+	}
+	// And the failed repair must not have reported success anywhere.
+	if prepare.Applied {
+		t.Fatal("the prepare record claims the repair was applied")
+	}
+	for _, rec := range records[1:] {
+		if rec.Applied || rec.Outcome == RepairOutcomeApplied {
+			t.Fatalf("a record claims success after an unrecorded completion: %+v", rec)
+		}
 	}
 }
 
@@ -653,13 +683,19 @@ func TestRepairFailsClosedWhenReadbackMismatches(t *testing.T) {
 		t.Fatalf("a durable row that differs from the repaired row must fail closed, got plan=%+v err=%v", plan, err)
 	}
 	// The original corrupt bytes must still be recoverable from the audit
-	// artifact even though the mailbox write went wrong.
-	raw, readErr := os.ReadFile(path + ".repair.jsonl")
-	if readErr != nil {
-		t.Fatalf("audit artifact missing after a failed repair: %v", readErr)
+	// artifact even though the mailbox write went wrong. Decoded, not
+	// substring-matched: the record embeds the row as a JSON string, and a
+	// fragment of the original is not the original.
+	records := readRepairRecords(t, path)
+	if len(records) == 0 {
+		t.Fatal("audit artifact retained nothing after a failed repair")
 	}
-	if !strings.Contains(string(raw), "2026-09-11T10:47:09.000000-0500") {
-		t.Fatal("audit artifact did not retain the original corrupt bytes after a failed repair")
+	if records[0].OriginalLine != legacyRow {
+		t.Fatalf("audit artifact did not retain the original corrupt bytes exactly:\n got %q\nwant %q",
+			records[0].OriginalLine, legacyRow)
+	}
+	if records[0].OriginalSHA256 != sha256Hex(legacyRow) {
+		t.Fatal("retained original does not match its recorded fingerprint")
 	}
 }
 
