@@ -60,8 +60,12 @@ cleanup() {
 	# worktrees and their metadata are not ours to touch.
 	if (( work_owned )) && [[ -n "$work" ]]; then
 		if ! timeout -k 10s "${cleanup_timeout}s" \
-			git -C "$repo_root" worktree remove --force -- "$work" >>"$summary" 2>&1; then
-			print -u2 "error: could not remove the mutation checkout $work; it is left in place deliberately"
+			git -C "$repo_root" worktree remove --force -- "$work" >&2; then
+			# The absolute path belongs in the operator's stderr, never in the
+			# artifact: the summary is published and this repository forbids
+			# absolute paths in it.
+			print -u2 "error: could not remove the mutation checkout at $work; it is left in place deliberately"
+			print -r -- 'cleanup FAILED: the mutation checkout was left in place (see stderr for its path)' >> "$summary"
 			cleanup_failed=1
 		fi
 	fi
@@ -96,17 +100,35 @@ pristine=$(git -C "$work" hash-object -- "$source_rel")
 compile_check() {
 	local log=$1 exit_code=0
 	( cd "$work" && timeout -k 10s "${compile_timeout}s" \
-		go test -c -o /dev/null "$test_pkg" ) >"$log" 2>&1 || exit_code=$?
+		go test -p 1 -c -o /dev/null "$test_pkg" ) >"$log" 2>&1 || exit_code=$?
 	print -r -- "$exit_code"
 }
 
-# run_focused executes the suite serially and records machine-readable events.
+# run_focused executes one -run selection serially and records machine-readable
+# events. Mutants run ONLY their anchored killer and its subtests, so an
+# unrelated test's failure or timeout cannot contaminate the verdict; the
+# baseline runs the whole focus set.
 run_focused() {
-	local events=$1 console=$2 exit_code=0
+	local selector=$1 events=$2 console=$3 exit_code=0
 	( cd "$work" && timeout -k 10s "${wall_timeout}s" \
 		go test -json -count=1 -p 1 -parallel 1 -timeout "${go_timeout}s" \
-		-run "$test_run" "$test_pkg" ) >"$events" 2>"$console" || exit_code=$?
+		-run "$selector" "$test_pkg" ) >"$events" 2>"$console" || exit_code=$?
 	print -r -- "$exit_code"
+}
+
+# events_valid proves the whole stream parses BEFORE anything reads it. A parse
+# error inside a `jq | grep` conditional is indistinguishable from "no match",
+# which would let a truncated stream read as a clean result.
+events_valid() {
+	jq -e -s 'type == "array" and length > 0' -- "$1" >/dev/null 2>&1
+}
+
+# stream_broken looks for build, panic, timeout and tool failures across the
+# ENTIRE stream, not just the killer's own events: an expected assertion
+# followed by a crash somewhere else is not a successful control.
+stream_broken() {
+	jq -r 'select(.Action == "output") | .Output // ""' -- "$1" \
+		| grep -qE 'panic: |test timed out|\[build failed\]|^# |^signal: |fatal error: '
 }
 
 # events_for emits one field of every event bound to the named test or one of
@@ -115,7 +137,7 @@ events_for() {
 	local events=$1 test_name=$2 action=$3 field=$4
 	jq -r --arg t "$test_name" --arg a "$action" --arg f "$field" \
 		'select(.Action == $a and ((.Test // "") == $t or ((.Test // "") | startswith($t + "/")))) | .[$f] // ""' \
-		"$events"
+		-- "$events"
 }
 
 patch_source() {
@@ -140,14 +162,15 @@ restore_source() {
 
 # classify_run maps one mutant onto the contract, given a compile that already
 # passed. Only a named assertion failure in the named test counts.
+# classify_run maps one mutant onto the contract, given a compile that already
+# passed. Only an exact go test exit 1, over a stream with no tool failure
+# anywhere in it, naming the killer and carrying the expected text, is a kill.
 classify_run() {
 	local run_exit=$1 events=$2 killer=$3 want=$4
-	if (( run_exit == 124 || run_exit == 137 )); then print -r -- 'TIMEOUT'; return; fi
+	if ! events_valid "$events"; then print -r -- 'INVALID-EVENTS'; return; fi
 	if (( run_exit == 0 )); then print -r -- 'SURVIVED'; return; fi
-	if [[ ! -s "$events" ]]; then print -r -- 'NO-EVENTS'; return; fi
-	if events_for "$events" "$killer" output Output | grep -q 'panic: test timed out'; then
-		print -r -- 'TIMEOUT'; return
-	fi
+	if (( run_exit != 1 )); then print -r -- "TOOLFAIL(exit $run_exit)"; return; fi
+	if stream_broken "$events"; then print -r -- 'BROKEN-RUN'; return; fi
 	if [[ -n "$(events_for "$events" "$killer" skip Test)" ]]; then print -r -- 'SKIPPED'; return; fi
 	if [[ -z "$(events_for "$events" "$killer" fail Test)" ]]; then print -r -- 'WRONG-TEST'; return; fi
 	if ! events_for "$events" "$killer" output Output | grep -qF -- "$want"; then
@@ -170,9 +193,14 @@ mutations=(
 
 note "pin $pin"
 note "source $source_rel ($pristine)"
-note "report $run_dir"
+# The artifact records WHICH invocation, never where on the host it lives.
+if [[ "$run_dir" == "$repo_root"/* ]]; then
+	note "report ${run_dir#$repo_root/}"
+else
+	note "report ${run_dir:t} (under VERIFY_BUDGET_REPORT_DIR, outside the repository)"
+fi
 
-baseline_exit=$(run_focused "$run_dir/baseline.json" "$run_dir/baseline.err")
+baseline_exit=$(run_focused "$test_run" "$run_dir/baseline.json" "$run_dir/baseline.err")
 if (( baseline_exit != 0 )); then
 	note "baseline FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
 	exit 1
@@ -196,7 +224,8 @@ for record in "${mutations[@]}"; do
 		(( failures += 1 ))
 		continue
 	fi
-	run_exit=$(run_focused "$stem.json" "$stem.err")
+	# Anchored to this mutant's one killer, subtests included.
+	run_exit=$(run_focused "^${killer}$" "$stem.json" "$stem.err")
 	verdict=$(classify_run "$run_exit" "$stem.json" "$killer" "$want")
 	restore_source
 
@@ -208,7 +237,7 @@ for record in "${mutations[@]}"; do
 done
 
 restore_source
-restored_exit=$(run_focused "$run_dir/restored.json" "$run_dir/restored.err")
+restored_exit=$(run_focused "$test_run" "$run_dir/restored.json" "$run_dir/restored.err")
 if (( restored_exit != 0 )); then
 	note "restored baseline FAILED (exit $restored_exit) - the source did not come back clean"
 	exit 1
