@@ -29,7 +29,7 @@ done
 source_rel=pkg/mail/bounded.go
 cli_rel=cmd/herd/mail_bounds.go
 test_pkg=./cmd/herd/
-test_run='TestBoundedInbox|TestBoundedRequest|TestBoundedControl'
+test_run='TestBoundedInbox|TestBoundedRequest|TestBoundedControl|TestSourceFingerprint'
 
 go_timeout=${VERIFY_BOUNDS_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -197,7 +197,7 @@ classify() {
 literal_occurrences() {
 	local hay=$1 needle=$2 stripped
 	(( ${#needle} )) || { print -r -- 0; return }
-	stripped=${hay//$needle/}
+	stripped=${hay//"$needle"/}
 	print -r -- $(( (${#hay} - ${#stripped}) / ${#needle} ))
 }
 
@@ -240,6 +240,9 @@ expected_passes=(
 	TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage
 	TestBoundedInboxCLIRefusesFIFOControlStore
 	TestBoundedInboxCLIRefusesFIFOFeedbackStore
+	TestBoundedInboxCLITimeoutCleansUpItsChild
+	TestSourceFingerprintResolvesNestedMissingStores
+	TestBoundedInboxEmptyStoreWithFreshCursorIsNormal
 	TestBoundedInboxToleratesAppendAndAckRewrites
 )
 
@@ -274,7 +277,7 @@ sep=$'\x1f'
 mutations=(
 "limit-not-enforced${sep}${source_rel}${sep}		if len(page.Envelopes) >= opts.Limit || page.Bytes+size > opts.MaxBytes {${sep}		if false { // MUTANT: limit and byte budget ignored${sep}TestBoundedInboxByteBudgetBindsOnSerializedSize${sep}near-boundary page"
 "cursor-recipient-unbound${sep}${source_rel}${sep}	if string(decoded) != recipient {${sep}	if false { // MUTANT: cursor recipient binding dropped${sep}TestBoundedInboxRejectsUnusableCursors${sep}was accepted"
-"cursor-storage-unbound${sep}${source_rel}${sep}	if cur.Source != "" && cur.Source != want {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedControlBindsTheMailboxItOpens${sep}shares its prefix"
+"cursor-storage-unbound${sep}${source_rel}${sep}	if cur.Source != \"\" && cur.Source != want {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedControlBindsTheMailboxItOpens${sep}shares its prefix"
 "resume-position-unchecked${sep}${source_rel}${sep}	if !resumeChecked {${sep}	if false { // MUTANT: missing resume position accepted${sep}TestBoundedInboxRejectsEmptiedStores${sep}accepted a live cursor"
 "unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence <= maxSeen {${sep}		if false { // MUTANT: unordered and duplicate sequences accepted${sep}TestBoundedInboxRefusesDuplicateIdentities${sep}would be lost"
 "late-scan-abandoned${sep}${source_rel}${sep}		if page.Truncated {
