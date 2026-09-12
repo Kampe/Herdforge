@@ -2,21 +2,26 @@
 # FAC-827: non-vacuity driver for the source manifest budget guards.
 #
 # Runs the focused budget suite, then mutates the REAL production source one
-# guard at a time and requires each mutant to die on a NAMED assertion.
+# guard at a time. A mutant counts as killed only when BOTH hold, as separate
+# evidence:
 #
-# A compile error, a timeout or a tool failure is NOT a kill. Those prove the
-# build broke, not that a test can see the guard, and counting them is how a
-# vacuous control passes.
+#   1. it COMPILES, proven by building the test binary, and
+#   2. the NAMED killer test fails with the NAMED assertion text, read from
+#      `go test -json` rather than scraped from console output.
 #
-# Every mutation happens inside an ephemeral detached worktree this script
-# creates and removes. The invoking checkout is never written to.
+# A compile error, a timeout, a skip, or an unrelated assertion is not a kill.
+# Counting any of them is how a vacuous control passes.
+#
+# All mutation happens in one ephemeral detached worktree this invocation
+# creates and owns. The invoking checkout is never written to, and this script
+# deletes nothing it did not create.
 set -euo pipefail
 
 script_dir=${0:A:h}
 repo_root=$(git -C "$script_dir/.." rev-parse --show-toplevel)
 cd "$repo_root"
 
-for tool in git go timeout; do
+for tool in git go timeout jq mktemp; do
 	(( $+commands[$tool] )) || { print -u2 "error: $tool is required"; exit 1; }
 done
 
@@ -24,35 +29,45 @@ source_rel=pkg/verifier/hermetic_docker_runner.go
 test_pkg=./pkg/verifier/
 test_run='TestManifestBudget|TestDefaultManifestBudget'
 
-# Finite and explicit. The outer wall clock is the backstop for a go test that
-# never reaches its own timeout.
+# Finite, explicit, and bounded at both ends before any arithmetic: an absurd
+# or overflowing override must be rejected, not added to.
 go_timeout=${VERIFY_BUDGET_GO_TIMEOUT:-180}
-[[ "$go_timeout" =~ '^[1-9][0-9]*$' ]] || go_timeout=180
-wall_timeout=$(( go_timeout + 120 ))
-
-log_dir=${VERIFY_BUDGET_LOG_DIR:-$repo_root/.verify-budget-logs}
-# The log directory is wiped at start, so refuse a value that would take
-# anything else with it: it must be an absolute path with a real leaf.
-if [[ "$log_dir" != /*/?* || "$log_dir" == */.. || "$log_dir" == */../* ]]; then
-	print -u2 "error: refusing an unsafe log directory"
-	exit 1
+if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 3 )) || (( go_timeout < 30 || go_timeout > 900 )); then
+	print -u2 "warning: ignoring unusable VERIFY_BUDGET_GO_TIMEOUT, using 180s"
+	go_timeout=180
 fi
-rm -r -f -- "$log_dir"
-mkdir -p -- "$log_dir"
-summary=$log_dir/summary.txt
+wall_timeout=$(( go_timeout + 120 ))
+compile_timeout=$go_timeout
+cleanup_timeout=60
+
+# Reports are additive. This script creates ONE subdirectory it owns and never
+# deletes a directory chosen by a caller: a path being well formed is not
+# permission to destroy what is in it.
+report_parent=${VERIFY_BUDGET_REPORT_DIR:-$repo_root/.verify-budget-logs}
+mkdir -p -- "$report_parent"
+run_dir=$(mktemp -d "$report_parent/run-XXXXXX")
+summary=$run_dir/summary.txt
 : >| "$summary"
 
-# Trusted runner temp first, so CI never writes the mutation checkout outside
-# the space the runner owns and cleans.
-temp_base=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
 work=""
+work_owned=0
+cleanup_failed=0
 
 cleanup() {
 	local code=$?
-	if [[ -n "$work" ]]; then
-		git -C "$repo_root" worktree remove --force -- "$work" >/dev/null 2>&1 || rm -r -f -- "$work"
+	# Only the checkout THIS invocation created, and only once its creation
+	# succeeded. No blind fallback deletion, and no global prune: other
+	# worktrees and their metadata are not ours to touch.
+	if (( work_owned )) && [[ -n "$work" ]]; then
+		if ! timeout -k 10s "${cleanup_timeout}s" \
+			git -C "$repo_root" worktree remove --force -- "$work" >>"$summary" 2>&1; then
+			print -u2 "error: could not remove the mutation checkout $work; it is left in place deliberately"
+			cleanup_failed=1
+		fi
 	fi
-	git -C "$repo_root" worktree prune >/dev/null 2>&1 || true
+	if (( cleanup_failed )) && (( code == 0 )); then
+		code=1
+	fi
 	return $code
 }
 trap cleanup EXIT
@@ -60,31 +75,49 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
+note() { print -r -- "$1" >> "$summary"; print -r -- "$1"; }
+
 pin=$(git -C "$repo_root" rev-parse HEAD)
-work=$(mktemp -d "$temp_base/verify-budget-XXXXXX")
-# mktemp made it; git worktree add needs the path absent. rmdir refuses a
-# non-empty directory, which is the guard we want here.
+work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/verify-budget-XXXXXX")
+# mktemp made the directory; `git worktree add` needs the path absent. rmdir
+# refuses a non-empty directory, which is the guard we want.
 rmdir -- "$work"
 git -C "$repo_root" worktree add --detach --quiet -- "$work" "$pin"
+work_owned=1
 
 work_pin=$(git -C "$work" rev-parse HEAD)
 [[ "$work_pin" == "$pin" ]] || { print -u2 "error: mutation checkout is at $work_pin, not $pin"; exit 1; }
 pristine=$(git -C "$work" hash-object -- "$source_rel")
 [[ -n "$pristine" ]] || { print -u2 "error: cannot hash $source_rel"; exit 1; }
 
-note() { print -r -- "$1" >> "$summary"; print -r -- "$1"; }
-
-# focused runs the suite in the mutation checkout and echoes its exit status.
-focused() {
-	local log=$1 status=0
-	( cd "$work" && timeout -k 10s "${wall_timeout}s" \
-		go test -count=1 -p 1 -parallel 1 -timeout "${go_timeout}s" \
-		-run "$test_run" "$test_pkg" ) >"$log" 2>&1 || status=$?
-	print -r -- "$status"
+# compile_check proves the mutant builds. Its result is kept separately from
+# the assertion evidence, because "the build broke" and "the test saw the
+# guard" are different claims.
+compile_check() {
+	local log=$1 exit_code=0
+	( cd "$work" && timeout -k 10s "${compile_timeout}s" \
+		go test -c -o /dev/null "$test_pkg" ) >"$log" 2>&1 || exit_code=$?
+	print -r -- "$exit_code"
 }
 
-# patch_source replaces exactly one occurrence of anchor. Any other count is a
-# hard failure, so source drift cannot become a silent no-op mutant.
+# run_focused executes the suite serially and records machine-readable events.
+run_focused() {
+	local events=$1 console=$2 exit_code=0
+	( cd "$work" && timeout -k 10s "${wall_timeout}s" \
+		go test -json -count=1 -p 1 -parallel 1 -timeout "${go_timeout}s" \
+		-run "$test_run" "$test_pkg" ) >"$events" 2>"$console" || exit_code=$?
+	print -r -- "$exit_code"
+}
+
+# events_for emits one field of every event bound to the named test or one of
+# its subtests, so an assertion can never be credited to a different test.
+events_for() {
+	local events=$1 test_name=$2 action=$3 field=$4
+	jq -r --arg t "$test_name" --arg a "$action" --arg f "$field" \
+		'select(.Action == $a and ((.Test // "") == $t or ((.Test // "") | startswith($t + "/")))) | .[$f] // ""' \
+		"$events"
+}
+
 patch_source() {
 	local anchor=$1 replacement=$2 file=$work/$source_rel found content mutated
 	found=$(grep -F -c -- "$anchor" "$file" || true)
@@ -105,17 +138,21 @@ restore_source() {
 	[[ "$now" == "$pristine" ]] || { print -u2 "error: restore left $now, want $pristine"; return 1; }
 }
 
-# classify maps one mutant run onto the contract. Only a named assertion
-# failure in the named test counts as a kill.
-classify() {
-	local status=$1 log=$2 killer=$3 want=$4
-	if (( status == 0 )); then print -r -- 'SURVIVED'; return; fi
-	if (( status != 1 )); then print -r -- "TOOLFAIL(exit $status)"; return; fi
-	if grep -qF -- '[build failed]' "$log" || grep -qE '^# |panic: test timed out|^signal: ' "$log"; then
-		print -r -- 'BUILDFAIL'; return
+# classify_run maps one mutant onto the contract, given a compile that already
+# passed. Only a named assertion failure in the named test counts.
+classify_run() {
+	local run_exit=$1 events=$2 killer=$3 want=$4
+	if (( run_exit == 124 || run_exit == 137 )); then print -r -- 'TIMEOUT'; return; fi
+	if (( run_exit == 0 )); then print -r -- 'SURVIVED'; return; fi
+	if [[ ! -s "$events" ]]; then print -r -- 'NO-EVENTS'; return; fi
+	if events_for "$events" "$killer" output Output | grep -q 'panic: test timed out'; then
+		print -r -- 'TIMEOUT'; return
 	fi
-	grep -qF -- "--- FAIL: $killer" "$log" || { print -r -- 'WRONG-TEST'; return; }
-	grep -qF -- "$want" "$log" || { print -r -- 'WRONG-ASSERTION'; return; }
+	if [[ -n "$(events_for "$events" "$killer" skip Test)" ]]; then print -r -- 'SKIPPED'; return; fi
+	if [[ -z "$(events_for "$events" "$killer" fail Test)" ]]; then print -r -- 'WRONG-TEST'; return; fi
+	if ! events_for "$events" "$killer" output Output | grep -qF -- "$want"; then
+		print -r -- 'WRONG-ASSERTION'; return
+	fi
 	print -r -- 'KILLED'
 }
 
@@ -133,11 +170,11 @@ mutations=(
 
 note "pin $pin"
 note "source $source_rel ($pristine)"
+note "report $run_dir"
 
-status=$(focused "$log_dir/baseline.log")
-if (( status != 0 )); then
-	note "baseline FAILED (exit $status) - the suite must pass before any mutant means anything"
-	tail -n 40 -- "$log_dir/baseline.log" >&2
+baseline_exit=$(run_focused "$run_dir/baseline.json" "$run_dir/baseline.err")
+if (( baseline_exit != 0 )); then
+	note "baseline FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
 	exit 1
 fi
 note 'baseline PASS'
@@ -149,25 +186,31 @@ for record in "${mutations[@]}"; do
 	fields=("${(@ps:$sep:)record}")
 	id=$fields[1]; anchor=$fields[2]; replacement=$fields[3]
 	killer=$fields[4]; want=$fields[5]
-	log=$log_dir/$(printf 'm%02d-%s.log' "$index" "$id")
+	stem=$run_dir/$(printf 'm%02d-%s' "$index" "$id")
 
 	patch_source "$anchor" "$replacement"
-	status=$(focused "$log")
-	verdict=$(classify "$status" "$log" "$killer" "$want")
+	compile_exit=$(compile_check "$stem.compile.log")
+	if (( compile_exit != 0 )); then
+		restore_source
+		note "mutant $id: COMPILE-FAIL (exit $compile_exit) - a mutant that does not build proves nothing"
+		(( failures += 1 ))
+		continue
+	fi
+	run_exit=$(run_focused "$stem.json" "$stem.err")
+	verdict=$(classify_run "$run_exit" "$stem.json" "$killer" "$want")
 	restore_source
 
-	note "mutant $id: $verdict (killer $killer)"
+	note "mutant $id: compile PASS, run $verdict (killer $killer, exit $run_exit)"
 	if [[ "$verdict" != KILLED ]]; then
 		(( failures += 1 ))
-		tail -n 30 -- "$log" >&2
+		[[ -s "$stem.err" ]] && tail -n 20 -- "$stem.err" >&2
 	fi
 done
 
 restore_source
-status=$(focused "$log_dir/restored.log")
-if (( status != 0 )); then
-	note "restored baseline FAILED (exit $status) - the source did not come back clean"
-	tail -n 40 -- "$log_dir/restored.log" >&2
+restored_exit=$(run_focused "$run_dir/restored.json" "$run_dir/restored.err")
+if (( restored_exit != 0 )); then
+	note "restored baseline FAILED (exit $restored_exit) - the source did not come back clean"
 	exit 1
 fi
 note 'restored baseline PASS'
@@ -176,4 +219,4 @@ if (( failures > 0 )); then
 	note "$failures of ${#mutations[@]} controls did not kill their mutant"
 	exit 1
 fi
-note "all ${#mutations[@]} controls killed their mutant on a named assertion"
+note "all ${#mutations[@]} controls compiled and died on their named assertion"

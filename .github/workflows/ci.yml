@@ -88,12 +88,15 @@ jobs:
           CHAINSEER_BIN: chainseer/bin
 
       # FAC-827: the budget guards are covered by tests that had never been
-      # shown to fail. This driver mutates the real source one guard at a time
-      # and requires a named assertion failure for each, so the receipt cannot
-      # claim controls that never ran. It makes its own ephemeral worktree
-      # under RUNNER_TEMP and removes it on every exit path.
+      # shown to fail. This driver proves each mutant COMPILES and then dies on
+      # a named assertion, read from go test JSON, so the receipt cannot claim
+      # controls that never ran. It owns one ephemeral worktree under
+      # RUNNER_TEMP, removes only that, and fails the step if it cannot.
       - name: FAC-827 manifest budget non-vacuity controls
-        run: scripts/verify-manifest-budget.zsh
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-manifest-budget.zsh
 
       - name: Upload manifest budget control logs
         if: always()
