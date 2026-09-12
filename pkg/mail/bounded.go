@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -54,8 +55,9 @@ var ErrStorageRewound = errors.New("mail: cursor is ahead of the store; it was r
 // other shape it skips the lower records that follow a higher one.
 var ErrStorageUnordered = errors.New("mail: store sequences do not ascend in file order; a high-water mark would skip records")
 
-// Cursor is a versioned position carrying one high-water mark per source,
-// bound to both the recipient and the STORES it was issued against.
+// Cursor is a versioned position carrying, per source, a high-water mark AND
+// an anchor on that store's first record. It is bound to the recipient and to
+// the resolved identity of the stores it was issued against.
 //
 // Two marks, not one, because the control bus and the feedback store number
 // records with SEPARATE counters -- feedback conversion sets Sequence from
@@ -68,14 +70,52 @@ type Cursor struct {
 	Recipient string
 	Source    string
 	Control   int64
-	Feedback  int64
+	// ControlAnchor identifies the first record of the control store, and
+	// FeedbackAnchor the first record of the feedback store. Path binding
+	// alone cannot notice a store REPLACED by a different stream that happens
+	// to reach the same or higher numbers; the first record can. Appends
+	// never change it, and acknowledgement writes the handled sidecar rather
+	// than the mailbox, so an ack-only rewrite keeps a cursor usable. A
+	// repair that rewrites the first record does invalidate it, which is the
+	// conservative direction.
+	ControlAnchor  string
+	Feedback       int64
+	FeedbackAnchor string
 }
 
-const cursorVersion = "v1"
+const (
+	cursorVersion = "v2"
+	// EmptyAnchor is the anchor of a store with no records.
+	EmptyAnchor = "0"
+)
 
 // SourceFingerprint identifies the exact stores a cursor is valid against.
+//
+// Paths are RESOLVED first: two runs with the same relative --mail value from
+// different working directories address different files, and hashing the raw
+// strings made them accept each other's cursors. Symlinks are resolved too,
+// so one store reached by two names is one identity. A path that cannot be
+// resolved is fingerprinted from its absolute form, which still separates it
+// from an unrelated store; it is never silently treated as equal.
 func SourceFingerprint(controlPath, feedbackDir string) string {
-	sum := sha256.Sum256([]byte(controlPath + "\x00" + feedbackDir))
+	sum := sha256.Sum256([]byte(canonicalStoragePath(controlPath) + "\x00" + canonicalStoragePath(feedbackDir)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func canonicalStoragePath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
+}
+
+// RecordAnchor identifies a store's first record.
+func RecordAnchor(id string, seq int64) string {
+	sum := sha256.Sum256([]byte(id + "\x00" + strconv.FormatInt(seq, 10)))
 	return hex.EncodeToString(sum[:8])
 }
 
@@ -83,8 +123,16 @@ func SourceFingerprint(controlPath, feedbackDir string) string {
 // INJECTIVE: an earlier draft mapped '.' to '_', which made "a.b" and "a_b"
 // encode identically and accept each other's cursors.
 func (c Cursor) String() string {
-	return fmt.Sprintf("%s.%s.%s.c%d.f%d",
-		cursorVersion, hex.EncodeToString([]byte(c.Recipient)), c.Source, c.Control, c.Feedback)
+	return fmt.Sprintf("%s.%s.%s.c%d:%s.f%d:%s",
+		cursorVersion, hex.EncodeToString([]byte(c.Recipient)), c.Source,
+		c.Control, anchorOrEmpty(c.ControlAnchor), c.Feedback, anchorOrEmpty(c.FeedbackAnchor))
+}
+
+func anchorOrEmpty(a string) string {
+	if strings.TrimSpace(a) == "" {
+		return EmptyAnchor
+	}
+	return a
 }
 
 // ParseCursor parses and BINDS a cursor to the recipient and stores being
@@ -97,7 +145,7 @@ func ParseCursor(raw, recipient, source string) (Cursor, error) {
 	}
 	parts := strings.Split(raw, ".")
 	if len(parts) != 5 {
-		return Cursor{}, fmt.Errorf("mail cursor is malformed: want %s.<recipient>.<source>.c<n>.f<n>", cursorVersion)
+		return Cursor{}, fmt.Errorf("mail cursor is malformed: want %s.<recipient>.<source>.c<n>:<anchor>.f<n>:<anchor>", cursorVersion)
 	}
 	if parts[0] != cursorVersion {
 		return Cursor{}, fmt.Errorf("mail cursor version %q is not supported by this build (want %s)", parts[0], cursorVersion)
@@ -112,29 +160,43 @@ func ParseCursor(raw, recipient, source string) (Cursor, error) {
 	if parts[2] != source {
 		return Cursor{}, errors.New("mail cursor was issued against different storage (mailbox path or feedback root changed); refusing to resume")
 	}
-	control, err := parseCursorMark(parts[3], "c")
+	control, controlAnchor, err := parseCursorMark(parts[3], "c")
 	if err != nil {
 		return Cursor{}, err
 	}
-	feedback, err := parseCursorMark(parts[4], "f")
+	feedback, feedbackAnchor, err := parseCursorMark(parts[4], "f")
 	if err != nil {
 		return Cursor{}, err
 	}
-	return Cursor{Recipient: recipient, Source: source, Control: control, Feedback: feedback}, nil
+	return Cursor{
+		Recipient: recipient, Source: source,
+		Control: control, ControlAnchor: controlAnchor,
+		Feedback: feedback, FeedbackAnchor: feedbackAnchor,
+	}, nil
 }
 
-func parseCursorMark(field, prefix string) (int64, error) {
+func parseCursorMark(field, prefix string) (int64, string, error) {
 	if !strings.HasPrefix(field, prefix) {
-		return 0, fmt.Errorf("mail cursor field is missing its %q marker", prefix)
+		return 0, "", fmt.Errorf("mail cursor field is missing its %q marker", prefix)
 	}
-	value, err := strconv.ParseInt(strings.TrimPrefix(field, prefix), 10, 64)
+	mark, anchor, ok := strings.Cut(strings.TrimPrefix(field, prefix), ":")
+	if !ok {
+		return 0, "", errors.New("mail cursor field is missing its store anchor")
+	}
+	value, err := strconv.ParseInt(mark, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("mail cursor field is not a number: %w", err)
+		return 0, "", fmt.Errorf("mail cursor field is not a number: %w", err)
 	}
 	if value < 0 {
-		return 0, errors.New("mail cursor field is negative")
+		return 0, "", errors.New("mail cursor field is negative")
 	}
-	return value, nil
+	if strings.TrimSpace(anchor) == "" {
+		return 0, "", errors.New("mail cursor field has an empty store anchor")
+	}
+	if value > 0 && anchor == EmptyAnchor {
+		return 0, "", errors.New("mail cursor claims a position in a store it records as empty")
+	}
+	return value, anchor, nil
 }
 
 // BoundedPage is one bounded read. Truncated is explicit rather than inferred
@@ -152,6 +214,10 @@ type BoundedPage struct {
 type BoundedOptions struct {
 	Limit    int
 	MaxBytes int
+	// Source is the fingerprint the caller computed for the stores it is
+	// reading. It is checked against the cursor here so a Cursor built as a
+	// struct literal cannot bypass the binding the parsed path enforces.
+	Source string
 }
 
 func (o BoundedOptions) validate() error {
@@ -201,7 +267,12 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 		return page, errors.New("mail: nil mailbox")
 	}
 	if ctx == nil {
-		return page, errors.New("mail: bounded read requires a context with a deadline")
+		return page, errors.New("mail: bounded read requires a context")
+	}
+	// Checked at ENTRY, so a cancelled read fails even when the store is
+	// missing or empty and the scan below never runs.
+	if err := ctx.Err(); err != nil {
+		return page, err
 	}
 	recipient = strings.TrimSpace(recipient)
 	if recipient == "" {
@@ -210,44 +281,50 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	if err := opts.validate(); err != nil {
 		return page, err
 	}
-	// A Cursor handed in directly must be validated exactly as a parsed one
-	// is: the CLI is not the only caller, and an unchecked struct literal
-	// would bypass every binding below.
 	if cur.Recipient != recipient {
 		return page, errors.New("mail: cursor recipient does not match the read recipient")
 	}
 	if cur.Control < 0 || cur.Feedback < 0 {
 		return page, errors.New("mail: cursor marks must not be negative")
 	}
+	// A Cursor handed in directly must have its SOURCE checked too. Accepting
+	// whatever the caller put there let a struct literal bypass the binding
+	// the parsed path enforces.
+	if opts.Source != "" && cur.Source != "" && cur.Source != opts.Source {
+		return page, errors.New("mail: cursor source does not identify the stores being read")
+	}
 	high := cur.Control
 
-	info, err := os.Stat(m.MailFile)
+	file, err := os.Open(m.MailFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if cur.Control > 0 {
 				return page, fmt.Errorf("%w: control mailbox is absent but the cursor is at %d", ErrStorageRewound, cur.Control)
 			}
-			page.Next = Cursor{Recipient: recipient, Source: cur.Source, Control: high, Feedback: cur.Feedback}.String()
+			page.Next = cur.withControl(0, EmptyAnchor).String()
 			return page, nil
 		}
-		return page, fmt.Errorf("mail: stat mailbox: %w", err)
-	}
-	// A FIFO or device would block past any deadline this read was given.
-	if !info.Mode().IsRegular() {
-		return page, errors.New("mail: control mailbox is not a regular file; a bounded read cannot bound a stream")
-	}
-
-	file, err := os.Open(m.MailFile)
-	if err != nil {
 		return page, fmt.Errorf("mail: open mailbox: %w", err)
 	}
 	defer file.Close()
+
+	// Stat the OPEN HANDLE, not the path. A stat before the open leaves a
+	// window in which the regular file it approved is replaced by something
+	// unbounded, so the check would have described a file this read never had.
+	info, err := file.Stat()
+	if err != nil {
+		return page, fmt.Errorf("mail: stat mailbox: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return page, errors.New("mail: control mailbox is not a regular file; a bounded read cannot bound a stream")
+	}
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), MaxBoundedRecordBytes)
 	var quarantineErrs []error
 	quarantineFailures := 0
 	var maxSeen int64
+	anchor := EmptyAnchor
 	sawAny := false
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -267,15 +344,24 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 			}
 			continue
 		}
-		// Ordering is validated over the WHOLE file, for every recipient,
-		// because the sequence space is global and a high-water mark is only
-		// sound while it ascends.
-		if sawAny && env.Sequence < maxSeen {
-			return page, fmt.Errorf("%w: sequence %d follows %d", ErrStorageUnordered, env.Sequence, maxSeen)
+		// A record with no usable sequence is malformed, not old. Treating it
+		// as <= cursor silently discarded it on every page.
+		if env.Sequence <= 0 {
+			return page, fmt.Errorf("%w: record %q carries sequence %d", ErrStorageUnordered, env.ID, env.Sequence)
 		}
-		if env.Sequence > maxSeen || !sawAny {
-			maxSeen = env.Sequence
+		// STRICTLY increasing. `<` accepted DUPLICATES: two records at the
+		// same sequence, read one per page, made the second vanish because
+		// the cursor had already advanced to that number.
+		if sawAny && env.Sequence <= maxSeen {
+			return page, fmt.Errorf("%w: sequence %d does not exceed %d", ErrStorageUnordered, env.Sequence, maxSeen)
 		}
+		if !sawAny {
+			anchor = RecordAnchor(env.ID, env.Sequence)
+			if cur.Control > 0 && cur.ControlAnchor != EmptyAnchor && cur.ControlAnchor != anchor {
+				return page, fmt.Errorf("%w: the control store's first record changed", ErrStorageRewound)
+			}
+		}
+		maxSeen = env.Sequence
 		sawAny = true
 
 		if env.Recipient != recipient && env.Recipient != "all" {
@@ -285,8 +371,6 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 			continue
 		}
 		if page.Truncated {
-			// Page is already full. Keep validating, retain nothing, and do
-			// NOT advance the cursor over this record.
 			continue
 		}
 		size, sizeErr := EnvelopeBytes(&env)
@@ -294,8 +378,6 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 			return page, sizeErr
 		}
 		if size > opts.MaxBytes {
-			// Skipping it would loop forever on empty truncated pages whose
-			// cursor never moves; consuming it would break the budget.
 			return page, fmt.Errorf("%w: sequence %d needs %d bytes, budget is %d",
 				ErrRecordExceedsBudget, env.Sequence, size, opts.MaxBytes)
 		}
@@ -313,12 +395,29 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	if err := scanner.Err(); err != nil {
 		return page, fmt.Errorf("mail: scan mailbox: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return page, err
+	}
 	if len(quarantineErrs) > 0 {
 		return page, fmt.Errorf("mail: %d quarantine write(s) failed: %w", quarantineFailures, errors.Join(quarantineErrs...))
+	}
+	// An EMPTY regular file is a truncated store, not a fresh one. Guarding
+	// this behind sawAny let a file emptied under a live cursor accept any
+	// mark and report a clean, permanently empty page.
+	if !sawAny && cur.Control > 0 {
+		return page, fmt.Errorf("%w: control store holds no records but the cursor is at %d", ErrStorageRewound, cur.Control)
 	}
 	if sawAny && cur.Control > maxSeen {
 		return page, fmt.Errorf("%w: cursor at %d, highest stored sequence is %d", ErrStorageRewound, cur.Control, maxSeen)
 	}
-	page.Next = Cursor{Recipient: recipient, Source: cur.Source, Control: high, Feedback: cur.Feedback}.String()
+	page.Next = cur.withControl(high, anchor).String()
 	return page, nil
+}
+
+// withControl returns the cursor advanced over the control store, preserving
+// the feedback position untouched.
+func (c Cursor) withControl(mark int64, anchor string) Cursor {
+	c.Control = mark
+	c.ControlAnchor = anchor
+	return c
 }

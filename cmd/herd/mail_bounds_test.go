@@ -190,7 +190,7 @@ func TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage(t *testing.T) {
 // Cursor encoding must be injective: "a.b" and "a_b" are different lanes.
 func TestBoundedInboxCursorEncodingIsInjective(t *testing.T) {
 	source := mail.SourceFingerprint("/x", "/y")
-	dotted := mail.Cursor{Recipient: "a.b", Source: source, Control: 1}.String()
+	dotted := mail.Cursor{Recipient: "a.b", Source: source, Control: 1, ControlAnchor: mail.RecordAnchor("x", 1)}.String()
 	if _, err := mail.ParseCursor(dotted, "a_b", source); err == nil {
 		t.Fatal("a cursor for a.b was accepted for a_b; the encoding is not injective")
 	}
@@ -218,11 +218,13 @@ func TestBoundedInboxRejectsUnusableCursors(t *testing.T) {
 	parts := strings.Split(good, ".")
 
 	for name, cursor := range map[string]string{
-		"wrong version":    "v2." + strings.Join(parts[1:], "."),
-		"other recipient":  "v1." + fmt.Sprintf("%x", "someone-else") + "." + parts[2] + ".c0.f0",
+		"wrong version":    "v3." + strings.Join(parts[1:], "."),
+		"other recipient":  "v2." + fmt.Sprintf("%x", "someone-else") + "." + parts[2] + ".c0:0.f0:0",
 		"missing field":    strings.Join(parts[:4], "."),
-		"non-numeric mark": strings.Join(parts[:3], ".") + ".cx.f0",
-		"negative mark":    strings.Join(parts[:3], ".") + ".c-5.f0",
+		"non-numeric mark": strings.Join(parts[:3], ".") + ".cx:aa.f0:0",
+		"negative mark":    strings.Join(parts[:3], ".") + ".c-5:aa.f0:0",
+		"missing anchor":   strings.Join(parts[:3], ".") + ".c1.f0:0",
+		"anchorless mark":  strings.Join(parts[:3], ".") + ".c1:0.f0:0",
 		"garbage":          "not-a-cursor",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -241,13 +243,141 @@ func TestBoundedInboxRejectsUnusableCursors(t *testing.T) {
 // receipt-backed repair path rewrites it in place.
 func TestBoundedInboxRejectsRewoundStorage(t *testing.T) {
 	f := newBoundsFixture(t, []int64{1, 2, 3}, nil)
-	ahead := mail.Cursor{
-		Recipient: boundsRecipient,
-		Source:    mail.SourceFingerprint(f.box.MailFile, f.feedbackDir),
-		Control:   99,
-	}.String()
+	live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+	ahead := strings.Replace(live, ".c3:", ".c99:", 1)
+	if ahead == live {
+		t.Fatalf("fixture did not produce the expected control mark: %s", live)
+	}
 	if err := boundsReadErr(f, ahead, 10, 1<<20); err == nil {
 		t.Fatal("a cursor ahead of the store was accepted; lower records would be skipped silently")
+	}
+}
+
+// A store truncated to EMPTY under a live cursor is a rewind, not a fresh
+// mailbox. Guarding this behind "did we see any record" let an emptied file
+// accept any mark and report a clean, permanently empty page. Both sources.
+func TestBoundedInboxRejectsEmptiedStores(t *testing.T) {
+	t.Run("control emptied", func(t *testing.T) {
+		f := newBoundsFixture(t, []int64{1, 2}, nil)
+		live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+		if err := os.WriteFile(f.box.MailFile, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
+			t.Fatal("an emptied control store accepted a live cursor")
+		}
+	})
+	t.Run("control removed", func(t *testing.T) {
+		f := newBoundsFixture(t, []int64{1, 2}, nil)
+		live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+		if err := os.Remove(f.box.MailFile); err != nil {
+			t.Fatal(err)
+		}
+		if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
+			t.Fatal("a removed control store accepted a live cursor")
+		}
+	})
+	t.Run("feedback emptied", func(t *testing.T) {
+		f := newBoundsFixture(t, []int64{1}, []int64{1, 2})
+		live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+		if err := os.WriteFile(filepath.Join(f.feedbackDir, boundsRecipient+".jsonl"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
+			t.Fatal("an emptied feedback store accepted a live cursor")
+		}
+	})
+	t.Run("feedback removed", func(t *testing.T) {
+		f := newBoundsFixture(t, []int64{1}, []int64{1, 2})
+		live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+		if err := os.Remove(filepath.Join(f.feedbackDir, boundsRecipient+".jsonl")); err != nil {
+			t.Fatal(err)
+		}
+		if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
+			t.Fatal("a removed feedback store accepted a live cursor")
+		}
+	})
+}
+
+// Duplicate identities across a page boundary used to VANISH: limit 1 returned
+// the first, the cursor advanced to that number, and the second read as
+// already-seen. Both sources, at the exact boundary that loses the record.
+func TestBoundedInboxRefusesDuplicateIdentities(t *testing.T) {
+	t.Run("control duplicate at limit 1", func(t *testing.T) {
+		f := newBoundsFixture(t, []int64{1}, nil)
+		appendLineTo(t, f.box.MailFile, controlLine(1, boundsRecipient, "same sequence, different record"))
+		if err := boundsReadErr(f, "", 1, 1<<20); err == nil {
+			t.Fatal("two control records sharing one sequence were paged; the second would be lost")
+		}
+	})
+	t.Run("feedback duplicate at limit 1", func(t *testing.T) {
+		f := newBoundsFixture(t, nil, []int64{1})
+		appendLineTo(t, filepath.Join(f.feedbackDir, boundsRecipient+".jsonl"), feedbackLine(1, boundsRecipient))
+		if err := boundsReadErr(f, "", 1, 1<<20); err == nil {
+			t.Fatal("two feedback records sharing one id were paged; the second would be lost")
+		}
+	})
+}
+
+// A record with no usable identity is malformed, not old. Treating it as
+// <= cursor discarded it on every page.
+func TestBoundedInboxRefusesNonPositiveIdentities(t *testing.T) {
+	t.Run("control", func(t *testing.T) {
+		f := newBoundsFixture(t, nil, nil)
+		appendLineTo(t, f.box.MailFile, controlLine(0, boundsRecipient, "no sequence"))
+		if err := boundsReadErr(f, "", 10, 1<<20); err == nil {
+			t.Fatal("a control record with sequence 0 was silently treated as an old position")
+		}
+	})
+	t.Run("feedback", func(t *testing.T) {
+		f := newBoundsFixture(t, nil, nil)
+		appendLineTo(t, filepath.Join(f.feedbackDir, boundsRecipient+".jsonl"), feedbackLine(0, boundsRecipient))
+		if err := boundsReadErr(f, "", 10, 1<<20); err == nil {
+			t.Fatal("a feedback record with id 0 was silently treated as an old position")
+		}
+	})
+}
+
+// Replacement by a DIFFERENT stream that reaches the same numbers must not
+// resume silently, while an ack-only rewrite must stay usable. Acknowledgement
+// writes the handled sidecar, not the mailbox, so the anchor survives it.
+func TestBoundedInboxDetectsReplacementButToleratesAck(t *testing.T) {
+	f := newBoundsFixture(t, []int64{1, 2}, nil)
+	live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+
+	// Ack-only: the mailbox is untouched, so the cursor still resumes.
+	if err := f.box.MarkHandled(boundsRecipient, "c-1"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if err := boundsReadErr(f, live, 10, 1<<20); err != nil {
+		t.Fatalf("an ack-only rewrite must leave the cursor usable: %v", err)
+	}
+
+	// Replacement: a different stream reaching the same sequences.
+	replaced := strings.Join([]string{
+		controlLine(1, boundsRecipient, "different stream"),
+		controlLine(2, boundsRecipient, "different stream"),
+		"",
+	}, "\n")
+	if err := os.WriteFile(f.box.MailFile, []byte(strings.Replace(replaced, `"id":"c-`, `"id":"z-`, -1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := boundsReadErr(f, live, 10, 1<<20); err == nil {
+		t.Fatal("a replaced stream at the same sequences resumed silently")
+	}
+}
+
+// A cancelled context must fail even when the store is missing, where the
+// scan never runs.
+func TestBoundedInboxCancellationBeatsMissingStore(t *testing.T) {
+	f := newBoundsFixture(t, nil, nil)
+	if err := os.Remove(f.box.MailFile); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := readBoundedInbox(ctx, f.box, boundsRecipient, boundsRequest("", 10, 1<<20)); err == nil {
+		t.Fatal("a cancelled read succeeded because the store was missing")
 	}
 }
 

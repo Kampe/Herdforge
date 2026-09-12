@@ -109,7 +109,7 @@ func readBoundedInbox(ctx context.Context, box *mail.Mailbox, recipient string, 
 	if err != nil {
 		return out, err
 	}
-	page, controlErr := box.ReadBoundedControl(ctx, recipient, cur, mail.BoundedOptions{Limit: req.Limit, MaxBytes: req.MaxBytes})
+	page, controlErr := box.ReadBoundedControl(ctx, recipient, cur, mail.BoundedOptions{Limit: req.Limit, MaxBytes: req.MaxBytes, Source: source})
 
 	// The feedback store is ALWAYS validated, even when the control read
 	// failed or already filled the page. Returning early on control.Truncated
@@ -119,7 +119,7 @@ func readBoundedInbox(ctx context.Context, box *mail.Mailbox, recipient string, 
 	if page.Truncated || controlErr != nil {
 		remainingLimit, remainingBytes = 0, 0
 	}
-	fb, highest, fbTruncated, fbErr := readFeedbackMailboxBounded(ctx, dir, recipient, cur.Feedback, remainingLimit, remainingBytes, req.MaxBytes)
+	fb, highest, fbAnchor, fbTruncated, fbErr := readFeedbackMailboxBounded(ctx, dir, recipient, cur.Feedback, cur.FeedbackAnchor, remainingLimit, remainingBytes, req.MaxBytes)
 
 	if controlErr != nil {
 		return out, errors.Join(controlErr, fbErr)
@@ -145,6 +145,7 @@ func readBoundedInbox(ctx context.Context, box *mail.Mailbox, recipient string, 
 		return out, err
 	}
 	next.Feedback = highest
+	next.FeedbackAnchor = fbAnchor
 	out.NextCursor = next.String()
 	return out, nil
 }
@@ -160,32 +161,41 @@ func readBoundedInbox(ctx context.Context, box *mail.Mailbox, recipient string, 
 // drift, and mirrors the unbounded converter's schema exactly: feedback
 // writes id(int)/from/to/summary/message/read_at, which will not unmarshal
 // into mail.Envelope directly.
-func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, after int64, remainingLimit, remainingBytes, budget int) ([]*mail.Envelope, int64, bool, error) {
+func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, after int64, anchor string, remainingLimit, remainingBytes, budget int) ([]*mail.Envelope, int64, string, bool, error) {
 	highest := after
+	storeAnchor := mail.EmptyAnchor
 	if strings.TrimSpace(recipient) == "" {
-		return nil, highest, false, nil
+		return nil, highest, storeAnchor, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, highest, storeAnchor, false, err
 	}
 	path := filepath.Join(dir, recipient+".jsonl")
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Normal: a lane never polled for feedback has no store. This is
-			// checked BEFORE any budget decision, because reporting
-			// truncated=true here claimed more data existed when the store
-			// did not exist at all.
-			return nil, highest, false, nil
-		}
-		return nil, highest, false, fmt.Errorf("mail: stat feedback mailbox: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, highest, false, errors.New("mail: feedback mailbox is not a regular file; a bounded read cannot bound a stream")
-	}
-
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, highest, false, fmt.Errorf("mail: open feedback mailbox: %w", err)
+		if os.IsNotExist(err) {
+			// A lane never polled for feedback has no store, which is normal
+			// ONLY while the cursor claims no position in it. Returning
+			// success unconditionally let an absent store satisfy a live
+			// cursor and silently drop everything it had pointed at.
+			if after > 0 {
+				return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback store is absent but the cursor is at %d", mail.ErrStorageRewound, after)
+			}
+			return nil, highest, storeAnchor, false, nil
+		}
+		return nil, highest, storeAnchor, false, fmt.Errorf("mail: open feedback mailbox: %w", err)
 	}
 	defer file.Close()
+
+	// Stat the OPEN HANDLE: a stat on the path first leaves a window in which
+	// the regular file it approved is replaced by something unbounded.
+	info, err := file.Stat()
+	if err != nil {
+		return nil, highest, storeAnchor, false, fmt.Errorf("mail: stat feedback mailbox: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, highest, storeAnchor, false, errors.New("mail: feedback mailbox is not a regular file; a bounded read cannot bound a stream")
+	}
 
 	var out []*mail.Envelope
 	used := 0
@@ -196,7 +206,7 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 	scanner.Buffer(make([]byte, 0, 64*1024), mail.MaxBoundedRecordBytes)
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
-			return nil, highest, false, err
+			return nil, highest, storeAnchor, false, err
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -215,14 +225,23 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 			// The unbounded path reports this on stderr and continues, which
 			// a paged caller cannot see; a bounded page that dropped it would
 			// certify itself complete.
-			return nil, highest, false, fmt.Errorf("mail: unparseable feedback record: %w", err)
+			return nil, highest, storeAnchor, false, fmt.Errorf("mail: unparseable feedback record: %w", err)
 		}
-		if sawAny && fb.ID < maxSeen {
-			return nil, highest, false, fmt.Errorf("%w: feedback id %d follows %d", mail.ErrStorageUnordered, fb.ID, maxSeen)
+		if fb.ID <= 0 {
+			return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback record carries id %d", mail.ErrStorageUnordered, fb.ID)
 		}
-		if fb.ID > maxSeen || !sawAny {
-			maxSeen = fb.ID
+		// STRICTLY increasing: `<` accepted duplicate ids, and a page break
+		// between two records sharing one id made the second vanish.
+		if sawAny && fb.ID <= maxSeen {
+			return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback id %d does not exceed %d", mail.ErrStorageUnordered, fb.ID, maxSeen)
 		}
+		if !sawAny {
+			storeAnchor = mail.RecordAnchor(fmt.Sprintf("feedback-%d", fb.ID), fb.ID)
+			if after > 0 && anchor != mail.EmptyAnchor && anchor != storeAnchor {
+				return nil, highest, storeAnchor, false, fmt.Errorf("%w: the feedback store's first record changed", mail.ErrStorageRewound)
+			}
+		}
+		maxSeen = fb.ID
 		sawAny = true
 		if fb.ID <= after {
 			continue
@@ -244,10 +263,10 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 		}
 		size, sizeErr := mail.EnvelopeBytes(env)
 		if sizeErr != nil {
-			return nil, highest, false, sizeErr
+			return nil, highest, storeAnchor, false, sizeErr
 		}
 		if size > budget {
-			return nil, highest, false, fmt.Errorf("%w: feedback id %d needs %d bytes, budget is %d",
+			return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback id %d needs %d bytes, budget is %d",
 				mail.ErrRecordExceedsBudget, fb.ID, size, budget)
 		}
 		if len(out) >= remainingLimit || used+size > remainingBytes {
@@ -261,10 +280,17 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, highest, false, fmt.Errorf("mail: scan feedback mailbox: %w", err)
+		return nil, highest, storeAnchor, false, fmt.Errorf("mail: scan feedback mailbox: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, highest, storeAnchor, false, err
+	}
+	// An EMPTY feedback file is a truncated store, not a fresh one.
+	if !sawAny && after > 0 {
+		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback store holds no records but the cursor is at %d", mail.ErrStorageRewound, after)
 	}
 	if sawAny && after > maxSeen {
-		return nil, highest, false, fmt.Errorf("%w: feedback cursor at %d, highest stored id is %d", mail.ErrStorageRewound, after, maxSeen)
+		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback cursor at %d, highest stored id is %d", mail.ErrStorageRewound, after, maxSeen)
 	}
-	return out, highest, truncated, nil
+	return out, highest, storeAnchor, truncated, nil
 }
