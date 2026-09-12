@@ -532,52 +532,50 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 	// content probe then fails closed rather than proving against a ref that
 	// may move underneath it.
 	basePin := e.pinBase(ctx, root, baseRef)
-	accounted := 0
-	for i := range lanes {
-		// Unselected lanes of the rotating window are preserved fail-closed
-		// BEFORE any expensive per-lane operation: no status, process,
-		// ownership, landing, or lease evidence call may reach them this
-		// sweep. The full ring stays in the report; their next evidence
-		// comes when the cursor rotates to them.
-		if windowActive {
+	// Examination follows RING order, the same order the window was selected
+	// in, because the cursor advances from windowStart by the number of lanes
+	// examined. Walking the ring by ascending index instead would make those
+	// two disagree whenever the window wraps: with len 5, start 4 and width 3
+	// the window is [4,0,1] but ascending order examines [0,1,4], so a sweep
+	// cancelled after one lane would advance 4->0 and skip lane 4, which it
+	// never examined, while re-examining lane 0, which it did.
+	//
+	// Unselected lanes are preserved fail-closed up front, before any
+	// expensive per-lane operation: no status, process, ownership, landing or
+	// lease evidence call reaches them this sweep. The full ring stays in the
+	// report in its original order; only the visit order is the ring's.
+	order := make([]int, 0, len(lanes))
+	if windowActive {
+		for i := range lanes {
 			if _, ok := selectedIdx[i]; !ok {
 				lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "census_window_deferred"
-				continue
-			}
-			// A cancelled sweep truncates the window: this lane and every
-			// remaining selected lane stay unexamined (conservatively
-			// unknown, mirroring the budget-exhaustion convention), the
-			// loop stops, and the cursor advances only by the lanes that
-			// were actually accounted - so the next sweep re-processes the
-			// unexamined remainder instead of skipping it. Unselected
-			// lanes of the remainder keep the explicit deferred reason.
-			if ctx.Err() != nil {
-				for j := i; j < len(lanes); j++ {
-					if _, ok := selectedIdx[j]; ok {
-						lanes[j].State, lanes[j].PreserveReason = LaneUnknown, "census_budget_exhausted"
-					} else {
-						lanes[j].State, lanes[j].PreserveReason = LaneUnknown, "census_window_deferred"
-					}
-				}
-				break
 			}
 		}
-		// This lane is now EXAMINED, and the cursor accounts for examination
-		// rather than for success.
-		//
-		// Counting at the end of the body instead made the cursor a count of
-		// lanes that completed the whole pipeline, and eight paths below leave
-		// early with a conservative unknown state: unreadable realpath, stat,
-		// git status (absent or failed), merge state, missing lease evidence,
-		// process evidence, and lifecycle evidence. A window whose lanes all
-		// took one of those advanced the cursor by nothing, so the next sweep
-		// selected the same slice, failed the same way, and the fleet could
-		// starve on an unprovable window forever.
-		//
-		// Everything that must NOT count is already excluded above: an
-		// unselected lane continues before this point, and a cancelled sweep
-		// breaks before it, so a lane the sweep never looked at is never
-		// charged to the cursor.
+		for offset := 0; offset < windowLimit; offset++ {
+			order = append(order, (windowStart+offset)%len(lanes))
+		}
+	} else {
+		for i := range lanes {
+			order = append(order, i)
+		}
+	}
+	accounted := 0
+	for pos := 0; pos < len(order); pos++ {
+		i := order[pos]
+		// A cancelled sweep truncates the window: this lane and every
+		// selected lane after it in RING order stay unexamined and
+		// conservatively unknown, so the next sweep re-processes them
+		// instead of skipping them.
+		if windowActive && ctx.Err() != nil {
+			for _, j := range order[pos:] {
+				lanes[j].State, lanes[j].PreserveReason = LaneUnknown, "census_budget_exhausted"
+			}
+			break
+		}
+		// The lane is now EXAMINED. The cursor accounts for examination, not
+		// for success: eight paths below leave early with a conservative
+		// unknown state, and counting at the end of the body instead let a
+		// window of unprovable lanes advance by nothing and repeat forever.
 		accounted++
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {

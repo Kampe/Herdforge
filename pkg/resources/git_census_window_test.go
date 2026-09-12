@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -370,13 +371,8 @@ func TestRegisteredCensusWindowUnwiredEnumeratesAllLanes(t *testing.T) {
 	}
 }
 
-// FAC-825. The cursor accounts for EXAMINATION, not for success.
-//
-// It previously counted at the end of the loop body, so any of the eight
-// early-continue paths left a lane examined-but-uncounted. A window whose
-// lanes all took one advanced by nothing, and the next sweep selected the
-// same slice and failed the same way -- an unprovable window could starve the
-// rest of the ring indefinitely.
+// FAC-825. The cursor accounts for EXAMINATION, in RING order, so the number
+// it advances by always matches the lanes the sweep actually looked at.
 
 // windowSeamAdvance is the cursor position after one sweep, or -1 when the
 // sweep advanced nothing at all.
@@ -387,9 +383,46 @@ func windowSeamAdvance(seam *windowSeamEnumerator) int {
 	return seam.advances[len(seam.advances)-1]
 }
 
+// requireVisited asserts the exact, nonempty set of lanes whose evidence was
+// read, in order. Asserting the list rather than iterating it matters: a sweep
+// that examined NOTHING would satisfy any loop over the recorded reads.
+func requireVisited(t *testing.T, seam *windowSeamEnumerator, want ...string) {
+	t.Helper()
+	got := seam.evidence.read
+	if len(got) == 0 {
+		t.Fatalf("no lane was examined at all; expected %v", want)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("examined %v, want exactly %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("examined %v in that order, want exactly %v", got, want)
+		}
+	}
+}
+
+func requireDefinitive(t *testing.T, lanes []RegisteredWorktree, indexes ...int) {
+	t.Helper()
+	for _, i := range indexes {
+		if lanes[i].State == LaneUnknown {
+			t.Fatalf("lane-%d was examined and must reach a definitive state, got unknown (%q)", i, lanes[i].PreserveReason)
+		}
+	}
+}
+
+func requireReason(t *testing.T, lanes []RegisteredWorktree, reason string, indexes ...int) {
+	t.Helper()
+	for _, i := range indexes {
+		if lanes[i].State != LaneUnknown || lanes[i].PreserveReason != reason {
+			t.Fatalf("lane-%d must be unknown/%s, got state=%v reason=%q", i, reason, lanes[i].State, lanes[i].PreserveReason)
+		}
+	}
+}
+
 // A window in which EVERY selected lane leaves early must still advance by the
-// window's full width. This is the starvation case: without it the same slice
-// is re-selected forever.
+// window's full width, and the next sweep must examine the NEXT lanes and
+// prove them. This is the starvation case.
 func TestRegisteredCensusWindowAdvancesWhenEverySelectedLaneIsUnproven(t *testing.T) {
 	root, lanes := windowSeamRepo(t, 5)
 	seam := newWindowSeamEnumerator(t, root, 2)
@@ -400,26 +433,19 @@ func TestRegisteredCensusWindowAdvancesWhenEverySelectedLaneIsUnproven(t *testin
 	if err != nil {
 		t.Fatalf("windowed evaluate must answer: %v", err)
 	}
-	for _, i := range []int{0, 1} {
-		if got[i].State != LaneUnknown || got[i].PreserveReason != "canonical_lifecycle_evidence_unavailable" {
-			t.Fatalf("lane-%d must stay conservatively unknown, got state=%v reason=%q", i, got[i].State, got[i].PreserveReason)
-		}
-	}
+	requireVisited(t, seam, "lane-0", "lane-1")
+	requireReason(t, got, "canonical_lifecycle_evidence_unavailable", 0, 1)
 	if advance := windowSeamAdvance(seam); advance != 2 {
 		t.Fatalf("a fully unproven window must still advance by its width: cursor at %d, advances %v", advance, seam.advances)
 	}
 
-	// And the next sweep must reach DIFFERENT lanes, which is the property the
-	// advance exists to provide.
 	seam.evidence.read = nil
-	if _, err := seam.enumerator.evaluate(context.Background(), root, lanes, "main"); err != nil {
+	got, err = seam.enumerator.evaluate(context.Background(), root, lanes, "main")
+	if err != nil {
 		t.Fatalf("second sweep must answer: %v", err)
 	}
-	for _, branch := range seam.evidence.read {
-		if branch == "lane-0" || branch == "lane-1" {
-			t.Fatalf("the unprovable window repeated instead of rotating: second sweep read %v", seam.evidence.read)
-		}
-	}
+	requireVisited(t, seam, "lane-2", "lane-3")
+	requireDefinitive(t, got, 2, 3)
 }
 
 // A window mixing early-exit and fully processed lanes advances by every lane
@@ -427,33 +453,27 @@ func TestRegisteredCensusWindowAdvancesWhenEverySelectedLaneIsUnproven(t *testin
 func TestRegisteredCensusWindowAdvancesByExaminedNotByProvenLanes(t *testing.T) {
 	root, lanes := windowSeamRepo(t, 6)
 	seam := newWindowSeamEnumerator(t, root, 3)
-	// One of the three selected lanes leaves early; the other two complete.
 	seam.evidence.failFor["lane-1"] = true
 
 	got, err := seam.enumerator.evaluate(context.Background(), root, lanes, "main")
 	if err != nil {
 		t.Fatalf("windowed evaluate must answer: %v", err)
 	}
-	if got[1].State != LaneUnknown {
-		t.Fatalf("the failing lane must stay unknown, got %v", got[1].State)
-	}
-	if got[0].State == LaneUnknown || got[2].State == LaneUnknown {
-		t.Fatalf("the completing lanes must reach a definitive state, got %v and %v", got[0].State, got[2].State)
-	}
+	requireVisited(t, seam, "lane-0", "lane-1", "lane-2")
+	requireReason(t, got, "canonical_lifecycle_evidence_unavailable", 1)
+	requireDefinitive(t, got, 0, 2)
 	if advance := windowSeamAdvance(seam); advance != 3 {
-		t.Fatalf("cursor must advance by all 3 examined lanes, not by the 2 proven: cursor at %d, advances %v", advance, seam.advances)
+		t.Fatalf("cursor must advance by all 3 examined lanes, not the 2 proven: cursor at %d, advances %v", advance, seam.advances)
 	}
 }
 
-// Cancellation before a lane is examined must NOT charge that lane to the
+// Cancellation before a lane is examined must not charge that lane to the
 // cursor: the unexamined remainder has to be re-selected next sweep.
 func TestRegisteredCensusWindowCancellationLeavesUnexaminedLaneForNextSweep(t *testing.T) {
 	root, lanes := windowSeamRepo(t, 6)
 	seam := newWindowSeamEnumerator(t, root, 3)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Fire after the FIRST lane's evidence read, so lane-0 is examined and
-	// lanes 1 and 2 are not.
 	seam.evidence.onReadHook = func(branch string) {
 		if branch == "lane-0" {
 			cancel()
@@ -464,56 +484,89 @@ func TestRegisteredCensusWindowCancellationLeavesUnexaminedLaneForNextSweep(t *t
 	if err != nil {
 		t.Fatalf("a cancelled sweep must still answer with the partial census: %v", err)
 	}
-	for _, i := range []int{1, 2} {
-		if got[i].State != LaneUnknown || got[i].PreserveReason != "census_budget_exhausted" {
-			t.Fatalf("unexamined lane-%d must stay unknown for the next sweep, got state=%v reason=%q", i, got[i].State, got[i].PreserveReason)
-		}
-	}
+	requireVisited(t, seam, "lane-0")
+	requireDefinitive(t, got, 0)
+	requireReason(t, got, "census_budget_exhausted", 1, 2)
 	if advance := windowSeamAdvance(seam); advance != 1 {
 		t.Fatalf("cursor must advance by the one examined lane only: cursor at %d, advances %v", advance, seam.advances)
 	}
 
-	// The next sweep must re-select the lanes cancellation skipped.
 	seam.evidence.onReadHook = nil
 	seam.evidence.read = nil
-	if _, err := seam.enumerator.evaluate(context.Background(), root, lanes, "main"); err != nil {
+	got, err = seam.enumerator.evaluate(context.Background(), root, lanes, "main")
+	if err != nil {
 		t.Fatalf("second sweep must answer: %v", err)
 	}
-	reread := map[string]bool{}
-	for _, branch := range seam.evidence.read {
-		reread[branch] = true
-	}
-	for _, branch := range []string{"lane-1", "lane-2"} {
-		if !reread[branch] {
-			t.Fatalf("%s was skipped by the cursor instead of re-processed: second sweep read %v", branch, seam.evidence.read)
+	requireVisited(t, seam, "lane-1", "lane-2", "lane-3")
+	requireDefinitive(t, got, 1, 2, 3)
+}
+
+// A WRAPPING window cancelled mid-sweep. The window is [4,0,1] but ascending
+// index order would examine [0,1,4]: a sweep cancelled after one lane would
+// then advance 4->0, skipping lane 4 which was never examined and repeating
+// lane 0 which was. Examination must follow the ring, so the lane actually
+// examined first is lane-4.
+func TestRegisteredCensusWindowWrappingCancellationAdvancesInRingOrder(t *testing.T) {
+	root, lanes := windowSeamRepo(t, 5)
+	seam := newWindowSeamEnumerator(t, root, 3)
+	seam.cursor = 4
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seam.evidence.onReadHook = func(branch string) {
+		if branch == "lane-4" {
+			cancel()
 		}
 	}
+
+	got, err := seam.enumerator.evaluate(ctx, root, lanes, "main")
+	if err != nil {
+		t.Fatalf("a cancelled wrapping sweep must still answer: %v", err)
+	}
+	// The ring's first lane, not the lowest index, is the one examined.
+	requireVisited(t, seam, "lane-4")
+	requireDefinitive(t, got, 4)
+	requireReason(t, got, "census_budget_exhausted", 0, 1)
+	requireReason(t, got, "census_window_deferred", 2, 3)
+	if advance := windowSeamAdvance(seam); advance != 0 {
+		t.Fatalf("cursor must advance 4->0 by the one examined lane: cursor at %d, advances %v", advance, seam.advances)
+	}
+
+	// The lanes cancellation left unexamined must be the ones the next sweep
+	// reaches, not lanes it already proved.
+	seam.evidence.onReadHook = nil
+	seam.evidence.read = nil
+	got, err = seam.enumerator.evaluate(context.Background(), root, lanes, "main")
+	if err != nil {
+		t.Fatalf("second sweep must answer: %v", err)
+	}
+	requireVisited(t, seam, "lane-0", "lane-1", "lane-2")
+	requireDefinitive(t, got, 0, 1, 2)
 }
 
 // A corrupt negative cursor must not index lanes[-n]. Go's % keeps the
-// dividend's sign, so reducing a negative start leaves it negative; the policy
-// is to start at the ring head deterministically and write a sane cursor back.
+// dividend's sign, so reducing a negative start leaves it negative for every
+// value that is not an exact multiple of the ring length -- which is why the
+// inputs here are chosen to survive the old reduction as negatives.
 func TestRegisteredCensusWindowNegativeStartStartsAtRingHead(t *testing.T) {
-	root, lanes := windowSeamRepo(t, 5)
-	seam := newWindowSeamEnumerator(t, root, 2)
-	seam.enumerator.WindowStart = func(int) int { return -5 }
+	for _, start := range []int{-1, -6, -5, math.MinInt} {
+		t.Run(fmt.Sprintf("start_%d", start), func(t *testing.T) {
+			root, lanes := windowSeamRepo(t, 5)
+			seam := newWindowSeamEnumerator(t, root, 2)
+			seam.enumerator.WindowStart = func(int) int { return start }
 
-	got, err := seam.enumerator.evaluate(context.Background(), root, lanes, "main")
-	if err != nil {
-		t.Fatalf("a negative cursor must be normalized, not fatal: %v", err)
-	}
-	for _, i := range []int{0, 1} {
-		if got[i].PreserveReason == "census_window_deferred" {
-			t.Fatalf("the window must start at the ring head, but lane-%d was deferred", i)
-		}
-	}
-	for _, i := range []int{2, 3, 4} {
-		if got[i].PreserveReason != "census_window_deferred" {
-			t.Fatalf("lane-%d is outside a head-anchored window and must be deferred, got %q", i, got[i].PreserveReason)
-		}
-	}
-	if advance := windowSeamAdvance(seam); advance != 2 {
-		t.Fatalf("a normalized sweep must write a sane cursor back: cursor at %d, advances %v", advance, seam.advances)
+			got, err := seam.enumerator.evaluate(context.Background(), root, lanes, "main")
+			if err != nil {
+				t.Fatalf("a negative cursor must be normalized, not fatal: %v", err)
+			}
+			// Positive proof the head-anchored window did real work, rather
+			// than only the absence of a deferred reason.
+			requireVisited(t, seam, "lane-0", "lane-1")
+			requireDefinitive(t, got, 0, 1)
+			requireReason(t, got, "census_window_deferred", 2, 3, 4)
+			if advance := windowSeamAdvance(seam); advance != 2 {
+				t.Fatalf("a normalized sweep must write a sane cursor back: cursor at %d, advances %v", advance, seam.advances)
+			}
+		})
 	}
 }
 
@@ -528,12 +581,10 @@ func TestRegisteredCensusWindowOversizedStartWrapsIntoRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an oversized cursor must wrap, not fail: %v", err)
 	}
-	// 7 % 5 == 2, so lanes 2 and 3 are selected.
-	for _, i := range []int{2, 3} {
-		if got[i].PreserveReason == "census_window_deferred" {
-			t.Fatalf("lane-%d must be selected by the wrapped window", i)
-		}
-	}
+	// 7 % 5 == 2, so lanes 2 and 3 are the window.
+	requireVisited(t, seam, "lane-2", "lane-3")
+	requireDefinitive(t, got, 2, 3)
+	requireReason(t, got, "census_window_deferred", 0, 1, 4)
 	if advance := windowSeamAdvance(seam); advance != 4 {
 		t.Fatalf("cursor must advance from the wrapped start: cursor at %d, advances %v", advance, seam.advances)
 	}
