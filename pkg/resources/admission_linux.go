@@ -192,6 +192,14 @@ func parseMeminfoHeadroom(raw string) (MemHeadroom, error) {
 // bits.Div64 requires hi < whole, which holds here: part <= whole bounds the
 // quotient at 100, so part*100 < 101*whole and hi = (part*100)>>64 <= 50; when
 // whole <= 50 the product fits in 64 bits and hi is 0.
+//
+// The same reasoning bounds the quotient at 0..100, but that proof lives in
+// the guards above and in this comment, not at the conversion. A narrowing
+// uint64 -> int that is only correct because of an argument made elsewhere is
+// exactly what a reader, a refactor, and a scanner all have to take on trust,
+// so the bound is re-checked locally below before the conversion happens.
+// Once checked, the value fits int on 32-bit platforms as well: 100 is far
+// inside int32.
 func percentOf(part, whole int64) (int, error) {
 	if whole <= 0 {
 		return 0, fmt.Errorf("cannot take a percentage of a total of %d", whole)
@@ -204,5 +212,12 @@ func percentOf(part, whole int64) (int, error) {
 	}
 	hi, lo := bits.Mul64(uint64(part), 100)
 	quo, _ := bits.Div64(hi, lo, uint64(whole))
+	// Fail closed on an impossible quotient. Reaching here means one of the
+	// guards above no longer holds, and a percentage outside 0..100 is a
+	// broken invariant rather than a headroom reading: admitting on it would
+	// be worse than refusing to answer.
+	if quo > 100 {
+		return 0, fmt.Errorf("percentage of %d/%d computed as %d, outside the 0..100 range the input guards bound it to", part, whole, quo)
+	}
 	return int(quo), nil
 }

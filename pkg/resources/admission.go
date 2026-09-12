@@ -533,11 +533,6 @@ func cpuReadingFrom(source string, at time.Time, out string, cpus int) freshness
 	return freshness.Fresh(source, at, CPULoad{Load1: load1, CPUs: cpus, Normalized: load1 / float64(cpus)})
 }
 
-// parseFreePctStrict is the truthful counterpart to parseMemoryPressureFreePct,
-// which answers 100 to every malformed shape.
-//
-// It reads the WHOLE token after the label rather than scanning backwards for
-// trailing digits, which silently rewrote "-50%" into 50 and "1.50%" into 50.
 // parseDarwinPressureLevel reads kern.memorystatus_vm_pressure_level's value.
 //
 // It lives here, unconstrained, rather than beside the Darwin probe, because it
@@ -568,6 +563,11 @@ func parseDarwinPressureLevel(output string) (PressureLevel, error) {
 	}
 }
 
+// parseFreePctStrict is the truthful counterpart to parseMemoryPressureFreePct,
+// which answers 100 to every malformed shape.
+//
+// It reads the WHOLE token after the label rather than scanning backwards for
+// trailing digits, which silently rewrote "-50%" into 50 and "1.50%" into 50.
 func parseFreePctStrict(output, label string) (int, error) {
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
