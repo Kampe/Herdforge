@@ -535,6 +535,12 @@ func (g *Governor) recordStage(report *GovernorReport, stage CensusStage) {
 	report.Stages = append(report.Stages, stage)
 }
 
+// census runs against a policy that has ALREADY passed validate(). Both
+// callers, Run and AcquireDispatch, call defaults() then validate() before
+// reaching here, and the arithmetic downstream depends on it: setConcurrency
+// divides by the task reserve, which validate() requires to be nonzero. A
+// caller that reaches census without validating -- only a test can, since
+// census is unexported -- is using it outside its contract.
 func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	report := GovernorReport{}
 	start := g.now()

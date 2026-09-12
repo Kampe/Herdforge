@@ -73,10 +73,24 @@ func censusSeamGovernor(t *testing.T, laneCount, window int) (*Governor, string,
 	evidence := &windowSeamEvidence{failFor: map[string]bool{}}
 	measurer := &censusWindowRecordingMeasurer{failBase: map[string]bool{}}
 	g := &Governor{
+		// These fixtures call g.census directly, which Run and
+		// AcquireDispatch only ever reach through validate(). The policy must
+		// therefore satisfy the SAME invariants validate() enforces, or the
+		// fixture is exercising census outside its contract: the first
+		// version of this helper left PressureBytes and TaskReserveBytes
+		// zero, and setConcurrency divided by that zero reserve.
 		Policy: GovernorPolicy{
 			HostID: "census-seam", RepositoryRoot: root, BaseRef: "main",
-			LockPath:       filepath.Join(root, "governor.lock"),
-			MaxScanEntries: 64, LockTimeout: time.Second, LockRetry: time.Millisecond,
+			LockPath:               filepath.Join(root, "governor.lock"),
+			GeneratedDirectories:   []string{"node_modules"},
+			PressureBytes:          1000,
+			RecoveryBytes:          2000,
+			TaskReserveBytes:       1000,
+			MaxDispatchConcurrency: 4,
+			ReapBatchLimit:         2,
+			MaxScanEntries:         64,
+			LockTimeout:            time.Second,
+			LockRetry:              time.Millisecond,
 		},
 		Worktrees: GitWorktreeEnumerator{
 			Processes:    &windowSeamProcesses{},
@@ -93,6 +107,14 @@ func censusSeamGovernor(t *testing.T, laneCount, window int) (*Governor, string,
 		Measure:  measurer,
 		Locks:    &channelLocks{},
 		Now:      func() time.Time { return time.Unix(200, 0).UTC() },
+	}
+	// defaults() wires the window hooks onto the concrete enumerator, and the
+	// validate() that follows is the contract check every direct-census
+	// fixture owes: it fails HERE, naming the invalid field, instead of
+	// panicking deep inside the arithmetic that assumes it.
+	g.defaults()
+	if err := g.Policy.validate(); err != nil {
+		t.Fatalf("census fixture policy must satisfy the same validation Run enforces: %v", err)
 	}
 	return g, root, measurer, evidence
 }
@@ -126,7 +148,6 @@ func censusStage(t *testing.T, report GovernorReport) CensusStage {
 // so a normal sweep with most of the ring explicitly deferred reported zero.
 func TestGovernorCensusStageCountsDeferredAndUnknownLanes(t *testing.T) {
 	g, _, measurer, _ := censusSeamGovernor(t, 5, 2)
-	g.defaults()
 	seedRegisteredCursor(t, g, 0)
 
 	report, err := g.census(context.Background())
@@ -196,7 +217,6 @@ func TestGovernorCensusCountsEnumeratorUnknownsWithoutDoubleCounting(t *testing.
 	evidence.failFor["lane-0"] = true
 	evidence.failFor["lane-1"] = true
 	measurer.failBase["lane-0"] = true
-	g.defaults()
 	seedRegisteredCursor(t, g, 0)
 
 	report, err := g.census(context.Background())
@@ -260,7 +280,6 @@ func TestGovernorCensusCountsEnumeratorUnknownsWithoutDoubleCounting(t *testing.
 // the stage, must not fail the sweep, and must not promote any unknown lane.
 func TestGovernorCensusCursorWriteFailureIsVisibleAndChangesNoLane(t *testing.T) {
 	g, root, _, _ := censusSeamGovernor(t, 5, 2)
-	g.defaults()
 	// Block the cursor directory with a regular file so the advance cannot
 	// create it. The read side falls back to the deterministic stride.
 	blocked := filepath.Join(root, ".herd", "governor")
