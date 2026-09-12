@@ -3,37 +3,32 @@ package verifier
 import (
 	"archive/tar"
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// The source manifest budget.
-//
-// The regression these cover: the total budget was 16 MiB and this
-// repository's own tracked tree reached 16,749,519 bytes, leaving 27,697
-// bytes of headroom. CI validates a pull request's MERGE ref rather than its
-// head, so a merge tree of 16,809,993 bytes was refused while both of its
-// parents passed on their own, and the next change of any size would have
-// done the same to whoever authored it.
-//
-// Everything here drives the REAL admission path with an injected tiny
-// budget. That is deliberate: reaching a ceiling by allocating it would make
-// these tests cost megabytes to prove arithmetic, and a test that is
-// expensive to run is a test that stops being run. Nothing below needs
-// Docker, and nothing below asserts anything about the host's current tree,
-// so the regression stays reproducible long after this tree's size changes.
+// Source manifest budget. Every case drives the real admission path with a
+// small injected budget rather than allocating a ceiling, and asserts the
+// budget-specific refusal so an unrelated metadata error cannot stand in for
+// a budget refusal.
 
-// budgetArchiveMember renders one well-formed regular-file member. Metadata is
-// what git archive emits, so these fixtures reach the budget check rather than
-// dying earlier on ownership or mode validation.
-func budgetArchiveMember(t *testing.T, name string, size int) []byte {
+const budgetErrMarker = "source manifest budget"
+
+func tinyBudget(fileBytes, totalBytes int64) sourceManifestBudget {
+	return sourceManifestBudget{fileBytes: fileBytes, totalBytes: totalBytes}
+}
+
+// budgetTarMember renders one well-formed member with the metadata git archive
+// emits, so a fixture reaches the budget check instead of dying earlier.
+func budgetTarMember(t *testing.T, header tar.Header, size int) []byte {
 	t.Helper()
 	var member bytes.Buffer
 	writer := tar.NewWriter(&member)
-	header := &tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(size), Uid: 0, Gid: 0}
-	if err := writer.WriteHeader(header); err != nil {
+	header.Size = int64(size)
+	if err := writer.WriteHeader(&header); err != nil {
 		t.Fatal(err)
 	}
 	if size > 0 {
@@ -44,8 +39,18 @@ func budgetArchiveMember(t *testing.T, name string, size int) []byte {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// Drop the writer's trailing end-of-archive block so members concatenate.
+	// Drop the end-of-archive block so members concatenate.
 	return member.Bytes()[:member.Len()-1024]
+}
+
+func budgetTarFile(t *testing.T, name string, size int) []byte {
+	t.Helper()
+	return budgetTarMember(t, tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644}, size)
+}
+
+func budgetTarSymlink(t *testing.T, name, target string) []byte {
+	t.Helper()
+	return budgetTarMember(t, tar.Header{Name: name, Typeflag: tar.TypeSymlink, Mode: 0o777, Linkname: target}, 0)
 }
 
 func budgetArchive(t *testing.T, members ...[]byte) []byte {
@@ -58,129 +63,163 @@ func budgetArchive(t *testing.T, members ...[]byte) []byte {
 	return archive.Bytes()
 }
 
-func tinyBudget(fileBytes, totalBytes int64) sourceManifestBudget {
-	return sourceManifestBudget{fileBytes: fileBytes, totalBytes: totalBytes}
+// budgetFilesystemFile writes real content and pairs it with a root-owned
+// FileInfo, because the readback's ownership gate refuses anything else and a
+// test-owned file would fail there instead of at the budget.
+func budgetFilesystemFile(t *testing.T, root, name string, size int) filesystemManifestMember {
+	t.Helper()
+	full := filepath.Join(root, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, bytes.Repeat([]byte{'x'}, size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filesystemManifestMember{name: name, info: newFAC198RegularInfo(int64(size))}
 }
 
-// TestManifestBudgetAdmitsExactlyAtTheTotalAndRefusesOneByteOver is the
-// boundary itself. A tree that exactly fills the budget is legitimate source
-// and must build; one byte more must refuse.
-func TestManifestBudgetAdmitsExactlyAtTheTotalAndRefusesOneByteOver(t *testing.T) {
-	budget := tinyBudget(64, 100)
+func budgetFilesystemSymlink(name, target string) filesystemManifestMember {
+	return filesystemManifestMember{name: name, info: newFAC198SymlinkInfo(), target: target}
+}
 
-	atLimit := budgetArchive(t, budgetArchiveMember(t, "a.go", 60), budgetArchiveMember(t, "b.go", 40))
-	if _, err := sourceManifestDigestFromArchiveWithBudget(atLimit, budget); err != nil {
-		t.Fatalf("a manifest of exactly the budget is legitimate source and must be admitted: %v", err)
-	}
-
-	overByOne := budgetArchive(t, budgetArchiveMember(t, "a.go", 60), budgetArchiveMember(t, "b.go", 41))
-	_, err := sourceManifestDigestFromArchiveWithBudget(overByOne, budget)
+func requireBudgetRefusal(t *testing.T, side string, err error, wants ...string) {
+	t.Helper()
 	if err == nil {
-		t.Fatal("one byte over the total budget must refuse")
+		t.Fatalf("%s: expected a refusal", side)
 	}
-	for _, want := range []string{"candidate archive", "b.go", "101", "100", "total source manifest budget"} {
+	if !strings.Contains(err.Error(), budgetErrMarker) {
+		t.Fatalf("%s: refusal is not the budget's, so this case proves nothing: %v", side, err)
+	}
+	for _, want := range wants {
 		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal must name %q so an operator can act on it, got: %v", want, err)
+			t.Errorf("%s: refusal must name %q, got: %v", side, want, err)
 		}
 	}
 }
 
-// TestManifestBudgetRefusesAggregateOfManySmallFiles is the shape of the real
-// failure: no single member is anywhere near the per-file limit, and the tree
-// still crosses the total. A budget that only ever looked at one file at a
-// time would have admitted this.
+// TestManifestBudgetAdmitsExactlyAtTheTotalAndRefusesOneByteOver: a tree that
+// exactly fills the budget is legitimate source; one byte more refuses.
+func TestManifestBudgetAdmitsExactlyAtTheTotalAndRefusesOneByteOver(t *testing.T) {
+	budget := tinyBudget(64, 100)
+
+	atLimit := budgetArchive(t, budgetTarFile(t, "a.go", 60), budgetTarFile(t, "b.go", 40))
+	digest, err := sourceManifestDigestFromArchiveWithBudget(atLimit, budget)
+	if err != nil {
+		t.Fatalf("a manifest of exactly the budget must be admitted: %v", err)
+	}
+	if digest == "" {
+		t.Fatal("an admitted manifest must produce a digest")
+	}
+
+	overByOne := budgetArchive(t, budgetTarFile(t, "a.go", 60), budgetTarFile(t, "b.go", 41))
+	_, err = sourceManifestDigestFromArchiveWithBudget(overByOne, budget)
+	requireBudgetRefusal(t, "archive", err, "candidate archive", "b.go", "41", "100", "total")
+}
+
+// TestManifestBudgetRefusesAggregateOfManySmallFiles is the real failure's
+// shape: no member is near the per-file limit and the tree still crosses.
 func TestManifestBudgetRefusesAggregateOfManySmallFiles(t *testing.T) {
 	budget := tinyBudget(1024, 100)
 	members := make([][]byte, 0, 11)
 	for i := 0; i < 11; i++ {
-		members = append(members, budgetArchiveMember(t, "pkg/small"+string(rune('a'+i))+".go", 10))
+		members = append(members, budgetTarFile(t, "pkg/small"+string(rune('a'+i))+".go", 10))
 	}
 	_, err := sourceManifestDigestFromArchiveWithBudget(budgetArchive(t, members...), budget)
-	if err == nil {
-		t.Fatal("many small files crossing the total must refuse even when every file is far under the per-file limit")
-	}
+	requireBudgetRefusal(t, "archive", err, "total")
 	if strings.Contains(err.Error(), "per-file") {
-		t.Errorf("aggregate overflow must be reported against the TOTAL budget, not the per-file one: %v", err)
-	}
-	if !strings.Contains(err.Error(), "total source manifest budget") {
-		t.Errorf("refusal must name the total budget: %v", err)
+		t.Errorf("aggregate overflow must be reported against the total budget: %v", err)
 	}
 }
 
 // TestManifestBudgetRefusesSingleFileOverThePerFileLimit keeps the inner
-// ceiling meaningful: one oversized member is refused on its own terms, with
-// the per-file category named, even when the total still has room.
+// ceiling meaningful when the total still has room.
 func TestManifestBudgetRefusesSingleFileOverThePerFileLimit(t *testing.T) {
-	budget := tinyBudget(32, 1024)
 	_, err := sourceManifestDigestFromArchiveWithBudget(
-		budgetArchive(t, budgetArchiveMember(t, "big.bin", 33)), budget)
-	if err == nil {
-		t.Fatal("a member over the per-file budget must refuse even with total headroom to spare")
-	}
-	for _, want := range []string{"per-file source manifest budget", "big.bin", "33", "32"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("refusal must name %q, got: %v", want, err)
-		}
-	}
+		budgetArchive(t, budgetTarFile(t, "big.bin", 33)), tinyBudget(32, 1024))
+	requireBudgetRefusal(t, "archive", err, "per-file", "big.bin", "33", "32")
 }
 
 // TestManifestBudgetRefusalNamesNoHostPath: these strings land in CI output.
-// The manifest path is archive-relative by construction and must stay that way.
 func TestManifestBudgetRefusalNamesNoHostPath(t *testing.T) {
-	budget := tinyBudget(8, 8)
 	_, err := sourceManifestDigestFromArchiveWithBudget(
-		budgetArchive(t, budgetArchiveMember(t, "pkg/verifier/x.go", 9)), budget)
-	if err == nil {
-		t.Fatal("expected a refusal")
-	}
+		budgetArchive(t, budgetTarFile(t, "pkg/verifier/x.go", 9)), tinyBudget(8, 8))
+	requireBudgetRefusal(t, "archive", err, "pkg/verifier/x.go")
 	if strings.HasPrefix(err.Error(), "/") || strings.Contains(err.Error(), " /") {
 		t.Errorf("refusal leaked an absolute host path: %v", err)
 	}
-	if !strings.Contains(err.Error(), "pkg/verifier/x.go") {
-		t.Errorf("refusal must still name the archive-relative member: %v", err)
-	}
 }
 
-// TestManifestBudgetAdmitChecksOverflowBeforeAdding: the total check must not
-// be expressible as total+size, or a corrupt or hostile size can wrap the
-// accumulator and read as comfortably under budget.
-func TestManifestBudgetAdmitChecksOverflowBeforeAdding(t *testing.T) {
-	budget := tinyBudget(1<<62, 1<<62)
-	const nearMax = int64(1)<<62 - 1
-	if err := budget.admit("candidate archive", "file", "huge.bin", nearMax, nearMax); err == nil {
-		t.Fatal("a total that would overflow int64 must refuse, not wrap into looking small")
+// TestManifestBudgetAdmitRefusesGenuineInt64Overflow pins the invariant that
+// the total is never checked or reported as total+size.
+//
+// The arithmetic matters: the pair must actually wrap. total = MaxInt64-1 and
+// size = 2 sum to MaxInt64+1, which wraps to MinInt64 and reads as far under
+// any ceiling, so a regression written as total+size > limit ADMITS it. Both
+// values stay inside the per-file limit here, so the per-file check cannot
+// refuse first and mask the result.
+func TestManifestBudgetAdmitRefusesGenuineInt64Overflow(t *testing.T) {
+	budget := tinyBudget(math.MaxInt64, math.MaxInt64)
+	// Variables, not constants: Go evaluates constant arithmetic exactly, so a
+	// constant total+size here would not compile rather than wrap.
+	var total int64 = math.MaxInt64 - 1
+	var size int64 = 2
+
+	if total+size >= 0 {
+		t.Fatalf("fixture does not overflow: total+size = %d, so this case cannot detect the bug", total+size)
+	}
+	err := budget.admit("candidate archive", "file", "wrap.bin", size, total)
+	requireBudgetRefusal(t, "admit", err, "wrap.bin")
+	// The message must not have computed the wrapped sum either: MaxInt64-1
+	// plus 2 wraps to MinInt64, so any negative total in the text is the bug.
+	if strings.Contains(err.Error(), "-92233720368547758") {
+		t.Errorf("diagnostic computed the overflowed total: %v", err)
+	}
+
+	// Controls: the same budget admits a member that genuinely fits, and a
+	// negative declared size is refused outright.
+	if err := budget.admit("candidate archive", "file", "fits.bin", 2, 0); err != nil {
+		t.Fatalf("a member inside both budgets must be admitted: %v", err)
 	}
 	if err := budget.admit("candidate archive", "file", "negative.bin", -1, 0); err == nil {
 		t.Fatal("a negative declared size must refuse")
 	}
-	if err := budget.admit("candidate archive", "file", "exact.bin", 10, 0); err != nil {
-		t.Fatalf("a member inside both budgets must be admitted: %v", err)
-	}
 }
 
-// TestManifestBudgetProducerAndReadbackAgree is the parity contract: the
-// archive producer and the filesystem readback share one policy, so a tree
-// either passes both or fails both. Drift between them would let a source set
-// be archived and then refused on the way back, or worse, the reverse.
-func TestManifestBudgetProducerAndReadbackAgree(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
-		t.Fatal(err)
+// budgetParityCase runs one budget through both policy sites over the same
+// logical member set and asserts they agree: equal digests when admitted,
+// budget refusals on BOTH sides when not.
+func budgetParityCase(t *testing.T, archive []byte, root string, members []filesystemManifestMember, budget sourceManifestBudget, admit bool) {
+	t.Helper()
+	archiveDigest, archiveErr := sourceManifestDigestFromArchiveWithBudget(archive, budget)
+	readbackDigest, readbackErr := sourceManifestDigestFromFilesystemMembersWithBudget(root, members, budget)
+	if (archiveErr == nil) != (readbackErr == nil) {
+		t.Fatalf("producer and readback disagreed: archive=%v readback=%v", archiveErr, readbackErr)
 	}
-	sizes := map[string]int{"pkg/a.go": 60, "pkg/b.go": 40}
-	for name, size := range sizes {
-		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(name)), bytes.Repeat([]byte{'x'}, size), 0o644); err != nil {
-			t.Fatal(err)
+	if admit {
+		if archiveErr != nil {
+			t.Fatalf("both sides should admit: %v", archiveErr)
 		}
+		if archiveDigest == "" || archiveDigest != readbackDigest {
+			t.Fatalf("admitted manifests must produce one identical digest: archive=%q readback=%q", archiveDigest, readbackDigest)
+		}
+		return
 	}
-	members, err := collectFilesystemReadbackMembers(root)
-	if err != nil {
-		t.Fatal(err)
+	requireBudgetRefusal(t, "archive", archiveErr)
+	requireBudgetRefusal(t, "readback", readbackErr)
+}
+
+// TestManifestBudgetFileParityAcrossProducerAndReadback: one policy, one
+// digest, and refusals that are the budget's on both sides.
+func TestManifestBudgetFileParityAcrossProducerAndReadback(t *testing.T) {
+	if !fac198OwnerFixtureSupported() {
+		t.Skip("readback ownership fixture is unavailable on this platform")
 	}
-	archive := budgetArchive(t,
-		budgetArchiveMember(t, "pkg/a.go", sizes["pkg/a.go"]),
-		budgetArchiveMember(t, "pkg/b.go", sizes["pkg/b.go"]),
-	)
+	root := t.TempDir()
+	members := []filesystemManifestMember{
+		budgetFilesystemFile(t, root, "pkg/a.go", 60),
+		budgetFilesystemFile(t, root, "pkg/b.go", 40),
+	}
+	archive := budgetArchive(t, budgetTarFile(t, "pkg/a.go", 60), budgetTarFile(t, "pkg/b.go", 40))
 
 	for _, tc := range []struct {
 		name   string
@@ -192,72 +231,80 @@ func TestManifestBudgetProducerAndReadbackAgree(t *testing.T) {
 		{"per-file too small for either side", tinyBudget(50, 1024), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, archiveErr := sourceManifestDigestFromArchiveWithBudget(archive, tc.budget)
-			_, readbackErr := sourceManifestDigestFromFilesystemMembersWithBudget(root, members, tc.budget)
-			if (archiveErr == nil) != (readbackErr == nil) {
-				t.Fatalf("producer and readback disagreed under one budget: archive=%v readback=%v", archiveErr, readbackErr)
-			}
-			if tc.admit && archiveErr != nil {
-				t.Fatalf("both sides should admit: %v", archiveErr)
-			}
-			if !tc.admit && archiveErr == nil {
-				t.Fatal("both sides should refuse")
-			}
+			budgetParityCase(t, archive, root, members, tc.budget, tc.admit)
 		})
 	}
 }
 
-// TestDefaultManifestBudgetLeavesRealHeadroomForAMergedTree is the guard on
-// the constant itself, written so it never asserts on the host's tree: it
-// states the sizes the incident actually produced and requires the shipped
-// budget to clear the largest of them with genuine room to grow.
-func TestDefaultManifestBudgetLeavesRealHeadroomForAMergedTree(t *testing.T) {
+// TestManifestBudgetSymlinkParityAcrossProducerAndReadback drives real symlink
+// members through BOTH production call sites, so dropping the bound at either
+// one is caught. A positive control reaches the same path first.
+func TestManifestBudgetSymlinkParityAcrossProducerAndReadback(t *testing.T) {
+	if !fac198OwnerFixtureSupported() {
+		t.Skip("readback ownership fixture is unavailable on this platform")
+	}
+	const target = "sibling.go"
+	root := t.TempDir()
+	members := []filesystemManifestMember{budgetFilesystemSymlink("nested/link", target)}
+	archive := budgetArchive(t, budgetTarSymlink(t, "nested/link", target))
+
+	for _, tc := range []struct {
+		name   string
+		budget sourceManifestBudget
+		admit  bool
+	}{
+		{"target fits both budgets", tinyBudget(64, 64), true},
+		{"target over the total", tinyBudget(64, int64(len(target))-1), false},
+		{"target over the per-file bound", tinyBudget(int64(len(target))-1, 1024), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			budgetParityCase(t, archive, root, members, tc.budget, tc.admit)
+		})
+	}
+}
+
+// TestManifestBudgetSymlinkCountsTowardTheRunningTotal: a symlink target's
+// bytes share the file accumulator, so a file plus a target can cross together.
+func TestManifestBudgetSymlinkCountsTowardTheRunningTotal(t *testing.T) {
+	const target = "sibling.go"
+	archive := budgetArchive(t,
+		budgetTarFile(t, "a.go", 10),
+		budgetTarSymlink(t, "nested/link", target),
+	)
+	fits := tinyBudget(64, int64(10+len(target)))
+	if _, err := sourceManifestDigestFromArchiveWithBudget(archive, fits); err != nil {
+		t.Fatalf("a file and a symlink target exactly filling the total must be admitted: %v", err)
+	}
+	_, err := sourceManifestDigestFromArchiveWithBudget(archive, tinyBudget(64, int64(10+len(target))-1))
+	requireBudgetRefusal(t, "archive", err, "nested/link", "total")
+}
+
+// TestDefaultManifestBudgetClearsTheMeasuredMergeTree guards the shipped
+// constants using the incident's measured sizes as literals, so it never
+// asserts anything about the host's current tree.
+func TestDefaultManifestBudgetClearsTheMeasuredMergeTree(t *testing.T) {
 	const (
 		observedMergedTreeBytes = int64(16_809_993) // refs/pull/830/merge
 		observedMainTreeBytes   = int64(16_749_519) // main at the time
 	)
 	budget := defaultSourceManifestBudget()
-	if budget.totalBytes <= observedMergedTreeBytes {
-		t.Fatalf("total budget %d does not admit the merged tree that failed CI (%d)", budget.totalBytes, observedMergedTreeBytes)
+	if budget.totalBytes <= observedMergedTreeBytes || budget.totalBytes <= observedMainTreeBytes {
+		t.Fatalf("total budget %d does not clear the measured trees (%d merged, %d main)",
+			budget.totalBytes, observedMergedTreeBytes, observedMainTreeBytes)
 	}
-	// A budget that merely clears the incident would fail again on the next
-	// merge. Require room for the tree to roughly double.
 	if budget.totalBytes < 2*observedMergedTreeBytes {
-		t.Fatalf("total budget %d leaves less than double the observed merged tree (%d); the next merges would hit it again",
+		t.Fatalf("total budget %d leaves less than double the measured merged tree %d",
 			budget.totalBytes, observedMergedTreeBytes)
 	}
-	if budget.totalBytes <= observedMainTreeBytes {
-		t.Fatalf("total budget %d does not admit the observed main tree (%d)", budget.totalBytes, observedMainTreeBytes)
-	}
-	// The per-file ceiling must stay a real inner bound, not be raised to the
-	// total by accident.
 	if budget.fileBytes <= 0 || budget.fileBytes >= budget.totalBytes {
-		t.Fatalf("per-file budget %d must stay a meaningful bound under the total %d", budget.fileBytes, budget.totalBytes)
+		t.Fatalf("per-file budget %d must stay a bound under the total %d", budget.fileBytes, budget.totalBytes)
 	}
-	// Every bound stays finite; a budget is a ceiling, not a switch.
 	if budget.totalBytes <= 0 || maxHermeticSourceTransportBytes <= 0 ||
 		maxHermeticSourceTransportMembers <= 0 || maxHermeticSourceTransportPathBytes <= 0 {
-		t.Fatal("every transport and manifest bound must remain finite and positive")
+		t.Fatal("every manifest and transport bound must remain finite and positive")
 	}
 	if maxHermeticSourceTransportBytes <= budget.totalBytes {
-		t.Fatalf("transport ceiling %d must exceed the manifest total %d it carries",
+		t.Fatalf("transport ceiling %d must exceed the manifest total %d",
 			maxHermeticSourceTransportBytes, budget.totalBytes)
-	}
-}
-
-// TestManifestBudgetSymlinkTargetsShareTheSameBudget keeps symlink accounting
-// on the one policy: a target's bytes count toward the same total, and its
-// refusal is as specific as a file's.
-func TestManifestBudgetSymlinkTargetsShareTheSameBudget(t *testing.T) {
-	budget := tinyBudget(4, 4)
-	if err := budget.admit("candidate archive", "symlink target", "nested/link", 5, 0); err == nil {
-		t.Fatal("an oversized symlink target must refuse")
-	} else if !strings.Contains(err.Error(), "symlink target") || !strings.Contains(err.Error(), "nested/link") {
-		t.Errorf("symlink refusal must name its category and member: %v", err)
-	}
-	if err := budget.admit("copied source", "symlink target", "nested/link", 3, 2); err == nil {
-		t.Fatal("a symlink target crossing the running total must refuse")
-	} else if !strings.Contains(err.Error(), "copied source") {
-		t.Errorf("readback refusal must name its own surface: %v", err)
 	}
 }

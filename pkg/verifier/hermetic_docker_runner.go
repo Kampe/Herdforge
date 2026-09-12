@@ -1221,42 +1221,23 @@ func fixedGitArchiveArgs(root, candidateSHA string) []string {
 
 const (
 	maxSourceManifestFileBytes = 16 << 20
-	// maxSourceManifestTotalBytes bounds the WHOLE source manifest, and it is
-	// the only bound this repository's own tree was ever close to.
-	//
-	// It was 16 MiB, and the tracked tree reached 16,749,519 bytes -- 27,697
-	// bytes of headroom, 0.17%. CI validates the pull request's MERGE ref, not
-	// its head, so a merge tree at 16,809,993 bytes failed the total check
-	// while both parents passed it individually. At that margin the next
-	// merge of any size breaks the hermetic profile for whoever happens to
-	// author it, which is a property of the budget, not of their change.
-	//
-	// 64 MiB restores ~47 MiB of real headroom against the measured merge
-	// tree -- on the order of hundreds of merges at the growth rate those
-	// trees show -- while staying a finite, audited ceiling. Peak cost is
-	// bounded by the derived transport ceiling plus the record slice, a few
-	// hundred MiB at the member cap, so the validator still refuses long
-	// before it could pressure a build host.
-	//
-	// The PER-FILE bound is deliberately NOT raised with it: the largest blob
-	// in this tree is under half a megabyte, so 16 MiB already leaves a single
-	// file more than an order of magnitude of room, and keeping it where it is
-	// preserves a meaningful single-member ceiling underneath the total.
+	// 16 MiB aggregate refused this repository's own merge tree: 16,809,993
+	// bytes measured against a 16,777,216-byte ceiling, while both parent trees
+	// passed individually. 64 MiB restores aggregate headroom. The per-file
+	// bound stays 16 MiB, keeping a real single-member ceiling under the total.
+	// This is an input bound, not a memory budget: native guard headroom is
+	// still required.
 	maxSourceManifestTotalBytes         = 64 << 20
 	maxHermeticSourceTransportMembers   = 16384
 	maxHermeticSourceTransportPathBytes = 4096
 	maxHermeticSourceTransportBytes     = maxSourceManifestTotalBytes + int64(maxHermeticSourceTransportMembers+1)*(1024+2*maxHermeticSourceTransportPathBytes)
 )
 
-// sourceManifestBudget is the ONE admission policy for manifest members,
-// shared by the archive producer and the filesystem readback so the two can
-// never drift apart and disagree about what a legal source tree is.
-//
-// It is a value rather than a package-level knob on purpose: production reads
-// the constants above, tests construct a tiny budget and drive the real
-// admission path with a few bytes instead of allocating megabytes to reach a
-// ceiling. There is no setter, no environment override, and no way for a
-// caller to widen a budget at run time.
+// sourceManifestBudget is the one admission policy for manifest members,
+// shared by the archive producer and the filesystem readback so the two cannot
+// disagree about what a legal source tree is. It is a value, not a package
+// knob: production reads the constants above, tests pass a small budget. There
+// is no setter and no environment override.
 type sourceManifestBudget struct {
 	fileBytes  int64
 	totalBytes int64
@@ -1266,14 +1247,13 @@ func defaultSourceManifestBudget() sourceManifestBudget {
 	return sourceManifestBudget{fileBytes: maxSourceManifestFileBytes, totalBytes: maxSourceManifestTotalBytes}
 }
 
-// admit reports whether one member of the given size fits, both on its own and
-// against the running total. surface names the policy site ("candidate
-// archive" or "copied source") and kind names the member class, so a refusal
-// says WHICH budget stopped WHICH member at WHAT size against WHAT limit.
+// admit reports whether one member fits, on its own and against the running
+// total. surface and kind name the policy site and member class so a refusal
+// says which budget stopped which member at what size. name is the manifest
+// path, archive-relative by construction and never a host path.
 //
-// name is the manifest path: archive-relative and repository-relative by
-// construction, never a host path, so the diagnostic stays safe to publish in
-// CI output.
+// total+size is never computed, in the check or in the message: at int64
+// ceilings that sum wraps negative and reads as comfortably under budget.
 func (b sourceManifestBudget) admit(surface, kind, name string, size, total int64) error {
 	if size < 0 {
 		return fmt.Errorf("%s %s %q declares a negative size %d", surface, kind, name, size)
@@ -1282,11 +1262,9 @@ func (b sourceManifestBudget) admit(surface, kind, name string, size, total int6
 		return fmt.Errorf("%s %s %q is %d bytes, over the %d-byte per-file source manifest budget",
 			surface, kind, name, size, b.fileBytes)
 	}
-	// Checked before the addition so a hostile or corrupt size can never wrap
-	// the accumulator into looking small.
 	if total > b.totalBytes-size {
-		return fmt.Errorf("%s %s %q of %d bytes would bring the manifest to %d bytes, over the %d-byte total source manifest budget",
-			surface, kind, name, size, total+size, b.totalBytes)
+		return fmt.Errorf("%s %s %q of %d bytes does not fit the %d-byte total source manifest budget with %d bytes already counted",
+			surface, kind, name, size, b.totalBytes, total)
 	}
 	return nil
 }
@@ -1304,8 +1282,8 @@ func sourceManifestDigestFromArchive(archiveBytes []byte) (string, error) {
 }
 
 // sourceManifestDigestFromArchiveWithBudget is the real implementation. The
-// budget is a parameter so a test can exercise the genuine admission path at a
-// few bytes instead of building a multi-megabyte archive to reach a ceiling.
+// budget is a parameter so a test can drive the genuine admission path with a
+// few bytes rather than allocating a ceiling.
 func sourceManifestDigestFromArchiveWithBudget(archiveBytes []byte, budget sourceManifestBudget) (string, error) {
 	reader := tar.NewReader(bytes.NewReader(archiveBytes))
 	records := make([]sourceManifestRecord, 0)
@@ -1440,9 +1418,7 @@ func sourceManifestDigestFromFilesystemMembers(root string, members []filesystem
 }
 
 // sourceManifestDigestFromFilesystemMembersWithBudget is the readback twin of
-// sourceManifestDigestFromArchiveWithBudget. Both take the SAME budget type and
-// call the SAME admit method, which is what keeps producer and readback from
-// disagreeing about which source trees are legal.
+// sourceManifestDigestFromArchiveWithBudget: same budget type, same admit.
 func sourceManifestDigestFromFilesystemMembersWithBudget(root string, members []filesystemManifestMember, budget sourceManifestBudget) (string, error) {
 	records := make([]sourceManifestRecord, 0)
 	seen := make(map[string]struct{})
