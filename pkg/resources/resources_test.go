@@ -133,24 +133,30 @@ func TestParseFreePct(t *testing.T) {
 	}
 }
 
-func TestSnapshot_SafeOnProbeFailure(t *testing.T) {
+// TestSnapshot_FailsClosedOnProbeFailure REPLACES TestSnapshot_SafeOnProbeFailure.
+//
+// CONTRACT CHANGE, stated rather than slipped in. The old test asserted
+// FreePct==100 and an OK verdict when both probes failed, and called that
+// "safe". It was pinning the defect: an unmeasured host rendering as fully free
+// is what let heavy work start on a machine that was crashing (FAC-826). The
+// fixture is kept, the expectation is inverted.
+func TestSnapshot_FailsClosedOnProbeFailure(t *testing.T) {
 	clearEnv(t)
 	snap := snapshotWithProbes(func() (string, error) {
 		return "", errProbeFail
 	}, func() (string, error) {
 		return "", errProbeFail
 	})
-	if snap.FreePct != 100 {
-		t.Errorf("expected safe FreePct=100 on probe failure, got %d", snap.FreePct)
+	if snap.FreePct != -1 {
+		t.Errorf("FreePct = %d on probe failure, want -1: an unmeasured host must not render as a percentage", snap.FreePct)
 	}
-	if snap.SwapMB != 0 {
-		t.Errorf("expected safe SwapMB=0 on probe failure, got %d", snap.SwapMB)
+	if snap.Verdict != VerdictAlert {
+		t.Errorf("Verdict = %q on probe failure, want %q: not knowing is not healthy", snap.Verdict, VerdictAlert)
 	}
-	if v := Verdict(snap.FreePct, snap.SwapMB); v != "OK" {
-		t.Errorf("expected OK verdict on safe values, got %s", v)
+	if GatePasses(snap.Verdict) {
+		t.Errorf("a failed probe cleared the gate; that is the exact fail-open this card removes")
 	}
 }
-
 func TestDarwinSnapshot_MemoryPressureHealthyAfterVmStatLowMemory(t *testing.T) {
 	clearEnv(t)
 	snap := snapshotWithDarwinProbes(
@@ -203,20 +209,25 @@ func TestSelfTest_DeterministicUnderHostileEnv(t *testing.T) {
 	}
 }
 
+// TestGateDecision pins the gate contract after FAC-826.
+//
+// CONTRACT CHANGE: TIGHT used to pass. It no longer does. TIGHT now names a
+// refusal backed by a measurement and ALERT a refusal because nothing could be
+// measured, so only OK admits heavy work.
 func TestGateDecision(t *testing.T) {
 	cases := []struct {
 		name    string
 		verdict string
 		wantOK  bool
 	}{
-		{"OK passes gate", "OK", true},
-		{"TIGHT passes gate", "TIGHT", true},
-		{"ALERT fails gate", "ALERT", false},
+		{"OK passes gate", VerdictOK, true},
+		{"TIGHT refuses: measured pressure is not a warning to ignore", VerdictTight, false},
+		{"ALERT refuses: nothing could be measured", VerdictAlert, false},
+		{"an unrecognized verdict refuses", "SOMETHING_ELSE", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := GatePasses(c.verdict)
-			if got != c.wantOK {
+			if got := GatePasses(c.verdict); got != c.wantOK {
 				t.Errorf("GatePasses(%q) = %v, want %v", c.verdict, got, c.wantOK)
 			}
 		})

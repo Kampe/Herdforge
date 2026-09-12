@@ -146,7 +146,10 @@ func TestCapacityClaimRefreshFailureStillReleasesItsOwnLease(t *testing.T) {
 }
 
 func healthy() CapacityObservation {
-	return CapacityObservation{HerdrRunning: true, AgentsListed: true, MemAvailMiB: 36000, SwapUsedMiB: 0, SwapTotalMiB: 8192, PressurePct: 0.2}
+	// FAC-826: CPUNormalized is set EXPLICITLY. -1 is the unknown, and a
+	// fixture that leaves it at the zero value would be asserting "measured,
+	// perfectly idle" without meaning to.
+	return CapacityObservation{HerdrRunning: true, AgentsListed: true, MemAvailMiB: 36000, SwapUsedMiB: 0, SwapTotalMiB: 8192, PressurePct: 0.2, CPUNormalized: 0.2}
 }
 
 func TestCapacityRefusesWhenHerdrIsDown(t *testing.T) {
@@ -192,17 +195,51 @@ func TestCapacityRefusesWithoutHeadroomForOneMoreReviewer(t *testing.T) {
 	}
 }
 
-func TestCapacityAdmitsWhenMemoryIsUnmeasurable(t *testing.T) {
-	// Darwin has no /proc/meminfo. Unknown must not read as a refusal, or the
-	// gate becomes an outage on every host it cannot measure.
+// TestCapacityRefusesWhenMemoryIsUnmeasurable REPLACES
+// TestCapacityAdmitsWhenMemoryIsUnmeasurable.
+//
+// CONTRACT CHANGE, stated rather than slipped in. The old test asserted that an
+// unmeasurable memory reading must ADMIT, on the reasoning that a gate which
+// refuses whatever it cannot measure becomes an outage on every host it cannot
+// read. That reasoning is sound for signals that are merely absent on some
+// platform. It is wrong for the one resource whose exhaustion takes the host
+// down, and it is how an operator's Mac was admitted for more work while it was
+// crashing (FAC-826). The fixture is kept; the expectation is inverted.
+func TestCapacityRefusesWhenMemoryIsUnmeasurable(t *testing.T) {
 	o := healthy()
 	o.MemAvailMiB, o.SwapUsedMiB = -1, -1
 	c := decideCapacity(o, 4, 512, 2048)
-	if !c.Admit {
-		t.Fatalf("unmeasurable memory refused the launch: %s", c.Reason)
+	if c.Admit {
+		t.Fatalf("unmeasurable memory admitted the launch: %s", c.Reason)
 	}
-	if !strings.Contains(c.Reason, "unmeasurable") {
-		t.Fatalf("admitted without disclosing the unmeasured gate: %s", c.Reason)
+	if !strings.Contains(c.Reason, "could not be measured") {
+		t.Fatalf("refusal did not say WHY it could not measure: %s", c.Reason)
+	}
+}
+
+// The cpu signal this gate never had. Unknown refuses, saturated refuses, and a
+// healthy load admits -- each independently of memory.
+func TestCapacityCPUGate(t *testing.T) {
+	unknown := healthy()
+	unknown.CPUNormalized, unknown.CPUSource = -1, "cpu load could not be measured"
+	if c := decideCapacity(unknown, 4, 512, 2048); c.Admit {
+		t.Fatalf("an unmeasured cpu admitted: %s", c.Reason)
+	}
+
+	saturated := healthy()
+	saturated.CPUNormalized, saturated.CPUSource = 2.5, "load1 20.00 over 8 cpus"
+	c := decideCapacity(saturated, 4, 512, 2048)
+	if c.Admit {
+		t.Fatalf("a saturated cpu admitted: %s", c.Reason)
+	}
+	if !strings.Contains(c.Reason, "cpu is saturated") {
+		t.Fatalf("refusal did not name the cpu: %s", c.Reason)
+	}
+
+	// Memory is healthy in all three, so the cpu arms are proven to refuse on
+	// their own rather than riding on a memory refusal.
+	if c := decideCapacity(healthy(), 4, 512, 2048); !c.Admit {
+		t.Fatalf("a healthy host with a healthy cpu refused: %s", c.Reason)
 	}
 }
 
