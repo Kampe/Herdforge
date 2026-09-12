@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
@@ -1132,7 +1133,16 @@ func verifyReachableFromBase(ctx context.Context, repoRoot, slotPath, base strin
 	if head == "" {
 		return errors.New("slot HEAD is empty")
 	}
-	if err := exec.CommandContext(ctx, "git", "-C", repoRoot, "merge-base", "--is-ancestor", head, base).Run(); err != nil {
+	// Ancestry goes through gitroot's canonical predicate rather than a second
+	// copy of the merge-base invocation. It also distinguishes Git's ordinary
+	// "no" (exit 1) from a query that could not be answered, which this check
+	// previously collapsed into one message. Both still refuse — an unreadable
+	// answer is not permission to delete — but the reason is now accurate.
+	reachable, err := gitroot.IsAncestorContext(ctx, repoRoot, head, base)
+	if err != nil {
+		return fmt.Errorf("slot HEAD %s reachability from base %s could not be determined, refusing to discard possibly-unique work: %w", head, base, err)
+	}
+	if !reachable {
 		return fmt.Errorf("slot HEAD %s is not reachable from base %s, refusing to discard possibly-unique work", head, base)
 	}
 	return nil
