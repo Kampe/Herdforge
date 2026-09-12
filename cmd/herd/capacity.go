@@ -193,14 +193,20 @@ type CapacityObservation struct {
 	// PressurePct is PSI "some avg10" for memory: the share of the last 10s
 	// that work stalled waiting on memory. -1 where PSI is unavailable.
 	PressurePct float64 `json:"memory_pressure_pct"` // -1 unknown
-	// CPUNormalized is load1 divided by the core count: the run-queue depth
-	// relative to how wide this machine actually is. -1 unknown.
+	// Admission is the SHARED resource decision from pkg/resources, carried
+	// whole rather than as copied numbers.
 	//
-	// FAC-826: this gate had NO cpu signal at all. It counted reviewers and
-	// weighed memory while the operator's Mac was being driven into
-	// WindowServer watchdog resets by CPU contention, and admitted every time.
-	CPUNormalized float64 `json:"cpu_normalized"` // -1 unknown
-	CPUSource     string  `json:"cpu_source,omitempty"`
+	// FAC-826 first landed a COPY here: capacity read a normalized load into
+	// its own field and switched on it with its own threshold, beside its own
+	// independent memory observer. That is two policies, and they could
+	// disagree -- Darwin critical kernel pressure refused `herd resources`
+	// while capacity, which had no pressure signal at all, still admitted. One
+	// decision, evaluated once, consumed by both.
+	//
+	// It is a POINTER and nil means "not evaluated", which refuses. An
+	// observation that never asked the shared policy has not been cleared by
+	// it.
+	Admission *resources.AdmissionReport `json:"resource_admission,omitempty"`
 	// Processes/Threads/FDs, not RSS, are the plausible binding constraints
 	// here -- see the note on hostProcessLoad. -1 means unmeasured.
 	Processes int `json:"processes"`
@@ -340,31 +346,15 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 			c.Reason += fmt.Sprintf("; %d of them are idle and reapable: %s",
 				o.ReviewersIdle, strings.Join(o.IdleReviewerID, " "))
 		}
-	case o.CPUNormalized < 0:
-		// FAC-826: unknown is not idle. This gate used to carry no cpu signal
-		// at all, which is the same claim with fewer words.
-		c.Reason = "cpu load could not be measured on this host, and an unmeasured cpu is not an idle one; " +
-			"refusing rather than admitting on a reading that was never taken"
-		if o.CPUSource != "" {
-			c.Reason += " (" + o.CPUSource + ")"
-		}
-	case o.CPUNormalized >= resources.DefaultLimits().CPURefuseLoad:
-		c.Reason = fmt.Sprintf("cpu is saturated: normalized load %.2f (%s) is at or above the %.2f limit; "+
-			"a reviewer started now competes with the work already queued",
-			o.CPUNormalized, o.CPUSource, resources.DefaultLimits().CPURefuseLoad)
+	case o.Admission == nil:
+		c.Reason = "resource admission was not evaluated for this observation, so nothing has cleared this host for heavy work; " +
+			"refusing rather than treating an unasked question as a pass"
+	case !o.Admission.Admits:
+		// The SAME sentence the resources gate prints, from the same decision.
+		// If these two ever disagree it is because someone reintroduced a copy.
+		c.Reason = "resource admission refuses this host: " + o.Admission.Explanation
 		if o.ReviewersIdle > 0 {
 			c.Reason += fmt.Sprintf("; reap %d idle reviewer(s) first", o.ReviewersIdle)
-		}
-	case o.MemAvailMiB < 0:
-		// FAC-826 reverses this file's "only a gate that is actually FALSE
-		// refuses" doctrine for MEMORY specifically. That doctrine is right for
-		// signals that are merely absent on some platforms; it is wrong for the
-		// one resource whose exhaustion takes the host down. An unmeasurable
-		// memory reading admitted every launch on a machine nobody had measured.
-		c.Reason = "memory could not be measured on this host, and unmeasured memory is not free memory; " +
-			"refusing rather than admitting on herdr and the census alone"
-		if o.MemorySource != "" {
-			c.Reason += " (" + o.MemorySource + ")"
 		}
 	case o.PressurePct >= memoryPressurePct:
 		// Memory PRESSURE, not swap residue. PSI reports the share of time work
@@ -401,16 +391,12 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 }
 
 func observeCapacity() CapacityObservation {
-	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, SwapTotalMiB: -1, PressurePct: -1, CPUNormalized: -1, Processes: -1, Threads: -1, FDLimit: -1}
-	// FAC-826: the cpu reading comes from pkg/resources, the ONE admission
-	// authority, rather than a second probe with its own thresholds. Two places
-	// deciding "is this host busy" is how the two come to disagree.
-	if cpu, ok := resources.ObserveCPU(context.Background()).Value(); ok {
-		o.CPUNormalized = cpu.Normalized
-		o.CPUSource = fmt.Sprintf("load1 %.2f over %d cpus", cpu.Load1, cpu.CPUs)
-	} else {
-		o.CPUSource = "cpu load could not be measured"
-	}
+	o := CapacityObservation{MemTotalMiB: -1, MemAvailMiB: -1, SwapUsedMiB: -1, SwapTotalMiB: -1, PressurePct: -1, Processes: -1, Threads: -1, FDLimit: -1}
+	// FAC-826: ONE resource decision, evaluated once here and consumed by both
+	// this gate and `herd resources`. Not a copy of its inputs, and not a
+	// second threshold of our own -- those are what let the two disagree.
+	admission := resources.Admit(context.Background()).Report(time.Now())
+	o.Admission = &admission
 	o.HerdrRunning, o.HerdrDetail = herdrServerRunning()
 	// FAC-690: the memory reading now goes through pkg/freshness rather than
 	// three hand-rolled -1 sentinels. That package exists so an UNKNOWN cannot

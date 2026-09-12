@@ -90,7 +90,7 @@ func buildWaveRuntime(ctx context.Context, cfg *config.Config, cfgErr error) (wa
 			if s.Admission != nil {
 				// FAC-826: carry the reasons, not just the word. "TIGHT" alone
 				// told a coordinator nothing it could act on.
-				detail += " " + s.Admission.Explain()
+				detail += " " + s.Admission.Explanation
 			}
 			return s.Verdict, detail
 		},

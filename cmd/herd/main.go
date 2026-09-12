@@ -7830,7 +7830,7 @@ func runResources() {
 		if !resources.GatePasses(snap.Verdict) {
 			detail := snap.Verdict
 			if snap.Admission != nil {
-				detail = snap.Verdict + " — " + snap.Admission.Explain()
+				detail = snap.Verdict + " — " + snap.Admission.Explanation
 			}
 			// The operator escape stays explicit, and it is still never
 			// reported as healthy: the refusal is printed either way, and only

@@ -17,10 +17,13 @@
 // swap and swap had been removed as an input, Verdict could only return OK or
 // TIGHT and GatePasses accepted both, so the gate could not refuse ANY host;
 // meanwhile every probe failure and every malformed parse returned 100% free.
-// An operator whose Mac was taking repeated WindowServer watchdog crashes was
-// told the host was healthy. Admission (admission.go) is the one decision now:
-// it reads the kernel's real pressure signal plus normalized CPU load, and an
-// absence of measurement refuses instead of reporting headroom.
+// The operator reported host instability and required CPU/memory safety over
+// throughput. Whether any particular host failure coincided with a particular
+// gate evaluation is NOT something we measured and is not claimed here; the
+// fail-open implementation above is defect enough on its own. Admission
+// (admission.go) is the one decision now: it reads the kernel's real pressure
+// signal plus normalized CPU load, and an absence of measurement refuses
+// instead of reporting headroom.
 package resources
 
 import (
@@ -48,8 +51,8 @@ var errProbeFail = errors.New("probe failed")
 type Snapshot struct {
 	// FreePct is -1 when headroom could not be measured. It is NOT 100: an
 	// unmeasured host used to render here as fully free, and a reporter that
-	// prints 100 for "we do not know" is how a crashing host was called
-	// healthy (FAC-826).
+	// prints 100 for "we do not know" is reporting a measurement it never
+	// took (FAC-826).
 	FreePct    int    `json:"free_pct"`
 	SwapMB     int    `json:"swap_mb"`
 	Verdict    string `json:"verdict"`
@@ -61,7 +64,7 @@ type Snapshot struct {
 	// Admission is the decision this verdict came from, carried whole so a
 	// refusal reports its reasons and its observation postures instead of a
 	// bare word.
-	Admission *Admission `json:"admission,omitempty"`
+	Admission *AdmissionReport `json:"admission,omitempty"`
 }
 
 type SelfTestResult struct {
@@ -136,9 +139,17 @@ func TakeSnapshot() Snapshot {
 // SnapshotFrom renders an already-made decision. Split out so a fixture can
 // assert the reporting shape without observing a host.
 func SnapshotFrom(a Admission) Snapshot {
-	s := Snapshot{FreePct: -1, Verdict: AdmissionVerdict(a), Admission: &a}
-	if head, ok := a.Memory.Value(); ok {
-		s.FreePct, s.SwapMB = head.FreePct, head.SwapMB
+	report := a.Report(time.Now())
+	s := Snapshot{FreePct: -1, Verdict: report.Verdict, Admission: &report}
+	// Only a reading the DECISION accepted may populate the legacy numeric
+	// fields; the report is the authority on what was actually observed.
+	if report.Memory.Known {
+		if report.Memory.FreePct != nil {
+			s.FreePct = *report.Memory.FreePct
+		}
+		if report.Memory.SwapMB != nil {
+			s.SwapMB = *report.Memory.SwapMB
+		}
 	}
 	s.Thresholds.WarnFreePct = warnFreePct()
 	s.Thresholds.SwapAlertMB = swapAlertMB()
@@ -231,7 +242,8 @@ func snapshotWithDarwinProbes(memoryPressureFn, swapFn func() (string, error)) S
 //
 // It returned free_pct=100, swap_mb=0 and an OK verdict, reasoning that a broken
 // probe must never falsely refuse. That reasoning is inverted: a false refusal
-// costs a delayed job, a false admission costs the operator's host. It reports
+// costs a delayed job, a false admission spends resources the host may not
+// have. It reports
 // an unmeasured host as unmeasured now -- free_pct=-1, ALERT -- so no consumer
 // can render it as headroom.
 func safeSnapshot() Snapshot {

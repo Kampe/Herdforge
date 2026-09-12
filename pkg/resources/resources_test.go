@@ -138,7 +138,7 @@ func TestParseFreePct(t *testing.T) {
 // CONTRACT CHANGE, stated rather than slipped in. The old test asserted
 // FreePct==100 and an OK verdict when both probes failed, and called that
 // "safe". It was pinning the defect: an unmeasured host rendering as fully free
-// is what let heavy work start on a machine that was crashing (FAC-826). The
+// reports headroom that was never measured (FAC-826). The
 // fixture is kept, the expectation is inverted.
 func TestSnapshot_FailsClosedOnProbeFailure(t *testing.T) {
 	clearEnv(t)

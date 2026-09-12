@@ -1,7 +1,9 @@
 package resources
 
 import (
+	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -331,4 +333,233 @@ func TestParseDarwinPressureLevel(t *testing.T) {
 	if !PressureNormal.Known() || PressureNormal.Unsafe() {
 		t.Fatal("PressureNormal must be known and safe")
 	}
+}
+
+// strconv.ParseFloat accepts "NaN", "Inf" and "+Inf". NaN is false in EVERY
+// comparison, so a NaN load or a NaN threshold turns `normalized >= limit` into
+// a test no host can fail -- the gate admits unconditionally while looking like
+// it is still checking. An infinite threshold does the same thing.
+func TestNonFiniteNumbersNeverDisableTheThreshold(t *testing.T) {
+	for _, bad := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "inf"} {
+		t.Run("load_"+bad, func(t *testing.T) {
+			if v, err := parseLoad1(bad + " 1 2"); err == nil {
+				t.Fatalf("parseLoad1(%q) = %v with no error; a value no threshold can exceed is not a measurement", bad, v)
+			}
+		})
+		t.Run("override_"+bad, func(t *testing.T) {
+			t.Setenv("HERD_CPU_REFUSE_LOAD", bad)
+			if got := DefaultLimits().CPURefuseLoad; got != defaultCPURefuseLoad {
+				t.Fatalf("HERD_CPU_REFUSE_LOAD=%q produced limit %v; an invalid override must fall back to %v, never disable the limit",
+					bad, got, defaultCPURefuseLoad)
+			}
+		})
+	}
+	// A non-finite limit reaching Decide directly (it is a public function) is
+	// repaired and REPORTED, and the repaired limit still judges the load.
+	for _, limit := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 0, -1} {
+		l := testLimits()
+		l.CPURefuseLoad = limit
+		a := Decide(admissionNow, freshCPU(4.0), freshMem(90), l)
+		if a.Admits() {
+			t.Fatalf("limit %v admitted a normalized load of 4.0: %s", limit, a.Explain())
+		}
+		if !reasonsMentioning(a, "configuration repaired") {
+			t.Fatalf("limit %v was repaired silently: %v", limit, a.Reasons)
+		}
+	}
+	// And a healthy host is still admitted after the repair: the repair is not
+	// itself a refusal.
+	l := testLimits()
+	l.CPURefuseLoad = math.NaN()
+	if a := Decide(admissionNow, freshCPU(0.1), freshMem(90), l); !a.Admits() {
+		t.Fatalf("a repaired limit refused a healthy host: %s", a.Explain())
+	}
+}
+
+// Normalized is a plain struct field on a public type, so it is caller-supplied
+// data and not a fact. A reading whose Normalized disagrees with its own Load1
+// and CPUs is rejected rather than reconciled: there is no way to know which
+// field was the lie.
+func TestNormalizedIsDerivedNotTrusted(t *testing.T) {
+	forged := freshness.Fresh("test", admissionNow, CPULoad{Load1: 32, CPUs: 8, Normalized: 0.01})
+	a := Decide(admissionNow, forged, freshMem(90), testLimits())
+	if a.Admits() {
+		t.Fatalf("a forged normalized value admitted a load1 of 32 over 8 cpus: %s", a.Explain())
+	}
+	if !reasonsMentioning(a, "inconsistent") {
+		t.Fatalf("refusal did not name the inconsistency: %v", a.Reasons)
+	}
+
+	for _, bad := range []CPULoad{
+		{Load1: math.NaN(), CPUs: 8, Normalized: math.NaN()},
+		{Load1: math.Inf(1), CPUs: 8, Normalized: math.Inf(1)},
+		{Load1: -1, CPUs: 8, Normalized: -0.125},
+		{Load1: 1, CPUs: 0, Normalized: 0},
+		{Load1: 1, CPUs: -4, Normalized: 0},
+		{Load1: 8, CPUs: 8, Normalized: math.NaN()},
+	} {
+		r := freshness.Fresh("test", admissionNow, bad)
+		if a := Decide(admissionNow, r, freshMem(90), testLimits()); a.Admits() {
+			t.Errorf("unusable cpu reading %+v admitted: %s", bad, a.Explain())
+		}
+	}
+}
+
+// pkg/freshness deliberately answers "usable" for a ZERO Reading and never
+// calls a FRESH reading stale however old it is. Those are reasonable defaults
+// for its other consumers, so this policy layer tightens them locally rather
+// than changing a shared API other callers depend on.
+func TestConsumerPolicyEnforcesWhatFreshnessDoesNot(t *testing.T) {
+	limits := testLimits()
+
+	// A zero Reading: State "", no timestamp. freshness.Value() reports ok=true
+	// for it, which would hand Decide a zero CPULoad that looks perfectly idle.
+	var zeroCPU freshness.Reading[CPULoad]
+	if _, ok := zeroCPU.Value(); !ok {
+		t.Fatal("precondition changed: freshness now rejects a zero Reading, so this guard may be reconsidered")
+	}
+	if a := Decide(admissionNow, zeroCPU, freshMem(90), limits); a.Admits() {
+		t.Fatalf("a zero-valued reading admitted: %s", a.Explain())
+	}
+
+	// FRESH but ancient. StaleBeyond returns false for FRESH at any age.
+	ancient := freshness.Fresh("test", admissionNow.Add(-time.Hour), CPULoad{Load1: 0.8, CPUs: 8, Normalized: 0.1})
+	if ancient.StaleBeyond(admissionNow, limits.StaleAfter) {
+		t.Fatal("precondition changed: freshness now ages out FRESH readings itself")
+	}
+	a := Decide(admissionNow, ancient, freshMem(90), limits)
+	if a.Admits() {
+		t.Fatalf("an hour-old FRESH reading admitted: %s", a.Explain())
+	}
+	if !reasonsMentioning(a, "beyond the") {
+		t.Fatalf("refusal did not cite the age window: %v", a.Reasons)
+	}
+
+	// A timestamp from the future is not a very fresh reading.
+	future := freshness.Fresh("test", admissionNow.Add(time.Hour), CPULoad{Load1: 0.8, CPUs: 8, Normalized: 0.1})
+	if a := Decide(admissionNow, future, freshMem(90), limits); a.Admits() {
+		t.Fatalf("a reading timestamped an hour ahead admitted: %s", a.Explain())
+	}
+
+	// A non-positive StaleAfter must not switch the age check off.
+	for _, window := range []time.Duration{0, -time.Minute} {
+		l := testLimits()
+		l.StaleAfter = window
+		if a := Decide(admissionNow, ancient, freshMem(90), l); a.Admits() {
+			t.Fatalf("StaleAfter=%s disabled the age check: %s", window, a.Explain())
+		}
+	}
+
+	// An unrecognized state is not a posture.
+	bogus := freshness.Fresh("test", admissionNow, CPULoad{Load1: 0.8, CPUs: 8, Normalized: 0.1})
+	bogus.State = freshness.State("PROBABLY_FINE")
+	if a := Decide(admissionNow, bogus, freshMem(90), limits); a.Admits() {
+		t.Fatalf("an unrecognized freshness state admitted: %s", a.Explain())
+	}
+}
+
+// The old parser scanned backwards for trailing digits, so it silently rewrote
+// "-50%" into 50 and "1.50%" into 50 -- turning a negative or fractional
+// reading into a healthy whole number.
+func TestStrictPercentRejectsRewrittenTokens(t *testing.T) {
+	const label = "memory free percentage:"
+	for _, line := range []string{
+		"System-wide memory free percentage: -50%",
+		"System-wide memory free percentage: 1.50%",
+		"System-wide memory free percentage: +50%",
+		"System-wide memory free percentage: 5e1%",
+		"System-wide memory free percentage: 50,0%",
+		"System-wide memory free percentage: 0x32%",
+		"System-wide memory free percentage: 50 extra%",
+	} {
+		if got, err := parseFreePctStrict(line+"\n", label); err == nil {
+			t.Errorf("parseFreePctStrict(%q) = %d with no error; the value was rewritten into a healthy number", line, got)
+		}
+	}
+	if got, err := parseFreePctStrict("System-wide memory free percentage: 67%\n", label); err != nil || got != 67 {
+		t.Fatalf("a plain whole percentage stopped parsing: %d, %v", got, err)
+	}
+}
+
+// The JSON a consumer actually receives must carry the NUMBERS the safety
+// decision used. freshness.Reading keeps its value private and defines no
+// MarshalJSON, so encoding the readings directly emits posture and prose and
+// silently drops every observation.
+func TestPublicJSONCarriesTheObservedNumbers(t *testing.T) {
+	clearEnv(t)
+	healthy := Decide(admissionNow, freshCPU(0.25), darwinMem(PressureNormal, 4), testLimits())
+	decoded := decodeSnapshot(t, SnapshotFrom(healthy))
+
+	admission, ok := decoded["admission"].(map[string]any)
+	if !ok {
+		t.Fatalf("no admission object in %v", decoded)
+	}
+	cpu := admission["cpu"].(map[string]any)
+	if cpu["known"] != true {
+		t.Fatalf("cpu reported unknown for a healthy reading: %v", cpu)
+	}
+	if cpu["load1"] == nil || cpu["cpus"] == nil || cpu["normalized"] == nil {
+		t.Fatalf("cpu numbers were dropped from the JSON: %v", cpu)
+	}
+	if got := cpu["normalized"].(float64); math.Abs(got-0.25) > 1e-9 {
+		t.Fatalf("normalized = %v, want the derived 0.25", got)
+	}
+	mem := admission["memory"].(map[string]any)
+	if mem["pressure"] != "normal" || mem["pressure_known"] != true {
+		t.Fatalf("the pressure level used for the decision is missing: %v", mem)
+	}
+	if mem["free_pct_gates"] != false {
+		t.Fatalf("the JSON must say whether the percentage was allowed to decide: %v", mem)
+	}
+	if admission["explanation"] == "" || admission["verdict"] != VerdictOK {
+		t.Fatalf("admission summary missing: %v", admission)
+	}
+}
+
+// An UNKNOWN reading must OMIT its numbers, never publish a zero. A zero load
+// and a zero percentage are both plausible healthy-looking values.
+func TestPublicJSONOmitsUnknownsRatherThanZeroingThem(t *testing.T) {
+	clearEnv(t)
+	refused := Decide(admissionNow, unknownCPU(), unknownMem(), testLimits())
+	decoded := decodeSnapshot(t, SnapshotFrom(refused))
+
+	if decoded["verdict"] != VerdictAlert {
+		t.Fatalf("verdict = %v, want ALERT", decoded["verdict"])
+	}
+	if decoded["free_pct"].(float64) != -1 {
+		t.Fatalf("free_pct = %v, want -1 for an unmeasured host", decoded["free_pct"])
+	}
+	admission := decoded["admission"].(map[string]any)
+	cpu := admission["cpu"].(map[string]any)
+	for _, field := range []string{"load1", "cpus", "normalized"} {
+		if _, present := cpu[field]; present {
+			t.Errorf("unknown cpu published %q = %v; an absence must not render as a number", field, cpu[field])
+		}
+	}
+	if cpu["known"] != false || cpu["state"] != string(freshness.StateUnknown) {
+		t.Fatalf("unknown cpu did not report itself unknown: %v", cpu)
+	}
+	mem := admission["memory"].(map[string]any)
+	if _, present := mem["free_pct"]; present {
+		t.Errorf("unknown memory published free_pct = %v", mem["free_pct"])
+	}
+	if mem["pressure"] != "unknown" || mem["pressure_known"] != false {
+		t.Fatalf("unknown memory did not report unknown pressure: %v", mem)
+	}
+	if reasons, _ := admission["reasons"].([]any); len(reasons) == 0 {
+		t.Fatal("a refusal published no reasons")
+	}
+}
+
+func decodeSnapshot(t *testing.T, s Snapshot) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode snapshot json: %v", err)
+	}
+	return decoded
 }
