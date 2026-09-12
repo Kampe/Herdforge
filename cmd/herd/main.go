@@ -7848,6 +7848,8 @@ func runProcess() {
 	asJSON := procFlags.Bool("json", false, "Output JSON")
 	selftestFlag := procFlags.Bool("selftest", false, "Run process selftest and exit")
 	stalledFlag := procFlags.Bool("stalled", false, "Report stalled agents (done/idle with zero real commits)")
+	linesFlag := procFlags.Int("lines", 0, "Pane tail depth to read per agent (0 = default)")
+	workspaceFlag := procFlags.String("workspace", "", "Explicit herdr workspace scope (default: fleet.herdr_workspace)")
 	procFlags.Parse(os.Args[2:])
 
 	if *selftestFlag {
@@ -7867,34 +7869,51 @@ func runProcess() {
 		os.Exit(1)
 	}
 
-	// Read agent panes via herdr (simplified: show classify on sample text
-	// matching the zsh --selftest patterns). In full integration, this
-	// would call herdr agent list and iterate over panes.
-	//
-	// For now, return a digest showing the classification engine is loaded.
-	lines := 50
-	if len(procFlags.Args()) > 0 {
-		if procFlags.Args()[0] == "verbose" {
-			fmt.Printf("process engine: loaded — 8 classification buckets (NEEDS_REVIEW/COMPLETE/PASS/FAIL/BLOCKED/QUOTA/UNCONSUMED/UNKNOWN)\n")
-			return
-		}
-	}
-
-	if *asJSON {
-		targets := []process.Target{
-			process.ClassifyTarget("pane-demo", "agent-demo", "idle", "herd-process engine available"),
-		}
-		data, err := process.DigestJSON("", targets, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "process json: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(data))
+	if len(procFlags.Args()) > 0 && procFlags.Args()[0] == "verbose" {
+		fmt.Printf("process engine: loaded — 8 classification buckets (NEEDS_REVIEW/COMPLETE/PASS/FAIL/BLOCKED/QUOTA/UNCONSUMED/UNKNOWN)\n")
 		return
 	}
 
-	fmt.Printf("herd-process: classification engine ready (%d lines)\n", lines)
-	fmt.Println("  Usage: herd process [--json] [--selftest]")
+	limits := defaultProcessScanLimits()
+	if *linesFlag > 0 {
+		limits.Lines = *linesFlag
+	}
+	configured := ""
+	if cfg, cfgErr := config.LoadConfig(".herd/herd.yaml"); cfgErr == nil && cfg != nil {
+		configured = cfg.Fleet.HerdrWorkspace
+	}
+	workspace, err := resolveProcessWorkspace(*workspaceFlag, configured)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), limits.Deadline)
+	defer cancel()
+	result, err := collectProcessDigest(ctx, workspace, limits)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	if *asJSON {
+		data, jsonErr := process.DigestJSON(result.Digest.WorkspaceID, result.Digest.Items, result.Digest.MultiPaneTabs)
+		if jsonErr != nil {
+			fmt.Fprintf(os.Stderr, "process json: %v\n", jsonErr)
+			os.Exit(1)
+		}
+		fmt.Println(string(data))
+	} else {
+		fmt.Print(renderProcessDigestText(result))
+	}
+	// A partial sweep exits nonzero. Reporting an incomplete picture with a
+	// success status is how "nothing needs attention" gets believed.
+	if result.Partial {
+		for _, unknown := range result.Unknowns {
+			fmt.Fprintf(os.Stderr, "process: %s\n", unknown)
+		}
+		os.Exit(1)
+	}
 }
 
 // liveScorer backs lane resolution with the real herd-route port over live
