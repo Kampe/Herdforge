@@ -148,11 +148,12 @@ work_owned=1
 work_pin=$(git -C "$work" rev-parse HEAD)
 [[ "$work_pin" == "$pin" ]] || { print -u2 "error: mutation checkout is at $work_pin, not $pin"; exit 1; }
 
+# pristine and mutated_sources are populated from the MUTATION TABLE, below,
+# once it exists. A hardcoded list here is what broke run 34719284670: it held
+# two paths while an eleventh control declared a third, so the mutation hit an
+# unset key under `set -u` after ten mutants had already been killed.
 typeset -A pristine
-for src in "$admission_src" "$capacity_src"; do
-	pristine[$src]=$(git -C "$work" hash-object -- "$src")
-	[[ -n "${pristine[$src]}" ]] || { print -u2 "error: cannot hash $src"; exit 1; }
-done
+mutated_sources=()
 
 # compile_check proves the mutant builds. Its result is kept separately from the
 # assertion evidence: "the build broke" and "the test saw the guard" are
@@ -246,6 +247,10 @@ count_occurrences() {
 # A read failure is reported distinctly from a count mismatch.
 patch_source() {
 	local src=$1 anchor=$2 replacement=$3 file=$work/$1 content found mutated
+	if [[ -z "${pristine[$src]:-}" ]]; then
+		print -u2 "harness error: no pristine hash for $src; the source inventory missed a declared control source"
+		return 1
+	fi
 	if ! content=$(<"$file"); then
 		print -u2 "error: cannot read $src for mutation"
 		return 1
@@ -262,6 +267,10 @@ patch_source() {
 
 restore_source() {
 	local src=$1 now
+	if [[ -z "${pristine[$src]:-}" ]]; then
+		print -u2 "harness error: no pristine hash for $src; refusing to restore against an unknown baseline"
+		return 1
+	fi
 	git -C "$work" checkout --quiet -- "$src"
 	now=$(git -C "$work" hash-object -- "$src")
 	[[ "$now" == "${pristine[$src]}" ]] || { print -u2 "error: restore left $src at $now, want ${pristine[$src]}"; return 1; }
@@ -269,7 +278,7 @@ restore_source() {
 
 restore_all() {
 	local src
-	for src in "$admission_src" "$capacity_src"; do
+	for src in "${mutated_sources[@]}"; do
 		restore_source "$src"
 	done
 }
@@ -368,13 +377,36 @@ mutations=(
 "fixture-census-pin-wrong-value${sep}cmd/herd/capacity_shared_admission_fixture.go${sep}	o.MemAvailMiB = fixtureMemAvailMiB${sep}	o.MemAvailMiB = 1234 // MUTANT: a DETERMINISTIC wrong pin, never the runner value${sep}${sep}${sep}${herd_pkg}${sep}TestFixtureCensusPinsEveryPostAdmissionInput${sep}the fixture census did not reach this arm"
 )
 
+# Snapshot EVERY source a control declares, exactly once, before anything is
+# mutated. Deriving the inventory from the table is the whole point: a control
+# can no longer name a file the snapshot forgot. A declared source that is not
+# in the checkout, or that cannot be hashed, is a HARNESS error and stops the
+# run -- it is not a failed control, and it must not be silently skipped.
+for record in "${mutations[@]}"; do
+	fields=("${(@ps:$sep:)record}")
+	src=$fields[2]
+	if [[ -n "${pristine[$src]:-}" ]]; then
+		continue
+	fi
+	if [[ ! -f "$work/$src" ]]; then
+		print -u2 "harness error: a control declares $src, which is not a file in the checkout at $pin"
+		exit 1
+	fi
+	pristine[$src]=$(git -C "$work" hash-object -- "$src")
+	if [[ -z "${pristine[$src]}" ]]; then
+		print -u2 "harness error: cannot hash $src"
+		exit 1
+	fi
+	mutated_sources+=("$src")
+done
+
 note "pin $pin"
 if [[ "$run_dir" == "$repo_root"/* ]]; then
 	note "report ${run_dir#$repo_root/}"
 else
 	note "report ${run_dir:t} (under VERIFY_ADMISSION_REPORT_DIR, outside the repository)"
 fi
-for src in "$admission_src" "$capacity_src"; do
+for src in "${mutated_sources[@]}"; do
 	note "source $src (${pristine[$src]})"
 done
 
