@@ -87,6 +87,30 @@ jobs:
         env:
           CHAINSEER_BIN: chainseer/bin
 
+      # FAC-826: the admission guards are covered by tests that had never been
+      # shown to fail. This driver mutates the real source one guard at a time,
+      # proves each mutant COMPILES, then requires the named killer test to fail
+      # on its named assertion, read from go test JSON. It owns one ephemeral
+      # worktree under RUNNER_TEMP, removes only that, and fails if it cannot.
+      - name: FAC-826 resource admission non-vacuity controls
+        timeout-minutes: 45
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-resource-admission.zsh
+
+      # The logs land under a HIDDEN directory, which upload-artifact excludes
+      # by default; without these two settings a run would report green while
+      # retaining none of the evidence it claims (FAC-827, 19b4e765).
+      - name: Upload resource admission control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-resource-admission-logs
+          path: .verify-admission-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
