@@ -13,11 +13,33 @@ import (
 	"time"
 )
 
+// Audit phases. A repair writes at most two durable records: a PREPARE record
+// before it touches the mailbox, and a RESULT record once the outcome is
+// actually known. Nothing claims success in advance.
+const (
+	RepairPhasePrepare = "prepare"
+	RepairPhaseResult  = "result"
+
+	RepairOutcomeApplied = "applied"
+	RepairOutcomeFailed  = "failed"
+)
+
 // RepairPlan is what a repair would do, or did. Report-only and applied runs
-// return the same shape, so an operator reads identical evidence either way,
-// and the applied form is what lands in the durable audit artifact.
+// return the same shape, so an operator reads identical evidence either way.
+//
+// It is also the durable audit record, which is why Phase and Outcome exist.
+// An earlier version wrote ONE record, stamped Applied=true, BEFORE reserving
+// the sequence, writing the mailbox, or reading it back — so a mutation that
+// failed afterwards left permanent evidence claiming it had succeeded. Applied
+// is now only ever true on a RESULT record whose readback has already been
+// verified.
 type RepairPlan struct {
-	ID                string    `json:"id"`
+	ID      string `json:"id"`
+	Phase   string `json:"phase,omitempty"`
+	Outcome string `json:"outcome,omitempty"`
+	// Failure is the reason a RESULT record reports RepairOutcomeFailed. It is
+	// what makes a failed attempt legible instead of merely absent.
+	Failure           string    `json:"failure,omitempty"`
 	OriginalLine      string    `json:"original_line"`
 	OriginalSHA256    string    `json:"original_sha256"`
 	RepairedLine      string    `json:"repaired_line"`
@@ -25,10 +47,13 @@ type RepairPlan struct {
 	OriginalTimestamp string    `json:"original_timestamp"`
 	RepairedTimestamp time.Time `json:"repaired_timestamp"`
 	AssignedSequence  int64     `json:"assigned_sequence"`
-	Applied           bool      `json:"applied"`
-	Actor             string    `json:"actor,omitempty"`
-	Reason            string    `json:"reason,omitempty"`
-	RepairedAt        time.Time `json:"repaired_at,omitempty"`
+	// Applied is true only when the repaired row is durably on disk AND has
+	// been read back and compared field by field.
+	Applied     bool      `json:"applied"`
+	Actor       string    `json:"actor,omitempty"`
+	Reason      string    `json:"reason,omitempty"`
+	PreparedAt  time.Time `json:"prepared_at,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
 }
 
 // RepairRequest bounds one operator recovery to one exact row.
@@ -59,6 +84,15 @@ var (
 	// holds more than one DISTINCT original. Repeated identical copies are
 	// normal reader behaviour and are not a conflict; differing bytes are.
 	ErrRepairConflictingOriginals = errors.New("mail repair: quarantine holds conflicting originals for this id")
+	// ErrRepairActorRequired mirrors the CLI's --actor requirement at the
+	// package boundary, so no caller can apply an unattributed mutation.
+	ErrRepairActorRequired = errors.New("mail repair: acting requires an actor")
+	// ErrRepairCompletionUnrecorded is returned when the mailbox was repaired
+	// and verified but the completion record could not be durably written. The
+	// repair DID happen; what is missing is the evidence that it happened. That
+	// is reported as a failure rather than a success, because an operator who
+	// is told "applied" must be able to find the record that says so.
+	ErrRepairCompletionUnrecorded = errors.New("mail repair: row was repaired and verified but the completion record could not be written")
 )
 
 // envelopeJSONKeys is every key the Envelope encoder can round-trip. A row
@@ -158,6 +192,9 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 	}
 	if req.Act && strings.TrimSpace(req.Fingerprint) == "" {
 		return nil, ErrRepairFingerprintRequired
+	}
+	if req.Act && strings.TrimSpace(req.Actor) == "" {
+		return nil, ErrRepairActorRequired
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -271,23 +308,12 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 			return nil
 		}
 
-		// Audit before mutating: the original bytes must be durably recoverable
-		// from this artifact even if everything after it fails.
-		plan.Applied = true
-		plan.RepairedAt = time.Now().UTC()
-		auditRecord, err := json.Marshal(plan)
-		if err != nil {
-			return fmt.Errorf("mail repair: encode audit record: %w", err)
-		}
-		if err := appendLine(m.MailFile+".repair.jsonl", auditRecord); err != nil {
-			plan.Applied = false
-			return fmt.Errorf("mail repair: durable audit artifact: %w", err)
-		}
-
-		// Reserve the sequence only now that the repair is actually happening.
+		// Settle the sequence BEFORE anything is recorded or written, so the
+		// prepare record describes the exact bytes that will land. Reserving
+		// early can only ever leave a gap in the counter, never a duplicate —
+		// that is nextSequenceLocked's existing contract.
 		reserved, err := m.nextSequenceLocked()
 		if err != nil {
-			plan.Applied = false
 			return err
 		}
 		if reserved < nextSeq {
@@ -295,7 +321,6 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 			// the next ordinary send cannot collide with the repaired row.
 			// Reserving one at a time would fsync once per skipped number.
 			if err := m.setSequenceFloorLocked(nextSeq); err != nil {
-				plan.Applied = false
 				return err
 			}
 			reserved = nextSeq
@@ -304,7 +329,6 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 			repaired.Sequence = reserved
 			encoded, err = json.Marshal(repaired)
 			if err != nil {
-				plan.Applied = false
 				return fmt.Errorf("mail repair: encode repaired row: %w", err)
 			}
 			repairedLine = string(encoded)
@@ -313,17 +337,43 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 			plan.RepairedSHA256 = sha256OfLine(repairedLine)
 		}
 
+		// PREPARE: the original bytes, and exactly what is about to replace
+		// them, are durable BEFORE the mailbox is touched. This record claims
+		// nothing about the outcome — Applied stays false until a readback has
+		// proven it.
+		plan.Phase = RepairPhasePrepare
+		plan.PreparedAt = time.Now().UTC()
+		if err := m.appendRepairRecord(plan); err != nil {
+			return fmt.Errorf("mail repair: durable prepare record: %w", err)
+		}
+
+		// From here on every exit writes a RESULT record, so a failed attempt
+		// is legible in the artifact rather than merely absent.
 		out := make([]string, len(lines))
 		copy(out, lines)
 		out[targetIdx] = repairedLine
 		body := strings.Join(trimTrailingEmpty(out), "\n") + "\n"
 		if err := writeFileAtomic(m.MailFile, []byte(body), 0644); err != nil {
-			plan.Applied = false
-			return fmt.Errorf("mail repair: durable mailbox write: %w", err)
+			return m.recordRepairFailure(plan, fmt.Errorf("mail repair: durable mailbox write: %w", err))
 		}
 		if err := m.verifyRepairedRow(targetIdx, repaired); err != nil {
+			return m.recordRepairFailure(plan, err)
+		}
+
+		// RESULT: only now is the repair durable AND verified.
+		plan.Phase = RepairPhaseResult
+		plan.Outcome = RepairOutcomeApplied
+		plan.Applied = true
+		plan.CompletedAt = time.Now().UTC()
+		if err := m.appendRepairRecord(plan); err != nil {
+			// The row IS repaired and verified, but the evidence saying so is
+			// missing. Reporting success here would be the exact lie this
+			// phase split exists to prevent: an operator told "applied" must be
+			// able to find the record. The prepare record and the original
+			// bytes both remain on disk, so the state is recoverable.
 			plan.Applied = false
-			return err
+			plan.Outcome = RepairOutcomeFailed
+			return fmt.Errorf("%w: %v", ErrRepairCompletionUnrecorded, err)
 		}
 		return nil
 	})
@@ -331,6 +381,43 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 		return nil, err
 	}
 	return plan, nil
+}
+
+// appendRepairRecord durably appends one audit record. It takes a copy, so a
+// later phase mutating the caller's plan cannot retroactively change what an
+// earlier record said.
+func (m *Mailbox) appendRepairRecord(plan *RepairPlan) error {
+	if plan == nil {
+		return errors.New("mail repair: nil audit record")
+	}
+	record := *plan
+	data, err := json.Marshal(&record)
+	if err != nil {
+		return fmt.Errorf("encode audit record: %w", err)
+	}
+	return appendLine(m.MailFile+".repair.jsonl", data)
+}
+
+// recordRepairFailure writes the RESULT record for an attempt that did not
+// succeed, then returns the original cause.
+//
+// If the failure record itself cannot be written, both errors are returned
+// together rather than one masking the other: the operator needs to know the
+// repair failed AND that the artifact is now incomplete. Either way the
+// prepare record and the original bytes are already durable, so nothing is
+// unrecoverable and nothing reports success.
+func (m *Mailbox) recordRepairFailure(plan *RepairPlan, cause error) error {
+	plan.Phase = RepairPhaseResult
+	plan.Outcome = RepairOutcomeFailed
+	plan.Applied = false
+	plan.CompletedAt = time.Now().UTC()
+	if cause != nil {
+		plan.Failure = cause.Error()
+	}
+	if err := m.appendRepairRecord(plan); err != nil {
+		return fmt.Errorf("%w (and the failure record could not be written: %v)", cause, err)
+	}
+	return cause
 }
 
 // checkQuarantineIdentity compares the live malformed row against what the

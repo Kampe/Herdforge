@@ -353,13 +353,22 @@ herd mail repair is a bounded operator recovery for ONE quarantined row whose
 only defect is a legacy non-RFC3339 timestamp: it normalizes that timestamp,
 assigns a monotonic sequence under the canonical mailbox lock, and preserves
 the id, payload and every other row. It is REPORT-ONLY unless --act is given.
-Acting REQUIRES --fingerprint: run report-only first and pass back the
-original_sha256 it reports, so a rewrite can only ever replace the exact bytes
-an operator reviewed. It refuses ambiguous ids, a stale fingerprint, any other
-defect, and any privileged signed message. Repeated identical quarantine
-copies of one row are normal reader behaviour and never block a repair;
-conflicting recorded originals do. Original bytes are retained in <mail>.repair.jsonl
-and in the pre-existing <mail>.quarantine.jsonl. It changes no parsing rule.
+Acting REQUIRES --fingerprint and --actor: run report-only first and pass back
+the original_sha256 it reports, so a rewrite can only ever replace the exact
+bytes an operator reviewed, attributed to a named actor. It refuses ambiguous
+ids, a stale fingerprint, any other defect, and any privileged signed message.
+Repeated identical quarantine copies of one row are normal reader behaviour and
+never block a repair; conflicting recorded originals do.
+
+<mail>.repair.jsonl records TWO entries per act: a prepare entry written before
+the mailbox is touched, carrying the original bytes and exactly what will
+replace them, and a result entry written only once the new row has been read
+back and verified. applied=true appears only on a verified result; a failed
+attempt is recorded as outcome=failed with its reason. If the mailbox is
+repaired but the result entry cannot be written, the command FAILS rather than
+reporting a success whose record an operator could never find — the prepare
+entry and the original bytes both remain recoverable, here and in the
+pre-existing <mail>.quarantine.jsonl. It changes no parsing rule.
 
 Ordinary durable messages use the local mailbox and are not authenticated control.
 herd mail ack is the explicit ordinary-report disposition; inbox/read remain read-only.

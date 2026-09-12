@@ -238,19 +238,206 @@ func TestRepairAuditArtifactRetainsOriginalCorruptBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(path + ".repair.jsonl")
+	records := readRepairRecords(t, path)
+	if len(records) != 2 {
+		t.Fatalf("want a prepare record and a result record, got %d", len(records))
+	}
+	prepare := records[0]
+	if prepare.OriginalLine != legacyRow {
+		t.Fatal("audit artifact did not retain the original corrupt bytes verbatim")
+	}
+	if prepare.OriginalSHA256 != sha256Hex(legacyRow) || prepare.RepairedSHA256 != plan.RepairedSHA256 {
+		t.Fatalf("audit artifact digests do not bind the exact bytes: %+v", prepare)
+	}
+}
+
+// readRepairRecords decodes the audit artifact as the JSONL it is.
+func readRepairRecords(t *testing.T, mailPath string) []RepairPlan {
+	t.Helper()
+	raw, err := os.ReadFile(mailPath + ".repair.jsonl")
 	if err != nil {
 		t.Fatalf("no repair audit artifact: %v", err)
 	}
-	var rec RepairPlan
-	if err := json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &rec); err != nil {
+	var out []RepairPlan
+	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec RepairPlan
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("audit record is not valid JSON: %v", err)
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// The durable artifact must never claim a repair succeeded before it has. The
+// earlier single-record form stamped applied=true and wrote it BEFORE the
+// sequence reservation, the mailbox write and the readback, so any later
+// failure left permanent evidence of a success that never happened.
+func TestRepairAuditRecordsPrepareBeforeResult(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op", Reason: "3019",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if rec.OriginalLine != legacyRow {
-		t.Fatal("audit artifact did not retain the original corrupt bytes verbatim")
+	records := readRepairRecords(t, path)
+	if len(records) != 2 {
+		t.Fatalf("want exactly two audit records, got %d", len(records))
 	}
-	if rec.OriginalSHA256 != sha256Hex(legacyRow) || rec.RepairedSHA256 != plan.RepairedSHA256 {
-		t.Fatalf("audit artifact digests do not bind the exact bytes: %+v", rec)
+	prepare, result := records[0], records[1]
+	if prepare.Phase != RepairPhasePrepare {
+		t.Fatalf("first record is not a prepare record: %+v", prepare)
+	}
+	if prepare.Applied {
+		t.Fatal("the pre-mutation record claimed the repair was already applied")
+	}
+	if prepare.PreparedAt.IsZero() {
+		t.Fatal("prepare record carries no prepared_at")
+	}
+	if result.Phase != RepairPhaseResult || result.Outcome != RepairOutcomeApplied || !result.Applied {
+		t.Fatalf("second record is not a successful result record: %+v", result)
+	}
+	if result.CompletedAt.Before(prepare.PreparedAt) {
+		t.Fatalf("result predates prepare: %s vs %s", result.CompletedAt, prepare.PreparedAt)
+	}
+	// Both records must bind the same bytes, or they describe different events.
+	if result.OriginalSHA256 != prepare.OriginalSHA256 || result.RepairedSHA256 != prepare.RepairedSHA256 {
+		t.Fatal("result record does not bind the same bytes as the prepare record")
+	}
+	if result.Actor != "op" {
+		t.Fatalf("result record lost the actor: %q", result.Actor)
+	}
+}
+
+// A mutation that fails after prepare must leave a FAILED result record, not
+// silence and not a success.
+func TestRepairAuditRecordsFailureAfterPrepare(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	restore := writeFileAtomicFn
+	writeFileAtomicFn = func(p string, data []byte, perm os.FileMode) error {
+		if p == path {
+			return errors.New("injected mailbox write failure")
+		}
+		return restore(p, data, perm)
+	}
+	defer func() { writeFileAtomicFn = restore }()
+
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	}); err == nil {
+		t.Fatal("a failed mailbox write must not report success")
+	}
+	records := readRepairRecords(t, path)
+	if len(records) != 2 {
+		t.Fatalf("want prepare + failed result, got %d records", len(records))
+	}
+	if records[0].Phase != RepairPhasePrepare || records[0].Applied {
+		t.Fatalf("prepare record is wrong: %+v", records[0])
+	}
+	result := records[1]
+	if result.Phase != RepairPhaseResult || result.Outcome != RepairOutcomeFailed {
+		t.Fatalf("failure was not recorded as a failed result: %+v", result)
+	}
+	if result.Applied {
+		t.Fatal("a failed repair is recorded as applied")
+	}
+	if !strings.Contains(result.Failure, "injected mailbox write failure") {
+		t.Fatalf("failure record does not say why it failed: %q", result.Failure)
+	}
+	// The original bytes stay recoverable from the prepare record.
+	if records[0].OriginalLine != legacyRow {
+		t.Fatal("prepare record lost the original bytes")
+	}
+}
+
+// A readback mismatch is a failure like any other and must be recorded as one.
+func TestRepairAuditRecordsReadbackMismatchAsFailure(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	restore := writeFileAtomicFn
+	writeFileAtomicFn = func(p string, data []byte, perm os.FileMode) error {
+		if p == path {
+			data = []byte(`{"id":"host-81751-1789141629774","seq":1,"sender":"tampered",` +
+				`"recipient":"orchestrator","subject":"finding","body":"two defects",` +
+				`"read":false,"timestamp":"2026-09-11T10:47:09-05:00"}` + "\n")
+		}
+		return restore(p, data, perm)
+	}
+	defer func() { writeFileAtomicFn = restore }()
+
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	}); !errors.Is(err, ErrRepairReadbackFailed) {
+		t.Fatalf("want a readback failure, got %v", err)
+	}
+	records := readRepairRecords(t, path)
+	if len(records) != 2 || records[1].Outcome != RepairOutcomeFailed || records[1].Applied {
+		t.Fatalf("readback mismatch was not recorded as a failed result: %+v", records)
+	}
+}
+
+// If the mailbox is repaired and verified but the COMPLETION record cannot be
+// written, the caller must be told it failed. Reporting success would be the
+// precise lie the phase split exists to prevent, and the operator would be
+// told "applied" with no record to find.
+func TestRepairFailsWhenCompletionRecordCannotBeWritten(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	auditPath := path + ".repair.jsonl"
+	writes := 0
+	restore := fileSyncFn
+	fileSyncFn = func(f *os.File) error {
+		// Fail only the SECOND audit append: prepare succeeds, result does not.
+		if strings.Contains(f.Name(), ".repair.jsonl") {
+			writes++
+			if writes > 1 {
+				return errors.New("injected completion record failure")
+			}
+		}
+		return restore(f)
+	}
+	defer func() { fileSyncFn = restore }()
+
+	plan, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
+	})
+	if !errors.Is(err, ErrRepairCompletionUnrecorded) {
+		t.Fatalf("an unrecorded completion must fail clearly, got plan=%+v err=%v", plan, err)
+	}
+	// Recoverability: the prepare record with the original bytes is still there.
+	raw, readErr := os.ReadFile(auditPath)
+	if readErr != nil {
+		t.Fatalf("prepare record lost: %v", readErr)
+	}
+	if !strings.Contains(string(raw), legacyRow) {
+		t.Fatal("original bytes are not recoverable from the audit artifact")
+	}
+}
+
+// The CLI already demands --actor; the package must demand it too, or a direct
+// caller can apply an unattributed mutation.
+func TestRepairActRequiresActorAtThePackageBoundary(t *testing.T) {
+	mb, path := mailboxWith(t, legacyRow)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true,
+	}); !errors.Is(err, ErrRepairActorRequired) {
+		t.Fatalf("acting without an actor must refuse, got %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("an unattributed act mutated the mailbox")
+	}
+	if _, statErr := os.Stat(path + ".repair.jsonl"); !os.IsNotExist(statErr) {
+		t.Fatal("an unattributed act wrote an audit record")
+	}
+	// Report-only never needed an actor and still does not.
+	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{ID: "host-81751-1789141629774"}); err != nil {
+		t.Fatalf("report-only must not require an actor: %v", err)
 	}
 }
 
