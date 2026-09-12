@@ -105,12 +105,15 @@ func feedbackMailDir() string {
 func readBoundedInbox(ctx context.Context, box *mail.Mailbox, recipient string, req boundedInboxRequest) (boundedInboxResponse, error) {
 	out := boundedInboxResponse{Envelopes: []*mail.Envelope{}}
 	dir := feedbackMailDir()
-	source := mail.SourceFingerprint(box.MailFile, dir)
+	source, err := mail.SourceFingerprint(box.MailFile, dir)
+	if err != nil {
+		return out, err
+	}
 	cur, err := mail.ParseCursor(req.Cursor, recipient, source)
 	if err != nil {
 		return out, err
 	}
-	page, controlErr := box.ReadBoundedControl(ctx, recipient, cur, mail.BoundedOptions{Limit: req.Limit, MaxBytes: req.MaxBytes, Source: source})
+	page, controlErr := box.ReadBoundedControl(ctx, recipient, cur, mail.BoundedOptions{Limit: req.Limit, MaxBytes: req.MaxBytes, FeedbackDir: dir})
 
 	// The feedback store is ALWAYS validated, even when the control read
 	// failed or already filled the page. Returning early on control.Truncated
@@ -292,15 +295,13 @@ func readFeedbackMailboxBounded(ctx context.Context, dir, recipient string, afte
 	if err := ctx.Err(); err != nil {
 		return nil, highest, storeAnchor, false, err
 	}
-	// An EMPTY feedback file is a truncated store, not a fresh one.
-	if !sawAny && after > 0 {
-		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback store holds no records but the cursor is at %d", mail.ErrStorageRewound, after)
-	}
-	if sawAny && after > maxSeen {
-		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback cursor at %d, highest stored id is %d", mail.ErrStorageRewound, after, maxSeen)
-	}
+	// ONE refusal, subsuming emptied, truncated, renumbered and repaired-away
+	// stores: unless the cursor's exact id was seen and its prefix verified,
+	// this store cannot be resumed.
 	if !resumeChecked {
-		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback id %d is no longer present", mail.ErrStorageRewound, after)
+		return nil, highest, storeAnchor, false, fmt.Errorf("%w: feedback id %d is not present in this store (emptied, truncated, renumbered or repaired away)",
+			mail.ErrStorageRewound, after)
 	}
+	_ = maxSeen
 	return out, highest, emitted, truncated, nil
 }

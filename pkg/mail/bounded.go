@@ -105,20 +105,46 @@ const (
 // so one store reached by two names is one identity. A path that cannot be
 // resolved is fingerprinted from its absolute form, which still separates it
 // from an unrelated store; it is never silently treated as equal.
-func SourceFingerprint(controlPath, feedbackDir string) string {
-	sum := sha256.Sum256([]byte(canonicalStoragePath(controlPath) + "\x00" + canonicalStoragePath(feedbackDir)))
-	return hex.EncodeToString(sum[:8])
+func SourceFingerprint(controlPath, feedbackDir string) (string, error) {
+	control, err := canonicalStoragePath(controlPath)
+	if err != nil {
+		return "", fmt.Errorf("mail: resolve control store identity: %w", err)
+	}
+	feedback, err := canonicalStoragePath(feedbackDir)
+	if err != nil {
+		return "", fmt.Errorf("mail: resolve feedback store identity: %w", err)
+	}
+	sum := sha256.Sum256([]byte(control + "\x00" + feedback))
+	return hex.EncodeToString(sum[:8]), nil
 }
 
-func canonicalStoragePath(path string) string {
+// canonicalStoragePath resolves a store to the identity a fingerprint may be
+// computed from.
+//
+// Failure is PROPAGATED, not papered over. An earlier version returned the
+// raw input when filepath.Abs failed and the absolute form when EvalSymlinks
+// failed, then claimed the result identified the store exactly -- so a path
+// that could not be resolved was fingerprinted as if it had been.
+//
+// A store that does not exist yet is not a resolution failure: its PARENT is
+// resolved and the leaf appended, so a fresh mailbox and an existing one at
+// the same location fingerprint identically.
+func canonicalStoragePath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return path
+		return "", err
 	}
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return resolved
+		return resolved, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
 	}
-	return abs
+	parent, leaf := filepath.Split(abs)
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Clean(parent))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolvedParent, leaf), nil
 }
 
 // FoldWatermark folds one record's stable identity and content into a rolling
@@ -245,10 +271,12 @@ type BoundedPage struct {
 type BoundedOptions struct {
 	Limit    int
 	MaxBytes int
-	// Source is the fingerprint the caller computed for the stores it is
-	// reading. It is checked against the cursor here so a Cursor built as a
-	// struct literal cannot bypass the binding the parsed path enforces.
-	Source string
+	// FeedbackDir is the resolved feedback storage this read is paired with.
+	// The fingerprint is computed HERE, from m.MailFile and this directory,
+	// rather than taken from the caller: comparing a caller-supplied Source
+	// to a caller-supplied cursor let both stay constant while the mailbox
+	// path changed underneath, which is the binding this API promises.
+	FeedbackDir string
 }
 
 func (o BoundedOptions) validate() error {
@@ -321,12 +349,16 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	// A Cursor handed in directly must have its SOURCE checked too. Accepting
 	// whatever the caller put there let a struct literal bypass the binding
 	// the parsed path enforces.
-	// The binding is enforced, not merely compared when both sides happen to
-	// be populated. An empty opts.Source or an empty cur.Source used to skip
-	// the check entirely, so the documented invariant was bypassable by
-	// omission -- which is exactly how a struct literal got through.
-	if strings.TrimSpace(opts.Source) == "" {
-		return page, errors.New("mail: bounded read requires the caller's resolved storage fingerprint")
+	// The fingerprint is derived from the store THIS READ OPENS, not handed
+	// in. Comparing two caller-supplied strings let a caller keep both
+	// constant while switching m.MailFile, which is precisely the binding
+	// this API claims to enforce.
+	if strings.TrimSpace(opts.FeedbackDir) == "" {
+		return page, errors.New("mail: bounded read requires the paired feedback storage directory")
+	}
+	want, err := SourceFingerprint(m.MailFile, opts.FeedbackDir)
+	if err != nil {
+		return page, err
 	}
 	if cur.Control > 0 || cur.Feedback > 0 {
 		if cur.Source == "" {
@@ -336,10 +368,10 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 			return page, errors.New("mail: a cursor with a position must carry both store watermarks")
 		}
 	}
-	if cur.Source != "" && cur.Source != opts.Source {
-		return page, errors.New("mail: cursor source does not identify the stores being read")
+	if cur.Source != "" && cur.Source != want {
+		return page, errors.New("mail: cursor was issued against different storage than this read opens")
 	}
-	cur.Source = opts.Source
+	cur.Source = want
 	high := cur.Control
 
 	file, err := OpenRegularStore(m.MailFile)
@@ -457,19 +489,17 @@ func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur 
 	if len(quarantineErrs) > 0 {
 		return page, fmt.Errorf("mail: %d quarantine write(s) failed: %w", quarantineFailures, errors.Join(quarantineErrs...))
 	}
-	// An EMPTY regular file is a truncated store, not a fresh one. Guarding
-	// this behind sawAny let a file emptied under a live cursor accept any
-	// mark and report a clean, permanently empty page.
-	if !sawAny && cur.Control > 0 {
-		return page, fmt.Errorf("%w: control store holds no records but the cursor is at %d", ErrStorageRewound, cur.Control)
-	}
-	if sawAny && cur.Control > maxSeen {
-		return page, fmt.Errorf("%w: cursor at %d, highest stored sequence is %d", ErrStorageRewound, cur.Control, maxSeen)
-	}
-	// The cursor named a sequence the store no longer contains at all.
+	// ONE refusal, because it strictly subsumes the alternatives. The cursor
+	// names a sequence; unless a record carrying exactly that sequence was
+	// seen and its prefix verified, the store cannot be resumed. That covers
+	// an emptied store, a removed one, a cursor beyond the highest sequence,
+	// and a cursor whose record was repaired away. Separate checks for those
+	// read as extra protection while being unreachable behind this one.
 	if !resumeChecked {
-		return page, fmt.Errorf("%w: control sequence %d is no longer present", ErrStorageRewound, cur.Control)
+		return page, fmt.Errorf("%w: control sequence %d is not present in this store (emptied, truncated, renumbered or repaired away)",
+			ErrStorageRewound, cur.Control)
 	}
+	_ = maxSeen
 	page.Next = cur.withControl(high, emittedWatermark).String()
 	return page, nil
 }

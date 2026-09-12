@@ -24,6 +24,11 @@ import (
 
 const boundsRecipient = "lane-under-test"
 
+// feedbackEnvMailDir is the env var the feedback producer resolves its mail
+// directory from, named once so the fixtures and the unix-only FIFO file
+// agree without importing the package twice.
+const feedbackEnvMailDir = feedback.EnvMailDir
+
 type boundsFixture struct {
 	box         *mail.Mailbox
 	root        string
@@ -189,7 +194,10 @@ func TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage(t *testing.T) {
 
 // Cursor encoding must be injective: "a.b" and "a_b" are different lanes.
 func TestBoundedInboxCursorEncodingIsInjective(t *testing.T) {
-	source := mail.SourceFingerprint("/x", "/y")
+	source, err := mail.SourceFingerprint(t.TempDir(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	dotted := mail.Cursor{Recipient: "a.b", Source: source, Control: 1, ControlAnchor: mail.FoldWatermark(mail.EmptyAnchor, "x", "1")}.String()
 	if _, err := mail.ParseCursor(dotted, "a_b", source); err == nil {
 		t.Fatal("a cursor for a.b was accepted for a_b; the encoding is not injective")
@@ -416,8 +424,11 @@ func TestBoundedInboxToleratesAppendAndAckRewrites(t *testing.T) {
 // bypassed the binding entirely.
 func TestBoundedControlRejectsOmittedBindings(t *testing.T) {
 	f := newBoundsFixture(t, []int64{1, 2}, nil)
-	source := mail.SourceFingerprint(f.box.MailFile, f.feedbackDir)
-	opts := mail.BoundedOptions{Limit: 10, MaxBytes: 1 << 20, Source: source}
+	source, err := mail.SourceFingerprint(f.box.MailFile, f.feedbackDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := mail.BoundedOptions{Limit: 10, MaxBytes: 1 << 20, FeedbackDir: f.feedbackDir}
 
 	for name, cur := range map[string]mail.Cursor{
 		"no source":          {Recipient: boundsRecipient, Control: 1, ControlAnchor: "aa", FeedbackAnchor: "0"},
@@ -436,7 +447,39 @@ func TestBoundedControlRejectsOmittedBindings(t *testing.T) {
 	fresh := mail.Cursor{Recipient: boundsRecipient}
 	if _, err := f.box.ReadBoundedControl(context.Background(), boundsRecipient, fresh,
 		mail.BoundedOptions{Limit: 10, MaxBytes: 1 << 20}); err == nil {
-		t.Fatal("a read without the caller's storage fingerprint was accepted")
+		t.Fatal("a read without the paired feedback storage was accepted")
+	}
+}
+
+// The binding must follow the store the read actually OPENS. Comparing a
+// caller-supplied fingerprint to a caller-supplied cursor let both stay
+// constant while the mailbox path changed underneath. The two paths here
+// share a prefix, so a prefix-wise comparison would also pass.
+func TestBoundedControlBindsTheMailboxItOpens(t *testing.T) {
+	f := newBoundsFixture(t, []int64{1, 2}, nil)
+	live := boundsRead(t, f, "", 10, 1<<20).NextCursor
+
+	sibling := f.box.MailFile + "-sibling"
+	body, err := os.ReadFile(f.box.MailFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sibling, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := mail.SourceFingerprint(f.box.MailFile, f.feedbackDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err := mail.ParseCursor(live, boundsRecipient, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same cursor, same recipient, byte-identical content, different store.
+	other := mail.NewMailbox(sibling)
+	if _, err := other.ReadBoundedControl(context.Background(), boundsRecipient, cur,
+		mail.BoundedOptions{Limit: 10, MaxBytes: 1 << 20, FeedbackDir: f.feedbackDir}); err == nil {
+		t.Fatal("a cursor from one mailbox was accepted by another whose path shares its prefix")
 	}
 }
 
