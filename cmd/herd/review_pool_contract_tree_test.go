@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -614,8 +615,17 @@ func decodeCapacityCensus(t *testing.T, out []byte) map[string]float64 {
 	if err := dec.Decode(&raw); err != nil {
 		t.Fatalf("decode capacity json: %v; output:\n%s", err, out)
 	}
-	if dec.More() {
-		t.Fatalf("capacity output carried more than one record; output:\n%s", out)
+	// Decoder.More() is NOT an end-of-input check: it reports whether another
+	// element exists in the enclosing array or object, and can answer false
+	// with a trailing unmatched delimiter still in the stream. Decoding a
+	// SECOND value and requiring io.EOF is the real check -- nil means another
+	// record followed, and any other error means trailing garbage.
+	var trailing json.RawMessage
+	switch err := dec.Decode(&trailing); {
+	case err == nil:
+		t.Fatalf("capacity output carried a second record (%s); output:\n%s", trailing, out)
+	case !errors.Is(err, io.EOF):
+		t.Fatalf("capacity output carried trailing content after the record (%v); output:\n%s", err, out)
 	}
 
 	values := make(map[string]float64, 5)
