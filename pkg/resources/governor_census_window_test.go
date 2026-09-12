@@ -2,6 +2,7 @@ package resources
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,20 +16,33 @@ import (
 // is where the window hooks are wired, where the allocation walk is skipped,
 // and where the stage's Scanned/Deferred are reported.
 
-// recordingMeasurer records every path the allocation walk touched.
-type recordingMeasurer struct {
+// censusWindowRecordingMeasurer records every path the allocation walk touched
+// and can fail for named lanes. The name is task-specific because this package
+// already has an unrelated recordingMeasurer fixture in physical_context_test.go.
+//
+// Lanes are addressed by directory BASE name rather than full path: the
+// governor resolves and cleans each lane path before measuring, so matching on
+// the basename is stable against that rewrite.
+type censusWindowRecordingMeasurer struct {
 	mu       sync.Mutex
+	failBase map[string]bool
 	measured []string
+	failed   []string
 }
 
-func (m *recordingMeasurer) Measure(path string, _ int) (PhysicalUsage, error) {
+func (m *censusWindowRecordingMeasurer) Measure(path string, _ int) (PhysicalUsage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.measured = append(m.measured, filepath.Clean(path))
+	clean := filepath.Clean(path)
+	m.measured = append(m.measured, clean)
+	if m.failBase[filepath.Base(clean)] {
+		m.failed = append(m.failed, clean)
+		return PhysicalUsage{}, errors.New("census window fixture measurement failure")
+	}
 	return PhysicalUsage{Bytes: 4096}, nil
 }
 
-func (m *recordingMeasurer) touched(path string) bool {
+func (m *censusWindowRecordingMeasurer) touched(path string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, seen := range m.measured {
@@ -39,14 +53,25 @@ func (m *recordingMeasurer) touched(path string) bool {
 	return false
 }
 
+func (m *censusWindowRecordingMeasurer) failedFor(path string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, seen := range m.failed {
+		if seen == filepath.Clean(path) {
+			return true
+		}
+	}
+	return false
+}
+
 // censusSeamGovernor wires a real GitWorktreeEnumerator, with the window seam's
 // hermetic doubles, onto a Governor over a throwaway repository. Nothing here
 // touches a real fleet: the repository is built by windowSeamRepo in t.TempDir.
-func censusSeamGovernor(t *testing.T, laneCount, window int) (*Governor, string, *recordingMeasurer, *windowSeamEvidence) {
+func censusSeamGovernor(t *testing.T, laneCount, window int) (*Governor, string, *censusWindowRecordingMeasurer, *windowSeamEvidence) {
 	t.Helper()
 	root, _ := windowSeamRepo(t, laneCount)
 	evidence := &windowSeamEvidence{failFor: map[string]bool{}}
-	measurer := &recordingMeasurer{}
+	measurer := &censusWindowRecordingMeasurer{failBase: map[string]bool{}}
 	g := &Governor{
 		Policy: GovernorPolicy{
 			HostID: "census-seam", RepositoryRoot: root, BaseRef: "main",
@@ -158,41 +183,76 @@ func TestGovernorCensusStageCountsDeferredAndUnknownLanes(t *testing.T) {
 }
 
 // A lane the ENUMERATOR could not prove arrives already unknown. It must be
-// counted once, and must not be counted twice when the governor's own
-// measurement would also have failed for it.
+// counted once -- INCLUDING when the governor's own allocation measurement
+// then fails for that same lane, which is the only way a single lane can be
+// charged twice by a running counter.
 func TestGovernorCensusCountsEnumeratorUnknownsWithoutDoubleCounting(t *testing.T) {
 	// Window wider than the ring, so every lane is selected and the case does
 	// not depend on where git happens to order the seeded lanes.
-	g, _, _, evidence := censusSeamGovernor(t, 5, 10)
+	g, _, measurer, evidence := censusSeamGovernor(t, 5, 10)
+	// lane-0 fails BOTH: lifecycle evidence in the enumerator, then the
+	// governor's allocation walk. lane-1 fails only lifecycle, so the
+	// enumerator-origin case is still covered on its own.
 	evidence.failFor["lane-0"] = true
 	evidence.failFor["lane-1"] = true
+	measurer.failBase["lane-0"] = true
 	g.defaults()
 	seedRegisteredCursor(t, g, 0)
 
 	report, err := g.census(context.Background())
 	if err != nil {
-		t.Fatalf("census must answer despite lane-level evidence failures: %v", err)
+		t.Fatalf("census must answer despite lane-level failures: %v", err)
 	}
 	stage := censusStage(t, report)
+	if len(report.Worktrees) == 0 {
+		t.Fatal("census reported no registered worktrees; the fixture proves nothing")
+	}
 
-	unknown := 0
-	lifecycleUnknown := 0
-	for _, lane := range report.Worktrees {
+	var doubleFailed, lifecycleOnly *RegisteredWorktree
+	unknown, known := 0, 0
+	for i := range report.Worktrees {
+		lane := &report.Worktrees[i]
 		if lane.State == LaneUnknown {
 			unknown++
+		} else {
+			known++
 		}
-		if lane.PreserveReason == "canonical_lifecycle_evidence_unavailable" {
-			lifecycleUnknown++
+		switch lane.Branch {
+		case "lane-0":
+			doubleFailed = lane
+		case "lane-1":
+			lifecycleOnly = lane
 		}
 	}
-	if lifecycleUnknown != 2 {
-		t.Fatalf("expected the 2 seeded lifecycle failures to survive into the report, got %d", lifecycleUnknown)
+	if doubleFailed == nil || lifecycleOnly == nil {
+		t.Fatalf("fixture lanes missing from the report: lane-0=%v lane-1=%v", doubleFailed, lifecycleOnly)
 	}
+
+	// Positive proof the double failure actually happened, rather than the
+	// measurer simply never being asked.
+	if !measurer.failedFor(doubleFailed.Path) {
+		t.Fatalf("lane-0's allocation measurement never failed, so this case cannot detect a double count (measured=%v)", measurer.touched(doubleFailed.Path))
+	}
+	if doubleFailed.State != LaneUnknown {
+		t.Fatalf("lane-0 failed lifecycle evidence AND measurement and must stay unknown, got %v", doubleFailed.State)
+	}
+	if lifecycleOnly.State != LaneUnknown || lifecycleOnly.PreserveReason != "canonical_lifecycle_evidence_unavailable" {
+		t.Fatalf("lane-1 must keep its enumerator-origin reason, got state=%v reason=%q", lifecycleOnly.State, lifecycleOnly.PreserveReason)
+	}
+	if unknown < 2 {
+		t.Fatalf("expected at least the two seeded failures to be unknown, got %d", unknown)
+	}
+	if known == 0 {
+		t.Fatal("no lane reached a known state; the fixture is not exercising the healthy path at all")
+	}
+
+	// The exact detection: a counter that charged lane-0 for both its
+	// lifecycle failure and its measurement failure would report unknown+1.
 	if stage.Deferred != unknown {
-		t.Fatalf("stage Deferred %d must equal the %d distinct unknown lanes, counted once each", stage.Deferred, unknown)
+		t.Fatalf("stage Deferred %d must equal the %d distinct unknown lanes, counting the double-failed lane once", stage.Deferred, unknown)
 	}
-	if stage.Deferred < lifecycleUnknown {
-		t.Fatalf("stage Deferred %d omits enumerator-origin unknown lanes (%d of them)", stage.Deferred, lifecycleUnknown)
+	if stage.Scanned != len(report.Worktrees) {
+		t.Fatalf("stage Scanned %d must match the full inventory %d", stage.Scanned, len(report.Worktrees))
 	}
 }
 
