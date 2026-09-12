@@ -29,7 +29,7 @@ done
 source_rel=pkg/mail/bounded.go
 cli_rel=cmd/herd/mail_bounds.go
 test_pkg=./cmd/herd/
-test_run='TestBoundedInbox|TestBoundedRequest'
+test_run='TestBoundedInbox|TestBoundedRequest|TestBoundedControl'
 
 go_timeout=${VERIFY_BOUNDS_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -189,16 +189,26 @@ classify() {
 	print -r -- 'KILLED'
 }
 
+# literal_occurrences counts exact substring matches, multiline included.
+# grep is line-oriented: it cannot count an anchor that spans lines at all,
+# and -o -c on a line holding the anchor twice still reports one. Removing
+# every occurrence and dividing the length difference is exact, native, and
+# needs no external tool.
+literal_occurrences() {
+	local hay=$1 needle=$2 stripped
+	(( ${#needle} )) || { print -r -- 0; return }
+	stripped=${hay//$needle/}
+	print -r -- $(( (${#hay} - ${#stripped}) / ${#needle} ))
+}
+
 patch_source() {
 	local rel=$1 anchor=$2 replacement=$3 file=$work/$1 found content mutated
-	# OCCURRENCES, not matching lines: grep -c reports 1 for a line holding the
-	# anchor twice, and the global substitution below would mutate both.
-	found=$(grep -F -o -- "$anchor" "$file" | wc -l | tr -d ' ')
+	content=$(<"$file")
+	found=$(literal_occurrences "$content" "$anchor")
 	if [[ "$found" != 1 ]]; then
 		print -u2 "error: anchor matched ${found:-0} occurrences, want exactly 1 (source drifted): $anchor"
 		return 1
 	fi
-	content=$(<"$file")
 	print -r -- "${content//"$anchor"/"$replacement"}" >| "$file"
 	mutated=$(git -C "$work" hash-object -- "$rel")
 	[[ "$mutated" != "${pristine[$rel]}" ]] || { print -u2 'error: mutation did not change the source'; return 1; }
@@ -216,22 +226,21 @@ restore_sources() {
 # Every killer named below, so the baseline can prove each one exists and
 # passes before any mutant is allowed to claim it failed.
 expected_passes=(
+	TestBoundedControlBindsTheMailboxItOpens
+	TestBoundedControlRejectsOmittedBindings
 	TestBoundedInboxByteBudgetBindsOnSerializedSize
-	TestBoundedInboxRejectsUnusableCursors
-	TestBoundedInboxCursorIsBoundToStorage
-	TestBoundedInboxRejectsRewoundStorage
-	TestBoundedInboxRejectsEmptiedStores
-	TestBoundedInboxRejectsUnorderedStorage
-	TestBoundedInboxRefusesDuplicateIdentities
-	TestBoundedInboxRefusesNonPositiveIdentities
+	TestBoundedInboxBytesAccountForBothSources
 	TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord
 	TestBoundedInboxDetectsSameIDDifferentFeedbackContent
-	TestBoundedInboxToleratesAppendAndAckRewrites
-	TestBoundedControlRejectsOmittedBindings
-	TestBoundedInboxQuarantinesMalformedRowPastAFullPage
 	TestBoundedInboxOversizedRecordFailsInsteadOfStalling
+	TestBoundedInboxQuarantinesMalformedRowPastAFullPage
+	TestBoundedInboxRefusesDuplicateIdentities
+	TestBoundedInboxRejectsEmptiedStores
+	TestBoundedInboxRejectsUnusableCursors
 	TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage
-	TestBoundedInboxBytesAccountForBothSources
+	TestBoundedInboxCLIRefusesFIFOControlStore
+	TestBoundedInboxCLIRefusesFIFOFeedbackStore
+	TestBoundedInboxToleratesAppendAndAckRewrites
 )
 
 baseline_exit=$(run_focused "$test_run" "$run_dir/baseline.json" "$run_dir/baseline.err")
@@ -261,30 +270,29 @@ note 'baseline PASS (every anchored killer present and passing)'
 
 sep=$'\x1f'
 # id | file | anchor | replacement | killer test | required assertion text
+sep=$'\x1f'
 mutations=(
 "limit-not-enforced${sep}${source_rel}${sep}		if len(page.Envelopes) >= opts.Limit || page.Bytes+size > opts.MaxBytes {${sep}		if false { // MUTANT: limit and byte budget ignored${sep}TestBoundedInboxByteBudgetBindsOnSerializedSize${sep}near-boundary page"
 "cursor-recipient-unbound${sep}${source_rel}${sep}	if string(decoded) != recipient {${sep}	if false { // MUTANT: cursor recipient binding dropped${sep}TestBoundedInboxRejectsUnusableCursors${sep}was accepted"
-"cursor-storage-unbound${sep}${source_rel}${sep}	if parts[2] != source {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedInboxCursorIsBoundToStorage${sep}different mailbox/feedback root was accepted"
-"rewound-storage-accepted${sep}${source_rel}${sep}	if sawAny && cur.Control > maxSeen {${sep}	if false { // MUTANT: cursor ahead of the store accepted${sep}TestBoundedInboxRejectsRewoundStorage${sep}cursor ahead of the store was accepted"
-"unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence < maxSeen {${sep}		if false { // MUTANT: unordered store paged anyway${sep}TestBoundedInboxRejectsUnorderedStorage${sep}unordered store was paged anyway"
+"cursor-storage-unbound${sep}${source_rel}${sep}	if cur.Source != "" && cur.Source != want {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedControlBindsTheMailboxItOpens${sep}shares its prefix"
+"resume-position-unchecked${sep}${source_rel}${sep}	if !resumeChecked {${sep}	if false { // MUTANT: missing resume position accepted${sep}TestBoundedInboxRejectsEmptiedStores${sep}accepted a live cursor"
+"unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence <= maxSeen {${sep}		if false { // MUTANT: unordered and duplicate sequences accepted${sep}TestBoundedInboxRefusesDuplicateIdentities${sep}would be lost"
 "late-scan-abandoned${sep}${source_rel}${sep}		if page.Truncated {
-			// Page is already full. Keep validating, retain nothing, and do
-			// NOT advance the cursor over this record.
 			continue
 		}${sep}		if page.Truncated {
 			break // MUTANT: stop scanning once the page is full
 		}${sep}TestBoundedInboxQuarantinesMalformedRowPastAFullPage${sep}past the page boundary was never quarantined"
 "oversized-record-skipped${sep}${source_rel}${sep}		if size > opts.MaxBytes {${sep}		if false { // MUTANT: oversized record silently skipped${sep}TestBoundedInboxOversizedRecordFailsInsteadOfStalling${sep}oversized record produced a page instead of an error"
-"feedback-error-swallowed${sep}${cli_rel}${sep}			return nil, highest, false, fmt.Errorf(\"mail: unparseable feedback record: %w\", err)${sep}			continue // MUTANT: unreadable feedback silently dropped${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage${sep}full control page hid an unreadable feedback store"
+"prefix-watermark-unchecked${sep}${source_rel}${sep}				if cur.ControlAnchor != watermark {${sep}				if false { // MUTANT: consumed prefix not verified${sep}TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord${sep}resumed silently behind an unchanged first record"
+"binding-omission-allowed${sep}${source_rel}${sep}	if strings.TrimSpace(opts.FeedbackDir) == \"\" {${sep}	if false { // MUTANT: missing paired feedback storage tolerated${sep}TestBoundedControlRejectsOmittedBindings${sep}paired feedback storage was accepted"
+"feedback-error-swallowed${sep}${cli_rel}${sep}			return nil, highest, storeAnchor, false, fmt.Errorf(\"mail: unparseable feedback record: %w\", err)${sep}			continue // MUTANT: unreadable feedback silently dropped${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage${sep}full control page hid an unreadable feedback store"
 "feedback-truncation-before-existence${sep}${cli_rel}${sep}	if page.Truncated || controlErr != nil {
 		remainingLimit, remainingBytes = 0, 0
 	}${sep}	if page.Truncated || controlErr != nil {
 		return out, controlErr // MUTANT: return before validating feedback
 	}${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage${sep}full control page hid an unreadable feedback store"
-"prefix-watermark-unchecked${sep}${source_rel}${sep}				if cur.ControlAnchor != watermark {${sep}				if false { // MUTANT: consumed prefix not verified${sep}TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord${sep}resumed silently behind an unchanged first record"
-"feedback-watermark-unchecked${sep}${cli_rel}${sep}				if anchor != watermark {${sep}				if false { // MUTANT: feedback prefix not verified${sep}TestBoundedInboxDetectsSameIDDifferentFeedbackContent${sep}same id resumed silently"
-"binding-omission-allowed${sep}${source_rel}${sep}	if strings.TrimSpace(opts.Source) == "" {${sep}	if false { // MUTANT: missing caller fingerprint tolerated${sep}TestBoundedControlRejectsOmittedBindings${sep}storage fingerprint was accepted"
 "feedback-bytes-uncounted${sep}${cli_rel}${sep}		out.RetainedBytes += size${sep}		_ = size // MUTANT: feedback bytes not counted${sep}TestBoundedInboxBytesAccountForBothSources${sep}feedback bytes were not counted"
+"feedback-watermark-unchecked${sep}${cli_rel}${sep}				if anchor != watermark {${sep}				if false { // MUTANT: feedback prefix not verified${sep}TestBoundedInboxDetectsSameIDDifferentFeedbackContent${sep}same id resumed silently"
 )
 
 failures=0
