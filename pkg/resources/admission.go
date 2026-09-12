@@ -538,6 +538,36 @@ func cpuReadingFrom(source string, at time.Time, out string, cpus int) freshness
 //
 // It reads the WHOLE token after the label rather than scanning backwards for
 // trailing digits, which silently rewrote "-50%" into 50 and "1.50%" into 50.
+// parseDarwinPressureLevel reads kern.memorystatus_vm_pressure_level's value.
+//
+// It lives here, unconstrained, rather than beside the Darwin probe, because it
+// is a pure text parser with nothing platform-specific in it: running the
+// sysctl is Darwin's job, interpreting its output is not. That split is what
+// lets the vocabulary be tested on every platform CI runs on, which is the
+// point — a parser only exercised on the maintainer's laptop is a parser whose
+// regressions reach production.
+//
+// The vocabulary is fixed and closed: 1 normal, 2 warning, 4 critical, as the
+// memorystatus subsystem defines them. Everything else — an unlisted level, a
+// word, or silence — is an error and PressureUnknown. Silence in particular
+// must never read as normal: that would turn a failed probe into an admission.
+func parseDarwinPressureLevel(output string) (PressureLevel, error) {
+	token := strings.TrimSpace(output)
+	if token == "" {
+		return PressureUnknown, fmt.Errorf("kernel pressure level was empty; silence is not a reading")
+	}
+	switch token {
+	case "1":
+		return PressureNormal, nil
+	case "2":
+		return PressureWarn, nil
+	case "4":
+		return PressureCritical, nil
+	default:
+		return PressureUnknown, fmt.Errorf("kernel pressure level %q is not one of 1, 2 or 4", token)
+	}
+}
+
 func parseFreePctStrict(output, label string) (int, error) {
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
