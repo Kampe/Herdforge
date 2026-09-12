@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -163,7 +164,10 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
-	removeOwnedBinaryDirs()
+	if cleanupErr := removeOwnedBinaryDirs(); cleanupErr != nil {
+		fmt.Fprintf(os.Stderr, "test binary cleanup failed: %v\n", cleanupErr)
+		code = 1
+	}
 	restoreSlots()
 	os.Exit(code)
 }
@@ -938,15 +942,31 @@ func newOwnedBinaryDir(prefix string) (string, error) {
 	return dir, nil
 }
 
-// removeOwnedBinaryDirs removes only the directories newOwnedBinaryDir created,
-// on both the success and the failure path. It never touches a parent, a global
-// temp root, or any path a caller chose.
-func removeOwnedBinaryDirs() {
+// removeOwnedBinaryDirs removes only the directories newOwnedBinaryDir created.
+// It attempts EVERY one of them and returns what it could not remove, so a
+// failed cleanup cannot pass as a clean run. It never touches a parent, a
+// global temp root, or any path a caller chose. An absent path is not a
+// failure: os.RemoveAll already reports nil for one.
+func removeOwnedBinaryDirs() error {
 	ownedBinaryDirsMu.Lock()
 	dirs := ownedBinaryDirs
 	ownedBinaryDirs = nil
 	ownedBinaryDirsMu.Unlock()
+
+	var failed []string
+	var errs []error
 	for _, dir := range dirs {
-		_ = os.RemoveAll(dir)
+		if err := os.RemoveAll(dir); err != nil {
+			failed = append(failed, dir)
+			errs = append(errs, fmt.Errorf("remove %s: %w", dir, err))
+		}
 	}
+	if len(failed) > 0 {
+		// Keep ownership of what is still on disk. Clearing the list before
+		// the removals meant a directory that survived was also forgotten.
+		ownedBinaryDirsMu.Lock()
+		ownedBinaryDirs = append(ownedBinaryDirs, failed...)
+		ownedBinaryDirsMu.Unlock()
+	}
+	return errors.Join(errs...)
 }
