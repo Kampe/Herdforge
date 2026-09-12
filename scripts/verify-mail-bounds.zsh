@@ -155,7 +155,7 @@ test_emitted() {
 # classify maps one mutant run onto the contract. Skips, timeouts, build
 # failures and wrong-test failures are each their own verdict.
 classify() {
-	local run_exit=$1 events=$2 killer=$3 probe
+	local run_exit=$1 events=$2 killer=$3 want=$4 probe
 	if ! events_valid "$events"; then print -r -- 'INVALID-EVENTS'; return; fi
 	if (( run_exit == 0 )); then print -r -- 'SURVIVED'; return; fi
 	if (( run_exit != 1 )); then print -r -- "TOOLFAIL(exit $run_exit)"; return; fi
@@ -173,6 +173,17 @@ classify() {
 	probe=0; test_emitted "$events" "$killer" fail || probe=$?
 	case $probe in
 		1) print -r -- 'WRONG-TEST'; return ;;
+		2) print -r -- 'EVENTS-UNREADABLE'; return ;;
+	esac
+	# The named test failing is not enough: it must fail on the assertion this
+	# mutant was built to break. Without this a test that failed for an
+	# unrelated reason would be counted as a kill.
+	probe=0
+	jq_predicate 'any(.[]; (.Action == "output")
+		and (((.Test // "") == $t) or (((.Test // "") | startswith($t + "/"))))
+		and (((.Output // "") | contains($w))))' "$events" --arg t "$killer" --arg w "$want" || probe=$?
+	case $probe in
+		1) print -r -- 'WRONG-ASSERTION'; return ;;
 		2) print -r -- 'EVENTS-UNREADABLE'; return ;;
 	esac
 	print -r -- 'KILLED'
@@ -202,6 +213,24 @@ restore_sources() {
 	done
 }
 
+# Every killer named below, so the baseline can prove each one exists and
+# passes before any mutant is allowed to claim it failed.
+expected_passes=(
+	TestBoundedInboxByteBudgetBindsOnSerializedSize
+	TestBoundedInboxRejectsUnusableCursors
+	TestBoundedInboxCursorIsBoundToStorage
+	TestBoundedInboxRejectsRewoundStorage
+	TestBoundedInboxRejectsEmptiedStores
+	TestBoundedInboxRejectsUnorderedStorage
+	TestBoundedInboxRefusesDuplicateIdentities
+	TestBoundedInboxRefusesNonPositiveIdentities
+	TestBoundedInboxDetectsReplacementButToleratesAck
+	TestBoundedInboxQuarantinesMalformedRowPastAFullPage
+	TestBoundedInboxOversizedRecordFailsInsteadOfStalling
+	TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage
+	TestBoundedInboxBytesAccountForBothSources
+)
+
 baseline_exit=$(run_focused "$test_run" "$run_dir/baseline.json" "$run_dir/baseline.err")
 if (( baseline_exit != 0 )); then
 	note "baseline FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
@@ -212,35 +241,44 @@ if ! events_valid "$run_dir/baseline.json"; then
 	note 'baseline produced an unreadable event stream'
 	exit 1
 fi
-if ! jq_predicate 'any(.[]; .Action == "pass" and (.Test // "") != "")' "$run_dir/baseline.json"; then
-	note 'baseline selected NO tests - an empty selection is not a passing baseline'
-	exit 1
-fi
-note 'baseline PASS'
+# Every killer this driver relies on must be PRESENT and PASSING in the
+# baseline. "some test passed" would let a silently excluded subset -- a
+# renamed test, a build-tagged-out file -- read as a healthy baseline while
+# the mutant it anchors could never have run.
+baseline_missing=0
+for record in "${expected_passes[@]}"; do
+	probe=0; test_emitted "$run_dir/baseline.json" "$record" pass || probe=$?
+	if (( probe != 0 )); then
+		note "baseline is missing a passing $record (probe $probe)"
+		baseline_missing=1
+	fi
+done
+(( baseline_missing == 0 )) || exit 1
+note 'baseline PASS (every anchored killer present and passing)'
 
 sep=$'\x1f'
-# id | file | anchor | replacement | killer test
+# id | file | anchor | replacement | killer test | required assertion text
 mutations=(
-"limit-not-enforced${sep}${source_rel}${sep}		if len(page.Envelopes) >= opts.Limit || page.Bytes+size > opts.MaxBytes {${sep}		if false { // MUTANT: limit and byte budget ignored${sep}TestBoundedInboxByteBudgetBindsOnSerializedSize"
-"cursor-recipient-unbound${sep}${source_rel}${sep}	if string(decoded) != recipient {${sep}	if false { // MUTANT: cursor recipient binding dropped${sep}TestBoundedInboxRejectsUnusableCursors"
-"cursor-storage-unbound${sep}${source_rel}${sep}	if parts[2] != source {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedInboxCursorIsBoundToStorage"
-"rewound-storage-accepted${sep}${source_rel}${sep}	if sawAny && cur.Control > maxSeen {${sep}	if false { // MUTANT: cursor ahead of the store accepted${sep}TestBoundedInboxRejectsRewoundStorage"
-"unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence < maxSeen {${sep}		if false { // MUTANT: unordered store paged anyway${sep}TestBoundedInboxRejectsUnorderedStorage"
+"limit-not-enforced${sep}${source_rel}${sep}		if len(page.Envelopes) >= opts.Limit || page.Bytes+size > opts.MaxBytes {${sep}		if false { // MUTANT: limit and byte budget ignored${sep}TestBoundedInboxByteBudgetBindsOnSerializedSize${sep}near-boundary page"
+"cursor-recipient-unbound${sep}${source_rel}${sep}	if string(decoded) != recipient {${sep}	if false { // MUTANT: cursor recipient binding dropped${sep}TestBoundedInboxRejectsUnusableCursors${sep}was accepted"
+"cursor-storage-unbound${sep}${source_rel}${sep}	if parts[2] != source {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedInboxCursorIsBoundToStorage${sep}different mailbox/feedback root was accepted"
+"rewound-storage-accepted${sep}${source_rel}${sep}	if sawAny && cur.Control > maxSeen {${sep}	if false { // MUTANT: cursor ahead of the store accepted${sep}TestBoundedInboxRejectsRewoundStorage${sep}cursor ahead of the store was accepted"
+"unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence < maxSeen {${sep}		if false { // MUTANT: unordered store paged anyway${sep}TestBoundedInboxRejectsUnorderedStorage${sep}unordered store was paged anyway"
 "late-scan-abandoned${sep}${source_rel}${sep}		if page.Truncated {
 			// Page is already full. Keep validating, retain nothing, and do
 			// NOT advance the cursor over this record.
 			continue
 		}${sep}		if page.Truncated {
 			break // MUTANT: stop scanning once the page is full
-		}${sep}TestBoundedInboxQuarantinesMalformedRowPastAFullPage"
-"oversized-record-skipped${sep}${source_rel}${sep}		if size > opts.MaxBytes {${sep}		if false { // MUTANT: oversized record silently skipped${sep}TestBoundedInboxOversizedRecordFailsInsteadOfStalling"
-"feedback-error-swallowed${sep}${cli_rel}${sep}			return nil, highest, false, fmt.Errorf(\"mail: unparseable feedback record: %w\", err)${sep}			continue // MUTANT: unreadable feedback silently dropped${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage"
+		}${sep}TestBoundedInboxQuarantinesMalformedRowPastAFullPage${sep}past the page boundary was never quarantined"
+"oversized-record-skipped${sep}${source_rel}${sep}		if size > opts.MaxBytes {${sep}		if false { // MUTANT: oversized record silently skipped${sep}TestBoundedInboxOversizedRecordFailsInsteadOfStalling${sep}oversized record produced a page instead of an error"
+"feedback-error-swallowed${sep}${cli_rel}${sep}			return nil, highest, false, fmt.Errorf(\"mail: unparseable feedback record: %w\", err)${sep}			continue // MUTANT: unreadable feedback silently dropped${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage${sep}full control page hid an unreadable feedback store"
 "feedback-truncation-before-existence${sep}${cli_rel}${sep}	if page.Truncated || controlErr != nil {
 		remainingLimit, remainingBytes = 0, 0
 	}${sep}	if page.Truncated || controlErr != nil {
 		return out, controlErr // MUTANT: return before validating feedback
-	}${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage"
-"feedback-bytes-uncounted${sep}${cli_rel}${sep}		out.RetainedBytes += size${sep}		_ = size // MUTANT: feedback bytes not counted${sep}TestBoundedInboxBytesAccountForBothSources"
+	}${sep}TestBoundedInboxReportsFeedbackErrorBehindAFullControlPage${sep}full control page hid an unreadable feedback store"
+"feedback-bytes-uncounted${sep}${cli_rel}${sep}		out.RetainedBytes += size${sep}		_ = size // MUTANT: feedback bytes not counted${sep}TestBoundedInboxBytesAccountForBothSources${sep}feedback bytes were not counted"
 )
 
 failures=0
@@ -248,7 +286,7 @@ index=0
 for record in "${mutations[@]}"; do
 	(( index += 1 ))
 	fields=("${(@ps:$sep:)record}")
-	id=$fields[1]; rel=$fields[2]; anchor=$fields[3]; replacement=$fields[4]; killer=$fields[5]
+	id=$fields[1]; rel=$fields[2]; anchor=$fields[3]; replacement=$fields[4]; killer=$fields[5]; want=$fields[6]
 	stem=$run_dir/$(printf 'm%02d-%s' "$index" "$id")
 
 	patch_source "$rel" "$anchor" "$replacement"
@@ -262,14 +300,21 @@ for record in "${mutations[@]}"; do
 	fi
 
 	run_exit=$(run_focused "$killer" "$stem.json" "$stem.err")
-	verdict=$(classify "$run_exit" "$stem.json" "$killer")
+	verdict=$(classify "$run_exit" "$stem.json" "$killer" "$want")
 	note "$id: $verdict (killer $killer, exit $run_exit)"
 	[[ "$verdict" == KILLED ]] || (( failures += 1 ))
 
 	restore_sources
-	restored_exit=$(run_focused "$test_run" "$stem.restored.json" "$stem.restored.err")
-	if (( restored_exit != 0 )); then
-		note "$id: restore did not return to PASS (exit $restored_exit)"
+	restored_exit=$(run_focused "$killer" "$stem.restored.json" "$stem.restored.err")
+	# Exit 0 alone is not a restored baseline: a selector that matched nothing
+	# also exits 0. The killer must be present and PASSING again.
+	restored_ok=0
+	if (( restored_exit == 0 )) && events_valid "$stem.restored.json"; then
+		probe=0; test_emitted "$stem.restored.json" "$killer" pass || probe=$?
+		(( probe == 0 )) && restored_ok=1
+	fi
+	if (( ! restored_ok )); then
+		note "$id: restore did not return $killer to PASS (exit $restored_exit)"
 		(( failures += 1 ))
 	fi
 done
