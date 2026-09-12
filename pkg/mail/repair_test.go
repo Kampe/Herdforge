@@ -1479,3 +1479,62 @@ func TestBlankLinesAreNotTreatedAsCorruption(t *testing.T) {
 		t.Fatalf("blank framing was treated as corruption: plan=%+v err=%v", plan, err)
 	}
 }
+
+// json.Unmarshal succeeds on "null", on "{}" and on an object with no id,
+// producing a zero Envelope. Deciding health with the decoder therefore let
+// exactly those rows pass as ordinary neighbours, bypassing the unrelated-
+// corruption guard. Structure and identity are decided before the decode now.
+func TestRepairRefusesRowsWithoutCompleteObjectOrReadableIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  string
+	}{
+		{"json null", `null`},
+		{"empty object", `{}`},
+		{"object with no id", `{"sender":"x","recipient":"y"}`},
+		{"blank id", `{"id":"","sender":"x"}`},
+		{"whitespace id", `{"id":"   ","sender":"x"}`},
+		{"non-string id", `{"id":123,"sender":"x"}`},
+		{"json array", `["not","an","object"]`},
+		{"bare string", `"just a string"`},
+		{"whitespace-only row", `   `},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, act := range []bool{false, true} {
+				mb, path := rawMailbox(t, tc.row+"\n"+legacyRow+"\n")
+				before, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				seqBefore, seqExisted := readSeqState(t, path)
+
+				req := RepairRequest{ID: "host-81751-1789141629774"}
+				if act {
+					req.Act, req.Actor, req.Fingerprint = true, "op", sha256Hex(legacyRow)
+				}
+				if _, err := mb.RepairMalformedRow(context.Background(), req); !errors.Is(err, ErrRepairUnrelatedCorruption) {
+					t.Fatalf("act=%v: %s was accepted as a healthy neighbour: %v", act, tc.name, err)
+				}
+				assertNoRepairSideEffects(t, path, before, seqBefore, seqExisted)
+			}
+		})
+	}
+}
+
+// The other half: a row that IS a complete object with a readable identity is
+// still an ordinary neighbour, including when its body mentions the target id.
+// Without this the refusals above could be satisfied by refusing everything.
+func TestRowsWithReadableIdentityRemainOrdinaryNeighbours(t *testing.T) {
+	mention := `{"id":"other-row","seq":1,"sender":"a","recipient":"b","subject":"s",` +
+		`"body":"mentions host-81751-1789141629774 in passing","read":false,` +
+		`"timestamp":"2026-09-11T10:47:09Z"}`
+	mb, path := mailboxWith(t, mention, legacyRow)
+	plan, err := actOnLegacyRow(t, mb)
+	if err != nil || plan == nil || !plan.Applied {
+		t.Fatalf("a legible unrelated row blocked the repair: plan=%+v err=%v", plan, err)
+	}
+	data, _ := os.ReadFile(path)
+	if !bytes.Contains(data, []byte(mention)) {
+		t.Fatal("the unrelated row was modified")
+	}
+}

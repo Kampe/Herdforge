@@ -275,22 +275,38 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 			// and be skipped, while still carrying TARGET. Identity here is the
 			// DECODED id values, so an escaped spelling matches and a mere
 			// mention of the id inside some other row's body does not.
-			if isObject {
-				if dupKey, dup := duplicateKey(scan.Keys); dup {
-					if containsString(scan.IDs, req.ID) {
-						return fmt.Errorf("%w: a row carrying id %q repeats top-level key %q, so which value to keep is ambiguous",
-							ErrRepairDuplicateKeys, req.ID, dupKey)
-					}
-					// Last-key-wins means this row's identity is unreadable, so
-					// it could be hiding a conflicting one.
-					noteBad(i, fmt.Sprintf("repeated top-level key %q", dupKey))
-					continue
-				}
+			// Structure first, and structure decided HERE rather than by an
+			// Envelope decode. json.Unmarshal succeeds on "null", on "{}" and
+			// on an object with no id at all, producing a zero Envelope — so
+			// asking the decoder whether a row is healthy lets exactly those
+			// through as ordinary neighbours, which is the opposite of the
+			// complete-object, legible-identity boundary this guard exists to
+			// enforce.
+			if !isObject {
+				noteBad(i, "not a complete JSON object")
+				continue
 			}
+			if dupKey, dup := duplicateKey(scan.Keys); dup {
+				if containsString(scan.IDs, req.ID) {
+					return fmt.Errorf("%w: a row carrying id %q repeats top-level key %q, so which value to keep is ambiguous",
+						ErrRepairDuplicateKeys, req.ID, dupKey)
+				}
+				// Last-key-wins means this row's identity is unreadable, so it
+				// could be hiding a conflicting one.
+				noteBad(i, fmt.Sprintf("repeated top-level key %q", dupKey))
+				continue
+			}
+			// Exactly one top-level id, present and not blank. A row nobody can
+			// name cannot be shown to be unrelated to the target.
+			if len(scan.IDs) != 1 || strings.TrimSpace(scan.IDs[0]) == "" {
+				noteBad(i, "no readable unique identity")
+				continue
+			}
+			id := scan.IDs[0]
 
 			var env Envelope
 			if json.Unmarshal([]byte(line), &env) == nil {
-				if env.ID == req.ID {
+				if id == req.ID {
 					// A well-formed row already owns this id. Repairing the
 					// malformed twin would create a duplicate delivery.
 					return fmt.Errorf("%w: a well-formed row already carries id %q", ErrRepairAmbiguous, req.ID)
@@ -299,13 +315,9 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 				// mentions the target id. Left exactly as it is.
 				continue
 			}
-			if isObject && len(scan.IDs) == 1 && scan.IDs[0] == req.ID {
+			if id == req.ID {
 				malformedHits++
 				targetIdx = i
-				continue
-			}
-			if !isObject {
-				noteBad(i, "not a complete JSON object")
 				continue
 			}
 			noteBad(i, "not a well-formed envelope")
