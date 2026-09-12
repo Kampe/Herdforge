@@ -212,18 +212,113 @@ func TestRepairRefusesWhenAWellFormedRowAlreadyCarriesTheID(t *testing.T) {
 	}
 }
 
-func TestRepairLeavesUnrelatedMalformedRowsUntouched(t *testing.T) {
+// assertNoRepairSideEffects proves a refusal changed nothing an operator could
+// later mistake for progress: not the mailbox, not the sequence counter, not
+// the audit artifact.
+func assertNoRepairSideEffects(t *testing.T, path string, before []byte, seqBefore string, seqExisted bool) {
+	t.Helper()
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("mailbox unreadable after a refusal: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("a refused repair mutated the mailbox")
+	}
+	if _, err := os.Stat(path + ".repair.jsonl"); !os.IsNotExist(err) {
+		t.Fatal("a refused repair wrote an audit record")
+	}
+	seqAfter, seqErr := os.ReadFile(path + ".seq")
+	switch {
+	case seqExisted && (seqErr != nil || string(seqAfter) != seqBefore):
+		t.Fatalf("a refused repair advanced the sequence counter: %q -> %q (%v)", seqBefore, seqAfter, seqErr)
+	case !seqExisted && seqErr == nil:
+		t.Fatalf("a refused repair reserved a sequence: %q", seqAfter)
+	}
+}
+
+func readSeqState(t *testing.T, path string) (string, bool) {
+	t.Helper()
+	data, err := os.ReadFile(path + ".seq")
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// FAC-824's contract is to refuse unrelated corruption, not to work around it.
+// A repair that succeeds beside a truncated row reports success while every
+// strict reader stays blocked, and that row may itself carry a conflicting
+// identity nobody can read.
+func TestRepairRefusesWhenAnotherRowIsMalformed(t *testing.T) {
 	truncated := `{"id": "other-row", "sender": "x", "timestamp": "2026-09-1`
-	mb, path := mailboxWith(t, truncated, legacyRow)
-	if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
-		ID: "host-81751-1789141629774", Fingerprint: sha256Hex(legacyRow), Act: true, Actor: "op",
-	}); err != nil {
-		t.Fatalf("an unrelated malformed row must not block the targeted repair: %v", err)
+	for _, act := range []bool{false, true} {
+		mb, path := mailboxWith(t, truncated, legacyRow)
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqBefore, seqExisted := readSeqState(t, path)
+
+		req := RepairRequest{ID: "host-81751-1789141629774"}
+		if act {
+			req.Act, req.Actor, req.Fingerprint = true, "op", sha256Hex(legacyRow)
+		}
+		if _, err := mb.RepairMalformedRow(context.Background(), req); !errors.Is(err, ErrRepairUnrelatedCorruption) {
+			t.Fatalf("act=%v: an unrelated malformed row did not refuse the repair: %v", act, err)
+		} else if strings.Contains(err.Error(), truncated) {
+			t.Fatalf("act=%v: the refusal leaked the other row's payload: %v", act, err)
+		}
+		assertNoRepairSideEffects(t, path, before, seqBefore, seqExisted)
 	}
-	data, _ := os.ReadFile(path)
-	if !strings.Contains(string(data), truncated) {
-		t.Fatal("repair swept an unrelated malformed row it was not asked to touch")
+}
+
+// Same contract for a row whose identity is unreadable because a key repeats:
+// last-key-wins means it could be hiding a conflicting id.
+func TestRepairRefusesWhenAnotherRowHasUnreadableIdentity(t *testing.T) {
+	unrelated := `{"id": "other-row", "sender": "a", "recipient": "b", "subject": "s", ` +
+		`"read": false, "body": "first", "body": "twice", "timestamp": "2026-09-11T10:47:09Z"}`
+	for _, act := range []bool{false, true} {
+		mb, path := mailboxWith(t, unrelated, legacyRow)
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqBefore, seqExisted := readSeqState(t, path)
+
+		req := RepairRequest{ID: "host-81751-1789141629774"}
+		if act {
+			req.Act, req.Actor, req.Fingerprint = true, "op", sha256Hex(legacyRow)
+		}
+		if _, err := mb.RepairMalformedRow(context.Background(), req); !errors.Is(err, ErrRepairUnrelatedCorruption) {
+			t.Fatalf("act=%v: a duplicate-key row elsewhere did not refuse the repair: %v", act, err)
+		}
+		assertNoRepairSideEffects(t, path, before, seqBefore, seqExisted)
 	}
+}
+
+// The target's own precise refusals must survive the whole-mailbox check: a
+// stale fingerprint is still reported as a stale fingerprint, not as generic
+// corruption somewhere in the file.
+func TestTargetRefusalsTakePrecedenceOverUnrelatedCorruption(t *testing.T) {
+	truncated := `{"id": "other-row", "sender": "x", "timestamp": "2026-09-1`
+	privileged := `{"id": "priv-1", "sender": "control", "recipient": "orchestrator", "subject": "s", ` +
+		`"body": "b", "signature": "abc123", "timestamp": "2026-09-11T10:47:09.000000-0500"}`
+	t.Run("privileged target", func(t *testing.T) {
+		mb, _ := mailboxWith(t, truncated, privileged)
+		if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+			ID: "priv-1", Fingerprint: sha256Hex(privileged), Act: true, Actor: "op",
+		}); !errors.Is(err, ErrRepairPrivileged) {
+			t.Fatalf("the privileged refusal was replaced by a generic one: %v", err)
+		}
+	})
+	t.Run("stale fingerprint", func(t *testing.T) {
+		mb, _ := mailboxWith(t, truncated, legacyRow)
+		if _, err := mb.RepairMalformedRow(context.Background(), RepairRequest{
+			ID: "host-81751-1789141629774", Fingerprint: sha256Hex("not the row"), Act: true, Actor: "op",
+		}); !errors.Is(err, ErrRepairStale) {
+			t.Fatalf("the stale-fingerprint refusal was replaced by a generic one: %v", err)
+		}
+	})
 }
 
 func TestRepairRefusesUnsupportedDefect(t *testing.T) {
@@ -1264,17 +1359,56 @@ func TestRepairRefusesDuplicateIDRowWhoseLastIDIsAnother(t *testing.T) {
 // A duplicate-key row that merely MENTIONS the target in its body is unrelated.
 // It must neither be touched nor block a legitimate repair, which a raw
 // substring match on the line would have got wrong.
-func TestUnrelatedDuplicateKeyRowDoesNotBlockARepair(t *testing.T) {
-	unrelated := `{"id": "other-row", "sender": "a", "recipient": "b", "subject": "s", ` +
-		`"read": false, "body": "mentions host-81751-1789141629774 in passing", ` +
-		`"body": "twice", "timestamp": "2026-09-11T10:47:09Z"}`
-	mb, path := mailboxWith(t, unrelated, legacyRow)
+// The counterpart to the two refusals: a mailbox whose other rows are ordinary
+// still repairs, including a row whose BODY mentions the target id. Without
+// this the refusals above could be satisfied by a repair that never works.
+func TestWellFormedUnrelatedRowsAndBodyMentionsStillRepair(t *testing.T) {
+	mention := `{"id":"other-row","seq":1,"sender":"a","recipient":"b","subject":"s",` +
+		`"body":"mentions host-81751-1789141629774 in passing","read":false,` +
+		`"timestamp":"2026-09-11T10:47:09Z"}`
+	plain := goodRow(t, "plain-row", "someone-else", 2)
+
+	mb, path := mailboxWith(t, mention, legacyRow, plain)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	plan, err := actOnLegacyRow(t, mb)
 	if err != nil || plan == nil || !plan.Applied {
-		t.Fatalf("an unrelated duplicate-key row blocked a valid repair: plan=%+v err=%v", plan, err)
+		t.Fatalf("ordinary unrelated rows blocked a valid repair: plan=%+v err=%v", plan, err)
 	}
-	data, _ := os.ReadFile(path)
-	if !strings.Contains(string(data), unrelated) {
-		t.Fatal("the unrelated duplicate-key row was modified")
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both unrelated rows must survive byte-for-byte.
+	for _, row := range []string{mention, plain} {
+		if !bytes.Contains(after, []byte(row)) {
+			t.Fatalf("an unrelated row was modified by the repair: %q", row)
+		}
+	}
+	if bytes.Contains(after, []byte(legacyRow)) {
+		t.Fatal("the target row was not replaced")
+	}
+	// Framing is still preserved around the replacement.
+	idx := bytes.Index(before, []byte(legacyRow))
+	if idx < 0 {
+		t.Fatal("fixture does not contain the target row")
+	}
+	if !bytes.Equal(before[:idx], after[:idx]) {
+		t.Fatal("bytes before the target row changed")
+	}
+	if !bytes.HasSuffix(after, before[idx+len(legacyRow):]) {
+		t.Fatal("bytes after the target row changed")
+	}
+}
+
+// Blank framing is not corruption and must not refuse.
+func TestBlankLinesAreNotTreatedAsCorruption(t *testing.T) {
+	plain := goodRow(t, "plain-row", "someone-else", 2)
+	mb, _ := rawMailbox(t, plain+"\n\n"+legacyRow+"\n\n\n")
+	plan, err := actOnLegacyRow(t, mb)
+	if err != nil || plan == nil || !plan.Applied {
+		t.Fatalf("blank framing was treated as corruption: plan=%+v err=%v", plan, err)
 	}
 }

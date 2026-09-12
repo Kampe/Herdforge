@@ -99,7 +99,19 @@ var (
 	// keeps only the last value, so normalizing such a row would silently
 	// discard an original the operator never saw.
 	ErrRepairDuplicateKeys = errors.New("mail repair: row carries repeated top-level keys")
+	// ErrRepairUnrelatedCorruption fires when some OTHER row in the mailbox is
+	// malformed or has unreadable identity. Repairing beside it would report
+	// success while every strict reader stayed blocked, and that row may itself
+	// hold a conflicting identity nobody can read.
+	ErrRepairUnrelatedCorruption = errors.New("mail repair: another row in the mailbox is malformed or has unreadable identity")
 )
+
+// unrelatedCorruptionError names where the trouble is and what class it is,
+// never what the other row contains.
+func unrelatedCorruptionError(found []string) error {
+	return fmt.Errorf("%w: %d row(s) must be resolved first (%s)",
+		ErrRepairUnrelatedCorruption, len(found), strings.Join(found, "; "))
+}
 
 // envelopeJSONKeys is every key the Envelope encoder can round-trip. A row
 // carrying anything else cannot be re-encoded without silently dropping that
@@ -225,8 +237,23 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 			lines[i] = string(data[sp.start:sp.end])
 		}
 
+		// The mailbox as a whole must be legible before one row of it is
+		// rewritten. A repair that succeeds beside a truncated row leaves every
+		// strict reader still blocked while reporting success, and that other
+		// row may itself carry a conflicting identity nobody can read. So any
+		// row that is neither blank, nor a well-formed envelope, nor the target
+		// refuses the whole operation — in report mode as well as act, and
+		// before any sequence is reserved, any record written or any byte
+		// changed.
 		targetIdx := -1
 		malformedHits := 0
+		var otherBad []string
+		noteBad := func(i int, why string) {
+			// Line number and class only. The other row's payload is not this
+			// operation's to disclose.
+			otherBad = append(otherBad, fmt.Sprintf("line %d: %s", i+1, why))
+		}
+
 		for i, line := range lines {
 			if len(line) == 0 {
 				continue
@@ -245,8 +272,9 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 						return fmt.Errorf("%w: a row carrying id %q repeats top-level key %q, so which value to keep is ambiguous",
 							ErrRepairDuplicateKeys, req.ID, dupKey)
 					}
-					// An unrelated duplicate-key row is left strictly alone and
-					// must not block a legitimate repair elsewhere.
+					// Last-key-wins means this row's identity is unreadable, so
+					// it could be hiding a conflicting one.
+					noteBad(i, fmt.Sprintf("repeated top-level key %q", dupKey))
 					continue
 				}
 			}
@@ -258,23 +286,31 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 					// malformed twin would create a duplicate delivery.
 					return fmt.Errorf("%w: a well-formed row already carries id %q", ErrRepairAmbiguous, req.ID)
 				}
+				// An ordinary unrelated row, including one whose body merely
+				// mentions the target id. Left exactly as it is.
 				continue
 			}
-			if !isObject || len(scan.IDs) != 1 || scan.IDs[0] != req.ID {
+			if isObject && len(scan.IDs) == 1 && scan.IDs[0] == req.ID {
+				malformedHits++
+				targetIdx = i
 				continue
 			}
-			malformedHits++
-			targetIdx = i
+			if !isObject {
+				noteBad(i, "not a complete JSON object")
+				continue
+			}
+			noteBad(i, "not a well-formed envelope")
 		}
 		if malformedHits > 1 {
 			return fmt.Errorf("%w: %d malformed rows carry id %q", ErrRepairAmbiguous, malformedHits, req.ID)
 		}
+
+		// Target-specific refusals stay precise and take precedence; only then
+		// is the rest of the mailbox reported.
 		if targetIdx < 0 {
-			// The row may be present but so damaged that its id cannot be read
-			// as JSON at all. Say that precisely instead of "not found", while
-			// still refusing: a row we cannot parse is a row we must not
-			// rewrite. This branch only ever produces a better refusal.
-			unparseable := 0
+			// A row too damaged to parse may BE the target with its identity
+			// unreadable. Substring is a heuristic and is used only to choose
+			// the clearer refusal, never to select a row to act on.
 			for _, line := range lines {
 				if len(line) == 0 || !strings.Contains(line, req.ID) {
 					continue
@@ -284,18 +320,14 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 					continue
 				}
 				if rawObjectID(line) == "" {
-					unparseable++
+					return fmt.Errorf("%w: a row mentioning %q is present but does not parse as a JSON object, so only its bytes are recoverable", ErrRepairUnsupported, req.ID)
 				}
 			}
-			switch {
-			case unparseable == 1:
-				return fmt.Errorf("%w: a row mentioning %q is present but does not parse as a JSON object, so only its bytes are recoverable", ErrRepairUnsupported, req.ID)
-			case unparseable > 1:
-				return fmt.Errorf("%w: %d unparseable rows mention %q", ErrRepairAmbiguous, unparseable, req.ID)
+			if len(otherBad) > 0 {
+				return unrelatedCorruptionError(otherBad)
 			}
 			return fmt.Errorf("%w: %q", ErrRepairNotFound, req.ID)
 		}
-
 		original := lines[targetIdx]
 		originalHash := sha256OfLine(original)
 		if fp := strings.TrimSpace(req.Fingerprint); fp != "" && !strings.EqualFold(fp, originalHash) {
@@ -308,6 +340,16 @@ func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*R
 		repaired, rawTimestamp, ts, err := buildRepairedEnvelope(original)
 		if err != nil {
 			return err
+		}
+
+		// The rest of the mailbox is checked LAST among the refusals, so a
+		// problem with the target itself — stale fingerprint, privileged
+		// envelope, unsupported defect, ambiguous identity — is still reported
+		// as precisely as before rather than being replaced by a generic
+		// "something else is broken". It is still checked before anything is
+		// reserved, recorded or written, so nothing has moved on either side.
+		if len(otherBad) > 0 {
+			return unrelatedCorruptionError(otherBad)
 		}
 
 		nextSeq, err := m.peekNextSequence()
