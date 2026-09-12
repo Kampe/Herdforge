@@ -99,9 +99,15 @@ jobs:
       # Finite and explicit. The driver bounds each compile and each serial
       # package run itself; this is the outer ceiling so a wedged step cannot
       # hold a runner. Five mutants, each one compile plus one anchored run,
-      # plus two package baselines and two restored runs, all serial. The
-      # subprocess CLI fixtures are deliberately outside its selectors: they
-      # build the whole binary, and the ordinary test job already runs them.
+      # plus two package baselines and two restored runs, all serial.
+      #
+      # Scope, stated at its real strength: the subprocess CLI fixtures are
+      # deliberately outside this driver's selectors because they build the
+      # whole binary, so the step above remains the required executor for them.
+      # In particular the end-to-end shared-deadline claim is carried by
+      # TestProcessCLIHungPanesStopAtTheSweepDeadline in `make test-unit`, not
+      # here: this driver's sweep-context control proves only the inter-pane
+      # check, against an in-memory helper with the transport stubbed out.
       - name: Verify process digest guard controls
         timeout-minutes: 45
         run: |

@@ -134,11 +134,25 @@ suites=(
 )
 
 # ---------------------------------------------------------------------------
-# Controls. Five independent guards, each the subject of a review finding:
+# Controls. Five independent guards, each the subject of a review finding.
 #
-#   real-roster-wiring     the digest reads the LIVE roster, not a demo or an
-#                          empty result that exits 0
-#   shared-sweep-deadline  ONE context bounds the whole sweep
+# What each one ACTUALLY proves, stated at its real strength:
+#
+#   real-roster-wiring     the digest reads the LIVE roster, not a demo record
+#                          or an empty result that still exits 0
+#   sweep-context-checked-between-panes
+#                          the sweep consults its context BETWEEN panes. That
+#                          is the whole claim. It does NOT prove the same
+#                          context reaches each pane read, because the killer
+#                          is an in-memory helper test with the transport
+#                          stubbed out. The end-to-end claim -- one shared
+#                          deadline bounding the roster read and every pane
+#                          read of a real child -- is carried by
+#                          TestProcessCLIHungPanesStopAtTheSweepDeadline, a
+#                          subprocess fixture that this driver deliberately
+#                          excludes and that the ordinary CI test job runs.
+#                          That test remains required; this control is not a
+#                          substitute for it.
 #   finite-transport-bytes reads are capped at the process boundary
 #   error-envelope-closed  a transport error envelope fails closed
 #   partial-truncation     a tail this sweep cut makes the digest incomplete
@@ -147,7 +161,7 @@ suites=(
 # ---------------------------------------------------------------------------
 mutations=(
 "real-roster-wiring${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}	agents, err := processAgentList(ctx)${sep}	agents, err := []herdr.AgentEntry(nil), error(nil) // MUTANT: empty result instead of the live roster${sep}TestProcessDigestReportsEveryRealPaneIdentity${sep}want 3 items, got 0"
-"shared-sweep-deadline${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}		if ctxErr := ctx.Err(); ctxErr != nil {${sep}		if ctxErr := error(nil); ctxErr != nil { // MUTANT: sweep context ignored between panes${sep}TestProcessDigestCanceledSweepStopsAndReportsPartial${sep}a canceled sweep still issued"
+"sweep-context-checked-between-panes${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}		if ctxErr := ctx.Err(); ctxErr != nil {${sep}		if ctxErr := error(nil); ctxErr != nil { // MUTANT: sweep context ignored between panes${sep}TestProcessDigestCanceledSweepStopsAndReportsPartial${sep}a canceled sweep still issued"
 "partial-truncation${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}				result.Partial = true
 				note := fmt.Sprintf(\"%s: pane tail truncated to %d bytes by this sweep\", agent.Name, limits.MaxTailBytes)${sep}				note := fmt.Sprintf(\"%s: pane tail truncated to %d bytes by this sweep\", agent.Name, limits.MaxTailBytes) // MUTANT: a cut tail no longer makes the sweep partial${sep}TestProcessDigestCapsPaneTextBeforeClassification${sep}a sweep-truncated tail left the digest claiming to be complete"
 "finite-transport-bytes${sep}pkg/herdr/read_bounded.go${sep}./pkg/herdr/${sep}	remaining := w.limit - w.buf.Len()${sep}	remaining := len(p) // MUTANT: byte bound removed, every write is accepted${sep}TestCappedWriterBoundsAndStopsOnce${sep}bytes past a limit of 8"
