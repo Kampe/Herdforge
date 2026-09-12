@@ -131,3 +131,4 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl
 .herd/review-ledger.jsonl.*
 .herd/harvest-queue.jsonl.*
+.verify-bounds-logs/

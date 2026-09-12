@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -388,6 +389,11 @@ func runMailInbox(mode string, args []string) {
 	fs := flag.NewFlagSet("mail "+mode, flag.ContinueOnError)
 	recipient := fs.String("recipient", "", "inbox recipient")
 	mailPath := fs.String("mail", "", "mailbox path override")
+	// Additive paging. Passing either flag opts INTO the bounded object
+	// response; an unflagged call keeps the exact array it always returned.
+	afterCursor := fs.String("after-cursor", "", "resume after an opaque cursor from a previous page")
+	limit := fs.Int("limit", 0, "maximum records to retain in one page (enables bounded mode)")
+	maxBytes := fs.Int("max-bytes", 0, "maximum encoded bytes to retain in one page")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -399,6 +405,29 @@ func runMailInbox(mode string, args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, err)
 		os.Exit(1)
+	}
+	if req := (boundedInboxRequest{
+		Active:   strings.TrimSpace(*afterCursor) != "" || *limit > 0 || *maxBytes > 0,
+		Cursor:   strings.TrimSpace(*afterCursor),
+		Limit:    *limit,
+		MaxBytes: *maxBytes,
+	}); req.Active {
+		if req.Limit <= 0 {
+			req.Limit = defaultBoundedLimit
+		}
+		if req.MaxBytes <= 0 {
+			req.MaxBytes = defaultBoundedMaxBytes
+		}
+		resp, berr := readBoundedInbox(context.Background(), mail.NewMailbox(path), strings.TrimSpace(*recipient), req)
+		if berr != nil {
+			fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, berr)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+			fmt.Fprintf(os.Stderr, "mail %s: encode response: %v\n", mode, err)
+			os.Exit(1)
+		}
+		return
 	}
 	result, err := mail.NewMailbox(path).ReadInboxStatus(strings.TrimSpace(*recipient))
 	if err != nil {
