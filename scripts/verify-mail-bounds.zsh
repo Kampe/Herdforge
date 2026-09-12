@@ -276,15 +276,18 @@ sep=$'\x1f'
 sep=$'\x1f'
 mutations=(
 "limit-not-enforced${sep}${source_rel}${sep}		if len(page.Envelopes) >= opts.Limit || page.Bytes+size > opts.MaxBytes {${sep}		if false { // MUTANT: limit and byte budget ignored${sep}TestBoundedInboxByteBudgetBindsOnSerializedSize${sep}near-boundary page"
-"cursor-recipient-unbound${sep}${source_rel}${sep}	if string(decoded) != recipient {${sep}	if false { // MUTANT: cursor recipient binding dropped${sep}TestBoundedInboxRejectsUnusableCursors${sep}was accepted"
+"cursor-recipient-unbound${sep}${source_rel}${sep}	if string(decoded) != recipient {${sep}	if false && string(decoded) != recipient { // MUTANT: cursor recipient binding dropped${sep}TestBoundedInboxRejectsUnusableCursors${sep}was accepted"
 "cursor-storage-unbound${sep}${source_rel}${sep}	if cur.Source != \"\" && cur.Source != want {${sep}	if false { // MUTANT: cursor storage binding dropped${sep}TestBoundedControlBindsTheMailboxItOpens${sep}shares its prefix"
-"resume-position-unchecked${sep}${source_rel}${sep}	if !resumeChecked {${sep}	if false { // MUTANT: missing resume position accepted${sep}TestBoundedInboxRejectsEmptiedStores${sep}accepted a live cursor"
-"unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence <= maxSeen {${sep}		if false { // MUTANT: unordered and duplicate sequences accepted${sep}TestBoundedInboxRefusesDuplicateIdentities${sep}would be lost"
+"resume-position-unchecked${sep}${source_rel}${sep}	if !resumeChecked {${sep}	if false && !resumeChecked { // MUTANT: missing resume position accepted${sep}TestBoundedInboxRejectsEmptiedStores${sep}accepted a live cursor"
+"unordered-storage-accepted${sep}${source_rel}${sep}		if sawAny && env.Sequence <= maxSeen {${sep}		if false && sawAny && env.Sequence <= maxSeen { // MUTANT: unordered and duplicate sequences accepted${sep}TestBoundedInboxRefusesDuplicateIdentities${sep}would be lost"
 "late-scan-abandoned${sep}${source_rel}${sep}		if page.Truncated {
 			continue
 		}${sep}		if page.Truncated {
 			break // MUTANT: stop scanning once the page is full
 		}${sep}TestBoundedInboxQuarantinesMalformedRowPastAFullPage${sep}past the page boundary was never quarantined"
+"late-scan-abandoned-at-fill${sep}${source_rel}${sep}			page.Truncated = true
+			continue${sep}			page.Truncated = true
+			break // MUTANT: abandon the scan the moment the page fills${sep}TestBoundedInboxQuarantinesMalformedRowPastAFullPage${sep}past the page boundary was never quarantined"
 "oversized-record-skipped${sep}${source_rel}${sep}		if size > opts.MaxBytes {${sep}		if false { // MUTANT: oversized record silently skipped${sep}TestBoundedInboxOversizedRecordFailsInsteadOfStalling${sep}oversized record produced a page instead of an error"
 "prefix-watermark-unchecked${sep}${source_rel}${sep}				if cur.ControlAnchor != watermark {${sep}				if false { // MUTANT: consumed prefix not verified${sep}TestBoundedInboxDetectsChangedPrefixBehindAnUnchangedFirstRecord${sep}resumed silently behind an unchanged first record"
 "binding-omission-allowed${sep}${source_rel}${sep}	if strings.TrimSpace(opts.FeedbackDir) == \"\" {${sep}	if false { // MUTANT: missing paired feedback storage tolerated${sep}TestBoundedControlRejectsOmittedBindings${sep}paired feedback storage was accepted"
