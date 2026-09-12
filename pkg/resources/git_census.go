@@ -456,7 +456,17 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 		}
 		windowLimit = limit
 		windowStart = e.WindowStart(len(lanes))
-		if windowStart < 0 || windowStart >= len(lanes) {
+		switch {
+		case windowStart < 0:
+			// A negative cursor is corrupt persisted state, not a position.
+			// Reducing it would NOT bring it into range: Go's % keeps the
+			// dividend's sign, so -5 % 16 stays -5 and the selection below
+			// indexes lanes[-5] and panics. The deterministic policy is to
+			// start at the ring's head: the sweep still makes progress, every
+			// lane remains reachable, and the advance at the end writes a
+			// sane cursor back over the corrupt one.
+			windowStart = 0
+		case windowStart >= len(lanes):
 			windowStart %= len(lanes)
 		}
 		for offset := 0; offset < limit; offset++ {
@@ -552,6 +562,23 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 				break
 			}
 		}
+		// This lane is now EXAMINED, and the cursor accounts for examination
+		// rather than for success.
+		//
+		// Counting at the end of the body instead made the cursor a count of
+		// lanes that completed the whole pipeline, and eight paths below leave
+		// early with a conservative unknown state: unreadable realpath, stat,
+		// git status (absent or failed), merge state, missing lease evidence,
+		// process evidence, and lifecycle evidence. A window whose lanes all
+		// took one of those advanced the cursor by nothing, so the next sweep
+		// selected the same slice, failed the same way, and the fleet could
+		// starve on an unprovable window forever.
+		//
+		// Everything that must NOT count is already excluded above: an
+		// unselected lane continues before this point, and a cancelled sweep
+		// breaks before it, so a lane the sweep never looked at is never
+		// charged to the cursor.
+		accounted++
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "worktree_realpath_unavailable"
@@ -628,14 +655,13 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 		default:
 			lanes[i].State = LaneIdle
 		}
-		accounted++
 	}
-	// The cursor advances only by the lanes actually accounted: a window
-	// that ran to completion advances its full width, a sweep truncated by
-	// cancellation advances exactly the examined prefix so the unexamined
-	// remainder is re-processed next sweep instead of skipped. A failed
-	// persistence write is recorded as a partial diagnostic and never
-	// changes any lane's evidence or eligibility.
+	// The cursor advances by the lanes actually EXAMINED: a window whose
+	// selected lanes were all reached advances its full width whatever each
+	// lane concluded, and a sweep truncated by cancellation advances exactly
+	// the examined prefix so the unexamined remainder is re-processed next
+	// sweep instead of skipped. A failed persistence write is recorded as a
+	// partial diagnostic and never changes any lane's evidence or eligibility.
 	if accounted > windowLimit {
 		accounted = windowLimit
 	}
