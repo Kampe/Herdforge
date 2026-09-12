@@ -55,10 +55,25 @@ summary=$run_dir/summary.txt
 
 work=""
 work_owned=0
+work_add_started=0
 cleanup_failed=0
 
 cleanup() {
 	local code=$?
+	# RESIDUAL, stated rather than papered over: ownership is only claimed AFTER
+	# `git worktree add` returns success. If that command fails part way it may
+	# already have created the directory, administrative metadata under
+	# .git/worktrees, or both, and this script does not own or remove any of it.
+	#
+	# That is deliberate. A partial add is exactly the case where the script
+	# cannot tell what it made from what was already there, and deleting under
+	# that uncertainty is how a cleanup routine destroys someone else's
+	# checkout. It reports the path and leaves it; an operator or `git worktree
+	# prune` resolves it with more context than this script has.
+	if (( work_add_started )) && ! (( work_owned )) && [[ -n "$work" ]]; then
+		print -u2 "warning: 'git worktree add' did not complete; a PARTIAL checkout and/or administrative metadata may exist at $work and is deliberately left untouched"
+		print -r -- 'cleanup SKIPPED: worktree creation did not complete; a partial checkout may remain (see stderr for its path). Nothing was deleted.' >> "$summary"
+	fi
 	# Only the checkout THIS invocation created, and only once its creation
 	# succeeded. No blind fallback deletion, and no global prune: other
 	# worktrees and their metadata are not ours to touch.
@@ -90,6 +105,7 @@ work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/verify-mail-repair-XXXXXX")
 # mktemp made the directory; `git worktree add` needs the path absent. rmdir
 # refuses a non-empty directory, which is the guard we want.
 rmdir -- "$work"
+work_add_started=1
 git -C "$repo_root" worktree add --detach --quiet -- "$work" "$pin"
 work_owned=1
 
@@ -172,14 +188,41 @@ test_emitted() {
 		"$events" --arg t "$test_name" --arg a "$action" --arg w "$want"
 }
 
+# read_source returns the file's contents, or fails loudly. An unreadable
+# source must never be indistinguishable from an empty one: `|| true` on a read
+# turns "I could not look" into "I looked and saw nothing".
+read_source() {
+	local file=$1 content
+	[[ -r "$file" ]] || { print -u2 "error: cannot read $file"; return 2; }
+	content=$(<"$file") || { print -u2 "error: failed reading $file"; return 2; }
+	[[ -n "$content" ]] || { print -u2 "error: $file is empty"; return 2; }
+	print -r -- "$content"
+}
+
+# count_literal counts LITERAL OCCURRENCES, not matching lines.
+#
+# grep -F -c counts lines, so two copies of an anchor on one line report 1 —
+# and ${content//anchor/replacement} would then replace BOTH while the guard
+# said the anchor was unique. Occurrences and lines are different numbers and
+# only one of them is the safety property.
+count_literal() {
+	local anchor=$1 content=$2 rest=$2 n=0
+	[[ -n "$anchor" ]] || { print -u2 'error: empty anchor'; return 2; }
+	while [[ "$rest" == *"$anchor"* ]]; do
+		(( n += 1 ))
+		rest=${rest#*"$anchor"}
+	done
+	print -r -- "$n"
+}
+
 patch_source() {
-	local anchor=$1 replacement=$2 file=$work/$source_rel found content mutated
-	found=$(grep -F -c -- "$anchor" "$file" || true)
+	local anchor=$1 replacement=$2 file=$work/$source_rel content found mutated
+	content=$(read_source "$file") || return 2
+	found=$(count_literal "$anchor" "$content") || return 2
 	if [[ "$found" != 1 ]]; then
-		print -u2 "error: anchor matched ${found:-0} times, want exactly 1 (source drifted): $anchor"
+		print -u2 "error: anchor occurs $found time(s), want exactly 1 (source drifted): $anchor"
 		return 1
 	fi
-	content=$(<"$file")
 	print -r -- "${content//"$anchor"/"$replacement"}" >| "$file"
 	mutated=$(git -C "$work" hash-object -- "$source_rel")
 	[[ "$mutated" != "$pristine" ]] || { print -u2 'error: mutation did not change the source'; return 1; }
@@ -256,14 +299,61 @@ else
 	note "report ${run_dir:t} (under VERIFY_MAIL_REPAIR_REPORT_DIR, outside the repository)"
 fi
 
-# selected_tests counts distinct named tests that actually reported a result.
-# `go test -run` exits 0 when its pattern matches NOTHING, so a selector that
-# has drifted away from the suite would make the baseline, and every later
-# comparison against it, pass on an empty run.
-selected_tests() {
-	jq -s -r '[.[] | select(.Action == "pass" or .Action == "fail")
-		| (.Test // "") | select(. != "" and (contains("/") | not))] | unique | length' \
-		-- "$1" 2>/dev/null
+# required_tests is every identity a run must PROVE it executed: each mutant's
+# killer, plus the positive controls that show a repair still works.
+#
+# A count is not an identity. Eight unrelated repair tests passing says nothing
+# about whether THIS killer ran, and a required test that was skipped or
+# renamed away would leave the count intact while the control it anchors
+# silently stopped existing. The selector already knows these names, so the
+# baseline checks for them by name.
+required_tests=(
+	# killers, one per mutant below
+	TestRepairRefusesStaleFingerprint
+	TestRepairRefusesConflictingQuarantinedOriginals
+	TestRepairRefusesWhenAnotherRowIsMalformed
+	TestRepairRefusesDuplicateKeyRowEvenWhenARepairableRowExists
+	TestRepairRefusesPrivilegedSignedControlMessage
+	TestRepairAuditRecordsPrepareBeforeResult
+	TestRepairFailsClosedWhenReadbackMismatches
+	TestRepairFailsWhenCompletionRecordCannotBeWritten
+	# positive controls: a suite of refusals alone cannot show a repair works
+	TestRepairNormalizesLegacyOffsetAndAssignsSequence
+	TestRepairedRowIsVisibleToDedupeScan
+	TestRepairAppliesWhenTheWriterIsFaithful
+	TestWellFormedUnrelatedRowsAndBodyMentionsStillRepair
+	TestAppendLineWriteSurvivesAFailedSync
+)
+
+# assert_required_identities proves, by name, that every required test reported
+# a top-level PASS and that none of them (or their subtests) was skipped.
+assert_required_identities() {
+	local events=$1 label=$2 name missing=0 probe
+	if ! events_valid "$events"; then
+		note "$label: event stream did not parse - no identity can be read from it"
+		return 1
+	fi
+	for name in "${required_tests[@]}"; do
+		probe=0; test_emitted "$events" "$name" skip || probe=$?
+		case $probe in
+			0) note "$label: required test $name was SKIPPED - a skipped control is not a control"; (( missing += 1 )); continue ;;
+			2) note "$label: could not read events while checking $name"; return 1 ;;
+		esac
+		# Exact top-level pass, not a subtest and not a prefix match.
+		probe=0
+		jq_predicate 'any(.[]; .Action == "pass" and ((.Test // "") == $t))' \
+			"$events" --arg t "$name" || probe=$?
+		case $probe in
+			1) note "$label: required test $name did not report a top-level PASS"; (( missing += 1 )) ;;
+			2) note "$label: could not read events while checking $name"; return 1 ;;
+		esac
+	done
+	if (( missing > 0 )); then
+		note "$label: $missing of ${#required_tests[@]} required identities were absent or skipped"
+		return 1
+	fi
+	note "$label: all ${#required_tests[@]} required identities passed"
+	return 0
 }
 
 baseline_exit=$(run_focused "$test_run" "$run_dir/baseline.json" "$run_dir/baseline.err")
@@ -271,12 +361,8 @@ if (( baseline_exit != 0 )); then
 	note "baseline FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
 	exit 1
 fi
-baseline_tests=$(selected_tests "$run_dir/baseline.json")
-if [[ "$baseline_tests" != <-> ]] || (( baseline_tests < ${#mutations[@]} )); then
-	note "baseline selector matched ${baseline_tests:-0} top-level tests, want at least ${#mutations[@]} - an empty or drifted selection cannot be a baseline"
-	exit 1
-fi
-note "baseline PASS ($baseline_tests top-level tests)"
+assert_required_identities "$run_dir/baseline.json" 'baseline' || exit 1
+note 'baseline PASS'
 
 failures=0
 index=0
@@ -313,12 +399,10 @@ if (( restored_exit != 0 )); then
 	note "restored baseline FAILED (exit $restored_exit) - the source did not come back clean"
 	exit 1
 fi
-restored_tests=$(selected_tests "$run_dir/restored.json")
-if [[ "$restored_tests" != "$baseline_tests" ]]; then
-	note "restored baseline ran ${restored_tests:-0} top-level tests, baseline ran $baseline_tests - the restored run is not the same measurement"
-	exit 1
-fi
-note "restored baseline PASS ($restored_tests top-level tests)"
+# The restored run must prove the SAME identities, not merely the same count:
+# it is the evidence that the mutants were undone and the guards are back.
+assert_required_identities "$run_dir/restored.json" 'restored baseline' || exit 1
+note 'restored baseline PASS'
 
 if (( failures > 0 )); then
 	note "$failures of ${#mutations[@]} controls did not kill their mutant"

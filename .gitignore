@@ -131,3 +131,7 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl
 .herd/review-ledger.jsonl.*
 .herd/harvest-queue.jsonl.*
+
+# FAC-824: operational artifacts from scripts/verify-mail-repair-guards.zsh.
+# The driver is checked in, so running it must not dirty a working tree.
+.verify-mail-repair-logs/

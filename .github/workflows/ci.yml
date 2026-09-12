@@ -94,7 +94,12 @@ jobs:
       # bearing, so this step removes each one from the REAL source, in its own
       # ephemeral worktree, and requires the named test to fail on its named
       # assertion. Serial by construction: one checkout, one mutant at a time.
+      # Finite and explicit. The driver bounds each compile and each serial
+      # package run itself; this is the outer ceiling so a wedged step cannot
+      # hold a runner indefinitely. Eight mutants, each one compile plus one
+      # anchored package run, plus a baseline and a restored run, all serial.
       - name: Verify mail repair guard controls
+        timeout-minutes: 30
         run: |
           command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
           scripts/verify-mail-repair-guards.zsh
