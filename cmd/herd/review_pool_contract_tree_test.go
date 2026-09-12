@@ -318,6 +318,13 @@ func TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease(t *testing.T) {
 	if !strings.Contains(string(out), "review surface ready") {
 		t.Fatalf("expected the --no-launch ready report; output:\n%s", out)
 	}
+	// The census the pool gate decided against must be the FIXTURE's, not the
+	// runner's. The gate prints mem_available from the same observation the
+	// post-admission arms read, so this one assertion proves the seam reached
+	// every one of them rather than only the admission.
+	if !strings.Contains(string(out), "mem_available=49152MiB") {
+		t.Fatalf("the capacity gate did not decide against the pinned fixture census; output:\n%s", out)
+	}
 
 	// The surface exists, is a symlink, and resolves to a pool slot pinned at
 	// the exact candidate.

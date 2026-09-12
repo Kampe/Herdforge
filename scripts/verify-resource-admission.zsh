@@ -12,28 +12,28 @@
 # A compile error, a timeout, a skip, or an unrelated assertion is not a kill.
 # Counting any of them is how a vacuous control passes.
 #
-# UNKNOWN is covered at the CONSUMER, and left unverified INSIDE resources.Decide.
-# These are different claims and the driver keeps them apart.
+# UNKNOWN is targeted at the CONSUMER and left unverified INSIDE
+# resources.Decide. They are different claims and the driver keeps them apart.
+# Neither is proof until the control compiles and its killer fails in CI.
 #
-# Consumer (proven): the pool gate must refuse a host whose readings are
-# UNKNOWN. The fixture host "not-a-known-host" produces UNKNOWN cpu and memory
-# readings, Decide refuses on them, and neutralising the gate's one admission
-# arm lets the switch fall through to its admitting default -- so the control
-# below is a real single-site regression with a named UNKNOWN killer, and it
-# holds independently of how Decide reached the refusal.
+# Consumer (targeted, execution pending): the pool gate must refuse a host whose
+# readings are UNKNOWN. The fixture host "not-a-known-host" produces UNKNOWN cpu
+# and memory readings, Decide refuses on them, and the gate's one admission arm
+# is all that acts on that -- neutralised, the switch falls through to its
+# admitting default. A single-site regression with a named UNKNOWN killer, and
+# it holds however Decide reached the refusal.
 #
-# Internals (unverified, deliberately): a genuinely UNKNOWN reading is refused
-# at three independent sites inside Decide -- checkReading rejects the posture,
+# Internals (unverified, deliberately): a genuinely UNKNOWN reading is refused at
+# three independent sites inside Decide -- checkReading rejects the posture,
 # freshness.Value reports ok=false, and the zero value then fails
 # Usable/normalizedFrom. No single compiling mutation admits one there, and a
 # three-site mutation would not resemble any plausible regression, so that
 # clause stays explicitly unverified rather than covered by a fabricated kill.
 # The unmeasured-host-not-alert control pins the reporting half only.
 #
-# The pool-side controls depend on the enforced positive baseline: the later
-# PSI, swap and headroom arms read the RUNNER's own census, and
-# TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease passing proves none
-# of them is firing, which is what makes the fall-through causal.
+# The pool-side controls do not depend on runner load: the herdfixture census
+# seam pins the PSI, swap and headroom inputs those arms read, so a mutant
+# cannot be refused by a busy runner instead of by the guard under test.
 #
 # All mutation happens in one ephemeral detached worktree this invocation
 # creates and owns. The invoking checkout is never written to, and this script
