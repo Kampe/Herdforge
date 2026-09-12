@@ -601,19 +601,17 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	// findings (unknown lanes, duplicate realpath refusal) land on the same
 	// single record.
 	seen := make(map[string]struct{}, len(lanes))
-	unknownLanes := 0
 	for i := range lanes {
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_realpath_unavailable"
-			unknownLanes++
 			continue
 		}
 		lanes[i].Path = filepath.Clean(resolved)
 		if _, exists := seen[lanes[i].Path]; exists {
 			listStage.Cause = fmt.Sprintf("duplicate registered worktree realpath %q", lanes[i].Path)
-			listStage.Deferred = unknownLanes
+			listStage.Deferred = countUnknownLanes(lanes)
 			g.recordStage(&report, listStage)
 			report.Error = listStage.Cause
 			return report, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
@@ -649,7 +647,6 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 				}
 				lanes[j].State = LaneUnknown
 				lanes[j].PreserveReason = "census_budget_exhausted"
-				unknownLanes++
 			}
 			break
 		}
@@ -657,7 +654,6 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_allocation_unavailable"
-			unknownLanes++
 			continue
 		}
 		lanes[i].AllocatedBytes = usage.Bytes
@@ -666,7 +662,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			lanes[i].PreserveReason = "worktree_allocation_truncated"
 		}
 	}
-	listStage.Deferred = unknownLanes
+	listStage.Deferred = countUnknownLanes(lanes)
 	// The registered census's failed durable-cursor advance is a partial
 	// diagnostic on the stage (same field and contract as the orphan
 	// census's cursor): broken progress persistence must be visible without
@@ -745,6 +741,27 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	})
 	g.setConcurrency(&report)
 	return report, nil
+}
+
+// countUnknownLanes reports how many DISTINCT lanes the sweep is leaving in a
+// fail-closed unknown state.
+//
+// The stage used to carry a counter incremented at the three places this loop
+// marks a lane itself, which undercounted twice. Lanes already unknown when
+// the enumerator handed them over were never counted at all: with the rotating
+// window that is MOST of the ring on a normal sweep, every one of them
+// explicitly census_window_deferred, plus any lane the enumerator could not
+// prove. A normal windowed census therefore reported Deferred=0. Counting the
+// final states instead is inherently one-per-lane, so a lane that arrives
+// unknown and then also fails measurement still counts exactly once.
+func countUnknownLanes(lanes []RegisteredWorktree) int {
+	unknown := 0
+	for i := range lanes {
+		if lanes[i].State == LaneUnknown {
+			unknown++
+		}
+	}
+	return unknown
 }
 
 func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree, before Capacity) (orphanCensusResult, error) {
