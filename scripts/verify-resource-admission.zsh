@@ -12,13 +12,28 @@
 # A compile error, a timeout, a skip, or an unrelated assertion is not a kill.
 # Counting any of them is how a vacuous control passes.
 #
-# UNKNOWN clause: a genuinely UNKNOWN reading is refused at three independent
-# sites (checkReading rejects the posture, freshness.Value reports ok=false, and
-# the zero value then fails Usable/normalizedFrom), so no single compiling
-# mutation admits one. The control here instead pins the UNKNOWN REPORTING
-# guard: an unmeasured host must verdict ALERT, not TIGHT. The UNKNOWN REFUSAL
-# clause is therefore left explicitly unverified rather than covered by a
-# three-site mutation that would not resemble any plausible regression.
+# UNKNOWN is covered at the CONSUMER, and left unverified INSIDE resources.Decide.
+# These are different claims and the driver keeps them apart.
+#
+# Consumer (proven): the pool gate must refuse a host whose readings are
+# UNKNOWN. The fixture host "not-a-known-host" produces UNKNOWN cpu and memory
+# readings, Decide refuses on them, and neutralising the gate's one admission
+# arm lets the switch fall through to its admitting default -- so the control
+# below is a real single-site regression with a named UNKNOWN killer, and it
+# holds independently of how Decide reached the refusal.
+#
+# Internals (unverified, deliberately): a genuinely UNKNOWN reading is refused
+# at three independent sites inside Decide -- checkReading rejects the posture,
+# freshness.Value reports ok=false, and the zero value then fails
+# Usable/normalizedFrom. No single compiling mutation admits one there, and a
+# three-site mutation would not resemble any plausible regression, so that
+# clause stays explicitly unverified rather than covered by a fabricated kill.
+# The unmeasured-host-not-alert control pins the reporting half only.
+#
+# The pool-side controls depend on the enforced positive baseline: the later
+# PSI, swap and headroom arms read the RUNNER's own census, and
+# TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease passing proves none
+# of them is firing, which is what makes the fall-through causal.
 #
 # All mutation happens in one ephemeral detached worktree this invocation
 # creates and owns. The invoking checkout is never written to, and this script
@@ -323,6 +338,11 @@ classify_run() {
 # anchor2 is empty for a single-site mutation. A pair is used only where the
 # guard is genuinely defended in two places and removing one would panic or be
 # caught by the other: that is still ONE introduced regression, not two.
+#
+# Three rows share the capacity anchor on purpose. They are separate CAUSAL
+# claims -- cpu, memory pressure and UNKNOWN each reaching the pool gate -- and
+# each is bound to its own subtest, so a kill in one cannot be reported as
+# evidence for another.
 sep=$'\x1f'
 mutations=(
 "cpu-threshold-removed${sep}${admission_src}${sep}		if normalized >= limits.CPURefuseLoad {${sep}		if false { // MUTANT: cpu threshold removed${sep}${sep}${sep}${resources_pkg}${sep}TestCPUAndMemoryRefuseIndependently${sep}saturated cpu with healthy memory admitted"
@@ -332,6 +352,8 @@ mutations=(
 "unrecognized-posture-accepted${sep}${admission_src}${sep}		return fmt.Sprintf(\"%s carries an unrecognized freshness state %q; an unset posture is not an observation\", what, string(state))${sep}		return \"\" // MUTANT: unrecognised posture accepted${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an unrecognized freshness state admitted"
 "unmeasured-host-not-alert${sep}${admission_src}${sep}	if !a.cpuUsable || !a.memUsable {${sep}	if false { // MUTANT: an unmeasured host stops reporting ALERT${sep}${sep}${sep}${resources_pkg}${sep}TestUnknownObservationsRefuse${sep}want \"ALERT\" for an unmeasured host"
 "capacity-ignores-refusal${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/cpu-saturated${sep}an unsafe host must refuse the launch"
+"capacity-ignores-unknown-host${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/not-a-known-host${sep}an unsafe host must refuse the launch"
+"capacity-ignores-memory-pressure${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/memory-pressure${sep}an unsafe host must refuse the launch"
 "capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: paired, so the nil case cannot be dereferenced${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted"
 )
 
