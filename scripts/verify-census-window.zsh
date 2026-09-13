@@ -306,7 +306,7 @@ mutations=(
 			g.registeredCursorReadErr = fmt.Sprintf(\"registered census cursor read: %v\", err)
 		}${sep}		_ = errors.Is(err, os.ErrNotExist) // MUTANT: read failures are silently discarded again${sep}TestGovernorCensusNonENOENTCursorReadFailureSurvivesASuccessfulAdvance${sep}the lost durable position is invisible"
 "cursor-parse-failure-is-discarded${sep}${governor_src}${sep}		g.registeredCursorReadErr = fmt.Sprintf(\"registered census cursor parse: %v\", err)
-		return fallback${sep}		return fallback // MUTANT: an unparsable cursor is silently discarded again${sep}TestGovernorCensusCursorReadFailureSurvivesASuccessfulAdvance${sep}the lost durable position is invisible"
+		return fallback${sep}		return fallback // MUTANT: an unparsable cursor is silently discarded again${sep}TestGovernorCensusCursorReadFailureSurvivesASuccessfulAdvance/unparsable_value${sep}the lost durable position is invisible"
 )
 
 # Snapshot EVERY source a control declares, exactly once, before anything is
