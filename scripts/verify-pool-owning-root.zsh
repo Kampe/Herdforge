@@ -48,7 +48,7 @@ pool_src=pkg/worktree/pool.go
 worktree_pkg=./pkg/worktree/
 
 pool_run='TestReleaseFromAForeignCaller|TestReclaimFromAForeignCaller|TestAReassignedSlotRefuses|TestReleaseRefuses|TestReleaseKeepsTheLease'
-pool_expect='TestReleaseFromAForeignCallerResetsTheOwningSlot TestReclaimFromAForeignCallerResetsTheOwningSlot TestAReassignedSlotRefusesTheRetiredLeaseIdentity TestReleaseRefusesAnUnknownLeaseAndLeavesTheOwnerHeld TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease TestReleaseKeepsTheLeaseWhenTheSlotIsGone'
+pool_expect='TestReleaseFromAForeignCallerResetsTheOwningSlot TestReclaimFromAForeignCallerResetsTheOwningSlot TestAReassignedSlotRefusesTheRetiredLeaseIdentity TestReleaseRefusesAnUnknownLeaseAndLeavesTheOwnerHeld TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease TestReleaseKeepsTheLeaseWhenTheSlotIsGone TestRelativeConstructorAnchorsBeforeTheCallerMoves TestFixedClockMintsAUniqueIncarnationForEveryAssignment TestARecreatedSlotDoesNotResurrectARetiredIdentity'
 
 go_timeout=${VERIFY_POOL_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -162,18 +162,20 @@ run_focused() {
 	local selector=$1
 	local events=$2
 	local console=$3
+	local pkg=${4:-$worktree_pkg}
 	local rc=0
 	( cd "$work" && timeout -k 10s "${wall_timeout}s" \
 		go test -json -count=1 -p 1 -parallel 1 -timeout "${go_timeout}s" \
-		-run "$selector" "$worktree_pkg" ) >"$events" 2>"$console" || rc=$?
+		-run "$selector" "$pkg" ) >"$events" 2>"$console" || rc=$?
 	print -r -- "$rc"
 }
 
 compile_check() {
 	local log=$1
+	local pkg=${2:-$worktree_pkg}
 	local rc=0
 	( cd "$work" && timeout -k 10s "${compile_timeout}s" \
-		go test -p 1 -c -o /dev/null "$worktree_pkg" ) >"$log" 2>&1 || rc=$?
+		go test -p 1 -c -o /dev/null "$pkg" ) >"$log" 2>&1 || rc=$?
 	print -r -- "$rc"
 }
 
@@ -231,7 +233,7 @@ restore_source() {
 
 # ---------------------------------------------------------------------------
 # The controls. Fields, separated by the record separator below:
-#   name | source | anchor | replacement | killer | assertion
+#   name | source | package | anchor | replacement | killer | assertion
 #
 # The assertion is the FIRST one the killer emits under that mutant, derived
 # from the mutated control flow, not from whatever the run happens to print.
@@ -239,7 +241,7 @@ restore_source() {
 sep=$'\x1f'
 typeset -a controls
 controls=(
-"release-anchored-to-the-owning-repository${sep}${pool_src}${sep}			base := p.DefaultBase
+"release-anchored-to-the-owning-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}			base := p.DefaultBase
 			if base == \"\" {
 				base = \"origin/main\"
 			}
@@ -248,12 +250,12 @@ controls=(
 				base = \"origin/main\"
 			}
 			cmd := exec.CommandContext(ctx, \"git\", \"-C\", slot.Path, \"reset\", \"--hard\", base) // MUTANT: the stored path is resolved against the caller${sep}TestReleaseFromAForeignCallerResetsTheOwningSlot${sep}owning slot HEAD ="
-"reclaim-anchored-to-the-owning-repository${sep}${pool_src}${sep}		if out, err := exec.CommandContext(ctx, \"git\", \"-C\", slotPath, \"reset\", \"--hard\", base).CombinedOutput(); err != nil {${sep}		if out, err := exec.CommandContext(ctx, \"git\", \"-C\", slot.Path, \"reset\", \"--hard\", base).CombinedOutput(); err != nil { // MUTANT: unattended reclaim resolved against the caller${sep}TestReclaimFromAForeignCallerResetsTheOwningSlot${sep}reclaimed slot HEAD ="
-"slot-path-contained-in-the-pool-root${sep}${pool_src}${sep}	if err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel) {${sep}	if false && (err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel)) { // MUTANT: containment no longer refuses an escaping path${sep}TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease${sep}want the containment refusal"
-"slot-must-be-a-registered-worktree${sep}${pool_src}${sep}	if !registered {
+"reclaim-anchored-to-the-owning-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}		if out, err := exec.CommandContext(ctx, \"git\", \"-C\", slotPath, \"reset\", \"--hard\", base).CombinedOutput(); err != nil {${sep}		if out, err := exec.CommandContext(ctx, \"git\", \"-C\", slot.Path, \"reset\", \"--hard\", base).CombinedOutput(); err != nil { // MUTANT: unattended reclaim resolved against the caller${sep}TestReclaimFromAForeignCallerResetsTheOwningSlot${sep}reclaimed slot HEAD ="
+"slot-path-contained-in-the-pool-root${sep}${pool_src}${sep}${worktree_pkg}${sep}	if err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel) {${sep}	if false && (err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel)) { // MUTANT: containment no longer refuses an escaping path${sep}TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease${sep}want the containment refusal"
+"slot-must-be-a-registered-worktree${sep}${pool_src}${sep}${worktree_pkg}${sep}	if !registered {
 		return \"\", fmt.Errorf(\"worktree pool: slot %s path %s is not a registered worktree of this repository; refusing to reset it\", slot.Name, resolved)${sep}	if false && !registered { // MUTANT: any contained directory counts as ours
 		return \"\", fmt.Errorf(\"worktree pool: slot %s path %s is not a registered worktree of this repository; refusing to reset it\", slot.Name, resolved)${sep}TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease${sep}want the registration refusal"
-"refused-release-keeps-the-lease${sep}${pool_src}${sep}			// Anchored to the owning repository BEFORE anything destructive
+"refused-release-keeps-the-lease${sep}${pool_src}${sep}${worktree_pkg}${sep}			// Anchored to the owning repository BEFORE anything destructive
 			// runs, and refused rather than guessed. A failure here returns
 			// with the lease still held: refusing to reset is always safer
 			// than resetting a directory we have not proven is ours.
@@ -267,6 +269,8 @@ controls=(
 				_ = p.writeState(state)
 				return err
 			}${sep}TestReleaseKeepsTheLeaseWhenTheSlotIsGone${sep}a failed release cleared the lease"
+"owning-roots-canonical-before-state-access${sep}${pool_src}${sep}${worktree_pkg}${sep}	abs, err := filepath.Abs(path)${sep}	abs, err := path, error(nil) // MUTANT: the owning roots keep the caller's spelling${sep}TestRelativeConstructorAnchorsBeforeTheCallerMoves${sep}the owning slot was not the one released"
+"lease-incarnation-unique-per-assignment${sep}${pool_src}${sep}${worktree_pkg}${sep}	if n <= state.LastAssignedGeneration {${sep}	if false && n <= state.LastAssignedGeneration { // MUTANT: a fixed clock reissues a retired identity${sep}TestFixedClockMintsAUniqueIncarnationForEveryAssignment${sep}reissued the retired lease identity"
 )
 
 # ---------------------------------------------------------------------------
@@ -283,13 +287,13 @@ live_source[$pool_src]=$(<"$repo_root/$pool_src")
 for row in "${controls[@]}"; do
 	typeset -a fields
 	fields=("${(@ps:$sep:)row}")
-	if (( ${#fields} != 6 )); then
-		print -u2 "harness error: control has ${#fields} field(s), want 6: ${fields[1]:-<unnamed>}"
+	if (( ${#fields} != 7 )); then
+		print -u2 "harness error: control has ${#fields} field(s), want 7: ${fields[1]:-<unnamed>}"
 		exit 1
 	fi
-	name=$fields[1]; src=$fields[2]; anchor=$fields[3]
-	replacement=$fields[4]; killer=$fields[5]; want=$fields[6]
-	for label field in name "$name" source "$src" anchor "$anchor" replacement "$replacement" killer "$killer" assertion "$want"; do
+	name=$fields[1]; src=$fields[2]; pkg=$fields[3]; anchor=$fields[4]
+	replacement=$fields[5]; killer=$fields[6]; want=$fields[7]
+	for label field in name "$name" source "$src" package "$pkg" anchor "$anchor" replacement "$replacement" killer "$killer" assertion "$want"; do
 		if [[ -z "$field" ]]; then
 			print -u2 "harness error: control ${name:-<unnamed>} has an empty $label"
 			exit 1
@@ -352,8 +356,8 @@ failures=0
 for row in "${controls[@]}"; do
 	typeset -a fields
 	fields=("${(@ps:$sep:)row}")
-	name=$fields[1]; src=$fields[2]; anchor=$fields[3]
-	replacement=$fields[4]; killer=$fields[5]; want=$fields[6]
+	name=$fields[1]; src=$fields[2]; pkg=$fields[3]; anchor=$fields[4]
+	replacement=$fields[5]; killer=$fields[6]; want=$fields[7]
 
 	compile_log=$run_dir/$name.compile
 	events=$run_dir/$name.json
@@ -363,7 +367,7 @@ for row in "${controls[@]}"; do
 	patch_source "$src" "$anchor" "$replacement"
 	git -C "$work" diff -- "$src" >| "$mutant_diff" 2>/dev/null || true
 
-	compile_rc=$(compile_check "$compile_log")
+	compile_rc=$(compile_check "$compile_log" "$pkg")
 	if (( compile_rc != 0 )); then
 		note "BROKEN-MUTANT $name: does not compile (see $compile_log)"
 		restore_source "$src"
@@ -371,7 +375,7 @@ for row in "${controls[@]}"; do
 		continue
 	fi
 
-	rc=$(run_focused "^${killer}\$" "$events" "$console")
+	rc=$(run_focused "^${killer}\$" "$events" "$console" "$pkg")
 	restore_source "$src"
 
 	if killed_by "$events" "$killer" "$want" "$rc"; then
