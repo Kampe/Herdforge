@@ -115,6 +115,17 @@ var ErrObserverBusy = errors.New("resources: another observer holds the canonica
 // leaving an older, non-terminal report in place for a consumer to trust.
 var ErrObserverPublishFailed = errors.New("resources: observer status publication failed")
 
+// ErrObserverReadUnsupported is returned when the platform has no bounded-open
+// primitive for the status file, so the read is refused rather than attempted.
+//
+// It lives here, in shared untagged source, rather than beside either
+// implementation. Declaring it once per platform file put the same message in
+// two places, which is a duplicated rule however narrow the platforms are: the
+// two copies could drift, and a consumer matching on the text would then match
+// only one of them. What genuinely differs per platform is the capability
+// constant and the open itself, which stay in the tagged files.
+var ErrObserverReadUnsupported = errors.New("resources: reading the observer status is unsupported on this platform")
+
 // ObserverConfig is the validated shape of one observer run.
 type ObserverConfig struct {
 	Interval      time.Duration

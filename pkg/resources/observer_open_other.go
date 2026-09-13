@@ -2,18 +2,15 @@
 
 package resources
 
-import (
-	"errors"
-	"os"
-)
+import "os"
 
 // observerReadSupported says whether this platform has a bounded-open primitive
 // for the status file. Tests that exercise the read path narrow their
 // expectations with it rather than skipping wholesale.
+//
+// ErrObserverReadUnsupported is declared once in observer.go; this file returns
+// it, and no longer restates its message.
 const observerReadSupported = false
-
-// ErrObserverReadUnsupported is returned on platforms with no bounded open.
-var ErrObserverReadUnsupported = errors.New("resources: reading the observer status is unsupported on this platform")
 
 // openRegularNonBlocking refuses without touching the filesystem.
 //

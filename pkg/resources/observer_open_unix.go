@@ -3,7 +3,6 @@
 package resources
 
 import (
-	"errors"
 	"os"
 	"syscall"
 )
@@ -11,11 +10,10 @@ import (
 // observerReadSupported says whether this platform has a bounded-open primitive
 // for the status file. It does: O_NONBLOCK returns from the open itself, and
 // the caller then validates the mode on the descriptor it actually holds.
+//
+// ErrObserverReadUnsupported is declared once in observer.go and is never
+// returned here.
 const observerReadSupported = true
-
-// ErrObserverReadUnsupported exists on every platform so consumers can test for
-// it uniformly. It is never returned here.
-var ErrObserverReadUnsupported = errors.New("resources: reading the observer status is unsupported on this platform")
 
 // openRegularNonBlocking opens path without blocking on a FIFO or device.
 //

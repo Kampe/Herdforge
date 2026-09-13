@@ -27,10 +27,18 @@ func cliAdmittingReport(at time.Time) resources.AdmissionReport {
 	cpus := 8
 	freePct := 60
 	stamp := at.UTC().Format(time.RFC3339Nano)
+	// A published report carries BOTH decision stamps. Omitting DecidedAt made
+	// this "valid" fixture invalid, and the production reader was right to
+	// refuse it: a report that does not say when it was decided cannot show
+	// that anything it carries is current. The fixture is corrected rather than
+	// the rule relaxed. Decided at the observation instant and rendered no
+	// earlier, which is the order a real decision produces.
+	decided := at.UTC().Add(-10 * time.Millisecond).Format(time.RFC3339Nano)
 	return resources.AdmissionReport{
 		Decision:   "ADMIT",
 		Admits:     true,
 		Verdict:    "OK",
+		DecidedAt:  decided,
 		RenderedAt: stamp,
 		Limits:     resources.DefaultLimits(),
 		CPU: resources.CPUReport{
@@ -142,6 +150,35 @@ func TestObserverStatusCommandFailsClosed(t *testing.T) {
 			t.Fatalf("a refusing decision exited %d, expected %d", code, observerExitRefused)
 		}
 	})
+
+	// The decision stamps get their own negative cases so the positive fixture
+	// can never again be the only thing covering them. A missing stamp used to
+	// be discovered as a broken "valid" fixture; it is asserted here instead.
+	for _, tc := range []struct {
+		name   string
+		mutate func(*resources.AdmissionReport)
+	}{
+		{"missing decided_at refuses", func(r *resources.AdmissionReport) { r.DecidedAt = "" }},
+		{"missing rendered_at refuses", func(r *resources.AdmissionReport) { r.RenderedAt = "" }},
+		{"rendered before decided refuses", func(r *resources.AdmissionReport) {
+			r.RenderedAt = now.Add(-time.Hour).Format(time.RFC3339Nano)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HERD_STATE_DIR", t.TempDir())
+			sample := cliSample(now)
+			tc.mutate(&sample.Report)
+			writeObserverFixture(t, resources.ObserverStatus{
+				SchemaVersion: resources.ObserverSchemaVersion,
+				PublishedAt:   now.Format(time.RFC3339Nano),
+				ExpiresAt:     now.Add(time.Hour).Format(time.RFC3339Nano),
+				Latest:        sample,
+			})
+			if code := runResourcesObserverStatus(false); code != observerExitRefused {
+				t.Fatalf("%s exited %d, expected %d", tc.name, code, observerExitRefused)
+			}
+		})
+	}
 }
 
 // TestObserverWatchRefusesBadBoundsBeforeSampling proves an out-of-range flag
