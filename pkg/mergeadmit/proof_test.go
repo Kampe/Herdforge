@@ -1,6 +1,7 @@
 package mergeadmit
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -170,11 +171,11 @@ func TestProveRebaseModeRefusesWhitespaceAlteredContent(t *testing.T) {
 
 	// Guard the fixture: if patch-id ever stops colliding here, this test is
 	// no longer isolating the tree check and must be rebuilt.
-	cp, err := commitPatchID(dir, candidate)
+	cp, err := commitPatchID(context.Background(), dir, candidate)
 	if err != nil {
 		t.Fatalf("candidate patch id: %v", err)
 	}
-	lp, err := commitPatchID(dir, landed)
+	lp, err := commitPatchID(context.Background(), dir, landed)
 	if err != nil {
 		t.Fatalf("landed patch id: %v", err)
 	}
@@ -233,11 +234,11 @@ func TestProveSquashModeRefusesWhitespaceAlteredContent(t *testing.T) {
 	run(t, dir, "git", "checkout", "-q", "-B", "landed", base)
 	landed := commit(t, dir, "f.txt", "hello   world\n", "squashed")
 
-	wantPID, err := rangePatchID(dir, base, candidate)
+	wantPID, err := rangePatchID(context.Background(), dir, base, candidate)
 	if err != nil {
 		t.Fatalf("candidate range patch id: %v", err)
 	}
-	gotPID, err := rangePatchID(dir, base, landed)
+	gotPID, err := rangePatchID(context.Background(), dir, base, landed)
 	if err != nil {
 		t.Fatalf("landed range patch id: %v", err)
 	}

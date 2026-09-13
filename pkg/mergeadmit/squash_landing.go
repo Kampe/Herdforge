@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/Kampe/Herdforge/pkg/harvest"
 )
 
 // ProveLanded establishes content containment only. It does not admit review
@@ -22,25 +20,37 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ProveEquivalentLanded(g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
+	return ProveEquivalentLandedContext(context.Background(), g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
 }
 
 // A squash has the aggregate reviewed patch, not any intermediate patch.
 // Require both its complete patch identity and the exact result of replaying
 // the reviewed delta onto its actual parent. Patch-ID whitespace normalization
 // alone cannot authorize different bytes. More than one match is ambiguous.
-func matchSquashRangeReplay(dir, base, candidate string, landed []string) (string, bool, error) {
-	if !harvest.IsAncestor(context.Background(), dir, base, candidate) {
+//
+// The ancestry gate rides the package's own owned-process probe
+// (ancestorProven), not harvest.IsAncestor: a caller deadline must kill the
+// probe's whole process group and come back as the context error, never as a
+// "not an ancestor" evidence answer or an orphaned child.
+func matchSquashRangeReplay(ctx context.Context, dir, base, candidate string, landed []string) (string, bool, error) {
+	proven, err := ancestorProven(ctx, dir, base, candidate)
+	if err != nil {
+		return "", false, err
+	}
+	if !proven {
 		return "", false, fmt.Errorf("reviewed base ancestry is unproven")
 	}
-	want, err := rangePatchID(dir, base, candidate)
+	want, err := rangePatchID(ctx, dir, base, candidate)
 	if err != nil {
 		return "", false, err
 	}
 	var matches []string
 	for _, sha := range landed {
-		parents, err := gitOut(dir, "rev-list", "--parents", "-n", "1", sha)
+		parents, err := gitOut(ctx, dir, "rev-list", "--parents", "-n", "1", sha)
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			return "", false, err
 		}
 		fields := strings.Fields(parents)
@@ -48,22 +58,38 @@ func matchSquashRangeReplay(dir, base, candidate string, landed []string) (strin
 			continue
 		} // A squash endpoint is a single-parent commit.
 		parent := fields[1]
-		if !harvest.IsAncestor(context.Background(), dir, base, parent) {
+		parentProven, parentErr := ancestorProven(ctx, dir, base, parent)
+		if parentErr != nil {
+			// A fired deadline stops the whole loop: falling through to the
+			// next candidate would keep spawning probes after the budget
+			// died and read the cancellation as "no match found".
+			return "", false, parentErr
+		}
+		if !parentProven {
 			continue
 		}
-		got, err := rangePatchID(dir, parent, sha)
+		got, err := rangePatchID(ctx, dir, parent, sha)
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			return "", false, err
 		}
 		if got != want {
 			continue
 		}
-		replayed, err := replayReviewedTree(dir, base, parent, candidate)
+		replayed, err := replayReviewedTree(ctx, dir, base, parent, candidate)
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			continue
 		} // A conflicting replay proves no equivalence.
-		tree, err := gitOut(dir, "rev-parse", "--verify", sha+"^{tree}")
+		tree, err := gitOut(ctx, dir, "rev-parse", "--verify", sha+"^{tree}")
 		if err != nil {
+			if c := ctxFailure(ctx, err); c != nil {
+				return "", false, c
+			}
 			return "", false, err
 		}
 		if replayed == tree {

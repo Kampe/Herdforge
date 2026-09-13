@@ -9,16 +9,32 @@
 // free% with zero swap is normal steady state — it must be TIGHT (warn), never
 // ALERT. A free%-keyed refusal once blocked a healthy fleet at free=2%
 // swap=0MB.
+//
+// FAC-826 (2026-09-12) supersedes the gate half of that directive without
+// discarding its lesson. The lesson holds: low Darwin free% with no swap is
+// normal, and swap residue is a scar, not a wound -- neither refuses anything
+// here. What was wrong was the conclusion drawn from it. Because ALERT keyed on
+// swap and swap had been removed as an input, Verdict could only return OK or
+// TIGHT and GatePasses accepted both, so the gate could not refuse ANY host;
+// meanwhile every probe failure and every malformed parse returned 100% free.
+// The operator reported host instability and required CPU/memory safety over
+// throughput. Whether any particular host failure coincided with a particular
+// gate evaluation is NOT something we measured and is not claimed here; the
+// fail-open implementation above is defect enough on its own. Admission
+// (admission.go) is the one decision now: it reads the kernel's real pressure
+// signal plus normalized CPU load, and an absence of measurement refuses
+// instead of reporting headroom.
 package resources
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -33,6 +49,10 @@ const (
 var errProbeFail = errors.New("probe failed")
 
 type Snapshot struct {
+	// FreePct is -1 when headroom could not be measured. It is NOT 100: an
+	// unmeasured host used to render here as fully free, and a reporter that
+	// prints 100 for "we do not know" is reporting a measurement it never
+	// took (FAC-826).
 	FreePct    int    `json:"free_pct"`
 	SwapMB     int    `json:"swap_mb"`
 	Verdict    string `json:"verdict"`
@@ -40,6 +60,11 @@ type Snapshot struct {
 		WarnFreePct int `json:"warn_free_pct"`
 		SwapAlertMB int `json:"swap_alert_mb"`
 	} `json:"thresholds"`
+
+	// Admission is the decision this verdict came from, carried whole so a
+	// refusal reports its reasons and its observation postures instead of a
+	// bare word.
+	Admission *AdmissionReport `json:"admission,omitempty"`
 }
 
 type SelfTestResult struct {
@@ -88,49 +113,65 @@ func Verdict(freePct, swapMB int) string {
 	return verdict(freePct, swapMB, warnFreePct(), swapAlertMB())
 }
 
-// GatePasses reports whether a verdict allows heavy operations (OK or TIGHT).
+// GatePasses reports whether a verdict allows heavy operations.
+//
+// FAC-826: it used to accept TIGHT as well as OK, and Verdict() could never
+// return ALERT, so `herd resources --gate` could not exit nonzero on any real
+// host and the ALERT arm of pkg/backfill's gate was unreachable. The gate was
+// dead code, not a lenient policy. Only OK admits now, and a snapshot's verdict
+// comes from the one Admission decision -- so TIGHT names a measured refusal
+// and ALERT names a refusal because nothing could be measured.
 func GatePasses(verdict string) bool {
-	return verdict == VerdictOK || verdict == VerdictTight
+	return verdict == VerdictOK
 }
 
+// TakeSnapshot reports the host through the one admission authority.
+//
+// FAC-826: the verdict no longer comes from a free-percentage grade that could
+// only ever say OK or TIGHT. It comes from Admission, so an unmeasured or stale
+// observation reports ALERT rather than 100% free and OK, and the reasons
+// travel with it. The legacy free-percentage grade stays available as Verdict()
+// for callers that want the informational reading.
 func TakeSnapshot() Snapshot {
-	freePct, swapMB := gatherMetrics()
-	s := Snapshot{FreePct: freePct, SwapMB: swapMB}
-	s.Verdict = Verdict(freePct, swapMB)
+	a := Admit(context.Background())
+	// Rendered at the ACTUAL reporting boundary, not at DecidedAt: the probes
+	// and the decision are already behind us, and Report revalidates against
+	// this clock. Copying DecidedAt here would pretend revalidation happened.
+	return SnapshotFrom(a, time.Now())
+}
+
+// SnapshotFrom renders an already-made decision. Split out so a fixture can
+// assert the reporting shape without observing a host.
+func SnapshotFrom(a Admission, at time.Time) Snapshot {
+	report := a.Report(at)
+	s := Snapshot{FreePct: -1, Verdict: report.Verdict, Admission: &report}
+	// Only a reading the DECISION accepted may populate the legacy numeric
+	// fields; the report is the authority on what was actually observed.
+	if report.Memory.Known {
+		if report.Memory.FreePct != nil {
+			s.FreePct = *report.Memory.FreePct
+		}
+		if report.Memory.SwapMB != nil {
+			s.SwapMB = *report.Memory.SwapMB
+		}
+	}
 	s.Thresholds.WarnFreePct = warnFreePct()
 	s.Thresholds.SwapAlertMB = swapAlertMB()
 	return s
 }
 
-// gatherMetrics shells out to platform probes. On any probe failure it returns a
-// SAFE value (free_pct=100, swap_mb=0) so a broken probe never falsely refuses
-// heavy operations.
-func gatherMetrics() (freePct, swapMB int) {
-	if runtime.GOOS == "darwin" {
-		return gatherDarwinMetrics()
-	}
-	vmStatOut, err1 := runProbe("vm_stat")
-	memSizeOut, err2 := runProbe("sysctl", "-n", "hw.memsize")
-	if err1 != nil || err2 != nil {
-		return 100, 0
-	}
-	freePct = parseFreePct(vmStatOut, memSizeOut)
-	swapOut, err := runProbe("sysctl", "-n", "vm.swapusage")
-	if err != nil {
-		swapMB = 0
-	} else {
-		swapMB = parseSwapUsedMB(swapOut)
-	}
-	return freePct, swapMB
-}
-
-func gatherDarwinMetrics() (freePct, swapMB int) {
-	return gatherDarwinMetricsWithProbes(
-		func() (string, error) { return runProbe("memory_pressure", "-Q") },
-		func() (string, error) { return runProbe("sysctl", "-n", "vm.swapusage") },
-	)
-}
-
+// gatherMetrics and gatherDarwinMetrics are GONE (FAC-826).
+//
+// They were the live fail-open: every probe failure returned free_pct=100,
+// swap_mb=0, and on Linux the Darwin binaries do not exist at all, so a Linux
+// host reported 100% free from probes that had never run. Admission observes
+// through the platform-tagged observers in admission_{darwin,linux,other}.go,
+// where an unmeasured host stays unmeasured.
+//
+// gatherDarwinMetricsWithProbes below is retained ONLY for the informational
+// snapshotWithDarwinProbes reporting path and its existing fixtures. It still
+// carries the old 100-on-failure shape, which is exactly why nothing that
+// decides is allowed to call it.
 func gatherDarwinMetricsWithProbes(memoryPressureFn, swapFn func() (string, error)) (int, int) {
 	memoryPressureOut, err := memoryPressureFn()
 	if err != nil {
@@ -144,11 +185,32 @@ func gatherDarwinMetricsWithProbes(memoryPressureFn, swapFn func() (string, erro
 	return freePct, parseSwapUsedMB(swapOut)
 }
 
+// runProbe shells out with a bounded default timeout.
+//
+// FAC-826: this used to be exec.Command with no context at all, so a probe that
+// hung hung the caller with it and nothing cancelled the child. Every probe is
+// bounded now, and cancellation reaches the process.
 func runProbe(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.Output()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
+	defer cancel()
+	return runProbeCtx(ctx, defaultProbeTimeout, name, args...)
+}
+
+// runProbeCtx runs one probe under the caller's context and a hard timeout,
+// whichever fires first. A timeout is an ERROR, never an empty string a parser
+// could read as a healthy default.
+func runProbeCtx(ctx context.Context, timeout time.Duration, name string, args ...string) (string, error) {
+	if timeout <= 0 {
+		timeout = defaultProbeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, name, args...).Output()
 	if err != nil {
-		return "", err
+		if probeCtx.Err() != nil {
+			return "", fmt.Errorf("probe %s timed out or was cancelled after %s: %w", name, timeout, probeCtx.Err())
+		}
+		return "", fmt.Errorf("probe %s failed: %w", name, err)
 	}
 	return string(out), nil
 }
@@ -179,9 +241,17 @@ func snapshotWithDarwinProbes(memoryPressureFn, swapFn func() (string, error)) S
 	return s
 }
 
+// safeSnapshot is the UNKNOWN snapshot, and it is no longer "safe" in the sense
+// that word used to carry here.
+//
+// It returned free_pct=100, swap_mb=0 and an OK verdict, reasoning that a broken
+// probe must never falsely refuse. That reasoning is inverted: a false refusal
+// costs a delayed job, a false admission spends resources the host may not
+// have. It reports
+// an unmeasured host as unmeasured now -- free_pct=-1, ALERT -- so no consumer
+// can render it as headroom.
 func safeSnapshot() Snapshot {
-	s := Snapshot{FreePct: 100, SwapMB: 0}
-	s.Verdict = Verdict(s.FreePct, s.SwapMB)
+	s := Snapshot{FreePct: -1, SwapMB: 0, Verdict: VerdictAlert}
 	s.Thresholds.WarnFreePct = warnFreePct()
 	s.Thresholds.SwapAlertMB = swapAlertMB()
 	return s
