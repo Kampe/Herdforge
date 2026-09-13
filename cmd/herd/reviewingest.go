@@ -1893,9 +1893,19 @@ type verifyLandedBinding struct {
 // mints/reconciles the sealed completion receipt through mergeadmit so
 // approve/board-done have the same closing authority as a normal harvest.
 func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
-	wtDir := worktreeForBranch(branch)
-	if wtDir == "" {
-		return fmt.Errorf("no worktree found for branch %s", branch)
+	// FAC-831: a retired carrier is not a missing precondition, it is the
+	// normal end state of merged work, and this path exists for exactly that
+	// class. The invoking checkout stands in ONLY after the candidate is pinned
+	// by an explicit --candidate or an admitted PASS and the object is present
+	// here; a live carrier is used exactly as before.
+	surface, err := resolveVerifyLandedSurface(branch, binding, worktreeForBranch, invokingRepoRoot)
+	if err != nil {
+		return err
+	}
+	wtDir := surface.Dir
+	if surface.CarrierRetired {
+		fmt.Printf("herd harvest-merge: CARRIER RETIRED — observing from the invoking checkout against pinned candidate %s\n",
+			shortSHA12(surface.PinnedCandidate))
 	}
 
 	// FAC-566: a MOVING BRANCH HEAD IS NOT CANDIDATE IDENTITY. This used to

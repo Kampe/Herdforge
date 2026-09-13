@@ -99,12 +99,24 @@ type Proof struct {
 	BaseSHA      string `json:"base_sha"`
 	CandidateSHA string `json:"candidate_sha"`
 	LandedSHA    string `json:"landed_sha"`
-	// MergeSHA is the commit on the landed history whose patch the completion
-	// receipt binds its content check to. For ModeMerge that is the candidate
-	// itself (it survived); for a rewrite it is the landed tip.
+	// MergeSHA is the commit that INTEGRATED the reviewed content into the
+	// landed history. For ModeMerge that is the candidate itself (it
+	// survived); for a rewrite it is the landed tip. Consumers require the
+	// reviewed base to be an ancestor of it, so it must never be a commit that
+	// merely carries the patch on an unintegrated line (FAC-831).
 	MergeSHA string `json:"merge_sha"`
-	// PatchID is git patch-id --stable of MergeSHA, the value the completion
-	// receipt carries.
+	// ContentSHA is the content-bearing commit whose patch PatchID is.
+	//
+	// It equals MergeSHA in every ordinary landing and is recorded separately
+	// only because a merge-commit landing splits the two facts: the merge
+	// commit integrates the content but has no diff of its own, while the
+	// commit that does carry the diff is not on the integrated line. Binding
+	// both keeps the content evidence exact without weakening the ancestry
+	// requirement on MergeSHA. An empty value means the two are the same.
+	ContentSHA string `json:"content_sha,omitempty"`
+	// PatchID is git patch-id --stable of the content-bearing commit — that is,
+	// of ContentSHA when it is set and of MergeSHA otherwise. It is the value
+	// the completion receipt carries.
 	PatchID string `json:"patch_id"`
 	// Method names the predicate that actually proved it, so a receipt reader
 	// can tell ancestry from content identity without re-deriving it.

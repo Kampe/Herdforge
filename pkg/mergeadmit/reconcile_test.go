@@ -460,7 +460,7 @@ func TestProveEquivalentLandedEmptyMergeTipMutationControls(t *testing.T) {
 	if _, err := patchIDs(context.Background(), dir, landedCommits); err == nil {
 		t.Fatal("unfiltered landed patch IDs succeeded; empty-merge mapping is not under test")
 	}
-	if _, err := equivalentLandedProof(context.Background(), dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed"); err == nil {
+	if _, err := equivalentLandedProof(context.Background(), dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed", landedCommits); err == nil {
 		t.Fatal("equivalentLandedProof accepted the empty merge commit")
 	}
 

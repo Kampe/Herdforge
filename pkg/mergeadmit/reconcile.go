@@ -361,7 +361,7 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedContent)
 		if matchErr == nil {
 			return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
-				"ordered-patch-subsequence-on-landed")
+				"ordered-patch-subsequence-on-landed", landedCommits)
 		}
 		err = matchErr
 	}
@@ -376,7 +376,7 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 	if mergeSHA, found, squashErr := matchSquashRangeReplay(ctx, repoDir, base, candidate, landedContent); squashErr != nil {
 		return nil, fmt.Errorf("squash proof failed: %w", squashErr)
 	} else if found {
-		proof, proofErr := equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree")
+		proof, proofErr := equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree", landedCommits)
 		if proof != nil {
 			proof.Mode = ModeSquash
 		}
@@ -388,18 +388,38 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 		return nil, fmt.Errorf("equivalent-patch proof failed: ordered proof: %v; combined proof: %w", err, replayErr)
 	}
 	return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
-		"combined-range-replay-on-landed")
+		"combined-range-replay-on-landed", landedCommits)
 }
 
-func equivalentLandedProof(ctx context.Context, repoDir, base, candidate, landed, mergeSHA, method string) (*Proof, error) {
-	pid, err := commitPatchID(ctx, repoDir, mergeSHA)
+// equivalentLandedProof seals one proof. Every predicate above funnels through
+// it, so the base-ancestry requirement is enforced in exactly one place.
+//
+// FAC-831: contentSHA is the commit whose patch was actually matched, and
+// MergeSHA is the commit that integrated it. They are the same for an ordinary
+// rebase landing; for a merge-commit landing they are not, and sealing the
+// carrier as MergeSHA produced a receipt the consumer had to refuse. PatchID
+// stays bound to the content commit, because the integration commit has no
+// diff of its own — recomputing it from a merge commit would hard-fail in
+// stablePatchID ("no patch content"), turning a legitimate landing into a
+// refusal instead of fixing the binding.
+func equivalentLandedProof(ctx context.Context, repoDir, base, candidate, landed, contentSHA, method string, landedCommits []string) (*Proof, error) {
+	pid, err := commitPatchID(ctx, repoDir, contentSHA)
 	if err != nil {
-		return nil, fmt.Errorf("patch id for proved merge commit %s: %w", short(mergeSHA), err)
+		return nil, fmt.Errorf("patch id for proved content commit %s: %w", short(contentSHA), err)
 	}
-	return &Proof{
+	mergeSHA, err := integrationCommitFor(ctx, repoDir, base, contentSHA, landedCommits)
+	if err != nil {
+		return nil, err
+	}
+	proof := &Proof{
 		Mode: ModeRebase, BaseSHA: base, CandidateSHA: candidate,
 		LandedSHA: landed, MergeSHA: mergeSHA, PatchID: pid, Method: method,
-	}, nil
+	}
+	if mergeSHA != contentSHA {
+		proof.ContentSHA = contentSHA
+		proof.Method = method + "+integration-commit"
+	}
+	return proof, nil
 }
 
 // nonEmptyCommits removes generated administrative anchors while preserving

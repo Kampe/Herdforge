@@ -122,6 +122,33 @@ jobs:
       # package run itself; this is the outer ceiling so a wedged step cannot
       # hold a runner indefinitely. Eight mutants, each one compile plus one
       # anchored package run, plus a baseline and a restored run, all serial.
+      # FAC-831: the landed-receipt producer is defended by NEGATIVE assertions
+      # -- it must not seal a patch carrier as MergeSHA, must not reach for a
+      # later commit that merely contains the base, and must not observe a
+      # landing against the invoking checkout without a pinned candidate. Each
+      # is removed from the REAL source here and its named test must fail on its
+      # named assertion; a mutant that does not build is BROKEN-RUN, not a kill.
+      - name: Verify landed receipt guard controls
+        timeout-minutes: 30
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-landed-receipt-guards.zsh
+
+      # Bounded raw retention, same pattern as the other control steps. The log
+      # directory is HIDDEN, so include-hidden-files is required or the upload
+      # silently matches nothing; a missing log set is an error, not a warning,
+      # because evidence that did not survive must not read as green; and
+      # if: always() keeps the logs from the failing runs that need them most.
+      - name: Upload landed receipt control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-landed-receipt-logs
+          path: .verify-landed-receipt-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Verify mail repair guard controls
         timeout-minutes: 30
         run: |
