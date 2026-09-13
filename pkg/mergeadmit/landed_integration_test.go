@@ -6,40 +6,61 @@ import (
 	"testing"
 )
 
-// prShapedLanding builds the exact PR836 shape with real git.
+// prShapedLanding builds the PR836 shape with real git, matching the topology
+// actually measured on the merged objects rather than a guess at it:
 //
-//	c0 ────────────── base ──────── merge      (main)
-//	 └── sideCommit ──────────────────┘        (pull request line)
+//	c0 ───────────── base ─────────────── merge      (main)
+//	 └── carrier ───── prBase ── candidate ──┘        (pull request line)
 //
-// The pull request branched BEFORE the reviewed base advanced, so the commit
-// that carries the content is NOT a descendant of the base. Only the two-parent
-// merge contains both. That is why sealing the carrier produced a receipt
-// `herd approve` had to refuse.
-func prShapedLanding(t *testing.T) (dir, base, sideCommit, mergeCommit string) {
+// The facts that matter, all verified on the real commits:
+//   - base (903457b7) IS an ancestor of the CANDIDATE (78455432). A reviewed
+//     candidate sits on its reviewed base; that is the normal relationship and
+//     the first version of this fixture had it backwards.
+//   - base is NOT an ancestor of the CARRIER (e1e19ed1). The carrier is an
+//     OLDER commit on the pull request's own line, from before the base entered
+//     that line, and matchOrderedPatchSubsequence returns it because its patch
+//     matched.
+//   - the merge (fb351fa8) has two parents, main and the candidate.
+//
+// So the defect is not "the PR branched before the base". It is that the commit
+// whose PATCH matched predates the base on the PR's own line, while every
+// consumer requires the reviewed base to be an ancestor of what gets sealed.
+func prShapedLanding(t *testing.T) (dir, base, carrier, candidate, mergeCommit string) {
 	t.Helper()
 	dir = gitRepo(t)
 	c0 := commit(t, dir, "a.txt", "zero\n", "c0")
 
+	// The pull request's own line starts before the base exists.
 	run(t, dir, "git", "checkout", "-q", "-b", "pr", c0)
-	sideCommit = commit(t, dir, "b.txt", "reviewed content\n", "reviewed candidate work")
+	carrier = commit(t, dir, "b.txt", "reviewed content\n", "reviewed candidate work")
 
+	// Main advances to the reviewed base.
 	run(t, dir, "git", "checkout", "-q", "main")
 	base = commit(t, dir, "c.txt", "base advanced\n", "unrelated main work (reviewed base)")
 
-	mergeCommit = githubEmptyMerge(t, dir, base, sideCommit, "Merge pull request #836")
+	// The pull request takes the base in, then finishes. The candidate is what
+	// was reviewed, and it descends from BOTH the carrier and the base.
+	run(t, dir, "git", "checkout", "-q", "pr")
+	run(t, dir, "git", "merge", "--no-ff", "--no-edit", "-m", "bring the reviewed base into the pull request", base)
+	candidate = commit(t, dir, "d.txt", "final reviewed change\n", "candidate tip")
 
-	// Prove the fixture really has the shape the defect needs, or the test
-	// would pass against a fixture that cannot exhibit it.
-	if ancestorOK(t, dir, base, sideCommit) {
+	mergeCommit = prMergeAfterBaseAdvanced(t, dir, base, candidate, "b.txt", "Merge pull request #836")
+
+	// Prove the fixture really has the measured shape, or the tests below would
+	// pass against a topology that cannot exhibit the defect.
+	if ancestorOK(t, dir, base, carrier) {
 		t.Fatal("fixture invalid: base is an ancestor of the carrier, so the defect cannot occur")
 	}
-	if !ancestorOK(t, dir, base, mergeCommit) {
-		t.Fatal("fixture invalid: base is not an ancestor of the merge commit")
+	if !ancestorOK(t, dir, base, candidate) {
+		t.Fatal("fixture invalid: the reviewed base is not an ancestor of the candidate")
 	}
-	if !ancestorOK(t, dir, sideCommit, mergeCommit) {
-		t.Fatal("fixture invalid: the carrier is not contained in the merge commit")
+	if !ancestorOK(t, dir, carrier, candidate) {
+		t.Fatal("fixture invalid: the carrier is not on the candidate's own history")
 	}
-	return dir, base, sideCommit, mergeCommit
+	if !ancestorOK(t, dir, base, mergeCommit) || !ancestorOK(t, dir, carrier, mergeCommit) {
+		t.Fatal("fixture invalid: the merge does not contain both the base and the carrier")
+	}
+	return dir, base, carrier, candidate, mergeCommit
 }
 
 func ancestorOK(t *testing.T, dir, sha, ref string) bool {
@@ -54,25 +75,22 @@ func ancestorOK(t *testing.T, dir, sha, ref string) bool {
 // REGRESSION (FAC-831): the selected commit must be the one that INTEGRATED the
 // reviewed content, not the one that merely carries its patch.
 func TestIntegrationCommitForPromotesCarrierToTheMergeCommit(t *testing.T) {
-	dir, base, sideCommit, mergeCommit := prShapedLanding(t)
+	dir, base, carrier, candidate, mergeCommit := prShapedLanding(t)
 
 	landedCommits, err := rangeCommits(context.Background(), dir, base, mergeCommit)
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
 
-	got, err := integrationCommitFor(context.Background(), dir, base, sideCommit, sideCommit, landedCommits)
+	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err != nil {
 		t.Fatalf("integrationCommitFor: %v", err)
 	}
-	if got == sideCommit {
-		t.Fatal("selected the patch carrier; the reviewed base is not an ancestor of it, so the receipt would be unapprovable")
-	}
-	if got != mergeCommit {
-		t.Fatalf("selected %s, want the integration commit %s", short(got), short(mergeCommit))
-	}
-	if !ancestorOK(t, dir, base, got) {
-		t.Fatalf("selected %s does not contain the reviewed base", short(got))
+	assertIntegrationContract(t, dir, base, candidate, carrier, got)
+	// The merge is in range and qualifies; whichever qualifying commit the walk
+	// reaches first, it must be on the integrated line, never the carrier.
+	if !ancestorOK(t, dir, got, mergeCommit) {
+		t.Fatalf("selected %s is not on the integrated line ending at %s", short(got), short(mergeCommit))
 	}
 }
 
@@ -115,15 +133,21 @@ func TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
-	got, err := integrationCommitFor(context.Background(), dir, base, sideCommit, sideCommit, landedCommits)
+	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err == nil {
 		t.Fatalf("sealed %s although nothing integrates the reviewed base with the carrier", short(got))
 	}
 	if got != "" {
 		t.Fatalf("a refusal returned a commit: %s", short(got))
 	}
-	if !strings.Contains(err.Error(), "no landed commit integrates reviewed base") {
+	// The refusal names BOTH halves of the rule. Matching only the first would
+	// let a regression that dropped the content requirement keep this test
+	// green, which is exactly how the ancestry-only version shipped.
+	if !strings.Contains(err.Error(), "no landed commit both integrates reviewed base") {
 		t.Fatalf("refusal reason = %v", err)
+	}
+	if !strings.Contains(err.Error(), "preserves the reviewed result") {
+		t.Fatalf("refusal does not name the content requirement: %v", err)
 	}
 	// The later commit contains the base but NOT the content. Selecting it
 	// would be a false proof, and it must not be what came back.
@@ -137,27 +161,28 @@ func TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase(t *testing.T) {
 // content — recomputing it from the merge commit would hard-fail in
 // stablePatchID, because a merge commit has no diff of its own.
 func TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID(t *testing.T) {
-	dir, base, sideCommit, mergeCommit := prShapedLanding(t)
+	dir, base, carrier, candidate, mergeCommit := prShapedLanding(t)
 
 	landedCommits, err := rangeCommits(context.Background(), dir, base, mergeCommit)
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
-	wantPatch, err := commitPatchID(context.Background(), dir, sideCommit)
+	wantPatch, err := commitPatchID(context.Background(), dir, carrier)
 	if err != nil {
 		t.Fatalf("carrier patch id: %v", err)
 	}
 
-	proof, err := equivalentLandedProof(context.Background(), dir, base, sideCommit, mergeCommit,
-		sideCommit, "ordered-patch-subsequence-on-landed", landedCommits)
+	proof, err := equivalentLandedProof(context.Background(), dir, base, candidate, mergeCommit,
+		carrier, "ordered-patch-subsequence-on-landed", landedCommits)
 	if err != nil {
 		t.Fatalf("equivalentLandedProof: %v", err)
 	}
-	if proof.MergeSHA != mergeCommit {
-		t.Fatalf("MergeSHA = %s, want the integration commit %s", short(proof.MergeSHA), short(mergeCommit))
+	assertIntegrationContract(t, dir, base, candidate, carrier, proof.MergeSHA)
+	if !ancestorOK(t, dir, proof.MergeSHA, mergeCommit) {
+		t.Fatalf("MergeSHA %s is not on the integrated line ending at %s", short(proof.MergeSHA), short(mergeCommit))
 	}
-	if proof.ContentSHA != sideCommit {
-		t.Fatalf("ContentSHA = %s, want the carrier %s", short(proof.ContentSHA), short(sideCommit))
+	if proof.ContentSHA != carrier {
+		t.Fatalf("ContentSHA = %s, want the carrier %s", short(proof.ContentSHA), short(carrier))
 	}
 	if proof.PatchID != wantPatch {
 		t.Fatalf("PatchID = %s, want the carrier's patch %s", short(proof.PatchID), short(wantPatch))
@@ -273,7 +298,7 @@ func TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent(t *testin
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
-	got, err := integrationCommitFor(context.Background(), dir, base, sideCommit, sideCommit, landedCommits)
+	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err == nil {
 		t.Fatalf("selected %s: an ours merge that discarded every reviewed hunk was sealed as the integration commit",
 			short(got))
@@ -298,7 +323,7 @@ func TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent(t *testi
 
 	// Merge normally, then amend the merge so the reviewed file holds other
 	// bytes. This is what a hand-resolved conflict looks like from outside.
-	merged := githubEmptyMerge(t, dir, base, sideCommit, "Merge pull request #836")
+	merged := prMergeAfterBaseAdvanced(t, dir, base, sideCommit, "b.txt", "Merge pull request #836")
 	if err := osWriteFile(t, dir, "b.txt", "SUBSTITUTED content\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +341,7 @@ func TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent(t *testi
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
-	got, err := integrationCommitFor(context.Background(), dir, base, sideCommit, sideCommit, landedCommits)
+	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err == nil {
 		t.Fatalf("selected %s: a merge whose tree holds different bytes than the reviewed result was sealed",
 			short(got))
@@ -329,8 +354,9 @@ func TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent(t *testi
 // contentPreservedAt is the predicate the safety rests on, pinned directly:
 // true for the honest merge, false for the ours merge.
 func TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge(t *testing.T) {
-	dir, base, sideCommit, mergeCommit := prShapedLanding(t)
-	ok, err := contentPreservedAt(context.Background(), dir, base, sideCommit, mergeCommit)
+	// carrier is deliberately unused here: this test pins the predicate itself.
+	dir, base, _, candidate, mergeCommit := prShapedLanding(t)
+	ok, err := contentPreservedAt(context.Background(), dir, base, candidate, mergeCommit)
 	if err != nil {
 		t.Fatalf("honest merge: %v", err)
 	}
@@ -366,7 +392,7 @@ func TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge(t *testing.T) {
 // landing may still be approved is a policy decision about the probed tip, not
 // about which commit integrated it, and nothing here claims to make it.
 func TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt(t *testing.T) {
-	dir, base, sideCommit, mergeCommit := prShapedLanding(t)
+	dir, base, carrier, candidate, mergeCommit := prShapedLanding(t)
 	run(t, dir, "git", "checkout", "-q", "main")
 	run(t, dir, "git", "revert", "--no-edit", "-m", "1", mergeCommit)
 	reverted := revParse(t, dir, "HEAD")
@@ -381,16 +407,46 @@ func TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt(t *tes
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
-	got, err := integrationCommitFor(context.Background(), dir, base, sideCommit, sideCommit, landedCommits)
+	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err != nil {
 		t.Fatalf("integrationCommitFor: %v", err)
 	}
-	if got != mergeCommit {
-		t.Fatalf("selected %s, want the merge %s that actually integrated the content", short(got), short(mergeCommit))
+	assertIntegrationContract(t, dir, base, candidate, carrier, got)
+	if !ancestorOK(t, dir, got, mergeCommit) {
+		t.Fatalf("selected %s is not on the integrated line ending at %s", short(got), short(mergeCommit))
 	}
 	// The revert commit itself must never be selected: it does not replay to
 	// the reviewed result.
 	if got == reverted {
 		t.Fatal("selected the revert commit as the integration commit")
+	}
+}
+
+// assertIntegrationContract checks what a selected commit must satisfy, rather
+// than pinning one SHA.
+//
+// Which qualifying commit the walk reaches first is a property of the range's
+// order, and an earlier version of these tests pinned a specific SHA twice and
+// was wrong twice. What actually has to hold is the contract every consumer
+// depends on: it is not the carrier, it contains the reviewed base, and its own
+// tree is the replayed reviewed result. That is non-vacuous — the carrier fails
+// the second condition and an ours merge fails the third.
+func assertIntegrationContract(t *testing.T, dir, base, candidate, carrier, got string) {
+	t.Helper()
+	if got == "" {
+		t.Fatal("no commit was selected")
+	}
+	if got == carrier {
+		t.Fatal("selected the patch carrier; the reviewed base is not an ancestor of it, so the receipt would be unapprovable")
+	}
+	if !ancestorOK(t, dir, base, got) {
+		t.Fatalf("selected %s does not contain the reviewed base; herd approve would refuse this receipt", short(got))
+	}
+	preserved, err := contentPreservedAt(context.Background(), dir, base, candidate, got)
+	if err != nil {
+		t.Fatalf("content proof for %s: %v", short(got), err)
+	}
+	if !preserved {
+		t.Fatalf("selected %s does not replay to the reviewed result", short(got))
 	}
 }
