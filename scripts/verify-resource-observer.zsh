@@ -302,6 +302,26 @@ restore_all() {
 # rather than a bare `false` -- because a mutant that leaves a variable unused
 # does not compile, and a control that cannot build proves nothing.
 #
+# Two rows carry a correction worth recording, because both were wrong in ways
+# that looked right:
+#
+#   pressure-enum-inconsistency-ignored SURVIVED against the subtest that sets
+#   PressureKnown=false on a Darwin-shaped report. That report gates on nothing,
+#   so the later neither-signal guard refuses it whether or not the enum/boolean
+#   check exists -- the control was measuring a redundant path. The row now
+#   targets the OTHER direction: a report claiming pressure IS known while
+#   naming an unknown level, gating on healthy headroom, which the neither-signal
+#   guard does not reach and the numbers otherwise admit. That is the case only
+#   this check catches, and its healthy counterpart is the linux shape in
+#   TestObserverUsableAcceptsBothHealthyPlatformShapes, identical except that it
+#   honestly reports pressure as not known.
+#
+#   catch-up-burst is anchored to the assertion its oracle ACTUALLY emits.
+#   Replaying every missed tick makes each gap exactly one, so the test's
+#   zero-skipped-ticks assertion fires before its inter-sample spacing check.
+#   Both claims belong to the same contract and both are violated; the control
+#   names the one the oracle reaches first rather than accepting any failure.
+#
 # One guard is deliberately NOT mutated here. reportSelfConsistent refuses a
 # missing decided_at/rendered_at with a named message, but an absent stamp also
 # fails the RFC3339 parse immediately after, so removing the explicit check
@@ -315,10 +335,10 @@ mutations=(
 "expiry-ignores-metric-window${sep}${observer_src}${sep}	if window.Before(cadence) {${sep}	if false && window.Before(cadence) { // MUTANT: expiry no longer bounded by the metric window${sep}${resources_pkg}${sep}TestObserverStampsPublishTimeAtWriteTime${sep}outlives the metric window"
 "history-unbounded${sep}${observer_src}${sep}	if len(history) < ObserverHistoryMax {${sep}	if true || len(history) < ObserverHistoryMax { // MUTANT: the ring stops being a ring${sep}${resources_pkg}${sep}TestObserverHistoryStaysBounded${sep}history grew to"
 "usable-trusts-published-booleans${sep}${observer_src}${sep}	if !again.Admits() {${sep}	if false && !again.Admits() { // MUTANT: the re-decision no longer overrules the booleans${sep}${resources_pkg}${sep}TestObserverUsableRefusesContradictoryReports/saturated_cpu_with_admit_booleans${sep}published booleans must not outrank published numbers"
-"pressure-enum-inconsistency-ignored${sep}${observer_src}${sep}	if level.Known() != r.PressureKnown {${sep}	if false && level.Known() != r.PressureKnown { // MUTANT: the enum and its boolean may disagree${sep}${resources_pkg}${sep}TestObserverUsableRefusesContradictoryReports/pressure_enum_contradicts_pressure_known${sep}published booleans must not outrank published numbers"
+"pressure-enum-inconsistency-ignored${sep}${observer_src}${sep}	if level.Known() != r.PressureKnown {${sep}	if false && level.Known() != r.PressureKnown { // MUTANT: the enum and its boolean may disagree${sep}${resources_pkg}${sep}TestObserverUsableRefusesContradictoryReports/pressure_known_contradicts_an_unknown_level${sep}published booleans must not outrank published numbers"
 "config-accepts-busy-loop${sep}${observer_src}${sep}	if c.Interval < MinObserverInterval || c.Interval > MaxObserverInterval {${sep}	if false && (c.Interval < MinObserverInterval || c.Interval > MaxObserverInterval) { // MUTANT: any interval accepted${sep}${resources_pkg}${sep}TestObserverConfigRefusesBusyLoopBounds/interval_above_ceiling_only${sep}must be refused, not repaired"
 "read-bound-removed${sep}${observer_src}${sep}		return status, fmt.Errorf(\"observer: status exceeds the %d-byte bound; refusing to parse it\",${sep}		_ = fmt.Sprintf(\"%d\", // MUTANT: an oversized status is parsed anyway${sep}${resources_pkg}${sep}TestReadObserverStatusRefusesAnOversizedFile${sep}the size bound is not enforced"
-"catch-up-burst${sep}${observer_src}${sep}		next := int64(elapsed/cfg.Interval) + 1${sep}		next := tickIndex + 1 // MUTANT: replay every missed tick${sep}${resources_pkg}${sep}TestObserverDropsOverrunTicksWithoutCatchUp${sep}that is a catch-up burst"
+"catch-up-burst${sep}${observer_src}${sep}		next := int64(elapsed/cfg.Interval) + 1${sep}		next := tickIndex + 1 // MUTANT: replay every missed tick${sep}${resources_pkg}${sep}TestObserverDropsOverrunTicksWithoutCatchUp${sep}an overrunning sample produced zero skipped ticks; drops are being hidden"
 "failed-sample-keeps-admit${sep}${observer_src}${sep}			sample.Report.Admits = false${sep}			_ = sampleErr // MUTANT: a failed sample keeps its admit${sep}${resources_pkg}${sep}TestObserverRecordsSampleFailureWithoutAdmitting${sep}a failure must not keep its admit"
 "broken-chronology-ignored${sep}${observer_src}${sep}	if why := sampleChronologyProblem(status, at); why != \"\" {${sep}	if why := \"\"; why != \"\" { // MUTANT: stamps no longer have to be credible${sep}${resources_pkg}${sep}TestObserverUsableRefusesBrokenChronology/missing_published_at${sep}was reported usable"
 "publish-failure-swallowed-by-cancellation${sep}${run_src}${sep}	if errors.Is(err, ErrObserverPublishFailed) {${sep}	if false && errors.Is(err, ErrObserverPublishFailed) { // MUTANT: a cancellation hides a failed final write${sep}${resources_pkg}${sep}TestRunObserverPreservesPublishFailureThroughCancellation${sep}a failed terminal publication was reported as a clean shutdown"

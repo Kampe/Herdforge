@@ -448,8 +448,25 @@ func TestObserverUsableRefusesContradictoryReports(t *testing.T) {
 			zero := 0
 			r.CPU.CPUs = &zero
 		},
+		// Both directions of the enum/boolean disagreement. This one is caught
+		// twice over: with FreePctGates false, the later neither-signal guard
+		// would refuse it anyway.
 		"pressure enum contradicts pressure_known": func(r *AdmissionReport) {
 			r.Memory.PressureKnown = false
+		},
+		// The direction only the enum/boolean check catches. The report claims
+		// pressure IS known while naming an unknown level, and it gates on
+		// headroom, so the neither-signal guard does not fire and the numbers
+		// otherwise admit. Without that check the unknown level would be handed
+		// to Decide as if it had been measured. Its healthy counterpart is the
+		// linux shape in TestObserverUsableAcceptsBothHealthyPlatformShapes,
+		// identical except that it honestly reports pressure as NOT known.
+		"pressure_known contradicts an unknown level": func(r *AdmissionReport) {
+			r.Memory.Pressure = "unknown"
+			r.Memory.PressureKnown = true
+			gating := 40
+			r.Memory.FreePct = &gating
+			r.Memory.FreePctGates = true
 		},
 		"unrecognised pressure level": func(r *AdmissionReport) {
 			r.Memory.Pressure = "spicy"
