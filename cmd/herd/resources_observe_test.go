@@ -270,6 +270,11 @@ func TestRunResourcesRejectsFlagsTheModeCannotHonour(t *testing.T) {
 		"selftest under observer status":       {"--observer-status", "--selftest"},
 		"bounds under observer status":         {"--observer-status", "--interval", "30s"},
 		"two modes at once":                    {"--watch", "--observer-status"},
+		// A mode flag written out as false does not open that mode's flag
+		// set: tuning outside an ACTUAL watch is still refused.
+		"bounds with watch explicitly disabled":   {"--watch=false", "--interval", "5s"},
+		"bounds with watch disabled and zero set": {"--watch=false", "--interval=0"},
+		"gate with status explicitly disabled":    {"--observer-status=false", "--gate", "--interval", "30s"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -323,17 +328,26 @@ func TestValidateResourcesModeAcceptsEverySupportedCombination(t *testing.T) {
 	supported := []struct {
 		name     string
 		provided []string
+		watch    bool
+		status   bool
 		want     resourcesMode
 	}{
-		{"plain resources", nil, resourcesModeOneShot},
-		{"one-shot json", []string{"json"}, resourcesModeOneShot},
-		{"one-shot gate", []string{"gate"}, resourcesModeOneShot},
-		{"one-shot selftest", []string{"selftest"}, resourcesModeOneShot},
-		{"one-shot gate and json", []string{"gate", "json"}, resourcesModeOneShot},
-		{"watch alone", []string{"watch"}, resourcesModeWatch},
-		{"watch with every bound", []string{"watch", "interval", "lifetime", "sample-timeout"}, resourcesModeWatch},
-		{"status alone", []string{"observer-status"}, resourcesModeStatus},
-		{"status with json", []string{"observer-status", "json"}, resourcesModeStatus},
+		{name: "plain resources", want: resourcesModeOneShot},
+		{name: "one-shot json", provided: []string{"json"}, want: resourcesModeOneShot},
+		{name: "one-shot gate", provided: []string{"gate"}, want: resourcesModeOneShot},
+		{name: "one-shot selftest", provided: []string{"selftest"}, want: resourcesModeOneShot},
+		{name: "one-shot gate and json", provided: []string{"gate", "json"}, want: resourcesModeOneShot},
+		{name: "watch alone", provided: []string{"watch"}, watch: true, want: resourcesModeWatch},
+		{name: "watch with every bound", provided: []string{"watch", "interval", "lifetime", "sample-timeout"}, watch: true, want: resourcesModeWatch},
+		{name: "status alone", provided: []string{"observer-status"}, status: true, want: resourcesModeStatus},
+		{name: "status with json", provided: []string{"observer-status", "json"}, status: true, want: resourcesModeStatus},
+		// A mode flag written out as false selects nothing and asks for
+		// nothing. Selecting on PRESENCE would have activated the observer
+		// here, which is the opposite of what the operator typed.
+		{name: "watch explicitly disabled", provided: []string{"watch"}, want: resourcesModeOneShot},
+		{name: "status explicitly disabled", provided: []string{"observer-status"}, want: resourcesModeOneShot},
+		{name: "watch disabled beside one-shot flags", provided: []string{"watch", "gate", "json"}, want: resourcesModeOneShot},
+		{name: "both modes explicitly disabled", provided: []string{"watch", "observer-status"}, want: resourcesModeOneShot},
 	}
 	for _, tc := range supported {
 		t.Run(tc.name, func(t *testing.T) {
@@ -341,7 +355,7 @@ func TestValidateResourcesModeAcceptsEverySupportedCombination(t *testing.T) {
 			for _, n := range tc.provided {
 				provided[n] = true
 			}
-			mode, err := validateResourcesMode(provided)
+			mode, err := validateResourcesMode(provided, tc.watch, tc.status)
 			if err != nil {
 				t.Fatalf("%s must be supported, got %v", tc.name, err)
 			}

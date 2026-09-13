@@ -7839,7 +7839,7 @@ func runResourcesWithArgs(args []string, stdout, stderr io.Writer) int {
 	// --watch used to be skipped by an early return, and the observer bounds
 	// were parsed and then ignored outside --watch, including an explicit
 	// --interval=0 that the observer would have refused.
-	mode, err := validateResourcesMode(provided)
+	mode, err := validateResourcesMode(provided, *watch, *observerStatus)
 	if err != nil {
 		fmt.Fprintf(stderr, "resources: %v\n", err)
 		return 2

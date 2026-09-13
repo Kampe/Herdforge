@@ -166,35 +166,49 @@ const (
 	resourcesModeStatus  resourcesMode = "--observer-status"
 )
 
-// resourcesModeFlags is what each mode legitimately accepts. Everything else
-// given alongside it is refused rather than ignored.
+// resourcesModeFlags is what each mode legitimately accepts BESIDES the mode
+// flags themselves. Everything else given alongside it is refused rather than
+// ignored.
 //
 // The rule this encodes: a flag the operator typed is a request, and a request
 // this command cannot honour must be an error. Parsing --gate under --watch and
 // then returning early silently discarded a resource guard; parsing --interval
 // outside --watch and then dropping it silently discarded a bound the observer
 // would have refused as invalid. Both read as success.
+//
+// The mode flags are deliberately absent from these sets. They are handled by
+// VALUE, not presence, so `--watch=false` selects no mode and is not itself an
+// offending flag -- writing out a disabled switch asks for nothing.
 var resourcesModeFlags = map[resourcesMode]map[string]bool{
 	resourcesModeOneShot: {"json": true, "gate": true, "selftest": true},
-	resourcesModeWatch:   {"watch": true, "interval": true, "lifetime": true, "sample-timeout": true},
-	resourcesModeStatus:  {"observer-status": true, "json": true},
+	resourcesModeWatch:   {"interval": true, "lifetime": true, "sample-timeout": true},
+	resourcesModeStatus:  {"json": true},
 }
 
-// validateResourcesMode resolves the mode from the flags ACTUALLY given and
-// refuses any flag that mode cannot honour.
+// resourcesModeNames are the flags that SELECT a mode. They are excluded from
+// the rejection scan because presence alone does not request them.
+var resourcesModeNames = map[string]bool{"watch": true, "observer-status": true}
+
+// validateResourcesMode resolves the mode from the mode flags' VALUES and
+// refuses any other flag that mode cannot honour.
 //
-// It is given fs.Visit's result, not the parsed values: an explicitly chosen
-// default is still an explicit choice, and `--interval=0` must reach the
-// observer's validation rather than being indistinguishable from silence.
-func validateResourcesMode(provided map[string]bool) (resourcesMode, error) {
-	if provided["watch"] && provided["observer-status"] {
+// The two inputs answer two different questions, and conflating them is a bug
+// in each direction. Mode comes from the VALUE: fs.Visit reports presence, so
+// selecting on presence would let `--watch=false` activate the observer, which
+// is the opposite of what the operator wrote. Rejection comes from PRESENCE:
+// an explicitly chosen default is still an explicit choice, and that is the
+// only way `--interval=0` can be told from an absent --interval. So
+// `--watch=false --interval 5s` is still refused -- tuning outside an actual
+// watch is exactly the case this exists to catch.
+func validateResourcesMode(provided map[string]bool, watch, observerStatus bool) (resourcesMode, error) {
+	if watch && observerStatus {
 		return "", errors.New("--watch and --observer-status are different jobs; pick one")
 	}
 	mode := resourcesModeOneShot
 	switch {
-	case provided["watch"]:
+	case watch:
 		mode = resourcesModeWatch
-	case provided["observer-status"]:
+	case observerStatus:
 		mode = resourcesModeStatus
 	}
 	allowed := resourcesModeFlags[mode]
@@ -203,9 +217,10 @@ func validateResourcesMode(provided map[string]bool) (resourcesMode, error) {
 	// must not see the same mistake described in a different order.
 	rejected := make([]string, 0, len(provided))
 	for name := range provided {
-		if !allowed[name] {
-			rejected = append(rejected, "--"+name)
+		if resourcesModeNames[name] || allowed[name] {
+			continue
 		}
+		rejected = append(rejected, "--"+name)
 	}
 	if len(rejected) == 0 {
 		return mode, nil
@@ -217,7 +232,7 @@ func validateResourcesMode(provided map[string]bool) (resourcesMode, error) {
 	}
 	sort.Strings(accepted)
 	if mode == resourcesModeOneShot {
-		return "", fmt.Errorf("%s accept no mode of their own; they belong to --watch. "+
+		return "", fmt.Errorf("%s belong to --watch and this is not a watch. "+
 			"Plain `herd resources` accepts %s",
 			strings.Join(rejected, ", "), strings.Join(accepted, ", "))
 	}
