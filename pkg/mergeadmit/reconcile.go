@@ -2,6 +2,7 @@ package mergeadmit
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -290,20 +291,30 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 // after the equivalent patch (main advanced). Tip-tree identity is therefore
 // not required; content identity is carried by stable patch ids.
 func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
-	base, err := resolveCommit(repoDir, req.BaseSHA, "base")
+	return ProveEquivalentLandedContext(context.Background(), repoDir, req)
+}
+
+// ProveEquivalentLandedContext is the context-aware form of
+// ProveEquivalentLanded: the identical predicate, with every git probe
+// (resolution, range walks, patch ids, merge-tree replays) bounded by ctx so a
+// caller's deadline can stop the proof instead of starving on a slow
+// repository. A context failure is returned as the bare context error, never
+// flattened into a proof refusal.
+func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof, error) {
+	base, err := resolveCommit(ctx, repoDir, req.BaseSHA, "base")
 	if err != nil {
 		return nil, err
 	}
-	candidate, err := resolveCommit(repoDir, req.CandidateSHA, "candidate")
+	candidate, err := resolveCommit(ctx, repoDir, req.CandidateSHA, "candidate")
 	if err != nil {
 		return nil, err
 	}
-	landed, err := resolveCommit(repoDir, req.LandedSHA, "landed")
+	landed, err := resolveCommit(ctx, repoDir, req.LandedSHA, "landed")
 	if err != nil {
 		return nil, err
 	}
 
-	candidateCommits, err := rangeCommits(repoDir, base, candidate)
+	candidateCommits, err := rangeCommits(ctx, repoDir, base, candidate)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +323,7 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 			short(candidate), short(base))
 	}
 
-	landedCommits, err := rangeCommits(repoDir, base, landed)
+	landedCommits, err := rangeCommits(ctx, repoDir, base, landed)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +331,7 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 		return nil, fmt.Errorf("landed %s adds no commits over base %s", short(landed), short(base))
 	}
 
-	candidateContent, err := nonEmptyCommits(repoDir, candidateCommits)
+	candidateContent, err := nonEmptyCommits(ctx, repoDir, candidateCommits)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +344,7 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 	// administrative commits with no patch content on the landed range. Patch
 	// identity is associated with the content-bearing counterpart, never the
 	// empty merge tip.
-	landedContent, err := nonEmptyCommits(repoDir, landedCommits)
+	landedContent, err := nonEmptyCommits(ctx, repoDir, landedCommits)
 	if err != nil {
 		return nil, err
 	}
@@ -341,15 +352,15 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 		return nil, fmt.Errorf("landed %s adds no content over base %s", short(landed), short(base))
 	}
 
-	want, err := patchIDs(repoDir, candidateContent)
+	want, err := patchIDs(ctx, repoDir, candidateContent)
 	if err != nil {
 		return nil, err
 	}
-	got, err := patchIDs(repoDir, landedContent)
+	got, err := patchIDs(ctx, repoDir, landedContent)
 	if err == nil {
 		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedContent)
 		if matchErr == nil {
-			return equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA,
+			return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
 				"ordered-patch-subsequence-on-landed")
 		}
 		err = matchErr
@@ -362,26 +373,26 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 		return nil, fmt.Errorf("equivalent-patch proof failed: %w", err)
 	}
 
-	if mergeSHA, found, squashErr := matchSquashRangeReplay(repoDir, base, candidate, landedContent); squashErr != nil {
+	if mergeSHA, found, squashErr := matchSquashRangeReplay(ctx, repoDir, base, candidate, landedContent); squashErr != nil {
 		return nil, fmt.Errorf("squash proof failed: %w", squashErr)
 	} else if found {
-		proof, proofErr := equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree")
+		proof, proofErr := equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree")
 		if proof != nil {
 			proof.Mode = ModeSquash
 		}
 		return proof, proofErr
 	}
 
-	mergeSHA, replayErr := matchCombinedRangeReplay(repoDir, base, candidate, candidateContent, landedContent)
+	mergeSHA, replayErr := matchCombinedRangeReplay(ctx, repoDir, base, candidate, candidateContent, landedContent)
 	if replayErr != nil {
 		return nil, fmt.Errorf("equivalent-patch proof failed: ordered proof: %v; combined proof: %w", err, replayErr)
 	}
-	return equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA,
+	return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
 		"combined-range-replay-on-landed")
 }
 
-func equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA, method string) (*Proof, error) {
-	pid, err := commitPatchID(repoDir, mergeSHA)
+func equivalentLandedProof(ctx context.Context, repoDir, base, candidate, landed, mergeSHA, method string) (*Proof, error) {
+	pid, err := commitPatchID(ctx, repoDir, mergeSHA)
 	if err != nil {
 		return nil, fmt.Errorf("patch id for proved merge commit %s: %w", short(mergeSHA), err)
 	}
@@ -394,10 +405,10 @@ func equivalentLandedProof(repoDir, base, candidate, landed, mergeSHA, method st
 // nonEmptyCommits removes generated administrative anchors while preserving
 // the order of every content-bearing commit. A wholly empty range is still a
 // hard refusal, enforced by the caller.
-func nonEmptyCommits(repoDir string, commits []string) ([]string, error) {
+func nonEmptyCommits(ctx context.Context, repoDir string, commits []string) ([]string, error) {
 	content := make([]string, 0, len(commits))
 	for _, commit := range commits {
-		diff, err := gitOutBytes(repoDir, "diff-tree", "-p", "--no-color", commit)
+		diff, err := gitOutBytes(ctx, repoDir, "diff-tree", "-p", "--no-color", commit)
 		if err != nil {
 			return nil, fmt.Errorf("inspect patch for %s: %w", short(commit), err)
 		}
@@ -415,20 +426,26 @@ func nonEmptyCommits(repoDir string, commits []string) ([]string, error) {
 // window's parent using the exact reviewed base as the merge base. Only one
 // window may produce the exact landed end tree; zero is missing/altered and
 // more than one is an ambiguous reconstruction.
-func matchCombinedRangeReplay(repoDir, base, candidate string, candidateContent, landedCommits []string) (string, error) {
+func matchCombinedRangeReplay(ctx context.Context, repoDir, base, candidate string, candidateContent, landedCommits []string) (string, error) {
 	stackLen := len(candidateContent)
 	if stackLen < 2 {
 		return "", fmt.Errorf("combined replay requires a multi-commit candidate")
 	}
-	tipPatch, err := commitPatchID(repoDir, candidateContent[stackLen-1])
+	tipPatch, err := commitPatchID(ctx, repoDir, candidateContent[stackLen-1])
 	if err != nil {
 		return "", fmt.Errorf("candidate tip patch: %w", err)
 	}
 
 	var matches []string
 	for end := stackLen - 1; end < len(landedCommits); end++ {
-		landedTipPatch, patchErr := commitPatchID(repoDir, landedCommits[end])
-		if patchErr != nil || landedTipPatch != tipPatch {
+		landedTipPatch, patchErr := commitPatchID(ctx, repoDir, landedCommits[end])
+		if patchErr != nil {
+			if c := ctxFailure(ctx, patchErr); c != nil {
+				return "", c
+			}
+			continue
+		}
+		if landedTipPatch != tipPatch {
 			continue
 		}
 		start := end - stackLen + 1
@@ -436,12 +453,18 @@ func matchCombinedRangeReplay(repoDir, base, candidate string, candidateContent,
 		if start > 0 {
 			windowBase = landedCommits[start-1]
 		}
-		replayedTree, mergeErr := replayReviewedTree(repoDir, base, windowBase, candidate)
+		replayedTree, mergeErr := replayReviewedTree(ctx, repoDir, base, windowBase, candidate)
 		if mergeErr != nil {
+			if c := ctxFailure(ctx, mergeErr); c != nil {
+				return "", c
+			}
 			continue
 		}
-		landedTree, treeErr := gitOut(repoDir, "rev-parse", "--verify", "-q", landedCommits[end]+"^{tree}")
+		landedTree, treeErr := gitOut(ctx, repoDir, "rev-parse", "--verify", "-q", landedCommits[end]+"^{tree}")
 		if treeErr != nil {
+			if c := ctxFailure(ctx, treeErr); c != nil {
+				return "", c
+			}
 			return "", fmt.Errorf("resolve landed tree %s: %w", short(landedCommits[end]), treeErr)
 		}
 		if replayedTree == landedTree {
@@ -486,8 +509,8 @@ func matchOrderedPatchSubsequence(want, got, landedCommits []string) (string, er
 
 // replayReviewedTree applies precisely the reviewed base-to-candidate delta to
 // a landed parent. Both rebased-stack and squash proofs use this predicate.
-func replayReviewedTree(repoDir, base, parent, candidate string) (string, error) {
-	return gitOut(repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
+func replayReviewedTree(ctx context.Context, repoDir, base, parent, candidate string) (string, error) {
+	return gitOut(ctx, repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
 }
 
 // ReplayTree is the one exported definition of the native merge-tree replay
@@ -498,7 +521,15 @@ func replayReviewedTree(repoDir, base, parent, candidate string) (string, error)
 // definition of the same primitive, and the copies would diverge exactly as
 // FAC-562..574 did.
 func ReplayTree(repoDir, base, parent, candidate string) (string, error) {
-	return replayReviewedTree(repoDir, base, parent, candidate)
+	return ReplayTreeContext(context.Background(), repoDir, base, parent, candidate)
+}
+
+// ReplayTreeContext is the context-aware form of ReplayTree: the identical
+// merge-tree replay with the subprocess bounded by ctx, so a caller's deadline
+// kills the probe instead of starving on it. A context failure is returned as
+// the bare context error, never flattened into a replay refusal.
+func ReplayTreeContext(ctx context.Context, repoDir, base, parent, candidate string) (string, error) {
+	return replayReviewedTree(ctx, repoDir, base, parent, candidate)
 }
 
 // validatePriorReceipt does not grant review consent: the normal admission
@@ -521,10 +552,10 @@ func (g *Gate) validatePriorReceipt(req Request) error {
 	if prior.CandidateSHA == req.CandidateSHA {
 		return fmt.Errorf("follow-up must name a new candidate")
 	}
-	if _, err := resolveCommit(g.RepoDir, prior.MergeSHA, "prior merge"); err != nil {
+	if _, err := resolveCommit(context.Background(), g.RepoDir, prior.MergeSHA, "prior merge"); err != nil {
 		return err
 	}
-	if _, err := resolveCommit(g.RepoDir, req.BaseSHA, "follow-up reviewed base"); err != nil {
+	if _, err := resolveCommit(context.Background(), g.RepoDir, req.BaseSHA, "follow-up reviewed base"); err != nil {
 		return err
 	}
 	if err := gitroot.RequireAncestor(g.RepoDir, prior.MergeSHA, req.BaseSHA); err != nil {

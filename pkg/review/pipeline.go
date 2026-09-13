@@ -18,6 +18,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/harvest"
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
@@ -332,6 +333,38 @@ func (d *Drain) Scan(ctx context.Context, unmerged []harvest.UnmergedWork) (*Dra
 		// therefore individually bounded: a pathological object is reported by
 		// name instead of silently starving every remaining tip.
 		merged, probeErr := harvest.ContentMerged(itemCtx, d.RepoRoot, "origin/main", sha)
+		// FAC-805 (drain side): harvest.ContentMerged is git cherry-pick
+		// equivalence over a SINGLE tip, which cannot survive a squash merge --
+		// the reviewed range's per-commit patches are gone, replaced by one
+		// combined patch on main, so cherry reports every original commit
+		// unique forever. Native worktree retirement already proves this
+		// correctly with a whole-range proof; only ask it when the cheap
+		// per-commit check found nothing and there is still budget left, so
+		// this stays a targeted recheck of one already-suspect tip rather than
+		// a speculative range walk added to every poll.
+		if probeErr == nil && !merged && itemCtx.Err() == nil {
+			rangeMerged, rangeErr := rangeContentMerged(itemCtx, d.RepoRoot, "origin/main", sha)
+			if rangeErr != nil && ctx.Err() != nil {
+				// The OUTER deadline landed inside the whole-range proof. The
+				// same fail-closed truncation contract as the probe path: hand
+				// back the partial report alongside the error instead of a
+				// verdict derived from interrupted evidence.
+				cancelItem()
+				r.ScanTruncated = true
+				r.ScannedTips = i
+				r.TotalTips = len(tips)
+				return r, ctx.Err()
+			}
+			// A remaining non-context rangeErr cannot happen (the helper only
+			// surfaces context failures); anything else is the conservative
+			// unmerged default. If the PER-ITEM bound fired inside the proof,
+			// the deadline state read below classifies this tip as slow -- the
+			// same bounded diagnostic as the probe path -- so a slow range
+			// proof stops the item instead of starving every remaining tip.
+			if rangeMerged {
+				merged = true
+			}
+		}
 		// Read the per-item deadline state BEFORE cancelling it. cancel() sets
 		// Err() to Canceled, so checking after cancel reports every fast
 		// failure as a timeout -- which misclassified unprobeable objects as
@@ -562,6 +595,96 @@ func gitOut(ctx context.Context, dir string, args ...string) (string, error) {
 	c.Dir = dir
 	b, e := c.Output()
 	return string(b), e
+}
+
+// rangeContentMerged asks whether sha's reviewed range is on mainRef using
+// the same whole-range landing proof FAC-805 already trusts for native
+// worktree retirement (mergeadmit.ProveEquivalentLanded), instead of
+// reimplementing its ordered-patch, squash-range, and combined-replay
+// matching here (pkg/invariant's duplicate-rule gate rejects a second
+// definition of the same primitive).
+//
+// A proof alone only shows the range landed at SOME point; main may have
+// since reverted it. Current-tip containment is required too: replaying the
+// base..sha delta onto mainRef's own tree with the native merge-tree
+// primitive must reproduce that tree exactly, or the "merge" is stale.
+//
+// mainRef is pinned to ONE exact commit on entry, and that immutable snapshot
+// is used for the merge base, the historical proof, and the containment
+// replay alike. Re-resolving a moving ref (origin/main) at each step could
+// combine a proof against one observed main with containment against another.
+//
+// Every git probe below runs under ctx — including the merge-base, the proof's
+// own subprocesses (range walks, patch ids, merge-tree), and the tree read —
+// so the caller's per-item deadline kills a slow probe instead of starving
+// the whole drain on it. The contract is:
+//
+//	(true, nil)    full proof + containment against the pinned snapshot;
+//	(false, nil)   any resolution, proof, or containment refusal — the
+//	               fail-closed conservative unknown. This can only ever ADD a
+//	               merged verdict to a tip harvest.ContentMerged already called
+//	               unmerged, never remove that default. A candidate that still
+//	               holds unique or reverted content fails every match here and
+//	               falls through unchanged;
+//	(false, err)   ctx gave up (deadline/cancellation). Returned bare so the
+//	               caller can classify a slow probe instead of misreading the
+//	               interrupted measurement as legitimate git evidence.
+func rangeContentMerged(ctx context.Context, repoRoot, mainRef, sha string) (bool, error) {
+	pinned, err := gitOut(ctx, repoRoot, "rev-parse", "--verify", "-q", mainRef+"^{commit}")
+	if err != nil {
+		if c := contextDropped(ctx, err); c != nil {
+			return false, c
+		}
+		return false, nil
+	}
+	pinned = strings.TrimSpace(pinned)
+	mbOut, err := gitOut(ctx, repoRoot, "merge-base", pinned, sha)
+	if err != nil {
+		if c := contextDropped(ctx, err); c != nil {
+			return false, c
+		}
+		return false, nil
+	}
+	mergeBase := strings.TrimSpace(mbOut)
+	if _, err := mergeadmit.ProveEquivalentLandedContext(ctx, repoRoot, mergeadmit.ProofRequest{
+		BaseSHA:      mergeBase,
+		CandidateSHA: sha,
+		LandedSHA:    pinned,
+	}); err != nil {
+		if c := contextDropped(ctx, err); c != nil {
+			return false, c
+		}
+		return false, nil
+	}
+	tipTree, err := gitOut(ctx, repoRoot, "rev-parse", "--verify", "-q", pinned+"^{tree}")
+	if err != nil {
+		if c := contextDropped(ctx, err); c != nil {
+			return false, c
+		}
+		return false, nil
+	}
+	replayed, err := mergeadmit.ReplayTreeContext(ctx, repoRoot, mergeBase, pinned, sha)
+	if err != nil {
+		if c := contextDropped(ctx, err); c != nil {
+			return false, c
+		}
+		return false, nil
+	}
+	if strings.TrimSpace(replayed) != strings.TrimSpace(tipTree) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// contextDropped reports whether err (or the context state itself) says the
+// caller's deadline or cancellation ended the probe, returning the bare
+// context error. Every other failure is repository evidence, not a deadline
+// signal, and must keep the fail-closed conservative verdict.
+func contextDropped(ctx context.Context, err error) error {
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return err
+	}
+	return ctx.Err()
 }
 
 var mergeTreeCache sync.Map
