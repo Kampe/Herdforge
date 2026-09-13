@@ -331,6 +331,15 @@ restore_all() {
 #   mutant feeds the validator an empty flag set, which compiles and restores
 #   exactly that behaviour, and the named CLI oracle catches it.
 #
+#   It is anchored to the CHILD subtest gate_under_watch, not the parent. Go
+#   emits the assertion output under the subtest that made it, and killed_by
+#   matches .Test EXACTLY, so the parent carries a fail action with no matching
+#   assertion output of its own. Anchoring at the parent read as
+#   WRONG-TEST-OR-ASSERTION in CI 34739189004 even though the guard was caught.
+#   Same subtest-anchoring pattern as the usable-*, config-* and scope controls.
+#   The parent stays in herd_expect, so its top-level PASS is still required at
+#   baseline and restored state.
+#
 #   catch-up-burst is anchored to the assertion its oracle ACTUALLY emits.
 #   Replaying every missed tick makes each gap exactly one, so the test's
 #   zero-skipped-ticks assertion fires before its inter-sample spacing check.
@@ -357,7 +366,7 @@ mutations=(
 "failed-sample-keeps-admit${sep}${observer_src}${sep}			sample.Report.Admits = false${sep}			_ = sampleErr // MUTANT: a failed sample keeps its admit${sep}${resources_pkg}${sep}TestObserverRecordsSampleFailureWithoutAdmitting${sep}a failure must not keep its admit"
 "broken-chronology-ignored${sep}${observer_src}${sep}	if why := sampleChronologyProblem(status, at); why != \"\" {${sep}	if why := \"\"; why != \"\" { // MUTANT: stamps no longer have to be credible${sep}${resources_pkg}${sep}TestObserverUsableRefusesBrokenChronology/missing_published_at${sep}was reported usable"
 "publish-failure-swallowed-by-cancellation${sep}${run_src}${sep}	if errors.Is(err, ErrObserverPublishFailed) {${sep}	if false && errors.Is(err, ErrObserverPublishFailed) { // MUTANT: a cancellation hides a failed final write${sep}${resources_pkg}${sep}TestRunObserverPreservesPublishFailureThroughCancellation${sep}a failed terminal publication was reported as a clean shutdown"
-"mode-validation-discarded${sep}${cli_src}${sep}	mode, err := validateResourcesMode(provided, *watch, *observerStatus)${sep}	mode, err := validateResourcesMode(map[string]bool{}, *watch, *observerStatus) // MUTANT: the mode validator never sees the operator's flags${sep}${herd_pkg}${sep}TestRunResourcesRejectsFlagsTheModeCannotHonour${sep}an unsupported mix must be refused, never ignored"
+"mode-validation-discarded${sep}${cli_src}${sep}	mode, err := validateResourcesMode(provided, *watch, *observerStatus)${sep}	mode, err := validateResourcesMode(map[string]bool{}, *watch, *observerStatus) // MUTANT: the mode validator never sees the operator's flags${sep}${herd_pkg}${sep}TestRunResourcesRejectsFlagsTheModeCannotHonour/gate_under_watch${sep}an unsupported mix must be refused, never ignored"
 "unknown-scope-sounds-safe${sep}${paths_src}${sep}	return \"unknown scope: treat exclusivity as unproven\"${sep}	return \"exclusive\" // MUTANT: an unrecognised scope claims exclusivity${sep}${resources_pkg}${sep}TestObserverLockScopeIsReportedHonestly/an_unrecognised_scope_refuses_to_sound_safe${sep}it must state that exclusivity is unproven"
 )
 

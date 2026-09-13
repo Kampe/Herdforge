@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -316,5 +317,235 @@ func TestGovernorCensusCursorWriteFailureIsVisibleAndChangesNoLane(t *testing.T)
 	}
 	if stage.Deferred != unknown {
 		t.Fatalf("stage Deferred %d must still equal the %d unknown lanes when the cursor write failed", stage.Deferred, unknown)
+	}
+}
+
+// seedRawRegisteredCursor writes arbitrary bytes as the durable cursor so a
+// read/parse failure can be staged without breaking the WRITE path — the
+// directory stays a directory and the file stays writable, so the advance that
+// follows succeeds.
+func seedRawRegisteredCursor(t *testing.T, g *Governor, body string) string {
+	t.Helper()
+	path := g.registeredCursorPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// REGRESSION (FAC-825): a cursor READ/PARSE failure followed by a SUCCESSFUL
+// advance write must still be visible.
+//
+// registeredWindowStart returned the time-bucket fallback for every read and
+// parse error without retaining anything, and CursorError was only ever
+// assigned from a failed WindowAdvance. So this exact sequence — unreadable
+// durable position, healthy write — reported no CursorError at all, and a lost
+// cursor looked identical to a working one.
+//
+// The existing write-failure test cannot cover this: it blocks the cursor
+// directory, so read AND write both fail and the write-side assignment is what
+// makes the diagnostic appear.
+func TestGovernorCensusCursorReadFailureSurvivesASuccessfulAdvance(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"unparsable value", "not-a-cursor\n", "registered census cursor parse"},
+		{"negative value", "-7\n", "registered census cursor parse"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, _, _, _ := censusSeamGovernor(t, 5, 2)
+			path := seedRawRegisteredCursor(t, g, tc.body)
+
+			report, err := g.census(context.Background())
+			if err != nil {
+				t.Fatalf("an unreadable cursor must not fail the sweep: %v", err)
+			}
+			stage := censusStage(t, report)
+			if stage.CursorError == "" {
+				t.Fatal("a cursor read failure followed by a successful advance reported nothing; the lost durable position is invisible")
+			}
+			if !strings.Contains(stage.CursorError, tc.want) {
+				t.Fatalf("CursorError = %q, want it to name the read/parse failure %q", stage.CursorError, tc.want)
+			}
+			// The WRITE really did succeed, or this fixture would be proving
+			// the old write-side path instead of the new read-side one.
+			if strings.Contains(stage.CursorError, "cursor advance") {
+				t.Fatalf("the advance also failed (%q); this case must isolate the READ failure", stage.CursorError)
+			}
+			raw, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatalf("cursor file unreadable after the sweep: %v", readErr)
+			}
+			if _, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr != nil {
+				t.Fatalf("the advance did not overwrite the bad cursor with a valid one: %q", raw)
+			}
+
+			// Lane results stay exactly as fail-closed as before.
+			if len(report.Worktrees) == 0 {
+				t.Fatal("census reported no registered worktrees; the fixture proves nothing")
+			}
+			unknown := 0
+			for _, lane := range report.Worktrees {
+				if lane.State != LaneUnknown {
+					continue
+				}
+				unknown++
+				if lane.PreserveReason == "" {
+					t.Fatalf("unknown lane %s lost its fail-closed reason under a cursor read failure", lane.Path)
+				}
+			}
+			if unknown == 0 {
+				t.Fatal("no lane was unknown; this case cannot show that unknown lanes stay fenced")
+			}
+			if stage.Deferred != unknown {
+				t.Fatalf("stage Deferred %d must still equal the %d unknown lanes", stage.Deferred, unknown)
+			}
+		})
+	}
+}
+
+// The documented fallback is preserved: an ABSENT cursor is the first-run state
+// and must stay silent. Without this, the regression above could be satisfied by
+// reporting an error for every sweep that ever takes the fallback.
+func TestGovernorCensusAbsentCursorReportsNoDiagnostic(t *testing.T) {
+	g, _, _, _ := censusSeamGovernor(t, 5, 2)
+	if _, err := os.Stat(g.registeredCursorPath()); !os.IsNotExist(err) {
+		t.Fatalf("fixture invalid: the cursor must be absent, stat err = %v", err)
+	}
+
+	report, err := g.census(context.Background())
+	if err != nil {
+		t.Fatalf("an absent cursor must not fail the sweep: %v", err)
+	}
+	if stage := censusStage(t, report); stage.CursorError != "" {
+		t.Fatalf("an absent cursor is the documented first-run fallback and must report nothing, got %q", stage.CursorError)
+	}
+}
+
+// registeredCursorDiagnostic keeps the advance-only contract byte-for-byte and
+// keeps BOTH facts when both fail.
+func TestRegisteredCursorDiagnosticKeepsBothFacts(t *testing.T) {
+	if got := registeredCursorDiagnostic("", ""); got != "" {
+		t.Fatalf("no failures = %q, want empty", got)
+	}
+	if got := registeredCursorDiagnostic("", "advance broke"); got != "advance broke" {
+		t.Fatalf("advance only = %q; the existing contract must be unchanged", got)
+	}
+	if got := registeredCursorDiagnostic("read broke", ""); got != "read broke" {
+		t.Fatalf("read only = %q", got)
+	}
+	got := registeredCursorDiagnostic("read broke", "advance broke")
+	if !strings.Contains(got, "read broke") || !strings.Contains(got, "advance broke") {
+		t.Fatalf("both failures = %q; neither fact may be dropped", got)
+	}
+}
+
+// REGRESSION (FAC-825), the READ half: a non-ENOENT os.ReadFile failure
+// followed by a SUCCESSFUL advance write must still be visible.
+//
+// The unparsable and negative cases above reach strconv.Atoi and never make
+// os.ReadFile fail at all, so they cannot exercise the ReadFile branch — a
+// mutant that discards only the read assignment survives them. This case makes
+// the read itself fail.
+//
+// A DIRECTORY at the cursor path makes os.ReadFile return EISDIR: POSIX,
+// deterministic, identical on Linux and macOS, and with no dependence on file
+// modes or on whether the test runs as root. The obstruction is then cleared
+// through the WindowStart seam — the function field g.defaults() already wires
+// — after the real read has happened and before the real WindowAdvance runs, so
+// the write under test is the unmodified storeRegisteredCursor and it succeeds.
+func TestGovernorCensusNonENOENTCursorReadFailureSurvivesASuccessfulAdvance(t *testing.T) {
+	g, _, _, _ := censusSeamGovernor(t, 5, 2)
+	cursorPath := g.registeredCursorPath()
+	if err := os.MkdirAll(cursorPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fixture must prove its own premise: reading the cursor fails, and the
+	// failure is NOT absence. Without this the test could silently degrade into
+	// the ENOENT path, where reporting nothing is correct.
+	probe, probeErr := os.ReadFile(cursorPath)
+	if probeErr == nil {
+		t.Fatalf("fixture invalid: reading a directory as the cursor succeeded, got %q", probe)
+	}
+	if errors.Is(probeErr, os.ErrNotExist) {
+		t.Fatalf("fixture invalid: the read failure must not be absence, got %v", probeErr)
+	}
+
+	// Clear the obstruction between the real read and the real advance, using
+	// the seam the governor already installed. WindowAdvance is untouched.
+	we, ok := g.Worktrees.(GitWorktreeEnumerator)
+	if !ok {
+		t.Fatalf("fixture invalid: expected a GitWorktreeEnumerator, got %T", g.Worktrees)
+	}
+	readInner := we.WindowStart
+	if readInner == nil {
+		t.Fatal("fixture invalid: g.defaults() did not wire WindowStart")
+	}
+	reads := 0
+	we.WindowStart = func(entryCount int) int {
+		start := readInner(entryCount)
+		reads++
+		if err := os.RemoveAll(cursorPath); err != nil {
+			t.Errorf("clearing the cursor obstruction: %v", err)
+		}
+		return start
+	}
+	g.Worktrees = we
+
+	report, err := g.census(context.Background())
+	if err != nil {
+		t.Fatalf("an unreadable cursor must not fail the sweep: %v", err)
+	}
+	if reads == 0 {
+		t.Fatal("WindowStart was never called; the read branch was not exercised")
+	}
+
+	stage := censusStage(t, report)
+	if stage.CursorError == "" {
+		t.Fatal("a non-ENOENT cursor read failure followed by a successful advance reported nothing; the lost durable position is invisible")
+	}
+	if !strings.Contains(stage.CursorError, "registered census cursor read") {
+		t.Fatalf("CursorError = %q, want it to name the READ failure", stage.CursorError)
+	}
+	if strings.Contains(stage.CursorError, "cursor parse") {
+		t.Fatalf("CursorError = %q names a parse failure; this case must isolate the ReadFile branch", stage.CursorError)
+	}
+	// The write really did succeed, or this would be re-proving the write path.
+	if strings.Contains(stage.CursorError, "cursor advance") {
+		t.Fatalf("the advance also failed (%q); this case must isolate the READ failure", stage.CursorError)
+	}
+	raw, readErr := os.ReadFile(cursorPath)
+	if readErr != nil {
+		t.Fatalf("the advance did not create a readable cursor file: %v", readErr)
+	}
+	if _, convErr := strconv.Atoi(strings.TrimSpace(string(raw))); convErr != nil {
+		t.Fatalf("the advance did not write a valid cursor: %q", raw)
+	}
+
+	// Lane results stay exactly as fail-closed as before.
+	if len(report.Worktrees) == 0 {
+		t.Fatal("census reported no registered worktrees; the fixture proves nothing")
+	}
+	unknown := 0
+	for _, lane := range report.Worktrees {
+		if lane.State != LaneUnknown {
+			continue
+		}
+		unknown++
+		if lane.PreserveReason == "" {
+			t.Fatalf("unknown lane %s lost its fail-closed reason under a cursor read failure", lane.Path)
+		}
+	}
+	if unknown == 0 {
+		t.Fatal("no lane was unknown; this case cannot show that unknown lanes stay fenced")
+	}
+	if stage.Deferred != unknown {
+		t.Fatalf("stage Deferred %d must still equal the %d unknown lanes", stage.Deferred, unknown)
 	}
 }

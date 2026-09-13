@@ -7845,11 +7845,17 @@ func runResourcesWithArgs(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// Dispatch through the seams, not the functions directly. A test that
+	// asserts a mix is REFUSED must be able to prove no job started, and it
+	// must stay bounded even when the refusal it is testing is absent: without
+	// the seam a regression in the validation above put the test inside a real
+	// twelve-hour observer, where it reported a timeout instead of the named
+	// failure. Production wires the real jobs in resources_observe.go.
 	switch mode {
 	case resourcesModeStatus:
-		return runResourcesObserverStatus(*asJSON)
+		return runResourcesObserverStatusFn(*asJSON)
 	case resourcesModeWatch:
-		return runResourcesObserver(observerFlags{
+		return runResourcesObserverFn(observerFlags{
 			interval:      *interval,
 			lifetime:      *lifetime,
 			sampleTimeout: *sampleTimeout,
