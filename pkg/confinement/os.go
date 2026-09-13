@@ -202,7 +202,7 @@ func (d DarwinSeatbelt) Prepare(worktree, sharedRoot, branch string, session Ses
 	if isPathPrefix(absSession, absWT) || absSession == absWT {
 		return "", fmt.Errorf("confinement: session root must be outside worktree")
 	}
-	gitDir, err := absoluteGitDir(absWT)
+	gitDir, err := AbsoluteGitDir(absWT)
 	if err != nil {
 		return "", fmt.Errorf("confinement: resolve worktree gitdir: %w", err)
 	}
@@ -313,7 +313,7 @@ func (d DarwinSeatbelt) ProveWriteDenials(worktree, sharedRoot, profilePath stri
 	_ = os.Remove(inside)
 
 	// Allowed: linked gitdir metadata.
-	gitDir, err := absoluteGitDir(absWT)
+	gitDir, err := AbsoluteGitDir(absWT)
 	if err != nil {
 		return fmt.Errorf("%w: gitdir: %v", ErrOSProbeFailed, err)
 	}
@@ -802,9 +802,9 @@ func writeSeatbeltProfile(worktree, gitDir, commonDir, branch, profilePath strin
 	return profilePath, nil
 }
 
-// absoluteGitDir returns the absolute git directory for a worktree (the
+// AbsoluteGitDir returns the absolute git directory for a worktree (the
 // linked-worktree metadata dir under .git/worktrees/<name> when applicable).
-func absoluteGitDir(worktree string) (string, error) {
+func AbsoluteGitDir(worktree string) (string, error) {
 	out, err := exec.Command("git", "-C", worktree, "rev-parse", "--absolute-git-dir").Output()
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse --absolute-git-dir: %w", err)
