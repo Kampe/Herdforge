@@ -7,7 +7,6 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
-	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // writeReceipt is the persistence seam. It exists so a test can simulate the
@@ -55,15 +54,24 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		return nil, fmt.Errorf("herd-merge-completion: admitted verdict carries no verification digest")
 	}
 
-	// Re-read the integration tip AFTER the merge. This is the same live probe
+	// ONE allowance for the whole invocation: the integration-tip read, the
+	// proof, the identity read and every git below share it. Prove() would have
+	// installed a second (review 212), and the tip read ran outside any at all
+	// (review 6c93cc2b) -- an unbounded fetch could hang ahead of every command
+	// this budget governs.
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+
+	// Re-read the integration tip AFTER the merge. This is the same live reading
 	// Admit used to assert the base had not moved; now its whole job is to
-	// report where the merge actually put things.
-	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	// report where the merge actually put things -- and which commit this receipt
+	// will seal, which is why it is charged to the allowance above.
+	landed, err := g.currentOriginMain(ctx, "origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-completion: %w", err)
 	}
 
-	proof, err := Prove(g.RepoDir, ProofRequest{
+	proof, err := proveContext(ctx, g.RepoDir, ProofRequest{
 		Mode:         d.Mode,
 		BaseSHA:      req.BaseSHA,
 		CandidateSHA: req.CandidateSHA,
@@ -73,7 +81,7 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		return nil, fmt.Errorf("herd-merge-completion: %s: %w", CodeProofFailed, err)
 	}
 
-	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	repoID, err := g.repositoryIdentity(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-completion: resolve repository identity: %w", err)
 	}
@@ -87,6 +95,7 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		BaseSHA:            proof.BaseSHA,
 		CandidateSHA:       proof.CandidateSHA,
 		MergeSHA:           proof.MergeSHA,
+		ContentSHA:         proof.ContentSHA,
 		PatchID:            proof.PatchID,
 		AcceptanceDigest:   req.AcceptanceDigest,
 		VerificationDigest: d.VerificationDigest,

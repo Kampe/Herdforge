@@ -44,7 +44,7 @@ func TestReconcileLandedEquivalentPatchDifferentSHA(t *testing.T) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain:    StaticProbe(advanced),
+			OriginMain: StaticProbe(advanced), OriginMainAt: StaticOriginProbe(advanced),
 			CandidateHead: StaticProbe(candidate),
 			Mergeable:     StaticProbe("CLEAN"),
 			TaskRevision:  StaticProbe(testRevision),
@@ -132,7 +132,7 @@ func TestReconcileLandedRefusesWhenEquivalentPatchMissing(t *testing.T) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain: StaticProbe(unrelated), CandidateHead: StaticProbe(candidate),
+			OriginMain: StaticProbe(unrelated), OriginMainAt: StaticOriginProbe(unrelated), CandidateHead: StaticProbe(candidate),
 			Mergeable: StaticProbe("CLEAN"), TaskRevision: StaticProbe(testRevision),
 			Checks: func() (map[string]string, error) { return map[string]string{testCheck: "success"}, nil },
 		},
@@ -164,7 +164,7 @@ func TestReconcileLandedIsIdempotent(t *testing.T) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain: StaticProbe(landedEquiv), CandidateHead: StaticProbe(candidate),
+			OriginMain: StaticProbe(landedEquiv), OriginMainAt: StaticOriginProbe(landedEquiv), CandidateHead: StaticProbe(candidate),
 			Mergeable: StaticProbe("CLEAN"), TaskRevision: StaticProbe(testRevision),
 			Checks: func() (map[string]string, error) { return map[string]string{testCheck: "success"}, nil },
 		},
@@ -192,7 +192,7 @@ func TestReconcileLandedReducedProvenanceUsesExactVerdictAndProof(t *testing.T) 
 	l := newLedger(t, dir)
 	launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
 	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
-	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(landed)}}
+	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(landed), OriginMainAt: StaticOriginProbe(landed)}}
 	req := Request{Ref: testRef, CandidateSHA: candidate, BaseSHA: base, ReducedProvenance: &ReducedProvenance{PullRequest: 2864, VerifyLanded: true}}
 	receipt, err := g.ReconcileLanded(req)
 	if err != nil {
@@ -271,7 +271,7 @@ func TestProveEquivalentLandedContextChangedStack(t *testing.T) {
 	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
-		Live: LiveState{OriginMain: StaticProbe(landed)},
+		Live: LiveState{OriginMain: StaticProbe(landed), OriginMainAt: StaticOriginProbe(landed)},
 	}
 	receipt, err := g.ReconcileLanded(okRequest(base, candidate))
 	if err != nil {
@@ -460,7 +460,7 @@ func TestProveEquivalentLandedEmptyMergeTipMutationControls(t *testing.T) {
 	if _, err := patchIDs(context.Background(), dir, landedCommits); err == nil {
 		t.Fatal("unfiltered landed patch IDs succeeded; empty-merge mapping is not under test")
 	}
-	if _, err := equivalentLandedProof(context.Background(), dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed"); err == nil {
+	if _, err := equivalentLandedProof(context.Background(), dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed", landedCommits); err == nil {
 		t.Fatal("equivalentLandedProof accepted the empty merge commit")
 	}
 
@@ -496,7 +496,7 @@ func TestReconcileLandedEmptyMergeTipSealsContentCommit(t *testing.T) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain:    StaticProbe(mergeTip),
+			OriginMain: StaticProbe(mergeTip), OriginMainAt: StaticOriginProbe(mergeTip),
 			CandidateHead: StaticProbe(candidate),
 			Mergeable:     StaticProbe("CLEAN"),
 			TaskRevision:  StaticProbe(testRevision),
@@ -577,7 +577,7 @@ func TestReconcileLandedEmptyMergeTipRefusesWithoutExactPASS(t *testing.T) {
 			tc.prep(t, l, candidate)
 			g := &Gate{
 				RepoDir: dir, Ledger: l, Policy: testPolicy(),
-				Live: LiveState{OriginMain: StaticProbe(mergeTip)},
+				Live: LiveState{OriginMain: StaticProbe(mergeTip), OriginMainAt: StaticOriginProbe(mergeTip)},
 			}
 			_, err := g.ReconcileLanded(okRequest(base, candidate))
 			if err == nil {
@@ -604,7 +604,7 @@ func TestReconcileReconstructedConsent(t *testing.T) {
 	if err := l.Reconstruction(reviewledger.ReconstructionOpts{SHA: rebuilt, CandidateSHA: candidate, ContentProof: "same row reanchored"}); err != nil {
 		t.Fatal(err)
 	}
-	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(rebuilt)}}
+	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(rebuilt), OriginMainAt: StaticOriginProbe(rebuilt)}}
 	req := Request{Ref: testRef, CandidateSHA: candidate, BaseSHA: base, ReducedProvenance: &ReducedProvenance{PullRequest: 1, VerifyLanded: true}, Reconstruction: &ReconstructionBinding{SHA: rebuilt, BaseSHA: newBase, AttestationDigest: ""}}
 	rows, err := l.AllRows()
 	if err != nil {

@@ -301,11 +301,14 @@ func nativeIntegrationCommand(ctx context.Context, dir string, timeout time.Dura
 	return out, nil
 }
 func (n *nativeIntegrationSteps) remoteMain(ctx context.Context) (string, error) {
-	out, err := nativeIntegrationCommand(ctx, n.root, 15*time.Second, "git", "ls-remote", "--heads", "--refs", "origin", gitroot.MainBranchRef)
+	// Charged, owned and output-capped like every other proof command. A 15s
+	// deadline alone left this read outside the shared command and output ledger
+	// (review 6c93cc2b advisory), so a proof that spends it paid nothing for it.
+	out, err := mergeadmit.BoundedGit(ctx, n.root)("ls-remote", "--heads", "--refs", "origin", gitroot.MainBranchRef)
 	if err != nil {
 		return "", err
 	}
-	f := strings.Fields(string(out))
+	f := strings.Fields(out)
 	if len(f) != 2 || len(f[0]) != 40 || f[1] != gitroot.MainBranchRef {
 		return "", fmt.Errorf("integration: remote main identity is unknown")
 	}
@@ -376,7 +379,17 @@ func (n *nativeIntegrationSteps) gate(ctx context.Context, p nativeIntegrationPl
 	if err != nil {
 		return nil, err
 	}
-	live := mergeadmit.LiveState{OriginMain: func() (string, error) { return n.remoteMain(ctx) }}
+	// Context-aware: the tip read is charged to whatever allowance the proof
+	// entry installs, instead of a closure that captured a context and hid an
+	// executable read behind a value-only field.
+	// BOTH: OriginMainAt is what the proof routes require, and Admit -- which has
+	// no proof context -- still reads the value-only field. Setting only the
+	// context-aware one left Admit with no probe at all, which is why the native
+	// crash cycle failed before it could publish (CI 34749406649).
+	live := mergeadmit.LiveState{
+		OriginMain:   func() (string, error) { return n.remoteMain(ctx) },
+		OriginMainAt: func(ctx context.Context) (string, error) { return n.remoteMain(ctx) },
+	}
 	if pr > 0 {
 		probes := &prProbes{number: pr, root: n.root, repository: p.Repository, ctx: ctx}
 		live.CandidateHead, live.Mergeable, live.Checks = probes.head, probes.mergeable, probes.checks

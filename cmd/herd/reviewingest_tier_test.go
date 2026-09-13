@@ -146,7 +146,7 @@ func TestReviewIngestRiskTierReachesReceiptReconcile(t *testing.T) {
 				RepoDir: root,
 				Ledger:  ledger,
 				Policy:  preflight.DefaultProtectedPolicy(),
-				Live:    mergeadmit.LiveState{OriginMain: mergeadmit.StaticProbe(sha)},
+				Live:    mergeadmit.LiveState{OriginMain: mergeadmit.StaticProbe(sha), OriginMainAt: mergeadmit.StaticOriginProbe(sha)},
 			}
 			completed, err := gate.ReconcileLanded(mergeadmit.Request{
 				Ref:          "FAC-631",

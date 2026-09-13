@@ -19,7 +19,7 @@ func TestReconcileFollowupRequiresFreshEvidenceAndRetainsPrior(t *testing.T) {
 			ledger := newLedger(t, dir)
 			launch(t, ledger, first, "reviewer-a", "anthropic", "builder-session-1")
 			verdict(t, ledger, first, "reviewer-a", reviewledger.VerdictPASS)
-			gate := &Gate{RepoDir: dir, Ledger: ledger, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(first)}}
+			gate := &Gate{RepoDir: dir, Ledger: ledger, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(first), OriginMainAt: StaticOriginProbe(first)}}
 			request := okRequest(base, first)
 			if mode == "reduced" {
 				request.ReducedProvenance = &ReducedProvenance{PullRequest: 1, VerifyLanded: true}
@@ -35,6 +35,8 @@ func TestReconcileFollowupRequiresFreshEvidenceAndRetainsPrior(t *testing.T) {
 			}
 			next := commit(t, dir, "second.txt", "second\n", "follow-up")
 			gate.Live.OriginMain = StaticProbe(next)
+			gate.Live.OriginMainAt = StaticOriginProbe(next)
+			gate.Live.OriginMainAt = StaticOriginProbe(next)
 			request = okRequest(first, next)
 			if mode == "reduced" {
 				request.ReducedProvenance = &ReducedProvenance{PullRequest: 2, VerifyLanded: true}

@@ -212,7 +212,7 @@ func TestFAC601MergeAdmitCLIRequiresRetainedProviderRevision(t *testing.T) {
 	gate := &mergeadmit.Gate{RepoDir: a.root, Ledger: a.ledger,
 		Policy: preflight.MergePolicy{Protected: true, RequiredChecks: []string{"fixture-build"}, RequireDifferentFamilyReview: true, RequirePullRequestReviews: true},
 		Live: mergeadmit.LiveState{
-			OriginMain: mergeadmit.StaticProbe(req.BaseSHA), CandidateHead: mergeadmit.StaticProbe(req.CandidateSHA),
+			OriginMain: mergeadmit.StaticProbe(req.BaseSHA), OriginMainAt: mergeadmit.StaticOriginProbe(req.BaseSHA), CandidateHead: mergeadmit.StaticProbe(req.CandidateSHA),
 			Mergeable: mergeadmit.StaticProbe("CLEAN"), TaskRevision: mergeadmit.StaticProbe(req.ProviderRevision),
 			Checks: func() (map[string]string, error) { return map[string]string{"fixture-build": "success"}, nil },
 		},

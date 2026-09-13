@@ -69,7 +69,7 @@ func TestReconcileLandedReducedRefusesAuthenticatedCrossHostDissent(t *testing.T
 			}
 			g := &Gate{
 				RepoDir: dir, Ledger: l, Policy: testPolicy(),
-				Live: LiveState{OriginMain: StaticProbe(landed)},
+				Live: LiveState{OriginMain: StaticProbe(landed), OriginMainAt: StaticOriginProbe(landed)},
 			}
 			req := Request{
 				Ref: testRef, CandidateSHA: candidate, BaseSHA: base,

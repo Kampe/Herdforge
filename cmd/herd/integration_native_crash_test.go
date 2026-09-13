@@ -74,14 +74,29 @@ go build -buildvcs=true -ldflags "-X github.com/Kampe/Herdforge/pkg/provenance.B
 	// to the bare temporary remote. Kill only this test's explicit child.
 	write("git", `#!/bin/sh
 set -eu
-if [ "$1" = -C ] && [ "${3:-}" = config ] && [ "${4:-}" = --get ] && [ "${5:-}" = remote.origin.url ]; then
- printf '%s\n' 'git@fixture.invalid:Kampe/Herdforge.git'
- exit 0
-fi
-if [ "$1" = remote ] && [ "$2" = get-url ]; then
- printf '%s\n' 'git@fixture.invalid:Kampe/Herdforge.git'
- exit 0
-fi
+# Identity is matched by SUBCOMMAND, not by argv position. git accepts both
+# "git -C <dir> config ..." and "git config ..." with the directory chosen by
+# the child's working directory, and a caller is free to use either. Keying on
+# $1 = -C made this shim stop intercepting the moment the bounded identity
+# runner started setting cmd.Dir instead: the real remote answered, the receipt
+# was sealed with the temp path, and the retained plan still held the hosted
+# identity -- the repo_id contradiction in CI 34745136415.
+_p2=''; _p1=''
+for _a do
+ case "$_p2:$_p1:$_a" in
+  config:--get:remote.origin.url)
+   printf '%s\n' 'git@fixture.invalid:Kampe/Herdforge.git'
+   exit 0
+   ;;
+ esac
+ case "$_p1:$_a" in
+  remote:get-url)
+   printf '%s\n' 'git@fixture.invalid:Kampe/Herdforge.git'
+   exit 0
+   ;;
+ esac
+ _p2=$_p1; _p1=$_a
+done
 if [ "$1" = push ]; then
  for arg do
   case "$arg" in

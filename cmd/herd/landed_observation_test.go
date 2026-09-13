@@ -49,9 +49,9 @@ func TestObserveVerifyLandedSquashPreservesCandidate(t *testing.T) {
 	landed := git(repo, "rev-parse", "HEAD")
 	git(repo, "push", "-q", "origin", "main")
 	git(repo, "checkout", "-q", "work")
-	gate := &mergeadmit.Gate{RepoDir: repo}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{BaseSHA: base, CandidateSHA: candidate}
-	proof, err := observeVerifyLanded(repo, gate, req)
+	proof, err := observeVerifyLandedUnderGate(t, repo, gate, req)
 	if err != nil {
 		t.Fatalf("squash observation: %v", err)
 	}
@@ -64,12 +64,12 @@ func TestObserveVerifyLandedSquashPreservesCandidate(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(repo, "a"), []byte("dirty\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := observeVerifyLanded(repo, gate, req); e == nil {
+	if _, e := observeVerifyLandedUnderGate(t, repo, gate, req); e == nil {
 		t.Fatal("dirty worktree admitted")
 	}
 	git(repo, "checkout", "--", "a")
 	git(repo, "remote", "set-url", "origin", filepath.Join(root, "missing.git"))
-	if _, e := observeVerifyLanded(repo, gate, req); e == nil {
+	if _, e := observeVerifyLandedUnderGate(t, repo, gate, req); e == nil {
 		t.Fatal("failed fetch admitted stale origin/main")
 	}
 }

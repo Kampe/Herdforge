@@ -33,7 +33,6 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
@@ -99,12 +98,24 @@ type Proof struct {
 	BaseSHA      string `json:"base_sha"`
 	CandidateSHA string `json:"candidate_sha"`
 	LandedSHA    string `json:"landed_sha"`
-	// MergeSHA is the commit on the landed history whose patch the completion
-	// receipt binds its content check to. For ModeMerge that is the candidate
-	// itself (it survived); for a rewrite it is the landed tip.
+	// MergeSHA is the commit that INTEGRATED the reviewed content into the
+	// landed history. For ModeMerge that is the candidate itself (it
+	// survived); for a rewrite it is the landed tip. Consumers require the
+	// reviewed base to be an ancestor of it, so it must never be a commit that
+	// merely carries the patch on an unintegrated line (FAC-831).
 	MergeSHA string `json:"merge_sha"`
-	// PatchID is git patch-id --stable of MergeSHA, the value the completion
-	// receipt carries.
+	// ContentSHA is the content-bearing commit whose patch PatchID is.
+	//
+	// It equals MergeSHA in every ordinary landing and is recorded separately
+	// only because a merge-commit landing splits the two facts: the merge
+	// commit integrates the content but has no diff of its own, while the
+	// commit that does carry the diff is not on the integrated line. Binding
+	// both keeps the content evidence exact without weakening the ancestry
+	// requirement on MergeSHA. An empty value means the two are the same.
+	ContentSHA string `json:"content_sha,omitempty"`
+	// PatchID is git patch-id --stable of the content-bearing commit — that is,
+	// of ContentSHA when it is set and of MergeSHA otherwise. It is the value
+	// the completion receipt carries.
 	PatchID string `json:"patch_id"`
 	// Method names the predicate that actually proved it, so a receipt reader
 	// can tell ancestry from content identity without re-deriving it.
@@ -122,6 +133,11 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 }
 
 func proveContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof, error) {
+	// Prove is exported and reached from cleanup paths, so it carries the same
+	// finite allowance as the reconcile entry rather than relying on whatever
+	// deadline its caller happened to bring.
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
 	mode, err := ParseMode(string(req.Mode))
 	if err != nil {
 		return nil, err
@@ -159,9 +175,11 @@ func proveContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof
 		// The candidate object survived, so ancestry is the whole question.
 		// This exit status IS the gate — capturing it and reporting success
 		// anyway is the FAC-178 bug.
-		if err := gitroot.RequireAncestor(repoDir, candidate, landed); err != nil {
-			return nil, fmt.Errorf("merge-mode proof failed: candidate %s is not an ancestor of landed %s",
-				short(candidate), short(landed))
+		if err := requireAncestorBounded(ctx, repoDir, candidate, landed, "merge-mode proof failed"); err != nil {
+			// A cancelled or exhausted run surfaces as itself. The old shape
+			// collapsed every failure into "is not an ancestor", so a budget
+			// refusal read as proof that the candidate had not landed.
+			return nil, err
 		}
 		p.MergeSHA = candidate
 		p.Method = "exact-ancestry"
@@ -277,9 +295,18 @@ func rangeCommits(ctx context.Context, repoDir, base, tip string) ([]string, err
 	if err != nil {
 		return nil, fmt.Errorf("rev-list %s..%s: %w", short(base), short(tip), err)
 	}
+	// Bounded materialisation: the replay cap downstream limits qualifying
+	// replay attempts only, so without this a large reachable history is walked
+	// and held in full before any cap can apply. Exhaustion is an explicit
+	// refusal, never a truncated range that would silently prove less.
+	maxCommits := ledgerFrom(ctx).maxRangeCommits()
 	var commits []string
 	for _, line := range strings.Split(out, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
+			if len(commits) >= maxCommits {
+				return nil, fmt.Errorf("%w: %s..%s holds more than %d commits",
+					ErrProofBudgetRange, short(base), short(tip), maxCommits)
+			}
 			commits = append(commits, s)
 		}
 	}
@@ -323,10 +350,23 @@ func stablePatchID(ctx context.Context, repoDir string, diff []byte) (string, er
 	if len(bytes.TrimSpace(diff)) == 0 {
 		return "", fmt.Errorf("no patch content (empty diff)")
 	}
+	// Charged and bounded like every other git read: patch-id is invoked once
+	// per commit in a range, so leaving it uncounted would let the command
+	// budget be bypassed by exactly the loop it is meant to bound.
+	ledger := ledgerFrom(ctx)
+	if err := ledger.spendCommand([]string{"patch-id", "--stable"}); err != nil {
+		return "", err
+	}
 	cmd := procsignal.CommandContext(ctx, "git", "patch-id", "--stable")
 	cmd.Dir = repoDir
 	cmd.Stdin = bytes.NewReader(diff)
-	out, err := cmd.Output()
+	stdout := &boundedBuffer{limit: ledger.maxOutputBytes()}
+	cmd.Stdout = stdout
+	err := cmd.Run()
+	if stdout.overflowed() {
+		return "", fmt.Errorf("%w: git patch-id exceeded %d bytes", ErrProofBudgetOutput, ledger.maxOutputBytes())
+	}
+	out := stdout.Bytes()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
@@ -351,7 +391,10 @@ func resolveCommit(ctx context.Context, repoDir, rev, role string) (string, erro
 		if c := ctxFailure(ctx, err); c != nil {
 			return "", c
 		}
-		return "", fmt.Errorf("%s revision %q does not resolve to a commit in %s", role, rev, repoDir)
+		// A budget refusal is not a resolution failure. Flattening it here turned
+		// "the allowance ran out" into "this revision does not resolve", which is
+		// both wrong and unrecognisable to errors.Is.
+		return "", resolveFailure(role, rev, repoDir, err)
 	}
 	if out == "" {
 		return "", fmt.Errorf("%s revision %q resolved to nothing", role, rev)
@@ -384,20 +427,41 @@ func runGit(repoDir string, args ...string) error {
 // gitOutBytes executes git under ctx. A context deadline or cancellation kills
 // the child and its process group and is returned as the bare context error;
 // any other failure keeps the exit-status wrapping the package relies on.
+// gitOutBytes is the single choke point every git read in this package passes
+// through, so the proof budget is charged HERE: one place to count commands
+// and one place to bound output. Charging at each call site instead would leave
+// whichever site was added next unbounded.
 func gitOutBytes(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	ledger := ledgerFrom(ctx)
+	if err := ledger.spendCommand(args); err != nil {
+		return nil, err
+	}
 	cmd := procsignal.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoDir
-	out, err := cmd.Output()
+	// Bounded stdout: an oversized producer is refused at the boundary rather
+	// than buffered whole. Stderr is bounded too and only feeds the message.
+	stdout := &boundedBuffer{limit: ledger.maxOutputBytes()}
+	stderr := &boundedBuffer{limit: 64 << 10}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if stdout.overflowed() {
+		return nil, fmt.Errorf("%w: `git %s` exceeded %d bytes of output",
+			ErrProofBudgetOutput, joinArgs(args), ledger.maxOutputBytes())
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
+		if msg := strings.TrimSpace(string(stderr.Bytes())); msg != "" {
+			return nil, fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), msg, err)
+		}
 		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
-	return out, nil
+	return stdout.Bytes(), nil
 }
 
 // ancestorProven reports whether sha is reachable from ref, through the same
@@ -418,6 +482,11 @@ func ancestorProven(ctx context.Context, repoDir, sha, ref string) (bool, error)
 		return false, nil
 	}
 	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	// Ancestry probes run inside the integration search loop, so they are
+	// charged too; the replay cap alone would not bound them.
+	if err := ledgerFrom(ctx).spendCommand([]string{"merge-base", "--is-ancestor"}); err != nil {
 		return false, err
 	}
 	cmd := procsignal.CommandContext(ctx, "git", "merge-base", "--is-ancestor", sha, ref)

@@ -119,3 +119,55 @@ func runOut(t *testing.T, dir, name string, args ...string) string {
 	}
 	return string(out)
 }
+
+// osWriteFile writes a file inside the fixture repository.
+func osWriteFile(t *testing.T, dir, name, body string) error {
+	t.Helper()
+	return os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644)
+}
+
+// prMergeAfterBaseAdvanced creates the REAL pull-request landing shape, which
+// is not the FAC-733 empty administrative merge.
+//
+// githubEmptyMerge requires tree(merge) == tree(secondParent): main contributed
+// nothing since the fork, so the merge adds only administrative history. The
+// PR836 shape is different and is the whole point of FAC-831 — main DID advance
+// to the reviewed base before the pull request merged, so both sides contribute
+// and the merge tree equals neither parent's.
+//
+// What the two shapes share, and what the defect turns on, is that `git
+// diff-tree -p` prints nothing for either: nonEmptyCommits filters both out of
+// the selection pool, which is why the carrier was being sealed instead.
+func prMergeAfterBaseAdvanced(t *testing.T, dir, mainTip, carrier, reviewedPath, msg string) string {
+	t.Helper()
+	run(t, dir, "git", "checkout", "-q", "-B", "main", mainTip)
+	run(t, dir, "git", "merge", "--no-ff", "--no-edit", "-m", msg, carrier)
+	sha := revParse(t, dir, "HEAD")
+
+	if n := strings.Count(strings.TrimSpace(runOut(t, dir, "git", "rev-list", "--parents", "-n", "1", sha)), " "); n != 2 {
+		t.Fatalf("fixture merge %s is not a two-parent commit (parent tokens=%d)", short(sha), n)
+	}
+	if got := revParse(t, dir, sha+"^1"); got != mainTip {
+		t.Fatalf("merge first parent = %s, want the main tip %s", short(got), short(mainTip))
+	}
+	if got := revParse(t, dir, sha+"^2"); got != carrier {
+		t.Fatalf("merge second parent = %s, want the carrier %s", short(got), short(carrier))
+	}
+	// Both sides contributed, or this is not the shape under test.
+	if revParse(t, dir, sha+"^{tree}") == revParse(t, dir, mainTip+"^{tree}") {
+		t.Fatal("fixture merge tree equals the main tip; main's advance is not represented")
+	}
+	if revParse(t, dir, sha+"^{tree}") == revParse(t, dir, carrier+"^{tree}") {
+		t.Fatal("fixture merge tree equals the carrier; this is an empty administrative merge, not a PR landing")
+	}
+	// The reviewed content is genuinely in the merged tree, so a positive case
+	// built on this fixture cannot pass vacuously.
+	if out := runOut(t, dir, "git", "ls-tree", "--name-only", "-r", sha); !strings.Contains(out, reviewedPath) {
+		t.Fatalf("fixture merge tree does not carry the reviewed path %s", reviewedPath)
+	}
+	// And it is still invisible to nonEmptyCommits, which is the defect's cause.
+	if out := runOut(t, dir, "git", "diff-tree", "-p", "--no-color", sha); len(strings.TrimSpace(out)) != 0 {
+		t.Fatal("fixture merge has its own patch content; nonEmptyCommits would not filter it and the defect could not occur")
+	}
+	return sha
+}

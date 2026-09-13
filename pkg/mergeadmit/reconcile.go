@@ -11,7 +11,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
-	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // ReconcileLanded mints (or reconciles) the sealed task-bound completion
@@ -29,6 +28,25 @@ import (
 // Idempotent: an identical sealed receipt already on disk finishes the job
 // (including ledger consume) rather than minting a second one.
 func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
+	// ONE allowance for the whole public invocation, shared by the follow-up
+	// validation, the proof, the identity read and the reduced path. Each of
+	// those previously installed its own or ran outside any (review 212).
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+	return g.reconcileLandedContext(ctx, req)
+}
+
+// ReconcileLandedContext is ReconcileLanded inside an allowance the CALLER
+// installed, so a composition that observes, proves, seals and records shares
+// ONE budget across all of it. ensureProofBudget installs only when the context
+// carries none, so this never re-mints and never widens what the caller set.
+func (g *Gate) ReconcileLandedContext(ctx context.Context, req Request) (*hsync.CompletionReceipt, error) {
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
+	return g.reconcileLandedContext(ctx, req)
+}
+
+func (g *Gate) reconcileLandedContext(ctx context.Context, req Request) (*hsync.CompletionReceipt, error) {
 	if g == nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: no gate configured")
 	}
@@ -36,7 +54,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		return nil, fmt.Errorf("herd-merge-reconcile: no review ledger configured; with no ledger there is no verdict, and no verdict is not a PASS")
 	}
 	if req.PriorReceiptDigest != "" {
-		if err := g.validatePriorReceipt(req); err != nil {
+		if err := g.validatePriorReceiptContext(ctx, req); err != nil {
 			return nil, err
 		}
 	}
@@ -44,7 +62,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		return nil, fmt.Errorf("reconstruction requires explicit reduced-provenance reconciliation")
 	}
 	if req.ReducedProvenance != nil {
-		return g.reconcileLandedReduced(req)
+		return g.reconcileLandedReduced(ctx, req)
 	}
 	for _, f := range []struct{ name, val string }{
 		{"ref", req.Ref},
@@ -123,17 +141,17 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: admitted verdict carries no reviewer family", CodeLedgerRefused)
 	}
 
-	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	landed, err := g.currentOriginMain(ctx, "origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}
 
-	proof, err := g.ProveLanded(req, landed)
+	proof, err := g.proveLandedContext(ctx, req, landed)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %w", CodeProofFailed, err)
 	}
 
-	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	repoID, err := g.repositoryIdentity(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: resolve repository identity: %w", err)
 	}
@@ -147,6 +165,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		BaseSHA:            proof.BaseSHA,
 		CandidateSHA:       proof.CandidateSHA,
 		MergeSHA:           proof.MergeSHA,
+		ContentSHA:         proof.ContentSHA,
 		PatchID:            proof.PatchID,
 		AcceptanceDigest:   req.AcceptanceDigest,
 		VerificationDigest: result.VerificationDigest,
@@ -189,7 +208,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 	return back, nil
 }
 
-func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, error) {
+func (g *Gate) reconcileLandedReduced(ctx context.Context, req Request) (*hsync.CompletionReceipt, error) {
 	rp := req.ReducedProvenance
 	if strings.TrimSpace(req.Ref) == "" || strings.TrimSpace(req.CandidateSHA) == "" {
 		return nil, fmt.Errorf("herd-merge-reconcile: reduced provenance requires verdict ref and exact candidate sha")
@@ -237,19 +256,19 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction current verdict gate refused: %s", readiness.Reason)
 		}
 	}
-	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	landed, err := g.currentOriginMain(ctx, "origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}
-	proof, err := g.ProveLanded(req, landed)
+	proof, err := g.proveLandedContext(ctx, req, landed)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: %w", CodeProofFailed, err)
 	}
-	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	repoID, err := g.repositoryIdentity(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: resolve repository identity: %w", err)
 	}
-	receipt := &hsync.CompletionReceipt{RepoID: repoID, TaskRef: hsync.NormalizeRef(req.Ref), BaseSHA: proof.BaseSHA, CandidateSHA: proof.CandidateSHA, MergeSHA: proof.MergeSHA, PatchID: proof.PatchID, VerificationDigest: result.VerificationDigest, RiskTier: result.Tier, AuthorFamily: result.AuthorFamily, ReviewerFamily: result.ReviewerFamily, Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged, ProvenanceMode: hsync.ProvenanceReduced, PullRequest: rp.PullRequest}
+	receipt := &hsync.CompletionReceipt{RepoID: repoID, TaskRef: hsync.NormalizeRef(req.Ref), BaseSHA: proof.BaseSHA, CandidateSHA: proof.CandidateSHA, MergeSHA: proof.MergeSHA, ContentSHA: proof.ContentSHA, PatchID: proof.PatchID, VerificationDigest: result.VerificationDigest, RiskTier: result.Tier, AuthorFamily: result.AuthorFamily, ReviewerFamily: result.ReviewerFamily, Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged, ProvenanceMode: hsync.ProvenanceReduced, PullRequest: rp.PullRequest}
 	if req.Reconstruction != nil {
 		receipt.CandidateSHA = req.CandidateSHA
 		receipt.BaseSHA = req.BaseSHA
@@ -301,6 +320,11 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 // repository. A context failure is returned as the bare context error, never
 // flattened into a proof refusal.
 func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof, error) {
+	// No exported entry may run unbounded. An already-budgeted context keeps
+	// its own allowance, so a nested call cannot quietly award itself a fresh
+	// one; only an unbudgeted caller gets the defaults installed here.
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
 	base, err := resolveCommit(ctx, repoDir, req.BaseSHA, "base")
 	if err != nil {
 		return nil, err
@@ -361,7 +385,7 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedContent)
 		if matchErr == nil {
 			return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
-				"ordered-patch-subsequence-on-landed")
+				"ordered-patch-subsequence-on-landed", landedCommits)
 		}
 		err = matchErr
 	}
@@ -376,7 +400,7 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 	if mergeSHA, found, squashErr := matchSquashRangeReplay(ctx, repoDir, base, candidate, landedContent); squashErr != nil {
 		return nil, fmt.Errorf("squash proof failed: %w", squashErr)
 	} else if found {
-		proof, proofErr := equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree")
+		proof, proofErr := equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA, "squash-range-patch+replay-tree", landedCommits)
 		if proof != nil {
 			proof.Mode = ModeSquash
 		}
@@ -388,18 +412,38 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 		return nil, fmt.Errorf("equivalent-patch proof failed: ordered proof: %v; combined proof: %w", err, replayErr)
 	}
 	return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
-		"combined-range-replay-on-landed")
+		"combined-range-replay-on-landed", landedCommits)
 }
 
-func equivalentLandedProof(ctx context.Context, repoDir, base, candidate, landed, mergeSHA, method string) (*Proof, error) {
-	pid, err := commitPatchID(ctx, repoDir, mergeSHA)
+// equivalentLandedProof seals one proof. Every predicate above funnels through
+// it, so the base-ancestry requirement is enforced in exactly one place.
+//
+// FAC-831: contentSHA is the commit whose patch was actually matched, and
+// MergeSHA is the commit that integrated it. They are the same for an ordinary
+// rebase landing; for a merge-commit landing they are not, and sealing the
+// carrier as MergeSHA produced a receipt the consumer had to refuse. PatchID
+// stays bound to the content commit, because the integration commit has no
+// diff of its own — recomputing it from a merge commit would hard-fail in
+// stablePatchID ("no patch content"), turning a legitimate landing into a
+// refusal instead of fixing the binding.
+func equivalentLandedProof(ctx context.Context, repoDir, base, candidate, landed, contentSHA, method string, landedCommits []string) (*Proof, error) {
+	pid, err := commitPatchID(ctx, repoDir, contentSHA)
 	if err != nil {
-		return nil, fmt.Errorf("patch id for proved merge commit %s: %w", short(mergeSHA), err)
+		return nil, fmt.Errorf("patch id for proved content commit %s: %w", short(contentSHA), err)
 	}
-	return &Proof{
+	mergeSHA, err := integrationCommitFor(ctx, repoDir, base, candidate, contentSHA, landedCommits)
+	if err != nil {
+		return nil, err
+	}
+	proof := &Proof{
 		Mode: ModeRebase, BaseSHA: base, CandidateSHA: candidate,
 		LandedSHA: landed, MergeSHA: mergeSHA, PatchID: pid, Method: method,
-	}, nil
+	}
+	if mergeSHA != contentSHA {
+		proof.ContentSHA = contentSHA
+		proof.Method = method + "+integration-commit"
+	}
+	return proof, nil
 }
 
 // nonEmptyCommits removes generated administrative anchors while preserving
@@ -510,7 +554,11 @@ func matchOrderedPatchSubsequence(want, got, landedCommits []string) (string, er
 // replayReviewedTree applies precisely the reviewed base-to-candidate delta to
 // a landed parent. Both rebased-stack and squash proofs use this predicate.
 func replayReviewedTree(ctx context.Context, repoDir, base, parent, candidate string) (string, error) {
-	return gitOut(ctx, repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
+	// The argv now has exactly one definition, in the leaf, shared with the
+	// consumer. The runner carries THIS proof's budget, so the leaf starts no
+	// process of its own and cannot escape the allowance.
+	return gitroot.ReplayReviewedTree(base, parent, candidate,
+		func(args ...string) (string, error) { return gitOut(ctx, repoDir, args...) })
 }
 
 // ReplayTree is the one exported definition of the native merge-tree replay
@@ -529,12 +577,28 @@ func ReplayTree(repoDir, base, parent, candidate string) (string, error) {
 // kills the probe instead of starving on it. A context failure is returned as
 // the bare context error, never flattened into a replay refusal.
 func ReplayTreeContext(ctx context.Context, repoDir, base, parent, candidate string) (string, error) {
+	// Exported callers were running with whatever deadline they happened to
+	// bring, because this wrapper reached the primitive without installing an
+	// allowance. Both exported forms now carry the same finite shared budget as
+	// every other proof path.
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
 	return replayReviewedTree(ctx, repoDir, base, parent, candidate)
 }
 
 // validatePriorReceipt does not grant review consent: the normal admission
 // path still runs afterward, and persistence performs a second exact CAS.
 func (g *Gate) validatePriorReceipt(req Request) error {
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+	return g.validatePriorReceiptContext(ctx, req)
+}
+
+// validatePriorReceiptContext runs the follow-up checks inside the caller's
+// allowance. Review 212: its identity read, its two resolveCommit calls and its
+// ancestry check all ran on context.Background(), outside the budget the entry
+// had already installed.
+func (g *Gate) validatePriorReceiptContext(ctx context.Context, req Request) error {
 	if reviewledger.CloseableCardRef(req.Ref) == "" {
 		return fmt.Errorf("follow-up requires an exact closeable task ref")
 	}
@@ -542,7 +606,7 @@ func (g *Gate) validatePriorReceipt(req Request) error {
 	if err != nil {
 		return fmt.Errorf("prior receipt: %w", err)
 	}
-	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	repoID, err := g.repositoryIdentity(ctx)
 	if err != nil {
 		return err
 	}
@@ -552,14 +616,15 @@ func (g *Gate) validatePriorReceipt(req Request) error {
 	if prior.CandidateSHA == req.CandidateSHA {
 		return fmt.Errorf("follow-up must name a new candidate")
 	}
-	if _, err := resolveCommit(context.Background(), g.RepoDir, prior.MergeSHA, "prior merge"); err != nil {
+	if _, err := resolveCommit(ctx, g.RepoDir, prior.MergeSHA, "prior merge"); err != nil {
 		return err
 	}
-	if _, err := resolveCommit(context.Background(), g.RepoDir, req.BaseSHA, "follow-up reviewed base"); err != nil {
+	if _, err := resolveCommit(ctx, g.RepoDir, req.BaseSHA, "follow-up reviewed base"); err != nil {
 		return err
 	}
-	if err := gitroot.RequireAncestor(g.RepoDir, prior.MergeSHA, req.BaseSHA); err != nil {
-		return fmt.Errorf("follow-up reviewed base does not contain prior delivery: %w", err)
+	if err := requireAncestorBounded(ctx, g.RepoDir, prior.MergeSHA, req.BaseSHA,
+		"follow-up reviewed base does not contain prior delivery"); err != nil {
+		return err
 	}
 	// Even idempotent consumed replays must not ignore a later dissent.
 	ready, err := g.Ledger.MergeReadinessFor(req.CandidateSHA)
