@@ -134,6 +134,11 @@ func Prove(repoDir string, req ProofRequest) (*Proof, error) {
 }
 
 func proveContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof, error) {
+	// Prove is exported and reached from cleanup paths, so it carries the same
+	// finite allowance as the reconcile entry rather than relying on whatever
+	// deadline its caller happened to bring.
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
 	mode, err := ParseMode(string(req.Mode))
 	if err != nil {
 		return nil, err
@@ -289,9 +294,18 @@ func rangeCommits(ctx context.Context, repoDir, base, tip string) ([]string, err
 	if err != nil {
 		return nil, fmt.Errorf("rev-list %s..%s: %w", short(base), short(tip), err)
 	}
+	// Bounded materialisation: the replay cap downstream limits qualifying
+	// replay attempts only, so without this a large reachable history is walked
+	// and held in full before any cap can apply. Exhaustion is an explicit
+	// refusal, never a truncated range that would silently prove less.
+	maxCommits := ledgerFrom(ctx).maxRangeCommits()
 	var commits []string
 	for _, line := range strings.Split(out, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
+			if len(commits) >= maxCommits {
+				return nil, fmt.Errorf("%w: %s..%s holds more than %d commits",
+					ErrProofBudgetRange, short(base), short(tip), maxCommits)
+			}
 			commits = append(commits, s)
 		}
 	}
@@ -335,10 +349,23 @@ func stablePatchID(ctx context.Context, repoDir string, diff []byte) (string, er
 	if len(bytes.TrimSpace(diff)) == 0 {
 		return "", fmt.Errorf("no patch content (empty diff)")
 	}
+	// Charged and bounded like every other git read: patch-id is invoked once
+	// per commit in a range, so leaving it uncounted would let the command
+	// budget be bypassed by exactly the loop it is meant to bound.
+	ledger := ledgerFrom(ctx)
+	if err := ledger.spendCommand([]string{"patch-id", "--stable"}); err != nil {
+		return "", err
+	}
 	cmd := procsignal.CommandContext(ctx, "git", "patch-id", "--stable")
 	cmd.Dir = repoDir
 	cmd.Stdin = bytes.NewReader(diff)
-	out, err := cmd.Output()
+	stdout := &boundedBuffer{limit: ledger.maxOutputBytes()}
+	cmd.Stdout = stdout
+	err := cmd.Run()
+	if stdout.overflowed() {
+		return "", fmt.Errorf("%w: git patch-id exceeded %d bytes", ErrProofBudgetOutput, ledger.maxOutputBytes())
+	}
+	out := stdout.Bytes()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
@@ -396,20 +423,41 @@ func runGit(repoDir string, args ...string) error {
 // gitOutBytes executes git under ctx. A context deadline or cancellation kills
 // the child and its process group and is returned as the bare context error;
 // any other failure keeps the exit-status wrapping the package relies on.
+// gitOutBytes is the single choke point every git read in this package passes
+// through, so the proof budget is charged HERE: one place to count commands
+// and one place to bound output. Charging at each call site instead would leave
+// whichever site was added next unbounded.
 func gitOutBytes(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	ledger := ledgerFrom(ctx)
+	if err := ledger.spendCommand(args); err != nil {
+		return nil, err
+	}
 	cmd := procsignal.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoDir
-	out, err := cmd.Output()
+	// Bounded stdout: an oversized producer is refused at the boundary rather
+	// than buffered whole. Stderr is bounded too and only feeds the message.
+	stdout := &boundedBuffer{limit: ledger.maxOutputBytes()}
+	stderr := &boundedBuffer{limit: 64 << 10}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if stdout.overflowed() {
+		return nil, fmt.Errorf("%w: `git %s` exceeded %d bytes of output",
+			ErrProofBudgetOutput, joinArgs(args), ledger.maxOutputBytes())
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
+		if msg := strings.TrimSpace(string(stderr.Bytes())); msg != "" {
+			return nil, fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), msg, err)
+		}
 		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
-	return out, nil
+	return stdout.Bytes(), nil
 }
 
 // ancestorProven reports whether sha is reachable from ref, through the same
@@ -430,6 +478,11 @@ func ancestorProven(ctx context.Context, repoDir, sha, ref string) (bool, error)
 		return false, nil
 	}
 	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	// Ancestry probes run inside the integration search loop, so they are
+	// charged too; the replay cap alone would not bound them.
+	if err := ledgerFrom(ctx).spendCommand([]string{"merge-base", "--is-ancestor"}); err != nil {
 		return false, err
 	}
 	cmd := procsignal.CommandContext(ctx, "git", "merge-base", "--is-ancestor", sha, ref)

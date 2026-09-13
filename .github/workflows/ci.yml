@@ -241,6 +241,26 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-831: the landed-proof producer is defended by bounds that only
+      # matter if real work actually consults them. Each control removes one —
+      # the command charge, the range cap, the entry-path allowance — and
+      # requires its named test to fail on its named assertion.
+      - name: Verify landed proof bounds controls
+        timeout-minutes: 30
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-landed-proof-bounds.zsh
+
+      - name: Upload landed proof bounds logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-landed-proof-bounds-logs
+          path: .verify-landed-proof-bounds-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Verify mail repair guard controls
         timeout-minutes: 30
         run: |

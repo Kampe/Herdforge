@@ -20,7 +20,13 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ProveEquivalentLandedContext(context.Background(), g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
+	// FAC-831: this entry point used context.Background(), so every layer below
+	// it ran with no deadline and no allowance. One finite, SHARED budget is
+	// installed here and reaches the whole proof: deadline, git command count,
+	// per-command output bytes and range size.
+	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)
+	defer cancel()
+	return ProveEquivalentLandedContext(ctx, g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
 }
 
 // A squash has the aggregate reviewed patch, not any intermediate patch.

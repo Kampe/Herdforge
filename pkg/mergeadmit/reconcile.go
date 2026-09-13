@@ -302,6 +302,11 @@ func ProveEquivalentLanded(repoDir string, req ProofRequest) (*Proof, error) {
 // repository. A context failure is returned as the bare context error, never
 // flattened into a proof refusal.
 func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof, error) {
+	// No exported entry may run unbounded. An already-budgeted context keeps
+	// its own allowance, so a nested call cannot quietly award itself a fresh
+	// one; only an unbudgeted caller gets the defaults installed here.
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
 	base, err := resolveCommit(ctx, repoDir, req.BaseSHA, "base")
 	if err != nil {
 		return nil, err
