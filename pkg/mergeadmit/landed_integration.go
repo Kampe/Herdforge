@@ -51,13 +51,28 @@ const maxIntegrationReplays = 64
 func contentPreservedAt(ctx context.Context, repoDir, base, candidate, sha string) (bool, error) {
 	parent, err := gitOut(ctx, repoDir, "rev-parse", "--verify", "-q", sha+"^1")
 	if err != nil {
+		// Parent RESOLUTION is on the same footing: a cancelled run or an
+		// exhausted allowance here is not "this commit has no first parent".
+		if proofRunAborted(ctx, err) {
+			if c := ctxFailure(ctx, err); c != nil {
+				return false, c
+			}
+			return false, err
+		}
 		// No first parent: a root commit cannot have integrated anything.
 		return false, nil
 	}
 	replayed, err := replayReviewedTree(ctx, repoDir, base, parent, candidate)
 	if err != nil {
-		if c := ctxFailure(ctx, err); c != nil {
-			return false, c
+		// A cancelled run or an exhausted allowance must ABORT, never answer.
+		// Returning (false, nil) for those turned "I could not look" into "the
+		// content is not preserved", which silently skips a candidate commit and
+		// can end in a wrong refusal or a wrong selection.
+		if proofRunAborted(ctx, err) {
+			if c := ctxFailure(ctx, err); c != nil {
+				return false, c
+			}
+			return false, err
 		}
 		// merge-tree refused (conflict). Unprovable is not proven.
 		return false, nil

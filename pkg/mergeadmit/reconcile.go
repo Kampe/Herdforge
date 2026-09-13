@@ -536,7 +536,11 @@ func matchOrderedPatchSubsequence(want, got, landedCommits []string) (string, er
 // replayReviewedTree applies precisely the reviewed base-to-candidate delta to
 // a landed parent. Both rebased-stack and squash proofs use this predicate.
 func replayReviewedTree(ctx context.Context, repoDir, base, parent, candidate string) (string, error) {
-	return gitOut(ctx, repoDir, "merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", base, parent, candidate)
+	// The argv now has exactly one definition, in the leaf, shared with the
+	// consumer. The runner carries THIS proof's budget, so the leaf starts no
+	// process of its own and cannot escape the allowance.
+	return gitroot.ReplayReviewedTree(base, parent, candidate,
+		func(args ...string) (string, error) { return gitOut(ctx, repoDir, args...) })
 }
 
 // ReplayTree is the one exported definition of the native merge-tree replay
@@ -555,6 +559,12 @@ func ReplayTree(repoDir, base, parent, candidate string) (string, error) {
 // kills the probe instead of starving on it. A context failure is returned as
 // the bare context error, never flattened into a replay refusal.
 func ReplayTreeContext(ctx context.Context, repoDir, base, parent, candidate string) (string, error) {
+	// Exported callers were running with whatever deadline they happened to
+	// bring, because this wrapper reached the primitive without installing an
+	// allowance. Both exported forms now carry the same finite shared budget as
+	// every other proof path.
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
 	return replayReviewedTree(ctx, repoDir, base, parent, candidate)
 }
 

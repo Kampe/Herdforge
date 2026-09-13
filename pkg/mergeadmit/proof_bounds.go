@@ -184,3 +184,30 @@ func (w *boundedBuffer) Write(p []byte) (int, error) {
 func (w *boundedBuffer) Bytes() []byte { return w.buf.Bytes() }
 
 func (w *boundedBuffer) overflowed() bool { return w.over }
+
+// isProofBudgetError reports whether err is one of this package's finite
+// allowances refusing, as opposed to a genuine content or repository answer.
+//
+// It exists because a budget refusal that gets flattened into a descriptive
+// message stops being recognisable to errors.Is, and then reads as an ordinary
+// failure of whatever step happened to be running. CI 34741746509 caught
+// exactly that: resolveCommit reported "base revision does not resolve" for a
+// run that had simply spent its allowance.
+func isProofBudgetError(err error) bool {
+	return errors.Is(err, ErrProofBudgetCommands) ||
+		errors.Is(err, ErrProofBudgetOutput) ||
+		errors.Is(err, ErrProofBudgetRange)
+}
+
+// proofRunAborted reports whether err means the run must STOP rather than be
+// answered. A cancelled context and an exhausted allowance are both "I could
+// not look", never "I looked and the answer is no".
+func proofRunAborted(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return isProofBudgetError(err)
+}

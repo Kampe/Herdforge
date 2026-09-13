@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // boundedProofRepo builds a real range with several commits, so the bounds
@@ -166,5 +168,107 @@ func TestBoundedBufferRefusesRatherThanTruncating(t *testing.T) {
 	}
 	if got := string(w.Bytes()); got != "abcd" {
 		t.Fatalf("buffer = %q; a refused write must not extend it", got)
+	}
+}
+
+// REGRESSION (CI 34741746509): a budget refusal reached the caller as
+// "base revision does not resolve", because resolveCommit dropped the cause.
+// Both reported failures were that flattening, not a missing bound.
+func TestProofBudgetSurvivesRevisionResolution(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 2)
+	for _, tc := range []struct {
+		name   string
+		budget ProofBudget
+		want   error
+	}{
+		{"commands exhausted at the first resolve", ProofBudget{MaxCommands: 0}, ErrProofBudgetCommands},
+		{"output exhausted at the first resolve", ProofBudget{MaxOutputBytes: 1}, ErrProofBudgetOutput},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := withProofBudget(context.Background(), tc.budget)
+			defer cancel()
+			_, err := ProveEquivalentLandedContext(ctx, dir, ProofRequest{
+				BaseSHA: base, CandidateSHA: candidate, LandedSHA: candidate,
+			})
+			if err == nil {
+				t.Fatal("an exhausted allowance produced a proof")
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want it to stay recognisable as %v; a flattened budget error reads as an ordinary resolution failure", err, tc.want)
+			}
+		})
+	}
+}
+
+// A budget refusal inside the replay must ABORT the search, never be reported
+// as "this commit does not preserve the content". That would silently skip a
+// candidate and can end in a wrong refusal or a wrong selection.
+func TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse(t *testing.T) {
+	dir, base, carrier, candidate, mergeCommit := prShapedLanding(t)
+	_ = carrier
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{MaxCommands: 0})
+	defer cancel()
+
+	ok, err := contentPreservedAt(ctx, dir, base, candidate, mergeCommit)
+	if err == nil {
+		t.Fatalf("an exhausted allowance answered the content question: preserved=%v", ok)
+	}
+	if ok {
+		t.Fatal("an aborted run reported the content preserved")
+	}
+	if !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want ErrProofBudgetCommands", err)
+	}
+}
+
+// The exported replay wrappers must carry the same finite allowance. Before
+// this, ReplayTreeContext reached the primitive without installing one.
+func TestReplayTreeContextCarriesAnAllowance(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 1)
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{MaxCommands: 0})
+	defer cancel()
+	if _, err := ReplayTreeContext(ctx, dir, base, base, candidate); !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want the exported wrapper to honour the allowance", err)
+	}
+}
+
+// The leaf refuses before running anything, and never starts a process itself.
+func TestGitrootReplayRefusesNilRunnerAndEmptyIdentities(t *testing.T) {
+	if _, err := gitroot.ReplayReviewedTree("a", "b", "c", nil); !errors.Is(err, gitroot.ErrNilReplayRunner) {
+		t.Fatalf("nil runner err = %v", err)
+	}
+	called := false
+	run := func(...string) (string, error) { called = true; return "", nil }
+	for _, tc := range [][3]string{{"", "b", "c"}, {"a", "", "c"}, {"a", "b", ""}, {" ", "b", "c"}} {
+		if _, err := gitroot.ReplayReviewedTree(tc[0], tc[1], tc[2], run); !errors.Is(err, gitroot.ErrEmptyReplayIdentity) {
+			t.Fatalf("identities %v err = %v", tc, err)
+		}
+	}
+	if called {
+		t.Fatal("the leaf ran a command for a refused input")
+	}
+}
+
+// The leaf passes the runner's error back unchanged, so a caller's cancellation
+// or budget refusal stays recognisable rather than becoming a content answer.
+func TestGitrootReplayPassesRunnerErrorsThroughUnchanged(t *testing.T) {
+	sentinel := errors.New("caller budget refused")
+	_, err := gitroot.ReplayReviewedTree("a", "b", "c", func(...string) (string, error) { return "", sentinel })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want the runner's own error", err)
+	}
+}
+
+// One argv, defined once, and it is the one the producer uses.
+func TestGitrootReplayArgsIsTheSoleDefinition(t *testing.T) {
+	got := gitroot.ReplayArgs("B", "P", "C")
+	want := []string{"merge-tree", gitroot.MergeTreeWriteFlag, "--merge-base", "B", "P", "C"}
+	if len(got) != len(want) {
+		t.Fatalf("argv = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv = %v, want %v", got, want)
+		}
 	}
 }

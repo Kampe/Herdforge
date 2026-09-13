@@ -390,7 +390,15 @@ func resolveCommit(ctx context.Context, repoDir, rev, role string) (string, erro
 		if c := ctxFailure(ctx, err); c != nil {
 			return "", c
 		}
-		return "", fmt.Errorf("%s revision %q does not resolve to a commit in %s", role, rev, repoDir)
+		// A budget refusal is not a resolution failure. Flattening it here turned
+		// "the allowance ran out" into "this revision does not resolve", which is
+		// both wrong and unrecognisable to errors.Is.
+		if isProofBudgetError(err) {
+			return "", err
+		}
+		// Everything else keeps its descriptive message AND its cause, so no
+		// sentinel further down can be lost either.
+		return "", fmt.Errorf("%s revision %q does not resolve to a commit in %s: %w", role, rev, repoDir, err)
 	}
 	if out == "" {
 		return "", fmt.Errorf("%s revision %q resolved to nothing", role, rev)

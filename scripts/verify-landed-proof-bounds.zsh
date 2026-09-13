@@ -134,7 +134,7 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating"
+"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities"
 )
 
 # ---------------------------------------------------------------------------
@@ -224,6 +224,9 @@ mutations=(
 					ErrProofBudgetRange, short(base), short(tip), maxCommits)
 			}${sep}			_ = maxCommits // MUTANT: the range is materialised without a bound${sep}TestProofRangeBudgetRefusesAnOversizedRange${sep}materialised a four-commit range"
 "entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)${sep}	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: the entry path loses its allowance${sep}TestEnsureProofBudgetInstallsOnceAndNeverReplaces${sep}was left without an allowance"
+"budget-error-flattened${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}		if isProofBudgetError(err) {
+			return \"\", err
+		}${sep}		_ = isProofBudgetError // MUTANT: a budget refusal is flattened into a resolution failure${sep}TestProofBudgetSurvivesRevisionResolution/commands_exhausted_at_the_first_resolve${sep}a flattened budget error reads as an ordinary resolution failure"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from
