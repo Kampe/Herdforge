@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 func readySources(t *testing.T) Sources {
@@ -452,5 +454,65 @@ func TestRaiseStandingConsultsReadyFlag(t *testing.T) {
 	}
 	if raiser.calls != 0 {
 		t.Fatal("RaiseStanding must honor Ready=false")
+	}
+}
+
+// TestResourcesVerdictGatesRaise is the FAC-826 regression for this caller.
+//
+// wave grouped "OK" and "TIGHT" as passing. TIGHT now names a REFUSAL backed by
+// a measurement -- a saturated cpu or kernel memory pressure -- so the grouping
+// let wave raise standing work that the resources gate had already refused.
+// Every non-OK verdict must block, and the raiser must not be called.
+func TestResourcesVerdictGatesRaise(t *testing.T) {
+	for _, tc := range []struct {
+		verdict   string
+		wantRaise bool
+	}{
+		{resources.VerdictOK, true},
+		{resources.VerdictTight, false},
+		{resources.VerdictAlert, false},
+		{"", false},
+		{"SOMETHING_ELSE", false},
+	} {
+		name := tc.verdict
+		if name == "" {
+			name = "empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			src := readySources(t)
+			src.Resources = func() (string, string) { return tc.verdict, "detail=" + name }
+
+			raiser := &fakeRaiser{}
+			rep, err := Run(context.Background(), src, Options{Standing: true}, raiser)
+			if tc.wantRaise {
+				if err != nil {
+					t.Fatalf("OK must admit raise: %v", err)
+				}
+				if !rep.Ready {
+					t.Fatalf("OK must be ready: %+v", rep.Gates)
+				}
+				// RaiseStanding activates ONE standing lane per configured
+				// lane, so the expected count is the fixture's own lane count.
+				// Derived rather than hardcoded, so it stays exact if the
+				// fixture gains a lane, and never an unbounded "> 0".
+				wantRaises := len(src.StandingLanes())
+				if wantRaises == 0 {
+					t.Fatal("the positive control must configure at least one standing lane")
+				}
+				if raiser.calls != wantRaises {
+					t.Fatalf("raiser calls = %d, want exactly %d (one per configured standing lane)", raiser.calls, wantRaises)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("verdict %q admitted raise", tc.verdict)
+			}
+			if rep.Ready {
+				t.Fatalf("verdict %q reported ready", tc.verdict)
+			}
+			if raiser.calls != 0 {
+				t.Fatalf("raiser ran %d time(s) on verdict %q; unsafe work was raised", raiser.calls, tc.verdict)
+			}
+		})
 	}
 }

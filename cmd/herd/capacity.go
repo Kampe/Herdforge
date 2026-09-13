@@ -17,6 +17,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/freshness"
 	"github.com/Kampe/Herdforge/pkg/herdr"
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // runCapacity reports whether THIS host can accept another review launch, as one
@@ -191,6 +192,21 @@ type CapacityObservation struct {
 	// PressurePct is PSI "some avg10" for memory: the share of the last 10s
 	// that work stalled waiting on memory. -1 where PSI is unavailable.
 	PressurePct float64 `json:"memory_pressure_pct"` // -1 unknown
+
+	// admission is the SHARED resource decision, carried whole so it can be
+	// REVALIDATED at the capacity decision boundary. A pre-rendered bool is a
+	// claim about the past; decideCapacity re-asks it at DecidedAt.
+	//
+	// nil means the shared policy was never consulted, which refuses.
+	admission *resources.Admission
+
+	// DecidedAt is the clock this capacity decision is made at. Explicit so a
+	// fixture is deterministic and a held decision cannot silently look fresh.
+	DecidedAt time.Time `json:"decided_at,omitempty"`
+
+	// Admission is the revalidated report, filled in by decideCapacity so the
+	// JSON carries the numbers the refusal or admission actually used.
+	Admission *resources.AdmissionReport `json:"resource_admission,omitempty"`
 	// Processes/Threads/FDs, not RSS, are the plausible binding constraints
 	// here -- see the note on hostProcessLoad. -1 means unmeasured.
 	Processes int `json:"processes"`
@@ -297,6 +313,18 @@ const memoryPressurePct = 20
 const swapExhaustedPct = 75
 
 func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB int64) Capacity {
+	// Revalidate the shared decision at THIS boundary. The report is derived
+	// here, never trusted from whenever the observation was taken: an admission
+	// whose readings have aged out comes back a refusal.
+	decidedAt := o.DecidedAt
+	if decidedAt.IsZero() {
+		decidedAt = time.Now()
+		o.DecidedAt = decidedAt
+	}
+	if o.admission != nil {
+		revalidated := o.admission.Report(decidedAt)
+		o.Admission = &revalidated
+	}
 	c := Capacity{
 		SchemaVersion:       capacitySchemaVersion,
 		ObservedAt:          time.Now().UTC().Format(time.RFC3339Nano),
@@ -330,6 +358,15 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 			c.Reason += fmt.Sprintf("; %d of them are idle and reapable: %s",
 				o.ReviewersIdle, strings.Join(o.IdleReviewerID, " "))
 		}
+	case o.admission == nil || o.Admission == nil:
+		c.Reason = "the shared resource policy was never consulted for this observation, so nothing has cleared this host for heavy work; " +
+			"refusing rather than treating an unasked question as a pass"
+	case !o.Admission.Admits:
+		// revalidated at this instant.
+		c.Reason = "resource admission refuses this host: " + o.Admission.Explanation
+		if o.ReviewersIdle > 0 {
+			c.Reason += fmt.Sprintf("; reap %d idle reviewer(s) first", o.ReviewersIdle)
+		}
 	case o.PressurePct >= memoryPressurePct:
 		// Memory PRESSURE, not swap residue. PSI reports the share of time work
 		// is stalled waiting on memory, which is the thing that actually hurts.
@@ -352,9 +389,6 @@ func decideCapacity(o CapacityObservation, limit int, perReviewerMiB, floorMiB i
 	default:
 		c.Admit = true
 		c.Reason = "host can host another reviewer"
-		if o.MemAvailMiB < 0 {
-			c.Reason += " (memory unmeasurable here; admitted on herdr and census alone)"
-		}
 		if o.HarnessPath != "" && !o.HarnessCapped {
 			// Deliberately a WARNING, not a refusal. Refusing would fence every
 			// host that has not adopted the wrapper yet, which trades a bounded
@@ -390,7 +424,7 @@ func observeCapacity() CapacityObservation {
 	agents, err := herdr.AgentList()
 	if err != nil {
 		o.HerdrDetail = strings.TrimSpace(o.HerdrDetail + " " + err.Error())
-		return o
+		return withSharedAdmission(o)
 	}
 	o.AgentsListed = true
 	o.Agents = len(agents)
@@ -414,7 +448,7 @@ func observeCapacity() CapacityObservation {
 			o.BlockedReviewerID = append(o.BlockedReviewerID, a.Name)
 		}
 	}
-	return o
+	return withSharedAdmission(o)
 }
 
 // isReviewerAgent matches the launch convention (review-<ref>) on a hyphen
@@ -443,7 +477,7 @@ func herdrServerRunning() (bool, string) {
 // Returns (-1, -1) where neither exists, which the decision treats as
 // unmeasured rather than as zero.
 func hostMemoryMiB() (total, avail, swapUsed int64) {
-	raw, err := os.ReadFile("/proc/meminfo")
+	raw, err := os.ReadFile(resources.LinuxMeminfoPath)
 	if err != nil {
 		if runtime.GOOS == "darwin" {
 			return darwinMemoryMiB()
@@ -1132,7 +1166,7 @@ func readHostMemory() freshness.Reading[hostMemory] {
 	// defect as every other mislabelled source this control plane has been
 	// bitten by -- an operator checking why a cap moved would go read a file
 	// that does not exist on the host that produced the number.
-	source := "/proc/meminfo"
+	source := resources.LinuxMeminfoPath
 	if runtime.GOOS == "darwin" {
 		source = "sysctl hw.memsize + vm_stat"
 	}
@@ -1153,7 +1187,7 @@ func readHostMemory() freshness.Reading[hostMemory] {
 // and therefore NOT a refusal. A kernel without PSI must not be fenced for
 // lacking an instrument.
 func hostMemoryPressurePct() float64 {
-	raw, err := os.ReadFile("/proc/pressure/memory")
+	raw, err := os.ReadFile(resources.LinuxPressureMemoryPath)
 	if err != nil {
 		return -1
 	}
@@ -1179,7 +1213,7 @@ func hostMemoryPressurePct() float64 {
 // hostSwapTotalMiB reports configured swap. -1 where unreadable, so the
 // backstop below cannot divide by an invented total.
 func hostSwapTotalMiB() int64 {
-	raw, err := os.ReadFile("/proc/meminfo")
+	raw, err := os.ReadFile(resources.LinuxMeminfoPath)
 	if err != nil {
 		return -1
 	}

@@ -82,8 +82,12 @@ func (g *FleetGate) Capacity(ctx context.Context) (Capacity, error) {
 			return Capacity{}, fmt.Errorf("memory verdict: %w", err)
 		}
 		switch verdict {
-		case resources.VerdictOK, resources.VerdictTight:
-		case resources.VerdictAlert:
+		case resources.VerdictOK:
+		// FAC-826: TIGHT no longer admits. It used to be grouped with OK as a
+		// warning, but it now names a MEASURED refusal -- headroom below the OS
+		// reserve or a saturated CPU -- and ALERT names a refusal because nothing
+		// could be measured. Both zero builder lanes; review drain still survives.
+		case resources.VerdictTight, resources.VerdictAlert:
 			lanes = 0
 		default:
 			return Capacity{}, fmt.Errorf("unrecognized memory verdict %q", verdict)
