@@ -185,6 +185,26 @@ suites=(
 #                          ours merge that discarded every reviewed hunk walks
 #                          straight through it.
 #
+#                          Anchored to the CHILD subtest that makes the
+#                          assertion, never to the parent. Go emits an
+#                          assertion's output event under the subtest that made
+#                          it, so a parent killer carries a fail action with no
+#                          assertion output of its own -- the exact shape that
+#                          read as WRONG-TEST-OR-ASSERTION for the observer
+#                          driver's mode-validation control in CI 34739189004.
+#                          test_emitted below also accepts a subtest of the
+#                          named test, so the child anchor satisfies both
+#                          readings instead of depending on which one is in
+#                          force. The parent stays in the pkg/sync suite row, so
+#                          its top-level PASS is still required at baseline and
+#                          after restore, and both subtests still run there.
+#
+# Every other control's assertion is emitted by its killer test ITSELF: none of
+# those five declares a subtest, and the shared helpers that assert for them
+# (assertIntegrationContract, assertSealedCarrierReceipt) run on the killer's
+# own *testing.T, so their output carries the killer's exact .Test name. No
+# control in this file depends on prefix matching to be attributable.
+#
 # Gate.Complete's copy of the same field has NO control here, deliberately: its
 # producer is Prove, which never sets ContentSHA on any of its three modes, so
 # no test can distinguish the copy from its absence. A control that cannot kill
@@ -226,7 +246,7 @@ mutations=(
 			return fmt.Errorf(
 				\"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither\",
 				mergeSHA, contentSHA, path, rev)
-		}${sep}TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath${sep}was accepted because the path was revised later"
+		}${sep}TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath/an_ours_merge_on_a_path_the_reviewed_line_also_revised${sep}was accepted because the path was revised later"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from
