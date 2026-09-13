@@ -1,7 +1,10 @@
 package usage
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,15 +29,42 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 					return err
 				}
 			}
-			time.Sleep(time.Second)
-			return nil
+			release := os.Getenv("HERD_CACHE_HOLDER_RELEASE")
+			if release == "" {
+				// Legacy contract, unchanged for the callers that rely on the
+				// holder simply going away on its own.
+				time.Sleep(time.Second)
+				return nil
+			}
+			// Release handshake. The lock is held until the PARENT says it is
+			// done, so the hold covers the other process's whole attempt by
+			// construction rather than by outlasting it. A fixed interval
+			// could expire between the parent seeing the ready file and the
+			// other process reaching the lock, which is the scheduling
+			// assumption this replaces.
+			//
+			// The fail-safe is not the mechanism, only a leak bound: if the
+			// parent dies without releasing, this returns an error instead of
+			// holding the lock forever.
+			deadline := time.Now().Add(holderReleaseFailSafe)
+			for {
+				if _, err := os.Stat(release); err == nil {
+					return nil
+				}
+				if !time.Now().Before(deadline) {
+					return fmt.Errorf("holder was never released within %s", holderReleaseFailSafe)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
 		}); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
 	url := os.Getenv("HERD_CACHE_FIXTURE_URL")
+	var polls atomic.Int32
 	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
+		polls.Add(1)
 		resp, err := http.Get(url)
 		if err != nil {
 			return ProviderUsage{}, err
@@ -52,8 +83,205 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 		if err == nil || pollErrorCode(err) != "rate-limited" {
 			t.Fatalf("expected persisted rate-limit result, got %v", err)
 		}
-	} else if err != nil {
-		t.Fatal(err)
+		return
+	}
+	// Report the outcome instead of demanding one. Under cross-process
+	// single-flight a caller legitimately ends in one of three states, and
+	// which one it reaches depends on the scheduler, not on the contract:
+	//
+	//   served    -- it won the lock and performed THE one poll
+	//   cached    -- it took the lock after the winner and was served from
+	//                the cache the winner had just written, polling nothing
+	//   contended -- the winner held the lock for the caller's whole bounded
+	//                wait, so it returned ErrCacheLockBusy, polling nothing
+	//
+	// All three preserve single-flight. Anything else is a real failure and is
+	// still reported as one below.
+	outcome := ""
+	switch {
+	case err == nil && polls.Load() == 1:
+		outcome = singleFlightServed
+	case err == nil && polls.Load() == 0:
+		outcome = singleFlightCached
+	case errors.Is(err, ErrCacheLockBusy) && polls.Load() == 0:
+		outcome = singleFlightContended
+	}
+	if outcome == "" {
+		t.Fatalf("%s%s polls=%d err=%v", singleFlightOutcomePrefix, "unexpected", polls.Load(), err)
+	}
+	fmt.Printf("%s%s polls=%d\n", singleFlightOutcomePrefix, outcome, polls.Load())
+}
+
+// The helper and its parent exchange outcomes through one stable line rather
+// than through exit codes, so a scheduler-dependent-but-legal result cannot be
+// mistaken for a failure, and an illegal one cannot hide behind exit 0.
+const (
+	singleFlightOutcomePrefix = "SINGLEFLIGHT-OUTCOME: "
+	singleFlightServed        = "served"
+	singleFlightCached        = "cached"
+	singleFlightContended     = "contended"
+
+	// Every owned subprocess is bounded. These are LEAK bounds, not the
+	// mechanism any assertion depends on: the handshakes below decide the
+	// outcome, and a budget being reached is reported as a failure of this
+	// test rather than absorbed into the suite-wide timeout.
+	helperProcessBudget     = 60 * time.Second
+	helperResultBudget      = 45 * time.Second
+	helperReapBudget        = 10 * time.Second
+	holderReleaseFailSafe   = 90 * time.Second
+	holderReadyBudget       = 30 * time.Second
+	helperWaitDelayOnKill   = 5 * time.Second
+	helperReadyPollInterval = 5 * time.Millisecond
+)
+
+// ownedHelper is one subprocess this test owns end to end.
+//
+// It exists because the previous shape leaked in two ways that a whole-suite
+// timeout hid: CombinedOutput and the result channel were read without any
+// deadline, so a t.Cleanup that killed processes could never run while the
+// test was blocked on them, and Kill alone does not reap -- the temp directory
+// could be removed while a child still had it open.
+//
+// Start is synchronous so cmd.Process is set before anything else can observe
+// it, Wait is called exactly once by one goroutine, and every accessor waits on
+// that single completion instead of calling Wait again.
+// Completion is signalled by CLOSING finished, never by sending on it: a
+// channel that carries the result can be drained only once, so cleanup would
+// then block for its whole reap budget on every already-finished helper. waitErr
+// is written before the close and read only after it, which is what makes the
+// unsynchronised field safe.
+type ownedHelper struct {
+	name     string
+	cmd      *exec.Cmd
+	cancel   context.CancelFunc
+	output   *bytes.Buffer
+	finished chan struct{}
+	waitErr  error
+	stopErr  error
+	stopped  sync.Once
+}
+
+// startOwnedHelper launches a helper under a finite context and registers a
+// cleanup that cancels it and WAITS for it to be reaped.
+func startOwnedHelper(t *testing.T, name string, env []string) *ownedHelper {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), helperProcessBudget)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
+	cmd.Env = env
+	// Bound the join as well as the process: without this, Wait can outlive
+	// the kill while an inherited pipe stays open.
+	cmd.WaitDelay = helperWaitDelayOnKill
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	h := &ownedHelper{name: name, cmd: cmd, cancel: cancel, output: &buf, finished: make(chan struct{})}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start %s helper: %v", name, err)
+	}
+	go func() {
+		h.waitErr = cmd.Wait()
+		close(h.finished)
+	}()
+	t.Cleanup(func() { h.stopAndReport(t) })
+	return h
+}
+
+// wait blocks for the helper's completion within a finite budget and returns
+// its combined output. Exceeding the budget is an ERROR naming the timeout, not
+// a result: a child that had to be killed proves nothing about the guard under
+// test.
+func (h *ownedHelper) wait(budget time.Duration) (string, error) {
+	select {
+	case <-h.finished:
+		// Safe to read the buffer and the error only after the single Wait
+		// has returned, which the close above establishes.
+		text := strings.TrimSpace(h.output.String())
+		if h.waitErr != nil {
+			return text, fmt.Errorf("%s helper failed: %w", h.name, h.waitErr)
+		}
+		return text, nil
+	case <-time.After(budget):
+		// Report what actually happened. Claiming the child was reaped when
+		// the reap budget also expired would turn an escaped process into a
+		// tidy-looking sentence, which is the failure this whole type exists
+		// to stop hiding.
+		if stopErr := h.stop(); stopErr != nil {
+			return "", fmt.Errorf("%s helper did not finish within %s and could not be reaped: %w",
+				h.name, budget, stopErr)
+		}
+		return "", fmt.Errorf("%s helper did not finish within %s; killed and reaped, result discarded", h.name, budget)
+	}
+}
+
+// exited reports whether the helper has already finished, without consuming its
+// completion, so a caller can distinguish "still holding" from "died early".
+func (h *ownedHelper) exited() bool {
+	select {
+	case <-h.finished:
+		return true
+	default:
+		return false
+	}
+}
+
+// stop cancels the process and waits for it to be reaped, returning a non-nil
+// error when the reap budget expired and the child therefore escaped.
+//
+// Idempotent, and the verdict is retained: sync.Once.Do blocks until the first
+// caller's function returns, so every later caller reads a stopErr that is
+// already written. A silent return here is not acceptable -- it let wait report
+// "killed and reaped" on a child that was still running, and it let a passing
+// test's cleanup hide a leaked process entirely.
+func (h *ownedHelper) stop() error {
+	h.stopped.Do(func() {
+		h.cancel()
+		select {
+		case <-h.finished:
+		case <-time.After(helperReapBudget):
+			h.stopErr = fmt.Errorf("%s helper was not reaped within %s after cancellation; it may still be running",
+				h.name, helperReapBudget)
+		}
+	})
+	return h.stopErr
+}
+
+// stopAndReport is the cleanup entry point. A failed reap fails the test even
+// when every assertion passed: a test that leaves a child behind has not
+// finished, whatever its assertions said.
+func (h *ownedHelper) stopAndReport(t *testing.T) {
+	t.Helper()
+	if err := h.stop(); err != nil {
+		t.Errorf("cleanup: %v", err)
+	}
+}
+
+// singleFlightOutcome extracts the reported outcome from one helper's output.
+// An absent or unreadable line is a failure, never an assumed pass: a helper
+// that printed nothing proves nothing.
+func singleFlightOutcome(output string) (string, error) {
+	found := ""
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, singleFlightOutcomePrefix) {
+			continue
+		}
+		value := strings.TrimPrefix(trimmed, singleFlightOutcomePrefix)
+		if name, _, ok := strings.Cut(value, " "); ok {
+			value = name
+		}
+		if found != "" && found != value {
+			return "", fmt.Errorf("helper reported two different outcomes, %q then %q", found, value)
+		}
+		found = value
+	}
+	switch found {
+	case singleFlightServed, singleFlightCached, singleFlightContended:
+		return found, nil
+	case "":
+		return "", fmt.Errorf("helper reported no outcome line")
+	default:
+		return "", fmt.Errorf("helper reported an unrecognised outcome %q", found)
 	}
 }
 
@@ -359,29 +587,63 @@ func TestProviderCacheAcrossProcessesSingleFlight(t *testing.T) {
 		"CODEX_HOME="+home,
 		"HERD_QUOTA_CACHE_SECONDS=45",
 	)
-	cmds := make([]*exec.Cmd, 2)
-	for i := range cmds {
-		cmds[i] = exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
-		cmds[i].Env = baseEnv
+	// Each helper is owned: started synchronously so its process handle exists
+	// before anything observes it, waited on exactly once, and cancelled and
+	// REAPED by cleanup before the temp directories are removed.
+	helpers := []*ownedHelper{
+		startOwnedHelper(t, "racer-a", baseEnv),
+		startOwnedHelper(t, "racer-b", baseEnv),
 	}
-	results := make(chan error, len(cmds))
-	for _, cmd := range cmds {
-		go func(cmd *exec.Cmd) {
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				results <- fmt.Errorf("helper failed: %w: %s", err, strings.TrimSpace(string(output)))
-				return
-			}
-			results <- nil
-		}(cmd)
+
+	// Collect BOTH results, each within its own finite budget, before
+	// asserting anything. Returning early on the first failure would leave the
+	// second helper's outcome unread and its process competing with the next
+	// test for the same cache path. A helper that exceeds its budget is killed
+	// and its result DISCARDED -- a child that had to be killed is not evidence
+	// about the guard under test.
+	outcomes := make([]string, 0, len(helpers))
+	var failures []error
+	for _, h := range helpers {
+		text, err := h.wait(helperResultBudget)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		outcome, parseErr := singleFlightOutcome(text)
+		if parseErr != nil {
+			failures = append(failures, fmt.Errorf("%s: %w: %s", h.name, parseErr, text))
+			continue
+		}
+		outcomes = append(outcomes, outcome)
 	}
-	for range cmds {
-		if err := <-results; err != nil {
-			t.Fatal(err)
+	if len(failures) > 0 {
+		t.Fatalf("helper(s) failed: %v", errors.Join(failures...))
+	}
+
+	// The single-flight contract, asserted on what was OBSERVED rather than on
+	// which process happened to be scheduled first: exactly one live poll
+	// reached the provider, exactly one caller performed it, and the other
+	// caller polled nothing -- whether it read the winner's cache or waited its
+	// bounded budget out. Neither outcome is a retry, a skip, or a longer
+	// timeout; they are the two legal ways to lose the race.
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("cross-process single-flight allowed %d fixture requests, want exactly 1 (outcomes %v)", got, outcomes)
+	}
+	served := 0
+	for _, outcome := range outcomes {
+		if outcome == singleFlightServed {
+			served++
 		}
 	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("cross-process cache lock allowed %d fixture requests, want 1", got)
+	if served != 1 {
+		t.Fatalf("expected exactly one caller to perform the poll, got %d (outcomes %v)", served, outcomes)
+	}
+	for _, outcome := range outcomes {
+		switch outcome {
+		case singleFlightServed, singleFlightCached, singleFlightContended:
+		default:
+			t.Fatalf("unrecognised single-flight outcome %q (outcomes %v)", outcome, outcomes)
+		}
 	}
 }
 
@@ -853,5 +1115,109 @@ func TestUnusableReadingsFallThroughToLive(t *testing.T) {
 	os.WriteFile(path, body, 0o600)
 	if _, _, ok := readSnapshotFile(time.Minute); ok {
 		t.Error("a future timestamp must be treated as unusable, never as fresh")
+	}
+}
+
+// TestProviderCacheContendedLockIsBusyNotAPoll pins the losing half of
+// single-flight.
+//
+// A holder subprocess takes the provider lock, announces it through a ready
+// file, and then KEEPS it until this test explicitly releases it -- which
+// happens only after the contender's result is in hand. The hold covers the
+// contender's whole attempt because of that ordering, not because any interval
+// is long enough: a fixed hold can expire between the ready file appearing and
+// the contender reaching the lock, and the contender would then legitimately
+// succeed while this test called it a failure.
+//
+// What is asserted is what the contender does about the busy lock: it must
+// report it as busy and must not poll the provider behind the holder's back.
+func TestProviderCacheContendedLockIsBusyNotAPoll(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"contended-account"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	ready := filepath.Join(dir, "holder.ready")
+	baseEnv := append(os.Environ(),
+		"HERD_CACHE_SUBPROCESS_HELPER=1",
+		"HERD_CACHE_FIXTURE_URL="+server.URL,
+		"HERD_QUOTA_CACHE_PATH="+filepath.Join(dir, "quota.json"),
+		"HOME="+home,
+		"CODEX_HOME="+home,
+		"HERD_QUOTA_CACHE_SECONDS=45",
+	)
+	release := filepath.Join(dir, "holder.release")
+	holder := startOwnedHelper(t, "holder", append(append([]string{}, baseEnv...),
+		"HERD_CACHE_HOLD_PROVIDER=codex",
+		"HERD_CACHE_HOLDER_READY="+ready,
+		"HERD_CACHE_HOLDER_RELEASE="+release,
+	))
+	// The release file is written on EVERY exit path, including a Fatal
+	// below, so the holder is never left waiting on its fail-safe. Cleanup
+	// registered after the helper runs BEFORE the helper's own cleanup, so the
+	// release lands before the reap wait rather than after it.
+	t.Cleanup(func() { _ = os.WriteFile(release, []byte("release\n"), 0o600) })
+
+	// Bounded wait for the announcement, polled rather than slept: the
+	// contender must not start before the lock is provably held, and a holder
+	// that never announces is a failure rather than a silent pass.
+	deadline := time.Now().Add(holderReadyBudget)
+	held := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(ready); err == nil {
+			held = true
+			break
+		}
+		if holder.exited() {
+			text, err := holder.wait(helperReapBudget)
+			t.Fatalf("holder exited before announcing the lock: %v: %s", err, text)
+		}
+		time.Sleep(helperReadyPollInterval)
+	}
+	if !held {
+		t.Fatalf("holder never announced that it held the provider lock within %s", holderReadyBudget)
+	}
+
+	// The holder now stays locked until THIS test releases it, which happens
+	// only after the contender's result is in hand. The hold therefore spans
+	// the contender's entire attempt by construction. A fixed hold interval
+	// could not promise that: it can expire between the ready file appearing
+	// and the contender reaching the lock, and the contender would then
+	// legitimately succeed while this test called it a failure.
+	contender := startOwnedHelper(t, "contender", baseEnv)
+	text, waitErr := contender.wait(helperResultBudget)
+	if waitErr != nil {
+		t.Fatalf("contender failed instead of reporting a busy lock: %v: %s", waitErr, text)
+	}
+	outcome, parseErr := singleFlightOutcome(text)
+	if parseErr != nil {
+		t.Fatalf("%v: %s", parseErr, text)
+	}
+	if outcome != singleFlightContended {
+		t.Fatalf("contender reported %q while the lock was held for its whole attempt, want %q",
+			outcome, singleFlightContended)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("a contender that could not take the lock still polled the provider %d time(s), want 0", got)
+	}
+
+	// Release explicitly and confirm the holder exits cleanly. A holder that
+	// hit its fail-safe reports an error here rather than passing silently.
+	if err := os.WriteFile(release, []byte("release\n"), 0o600); err != nil {
+		t.Fatalf("release holder: %v", err)
+	}
+	if holderText, err := holder.wait(helperResultBudget); err != nil {
+		t.Fatalf("holder failed after release: %v: %s", err, holderText)
 	}
 }

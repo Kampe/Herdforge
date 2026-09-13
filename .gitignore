@@ -131,6 +131,7 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl
 .herd/review-ledger.jsonl.*
 .herd/harvest-queue.jsonl.*
+.verify-bounds-logs/
 
 # FAC-36: operational artifacts from scripts/verify-process-digest-guards.zsh.
 # The driver is checked in, so running it must not dirty a working tree.
@@ -143,3 +144,6 @@ TASK-PACKET.md
 .verify-mail-repair-logs/
 # FAC-827: mutation-control logs from scripts/verify-manifest-budget.zsh.
 .verify-budget-logs/
+
+# FAC-830: mutation-control logs from scripts/verify-quota-singleflight.zsh.
+.verify-singleflight-logs/

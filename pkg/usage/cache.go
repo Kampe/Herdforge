@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,19 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrCacheLockBusy reports that a cache lock was held by someone else for the
+// whole bounded wait.
+//
+// It is a distinct, NORMAL outcome of single-flight, not a malfunction: the
+// holder is doing the one poll, and a caller that waited its budget out did not
+// poll either, so the single-flight property holds in both branches. Before
+// this sentinel existed the caller received a bare platform errno -- EWOULDBLOCK
+// on unix, ErrExist elsewhere -- which is unmatchable across platforms and
+// indistinguishable from a real lock failure such as a permission or I/O error.
+// Those still surface unwrapped, so "the lock was busy" and "the lock broke"
+// remain different answers.
+var ErrCacheLockBusy = errors.New("usage: cache lock held by another holder for the whole wait")
 
 // FAC-679: a live quota fetch reaches every provider serially, and it ran before
 // EVERY review launch. Measured on this fleet: 29 seconds on one launch and 272
