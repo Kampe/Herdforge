@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -182,7 +186,18 @@ func poolContractFixture(t *testing.T, binary string) (dir, keyDir string, shas 
 // fixtureStubDir is set by poolContractFixture for poolReviewCmd.
 var fixtureStubDir string
 
+// poolReviewCmd runs the pool path against a KNOWN healthy host. These fixtures
+// assert contract ownership and pool mutation, not resource admission, and the
+// runner's own load is not their subject.
 func poolReviewCmd(t *testing.T, binary, dir, keyDir string, args ...string) ([]byte, error) {
+	t.Helper()
+	return poolReviewCmdOnHost(t, "healthy", binary, dir, keyDir, args...)
+}
+
+// poolReviewCmdOnHost runs the pool path against the named fixture host. The
+// readings still go through the real admission policy in the herdfixture build,
+// so "cpu-saturated" and "memory-pressure" produce production refusals.
+func poolReviewCmdOnHost(t *testing.T, host, binary, dir, keyDir string, args ...string) ([]byte, error) {
 	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
@@ -197,6 +212,9 @@ func poolReviewCmd(t *testing.T, binary, dir, keyDir string, args ...string) ([]
 		// operator's fleet: the reviewer budget is a fixture fact here.
 		"HERD_REVIEWER_RSS_MIB=64",
 		"HERD_MEM_FLOOR_MIB=64",
+		// The host readings the capacity census decides against. Honoured only
+		// by the herdfixture build; see capacity_shared_admission_fixture.go.
+		"HERD_FIXTURE_ADMISSION="+host,
 	)
 	if seal := readMintedSeal(dir); seal != "" {
 		cmd.Env = append(cmd.Env, "HERD_FENCE_VOLUME_ID="+seal)
@@ -233,7 +251,7 @@ func assertZeroPoolMutation(t *testing.T, out []byte, poolRoot, surfaceRoot, pac
 // provenance-admitted on a retry. Same public entry, ledger absence as the
 // observable.
 func TestPoolReviewRefusesMalformedContractBeforeAssertedProvenance(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 	ledgerPath := reviewledger.DefaultPath(dir)
 
@@ -258,7 +276,7 @@ func TestPoolReviewRefusesMalformedContractBeforeAssertedProvenance(t *testing.T
 }
 
 func TestPoolReviewRefusesUnownedContractBeforePoolMutation(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 
 	for name, sha := range shas {
@@ -289,7 +307,7 @@ func TestPoolReviewRefusesUnownedContractBeforePoolMutation(t *testing.T) {
 // regular blobs passes the pre-pool gate, prepares the surface, and — under
 // --no-launch — keeps BOTH the surface and the lease (FAC-626).
 func TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 	sha := shas["valid"]
 	poolRoot := filepath.Join(t.TempDir(), "pool")
@@ -354,7 +372,7 @@ func TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease(t *testing.T) {
 // provisional surface must be removed and the lease released, leaving no
 // ownerless surface behind (finding 1, explicit provisional cleanup).
 func TestPoolReviewPostPreparationFailureCleansProvisionalSurface(t *testing.T) {
-	binary := buildHerd(t)
+	binary := buildHerdFixtureAdmission(t)
 	dir, keyDir, shas, calls := poolContractFixture(t, binary)
 	sha := shas["valid"]
 	poolRoot := filepath.Join(t.TempDir(), "pool")
@@ -453,3 +471,195 @@ func TestVerifyCandidateTreeContract(t *testing.T) {
 		}
 	})
 }
+
+// TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation is the counterpart
+// to the healthy path above, through the SAME subprocess seam.
+//
+// It matters that this goes through the subprocess: capacity_pool_gate_test.go
+// substitutes poolCapacityObserve in-process and therefore never reaches
+// withSharedAdmission at all. These cases do, so the attachment, the real
+// resources.Decide and the pool gate's refusal are exercised together.
+//
+// A refusal must land BEFORE any candidate or pool mutation, and it must name
+// the resource that refused, so an operator is not left guessing which ceiling
+// stopped the launch.
+func TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation(t *testing.T) {
+	binary := buildHerdFixtureAdmission(t)
+	dir, keyDir, shas, calls := poolContractFixture(t, binary)
+	sha := shas["valid"]
+
+	for _, tc := range []struct {
+		host  string
+		wants []string
+	}{
+		{
+			host: "cpu-saturated",
+			// The production sentence, not a fixture paraphrase.
+			wants: []string{"REFUSING before candidate preparation", "CPU is saturated", "normalized load 2.00"},
+		},
+		{
+			host:  "memory-pressure",
+			wants: []string{"REFUSING before candidate preparation", "kernel reports memory pressure critical"},
+		},
+		{
+			// An unset or misspelled request must refuse deterministically
+			// rather than inherit whatever the runner was doing.
+			host:  "not-a-known-host",
+			wants: []string{"REFUSING before candidate preparation", "not known"},
+		},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			poolRoot := filepath.Join(t.TempDir(), "pool")
+			surfaceRoot := filepath.Join(t.TempDir(), "review-surfaces")
+			packetRoot := filepath.Join(t.TempDir(), "review-packets")
+
+			out, err := poolReviewCmdOnHost(t, tc.host, binary, dir, keyDir, "review", "FAC-1", "--pool", "--no-launch",
+				"--sha", sha, "--pool-root", poolRoot, "--surface-root", surfaceRoot, "--packet-root", packetRoot)
+			if err == nil {
+				t.Fatalf("an unsafe host must refuse the launch; output:\n%s", out)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("refusal must name %q so the operator knows which ceiling stopped it. Output:\n%s", want, out)
+				}
+			}
+			// The candidate here OWNS its contract, so nothing but the resource
+			// gate can be refusing: the same sha admits on a healthy host in
+			// TestPoolReviewValidCandidatePreparesSurfaceAndHoldsLease.
+			assertZeroPoolMutation(t, out, poolRoot, surfaceRoot, packetRoot, calls)
+		})
+	}
+}
+
+// TestFixtureCensusPinsEveryPostAdmissionInput proves the herdfixture census
+// seam reaches the consumer, using a diagnostic the product ALREADY emits.
+//
+// review --pool goes through acquirePoolCapacityLeaseOrRefuse, which never
+// prints a capacity summary -- only the other, unused gate does -- so asserting
+// on its output would demand something production does not produce, and adding
+// a print for a test would be noise. `herd capacity --json` is an existing
+// consumer of the SAME observation, so it is asked instead.
+//
+// Every field here is one the arms decideCapacity evaluates AFTER the shared
+// admission read from the runner before this seam existed. Presence is checked
+// separately from value: two of the pinned values are zero, so a missing or
+// null field would otherwise satisfy the assertion by decoding to zero.
+func TestFixtureCensusPinsEveryPostAdmissionInput(t *testing.T) {
+	binary := buildHerdFixtureAdmission(t)
+
+	cmd := exec.Command(binary, "capacity", "--json")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(reviewTestEnv(),
+		"HERD_FIXTURE_ADMISSION=healthy",
+		"HERD_REVIEWER_RSS_MIB=64",
+		"HERD_MEM_FLOOR_MIB=64",
+	)
+	cmd.Env = append(cmd.Env, hermeticHerdrEnv(os.Getenv(herdr.BinaryEnv), os.Getenv("HERD_FAKE_LOG"))...)
+	// No stub PATH: fixtureStubDir is populated by poolContractFixture, which
+	// this test does not call, and CI runs with -shuffle so relying on another
+	// test to have set it would be a race. `herd capacity` needs no stubs.
+	out, runErr := cmd.CombinedOutput()
+	requireCapacityRunOutcome(t, runErr, out)
+
+	fields := decodeCapacityCensus(t, out)
+	for _, want := range []struct {
+		name string
+		want float64
+	}{
+		{"memory_pressure_pct", fixturePressurePctWant},
+		{"swap_used_mib", fixtureSwapUsedWant},
+		{"swap_total_mib", fixtureSwapTotalWant},
+		{"mem_total_mib", fixtureMemTotalWant},
+		{"mem_available_mib", fixtureMemAvailWant},
+	} {
+		// float64 throughout: truncating to int64 would let a pressure of 0.5
+		// satisfy a pinned 0.
+		if got := fields[want.name]; got != want.want {
+			t.Errorf("%s = %v, want the pinned %v; the fixture census did not reach this arm", want.name, got, want.want)
+		}
+	}
+}
+
+// requireCapacityRunOutcome permits only the two documented outcomes: success,
+// or the fail-closed refusal exit after a record has already been printed.
+// Whether this host refuses depends on herdr liveness and the reviewer census,
+// neither of which this test is about -- but a spawn failure, a signal or any
+// other status must not pass merely because a record happened to reach stdout.
+func requireCapacityRunOutcome(t *testing.T, runErr error, out []byte) {
+	t.Helper()
+	if runErr == nil {
+		return
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) {
+		t.Fatalf("herd capacity --json could not run: %v; output:\n%s", runErr, out)
+	}
+	// ExitCode reports -1 when the process was signalled.
+	if code := exitErr.ExitCode(); code != capacityRefusalExit {
+		t.Fatalf("herd capacity --json exited %d (want 0 or the documented refusal %d); output:\n%s",
+			code, capacityRefusalExit, out)
+	}
+}
+
+// decodeCapacityCensus parses ONE complete record and returns the five census
+// numbers, failing if any is absent, null, or not a number, and failing if
+// anything follows the record.
+func decodeCapacityCensus(t *testing.T, out []byte) map[string]float64 {
+	t.Helper()
+	start := bytes.IndexByte(out, '{')
+	if start < 0 {
+		t.Fatalf("no json object in capacity output:\n%s", out)
+	}
+	dec := json.NewDecoder(bytes.NewReader(out[start:]))
+	var raw map[string]json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		t.Fatalf("decode capacity json: %v; output:\n%s", err, out)
+	}
+	// Decoder.More() is NOT an end-of-input check: it reports whether another
+	// element exists in the enclosing array or object, and can answer false
+	// with a trailing unmatched delimiter still in the stream. Decoding a
+	// SECOND value and requiring io.EOF is the real check -- nil means another
+	// record followed, and any other error means trailing garbage.
+	var trailing json.RawMessage
+	switch err := dec.Decode(&trailing); {
+	case err == nil:
+		t.Fatalf("capacity output carried a second record (%s); output:\n%s", trailing, out)
+	case !errors.Is(err, io.EOF):
+		t.Fatalf("capacity output carried trailing content after the record (%v); output:\n%s", err, out)
+	}
+
+	values := make(map[string]float64, 5)
+	for _, name := range []string{
+		"memory_pressure_pct", "swap_used_mib", "swap_total_mib",
+		"mem_total_mib", "mem_available_mib",
+	} {
+		payload, present := raw[name]
+		if !present {
+			t.Fatalf("capacity record has no %q field, so the pinned value cannot be proven; output:\n%s", name, out)
+		}
+		if string(bytes.TrimSpace(payload)) == "null" {
+			t.Fatalf("capacity record reported %q as null; output:\n%s", name, out)
+		}
+		var value float64
+		if err := json.Unmarshal(payload, &value); err != nil {
+			t.Fatalf("capacity field %q is not a number (%s): %v", name, payload, err)
+		}
+		values[name] = value
+	}
+	return values
+}
+
+// The expected values are duplicated here deliberately: the constants they
+// mirror live in a herdfixture-tagged file this test binary does not compile,
+// and a test that imported them could not fail when the pin changed.
+const (
+	fixturePressurePctWant = 0.0
+	fixtureSwapUsedWant    = 0.0
+	fixtureSwapTotalWant   = 8192.0
+	fixtureMemTotalWant    = 65536.0
+	fixtureMemAvailWant    = 49152.0
+
+	// capacityRefusalExit is the fail-closed status `herd capacity` returns
+	// AFTER emitting its record.
+	capacityRefusalExit = 3
+)

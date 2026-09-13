@@ -86,7 +86,13 @@ func buildWaveRuntime(ctx context.Context, cfg *config.Config, cfgErr error) (wa
 		},
 		Resources: func() (string, string) {
 			s := resources.TakeSnapshot()
-			return s.Verdict, fmt.Sprintf("verdict=%s free_pct=%d swap_mb=%d", s.Verdict, s.FreePct, s.SwapMB)
+			detail := fmt.Sprintf("verdict=%s free_pct=%d swap_mb=%d", s.Verdict, s.FreePct, s.SwapMB)
+			if s.Admission != nil {
+				// FAC-826: carry the reasons, not just the word. "TIGHT" alone
+				// told a coordinator nothing it could act on.
+				detail += " " + s.Admission.Explanation
+			}
+			return s.Verdict, detail
 		},
 		Quota: func() (bool, string, error) {
 			snap, err := usage.FetchSnapshot()

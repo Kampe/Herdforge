@@ -1,6 +1,7 @@
 package mergeadmit
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -240,11 +241,11 @@ func TestProveEquivalentLandedContextChangedStack(t *testing.T) {
 	landedFirst := commit(t, dir, "shared.txt", "alpha\nreviewed one\ncontext one\ncontext two\nnew main context\ncontext four\nomega\n", "reviewed one")
 	landed := commit(t, dir, "second.txt", "reviewed two\n", "reviewed two")
 
-	wantFirst, err := commitPatchID(dir, first)
+	wantFirst, err := commitPatchID(context.Background(), dir, first)
 	if err != nil {
 		t.Fatalf("candidate first patch id: %v", err)
 	}
-	gotFirst, err := commitPatchID(dir, landedFirst)
+	gotFirst, err := commitPatchID(context.Background(), dir, landedFirst)
 	if err != nil {
 		t.Fatalf("landed first patch id: %v", err)
 	}
@@ -325,11 +326,11 @@ func TestProveEquivalentLandedContextChangedStackMutationControls(t *testing.T) 
 			// The reordered control must truly end in the other reviewed patch;
 			// otherwise it would not isolate the ordered endpoint binding.
 			if tc.mutation == "reorder" {
-				candidateTip, err := commitPatchID(dir, candidate)
+				candidateTip, err := commitPatchID(context.Background(), dir, candidate)
 				if err != nil {
 					t.Fatalf("candidate tip patch: %v", err)
 				}
-				landedTip, err := commitPatchID(dir, landed)
+				landedTip, err := commitPatchID(context.Background(), dir, landed)
 				if err != nil {
 					t.Fatalf("landed tip patch: %v", err)
 				}
@@ -384,14 +385,14 @@ func TestProveEquivalentLandedEmptyMergeTipReturnsContentCommit(t *testing.T) {
 	if proof.PatchID == "" {
 		t.Fatal("proof patch id is empty")
 	}
-	wantPatch, err := commitPatchID(dir, harvested)
+	wantPatch, err := commitPatchID(context.Background(), dir, harvested)
 	if err != nil {
 		t.Fatalf("harvested content patch id: %v", err)
 	}
 	if proof.PatchID != wantPatch {
 		t.Fatalf("proof patch %s != harvested content patch %s", short(proof.PatchID), short(wantPatch))
 	}
-	if _, err := commitPatchID(dir, mergeTip); err == nil {
+	if _, err := commitPatchID(context.Background(), dir, mergeTip); err == nil {
 		t.Fatal("empty merge tip unexpectedly has a patch id; fixture is not FAC-733")
 	}
 	if proof.Method != "ordered-patch-subsequence-on-landed" {
@@ -410,7 +411,7 @@ func TestProveEquivalentLandedLinearEmptyCommitTipReturnsContentCommit(t *testin
 	if emptyTip == harvested {
 		t.Fatal("empty tip equals the harvested content commit")
 	}
-	if _, err := commitPatchID(dir, emptyTip); err == nil {
+	if _, err := commitPatchID(context.Background(), dir, emptyTip); err == nil {
 		t.Fatal("linear empty tip has patch content; fixture is not administrative")
 	}
 
@@ -424,7 +425,7 @@ func TestProveEquivalentLandedLinearEmptyCommitTipReturnsContentCommit(t *testin
 		t.Fatalf("merge sha = %s, want harvested content %s (not empty tip %s)",
 			short(proof.MergeSHA), short(harvested), short(emptyTip))
 	}
-	wantPatch, err := commitPatchID(dir, harvested)
+	wantPatch, err := commitPatchID(context.Background(), dir, harvested)
 	if err != nil {
 		t.Fatalf("harvested content patch id: %v", err)
 	}
@@ -441,7 +442,7 @@ func TestProveEquivalentLandedEmptyMergeTipMutationControls(t *testing.T) {
 	harvested := rewriteOnto(t, dir, "landed", base, []string{candidate})
 	mergeTip := githubEmptyMerge(t, dir, base, harvested, "Merge pull request #710")
 
-	landedCommits, err := rangeCommits(dir, base, mergeTip)
+	landedCommits, err := rangeCommits(context.Background(), dir, base, mergeTip)
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
@@ -456,18 +457,18 @@ func TestProveEquivalentLandedEmptyMergeTipMutationControls(t *testing.T) {
 	// merge, and binding that merge as MergeSHA is a hard refusal. Removing
 	// the empty-commit mapping must make the success test RED because this
 	// unfiltered association is still illegal.
-	if _, err := patchIDs(dir, landedCommits); err == nil {
+	if _, err := patchIDs(context.Background(), dir, landedCommits); err == nil {
 		t.Fatal("unfiltered landed patch IDs succeeded; empty-merge mapping is not under test")
 	}
-	if _, err := equivalentLandedProof(dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed"); err == nil {
+	if _, err := equivalentLandedProof(context.Background(), dir, base, candidate, mergeTip, mergeTip, "ordered-patch-subsequence-on-landed"); err == nil {
 		t.Fatal("equivalentLandedProof accepted the empty merge commit")
 	}
 
-	want, err := patchIDs(dir, []string{harvested})
+	want, err := patchIDs(context.Background(), dir, []string{harvested})
 	if err != nil {
 		t.Fatalf("harvested patch id: %v", err)
 	}
-	if _, err := patchIDs(dir, []string{harvested, mergeTip}); err == nil {
+	if _, err := patchIDs(context.Background(), dir, []string{harvested, mergeTip}); err == nil {
 		t.Fatal("patch IDs of [content, empty merge] succeeded; mapping must skip the empty commit before patch-id")
 	}
 

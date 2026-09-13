@@ -7821,15 +7821,26 @@ func runResources() {
 
 	snap := resources.TakeSnapshot()
 
+	// FAC-826: the gate decides on the one Admission, and it reports the exact
+	// reasons rather than a fixed swap sentence. Before this, Verdict could
+	// only be OK or TIGHT and GatePasses accepted both, so this branch could
+	// not exit 3 on any host -- and the sentence it would have printed blamed
+	// swap, which has not been a gate input since FAC-693.
 	if *gate {
-		if os.Getenv("HERD_RESOURCES_GATE") == "0" {
-			if snap.Verdict == resources.VerdictAlert {
-				fmt.Fprintf(os.Stderr, "resources: ALERT (swap=%dMB) — gate disabled by HERD_RESOURCES_GATE=0\n", snap.SwapMB)
+		if !resources.GatePasses(snap.Verdict) {
+			detail := snap.Verdict
+			if snap.Admission != nil {
+				detail = snap.Verdict + " — " + snap.Admission.Explanation
 			}
-		} else if !resources.GatePasses(snap.Verdict) {
-			fmt.Fprintf(os.Stderr, "resources: ALERT — swap used %dMB exceeds alert threshold %dMB, refusing heavy ops\n",
-				snap.SwapMB, snap.Thresholds.SwapAlertMB)
-			os.Exit(3)
+			// The operator escape stays explicit, and it is still never
+			// reported as healthy: the refusal is printed either way, and only
+			// the exit status is waived.
+			if os.Getenv("HERD_RESOURCES_GATE") == "0" {
+				fmt.Fprintf(os.Stderr, "resources: %s\n  gate DISABLED by HERD_RESOURCES_GATE=0 — proceeding against this refusal, not despite a healthy host\n", detail)
+			} else {
+				fmt.Fprintf(os.Stderr, "resources: %s\n  refusing heavy ops; set HERD_RESOURCES_GATE=0 to override deliberately\n", detail)
+				os.Exit(3)
+			}
 		}
 	}
 
