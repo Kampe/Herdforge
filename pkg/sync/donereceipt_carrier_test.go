@@ -799,3 +799,34 @@ func TestContentProofRefusesAnOversizePatchInput(t *testing.T) {
 		t.Fatal("the process was started before its input was measured")
 	}
 }
+
+// The owned-group wiring, asserted STRUCTURALLY: the command this package hands
+// git is built by procsignal.CommandContext, so a cancelled deadline kills the
+// group and a git that spawned a helper cannot keep running with the pipe open.
+//
+// This deliberately starts NO process and spawns no tree. The behaviour of the
+// group kill itself is already proven once, at the primitive, by
+// procsignal.TestCommandContextKillsDescendantOnTimeout; re-running that here
+// would be a second copy of one claim. What is NOT proven there, and is proven
+// here, is that THIS package's route actually goes through it rather than bare
+// exec.CommandContext.
+func TestBoundedGitIsBuiltForAnOwnedProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	cmd, stdout, stderr := newBoundedCommand(context.Background(), dir, []byte("patch bytes"), "patch-id", "--stable")
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Fatal("git is not started in an owned process group, so a cancelled deadline would leave descendants running")
+	}
+	if cmd.Cancel == nil {
+		t.Fatal("the command has no cancel, so the deadline could not tear the group down at all")
+	}
+	if cmd.Dir != dir {
+		t.Fatalf("the command runs in %q, not the repository %q", cmd.Dir, dir)
+	}
+	if cmd.Stdin == nil {
+		t.Fatal("the bounded input was not wired to the process")
+	}
+	if stdout.max != contentProofMaxOutputBytes || stderr.max != contentProofMaxStderrBytes {
+		t.Fatalf("output caps are %d/%d, not %d/%d",
+			stdout.max, stderr.max, contentProofMaxOutputBytes, contentProofMaxStderrBytes)
+	}
+}

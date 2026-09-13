@@ -583,6 +583,27 @@ func (w *boundedOutput) Write(p []byte) (int, error) {
 // machine running CI is slow enough or the repository large enough.
 var contentProofCommand = runBoundedGit
 
+// newBoundedCommand builds the command every route uses, so the owned-group
+// wiring exists in ONE place and can be asserted without starting a process.
+//
+// procsignal.CommandContext is what makes cancellation reach DESCENDANTS: it
+// sets Setpgid and a Cancel that kills the claimed group. exec.CommandContext
+// plus a WaitDelay would signal the direct child only, and a git that has
+// spawned a helper would keep running with the pipe open after the deadline
+// said stop. That distinction is the whole reason this is not exec.CommandContext.
+func newBoundedCommand(ctx context.Context, repoDir string, stdin []byte, args ...string) (*exec.Cmd, *boundedOutput, *boundedOutput) {
+	cmd := procsignal.CommandContext(ctx, "git", args...)
+	cmd.Dir = repoDir
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	stdout := &boundedOutput{max: contentProofMaxOutputBytes}
+	stderr := &boundedOutput{max: contentProofMaxStderrBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd, stdout, stderr
+}
+
 // runBoundedGit is the physical half of the budget.
 //
 // The process is started through procsignal.CommandContext, so it runs in an
@@ -593,15 +614,7 @@ var contentProofCommand = runBoundedGit
 // limit and the two goroutines exec uses never share one buffer. Stdin is a
 // bounded byte slice the caller already measured.
 func runBoundedGit(ctx context.Context, repoDir string, stdin []byte, args ...string) (string, error) {
-	cmd := procsignal.CommandContext(ctx, "git", args...)
-	cmd.Dir = repoDir
-	if len(stdin) > 0 {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
-	stdout := &boundedOutput{max: contentProofMaxOutputBytes}
-	stderr := &boundedOutput{max: contentProofMaxStderrBytes}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+	cmd, stdout, stderr := newBoundedCommand(ctx, repoDir, stdin, args...)
 	err := cmd.Run()
 	if stdout.overflowed || stderr.overflowed {
 		return "", fmt.Errorf("%w: git %s produced more than the %d byte cap",
@@ -689,10 +702,13 @@ func (p *contentProof) answered(args ...string) (bool, error) {
 	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
 }
 
-// repositoryIdentityWith is the runner-aware shared identity reader. pkg/sync
-// does not re-implement the normalization: it supplies the bounded runner and
-// pkg/toolchild keeps the one definition of what an origin binding is.
-var repositoryIdentityWith = toolchild.RepositoryIdentityWith
+// repositoryIdentityWith is the runner-aware shared identity reader
+// (toolchild.RepositoryIdentityWithRunner). pkg/sync does not re-implement the
+// normalization: it supplies the bounded runner and pkg/toolchild keeps the one
+// definition of what an origin binding is. The runner is called with
+// `config --get remote.origin.url` and NO -C, because the runner already carries
+// the repository directory -- one place chooses it, not two that can disagree.
+var repositoryIdentityWith = toolchild.RepositoryIdentityWithRunner
 
 // repositoryIdentity reads the repository binding inside this validation's
 // budget. The unbounded toolchild.RepositoryIdentity remains the entry point for
