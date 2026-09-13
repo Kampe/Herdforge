@@ -7,7 +7,6 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
-	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // writeReceipt is the persistence seam. It exists so a test can simulate the
@@ -63,7 +62,13 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		return nil, fmt.Errorf("herd-merge-completion: %w", err)
 	}
 
-	proof, err := Prove(g.RepoDir, ProofRequest{
+	// ONE allowance for the whole invocation: the proof, the identity read and
+	// every git below share it. Prove() would have installed a second, and the
+	// identity read ran outside any (review 212).
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+
+	proof, err := proveContext(ctx, g.RepoDir, ProofRequest{
 		Mode:         d.Mode,
 		BaseSHA:      req.BaseSHA,
 		CandidateSHA: req.CandidateSHA,
@@ -73,7 +78,7 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		return nil, fmt.Errorf("herd-merge-completion: %s: %w", CodeProofFailed, err)
 	}
 
-	repoID, err := toolchild.RepositoryIdentity(g.RepoDir)
+	repoID, err := g.repositoryIdentity(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-completion: resolve repository identity: %w", err)
 	}

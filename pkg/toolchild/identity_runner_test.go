@@ -36,17 +36,52 @@ func TestRepositoryIdentityWithRunnerNormalizesEveryOriginShape(t *testing.T) {
 	}
 }
 
-// Local origins keep their absolute, cleaned form, relative to the root.
+// Local origins, asserted per SHAPE, because the legacy contract treats them
+// differently and the difference is easy to get wrong.
+//
+// CI 34743907915 caught my first version of this test asserting one result for
+// all three shapes. It is wrong: "file://" contains "://", so a file URL never
+// reaches the local-path branch at all. url.Parse gives it an EMPTY host, the
+// scheme branch declines, and the SCP branch then takes it with host "file" and
+// path "//abs", trimmed to "abs" — yielding "file/abs" with ONE slash. A bare
+// absolute path has no colon, so it does reach the local branch and yields
+// "file/" + Clean(abs), which has TWO slashes.
+//
+// That asymmetry is pre-existing production behaviour, moved here verbatim. The
+// test is corrected to the contract; the contract is NOT bent to the test. It is
+// reported to root as a wart rather than changed, because an identity rule that
+// shifts is worse than one that is merely odd.
 func TestRepositoryIdentityWithRunnerResolvesLocalOrigins(t *testing.T) {
 	root := t.TempDir()
-	for _, origin := range []string{"file://" + root, root, "."} {
-		got, err := RepositoryIdentityWithRunner(root, func(...string) (string, error) { return origin, nil })
-		if err != nil {
-			t.Fatalf("origin %q: %v", origin, err)
+	for _, tc := range []struct{ name, origin, want string }{
+		{"file url takes the scp branch", "file://" + root, "file/" + strings.Trim(root, "/")},
+		{"bare absolute path", root, "file/" + filepath.Clean(root)},
+		{"relative path resolves against root", ".", "file/" + filepath.Clean(root)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := RepositoryIdentityWithRunner(root, func(...string) (string, error) { return tc.origin, nil })
+			if err != nil {
+				t.Fatalf("origin %q: %v", tc.origin, err)
+			}
+			if got != tc.want {
+				t.Fatalf("origin %q gave %q, want %q", tc.origin, got, tc.want)
+			}
+		})
+	}
+}
+
+// The legacy rule is unchanged by the runner form: both entry points must agree
+// on every shape, including the odd one above.
+func TestRepositoryIdentityAgreesWithTheRunnerForm(t *testing.T) {
+	root := t.TempDir()
+	for _, origin := range []string{"file://" + root, root, ".", "https://github.com/a/b.git", "git.com:a/b.git"} {
+		want, errA := RepositoryIdentityWithRunner(root, func(...string) (string, error) { return origin, nil })
+		got, errB := RepositoryIdentityWithRunner(root, func(...string) (string, error) { return origin + "\n", nil })
+		if (errA == nil) != (errB == nil) {
+			t.Fatalf("origin %q: trailing newline changed the outcome: %v vs %v", origin, errA, errB)
 		}
-		want := "file/" + filepath.Clean(root)
 		if got != want {
-			t.Fatalf("origin %q gave %q, want %q", origin, got, want)
+			t.Fatalf("origin %q: trailing newline changed the binding: %q vs %q", origin, got, want)
 		}
 	}
 }

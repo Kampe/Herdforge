@@ -13,19 +13,34 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 	if g == nil {
 		return nil, fmt.Errorf("landed proof requires a gate")
 	}
+	// FAC-831 / review 212: ONE allowance for the whole public invocation.
+	// This entry first ran on context.Background(), so every layer below it
+	// had no deadline and no allowance. The repair then left a second defect
+	// here: the reconstruction content was read under an allowance of its own
+	// before this line, and the proof installed another below it, so a single
+	// public call spent two budgets and read the reconstruction twice. The
+	// content read now happens inside proveLandedContext, on this context,
+	// once. Its ledger precondition is enforced there too, so nothing that
+	// used to be checked here has been dropped.
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+	return g.proveLandedContext(ctx, req, landed)
+}
+
+// proveLandedContext is ProveLanded inside an allowance the CALLER already
+// installed, so a public entry that also seals a receipt spends ONE budget
+// across proof, identity and every follow-up read instead of resetting.
+func (g *Gate) proveLandedContext(ctx context.Context, req Request, landed string) (*Proof, error) {
+	if g == nil {
+		return nil, fmt.Errorf("landed proof requires a gate")
+	}
 	if req.Reconstruction != nil && g.Ledger == nil {
 		return nil, fmt.Errorf("reconstructed landing proof requires a ledger")
 	}
-	base, candidate, err := g.reconstructionContent(req)
+	base, candidate, err := g.reconstructionContentContext(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	// FAC-831: this entry point used context.Background(), so every layer below
-	// it ran with no deadline and no allowance. One finite, SHARED budget is
-	// installed here and reaches the whole proof: deadline, git command count,
-	// per-command output bytes and range size.
-	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)
-	defer cancel()
 	return ProveEquivalentLandedContext(ctx, g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
 }
 
