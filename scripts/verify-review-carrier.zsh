@@ -255,7 +255,7 @@ controls=(
 	}${sep}	root, err := firstEnv(\"HERD_ROOT\", \"HERD_REPO_ROOT\", \".\"), error(nil) // MUTANT: the selected root is used unresolved
 	if err != nil {
 		return fmt.Errorf(\"resolve repository root: %w\", err)
-	}${sep}TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot${sep}a relative repository root was refused"
+	}${sep}TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot${sep}the packet handed a later dispatch a surface it cannot reach from its own directory"
 "pool-root-resolved-before-the-pool${sep}${pool_src}${sep}${worktree_pkg}${sep}	poolPath, err := filepath.Abs(*poolRoot)
 	if err != nil {
 		return fmt.Errorf(\"resolve review pool root: %w\", err)
