@@ -205,11 +205,10 @@ func TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier(t *testing.T) {
 		t.Fatalf("no-launch preparation released the lease it must hold: %s", state)
 	}
 
-	// The census this fixture isolates must actually have run, or the
-	// owned-boundary claim above is vacuous. Only pane list is required: it is
-	// the census that refuses on error, so the entry could not have reached its
-	// return without it.
-	assertPaneCensusRan(t, herdrCalls())
+	// Every boundary this fixture serves must actually have been reached, or
+	// the protocols it answers are unproven: the two tolerant ones would fall
+	// back silently on a wrong envelope. Presence only — no order, no counts.
+	assertCompleteCensusObserved(t, herdrCalls())
 }
 
 // RETRY must not accumulate a carrier either.
@@ -289,23 +288,32 @@ func assertOnlyCensusCommands(t *testing.T, calls []string) {
 	}
 }
 
-// assertPaneCensusRan proves the pane census actually happened.
+// assertCompleteCensusObserved proves the successful entry actually reached
+// EVERY Herdr boundary this fixture serves, each at least once.
 //
-// This one presence assertion is necessary rather than optional: the positive
-// oracle's claim is that the entry ran its census against an OWNED boundary
-// and still left no carrier. If the census never ran, the test would pass
-// while proving nothing about that boundary, and the isolation this fixture
-// exists for would be untested. It is asserted only on the successful entry,
-// and only for `pane list` — the one census that refuses on error and so must
-// have succeeded for the entry to have reached its return at all. agent list
-// and workspace list tolerate failure by design, so their absence would not
-// make any claim here vacuous and requiring them would over-constrain.
-func assertPaneCensusRan(t *testing.T, calls []string) {
+// Presence is the point, and it is necessary rather than optional hardening:
+// agent list and workspace list both TOLERATE failure by design — an
+// unavailable roster reads as "not known", and an unresolvable workspace falls
+// back to the environment — so if the fixture answered either with a wrong
+// envelope the entry would take its tolerant path and this test would still
+// pass, silently proving nothing about those two protocols. Requiring the
+// observation is what makes the fixture a compatibility oracle instead of a
+// one-command one. pane list is the third and the only one that refuses on
+// error, so the entry could not have returned without it.
+//
+// Still NOT asserted: order, counts, or absence of duplicates. Only the
+// SUCCESS path requires the complete set; the refusal path legitimately stops
+// before the census and the retry path legitimately repeats reads, so both of
+// those inherit only the exact-vector rejection.
+func assertCompleteCensusObserved(t *testing.T, calls []string) {
 	t.Helper()
+	seen := make(map[string]bool, len(calls))
 	for _, call := range calls {
-		if call == "pane list" {
-			return
+		seen[call] = true
+	}
+	for _, want := range []string{"agent list", "pane list", "workspace list"} {
+		if !seen[want] {
+			t.Fatalf("the successful entry never reached the %q boundary, so this fixture proves nothing about that protocol; calls: %v", want, calls)
 		}
 	}
-	t.Fatalf("the entry never ran the pane census, so its owned-boundary and no-carrier claims are both vacuous; calls: %v", calls)
 }
