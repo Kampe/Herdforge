@@ -31,7 +31,7 @@ const entryRef = "FAC-9320"
 
 // entryFixture builds a real repository whose candidate commit carries the
 // reviewer contract the entry requires, and returns root and the candidate sha.
-func entryFixture(t *testing.T) (root, sha string) {
+func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	t.Helper()
 	root = t.TempDir()
 	git := func(args ...string) string {
@@ -100,7 +100,7 @@ func entryFixture(t *testing.T) (root, sha string) {
 	// `pane list` and `agent list` with correctly shaped EMPTY inventories and
 	// `workspace list` with its own wFAKE, so no developer binary, fleet, pane
 	// or workspace is reachable.
-	_, herdrCalls := installProtocolFakeHerdr(t)
+	_, herdrCalls = installProtocolFakeHerdr(t)
 	// Every test built on this fixture inherits the guard: reaching Herdr for
 	// anything the fixture does not model fails the test rather than escaping.
 	t.Cleanup(func() { assertOnlyCensusCommands(t, herdrCalls()) })
@@ -118,7 +118,7 @@ func entryFixture(t *testing.T) (root, sha string) {
 	// Keep the real capacity gate in play but guarantee it admits on any host.
 	t.Setenv("HERD_MEM_FLOOR_MIB", "1")
 	t.Setenv("HERD_REVIEWER_RSS_MIB", "1")
-	return root, sha
+	return root, sha, herdrCalls
 }
 
 // entryConfig writes the fixture's herd.yaml and installs a seeded provider for
@@ -177,7 +177,7 @@ func entryCarriers(t *testing.T, root string) []string {
 // THE ACCEPTANCE: fully pinned no-launch preparation is ready for the exact
 // candidate in the LEASED POOL SLOT, and leaves no redundant carrier.
 func TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier(t *testing.T) {
-	root, sha := entryFixture(t)
+	root, sha, herdrCalls := entryFixture(t)
 	entryConfig(t, root)
 	base := strings.TrimSpace(entryGitOutput(t, root, "rev-parse", sha+"^"))
 
@@ -204,11 +204,17 @@ func TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier(t *testing.T) {
 	if !strings.Contains(string(state), "\"lease_id\"") {
 		t.Fatalf("no-launch preparation released the lease it must hold: %s", state)
 	}
+
+	// The census this fixture isolates must actually have run, or the
+	// owned-boundary claim above is vacuous. Only pane list is required: it is
+	// the census that refuses on error, so the entry could not have reached its
+	// return without it.
+	assertPaneCensusRan(t, herdrCalls())
 }
 
 // RETRY must not accumulate a carrier either.
 func TestPoolNoLaunchEntryRetryLeavesNoCarrier(t *testing.T) {
-	root, sha := entryFixture(t)
+	root, sha, _ := entryFixture(t)
 	entryConfig(t, root)
 	base := strings.TrimSpace(entryGitOutput(t, root, "rev-parse", sha+"^"))
 
@@ -226,7 +232,7 @@ func TestPoolNoLaunchEntryRetryLeavesNoCarrier(t *testing.T) {
 // A FAILING preparation must not leave one behind either: an unresolvable
 // candidate is refused after the same candidate-resolution step.
 func TestPoolNoLaunchEntryFailureLeavesNoCarrier(t *testing.T) {
-	root, sha := entryFixture(t)
+	root, sha, _ := entryFixture(t)
 	entryConfig(t, root)
 	base := strings.TrimSpace(entryGitOutput(t, root, "rev-parse", sha+"^"))
 	missing := strings.Repeat("c", 40)
@@ -249,22 +255,57 @@ func entryGitOutput(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+// censusCommands are the EXACT argument vectors the no-launch entry is known
+// to make: agent list through liveReviewerFor, pane list through
+// evictPoolSlotOccupants, and workspace list through RequireWorkspace.
+var censusCommands = map[string]bool{
+	"pane list":      true,
+	"agent list":     true,
+	"workspace list": true,
+}
+
 // assertOnlyCensusCommands fails when the entry reached Herdr for anything
-// other than the reads this fixture models. The shared fake answers an
-// unknown command with an empty result rather than erroring, so the guard
-// against an unexpected invocation lives here instead of mutating a fixture
-// other tests depend on.
+// other than those exact vectors.
+//
+// The comparison is on the WHOLE logged line. The previous version split the
+// line with strings.Fields and compared only the first two tokens, which
+// accepted any suffix: `pane list --unexpected` matched the allowlist AND the
+// shared fake's own two-token dispatch, so it received a valid inventory and
+// passed. An exact compare rejects it. It also rejects an EMPTY extra
+// argument, which the fake's "$*" log represents as a trailing space and a
+// Fields() split would silently erase.
+//
+// Deliberately NOT asserted here: order, counts, or absence of duplicates.
+// Those are not a production contract. A failure path legitimately stops
+// before later reads, a retry legitimately repeats them, and harmless
+// reordering of independent reads would turn this into a test that mirrors
+// the implementation rather than its behaviour.
 func assertOnlyCensusCommands(t *testing.T, calls []string) {
 	t.Helper()
-	allowed := map[string]bool{
-		"pane list":      true,
-		"agent list":     true,
-		"workspace list": true,
-	}
 	for _, call := range calls {
-		fields := strings.Fields(call)
-		if len(fields) < 2 || !allowed[fields[0]+" "+fields[1]] {
+		if !censusCommands[call] {
 			t.Errorf("the no-launch entry invoked an unmodelled herdr command: %q", call)
 		}
 	}
+}
+
+// assertPaneCensusRan proves the pane census actually happened.
+//
+// This one presence assertion is necessary rather than optional: the positive
+// oracle's claim is that the entry ran its census against an OWNED boundary
+// and still left no carrier. If the census never ran, the test would pass
+// while proving nothing about that boundary, and the isolation this fixture
+// exists for would be untested. It is asserted only on the successful entry,
+// and only for `pane list` — the one census that refuses on error and so must
+// have succeeded for the entry to have reached its return at all. agent list
+// and workspace list tolerate failure by design, so their absence would not
+// make any claim here vacuous and requiring them would over-constrain.
+func assertPaneCensusRan(t *testing.T, calls []string) {
+	t.Helper()
+	for _, call := range calls {
+		if call == "pane list" {
+			return
+		}
+	}
+	t.Fatalf("the entry never ran the pane census, so its owned-boundary and no-carrier claims are both vacuous; calls: %v", calls)
 }
