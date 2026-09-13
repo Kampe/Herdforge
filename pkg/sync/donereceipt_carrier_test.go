@@ -158,7 +158,7 @@ func prReceiptRepo(t *testing.T) (dir, baseSHA, carrierSHA, mergeSHA string) {
 func TestValidateAcceptsSealedCarrierForAPullRequestLanding(t *testing.T) {
 	dir, base, carrier, merge := prReceiptRepo(t)
 	r := carrierReceipt(t, dir, base, carrier, carrier, merge)
-	if err := r.validateContentBinding(dir); err != nil {
+	if err := r.validateContentBindingFresh(dir); err != nil {
 		t.Fatalf("a pull-request landing must validate against its sealed carrier: %v", err)
 	}
 }
@@ -169,7 +169,7 @@ func TestValidateAcceptsSealedCarrierForAPullRequestLanding(t *testing.T) {
 func TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed(t *testing.T) {
 	dir, base, _, merge := prReceiptRepo(t)
 	r := CompletionReceipt{MergeSHA: merge, PatchID: "whatever", BaseSHA: base}
-	err := r.validateContentBinding(dir)
+	err := r.validateContentBindingFresh(dir)
 	if err == nil {
 		t.Fatal("a merge with no patch of its own must still be refused when no carrier is sealed")
 	}
@@ -192,7 +192,7 @@ func TestValidateRefusesForgedAndPatchMismatchedCarriers(t *testing.T) {
 			t.Fatal("fixture invalid: the forged carrier is the real one")
 		}
 		r := carrierReceipt(t, dir, base, forged, carrier, merge)
-		err := r.validateContentBinding(dir)
+		err := r.validateContentBindingFresh(dir)
 		if err == nil {
 			t.Fatal("a carrier the merge does not contain was accepted; patch equality alone is not landing")
 		}
@@ -205,7 +205,7 @@ func TestValidateRefusesForgedAndPatchMismatchedCarriers(t *testing.T) {
 		dir, base, carrier, merge := prReceiptRepo(t)
 		r := carrierReceipt(t, dir, base, carrier, carrier, merge)
 		r.PatchID = strings.Repeat("0", 40)
-		err := r.validateContentBinding(dir)
+		err := r.validateContentBindingFresh(dir)
 		if err == nil {
 			t.Fatal("a receipt whose sealed patch id does not match the carrier was accepted")
 		}
@@ -291,7 +291,7 @@ func iteratedPRRepo(t *testing.T, discarded bool) (dir, base, carrier, candidate
 func TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath(t *testing.T) {
 	dir, base, carrier, candidate, merge := iteratedPRRepo(t, false)
 	r := carrierReceipt(t, dir, base, carrier, candidate, merge)
-	if err := r.validateContentBinding(dir); err != nil {
+	if err := r.validateContentBindingFresh(dir); err != nil {
 		t.Fatalf("an honest landing whose carrier was revised again inside the pull request was refused: %v", err)
 	}
 }
@@ -491,7 +491,7 @@ func TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate(t *testing.T) {
 // never the speed of the machine or the size of the repository that ran them.
 // ---------------------------------------------------------------------------
 
-func stubContentProofCommand(t *testing.T, fn func(context.Context, string, ...string) (string, error)) {
+func stubContentProofCommand(t *testing.T, fn func(context.Context, string, []byte, ...string) (string, error)) {
 	t.Helper()
 	prev := contentProofCommand
 	contentProofCommand = fn
@@ -500,13 +500,13 @@ func stubContentProofCommand(t *testing.T, fn func(context.Context, string, ...s
 
 func TestContentProofRefusesAfterItsDeadline(t *testing.T) {
 	calls := 0
-	stubContentProofCommand(t, func(context.Context, string, ...string) (string, error) {
+	stubContentProofCommand(t, func(context.Context, string, []byte, ...string) (string, error) {
 		calls++
 		return "", nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	proof := &contentProof{repoDir: t.TempDir(), ctx: ctx}
+	proof := &contentProof{repoDir: t.TempDir(), ctx: ctx, maxCommands: contentProofMaxCommands}
 	_, err := proof.run("rev-parse", "HEAD")
 	if !errors.Is(err, ErrContentProofBudget) {
 		t.Fatalf("an expired deadline must stop the proof before it starts a process: %v", err)
@@ -518,11 +518,11 @@ func TestContentProofRefusesAfterItsDeadline(t *testing.T) {
 
 func TestContentProofRefusesWhenTheCommandBudgetIsSpent(t *testing.T) {
 	calls := 0
-	stubContentProofCommand(t, func(context.Context, string, ...string) (string, error) {
+	stubContentProofCommand(t, func(context.Context, string, []byte, ...string) (string, error) {
 		calls++
 		return "", nil
 	})
-	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background()}
+	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background(), maxCommands: contentProofMaxCommands}
 	for i := 0; i < contentProofMaxCommands; i++ {
 		if _, err := proof.run("rev-parse", "HEAD"); err != nil {
 			t.Fatalf("command %d was refused while the budget still had room: %v", i+1, err)
@@ -538,10 +538,10 @@ func TestContentProofRefusesWhenTheCommandBudgetIsSpent(t *testing.T) {
 }
 
 func TestContentProofRefusesOversizeCommandOutput(t *testing.T) {
-	stubContentProofCommand(t, func(context.Context, string, ...string) (string, error) {
+	stubContentProofCommand(t, func(context.Context, string, []byte, ...string) (string, error) {
 		return strings.Repeat("x", contentProofMaxOutputBytes+1), nil
 	})
-	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background()}
+	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background(), maxCommands: contentProofMaxCommands}
 	_, err := proof.run("ls-tree", "-r", "HEAD")
 	if !errors.Is(err, ErrContentProofBudget) {
 		t.Fatalf("output larger than the proof budget was accepted: %v", err)
@@ -562,5 +562,240 @@ func TestBoundedOutputRefusesToGrowPastItsCap(t *testing.T) {
 	}
 	if !w.overflowed {
 		t.Fatal("the writer did not record the overflow, so a truncated read would be reported as a complete one")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The PUBLIC entry's budget. Validate makes git calls in five stages -- identity,
+// integration ancestry, carrier ancestry, replay, patch -- and bounding only the
+// interesting one bounds a fragment of the validation and leaves the rest as the
+// real limit. These drive the ACTUAL public entry with a finite injected
+// allowance and name the stage that spends it.
+// ---------------------------------------------------------------------------
+
+// recordCommands wraps the real bounded runner and records every argv, so a test
+// can say WHICH stage spent the last command rather than only that one did.
+func recordCommands(t *testing.T) *[][]string {
+	t.Helper()
+	seen := &[][]string{}
+	prev := contentProofCommand
+	contentProofCommand = func(ctx context.Context, repoDir string, stdin []byte, args ...string) (string, error) {
+		*seen = append(*seen, append([]string(nil), args...))
+		return prev(ctx, repoDir, stdin, args...)
+	}
+	t.Cleanup(func() { contentProofCommand = prev })
+	return seen
+}
+
+// withCommandAllowance injects a finite cumulative allowance into the real
+// public entry. Production never writes this.
+func withCommandAllowance(t *testing.T, n int) {
+	t.Helper()
+	prev := contentProofMaxCommands
+	contentProofMaxCommands = n
+	t.Cleanup(func() { contentProofMaxCommands = prev })
+}
+
+func ranCommand(seen [][]string, marker string) bool {
+	for _, args := range seen {
+		for _, a := range args {
+			if a == marker {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A carrier landing that validates cleanly, used by every stage test below so
+// the only variable is the allowance.
+func budgetFixture(t *testing.T) (dir string, r CompletionReceipt, st *lifecycle.TaskState) {
+	t.Helper()
+	dir, base, carrier, merge := prReceiptRepo(t)
+	r, st = publicReceipt(t, dir, base, carrier, carrier, merge)
+	return dir, r, st
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// exhaustAtStage runs the SAME validation twice: once with the default allowance
+// to observe the real command sequence, then with an allowance that ends exactly
+// where the named stage begins.
+//
+// The boundary is DERIVED from that observation rather than hardcoded, so these
+// tests pin the stage and not a command count that a change in any other stage
+// -- or in the shared identity reader, which is not this package's code -- could
+// silently shift underneath them.
+func exhaustAtStage(t *testing.T, stage string, match func(CompletionReceipt, []string) bool) (error, [][]string) {
+	t.Helper()
+	dir, r, st := budgetFixture(t)
+	seen := recordCommands(t)
+	if err := r.Validate(dir, carrierRef, st); err != nil {
+		t.Fatalf("the fixture must validate cleanly before any budget is injected: %v", err)
+	}
+	observed := append([][]string(nil), (*seen)...)
+	at := -1
+	for i, args := range observed {
+		if match(r, args) {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		t.Fatalf("no command in the observed validation belongs to the %s stage: %v", stage, observed)
+	}
+	*seen = nil
+	withCommandAllowance(t, at)
+	return r.Validate(dir, carrierRef, st), *seen
+}
+
+func TestValidateStopsInTheIdentityStageWhenTheBudgetIsGone(t *testing.T) {
+	err, seen := exhaustAtStage(t, "identity", func(_ CompletionReceipt, a []string) bool { return hasArg(a, "config") })
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an exhausted budget in the identity stage must reach the caller as the budget sentinel: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot resolve repository identity") {
+		t.Fatalf("the identity read did not spend the validation budget: %v", err)
+	}
+	if ranCommand(seen, "config") {
+		t.Fatalf("the identity read ran outside the allowance: %v", seen)
+	}
+}
+
+func TestValidateStopsInTheIntegrationAncestryStageWhenTheBudgetIsGone(t *testing.T) {
+	err, seen := exhaustAtStage(t, "integration ancestry", func(_ CompletionReceipt, a []string) bool {
+		return len(a) > 0 && a[0] == "rev-parse" && hasArg(a, "origin/main")
+	})
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an exhausted budget in the integration ancestry stage must reach the caller as the budget sentinel: %v", err)
+	}
+	if strings.Contains(err.Error(), "no origin/main") {
+		t.Fatalf("an exhausted budget was reported as a missing origin/main: %v", err)
+	}
+	if ranCommand(seen, "origin/main") {
+		t.Fatalf("the integration probes ran outside the allowance: %v", seen)
+	}
+}
+
+func TestValidateStopsInTheCarrierAncestryStageWhenTheBudgetIsGone(t *testing.T) {
+	var carrier string
+	err, seen := exhaustAtStage(t, "carrier ancestry", func(r CompletionReceipt, a []string) bool {
+		carrier = r.ContentSHA
+		return len(a) > 0 && a[0] == "merge-base" && hasArg(a, r.ContentSHA)
+	})
+	if carrier == "" {
+		t.Fatal("fixture invalid: no carrier is sealed, so there is no carrier ancestry stage")
+	}
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an exhausted budget in the carrier ancestry stage must reach the caller as the budget sentinel: %v", err)
+	}
+	if strings.Contains(err.Error(), "is not an ancestor of merge sha") {
+		t.Fatalf("an exhausted budget was reported as a carrier that is not an ancestor: %v", err)
+	}
+	if ranCommand(seen, carrier) {
+		t.Fatalf("the carrier ancestry probe ran outside the allowance: %v", seen)
+	}
+}
+
+func TestValidateStopsInTheReplayStageWhenTheBudgetIsGone(t *testing.T) {
+	err, seen := exhaustAtStage(t, "replay", func(_ CompletionReceipt, a []string) bool {
+		for _, s := range a {
+			if strings.HasSuffix(s, "^1") {
+				return true
+			}
+		}
+		return false
+	})
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an exhausted budget in the replay stage must reach the caller as the budget sentinel: %v", err)
+	}
+	if strings.Contains(err.Error(), "does not preserve the content of") {
+		t.Fatalf("an exhausted budget was reported as content that did not land: %v", err)
+	}
+	if ranCommand(seen, "merge-tree") {
+		t.Fatalf("the replay ran outside the allowance: %v", seen)
+	}
+}
+
+func TestValidateStopsInThePatchStageWhenTheBudgetIsGone(t *testing.T) {
+	err, seen := exhaustAtStage(t, "patch", func(_ CompletionReceipt, a []string) bool { return len(a) > 0 && a[0] == "diff-tree" })
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an exhausted budget in the patch stage must reach the caller as the budget sentinel: %v", err)
+	}
+	if ranCommand(seen, "patch-id") || ranCommand(seen, "diff-tree") {
+		t.Fatalf("the patch pipeline ran outside the allowance: %v", seen)
+	}
+}
+
+func TestValidateSpendsOneSharedBudgetAndNeverResetsIt(t *testing.T) {
+	dir, r, st := budgetFixture(t)
+	seen := recordCommands(t)
+	if err := r.Validate(dir, carrierRef, st); err != nil {
+		t.Fatalf("the honest landing must validate under the default allowance: %v", err)
+	}
+	total := len(*seen)
+	if total == 0 {
+		t.Fatal("the validation ran no git commands at all, so it proves nothing about a budget")
+	}
+	if total > contentProofMaxCommands {
+		t.Fatalf("one validation spends %d commands, more than the %d allowance", total, contentProofMaxCommands)
+	}
+
+	*seen = nil
+	withCommandAllowance(t, total-1)
+	err := r.Validate(dir, carrierRef, st)
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an allowance one command short of the whole validation was not exhausted, so a stage re-minted the budget: %v", err)
+	}
+	if len(*seen) != total-1 {
+		t.Fatalf("the validation ran %d commands on an allowance of %d", len(*seen), total-1)
+	}
+}
+
+// The patch pipeline is bounded at both ends. Its OUTPUT cap stops an oversize
+// diff before it is ever fed anywhere.
+func TestPatchIDRefusesAnOversizeDiff(t *testing.T) {
+	fed := false
+	stubContentProofCommand(t, func(_ context.Context, _ string, stdin []byte, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "patch-id" {
+			fed = true
+			return "", nil
+		}
+		return strings.Repeat("x", contentProofMaxOutputBytes+1), nil
+	})
+	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background(), maxCommands: contentProofMaxCommands}
+	_, err := proof.patchID("0000000000000000000000000000000000000000")
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an oversize diff was accepted into the patch pipeline: %v", err)
+	}
+	if fed {
+		t.Fatal("git patch-id was fed a diff that had already exceeded the output cap")
+	}
+}
+
+// And its INPUT cap refuses to hand a process more bytes than the budget allows,
+// before starting it. patchID cannot reach this today because the diff it feeds
+// is already capped by the output limit above; the guard is what keeps that true
+// if another caller ever passes stdin.
+func TestContentProofRefusesAnOversizePatchInput(t *testing.T) {
+	started := false
+	stubContentProofCommand(t, func(context.Context, string, []byte, ...string) (string, error) {
+		started = true
+		return "", nil
+	})
+	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background(), maxCommands: contentProofMaxCommands}
+	_, err := proof.runRaw(make([]byte, contentProofMaxOutputBytes+1), "patch-id", "--stable")
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("oversize input was accepted into a process: %v", err)
+	}
+	if started {
+		t.Fatal("the process was started before its input was measured")
 	}
 }

@@ -17,6 +17,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
@@ -165,6 +166,12 @@ type LifecycleAuthority interface {
 // THIS repository, at THIS lease generation, naming a candidate whose content
 // is provably what landed on origin/main?
 func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState) error {
+	// ONE budget for the whole validation, constructed here at the public entry
+	// and threaded through every stage that touches git. The deadline starts now,
+	// the command allowance is cumulative, and no helper below re-mints it.
+	proof, cancel := newContentProof(repoDir)
+	defer cancel()
+
 	if r.Version != CompletionReceiptVersion {
 		return fmt.Errorf("receipt version %d is not %d", r.Version, CompletionReceiptVersion)
 	}
@@ -238,8 +245,10 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 
 	// Repository binding: a receipt minted against another repository never
 	// closes a card here, however well-formed it is.
-	repoID, err := toolchild.RepositoryIdentity(repoDir)
+	repoID, err := proof.repositoryIdentity()
 	if err != nil {
+		// %w keeps a budget refusal recognisable to errors.Is: a stopped
+		// validation must never read as a repository that does not exist.
 		return fmt.Errorf("cannot resolve repository identity: %w", err)
 	}
 	if !strings.EqualFold(repoID, r.RepoID) {
@@ -248,17 +257,29 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 
 	// Integration binding: the merge commit must actually be on origin/main,
 	// and the base it was cut from must precede it.
-	if _, err := git(repoDir, "rev-parse", "--verify", "-q", "origin/main"); err != nil {
+	present, err := proof.answered("rev-parse", "--verify", "-q", "origin/main")
+	if err != nil {
+		return err
+	}
+	if !present {
 		return fmt.Errorf("no origin/main in %s", repoDir)
 	}
-	if _, err := git(repoDir, "merge-base", "--is-ancestor", r.MergeSHA, "origin/main"); err != nil {
+	onMain, err := proof.answered("merge-base", "--is-ancestor", r.MergeSHA, "origin/main")
+	if err != nil {
+		return err
+	}
+	if !onMain {
 		return fmt.Errorf("merge sha %s is not an ancestor of origin/main", r.MergeSHA)
 	}
-	if _, err := git(repoDir, "merge-base", "--is-ancestor", r.BaseSHA, r.MergeSHA); err != nil {
+	fromBase, err := proof.answered("merge-base", "--is-ancestor", r.BaseSHA, r.MergeSHA)
+	if err != nil {
+		return err
+	}
+	if !fromBase {
 		return fmt.Errorf("base sha %s is not an ancestor of merge sha %s", r.BaseSHA, r.MergeSHA)
 	}
 
-	if err := r.validateContentBinding(repoDir); err != nil {
+	if err := r.validateContentBinding(proof); err != nil {
 		return err
 	}
 	// Reduced receipts are deliberately minted only by post-merge PR
@@ -299,27 +320,9 @@ const IntegrationMerged = "merged"
 // (an empty commit) is an error, not an empty patch id — that distinction is
 // the whole point of the check.
 func PatchID(repoDir, sha string) (string, error) {
-	diff := exec.Command("git", "diff-tree", "-p", "--no-color", sha)
-	diff.Dir = repoDir
-	out, err := diff.Output()
-	if err != nil {
-		return "", fmt.Errorf("git diff-tree: %w", err)
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return "", fmt.Errorf("commit carries no patch (empty commit)")
-	}
-	pid := exec.Command("git", "patch-id", "--stable")
-	pid.Dir = repoDir
-	pid.Stdin = bytes.NewReader(out)
-	pout, err := pid.Output()
-	if err != nil {
-		return "", fmt.Errorf("git patch-id: %w", err)
-	}
-	fields := strings.Fields(string(pout))
-	if len(fields) == 0 {
-		return "", fmt.Errorf("git patch-id produced no id")
-	}
-	return fields[0], nil
+	p, cancel := newContentProof(repoDir)
+	defer cancel()
+	return p.patchID(sha)
 }
 
 // ReceiptPath is where BoardDone looks for a card's receipt by default.
@@ -509,23 +512,40 @@ func ReadDoneLog(repoDir string) ([]DoneRecord, error) {
 
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-// The content-binding proof answers one question -- is the merged tree the
-// result of the REVIEWED DELTA -- and it has to answer inside a FIXED PHYSICAL
-// BUDGET. It runs in `herd approve` against a repository whose history an author
-// influences, so an unbounded walk is a denial of service with a receipt
-// attached. Per-command timeouts and argv batching bound neither the number of
-// commands nor the total work, so the budget below is shared by the whole proof.
+// Everything below is the PHYSICAL BUDGET for one public validation.
 //
-// Every limit fails CLOSED through ErrContentProofBudget. A proof that was
-// STOPPED is never reported as a landing that was PRESERVED: the two are
-// different answers and the caller must be able to tell them apart.
+// `herd approve` validates a receipt against a repository whose history and
+// configuration an author influences, so every git invocation the public entry
+// point makes has to be bounded -- not just the interesting one. Bounding an
+// inner proof while the identity read, three ancestry probes and the patch-id
+// pipeline outside it run unbounded does not bound the validation: it bounds a
+// fragment of it and leaves the rest as the actual limit.
+//
+// So ONE budget is constructed at the public entry and threaded through every
+// stage. It is never reset, never widened and never replaced part way: a helper
+// that made a fresh one would hand each stage the full allowance again, which is
+// the same defect wearing a different shape.
+//
+// Every limit fails CLOSED through ErrContentProofBudget. A validation that was
+// STOPPED is never reported as a landing that was PRESERVED, and never as a
+// missing revision or a failed ancestry either: those are content answers and
+// this is not one.
 const (
 	contentProofTimeout        = 30 * time.Second
-	contentProofKillDelay      = 5 * time.Second
-	contentProofMaxCommands    = 16
 	contentProofMaxOutputBytes = 1 << 20
 	contentProofMaxStderrBytes = 8 << 10
 )
+
+// contentProofMaxCommands is the CUMULATIVE command allowance for one public
+// validation. Every valid path is constant work and well inside it: the widest
+// is a sealed carrier at ten commands -- identity, origin/main, two integration
+// ancestry probes, the carrier ancestry probe, three for the replay and two for
+// the patch id -- and the legacy no-carrier path is six.
+//
+// It is a var only so a test can inject a FINITE allowance through the real
+// public entry point and observe the stage that spends it. Production never
+// writes it.
+var contentProofMaxCommands = 16
 
 // ErrContentProofBudget is the one sentinel for every limit above.
 var ErrContentProofBudget = errors.New("content proof stopped by its budget")
@@ -563,14 +583,21 @@ func (w *boundedOutput) Write(p []byte) (int, error) {
 // machine running CI is slow enough or the repository large enough.
 var contentProofCommand = runBoundedGit
 
-// runBoundedGit is the physical half of the same budget. The shared deadline
-// kills the process, WaitDelay stops a child that ignores that from holding the
-// call open, and stdout and stderr have separate capped writers so neither can
-// grow without limit and the two goroutines exec uses never share one buffer.
-func runBoundedGit(ctx context.Context, repoDir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+// runBoundedGit is the physical half of the budget.
+//
+// The process is started through procsignal.CommandContext, so it runs in an
+// OWNED PROCESS GROUP and a cancelled deadline kills the group rather than the
+// direct child alone: a WaitDelay by itself leaves descendants holding pipes
+// open, which is how a "bounded" call keeps running after it was stopped.
+// Stdout and stderr have separate capped writers, so neither can grow without
+// limit and the two goroutines exec uses never share one buffer. Stdin is a
+// bounded byte slice the caller already measured.
+func runBoundedGit(ctx context.Context, repoDir string, stdin []byte, args ...string) (string, error) {
+	cmd := procsignal.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoDir
-	cmd.WaitDelay = contentProofKillDelay
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	stdout := &boundedOutput{max: contentProofMaxOutputBytes}
 	stderr := &boundedOutput{max: contentProofMaxStderrBytes}
 	cmd.Stdout = stdout
@@ -580,29 +607,53 @@ func runBoundedGit(ctx context.Context, repoDir string, args ...string) (string,
 		return "", fmt.Errorf("%w: git %s produced more than the %d byte cap",
 			ErrContentProofBudget, strings.Join(args, " "), contentProofMaxOutputBytes)
 	}
-	return strings.TrimSpace(stdout.text.String()), err
+	return stdout.text.String(), err
 }
 
-// contentProof holds the budget for ONE validation. Every git call the proof
-// makes goes through run -- including the ones the shared replay primitive
-// makes, because the primitive takes this method as its runner and starts no
-// process of its own -- so the counters cannot be bypassed by adding a code path.
+// contentProof is the budget for ONE public validation. Every git call any stage
+// makes goes through it -- including the ones the shared replay primitive and
+// the shared identity reader make, because both take a runner and start no
+// process of their own -- so no stage can spend outside the allowance.
 type contentProof struct {
-	repoDir  string
-	ctx      context.Context
-	commands int
+	repoDir     string
+	ctx         context.Context
+	commands    int
+	maxCommands int
 }
 
+// newContentProof builds the budget and the cancel that releases it. The caller
+// MUST defer the cancel: it is what kills any still-running owned group.
+func newContentProof(repoDir string) (*contentProof, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), contentProofTimeout)
+	return &contentProof{repoDir: repoDir, ctx: ctx, maxCommands: contentProofMaxCommands}, cancel
+}
+
+// run returns trimmed stdout, which is what every identity, ancestry and tree
+// probe wants.
 func (p *contentProof) run(args ...string) (string, error) {
-	if p.commands >= contentProofMaxCommands {
-		return "", fmt.Errorf("%w: the proof asked for more than %d git commands",
-			ErrContentProofBudget, contentProofMaxCommands)
+	out, err := p.runRaw(nil, args...)
+	return strings.TrimSpace(out), err
+}
+
+// runRaw returns stdout EXACTLY as git produced it. The patch pipeline needs
+// that: git patch-id hashes the bytes it is fed, so trimming the diff before
+// hashing it would compute a different id than every receipt already holds.
+func (p *contentProof) runRaw(stdin []byte, args ...string) (string, error) {
+	// A spent allowance, and a zero or negative one, are both EXHAUSTED. There
+	// is no value of maxCommands that means "unlimited".
+	if p.commands >= p.maxCommands {
+		return "", fmt.Errorf("%w: this validation asked for more than %d git commands",
+			ErrContentProofBudget, p.maxCommands)
 	}
 	if err := p.ctx.Err(); err != nil {
 		return "", fmt.Errorf("%w: %w", ErrContentProofBudget, err)
 	}
+	if len(stdin) > contentProofMaxOutputBytes {
+		return "", fmt.Errorf("%w: git %s was handed %d bytes of input, more than the %d byte cap",
+			ErrContentProofBudget, strings.Join(args, " "), len(stdin), contentProofMaxOutputBytes)
+	}
 	p.commands++
-	out, err := contentProofCommand(p.ctx, p.repoDir, args...)
+	out, err := contentProofCommand(p.ctx, p.repoDir, stdin, args...)
 	if len(out) > contentProofMaxOutputBytes {
 		return "", fmt.Errorf("%w: git %s returned %d bytes, more than the %d byte cap",
 			ErrContentProofBudget, strings.Join(args, " "), len(out), contentProofMaxOutputBytes)
@@ -615,6 +666,70 @@ func (p *contentProof) run(args ...string) (string, error) {
 		}
 	}
 	return out, err
+}
+
+// answered runs a command whose EXIT STATUS is the answer: true for 0, false for
+// the documented "no" status 1, and an ERROR for anything else.
+//
+// A budget refusal is an error and never a "no". Reporting it as a "no" is how
+// an exhausted validation gets recorded as a commit that is not an ancestor --
+// a content verdict invented out of a stopped process.
+func (p *contentProof) answered(args ...string) (bool, error) {
+	out, err := p.run(args...)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, ErrContentProofBudget) {
+		return false, err
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+}
+
+// repositoryIdentityWith is the runner-aware shared identity reader. pkg/sync
+// does not re-implement the normalization: it supplies the bounded runner and
+// pkg/toolchild keeps the one definition of what an origin binding is.
+var repositoryIdentityWith = toolchild.RepositoryIdentityWith
+
+// repositoryIdentity reads the repository binding inside this validation's
+// budget. The unbounded toolchild.RepositoryIdentity remains the entry point for
+// callers that have no budget to share; the public receipt gate is not one.
+func (p *contentProof) repositoryIdentity() (string, error) {
+	return repositoryIdentityWith(p.repoDir, p.run)
+}
+
+// patchID is the ONE implementation of the patch identity rule. The exported
+// PatchID and the receipt gate both reach the bytes through it, so there is a
+// single answer to "what is this commit's patch" and a single place where an
+// empty commit is refused.
+func (p *contentProof) patchID(sha string) (string, error) {
+	diff, err := p.runRaw(nil, "diff-tree", "-p", "--no-color", sha)
+	if err != nil {
+		if errors.Is(err, ErrContentProofBudget) {
+			return "", err
+		}
+		return "", fmt.Errorf("git diff-tree: %w", err)
+	}
+	if len(strings.TrimSpace(diff)) == 0 {
+		return "", fmt.Errorf("commit carries no patch (empty commit)")
+	}
+	// The EXACT bytes git produced, bounded by the output cap that produced
+	// them and charged to the same allowance.
+	out, err := p.runRaw([]byte(diff), "patch-id", "--stable")
+	if err != nil {
+		if errors.Is(err, ErrContentProofBudget) {
+			return "", err
+		}
+		return "", fmt.Errorf("git patch-id: %w", err)
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("git patch-id produced no id")
+	}
+	return fields[0], nil
 }
 
 // reviewedDelta names the two commits whose difference IS the reviewed content.
@@ -698,20 +813,11 @@ func (p *contentProof) mergedTreeIsTheReviewedResult(r CompletionReceipt) error 
 	return nil
 }
 
-// replayProvesTheMergedTree is the consumer entry point: one shared deadline for
-// the whole proof, cancelled on every return.
-func (r CompletionReceipt) replayProvesTheMergedTree(repoDir string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), contentProofTimeout)
-	defer cancel()
-	proof := &contentProof{repoDir: repoDir, ctx: ctx}
-	return proof.mergedTreeIsTheReviewedResult(r)
-}
-
 // validateContentBinding is the content half of Validate, extracted so the
 // contract can be driven directly by a test without fabricating every unrelated
 // field a full receipt carries. Validate calls it and nothing else does: this
 // is the shipped consumer path, not a copy of it.
-func (r CompletionReceipt) validateContentBinding(repoDir string) error {
+func (r CompletionReceipt) validateContentBinding(p *contentProof) error {
 	// Content binding: the accepted candidate's patch must actually be in what
 	// landed. This is what makes "an empty commit naming the ticket" useless —
 	// an empty commit has no patch id at all.
@@ -728,7 +834,11 @@ func (r CompletionReceipt) validateContentBinding(repoDir string) error {
 		// Ancestry: the carrier must be IN the merge it claims to be carried
 		// by. Without this a receipt could name any commit in the repository
 		// whose patch happens to match and pass.
-		if _, err := git(repoDir, "merge-base", "--is-ancestor", r.ContentSHA, r.MergeSHA); err != nil {
+		carried, err := p.answered("merge-base", "--is-ancestor", r.ContentSHA, r.MergeSHA)
+		if err != nil {
+			return err
+		}
+		if !carried {
 			return fmt.Errorf("content sha %s is not an ancestor of merge sha %s", r.ContentSHA, r.MergeSHA)
 		}
 		// Content: the merged tree must BE the reviewed result -- the sealed
@@ -738,11 +848,11 @@ func (r CompletionReceipt) validateContentBinding(repoDir string) error {
 		// both keep the carrier an ancestor while landing something else. The
 		// carrier keeps its own independent bindings -- that ancestry, and the
 		// patch id below -- and the replay runs inside one shared, finite budget.
-		if err := r.replayProvesTheMergedTree(repoDir); err != nil {
+		if err := p.mergedTreeIsTheReviewedResult(r); err != nil {
 			return err
 		}
 	}
-	landed, err := PatchID(repoDir, contentSHA)
+	landed, err := p.patchID(contentSHA)
 	if err != nil {
 		return fmt.Errorf("content sha %s: %w", contentSHA, err)
 	}
@@ -751,4 +861,15 @@ func (r CompletionReceipt) validateContentBinding(repoDir string) error {
 			contentSHA, landed, r.PatchID)
 	}
 	return nil
+}
+
+// validateContentBindingFresh is the PRIVATE entry a focused test uses to drive
+// the content half alone. It mints its own top-level budget, which is exactly
+// what the PUBLIC path must never do: Validate threads its one budget through
+// every stage so the allowance is cumulative across the whole validation, and a
+// helper that re-minted it would hand each stage a full allowance again.
+func (r CompletionReceipt) validateContentBindingFresh(repoDir string) error {
+	p, cancel := newContentProof(repoDir)
+	defer cancel()
+	return r.validateContentBinding(p)
 }

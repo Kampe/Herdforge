@@ -136,7 +136,7 @@ done
 suites=(
 "./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt|TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt|TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt"
 "./cmd/herd/${sep}^(TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged|TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin|TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo|TestResolveVerifyLandedSurfaceRefusesAForeignRepository|TestRequireObjectPresentDemandsACommit|TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead)\$${sep}TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo TestResolveVerifyLandedSurfaceRefusesAForeignRepository TestRequireObjectPresentDemandsACommit TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead"
-"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedAndPatchMismatchedCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath|TestValidateRefusesAMergeThatDiscardedTheReviewedContent|TestValidateFollowsAReviewedRenameToItsDestination|TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit|TestValidateRefusesAnAlteredRenameDestination|TestValidateAcceptsIndependentMainAndReviewedHunks|TestValidateRefusesASubstitutedSealedCandidate|TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate|TestContentProofRefusesAfterItsDeadline|TestContentProofRefusesWhenTheCommandBudgetIsSpent|TestContentProofRefusesOversizeCommandOutput|TestBoundedOutputRefusesToGrowPastItsCap)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedAndPatchMismatchedCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath TestValidateRefusesAMergeThatDiscardedTheReviewedContent TestValidateFollowsAReviewedRenameToItsDestination TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit TestValidateRefusesAnAlteredRenameDestination TestValidateAcceptsIndependentMainAndReviewedHunks TestValidateRefusesASubstitutedSealedCandidate TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate TestContentProofRefusesAfterItsDeadline TestContentProofRefusesWhenTheCommandBudgetIsSpent TestContentProofRefusesOversizeCommandOutput TestBoundedOutputRefusesToGrowPastItsCap"
+"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedAndPatchMismatchedCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath|TestValidateRefusesAMergeThatDiscardedTheReviewedContent|TestValidateFollowsAReviewedRenameToItsDestination|TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit|TestValidateRefusesAnAlteredRenameDestination|TestValidateAcceptsIndependentMainAndReviewedHunks|TestValidateRefusesASubstitutedSealedCandidate|TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate|TestValidateStopsInTheIdentityStageWhenTheBudgetIsGone|TestValidateStopsInTheIntegrationAncestryStageWhenTheBudgetIsGone|TestValidateStopsInTheCarrierAncestryStageWhenTheBudgetIsGone|TestValidateStopsInTheReplayStageWhenTheBudgetIsGone|TestValidateStopsInThePatchStageWhenTheBudgetIsGone|TestValidateSpendsOneSharedBudgetAndNeverResetsIt|TestPatchIDRefusesAnOversizeDiff|TestContentProofRefusesAnOversizePatchInput|TestContentProofRefusesAfterItsDeadline|TestContentProofRefusesWhenTheCommandBudgetIsSpent|TestContentProofRefusesOversizeCommandOutput|TestBoundedOutputRefusesToGrowPastItsCap)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedAndPatchMismatchedCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath TestValidateRefusesAMergeThatDiscardedTheReviewedContent TestValidateFollowsAReviewedRenameToItsDestination TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit TestValidateRefusesAnAlteredRenameDestination TestValidateAcceptsIndependentMainAndReviewedHunks TestValidateRefusesASubstitutedSealedCandidate TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate TestValidateStopsInTheIdentityStageWhenTheBudgetIsGone TestValidateStopsInTheIntegrationAncestryStageWhenTheBudgetIsGone TestValidateStopsInTheCarrierAncestryStageWhenTheBudgetIsGone TestValidateStopsInTheReplayStageWhenTheBudgetIsGone TestValidateStopsInThePatchStageWhenTheBudgetIsGone TestValidateSpendsOneSharedBudgetAndNeverResetsIt TestPatchIDRefusesAnOversizeDiff TestContentProofRefusesAnOversizePatchInput TestContentProofRefusesAfterItsDeadline TestContentProofRefusesWhenTheCommandBudgetIsSpent TestContentProofRefusesOversizeCommandOutput TestBoundedOutputRefusesToGrowPastItsCap"
 )
 
 # ---------------------------------------------------------------------------
@@ -206,6 +206,33 @@ suites=(
 #                          so they prove the guard rather than the speed or size
 #                          of whatever ran CI that day.
 #
+#   validation-budget-never-reset
+#                          the ONE allowance is cumulative across the whole
+#                          public validation. The mutant makes the content half
+#                          mint its own, which is the same defect the review
+#                          found in a different shape: every stage bounded, the
+#                          validation not. Its killer gives the entry an
+#                          allowance one command short of the whole run, which
+#                          only passes if some stage started counting again.
+#   identity-read-must-be-bounded
+#                          the repository identity read goes through the shared
+#                          runner-aware reader with THIS validation's budget.
+#                          The mutant restores the unbounded
+#                          toolchild.RepositoryIdentity, and the killer notices
+#                          because no identity command reaches the runner at all.
+#   ancestry-budget-is-not-an-answer
+#                          an exhausted budget in an ancestry probe reaches the
+#                          caller as the sentinel. The mutant lets it answer
+#                          "no", which is how a stopped validation gets recorded
+#                          as a commit that is not an ancestor -- a content
+#                          verdict invented out of a killed process.
+#   process-input-measured-before-start
+#                          input handed to a process is measured BEFORE it
+#                          starts. The patch pipeline cannot exceed it today
+#                          because the diff it feeds is already capped on the way
+#                          out; the guard is what keeps that true for any later
+#                          caller that passes stdin.
+#
 # Every control's assertion is emitted by its killer test ITSELF: no killer in
 # this file declares a subtest, and the shared helpers that assert for them
 # (assertIntegrationContract, assertSealedCarrierReceipt) run on the killer's own
@@ -245,16 +272,24 @@ mutations=(
 		ContentSHA:         proof.ContentSHA,${sep}		MergeSHA:           proof.MergeSHA,
 		// MUTANT: the sealed carrier is dropped, so the receipt binds content to the merge alone${sep}TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}full-provenance producer did not seal the content carrier"
 "sealed-carrier-copied-into-the-reduced-receipt${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}MergeSHA: proof.MergeSHA, ContentSHA: proof.ContentSHA, PatchID: proof.PatchID,${sep}MergeSHA: proof.MergeSHA, /* MUTANT: the reduced receipt drops the sealed carrier */ PatchID: proof.PatchID,${sep}TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}reduced-provenance producer did not seal the content carrier"
-"proof-command-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if p.commands >= contentProofMaxCommands {${sep}	if false && p.commands >= contentProofMaxCommands { // MUTANT: the subprocess count is no longer bounded${sep}TestContentProofRefusesWhenTheCommandBudgetIsSpent${sep}the command budget did not stop the proof after"
+"proof-command-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if p.commands >= p.maxCommands {${sep}	if false && p.commands >= p.maxCommands { // MUTANT: the subprocess count is no longer bounded${sep}TestContentProofRefusesWhenTheCommandBudgetIsSpent${sep}the command budget did not stop the proof after"
 "proof-deadline-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if err := p.ctx.Err(); err != nil {${sep}	if err := error(nil); err != nil { // MUTANT: the shared deadline no longer stops the proof${sep}TestContentProofRefusesAfterItsDeadline${sep}an expired deadline must stop the proof before it starts a process"
 "proof-output-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if len(out) > contentProofMaxOutputBytes {${sep}	if false && len(out) > contentProofMaxOutputBytes { // MUTANT: command output is no longer bounded${sep}TestContentProofRefusesOversizeCommandOutput${sep}output larger than the proof budget was accepted"
-"sealed-carrier-requires-the-replay${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		if err := r.replayProvesTheMergedTree(repoDir); err != nil {
+"sealed-carrier-requires-the-replay${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		if err := p.mergedTreeIsTheReviewedResult(r); err != nil {
 			return err
 		}${sep}		if err := error(nil); err != nil { // MUTANT: a sealed carrier no longer has to replay to the merged tree
 			return err
 		}${sep}TestValidateRefusesAMergeThatDiscardedTheReviewedContent${sep}a merge that discarded every reviewed hunk was accepted"
 "replayed-tree-must-equal-the-merged-tree${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if !strings.EqualFold(replayed, landedTree) {${sep}	if false && !strings.EqualFold(replayed, landedTree) { // MUTANT: the replayed reviewed result no longer has to be what landed${sep}TestValidateRefusesAnAlteredRenameDestination${sep}an altered rename destination was accepted"
 "candidate-may-not-be-the-integration-commit${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if strings.EqualFold(candidate, r.MergeSHA) {${sep}	if false && strings.EqualFold(candidate, r.MergeSHA) { // MUTANT: a receipt may name the merge as its own reviewed candidate${sep}TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate${sep}the integration commit was accepted as its own reviewed candidate"
+"validation-budget-never-reset${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if err := r.validateContentBinding(proof); err != nil {${sep}	if err := r.validateContentBindingFresh(repoDir); err != nil { // MUTANT: the content half re-mints its own allowance${sep}TestValidateSpendsOneSharedBudgetAndNeverResetsIt${sep}so a stage re-minted the budget"
+"identity-read-must-be-bounded${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	return repositoryIdentityWith(p.repoDir, p.run)${sep}	return toolchild.RepositoryIdentity(p.repoDir) // MUTANT: the identity read escapes the validation budget${sep}TestValidateStopsInTheIdentityStageWhenTheBudgetIsGone${sep}belongs to the identity stage"
+"ancestry-budget-is-not-an-answer${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if errors.Is(err, ErrContentProofBudget) {
+		return false, err
+	}${sep}	if errors.Is(err, ErrContentProofBudget) {
+		return false, nil // MUTANT: an exhausted budget answers no instead of stopping
+	}${sep}TestValidateStopsInTheCarrierAncestryStageWhenTheBudgetIsGone${sep}an exhausted budget in the carrier ancestry stage must reach the caller"
+"process-input-measured-before-start${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if len(stdin) > contentProofMaxOutputBytes {${sep}	if false && len(stdin) > contentProofMaxOutputBytes { // MUTANT: process input is no longer measured before the process starts${sep}TestContentProofRefusesAnOversizePatchInput${sep}oversize input was accepted into a process"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from
