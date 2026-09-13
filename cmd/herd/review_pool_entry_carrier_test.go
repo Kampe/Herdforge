@@ -63,6 +63,34 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	git("init", "-q", "-b", "main", ".")
 	git("config", "commit.gpgsign", "false")
 	git("config", "gc.auto", "0")
+
+	// RUNTIME IGNORES, COMMITTED FIRST. The entry writes its own operating
+	// state into .herd/ AFTER the fixture's clean check, and the production
+	// dirty guard then refuses — correctly. CI 34755537851 listed exactly
+	// .herd/harvest-queue.jsonl, .herd/herd.yaml, .herd/review-ledger.jsonl
+	// and .herd/state/.
+	//
+	// These rules name only artifacts the RUNTIME creates, one per line, so
+	// genuine source dirt in the fixture still trips the real guard. Nothing
+	// broad is ignored: .herd/prompts/ stays tracked, because the reviewer
+	// contract IS source and the entry verifies it in the candidate's tree.
+	write(".gitignore", strings.Join([]string{
+		"/.herd/review-ledger.jsonl",
+		"/.herd/harvest-queue.jsonl",
+		"/.herd/pool/",
+		"/.herd/review-surfaces/",
+		"/.herd/review-packets/",
+		"/.herd/worktrees/",
+		"/.herd/review/",
+		"",
+	}, "\n"))
+
+	// CONFIGURATION IS TRACKED, not ignored: this repository tracks
+	// .herd/herd.yaml and ignores only .herd/herd.yaml.local, so a fixture
+	// that ignored its own config would be unfaithful to the native contract.
+	// It is committed before the candidate, like any other checked-in config.
+	write(".herd/herd.yaml", "version: \"1\"\nproject:\n  name: fixture\ntask_provider:\n  type: memory\n  project_id: "+entryProjectID+"\n")
+
 	// The entry refuses a candidate whose own tree does not track the reviewer
 	// contract and verdict template, so the fixture commits both.
 	write(reviewerContractPath, "# reviewer contract (fixture)\n")
@@ -71,6 +99,20 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	git("add", ".")
 	git("commit", "-qm", "base")
 	base := git("rev-parse", "HEAD")
+
+	// A REAL origin, because the warm pool creates its slots at origin/main:
+	// worktree.NewPool defaults DefaultBase to "origin/main" and runPoolReview
+	// does not override it, so a fixture without a remote would fail at
+	// Pool.Ensure — the next gate after the dirty check, not a hypothetical.
+	// origin/main stays at the BASE, as it would for unmerged candidate work;
+	// the slot is reset to the exact candidate afterwards by the entry itself.
+	originDir := filepath.Join(filepath.Dir(root), "origin-"+filepath.Base(root)+".git")
+	if out, err := exec.Command("git", "init", "--bare", "-q", "-b", "main", originDir).CombinedOutput(); err != nil {
+		t.Fatalf("fixture origin: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(originDir) })
+	git("remote", "add", "origin", originDir)
+	git("push", "-q", "origin", "main")
 
 	write("candidate.txt", "candidate work\n")
 	git("add", "candidate.txt")
@@ -133,12 +175,20 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	home := filepath.Join(root, "fixture-home")
+	// HOME sits OUTSIDE the repository. A home inside the checkout is not the
+	// native shape, and the moment anything wrote into it the directory would
+	// become untracked dirt and the production guard would refuse — the same
+	// class of failure as .herd/state/, one level up.
+	home := filepath.Join(filepath.Dir(root), "home-"+filepath.Base(root))
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
-	t.Setenv("HERD_ADMISSION_LEASE_PATH", filepath.Join(root, ".herd", "state", "admission.lease"))
+	// The admission lease lives under HOME in production: admissionLeasePath
+	// falls back to $HOME/.herd/state/admission.lease. Pointing it inside the
+	// repository is what put .herd/state/ in the dirty list.
+	t.Setenv("HERD_ADMISSION_LEASE_PATH", filepath.Join(home, ".herd", "state", "admission.lease"))
 	// The protocol fake reports exactly this workspace id (fakeherdr_test.go),
 	// so RequireWorkspace resolves against the fixture rather than any host.
 	t.Setenv("HERD_WORKSPACE", "wFAKE")
@@ -150,23 +200,19 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	return root, sha, herdrCalls
 }
 
-// entryConfig writes the fixture's herd.yaml and installs a seeded provider for
-// the entry's own lookup.
+// entryProjectID is the project the committed fixture config declares and the
+// seeded provider answers for.
+const entryProjectID = "fixture-project"
+
+// entryConfig installs the seeded provider for the entry's own task lookup.
+// The CONFIG itself is committed by entryFixture, because this repository
+// tracks .herd/herd.yaml.
 func entryConfig(t *testing.T, root string) {
 	t.Helper()
-	const projectID = "fixture-project"
-	body := "version: \"1\"\nproject:\n  name: fixture\ntask_provider:\n  type: memory\n  project_id: " + projectID + "\n"
-	p := filepath.Join(root, ".herd", "herd.yaml")
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	seeded := provider.NewMemoryProvider()
 	seeded.AddTask(&provider.Task{
 		ID: "fixture-1", Ref: entryRef, Title: "carrier lifecycle fixture",
-		Status: provider.StatusInProgress, ProjectID: projectID,
+		Status: provider.StatusInProgress, ProjectID: entryProjectID,
 	})
 	previous := loadReviewTaskProvider
 	loadReviewTaskProvider = func(*config.Config) (provider.TaskProvider, error) { return seeded, nil }
@@ -238,6 +284,18 @@ func TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier(t *testing.T) {
 	// the protocols it answers are unproven: the two tolerant ones would fall
 	// back silently on a wrong envelope. Presence only — no order, no counts.
 	assertCompleteCensusObserved(t, herdrCalls())
+
+	// The fixture's runtime ignores must COVER what the entry actually wrote.
+	// `git status --porcelain` omits ignored paths, so a clean result means
+	// every artifact the run produced was declared, while genuine source dirt —
+	// a tracked file the entry modified, or an undeclared new runtime file —
+	// still shows and fails here. That is the distinction the production guard
+	// makes, checked against real output rather than restated from the ignore
+	// list, so a future runtime artifact fails loudly here instead of silently
+	// refusing on the next hosted run.
+	if dirt := strings.TrimSpace(entryGitOutput(t, root, "status", "--porcelain")); dirt != "" {
+		t.Fatalf("the entry left undeclared dirt in the shared checkout:\n%s", dirt)
+	}
 }
 
 // RETRY must not accumulate a carrier either.
