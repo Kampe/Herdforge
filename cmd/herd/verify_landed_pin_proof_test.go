@@ -24,7 +24,16 @@ import (
 
 const pinProofRef = "FAC-843"
 
-// landedPinFixture builds a squash landing whose work branch is no longer
+// pinProofBranch is the reviewed branch, and it NAMES THE TASK, which is the
+// fleet's branch convention (`task/<ref>`) and what the shipped review
+// authority matches on: rowNamesRef resolves a ref from a ledger row's branch,
+// artifact or lane — never from its task field. A fixture whose branch did not
+// name the ref recorded evidence that AdmittedPass cannot find, so the ref had
+// no current admitted PASS and a retired carrier was correctly refused as
+// unpinned (CI 34751721492).
+const pinProofBranch = "task/" + pinProofRef
+
+// landedPinFixture builds a squash landing whose reviewed branch is no longer
 // checked out — the retired-carrier shape — and returns the identities.
 func landedPinFixture(t *testing.T) (repo, base, candidate, landed string) {
 	t.Helper()
@@ -57,11 +66,11 @@ func landedPinFixture(t *testing.T) (repo, base, candidate, landed string) {
 	}
 	base = commit("base\n", "base")
 	git(repo, "push", "-q", "origin", "main")
-	git(repo, "checkout", "-q", "-b", "work")
+	git(repo, "checkout", "-q", "-b", pinProofBranch)
 	commit("middle\n", "first")
 	candidate = commit("final\n", "second")
 	git(repo, "checkout", "-q", "main")
-	git(repo, "merge", "--squash", "work")
+	git(repo, "merge", "--squash", pinProofBranch)
 	git(repo, "commit", "-q", "-m", "squash")
 	landed = git(repo, "rev-parse", "HEAD")
 	git(repo, "push", "-q", "origin", "main")

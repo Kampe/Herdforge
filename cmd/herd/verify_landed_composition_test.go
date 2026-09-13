@@ -44,16 +44,20 @@ func compositionGate(t *testing.T, repo, candidate, tip string, budget mergeadmi
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
+	// Same evidence shape as the public fixture: the branch and artifact name
+	// the ref, which is what the shipped review authority matches on.
 	if err := ledger.Record(reviewledger.RecordOpts{
 		SHA: candidate, Reviewer: "reviewer-a", BuilderFamily: "anthropic", BuilderIdentity: "builder-1",
 		ReviewerFamily: "openai", Gate: "independent", Tier: "R3", Task: pinProofRef, Lease: "lease-1",
+		Branch: pinProofBranch,
 	}); err != nil {
 		t.Fatalf("record launch: %v", err)
 	}
 	if _, err := ledger.Verdict(reviewledger.VerdictOpts{
 		SHA: candidate, Reviewer: "reviewer-a", Verdict: reviewledger.VerdictPASS,
 		ReviewerFamily: "openai", BuilderFamily: "anthropic", Task: pinProofRef, Lease: "lease-1",
-		PatchURL: "patch-1", VfyDigest: "vfy-1", Artifact: "verdict.md", CandidateSHA: candidate,
+		PatchURL: "patch-1", VfyDigest: "vfy-1", CandidateSHA: candidate,
+		Branch: pinProofBranch, Artifact: pinProofRef + "-verdict.md",
 	}); err != nil {
 		t.Fatalf("write verdict: %v", err)
 	}
@@ -92,7 +96,7 @@ func TestVerifyLandedCompositionStopsBeforeAnythingIsRecorded(t *testing.T) {
 
 	ctx, cancel := gate.ProofContext()
 	defer cancel()
-	err := proveSealAndRecordLanded(ctx, gate, repo, "work", req)
+	err := proveSealAndRecordLanded(ctx, gate, repo, pinProofBranch, req)
 	if err == nil {
 		t.Fatal("an exhausted allowance completed a verify-landed invocation")
 	}
@@ -119,7 +123,7 @@ func TestVerifyLandedCompositionRecordsNothingWhenTheSealExhausts(t *testing.T) 
 
 	ctx, cancel := gate.ProofContext()
 	defer cancel()
-	err := proveSealAndRecordLanded(ctx, gate, repo, "work", req)
+	err := proveSealAndRecordLanded(ctx, gate, repo, pinProofBranch, req)
 	if err == nil {
 		t.Fatal("an allowance that could not reach the seal still completed the invocation")
 	}
@@ -172,7 +176,7 @@ func relandedElsewhere(t *testing.T, repo, base string) string {
 		return strings.TrimSpace(string(out))
 	}
 	git("checkout", "-q", "-b", "relanded", base)
-	git("merge", "--squash", "work")
+	git("merge", "--squash", pinProofBranch)
 	// A different message yields a different object for the same tree and
 	// parent, so this is a genuinely distinct integration commit.
 	git("commit", "-q", "-m", "relanded elsewhere")
@@ -205,7 +209,7 @@ func TestVerifyLandedCompositionRefusesWhenOriginMovesBetweenReads(t *testing.T)
 
 	ctx, cancel := gate.ProofContext()
 	defer cancel()
-	err := proveSealAndRecordLanded(ctx, gate, repo, "work", req)
+	err := proveSealAndRecordLanded(ctx, gate, repo, pinProofBranch, req)
 	if err == nil {
 		t.Fatal("a moved origin produced a result presenting two different integrations as one")
 	}

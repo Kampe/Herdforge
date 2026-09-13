@@ -25,8 +25,10 @@ import (
 // buildMergeGate supply the allowance.
 //
 // The retired-carrier route is used deliberately: no worktree stands on the
-// reviewed branch, the candidate is pinned explicitly, and the invoking checkout
-// stands in -- which is the exact shape this repair was written for.
+// reviewed branch and the invoking checkout stands in -- which is the exact
+// shape this repair was written for. The pin comes from an explicit --candidate
+// or, when that is omitted, from the ref's current admitted PASS; a live-carrier
+// variant below covers the other surface.
 
 // publicEntryFixture prepares a repository where runHarvestVerifyLanded can run
 // end to end: a real origin/clone with a squash landing, a reduced-provenance
@@ -49,16 +51,25 @@ func publicEntryFixture(t *testing.T) (repo, candidate string, binding verifyLan
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}
+	// THE EVIDENCE NAMES THE REF THE WAY THE SHIPPED AUTHORITY MATCHES IT.
+	// rowNamesRef resolves a ref from a row's branch, artifact or lane -- the
+	// task field is not consulted -- so rows carrying only Task recorded
+	// evidence AdmittedPass could never find, and the ref then had no current
+	// admitted PASS (CI 34751721492). Branch and artifact are what production
+	// review-ingest records from the verdict artifact, so this is the real
+	// shape, not a lookup key invented for the test.
 	if err := ledger.Record(reviewledger.RecordOpts{
 		SHA: candidate, Reviewer: "reviewer-a", BuilderFamily: "anthropic", BuilderIdentity: "builder-1",
 		ReviewerFamily: "openai", Gate: "independent", Tier: "R3", Task: pinProofRef, Lease: "lease-1",
+		Branch: pinProofBranch,
 	}); err != nil {
 		t.Fatalf("record launch: %v", err)
 	}
 	if _, err := ledger.Verdict(reviewledger.VerdictOpts{
 		SHA: candidate, Reviewer: "reviewer-a", Verdict: reviewledger.VerdictPASS,
 		ReviewerFamily: "openai", BuilderFamily: "anthropic", Task: pinProofRef, Lease: "lease-1",
-		PatchURL: "patch-1", VfyDigest: "vfy-1", Artifact: "verdict.md", CandidateSHA: candidate,
+		PatchURL: "patch-1", VfyDigest: "vfy-1", CandidateSHA: candidate,
+		Branch: pinProofBranch, Artifact: pinProofRef + "-verdict.md",
 	}); err != nil {
 		t.Fatalf("write verdict: %v", err)
 	}
@@ -90,7 +101,7 @@ func TestRunHarvestVerifyLandedSealsAndRecordsOnTheDefaultAllowance(t *testing.T
 	cliProofBudget = mergeadmit.ProofBudget{}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
-	if err := runHarvestVerifyLanded("work", binding); err != nil {
+	if err := runHarvestVerifyLanded(pinProofBranch, binding); err != nil {
 		t.Fatalf("the public entry could not complete a landing it should seal: %v", err)
 	}
 	assertReceiptAndDispositionAgree(t, repo)
@@ -136,7 +147,7 @@ func TestRunHarvestVerifyLandedResolvesAnOmittedCandidateAndSeals(t *testing.T) 
 	cliProofBudget = mergeadmit.ProofBudget{}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
-	if err := runHarvestVerifyLanded("work", binding); err != nil {
+	if err := runHarvestVerifyLanded(pinProofBranch, binding); err != nil {
 		t.Fatalf("the public entry could not resolve an omitted candidate and seal: %v", err)
 	}
 	assertReceiptAndDispositionAgree(t, repo)
@@ -172,7 +183,7 @@ func TestRunHarvestVerifyLandedRecordsNothingWhenSealingExhausts(t *testing.T) {
 	cliProofBudget = mergeadmit.ProofBudget{MaxCommands: observation}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
-	err := runHarvestVerifyLanded("work", binding)
+	err := runHarvestVerifyLanded(pinProofBranch, binding)
 	if err == nil {
 		t.Fatal("the seal completed on an allowance that only covers observation; it did not spend this invocation's budget")
 	}
@@ -207,11 +218,11 @@ func observationCompletesOn(t *testing.T, binding verifyLandedBinding, allowance
 	ctx, cancel := gate.ProofContext()
 	defer cancel()
 
-	surface, err := resolveVerifyLandedSurface(ctx, "work", binding, worktreeForBranch, invokingRepoRoot)
+	surface, err := resolveVerifyLandedSurface(ctx, pinProofBranch, binding, worktreeForBranch, invokingRepoRoot)
 	if err != nil {
 		return err
 	}
-	candidate, err := resolveVerifyLandedCandidate(ctx, surface.Dir, "work", binding)
+	candidate, err := resolveVerifyLandedCandidate(ctx, surface.Dir, pinProofBranch, binding)
 	if err != nil {
 		return err
 	}
@@ -261,7 +272,11 @@ func liveCarrierFixture(t *testing.T, branch, startPoint string) (repo, carrier,
 	t.Helper()
 	repo, candidate, binding = publicEntryFixture(t)
 
-	args := []string{"-C", repo, "worktree", "add", "-q", filepath.Join(filepath.Dir(repo), "carrier-"+branch)}
+	// A task branch contains a slash, which is a path separator, so the carrier
+	// DIRECTORY is named from a flattened form. The branch itself is unchanged:
+	// what the lookup below resolves is a real `task/<ref>` checkout.
+	dir := filepath.Join(filepath.Dir(repo), "carrier-"+strings.ReplaceAll(branch, "/", "-"))
+	args := []string{"-C", repo, "worktree", "add", "-q", dir}
 	if startPoint == "" {
 		args = append(args, branch)
 	} else {
@@ -286,12 +301,12 @@ func liveCarrierFixture(t *testing.T, branch, startPoint string) (repo, carrier,
 // the two artifacts agree. Without this the refusals below could all pass
 // against a route that refuses every live-carrier invocation.
 func TestRunHarvestVerifyLandedSealsFromALiveCarrierWithAnOmittedCandidate(t *testing.T) {
-	repo, _, _, binding := liveCarrierFixture(t, "work", "")
+	repo, _, _, binding := liveCarrierFixture(t, pinProofBranch, "")
 	binding.Candidate = ""
 	cliProofBudget = mergeadmit.ProofBudget{}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
-	if err := runHarvestVerifyLanded("work", binding); err != nil {
+	if err := runHarvestVerifyLanded(pinProofBranch, binding); err != nil {
 		t.Fatalf("the public entry could not resolve from a live carrier and seal: %v", err)
 	}
 	assertReceiptAndDispositionAgree(t, repo)
@@ -305,13 +320,13 @@ func TestRunHarvestVerifyLandedSealsFromALiveCarrierWithAnOmittedCandidate(t *te
 // stop here at all, and an independent per-helper allowance would not either --
 // only spending the route's own ledger produces this refusal.
 func TestRunHarvestVerifyLandedChargesCandidateResolutionToTheSharedAllowance(t *testing.T) {
-	repo, _, _, binding := liveCarrierFixture(t, "work", "")
+	repo, _, _, binding := liveCarrierFixture(t, pinProofBranch, "")
 	binding.Candidate = ""
 	binding.Ref = unpinnedRef
 	cliProofBudget = mergeadmit.ProofBudget{MaxCommands: 1}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
-	err := runHarvestVerifyLanded("work", binding)
+	err := runHarvestVerifyLanded(pinProofBranch, binding)
 	if err == nil {
 		t.Fatal("candidate resolution completed on an allowance of one command; it did not spend this invocation's budget")
 	}
@@ -329,7 +344,7 @@ func TestRunHarvestVerifyLandedChargesCandidateResolutionToTheSharedAllowance(t 
 // predated the landing -- which is exactly how a landed commit gets bound as the
 // reviewed candidate.
 func TestRunHarvestVerifyLandedRefusesResolutionWhenOriginCannotBeFetched(t *testing.T) {
-	repo, _, _, binding := liveCarrierFixture(t, "work", "")
+	repo, _, _, binding := liveCarrierFixture(t, pinProofBranch, "")
 	binding.Candidate = ""
 	binding.Ref = unpinnedRef
 	cliProofBudget = mergeadmit.ProofBudget{}
@@ -340,7 +355,7 @@ func TestRunHarvestVerifyLandedRefusesResolutionWhenOriginCannotBeFetched(t *tes
 		t.Fatalf("break origin: %v\n%s", err, out)
 	}
 
-	err := runHarvestVerifyLanded("work", binding)
+	err := runHarvestVerifyLanded(pinProofBranch, binding)
 	if err == nil {
 		t.Fatal("a stale tracking ref answered the candidate-identity guard")
 	}
@@ -391,7 +406,7 @@ func TestRunHarvestVerifyLandedRefusesWhenTheCarrierLookupCannotRun(t *testing.T
 	cliProofBudget = mergeadmit.ProofBudget{Deadline: time.Nanosecond}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
-	err := runHarvestVerifyLanded("work", binding)
+	err := runHarvestVerifyLanded(pinProofBranch, binding)
 	if err == nil {
 		t.Fatal("a carrier lookup that could not run still selected a proof surface")
 	}
