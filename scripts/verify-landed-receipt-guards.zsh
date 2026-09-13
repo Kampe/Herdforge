@@ -136,7 +136,7 @@ done
 suites=(
 "./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt|TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt|TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt"
 "./cmd/herd/${sep}^(TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged|TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin|TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo|TestResolveVerifyLandedSurfaceRefusesAForeignRepository|TestRequireObjectPresentDemandsACommit|TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead)\$${sep}TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo TestResolveVerifyLandedSurfaceRefusesAForeignRepository TestRequireObjectPresentDemandsACommit TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead"
-"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedDiscardedAndAlteredCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedDiscardedAndAlteredCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath"
+"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedDiscardedAndAlteredCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath|TestValidateFollowsAReviewedRenameToItsDestination|TestValidateRefusesAnAlteredRenameDestination|TestValidateRefusesARenameItCannotFollowByContent|TestContentProofRefusesAfterItsDeadline|TestContentProofRefusesWhenTheCommandBudgetIsSpent|TestContentProofRefusesOversizeCommandOutput|TestBoundedOutputRefusesToGrowPastItsCap)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedDiscardedAndAlteredCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath TestValidateFollowsAReviewedRenameToItsDestination TestValidateRefusesAnAlteredRenameDestination TestValidateRefusesARenameItCannotFollowByContent TestContentProofRefusesAfterItsDeadline TestContentProofRefusesWhenTheCommandBudgetIsSpent TestContentProofRefusesOversizeCommandOutput TestBoundedOutputRefusesToGrowPastItsCap"
 )
 
 # ---------------------------------------------------------------------------
@@ -199,11 +199,35 @@ suites=(
 #                          its top-level PASS is still required at baseline and
 #                          after restore, and both subtests still run there.
 #
-# Every other control's assertion is emitted by its killer test ITSELF: none of
-# those five declares a subtest, and the shared helpers that assert for them
-# (assertIntegrationContract, assertSealedCarrierReceipt) run on the killer's
-# own *testing.T, so their output carries the killer's exact .Test name. No
-# control in this file depends on prefix matching to be attributable.
+#   destination-accounting-required
+#                          a path the reviewed line REMOVED is followed to where
+#                          its bytes went, by content, or refused. Without that
+#                          the old name is absent on both sides and the shared
+#                          absence is read as agreement, so a renamed-then-
+#                          altered destination validates while never being
+#                          looked at. That is the acceptance hole the FAC-831
+#                          review found, and it is an acceptance of altered
+#                          content, not a conservative refusal.
+#   proof-command-budget-enforced
+#   proof-deadline-enforced
+#   proof-output-budget-enforced
+#                          the three physical limits of the consumer proof are
+#                          load bearing: total subprocesses, the one shared
+#                          deadline, and the bytes a single command may return.
+#                          A per-command timeout and an argv batch bound neither
+#                          the number of commands nor the total work, so each of
+#                          these is the only thing standing between `herd
+#                          approve` and an author-influenced history that can
+#                          monopolise the machine. Their killers drive an
+#                          INJECTED command, so they prove the guard rather than
+#                          the speed or size of whatever ran CI that day.
+#
+# Every control except later-revision-must-be-the-one-that-landed has its
+# assertion emitted by its killer test ITSELF: none of those nine declares a
+# subtest, and the shared helpers that assert for them (assertIntegrationContract,
+# assertSealedCarrierReceipt) run on the killer's own *testing.T, so their output
+# carries the killer's exact .Test name. No control in this file depends on
+# prefix matching to be attributable.
 #
 # Gate.Complete's copy of the same field has NO control here, deliberately: its
 # producer is Prove, which never sets ContentSHA on any of its three modes, so
@@ -238,15 +262,20 @@ mutations=(
 		ContentSHA:         proof.ContentSHA,${sep}		MergeSHA:           proof.MergeSHA,
 		// MUTANT: the sealed carrier is dropped, so the receipt binds content to the merge alone${sep}TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}full-provenance producer did not seal the content carrier"
 "sealed-carrier-copied-into-the-reduced-receipt${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}MergeSHA: proof.MergeSHA, ContentSHA: proof.ContentSHA, PatchID: proof.PatchID,${sep}MergeSHA: proof.MergeSHA, /* MUTANT: the reduced receipt drops the sealed carrier */ PatchID: proof.PatchID,${sep}TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}reduced-provenance producer did not seal the content carrier"
-"later-revision-must-be-the-one-that-landed${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		if !same {
-			return fmt.Errorf(
-				\"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither\",
-				mergeSHA, contentSHA, path, rev)
-		}${sep}		if false && !same { // MUTANT: a later revision alone licenses the path, so a discarded hunk passes
-			return fmt.Errorf(
-				\"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither\",
-				mergeSHA, contentSHA, path, rev)
-		}${sep}TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath/an_ours_merge_on_a_path_the_reviewed_line_also_revised${sep}was accepted because the path was revised later"
+"later-revision-must-be-the-one-that-landed${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}			if same {
+				continue
+			}
+			return fmt.Errorf(${sep}			if true || same { // MUTANT: a later revision alone licenses the path, so a discarded hunk passes
+				continue
+			}
+			return fmt.Errorf(${sep}TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath/an_ours_merge_on_a_path_the_reviewed_line_also_revised${sep}was accepted because the path was revised later"
+"destination-accounting-required${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		next, err := p.destinationClaims(claim, rev, contentSHA, mergeSHA)
+		if err != nil {
+			return err
+		}${sep}		var next []contentClaim // MUTANT: a shared absence of the old path is accepted as proof of the destination${sep}TestValidateRefusesAnAlteredRenameDestination${sep}an altered rename destination was accepted"
+"proof-command-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if p.commands >= contentProofMaxCommands {${sep}	if false && p.commands >= contentProofMaxCommands { // MUTANT: the subprocess count is no longer bounded${sep}TestContentProofRefusesWhenTheCommandBudgetIsSpent${sep}the command budget did not stop the proof after"
+"proof-deadline-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if err := p.ctx.Err(); err != nil {${sep}	if err := error(nil); err != nil { // MUTANT: the shared deadline no longer stops the proof${sep}TestContentProofRefusesAfterItsDeadline${sep}an expired deadline must stop the proof before it starts a process"
+"proof-output-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if len(out) > contentProofMaxOutputBytes {${sep}	if false && len(out) > contentProofMaxOutputBytes { // MUTANT: command output is no longer bounded${sep}TestContentProofRefusesOversizeCommandOutput${sep}output larger than the proof budget was accepted"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from

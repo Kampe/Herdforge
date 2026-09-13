@@ -2,6 +2,7 @@ package sync
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -225,6 +226,13 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 		if !fullSHA.MatchString(f.val) {
 			return fmt.Errorf("receipt %s %q is not a full 40-character commit sha", f.name, f.val)
 		}
+	}
+
+	// A sealed carrier is identified as strictly as the commits beside it. An
+	// empty ContentSHA is the legacy shape and stays exempt, so no receipt
+	// minted before the field existed is affected.
+	if r.ContentSHA != "" && !fullSHA.MatchString(r.ContentSHA) {
+		return fmt.Errorf("receipt content_sha %q is not a full 40-character commit sha", r.ContentSHA)
 	}
 
 	// Repository binding: a receipt minted against another repository never
@@ -500,22 +508,133 @@ func ReadDoneLog(repoDir string) ([]DoneRecord, error) {
 
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-// mergePathBatch bounds how many paths one git invocation may carry. The
-// pathspec is argv, so a carrier touching thousands of files would otherwise be
-// refused for exceeding ARG_MAX rather than for anything about its content.
-const mergePathBatch = 64
+// The content-binding proof answers one question -- did the merged tree keep
+// what the carrier changed -- and it has to answer inside a FIXED PHYSICAL
+// BUDGET. It runs in `herd approve` against a repository whose history an
+// author influences, so an unbounded walk is a denial of service with a receipt
+// attached. Per-command timeouts and argv batching bound neither the number of
+// commands nor the total work, so the budget below is shared by the whole proof
+// and covers every dimension it can spend: wall clock, subprocesses, output
+// bytes, paths, history entries, and rename hops.
+//
+// Every limit fails CLOSED through ErrContentProofBudget. A proof that was
+// STOPPED is never reported as a landing that was PRESERVED: the two are
+// different answers and the caller must be able to tell them apart.
+const (
+	contentProofTimeout        = 30 * time.Second
+	contentProofKillDelay      = 5 * time.Second
+	contentProofMaxCommands    = 512
+	contentProofMaxOutputBytes = 1 << 20
+	contentProofMaxStderrBytes = 8 << 10
+	contentProofMaxPaths       = 256
+	contentProofMaxHistory     = 256
+	contentProofMaxHops        = 8
+	contentProofPathBatch      = 64
+)
 
-// gitPredicate runs a git command whose EXIT STATUS is the answer: true for 0,
+// ErrContentProofBudget is the one sentinel for every limit above.
+var ErrContentProofBudget = errors.New("content proof stopped by its budget")
+
+var errContentProofOutput = errors.New("git produced more output than the content proof allows")
+
+// boundedOutput refuses to grow past max and reports that as a write error,
+// which exec surfaces from Wait. Capping AT THE PIPE is the point: measuring
+// output after reading all of it has already spent the memory.
+type boundedOutput struct {
+	max        int
+	text       strings.Builder
+	overflowed bool
+}
+
+func (w *boundedOutput) Write(p []byte) (int, error) {
+	room := w.max - w.text.Len()
+	if room < 0 {
+		room = 0
+	}
+	if room < len(p) {
+		if room > 0 {
+			w.text.Write(p[:room])
+		}
+		w.overflowed = true
+		return room, errContentProofOutput
+	}
+	w.text.Write(p)
+	return len(p), nil
+}
+
+// contentProofCommand is the subprocess seam. It exists so the budgets can be
+// proven by a deterministic test -- an injected command that returns more bytes
+// than the cap, or that is asked for once too often -- rather than by hoping the
+// machine running CI is slow enough or the repository large enough.
+var contentProofCommand = runBoundedGit
+
+// runBoundedGit is the physical half of the same budget. The shared deadline
+// kills the process, WaitDelay stops a child that ignores that from holding the
+// call open, and stdout and stderr have separate capped writers so neither can
+// grow without limit and the two goroutines exec uses never share one buffer.
+func runBoundedGit(ctx context.Context, repoDir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = repoDir
+	cmd.WaitDelay = contentProofKillDelay
+	stdout := &boundedOutput{max: contentProofMaxOutputBytes}
+	stderr := &boundedOutput{max: contentProofMaxStderrBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if stdout.overflowed || stderr.overflowed {
+		return "", fmt.Errorf("%w: git %s produced more than the %d byte cap",
+			ErrContentProofBudget, strings.Join(args, " "), contentProofMaxOutputBytes)
+	}
+	return strings.TrimSpace(stdout.text.String()), err
+}
+
+// contentProof holds the budget for ONE validation. Every git call the proof
+// makes goes through run, so the counters cannot be bypassed by adding a code
+// path that calls git directly.
+type contentProof struct {
+	repoDir  string
+	ctx      context.Context
+	commands int
+}
+
+func (p *contentProof) run(args ...string) (string, error) {
+	if p.commands >= contentProofMaxCommands {
+		return "", fmt.Errorf("%w: the proof asked for more than %d git commands",
+			ErrContentProofBudget, contentProofMaxCommands)
+	}
+	if err := p.ctx.Err(); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrContentProofBudget, err)
+	}
+	p.commands++
+	out, err := contentProofCommand(p.ctx, p.repoDir, args...)
+	if len(out) > contentProofMaxOutputBytes {
+		return "", fmt.Errorf("%w: git %s returned %d bytes, more than the %d byte cap",
+			ErrContentProofBudget, strings.Join(args, " "), len(out), contentProofMaxOutputBytes)
+	}
+	if err != nil {
+		// A failure while the shared deadline is gone is the budget speaking,
+		// not evidence about content.
+		if ctxErr := p.ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("%w: %w", ErrContentProofBudget, ctxErr)
+		}
+	}
+	return out, err
+}
+
+// predicate runs a git command whose EXIT STATUS is the answer: true for 0,
 // false for the documented "no" status 1, and an error for anything else.
 //
 // A missing object, a broken repository, or a killed process exits with neither
 // 0 nor 1, and reporting that as a clean "no" turns an infrastructure failure
 // into a content verdict -- `git diff --quiet` exiting 128 must never read as
 // "these paths differ".
-func gitPredicate(repoDir string, args ...string) (bool, error) {
-	out, err := git(repoDir, args...)
+func (p *contentProof) predicate(args ...string) (bool, error) {
+	out, err := p.run(args...)
 	if err == nil {
 		return true, nil
+	}
+	if errors.Is(err, ErrContentProofBudget) {
+		return false, err
 	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 1 {
@@ -524,107 +643,80 @@ func gitPredicate(repoDir string, args ...string) (bool, error) {
 	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
 }
 
-// pathsIdentical reports whether two commits hold the same bytes at every one
-// of these paths.
-func pathsIdentical(repoDir, from, to string, paths []string) (bool, error) {
+// identical reports whether two commits hold the same bytes at every path.
+func (p *contentProof) identical(from, to string, paths []string) (bool, error) {
 	args := append([]string{"diff", "--quiet", from, to, "--"}, paths...)
-	return gitPredicate(repoDir, args...)
+	return p.predicate(args...)
 }
 
-// contentPreservedInMerge proves the merge actually KEPT what the carrier
-// changed, rather than merely descending from it.
-//
-// Two real landings satisfy ancestry and still land something else: an ours
-// merge that discards every reviewed hunk, and a merge amended to substitute
-// different bytes. Both leave the carrier an ancestor of the merge, so the
-// graph says yes while the tree says no. Comparing the carrier's own paths is
-// what tells them apart; the whole tree is the wrong scope, because later
-// unrelated commits legitimately change other files.
-//
-// Byte identity WITH THE CARRIER is the right test only while nothing revised
-// those paths afterwards, and that assumption does not hold. The producer seals
-// the landed commit matching the candidate's last patch, which is routinely an
-// INTERMEDIATE commit on an iterated pull-request line whose own files are
-// revised again before the merge -- this repository produces that shape
-// constantly (merge 16de886a revises scripts/verify-mail-bounds.zsh five times
-// after the matched carrier, with no edit from main at all). Demanding byte
-// identity there refuses a landing that genuinely happened: the same false
-// refusal FAC-831 removed from the producer, reintroduced at the consumer.
-//
-// So a path that differs is not immediately a refusal. It is admitted on ONE
-// shape and nothing else: a commit DESCENDING FROM THE CARRIER, contained in
-// the merge, revised that path again, and the merged tree holds THAT commit's
-// bytes. What that still refuses, which is the point:
-//
-//   - an ours merge keeps main's bytes on the path. Main's commits do not
-//     descend from the carrier, and the reviewed line's own last revision is
-//     not what the merge holds, so it is refused either way.
-//   - a merge amended to substitute bytes introduces them at the merge itself,
-//     which is never accepted as a revision OF the content.
-//   - a path that both main and the reviewed line changed is refused,
-//     fail-closed. Telling an honest conflict resolution from a substitution
-//     needs the reviewed-delta replay the producer performs, and this consumer
-//     deliberately does not re-run it.
-func contentPreservedInMerge(repoDir, contentSHA, mergeSHA string) error {
-	changed, err := git(repoDir, "diff-tree", "--no-commit-id", "--name-only", "-r", contentSHA)
+// blobAt returns the blob a commit holds at path, and whether it holds one at
+// all. ls-tree answers both in one command and exits 0 either way, so an absent
+// path is never confused with a failed command.
+func (p *contentProof) blobAt(commit, path string) (string, bool, error) {
+	out, err := p.run("ls-tree", "-r", commit, "--", path)
 	if err != nil {
-		return fmt.Errorf("content sha %s: cannot list the paths it changed: %w", contentSHA, err)
+		return "", false, fmt.Errorf("cannot read %s at %s: %w", path, commit, err)
 	}
-	paths := make([]string, 0, 8)
-	for _, line := range strings.Split(changed, "\n") {
-		if p := strings.TrimSpace(line); p != "" {
-			paths = append(paths, p)
-		}
-	}
-	if len(paths) == 0 {
-		// A carrier that changed nothing cannot be the content this receipt
-		// claims landed. PatchID refuses an empty commit too; refusing here as
-		// well keeps the reason specific instead of arriving as "no patch".
-		return fmt.Errorf("content sha %s changed no path; it cannot be the landed content", contentSHA)
-	}
-	for start := 0; start < len(paths); start += mergePathBatch {
-		end := start + mergePathBatch
-		if end > len(paths) {
-			end = len(paths)
-		}
-		batch := paths[start:end]
-		// The batch check is the fast path for the ordinary landing, where the
-		// carrier's bytes are in the merge untouched.
-		same, err := pathsIdentical(repoDir, contentSHA, mergeSHA, batch)
-		if err != nil {
-			return err
-		}
-		if same {
+	for _, line := range strings.Split(out, "\n") {
+		meta, name, ok := strings.Cut(line, "\t")
+		if !ok || name != path {
 			continue
 		}
-		// Something in this batch moved. WHICH path moved, and whether the move
-		// is the reviewed line revising its own work, is decided per path.
-		for _, path := range batch {
-			same, err := pathsIdentical(repoDir, contentSHA, mergeSHA, []string{path})
-			if err != nil {
-				return err
-			}
-			if same {
-				continue
-			}
-			if err := revisedOnTheReviewedLine(repoDir, contentSHA, mergeSHA, path); err != nil {
-				return err
+		if f := strings.Fields(meta); len(f) >= 3 && f[1] == "blob" {
+			return f[2], true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// destinationsWithBlob returns every path in commit holding exactly these bytes.
+//
+// IDENTITY OF CONTENT, never similarity of names. Git's rename detection is a
+// heuristic, and a heuristic that picks the wrong destination would leave the
+// real one unexamined -- which is the whole defect this walk exists to close.
+// Bytes that are not found are a refusal, not an assumption.
+func (p *contentProof) destinationsWithBlob(commit, blob string) ([]string, error) {
+	out, err := p.run("ls-tree", "-r", commit)
+	if err != nil {
+		return nil, fmt.Errorf("cannot list the tree of %s: %w", commit, err)
+	}
+	var found []string
+	for _, line := range strings.Split(out, "\n") {
+		meta, name, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(meta)
+		if len(f) >= 3 && f[1] == "blob" && f[2] == blob {
+			found = append(found, name)
+			if len(found) > contentProofMaxHops {
+				return nil, fmt.Errorf("%w: %s holds those bytes at more than %d paths",
+					ErrContentProofBudget, commit, contentProofMaxHops)
 			}
 		}
 	}
-	return nil
+	return found, nil
 }
 
-// revisedOnTheReviewedLine decides one path whose bytes are not the carrier's.
+// contentClaim is one open obligation: the merged tree must hold `at`'s content
+// at `path`.
+type contentClaim struct{ path, at string }
+
+// lastReviewedRevision returns the newest commit that revised this path on the
+// REVIEWED line after `at`, or "" when nobody did.
 //
 // --full-history so a revision on the pull request's side is never simplified
-// away when the merge is treesame to main, and --topo-order so the reviewed
-// line's LAST word on this path is seen first: that revision, not merely some
-// revision, is what the merge has to hold.
-func revisedOnTheReviewedLine(repoDir, contentSHA, mergeSHA, path string) error {
-	out, err := git(repoDir, "rev-list", "--full-history", "--topo-order", contentSHA+".."+mergeSHA, "--", path)
+// away when the merge is treesame to main; --topo-order so the reviewed line's
+// LAST word on the path is seen first; --max-count so the walk is finite. A
+// commit that does not descend from `at` is main's own work, which is not the
+// reviewed line revising itself and must never license a discarded hunk.
+func (p *contentProof) lastReviewedRevision(claim contentClaim, mergeSHA string) (string, error) {
+	out, err := p.run("rev-list", "--full-history", "--topo-order",
+		fmt.Sprintf("--max-count=%d", contentProofMaxHistory),
+		claim.at+".."+mergeSHA, "--", claim.path)
 	if err != nil {
-		return fmt.Errorf("merge sha %s: cannot list what revised %s after %s: %w", mergeSHA, path, contentSHA, err)
+		return "", fmt.Errorf("merge sha %s: cannot list what revised %s after %s: %w",
+			mergeSHA, claim.path, claim.at, err)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		rev := strings.TrimSpace(line)
@@ -633,33 +725,217 @@ func revisedOnTheReviewedLine(repoDir, contentSHA, mergeSHA, path string) error 
 		}
 		// The merge is not a revision OF the content. Bytes appearing for the
 		// first time in the merge commit are exactly the substitution this
-		// function exists to refuse.
+		// walk exists to refuse.
 		if strings.EqualFold(rev, mergeSHA) {
 			continue
 		}
-		descends, err := gitPredicate(repoDir, "merge-base", "--is-ancestor", contentSHA, rev)
+		descends, err := p.predicate("merge-base", "--is-ancestor", claim.at, rev)
+		if err != nil {
+			return "", err
+		}
+		if descends {
+			return rev, nil
+		}
+	}
+	return "", nil
+}
+
+// proveClaim follows ONE of the carrier's paths until the merged tree accounts
+// for it, or refuses.
+//
+// The path may move. A reviewed descendant can rename a to b, and then the old
+// name is absent in both the descendant and the merge -- a SHARED ABSENCE, which
+// proves only that neither holds the old name. Accepting it is how an altered b
+// validates: ancestry holds, the old path matches, and the carrier's patch id
+// still matches. So a removal is followed to its destination BY CONTENT and the
+// obligation moves with it, or the proof refuses. Deletions with no destination,
+// and renames whose bytes were edited in the same commit, are refusals rather
+// than assumptions -- fail-closed, and named as such in the error.
+func (p *contentProof) proveClaim(path, contentSHA, mergeSHA string) error {
+	start := contentClaim{path: path, at: contentSHA}
+	queue := []contentClaim{start}
+	seen := map[contentClaim]bool{start: true}
+	for hops := 0; len(queue) > 0; hops++ {
+		if hops >= contentProofMaxHops {
+			return fmt.Errorf("%w: following %s through more than %d reviewed-line moves",
+				ErrContentProofBudget, path, contentProofMaxHops)
+		}
+		claim := queue[0]
+		queue = queue[1:]
+
+		same, err := p.identical(claim.at, mergeSHA, []string{claim.path})
 		if err != nil {
 			return err
 		}
-		if !descends {
-			// Main's own work on the same path is not the reviewed line
-			// revising itself, and must never license a discarded hunk.
+		if same {
 			continue
 		}
-		same, err := pathsIdentical(repoDir, rev, mergeSHA, []string{path})
+		rev, err := p.lastReviewedRevision(claim, mergeSHA)
 		if err != nil {
 			return err
 		}
-		if !same {
+		if rev == "" {
+			return fmt.Errorf(
+				"merge sha %s does not preserve the content of %s: %s differs in the merged tree and no commit descending from %s revised it",
+				mergeSHA, contentSHA, claim.path, claim.at)
+		}
+		if _, present, err := p.blobAt(rev, claim.path); err != nil {
+			return err
+		} else if present {
+			same, err := p.identical(rev, mergeSHA, []string{claim.path})
+			if err != nil {
+				return err
+			}
+			if same {
+				continue
+			}
 			return fmt.Errorf(
 				"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither",
-				mergeSHA, contentSHA, path, rev)
+				mergeSHA, contentSHA, claim.path, rev)
 		}
-		return nil
+		next, err := p.destinationClaims(claim, rev, contentSHA, mergeSHA)
+		if err != nil {
+			return err
+		}
+		for _, n := range next {
+			if seen[n] {
+				continue
+			}
+			seen[n] = true
+			queue = append(queue, n)
+		}
 	}
-	return fmt.Errorf(
-		"merge sha %s does not preserve the content of %s: %s differs in the merged tree and no commit descending from the carrier revised it",
-		mergeSHA, contentSHA, path)
+	return nil
+}
+
+// destinationClaims handles the case the reviewed line REMOVED the path: it
+// establishes where those exact bytes went and returns the obligations that
+// replace this one. Returning no claims and no error would accept the shared
+// absence, which is precisely the acceptance hole, so every path out of here is
+// either a new obligation or a refusal.
+func (p *contentProof) destinationClaims(claim contentClaim, rev, contentSHA, mergeSHA string) ([]contentClaim, error) {
+	if _, inMerge, err := p.blobAt(mergeSHA, claim.path); err != nil {
+		return nil, err
+	} else if inMerge {
+		return nil, fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: the reviewed line removed %s at %s, and the merged tree holds different bytes there",
+			mergeSHA, contentSHA, claim.path, rev)
+	}
+	blob, held, err := p.blobAt(claim.at, claim.path)
+	if err != nil {
+		return nil, err
+	}
+	if !held {
+		return nil, fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: %s holds no content at %s, so there is nothing to follow",
+			mergeSHA, contentSHA, claim.at, claim.path)
+	}
+	dests, err := p.destinationsWithBlob(rev, blob)
+	if err != nil {
+		return nil, err
+	}
+	if len(dests) == 0 {
+		return nil, fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: the reviewed line removed %s at %s and that commit holds those exact bytes at no path, so the destination cannot be proven by content",
+			mergeSHA, contentSHA, claim.path, rev)
+	}
+	next := make([]contentClaim, 0, len(dests))
+	for _, d := range dests {
+		next = append(next, contentClaim{path: d, at: rev})
+	}
+	return next, nil
+}
+
+// preserved proves the merged tree kept what the carrier changed.
+//
+// Two real landings satisfy ancestry and still land something else: an ours
+// merge that discards every reviewed hunk, and a merge amended to substitute
+// different bytes. Both leave the carrier an ancestor of the merge, so the graph
+// says yes while the tree says no. The carrier's own paths are what tell them
+// apart; the whole tree is the wrong scope, because later unrelated commits
+// legitimately change other files.
+//
+// Byte identity WITH THE CARRIER is the right test only while nothing revised
+// those paths afterwards, and that assumption does not hold. The producer seals
+// the landed commit matching the candidate's last patch, which is routinely an
+// INTERMEDIATE commit on an iterated pull-request line whose own files are
+// revised again before the merge -- this repository produces that shape
+// constantly. Demanding byte identity there refuses a landing that genuinely
+// happened. So a differing path is followed by proveClaim rather than refused on
+// sight, and what that still refuses is listed there.
+func (p *contentProof) preserved(contentSHA, mergeSHA string) error {
+	// The carrier must be an ordinary single-parent content commit. A merge has
+	// no patch of its own, and "the paths it changed" is not a question with one
+	// answer for it -- so this is a refusal, not a diff against an arbitrary
+	// parent. It also makes the path listing below exact.
+	parents, err := p.run("rev-list", "--parents", "-n", "1", contentSHA)
+	if err != nil {
+		return fmt.Errorf("content sha %s: cannot read its parents: %w", contentSHA, err)
+	}
+	if fields := strings.Fields(parents); len(fields) != 2 {
+		return fmt.Errorf(
+			"content sha %s is not an ordinary single-parent commit (%d parent(s)); a commit with no patch of its own cannot be the landed content",
+			contentSHA, len(fields)-1)
+	}
+	changed, err := p.run("diff", "--name-only", contentSHA+"^", contentSHA)
+	if err != nil {
+		return fmt.Errorf("content sha %s: cannot list the paths it changed: %w", contentSHA, err)
+	}
+	paths := make([]string, 0, 8)
+	for _, line := range strings.Split(changed, "\n") {
+		if q := strings.TrimSpace(line); q != "" {
+			paths = append(paths, q)
+		}
+	}
+	if len(paths) == 0 {
+		// A carrier that changed nothing cannot be the content this receipt
+		// claims landed. PatchID refuses an empty commit too; refusing here as
+		// well keeps the reason specific instead of arriving as "no patch".
+		return fmt.Errorf("content sha %s changed no path; it cannot be the landed content", contentSHA)
+	}
+	if len(paths) > contentProofMaxPaths {
+		return fmt.Errorf("%w: content sha %s changed %d paths, more than the %d this proof will follow",
+			ErrContentProofBudget, contentSHA, len(paths), contentProofMaxPaths)
+	}
+	for start := 0; start < len(paths); start += contentProofPathBatch {
+		end := start + contentProofPathBatch
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := paths[start:end]
+		// The batch check is the fast path for the ordinary landing, where the
+		// carrier's bytes are in the merge untouched. Batching bounds argv only;
+		// the aggregate bound is the command and time budget above.
+		same, err := p.identical(contentSHA, mergeSHA, batch)
+		if err != nil {
+			return err
+		}
+		if same {
+			continue
+		}
+		for _, path := range batch {
+			same, err := p.identical(contentSHA, mergeSHA, []string{path})
+			if err != nil {
+				return err
+			}
+			if same {
+				continue
+			}
+			if err := p.proveClaim(path, contentSHA, mergeSHA); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// contentPreservedInMerge is the consumer entry point: one shared deadline for
+// the whole proof, cancelled on every return.
+func contentPreservedInMerge(repoDir, contentSHA, mergeSHA string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), contentProofTimeout)
+	defer cancel()
+	proof := &contentProof{repoDir: repoDir, ctx: ctx}
+	return proof.preserved(contentSHA, mergeSHA)
 }
 
 // validateContentBinding is the content half of Validate, extracted so the
@@ -686,11 +962,13 @@ func (r CompletionReceipt) validateContentBinding(repoDir string) error {
 		if _, err := git(repoDir, "merge-base", "--is-ancestor", r.ContentSHA, r.MergeSHA); err != nil {
 			return fmt.Errorf("content sha %s is not an ancestor of merge sha %s", r.ContentSHA, r.MergeSHA)
 		}
-		// Replay: every path the carrier changed must still hold the carrier's
-		// bytes in the merge's tree. Ancestry alone is satisfied by an ours
-		// merge that discarded every reviewed hunk, and by a merge amended to
-		// substitute different content: both keep the carrier as an ancestor
-		// while landing something else.
+		// Content: the merged tree has to account for every path the carrier
+		// changed -- holding the carrier's bytes, or the reviewed line's own
+		// later revision of them, or those bytes at the path the reviewed line
+		// moved them to. Ancestry alone is satisfied by an ours merge that
+		// discarded every reviewed hunk, and by a merge amended to substitute
+		// different content: both keep the carrier as an ancestor while landing
+		// something else. This runs inside one shared, finite budget.
 		if err := contentPreservedInMerge(repoDir, r.ContentSHA, r.MergeSHA); err != nil {
 			return err
 		}

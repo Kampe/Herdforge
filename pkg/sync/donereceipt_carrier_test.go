@@ -1,6 +1,8 @@
 package sync
 
 import (
+	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -357,4 +359,214 @@ func TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath(t *testing.T) {
 			t.Fatalf("refusal did not name the content rule: %v", err)
 		}
 	})
+}
+
+// renamedPRRepo builds the shape the FAC-831 review found unguarded: the
+// carrier changes a path, and a REVIEWED DESCENDANT renames it away.
+//
+//	root ─── base ─────────────────────── merge      (main, and origin/main)
+//	          └── carrier ── renamed ───────┘        (the pull request's line)
+//
+// The old name is then absent in both the renaming commit and the merge. That
+// shared absence proves only that neither holds the OLD name, so accepting it
+// lets an altered destination validate: carrier ancestry holds, the old path
+// matches, and the carrier's patch id still matches.
+//
+// altered amends the merge so the destination holds different bytes; edited
+// makes the rename change the content in the same commit, which is the case no
+// content proof can follow and is therefore refused rather than assumed.
+func renamedPRRepo(t *testing.T, altered, edited bool) (dir, baseSHA, carrierSHA, mergeSHA string) {
+	t.Helper()
+	dir = t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commitFile := func(name, body, msg string) string {
+		t.Helper()
+		writeFileTest(t, dir, name, body)
+		run("add", name)
+		run("commit", "-q", "-m", msg)
+		return run("rev-parse", "HEAD")
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "fixture@example.com")
+	run("config", "user.name", "fixture")
+
+	commitFile("a.txt", "root\n", "root")
+	baseSHA = commitFile("reviewed.txt", "base\n", "reviewed base")
+
+	run("checkout", "-q", "-b", "pr")
+	carrierSHA = commitFile("reviewed.txt", "reviewed v1\n", "reviewed candidate work")
+
+	run("mv", "reviewed.txt", "renamed.txt")
+	if edited {
+		writeFileTest(t, dir, "renamed.txt", "reviewed v2\n")
+		run("add", "renamed.txt")
+	}
+	run("commit", "-q", "-m", "move the reviewed file inside the pull request")
+	renamed := run("rev-parse", "HEAD")
+
+	run("checkout", "-q", "main")
+	run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
+	if altered {
+		writeFileTest(t, dir, "renamed.txt", "SUBSTITUTED content\n")
+		run("add", "renamed.txt")
+		run("commit", "-q", "--amend", "--no-edit")
+	}
+	mergeSHA = run("rev-parse", "HEAD")
+	run("update-ref", "refs/remotes/origin/main", mergeSHA)
+
+	// Non-vacuity, all of it asserted rather than assumed:
+	if out := run("ls-tree", "--name-only", "-r", mergeSHA); strings.Contains(out, "reviewed.txt") {
+		t.Fatal("fixture invalid: the merge still holds the old name, so no rename is under test")
+	}
+	if !strings.Contains(run("ls-tree", "--name-only", "-r", mergeSHA), "renamed.txt") {
+		t.Fatal("fixture invalid: the merge does not hold the destination")
+	}
+	carrierBlob := run("rev-parse", carrierSHA+":reviewed.txt")
+	destBlob := run("rev-parse", renamed+":renamed.txt")
+	if edited && carrierBlob == destBlob {
+		t.Fatal("fixture invalid: the rename was supposed to edit the content too")
+	}
+	if !edited && carrierBlob != destBlob {
+		t.Fatal("fixture invalid: the rename changed the content, so it is not a pure move")
+	}
+	return dir, baseSHA, carrierSHA, mergeSHA
+}
+
+// carrierReceipt is the receipt shape all three rename cases share.
+func carrierReceipt(t *testing.T, dir, base, carrier, merge string) CompletionReceipt {
+	t.Helper()
+	patch, err := PatchID(dir, carrier)
+	if err != nil {
+		t.Fatalf("carrier must have a patch id: %v", err)
+	}
+	return CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
+}
+
+// The honest rename: the reviewed line moved its own file and the merge holds
+// it at the destination. This must be ACCEPTED, or every lane that reorganises
+// a file mid-review is refused a receipt for work that genuinely landed.
+func TestValidateFollowsAReviewedRenameToItsDestination(t *testing.T) {
+	dir, base, carrier, merge := renamedPRRepo(t, false, false)
+	r := carrierReceipt(t, dir, base, carrier, merge)
+	if err := r.validateContentBinding(dir); err != nil {
+		t.Fatalf("an honest reviewed rename was refused: %v", err)
+	}
+}
+
+// The defect itself: the destination is altered in the merge. The old path is
+// equally absent on both sides, so a proof that only compares the old path
+// accepts this. It must be REFUSED.
+func TestValidateRefusesAnAlteredRenameDestination(t *testing.T) {
+	dir, base, carrier, merge := renamedPRRepo(t, true, false)
+	r := carrierReceipt(t, dir, base, carrier, merge)
+	err := r.validateContentBinding(dir)
+	if err == nil {
+		t.Fatal("an altered rename destination was accepted: a shared absence of the old path is not proof of what landed at the new one")
+	}
+	if !strings.Contains(err.Error(), "does not preserve the content of") {
+		t.Fatalf("refusal did not name the content rule: %v", err)
+	}
+}
+
+// The deliberate fail-closed edge, pinned so it is a decision rather than a
+// surprise: when the rename EDITS the bytes in the same commit, the carrier's
+// content is at no path in that commit and there is nothing to follow by
+// content. Git's rename detection could guess a destination, but a guess that
+// picks the wrong path would leave the real one unexamined, so this refuses.
+func TestValidateRefusesARenameItCannotFollowByContent(t *testing.T) {
+	dir, base, carrier, merge := renamedPRRepo(t, false, true)
+	r := carrierReceipt(t, dir, base, carrier, merge)
+	err := r.validateContentBinding(dir)
+	if err == nil {
+		t.Fatal("a removal whose destination cannot be proven by content was accepted")
+	}
+	if !strings.Contains(err.Error(), "destination cannot be proven by content") {
+		t.Fatalf("refusal did not name the reason it could not follow the content: %v", err)
+	}
+}
+
+// stubContentProofCommand replaces the subprocess seam for one test. The budgets
+// are proven by an injected command, never by hoping the machine is slow or the
+// repository large: a timing assertion would be a flake, not a guard.
+func stubContentProofCommand(t *testing.T, fn func(context.Context, string, ...string) (string, error)) {
+	t.Helper()
+	prev := contentProofCommand
+	contentProofCommand = fn
+	t.Cleanup(func() { contentProofCommand = prev })
+}
+
+func TestContentProofRefusesAfterItsDeadline(t *testing.T) {
+	calls := 0
+	stubContentProofCommand(t, func(context.Context, string, ...string) (string, error) {
+		calls++
+		return "", nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	proof := &contentProof{repoDir: t.TempDir(), ctx: ctx}
+	_, err := proof.run("rev-parse", "HEAD")
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an expired deadline must stop the proof before it starts a process: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("the proof started %d process(es) after its deadline was gone", calls)
+	}
+}
+
+func TestContentProofRefusesWhenTheCommandBudgetIsSpent(t *testing.T) {
+	calls := 0
+	stubContentProofCommand(t, func(context.Context, string, ...string) (string, error) {
+		calls++
+		return "", nil
+	})
+	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background()}
+	for i := 0; i < contentProofMaxCommands; i++ {
+		if _, err := proof.run("rev-parse", "HEAD"); err != nil {
+			t.Fatalf("command %d was refused while the budget still had room: %v", i+1, err)
+		}
+	}
+	_, err := proof.run("rev-parse", "HEAD")
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("the command budget did not stop the proof after %d commands: %v", contentProofMaxCommands, err)
+	}
+	if calls != contentProofMaxCommands {
+		t.Fatalf("the proof ran %d processes, not the %d its budget allows", calls, contentProofMaxCommands)
+	}
+}
+
+func TestContentProofRefusesOversizeCommandOutput(t *testing.T) {
+	stubContentProofCommand(t, func(context.Context, string, ...string) (string, error) {
+		return strings.Repeat("x", contentProofMaxOutputBytes+1), nil
+	})
+	proof := &contentProof{repoDir: t.TempDir(), ctx: context.Background()}
+	_, err := proof.run("ls-tree", "-r", "HEAD")
+	if !errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("output larger than the proof budget was accepted: %v", err)
+	}
+}
+
+// The seam test above proves the LOGICAL cap. This proves the PHYSICAL one: the
+// writer exec hands to git refuses to grow, so an adversarial history is stopped
+// while it is still being written rather than measured after it is all in memory.
+func TestBoundedOutputRefusesToGrowPastItsCap(t *testing.T) {
+	w := &boundedOutput{max: 8}
+	if n, err := w.Write([]byte("12345678")); n != 8 || err != nil {
+		t.Fatalf("a write within the cap was refused: n=%d err=%v", n, err)
+	}
+	n, err := w.Write([]byte("9"))
+	if err == nil {
+		t.Fatalf("a write past the cap was accepted: n=%d", n)
+	}
+	if !w.overflowed {
+		t.Fatal("the writer did not record the overflow, so a truncated read would be reported as a complete one")
+	}
 }
