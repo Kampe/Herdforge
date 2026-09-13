@@ -170,6 +170,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-830: the cross-process single-flight test failed on main under one
+      # specific shuffle order. This replays that exact seed a bounded number of
+      # times, so an order- or contention-sensitive test fails here rather than
+      # on somebody else's PR, and then removes each single-flight guard to prove
+      # the test can actually see it.
+      - name: FAC-830 quota single-flight determinism and controls
+        timeout-minutes: 20
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-quota-singleflight.zsh
+
+      # Hidden directory again: without these settings the run is green while
+      # retaining none of the evidence it claims.
+      - name: Upload quota single-flight control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-quota-singleflight-logs
+          path: .verify-singleflight-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
