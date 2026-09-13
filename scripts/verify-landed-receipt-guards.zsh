@@ -117,12 +117,22 @@ sources=(
 	pkg/sync/donereceipt.go
 	cmd/herd/verify_landed_surface.go
 )
+# An EMPTY source set is not "nothing to protect": it is a driver that would run
+# its mutation loop against files it never snapshotted. zsh iterates an empty
+# array zero times without complaint, so the refusal has to be explicit.
+(( ${#sources} > 0 )) || { print -u2 'error: no sources are declared; there is nothing to snapshot and nothing to restore'; exit 1; }
+
 typeset -A pristine
 for rel in "${sources[@]}"; do
+	[[ -n "${pristine[$rel]-}" ]] && { print -u2 "error: $rel is declared twice in sources"; exit 1; }
+	[[ -f "$work/$rel" ]] || { print -u2 "error: $rel does not exist in the mutation checkout"; exit 1; }
 	h=$(git -C "$work" hash-object -- "$rel") || { print -u2 "error: cannot hash $rel"; exit 1; }
 	[[ -n "$h" ]] || { print -u2 "error: empty hash for $rel"; exit 1; }
 	pristine[$rel]=$h
 done
+# Count, not just per-file success: a snapshot that silently covered fewer files
+# than were declared would leave some source mutable with no way back.
+(( ${#pristine} == ${#sources} )) || { print -u2 "error: snapshotted ${#pristine} of ${#sources} sources"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Focused suites. The pkg/sync row is the CONSUMER half: a receipt the producer
@@ -547,6 +557,41 @@ if [[ "$run_dir" == "$repo_root"/* ]]; then
 else
 	note "report ${run_dir:t} (under VERIFY_LANDED_RECEIPT_REPORT_DIR, outside the repository)"
 fi
+
+# Every control row is validated BEFORE the run starts, against the snapshot
+# taken above. A row with the wrong shape, or naming a file this driver never
+# hashed, would be mutated with no pristine hash to restore from -- and the
+# lookup that would have caught it only happens during mutation, after the
+# baseline suite has already been paid for. This block is placed after the
+# helpers it calls and before run_all_suites, so a registry defect costs a
+# second rather than a baseline and a child workload.
+(( ${#mutations} > 0 )) || { print -u2 'error: no controls are declared; this driver would report success having proven nothing'; exit 1; }
+for record in "${mutations[@]}"; do
+	fields=("${(@ps:$sep:)record}")
+	if (( ${#fields} != 7 )); then
+		print -u2 "error: control row ${fields[1]:-<unnamed>} has ${#fields} fields, want 7"
+		exit 1
+	fi
+	rel=$fields[2]
+	if [[ -z "${pristine[$rel]-}" ]]; then
+		print -u2 "error: control ${fields[1]} mutates $rel, which is not in sources and has no pristine hash"
+		exit 1
+	fi
+	[[ -n "$fields[3]" ]] || { print -u2 "error: control ${fields[1]} has no test package"; exit 1; }
+	[[ -n "$fields[4]" ]] || { print -u2 "error: control ${fields[1]} has an empty anchor"; exit 1; }
+	# Anchor uniqueness is checked HERE, against the ACTUAL source, not at
+	# mutation time: an anchor that drifted or that matches two sites is a
+	# control that cannot be applied, and finding that out from CI an hour later
+	# is the avoidable half of the cost.
+	occurrences=$(count_literal "$fields[4]" "$(<$work/$rel)") || exit 1
+	if [[ "$occurrences" != 1 ]]; then
+		print -u2 "error: control ${fields[1]} anchor occurs $occurrences time(s) in $rel, want exactly 1"
+		exit 1
+	fi
+	[[ -n "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} has an empty replacement"; exit 1; }
+	[[ "$fields[4]" != "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} replacement equals its anchor"; exit 1; }
+	[[ -n "$fields[6]" && -n "$fields[7]" ]] || { print -u2 "error: control ${fields[1]} has no killer or no required assertion"; exit 1; }
+done
 
 run_all_suites baseline || exit 1
 note 'baseline PASS'
