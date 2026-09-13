@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,8 +23,8 @@ import (
 // stands in -- which is the exact shape this repair was written for.
 
 // publicEntryFixture prepares a repository where runHarvestVerifyLanded can run
-// end to end: a real origin/clone with a squash landing, an admission record for
-// the ref, and a ledger carrying an independent PASS for the candidate.
+// end to end: a real origin/clone with a squash landing, a reduced-provenance
+// binding, and a ledger carrying an independent PASS for the candidate.
 func publicEntryFixture(t *testing.T) (repo, candidate string, binding verifyLandedBinding) {
 	t.Helper()
 	repo, base, candidate, _ := landedPinFixture(t)
@@ -58,24 +57,12 @@ func publicEntryFixture(t *testing.T) (repo, candidate string, binding verifyLan
 		t.Fatalf("write verdict: %v", err)
 	}
 
-	// The durable admission the request resolver prefers. Reduced provenance is
-	// the shape a post-merge verify-landed reconciliation actually carries.
-	rec := admissionRecord{Request: mergeadmit.Request{
-		Ref: pinProofRef, CandidateSHA: candidate, BaseSHA: base,
-		ReducedProvenance: &mergeadmit.ReducedProvenance{PullRequest: 1, VerifyLanded: true},
-	}}
-	raw, err := json.Marshal(rec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := admissionRecordPath(".", pinProofRef)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return repo, candidate, verifyLandedBinding{Ref: pinProofRef, Candidate: candidate}
+	// No admission record is written. resolveVerifyLandedRequest returns reduced
+	// provenance directly from the binding when --pr is present, which is the
+	// shape a post-merge verify-landed reconciliation actually carries, and it
+	// keeps the fixture from depending on a second durable store whose absence
+	// reads as "no merge-admission ... and --task-id is missing" (CI 34749406649).
+	return repo, candidate, verifyLandedBinding{Ref: pinProofRef, Candidate: candidate, BaseSHA: base, PullRequest: 1}
 }
 
 func publicEntryArtifacts(t *testing.T, repo string) (receipt, disposition bool) {

@@ -66,6 +66,14 @@ func landedPinFixture(t *testing.T) (repo, base, candidate, landed string) {
 	git(repo, "commit", "-q", "-m", "squash")
 	landed = git(repo, "rev-parse", "HEAD")
 	git(repo, "push", "-q", "origin", "main")
+	// Fixture bookkeeping -- the ledger, admissions, receipts and dispositions a
+	// run writes -- lives under .herd/ and must not make the worktree DIRTY: the
+	// landing proof refuses a dirty worktree, and that refusal would stand in for
+	// the budget refusal these tests are about (CI 34749406649).
+	if e := os.WriteFile(filepath.Join(repo, ".git", "info", "exclude"), []byte(".herd/\n"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+
 	// The carrier is retired: no worktree stands on the reviewed branch, and
 	// the invoking checkout is main. The candidate object is still here.
 	return repo, base, candidate, landed
@@ -87,7 +95,7 @@ func receiptUnsealed(t *testing.T, repo string) {
 // against a gate that refuses everything.
 func TestVerifyLandedGateProvesAPinnedRetiredCandidate(t *testing.T) {
 	repo, base, candidate, landed := landedPinFixture(t)
-	gate := &mergeadmit.Gate{RepoDir: repo}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
 	proof, err := observeVerifyLanded(context.Background(), repo, gate, req)
@@ -102,8 +110,8 @@ func TestVerifyLandedGateProvesAPinnedRetiredCandidate(t *testing.T) {
 // The object-presence guard, at its new home. A pin naming an object this
 // repository does not hold is refused by the bounded proof.
 func TestVerifyLandedGateRefusesAnAbsentPin(t *testing.T) {
-	repo, base, _, _ := landedPinFixture(t)
-	gate := &mergeadmit.Gate{RepoDir: repo}
+	repo, base, _, landed := landedPinFixture(t)
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: strings.Repeat("0", 40)}
 
 	if _, err := observeVerifyLanded(context.Background(), repo, gate, req); err == nil {
@@ -115,7 +123,7 @@ func TestVerifyLandedGateRefusesAnAbsentPin(t *testing.T) {
 // The object-TYPE guard, at its new home. A tree id resolves in git but is not
 // a candidate; `^{commit}` is what refuses it.
 func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
-	repo, base, candidate, _ := landedPinFixture(t)
+	repo, base, candidate, landed := landedPinFixture(t)
 	tree := func() string {
 		c := exec.Command("git", "rev-parse", candidate+"^{tree}")
 		c.Dir = repo
@@ -125,7 +133,7 @@ func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
 		}
 		return strings.TrimSpace(string(out))
 	}()
-	gate := &mergeadmit.Gate{RepoDir: repo}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: tree}
 
 	if _, err := observeVerifyLanded(context.Background(), repo, gate, req); err == nil {
@@ -138,8 +146,8 @@ func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
 // the semantics CI 34742740503 m03 established, preserved after the move:
 // resolveCommit refuses a blank revision before spending any command.
 func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
-	repo, base, _, _ := landedPinFixture(t)
-	gate := &mergeadmit.Gate{RepoDir: repo}
+	repo, base, _, landed := landedPinFixture(t)
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: "   "}
 
 	_, err := observeVerifyLanded(context.Background(), repo, gate, req)
@@ -156,9 +164,9 @@ func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
 // An exhausted allowance stops the route with its cause intact, and seals
 // nothing — it must never read as "the object is not there".
 func TestVerifyLandedGateStopsOnAnExhaustedAllowance(t *testing.T) {
-	repo, base, candidate, _ := landedPinFixture(t)
+	repo, base, candidate, landed := landedPinFixture(t)
 	// Positive MaxCommands is mandatory: zero means DEFAULT, not exhausted.
-	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: 1}}
+	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: 1}, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
 	_, err := observeVerifyLanded(context.Background(), repo, gate, req)

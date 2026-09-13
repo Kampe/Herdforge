@@ -29,7 +29,14 @@ import (
 // allowance and a real ledger carrying an independent PASS for the candidate.
 func compositionGate(t *testing.T, repo, candidate, tip string, budget mergeadmit.ProofBudget) *mergeadmit.Gate {
 	t.Helper()
-	ledger, err := reviewledger.NewReviewLedger(repo, filepath.Join(repo, "review-ledger.jsonl"))
+	// Under .herd/, which landedPinFixture excludes from git: a ledger file at
+	// the repository root made the worktree DIRTY, and the landing proof's
+	// dirty-worktree refusal then stood in for the budget refusal these tests
+	// are about (CI 34749406649).
+	if err := os.MkdirAll(filepath.Join(repo, ".herd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := reviewledger.NewReviewLedger(repo, filepath.Join(repo, ".herd", "review-ledger.jsonl"))
 	if err != nil {
 		t.Fatalf("open ledger: %v", err)
 	}

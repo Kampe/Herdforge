@@ -382,7 +382,14 @@ func (n *nativeIntegrationSteps) gate(ctx context.Context, p nativeIntegrationPl
 	// Context-aware: the tip read is charged to whatever allowance the proof
 	// entry installs, instead of a closure that captured a context and hid an
 	// executable read behind a value-only field.
-	live := mergeadmit.LiveState{OriginMainAt: func(ctx context.Context) (string, error) { return n.remoteMain(ctx) }}
+	// BOTH: OriginMainAt is what the proof routes require, and Admit -- which has
+	// no proof context -- still reads the value-only field. Setting only the
+	// context-aware one left Admit with no probe at all, which is why the native
+	// crash cycle failed before it could publish (CI 34749406649).
+	live := mergeadmit.LiveState{
+		OriginMain:   func() (string, error) { return n.remoteMain(ctx) },
+		OriginMainAt: func(ctx context.Context) (string, error) { return n.remoteMain(ctx) },
+	}
 	if pr > 0 {
 		probes := &prProbes{number: pr, root: n.root, repository: p.Repository, ctx: ctx}
 		live.CandidateHead, live.Mergeable, live.Checks = probes.head, probes.mergeable, probes.checks

@@ -50,7 +50,7 @@ func TestObserveVerifyLandedSquashPreservesCandidate(t *testing.T) {
 	landed := git(repo, "rev-parse", "HEAD")
 	git(repo, "push", "-q", "origin", "main")
 	git(repo, "checkout", "-q", "work")
-	gate := &mergeadmit.Gate{RepoDir: repo}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
 	req := mergeadmit.Request{BaseSHA: base, CandidateSHA: candidate}
 	proof, err := observeVerifyLanded(context.Background(), repo, gate, req)
 	if err != nil {
