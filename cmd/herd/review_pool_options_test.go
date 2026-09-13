@@ -29,7 +29,10 @@ func TestAdmissionPhaseIsWriteAheadOfCandidateAndRoute(t *testing.T) {
 		t.Fatal("cannot locate runPoolReview")
 	}
 	candidate := strings.Index(body, "capacityLease.update(admissionPhaseCandidate)")
-	resolveCandidate := strings.Index(body, "resolvePoolReviewCandidateAtFor(")
+	// Anchored on the ASSIGNMENT, not the bare name: an explanatory comment in
+	// this same body names the resolver in prose, and a lexical match on prose
+	// would make this a coincidence rather than a check on the real call.
+	resolveCandidate := strings.Index(body, "candidateDir, err := resolvePoolReviewCandidateAtFor(")
 	if candidate < 0 || resolveCandidate < 0 || candidate > resolveCandidate {
 		t.Fatal("candidate phase is not write-ahead of candidate preparation")
 	}

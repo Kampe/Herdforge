@@ -105,22 +105,27 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	// anything the fixture does not model fails the test rather than escaping.
 	t.Cleanup(func() { assertOnlyCensusCommands(t, herdrCalls()) })
 
-	// The capacity census makes ONE MORE external call, and it does not use the
-	// override: herdrServerRunning (capacity.go:461) execs "herdr" from PATH
-	// directly. CI 34753903312 proved it — the entry refused with
+	// The capacity census makes ONE MORE external call, on a DIFFERENT
+	// transport: herdrServerRunning (capacity.go:461) execs "herdr" from PATH
+	// directly. pkg/herdr does honour HERD_HERDR_BIN — this probe simply does
+	// not go through it. CI 34753903312 proved the gap: the entry refused with
 	// `herdr status server: exec: "herdr": executable file not found in $PATH`
 	// before candidate preparation, so the earlier fixture never reached the
-	// census at all. That PATH resolution is deliberate, and this package's
-	// convention for it is poolContractStatusStub: a fixture-owned `herdr` on
-	// PATH that answers the health probe and delegates everything else to the
-	// protocol fake, so the real probe really runs and really parses.
+	// census it claimed to isolate.
 	//
-	// The probe is therefore NOT in the call log (the stub answers it before
-	// delegating), and nothing asserts it directly. It needs no assertion: a
-	// failing probe refuses BEFORE candidate preparation, so the positive
-	// oracle reaching its assertions at all is proof the probe was served here.
+	// entryHealthStub is poolContractStatusStub's shape — answer the health
+	// probe, exec $HERD_HERDR_BIN for everything else — plus one line: it LOGS
+	// the probe. The shared stub answers silently, and a boundary that is not
+	// observed cannot be asserted. Logging it makes `status server` a
+	// first-class member of the same exact-argv allowlist and of the
+	// success-path presence set, so this pre-candidate health read is neither
+	// concealed nor bypassed, and the real capacity gate still decides.
+	//
+	// The fake's own default envelope would NOT work here: herdrServerRunning
+	// parses plain `key: value` text and wants `status: running`, while the
+	// fake's default is JSON {"result":{}} with no status line.
 	stubDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(stubDir, "herdr"), []byte(poolContractStatusStub), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(stubDir, "herdr"), []byte(entryHealthStub), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -275,9 +280,12 @@ func entryGitOutput(t *testing.T, dir string, args ...string) string {
 }
 
 // censusCommands are the EXACT argument vectors the no-launch entry is known
-// to make: agent list through liveReviewerFor, pane list through
-// evictPoolSlotOccupants, and workspace list through RequireWorkspace.
+// to make: status server through herdrServerRunning on the raw-PATH transport,
+// then agent list through liveReviewerFor, pane list through
+// evictPoolSlotOccupants and workspace list through RequireWorkspace, all
+// three through the HERD_HERDR_BIN transport.
 var censusCommands = map[string]bool{
+	"status server":  true,
 	"pane list":      true,
 	"agent list":     true,
 	"workspace list": true,
@@ -331,9 +339,21 @@ func assertCompleteCensusObserved(t *testing.T, calls []string) {
 	for _, call := range calls {
 		seen[call] = true
 	}
-	for _, want := range []string{"agent list", "pane list", "workspace list"} {
+	for _, want := range []string{"status server", "agent list", "pane list", "workspace list"} {
 		if !seen[want] {
 			t.Fatalf("the successful entry never reached the %q boundary, so this fixture proves nothing about that protocol; calls: %v", want, calls)
 		}
 	}
 }
+
+// entryHealthStub is poolContractStatusStub plus a log line. The raw-PATH
+// health probe is a real boundary of this entry, so this fixture records it
+// like every other call instead of answering it invisibly.
+const entryHealthStub = `#!/bin/sh
+if [ "$1" = "status" ] && [ "$2" = "server" ]; then
+  printf '%s\n' "$*" >> "$HERD_FAKE_LOG"
+  echo "status: running"
+  exit 0
+fi
+exec "$HERD_HERDR_BIN" "$@"
+`
