@@ -614,6 +614,15 @@ func runBoundedGit(ctx context.Context, repoDir string, stdin []byte, args ...st
 		return "", fmt.Errorf("%w: git %s produced more than the %d byte cap",
 			ErrContentProofBudget, strings.Join(args, " "), contentProofMaxOutputBytes)
 	}
+	// git explains itself on stderr -- "Not a valid object name", "bad revision".
+	// Dropping it leaves callers with a bare exit status and no diagnosis, which
+	// is what CI 34743907915 read like. %w keeps the ExitError reachable, so the
+	// classification above still works on the wrapped error.
+	if err != nil {
+		if why := strings.TrimSpace(stderr.text.String()); why != "" {
+			return stdout.text.String(), fmt.Errorf("%w: %s", err, why)
+		}
+	}
 	return stdout.text.String(), err
 }
 
@@ -686,14 +695,47 @@ func (p *contentProof) answered(args ...string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if errors.Is(err, ErrContentProofBudget) {
-		return false, err
-	}
+	// Exit status 1 is git saying no. Every other outcome is classified by
+	// probeStopped at the call site, which is the only place that may turn a
+	// failure into this gate's answer.
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 1 {
 		return false, nil
 	}
 	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+}
+
+// probeStopped reports whether an error means the probe NEVER ANSWERED, as
+// opposed to git answering "no".
+//
+// Only a git process that actually ran and exited with a status has answered
+// anything. Everything else is a stopping cause and must reach the caller as
+// itself:
+//
+//   - ErrContentProofBudget: the command, output or input allowance was spent;
+//   - context.Canceled and context.DeadlineExceeded: the shared deadline ended
+//     the run, whether it surfaced through the context or from the killed child;
+//   - no *exec.ExitError at all: git never became a process, or the tool itself
+//     failed -- a missing binary is not evidence about a commit;
+//   - a negative exit code: the process was killed by a signal, so it has no
+//     exit status and made no claim.
+//
+// Reporting any of these as a proved non-ancestor invents a content verdict out
+// of a run that was stopped, which is the inversion this whole gate exists to
+// avoid.
+func probeStopped(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrContentProofBudget) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return true
+	}
+	return exit.ExitCode() < 0
 }
 
 // ancestryRefusal turns one ancestry probe into the gate's answer.
@@ -711,7 +753,7 @@ func (p *contentProof) answered(args ...string) (bool, error) {
 // dressed up as an ancestry verdict.
 func ancestryRefusal(ok bool, err error, format string, args ...any) error {
 	if err != nil {
-		if errors.Is(err, ErrContentProofBudget) {
+		if probeStopped(err) {
 			return err
 		}
 		return fmt.Errorf(format+": %w", append(args, err)...)

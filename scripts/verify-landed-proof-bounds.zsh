@@ -134,6 +134,7 @@ sources=(
 	pkg/mergeadmit/proof_bounds.go
 	pkg/mergeadmit/proof.go
 	pkg/mergeadmit/squash_landing.go
+	pkg/mergeadmit/reconcile.go
 )
 
 # An EMPTY source set is not "nothing to protect": it is a driver that would run
@@ -161,7 +162,7 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget|TestGitOutBytesIsTheChargingBoundaryForGitReads|TestStablePatchIDChargesItsOwnCommand|TestAncestorProvenChargesItsOwnCommand)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget TestGitOutBytesIsTheChargingBoundaryForGitReads TestStablePatchIDChargesItsOwnCommand TestAncestorProvenChargesItsOwnCommand"
+"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget|TestGitOutBytesIsTheChargingBoundaryForGitReads|TestStablePatchIDChargesItsOwnCommand|TestAncestorProvenChargesItsOwnCommand|TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable|TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal|TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry|TestPublicProveMergeModeSucceedsOnTheDefaultBudget|TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation|TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing|TestCompletePublicEntrySucceedsOnTheDefaultAllowance|TestReconcileLandedPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedPublicEntrySucceedsOnTheDefaultAllowance|TestReconcileLandedReducedPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedReducedPublicEntrySucceedsOnTheDefaultAllowance|TestFollowUpPublicEntryStopsOnTheSharedAllowance)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget TestGitOutBytesIsTheChargingBoundaryForGitReads TestStablePatchIDChargesItsOwnCommand TestAncestorProvenChargesItsOwnCommand TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry TestPublicProveMergeModeSucceedsOnTheDefaultBudget TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing TestCompletePublicEntrySucceedsOnTheDefaultAllowance TestReconcileLandedPublicEntryStopsOnTheSharedAllowance TestReconcileLandedPublicEntrySucceedsOnTheDefaultAllowance TestReconcileLandedReducedPublicEntryStopsOnTheSharedAllowance TestReconcileLandedReducedPublicEntrySucceedsOnTheDefaultAllowance TestFollowUpPublicEntryStopsOnTheSharedAllowance"
 )
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,27 @@ suites=(
 #                          top-level PASS is still required at baseline and
 #                          after restore.
 #
+#   identity-outside-allowance
+#                          the repository identity read goes through the shared
+#                          runner-aware reader with THIS invocation's allowance.
+#                          Its killer COUNTS the charge, so another budget path
+#                          paying for it cannot mask the mutant.
+#   ancestry-absence-vs-refusal
+#                          a bounded ancestry probe separates "not an ancestor"
+#                          from "could not answer". This is the single-hunk form
+#                          of the merge-mode control: the two-hunk form the
+#                          producer author proposed would have had to re-add the
+#                          gitroot import to proof.go, and a mutant that does not
+#                          build is BROKEN-RUN, not a kill.
+#   reconcile-installs-second-budget
+#                          the public ReconcileLanded entry installs the shared
+#                          allowance rather than taking a fresh unbudgeted
+#                          context. Anchored with the comment line above the
+#                          call because `ctx, cancel := g.gateProofContext()`
+#                          appears TWICE in reconcile.go -- the public entry and
+#                          validatePriorReceipt -- and a two-site anchor is a
+#                          control that cannot be applied.
+#
 # id | source | test package | anchor | replacement | killer | required assertion
 # ---------------------------------------------------------------------------
 mutations=(
@@ -235,7 +257,9 @@ mutations=(
 				return nil, fmt.Errorf(\"%w: %s..%s holds more than %d commits\",
 					ErrProofBudgetRange, short(base), short(tip), maxCommits)
 			}${sep}			_ = maxCommits // MUTANT: the range is materialised without a bound${sep}TestProofRangeBudgetRefusesAnOversizedRange${sep}materialised a four-commit range"
-"entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)${sep}	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: the entry path loses its allowance${sep}TestGateProveLandedCarriesItsInjectedBudget${sep}ignored its injected allowance and proved a landing"
+"entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	// per-command output bytes and range size.
+	ctx, cancel := g.gateProofContext()${sep}	// per-command output bytes and range size.
+	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: the entry path loses its allowance${sep}TestGateProveLandedCarriesItsInjectedBudget${sep}ignored its injected allowance and proved a landing"
 # ONE control, not two. An earlier revision split this into a passthrough mutant
 # and a %w mutant; NEITHER could kill, because each half alone still lets
 # errors.Is reach the sentinel through the other. Only restoring the original
@@ -245,29 +269,12 @@ mutations=(
 		return err
 	}
 	return fmt.Errorf(\"%s revision %q does not resolve to a commit in %s: %w\", role, rev, repoDir, err)${sep}	return fmt.Errorf(\"%s revision %q does not resolve to a commit in %s\", role, rev, repoDir) // MUTANT: the original flattening, cause and sentinel both lost${sep}TestProofBudgetSurvivesRevisionResolution/commands_exhausted_during_resolution${sep}a flattened budget error reads as an ordinary resolution failure"
+"identity-outside-allowance${sep}pkg/mergeadmit/proof_bounds.go${sep}./pkg/mergeadmit/${sep}	return toolchild.RepositoryIdentityWithRunner(g.RepoDir, boundedGit(ctx, g.RepoDir))${sep}	return toolchild.RepositoryIdentity(g.RepoDir) // MUTANT: identity runs outside the allowance${sep}TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable${sep}the identity read charged"
+"ancestry-absence-vs-refusal${sep}pkg/mergeadmit/proof_bounds.go${sep}./pkg/mergeadmit/${sep}	if !proven {${sep}	if false && !proven { // MUTANT: absence and refusal conflated${sep}TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal${sep}a non-ancestor was accepted"
+"reconcile-installs-second-budget${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}	// those previously installed its own or ran outside any (review 212).
+	ctx, cancel := g.gateProofContext()${sep}	// those previously installed its own or ran outside any (review 212).
+	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: ReconcileLanded takes no allowance${sep}TestReconcileLandedPublicEntryStopsOnTheSharedAllowance${sep}ReconcileLanded sealed a receipt on an exhausted allowance"
 )
-
-# Every control row is validated BEFORE the run starts, against the snapshot
-# taken above. A row with the wrong shape, or naming a file this driver never
-# hashed, would be mutated with no pristine hash to restore from -- the same
-# class of defect as snapshotting after mutating, caught here rather than
-# discovered halfway through a run with a modified checkout.
-(( ${#mutations} > 0 )) || { print -u2 'error: no controls are declared; this driver would report success having proven nothing'; exit 1; }
-for record in "${mutations[@]}"; do
-	fields=("${(@ps:$sep:)record}")
-	if (( ${#fields} != 7 )); then
-		print -u2 "error: control row ${fields[1]:-<unnamed>} has ${#fields} fields, want 7"
-		exit 1
-	fi
-	rel=$fields[2]
-	if [[ -z "${pristine[$rel]-}" ]]; then
-		print -u2 "error: control ${fields[1]} mutates $rel, which is not in sources and has no pristine hash"
-		exit 1
-	fi
-	[[ -n "$fields[4]" ]] || { print -u2 "error: control ${fields[1]} has an empty anchor"; exit 1; }
-	[[ "$fields[4]" != "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} replacement equals its anchor"; exit 1; }
-	[[ -n "$fields[6]" && -n "$fields[7]" ]] || { print -u2 "error: control ${fields[1]} has no killer or no required assertion"; exit 1; }
-done
 
 # compile_check proves the mutant builds. Its result is kept separately from
 # the assertion evidence, because "the build broke" and "the test saw the
@@ -501,6 +508,38 @@ if [[ "$run_dir" == "$repo_root"/* ]]; then
 else
 	note "report ${run_dir:t} (under VERIFY_LANDED_PROOF_BOUNDS_REPORT_DIR, outside the repository)"
 fi
+
+
+# Every control row is validated BEFORE the run starts, against the snapshot
+# taken above. A row with the wrong shape, or naming a file this driver never
+# hashed, would be mutated with no pristine hash to restore from -- the same
+# class of defect as snapshotting after mutating, caught here rather than
+# discovered halfway through a run with a modified checkout.
+(( ${#mutations} > 0 )) || { print -u2 'error: no controls are declared; this driver would report success having proven nothing'; exit 1; }
+for record in "${mutations[@]}"; do
+	fields=("${(@ps:$sep:)record}")
+	if (( ${#fields} != 7 )); then
+		print -u2 "error: control row ${fields[1]:-<unnamed>} has ${#fields} fields, want 7"
+		exit 1
+	fi
+	rel=$fields[2]
+	if [[ -z "${pristine[$rel]-}" ]]; then
+		print -u2 "error: control ${fields[1]} mutates $rel, which is not in sources and has no pristine hash"
+		exit 1
+	fi
+	[[ -n "$fields[4]" ]] || { print -u2 "error: control ${fields[1]} has an empty anchor"; exit 1; }
+	# Anchor uniqueness is checked HERE, before the baseline suite spends a
+	# minute, not at mutation time: an anchor that drifted or that matches two
+	# sites is a control that cannot be applied, and finding that out from CI an
+	# hour later is the avoidable half of the cost.
+	occurrences=$(count_literal "$fields[4]" "$(<$work/$rel)") || exit 1
+	if [[ "$occurrences" != 1 ]]; then
+		print -u2 "error: control ${fields[1]} anchor occurs $occurrences time(s) in $rel, want exactly 1"
+		exit 1
+	fi
+	[[ "$fields[4]" != "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} replacement equals its anchor"; exit 1; }
+	[[ -n "$fields[6]" && -n "$fields[7]" ]] || { print -u2 "error: control ${fields[1]} has no killer or no required assertion"; exit 1; }
+done
 
 run_all_suites baseline || exit 1
 note 'baseline PASS'

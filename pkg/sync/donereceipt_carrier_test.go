@@ -853,3 +853,40 @@ func TestValidateRefusesACarrierThisRepositoryDoesNotHave(t *testing.T) {
 		t.Fatalf("an ordinary missing object was reported as a stopped proof: %v", err)
 	}
 }
+
+// A probe that never ANSWERED must never be reported as a proved non-ancestor.
+// Exit status 1 is git saying no; a tool that never ran, a cancellation that
+// arrived from the killed child rather than from our own context, and a spent
+// allowance are all stopping causes, and each must reach the caller as itself.
+// Inventing a content verdict out of a stopped run is the inversion this gate
+// exists to avoid.
+func TestValidateDoesNotReportAStoppedProbeAsANonAncestor(t *testing.T) {
+	dir, base, carrier, merge := prReceiptRepo(t)
+	r, st := publicReceipt(t, dir, base, carrier, carrier, merge)
+
+	for _, cause := range []error{
+		errors.New(`exec: "git": executable file not found in $PATH`),
+		context.Canceled,
+		context.DeadlineExceeded,
+	} {
+		prev := contentProofCommand
+		contentProofCommand = func(ctx context.Context, repoDir string, stdin []byte, args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "merge-base" {
+				return "", cause
+			}
+			return prev(ctx, repoDir, stdin, args...)
+		}
+		err := r.Validate(dir, carrierRef, st)
+		contentProofCommand = prev
+
+		if err == nil {
+			t.Fatalf("a probe that never answered (%v) was accepted as proof", cause)
+		}
+		if strings.Contains(err.Error(), "is not an ancestor") {
+			t.Fatalf("a probe that never answered was reported as a proved non-ancestor: cause %v, error %v", cause, err)
+		}
+		if !errors.Is(err, cause) {
+			t.Fatalf("the stopping cause %v did not survive to the caller: %v", cause, err)
+		}
+	}
+}
