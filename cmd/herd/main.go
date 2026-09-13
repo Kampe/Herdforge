@@ -729,6 +729,8 @@ func printUsage() {
 	fmt.Println("  attention       List standing agents needing coordinator eyes (triage)")
 	fmt.Println("  lifecycle       Observe and act on fleet state via lifecycle engine")
 	fmt.Println("  resources       Snapshot system-resource headroom (free-mem, swap, gate verdict)")
+	fmt.Println("                  --watch runs a bounded foreground observer on a native clock;")
+	fmt.Println("                  --observer-status reads its snapshot and exits 3 once it expires")
 	fmt.Println("  lock           Advisory shared-checkout lock: with, acquire, release, status")
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
 	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
@@ -7796,27 +7798,80 @@ func runLifecycle() {
 }
 
 func runResources() {
-	fs := flag.NewFlagSet("resources", flag.ExitOnError)
+	os.Exit(runResourcesWithArgs(os.Args[2:], os.Stdout, os.Stderr))
+}
+
+// runResourcesWithArgs is the whole command, returning its exit code instead of
+// calling os.Exit, so the argv contract itself is testable rather than only its
+// helpers. Writers are injected for the same reason: a rejected invocation must
+// be provably silent on stdout.
+func runResourcesWithArgs(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("resources", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "Output JSON")
 	gate := fs.Bool("gate", false, "Exit 3 on ALERT (refuses heavy ops); HERD_RESOURCES_GATE=0 disables")
 	selftest := fs.Bool("selftest", false, "Run verdict assertions and exit")
-	fs.Parse(os.Args[2:])
+	// FAC-829: opt-in observer mode. Absent these flags, everything below is
+	// the original one-shot command, unchanged.
+	watch := fs.Bool("watch", false,
+		"Foreground observer: sample on a native clock and publish a bounded snapshot until stopped")
+	observerStatus := fs.Bool("observer-status", false,
+		"Read the published observer snapshot; exit 3 when it is expired, terminated or refusing")
+	interval := fs.Duration("interval", 0,
+		"Observer sampling interval (default 30s; bounded, a zero or negative value is refused, not repaired)")
+	lifetime := fs.Duration("lifetime", 0,
+		"Observer total lifetime before it exits on its own (default 12h)")
+	sampleTimeout := fs.Duration("sample-timeout", 0,
+		"Per-sample deadline (default half the interval); may not exceed half the interval")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// fs.Visit reports the flags the operator ACTUALLY gave, which is the only
+	// way to tell `--interval 0` from an absent --interval: a value-versus-
+	// default comparison collapses those two, and an explicitly chosen default
+	// is still an explicit choice.
+	provided := map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { provided[fl.Name] = true })
+
+	// Mode dispatch is validated BEFORE any observation. A resource guard the
+	// operator asked for must never be silently discarded: --gate under
+	// --watch used to be skipped by an early return, and the observer bounds
+	// were parsed and then ignored outside --watch, including an explicit
+	// --interval=0 that the observer would have refused.
+	mode, err := validateResourcesMode(provided)
+	if err != nil {
+		fmt.Fprintf(stderr, "resources: %v\n", err)
+		return 2
+	}
+
+	switch mode {
+	case resourcesModeStatus:
+		return runResourcesObserverStatus(*asJSON)
+	case resourcesModeWatch:
+		return runResourcesObserver(observerFlags{
+			interval:      *interval,
+			lifetime:      *lifetime,
+			sampleTimeout: *sampleTimeout,
+			provided:      provided,
+		})
+	}
 
 	if *selftest {
 		results := resources.SelfTest()
 		allPass := true
 		for _, r := range results {
 			if r.Pass {
-				fmt.Printf("[PASS] %s\n", r.Name)
+				fmt.Fprintf(stdout, "[PASS] %s\n", r.Name)
 			} else {
-				fmt.Printf("[FAIL] %s: %s\n", r.Name, r.Detail)
+				fmt.Fprintf(stdout, "[FAIL] %s: %s\n", r.Name, r.Detail)
 				allPass = false
 			}
 		}
 		if !allPass {
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	}
 
 	snap := resources.TakeSnapshot()
@@ -7836,22 +7891,23 @@ func runResources() {
 			// reported as healthy: the refusal is printed either way, and only
 			// the exit status is waived.
 			if os.Getenv("HERD_RESOURCES_GATE") == "0" {
-				fmt.Fprintf(os.Stderr, "resources: %s\n  gate DISABLED by HERD_RESOURCES_GATE=0 — proceeding against this refusal, not despite a healthy host\n", detail)
+				fmt.Fprintf(stderr, "resources: %s\n  gate DISABLED by HERD_RESOURCES_GATE=0 — proceeding against this refusal, not despite a healthy host\n", detail)
 			} else {
-				fmt.Fprintf(os.Stderr, "resources: %s\n  refusing heavy ops; set HERD_RESOURCES_GATE=0 to override deliberately\n", detail)
-				os.Exit(3)
+				fmt.Fprintf(stderr, "resources: %s\n  refusing heavy ops; set HERD_RESOURCES_GATE=0 to override deliberately\n", detail)
+				return 3
 			}
 		}
 	}
 
 	if *asJSON {
 		out, _ := json.MarshalIndent(snap, "", "  ")
-		fmt.Println(string(out))
-		return
+		fmt.Fprintln(stdout, string(out))
+		return 0
 	}
 
-	fmt.Printf("free-memory: %d%%  swap-used: %dMB  verdict: %s\n",
+	fmt.Fprintf(stdout, "free-memory: %d%%  swap-used: %dMB  verdict: %s\n",
 		snap.FreePct, snap.SwapMB, snap.Verdict)
+	return 0
 }
 
 func runProcess() {

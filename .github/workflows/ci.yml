@@ -111,6 +111,26 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: FAC-829 resource observer non-vacuity controls
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-resource-observer.zsh
+
+      # Same hidden-directory trap as above: without these two settings the run
+      # reports green while retaining none of the evidence it claims. The path is
+      # restricted to run-* evidence so nothing but this driver's own logs can be
+      # uploaded, whatever else ends up under the directory.
+      - name: Upload resource observer control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-resource-observer-logs
+          path: .verify-observer-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # FAC-824: the mailbox-repair guards refuse stale or conflicting
       # identity, malformed unrelated rows, privileged records and concurrent
       # change, and they bound the durable prepare/recovery/completion

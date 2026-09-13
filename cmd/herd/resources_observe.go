@@ -1,0 +1,226 @@
+package main
+
+// FAC-829: `herd resources --watch`, an opt-in observer mode on the existing
+// command.
+//
+// The one-shot interface is untouched: without --watch this file is not
+// reached, and `herd resources`, `--json`, `--gate` and `--selftest` behave
+// exactly as before.
+//
+// This is a FOREGROUND service, not a daemon. It does not fork, detach, or
+// install anything. The operator's terminal owns it and Ctrl-C stops it, which
+// is the property that makes it safe to offer under a resource hold.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Kampe/Herdforge/pkg/resources"
+)
+
+// observerStatusJSON renders a published status for --json consumers.
+func observerStatusJSON(status resources.ObserverStatus) (string, error) {
+	body, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encode observer status: %w", err)
+	}
+	return string(body), nil
+}
+
+// Exit codes for observer mode. 3 is already "refused" for `--gate`, so the
+// observer reuses it for a refusal to START and keeps 1 for real failures.
+const (
+	observerExitRefused = 3
+)
+
+// observerFlags are the operator-settable bounds. Paths are deliberately absent:
+// the lock and status locations are canonical (see resources.ObserverLockPath),
+// because a caller-supplied lock path lets two observers each believe they are
+// the singleton, and a caller-supplied status path could be aimed at the
+// operational guard's report or at source.
+type observerFlags struct {
+	interval      time.Duration
+	lifetime      time.Duration
+	sampleTimeout time.Duration
+	// provided records which duration flags the operator actually set. An
+	// ABSENT flag takes the default; a flag SET to zero or a negative value is
+	// an explicit mistake and is refused. Collapsing those two cases is how a
+	// deliberate `--interval 0` gets silently turned into 30s.
+	provided map[string]bool
+}
+
+func (f observerFlags) was(name string) bool { return f.provided[name] }
+
+// runResourcesObserver runs the bounded observer until the lifetime elapses or
+// a signal arrives. It prints nothing per tick: the status file is the output,
+// and a chatty sampler would be its own log-volume problem.
+func runResourcesObserver(f observerFlags) int {
+	cfg := resources.DefaultObserverConfig()
+	if f.was("interval") {
+		cfg.Interval = f.interval
+		// Keep the default relationship between interval and per-sample
+		// timeout when the operator moved only the interval.
+		if !f.was("sample-timeout") {
+			cfg.SampleTimeout = f.interval / 2
+		}
+	}
+	if f.was("lifetime") {
+		cfg.Lifetime = f.lifetime
+	}
+	if f.was("sample-timeout") {
+		cfg.SampleTimeout = f.sampleTimeout
+	}
+
+	validated, err := cfg.Validate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resources --watch: %v\n", err)
+		return observerExitRefused
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	scope := resources.ObserverLockScope()
+	fmt.Fprintf(os.Stderr, "resources observer: interval=%s lifetime=%s sample-timeout=%s\n",
+		validated.Interval, validated.Lifetime, validated.SampleTimeout)
+	fmt.Fprintf(os.Stderr, "resources observer: status=%s\n", validated.StatusPath)
+	fmt.Fprintf(os.Stderr, "resources observer: lock=%s scope=%s (%s)\n",
+		validated.LockPath, scope, resources.ObserverScopeExplanation(scope))
+	fmt.Fprintln(os.Stderr, "resources observer: "+resources.ObserverAuthorityNote)
+
+	status, err := resources.RunObserver(ctx, validated, nil)
+	if code := observerExitCodeFor(err); code != 0 {
+		fmt.Fprintf(os.Stderr, "resources --watch: %v\n", err)
+		return code
+	}
+	fmt.Fprintf(os.Stderr, "resources observer: stopped after %d tick(s), %d skipped\n",
+		status.TotalTicks, status.SkippedTicks)
+	return 0
+}
+
+// observerExitCodeFor maps a RunObserver result to an exit code.
+//
+// It is separate so the mapping can be asserted directly: a run whose terminal
+// status failed to publish must never reach the success branch, however it was
+// stopped. A clean shutdown is the ONLY path to zero.
+func observerExitCodeFor(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, resources.ErrObserverBusy):
+		return observerExitRefused
+	default:
+		return 1
+	}
+}
+
+// runResourcesObserverStatus reads the published status and reports whether it
+// is current enough to be worth anything.
+//
+// This is the consumer half of the contract, and it exists so the expiry check
+// is demonstrated by shipped code rather than only described in a comment: an
+// old file or an exited observer authorizes nothing.
+func runResourcesObserverStatus(asJSON bool) int {
+	path := resources.ObserverStatusPath()
+	status, err := resources.ReadObserverStatus(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resources --observer-status: %v\n", err)
+		return observerExitRefused
+	}
+	now := time.Now().UTC()
+	if asJSON {
+		// The status is already the wire shape; print it verbatim so a
+		// consumer sees exactly what was published, including the expiry.
+		body, merr := observerStatusJSON(status)
+		if merr != nil {
+			fmt.Fprintf(os.Stderr, "resources --observer-status: %v\n", merr)
+			return 1
+		}
+		fmt.Println(body)
+	} else {
+		fmt.Println(resources.ObserverStatusSummary(status, now))
+	}
+	if usable, _ := resources.ObserverUsable(status, now); !usable {
+		// Not an error: reporting an expired or refusing observation IS the
+		// job. The non-zero code lets a caller gate on it without parsing.
+		return observerExitRefused
+	}
+	return 0
+}
+
+// resourcesMode is which job one `herd resources` invocation selected. The
+// three are mutually exclusive and each accepts a different set of flags.
+type resourcesMode string
+
+const (
+	resourcesModeOneShot resourcesMode = "one-shot"
+	resourcesModeWatch   resourcesMode = "--watch"
+	resourcesModeStatus  resourcesMode = "--observer-status"
+)
+
+// resourcesModeFlags is what each mode legitimately accepts. Everything else
+// given alongside it is refused rather than ignored.
+//
+// The rule this encodes: a flag the operator typed is a request, and a request
+// this command cannot honour must be an error. Parsing --gate under --watch and
+// then returning early silently discarded a resource guard; parsing --interval
+// outside --watch and then dropping it silently discarded a bound the observer
+// would have refused as invalid. Both read as success.
+var resourcesModeFlags = map[resourcesMode]map[string]bool{
+	resourcesModeOneShot: {"json": true, "gate": true, "selftest": true},
+	resourcesModeWatch:   {"watch": true, "interval": true, "lifetime": true, "sample-timeout": true},
+	resourcesModeStatus:  {"observer-status": true, "json": true},
+}
+
+// validateResourcesMode resolves the mode from the flags ACTUALLY given and
+// refuses any flag that mode cannot honour.
+//
+// It is given fs.Visit's result, not the parsed values: an explicitly chosen
+// default is still an explicit choice, and `--interval=0` must reach the
+// observer's validation rather than being indistinguishable from silence.
+func validateResourcesMode(provided map[string]bool) (resourcesMode, error) {
+	if provided["watch"] && provided["observer-status"] {
+		return "", errors.New("--watch and --observer-status are different jobs; pick one")
+	}
+	mode := resourcesModeOneShot
+	switch {
+	case provided["watch"]:
+		mode = resourcesModeWatch
+	case provided["observer-status"]:
+		mode = resourcesModeStatus
+	}
+	allowed := resourcesModeFlags[mode]
+
+	// Sorted so the message is deterministic: an operator comparing two runs
+	// must not see the same mistake described in a different order.
+	rejected := make([]string, 0, len(provided))
+	for name := range provided {
+		if !allowed[name] {
+			rejected = append(rejected, "--"+name)
+		}
+	}
+	if len(rejected) == 0 {
+		return mode, nil
+	}
+	sort.Strings(rejected)
+	accepted := make([]string, 0, len(allowed))
+	for name := range allowed {
+		accepted = append(accepted, "--"+name)
+	}
+	sort.Strings(accepted)
+	if mode == resourcesModeOneShot {
+		return "", fmt.Errorf("%s accept no mode of their own; they belong to --watch. "+
+			"Plain `herd resources` accepts %s",
+			strings.Join(rejected, ", "), strings.Join(accepted, ", "))
+	}
+	return "", fmt.Errorf("%s cannot be combined with %s; %s accepts %s",
+		strings.Join(rejected, ", "), mode, mode, strings.Join(accepted, ", "))
+}
