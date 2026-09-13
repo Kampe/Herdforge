@@ -1893,12 +1893,27 @@ type verifyLandedBinding struct {
 // mints/reconciles the sealed completion receipt through mergeadmit so
 // approve/board-done have the same closing authority as a normal harvest.
 func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
+	// THE ALLOWANCE IS CREATED BEFORE ANY GIT RUNS. Review b70054a6: surface
+	// selection and candidate resolution came first and ran unbounded worktree,
+	// rev-parse, fetch and ancestry commands, so the route spent uncharged
+	// commands before the budget it later enforced even existed. The gate is
+	// built from the BINDING's ref and task id, which are what the operator
+	// supplied; the only gate field those choose is the task-revision probe,
+	// which this route never reads.
+	gate, err := buildMergeGate(binding.Ref, binding.TaskID, 0)
+	if err != nil {
+		return fmt.Errorf("receipt reconcile: %w", err)
+	}
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+
 	// FAC-831: a retired carrier is not a missing precondition, it is the
 	// normal end state of merged work, and this path exists for exactly that
 	// class. The invoking checkout stands in ONLY after the candidate is pinned
 	// by an explicit --candidate or an admitted PASS and the object is present
-	// here; a live carrier is used exactly as before.
-	surface, err := resolveVerifyLandedSurface(branch, binding, worktreeForBranch, invokingRepoRoot)
+	// here; a live carrier is used exactly as before. A lookup that FAILED is
+	// neither case and refuses here rather than being read as an absent carrier.
+	surface, err := resolveVerifyLandedSurface(ctx, branch, binding, worktreeForBranch, invokingRepoRoot)
 	if err != nil {
 		return err
 	}
@@ -1914,7 +1929,7 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 	// exact class this path serves -- HEAD is the LANDED head, so the recorded
 	// candidate became the merge commit and Route B then refused the legitimate
 	// verdict it was supposed to authorize.
-	candidate, err := resolveVerifyLandedCandidate(wtDir, branch, binding)
+	candidate, err := resolveVerifyLandedCandidate(ctx, wtDir, branch, binding)
 	if err != nil {
 		return err
 	}
@@ -1931,11 +1946,7 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 	if err := requirePinnedCandidateProved(surface, req.CandidateSHA); err != nil {
 		return err
 	}
-	gate, err := buildMergeGate(req.Ref, req.TaskID, 0)
-	if err != nil {
-		return fmt.Errorf("receipt reconcile: %w", err)
-	}
-	return proveSealAndRecordLanded(gate, wtDir, branch, candidate, req)
+	return proveSealAndRecordLanded(ctx, gate, wtDir, branch, req)
 }
 
 // proveSealAndRecordLanded is the proof-and-seal COMPOSITION of the
@@ -1943,20 +1954,15 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 // driven directly by a fixture. runHarvestVerifyLanded resolves the surface,
 // the candidate and the request, and then this performs every step that spends
 // the allowance or mutates state.
-func proveSealAndRecordLanded(gate *mergeadmit.Gate, wtDir, branch, candidate string, req mergeadmit.Request) error {
-	// ONE allowance for this ENTIRE invocation: the worktree status read, the
-	// integration-tip fetch and rev-parse, the landing proof, the identity read,
-	// the ancestry and replay, and the seal. Each public entry used to mint its
-	// own, so a single `harvest-merge --verify-landed` could spend several full
-	// budgets and prove the same landing twice (FAC-831 review 6c93cc2b).
-	ctx, cancel := gate.ProofContext()
-	defer cancel()
-
+// The resolved candidate is NOT a separate parameter: it is req.CandidateSHA,
+// which is what the proof proves and the receipt seals. Carrying a second copy
+// alongside the request is how the announced candidate and the sealed one
+// drifted apart in the first place.
+func proveSealAndRecordLanded(ctx context.Context, gate *mergeadmit.Gate, wtDir, branch string, req mergeadmit.Request) error {
 	proof, err := observeVerifyLanded(ctx, wtDir, gate, req)
 	if err != nil {
 		return fmt.Errorf("LANDING UNPROVEN — %w", err)
 	}
-	fmt.Printf("herd harvest-merge: LANDED — %s candidate %s as %s (%s)\n", branch, candidate, proof.MergeSHA, proof.Method)
 
 	// THE SEAL COMES BEFORE THE DISPOSITION, and that order is the contract.
 	// One shared allowance alone does not prevent a partial mutation: observation
@@ -1969,9 +1975,38 @@ func proveSealAndRecordLanded(gate *mergeadmit.Gate, wtDir, branch, candidate st
 		return fmt.Errorf("receipt reconcile: %w", err)
 	}
 
+	// THE RECEIPT IS THE AUTHORITY, AND THE DISPOSITION IS DERIVED FROM IT.
+	//
+	// Review b70054a6: the disposition was written from the FIRST observation
+	// while the seal re-read origin and proved again, so if origin moved between
+	// the two reads the two artifacts could describe different integrations
+	// while the success line presented them as one result. Detecting that after
+	// writing both would already have persisted the contradiction.
+	//
+	// So the receipt's own fields are what gets recorded, and the two reads must
+	// agree before anything is recorded at all. A moved origin is a refusal with
+	// the receipt standing and NO disposition, not a disposition that contradicts
+	// the receipt it is supposed to describe.
+	if !strings.EqualFold(receipt.CandidateSHA, req.CandidateSHA) {
+		return fmt.Errorf("receipt reconcile: sealed receipt binds candidate %s, not the requested %s",
+			shortSHA12(receipt.CandidateSHA), shortSHA12(req.CandidateSHA))
+	}
+	if !strings.EqualFold(receipt.MergeSHA, proof.MergeSHA) {
+		return fmt.Errorf(
+			"LANDING MOVED — the observation proved %s and the sealed receipt binds %s, so origin changed between the two reads; "+
+				"no disposition was recorded, and the receipt is the authority. Re-run --verify-landed against the current origin",
+			shortSHA12(proof.MergeSHA), shortSHA12(receipt.MergeSHA))
+	}
+
+	// The success line is the receipt's reading too, not the first observation's.
+	// Announcing a landing before the seal agreed with it is how an operator saw
+	// "LANDED as X" on a run that then refused, or that sealed Y.
+	fmt.Printf("herd harvest-merge: LANDED — %s candidate %s as %s (%s)\n",
+		branch, receipt.CandidateSHA, receipt.MergeSHA, proof.Method)
+
 	// Content observation is separate from the review/receipt authority above.
 	if rec, err := hsync.WriteLandedDisposition(".", hsync.LandedDisposition{
-		Ref: req.Ref, CandidateSHA: candidate, MergeSHA: proof.MergeSHA,
+		Ref: receipt.TaskRef, CandidateSHA: receipt.CandidateSHA, MergeSHA: receipt.MergeSHA,
 		Branch: branch, Method: proof.Method,
 	}); err != nil {
 		return fmt.Errorf("landed disposition: %w", err)
@@ -2053,32 +2088,38 @@ func resolveVerifyLandedRequest(binding verifyLandedBinding, candidate string) (
 }
 
 // worktreeForBranch finds the worktree directory whose checked-out branch
-// matches branch. Returns "" when no worktree holds the branch. Used by
-// harvest-merge --verify-landed to locate the lane's worktree for LandedProof.
-func worktreeForBranch(branch string) string {
+// matches branch. It answers ("", nil) when no worktree holds the branch, and
+// returns an error when it COULD NOT LOOK.
+//
+// Review b70054a6 / BQ advisory: this used to collapse every failure into "",
+// and its one caller reads "" as CARRIER RETIRED -- which authorises the
+// invoking checkout to stand in as the proof surface. A failed lookup is not an
+// absent carrier: it is no answer at all, and turning it into one hands proof
+// scope to a repository that was never shown to be unrelated to the live lane.
+// The two are now distinct, and the command runs INSIDE the caller's allowance
+// like every other read that decides what gets proved.
+func worktreeForBranch(ctx context.Context, branch string) (string, error) {
 	repoRoot, err := filepath.Abs(".")
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("resolve the invoking repository path: %w", err)
 	}
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
-	cmd.Dir = repoRoot
-	out, err := cmd.Output()
+	out, err := mergeadmit.BoundedGit(ctx, repoRoot)("worktree", "list", "--porcelain")
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("list the worktrees of the invoking repository: %w", err)
 	}
 	var dir string
-	for _, ln := range strings.Split(string(out), "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		switch {
 		case strings.HasPrefix(ln, "worktree "):
 			dir = strings.TrimSpace(strings.TrimPrefix(ln, "worktree "))
 		case strings.HasPrefix(ln, "branch "):
 			b := strings.TrimSpace(strings.TrimPrefix(ln, "branch "))
 			if b == "refs/heads/"+branch || b == branch {
-				return dir
+				return dir, nil
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // reachableFromBranch reports whether an object is contained in a branch.

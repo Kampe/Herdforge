@@ -296,6 +296,30 @@ func BoundedGit(ctx context.Context, repoDir string) func(args ...string) (strin
 	return boundedGit(ctx, repoDir)
 }
 
+// ProofRunAborted reports whether err means the run could not look, as opposed
+// to having looked and found nothing.
+//
+// It is exported for the CLI's candidate-identity guard, which must not read an
+// exhausted allowance or a cancelled run as "HEAD is not contained in
+// origin/main" -- that answer is precisely what the guard exists to refuse. The
+// predicate stays defined ONCE here, beside the sentinels it recognises,
+// because a second copy in cmd/herd is how the two drift apart.
+func ProofRunAborted(ctx context.Context, err error) bool {
+	return proofRunAborted(ctx, err)
+}
+
+// AncestorProven answers ancestry inside the shared allowance, separating a
+// genuine "not an ancestor" from a run that was stopped.
+//
+// A caller outside this package needs the same distinction the proof routes
+// have: a bare `merge-base --is-ancestor` exits non-zero for non-ancestry AND
+// for a killed process, so a caller that reads the exit status alone turns an
+// exhausted or cancelled run into a content answer. This is the one charged,
+// bounded definition; it is exported rather than re-implemented.
+func AncestorProven(ctx context.Context, repoDir, sha, ref string) (bool, error) {
+	return ancestorProven(ctx, repoDir, sha, ref)
+}
+
 // repositoryIdentity reads the origin binding inside the shared allowance.
 //
 // It replaces toolchild.RepositoryIdentity, which ran its own unbounded

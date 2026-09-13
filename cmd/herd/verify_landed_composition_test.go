@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/mergeadmit"
@@ -86,7 +90,9 @@ func TestVerifyLandedCompositionStopsBeforeAnythingIsRecorded(t *testing.T) {
 		ReducedProvenance: &mergeadmit.ReducedProvenance{PullRequest: 1, VerifyLanded: true},
 	}
 
-	err := proveSealAndRecordLanded(gate, repo, "work", candidate, req)
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+	err := proveSealAndRecordLanded(ctx, gate, repo, "work", req)
 	if err == nil {
 		t.Fatal("an exhausted allowance completed a verify-landed invocation")
 	}
@@ -111,7 +117,9 @@ func TestVerifyLandedCompositionRecordsNothingWhenTheSealExhausts(t *testing.T) 
 		ReducedProvenance: &mergeadmit.ReducedProvenance{PullRequest: 1, VerifyLanded: true},
 	}
 
-	err := proveSealAndRecordLanded(gate, repo, "work", candidate, req)
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+	err := proveSealAndRecordLanded(ctx, gate, repo, "work", req)
 	if err == nil {
 		t.Fatal("an allowance that could not reach the seal still completed the invocation")
 	}
@@ -134,4 +142,100 @@ func observationCost(t *testing.T, repo, base, candidate, landed string) int {
 	}
 	t.Fatal("observation never completed within a sane allowance")
 	return 0
+}
+
+// SWITCHING ORIGIN. The observation and the seal read the integration tip
+// separately, so origin can move between them. Before review b70054a6 the
+// disposition was written from the FIRST reading while the receipt was sealed
+// against the SECOND, and the success line presented the two as one result.
+//
+// The contract now: the receipt is the authority, the disposition is derived
+// from it, and the two readings must agree BEFORE anything is recorded. A moved
+// origin is a refusal with no disposition -- never a disposition that
+// contradicts the receipt it claims to describe.
+//
+// The two tips carry DIFFERENT INTEGRATIONS of the same reviewed work, not a
+// tip that merely advanced: an empty commit on top of the same squash still
+// proves the same integration commit, so the two reads would agree and the
+// scenario would assert nothing. The second line re-lands the identical patch
+// as a different commit, which is what makes the readings diverge.
+func relandedElsewhere(t *testing.T, repo, base string) string {
+	t.Helper()
+	git := func(args ...string) string {
+		t.Helper()
+		c := exec.Command("git", args...)
+		c.Dir = repo
+		out, err := c.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("checkout", "-q", "-b", "relanded", base)
+	git("merge", "--squash", "work")
+	// A different message yields a different object for the same tree and
+	// parent, so this is a genuinely distinct integration commit.
+	git("commit", "-q", "-m", "relanded elsewhere")
+	tip := git("rev-parse", "HEAD")
+	git("checkout", "-q", "main")
+	return tip
+}
+
+func TestVerifyLandedCompositionRefusesWhenOriginMovesBetweenReads(t *testing.T) {
+	repo, base, candidate, landed := landedPinFixture(t)
+	t.Chdir(repo)
+	elsewhere := relandedElsewhere(t, repo, base)
+	if elsewhere == landed {
+		t.Fatal("fixture invalid: the second landing is the same commit as the first")
+	}
+
+	reads := 0
+	gate := compositionGate(t, repo, candidate, landed, mergeadmit.ProofBudget{})
+	gate.Live.OriginMainAt = func(context.Context) (string, error) {
+		reads++
+		if reads == 1 {
+			return landed, nil // what the observation proves
+		}
+		return elsewhere, nil // what the seal would bind
+	}
+	req := mergeadmit.Request{
+		Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate,
+		ReducedProvenance: &mergeadmit.ReducedProvenance{PullRequest: 1, VerifyLanded: true},
+	}
+
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+	err := proveSealAndRecordLanded(ctx, gate, repo, "work", req)
+	if err == nil {
+		t.Fatal("a moved origin produced a result presenting two different integrations as one")
+	}
+	if !strings.Contains(err.Error(), "LANDING MOVED") {
+		t.Fatalf("err = %v, want the moved-origin refusal", err)
+	}
+	if reads < 2 {
+		t.Fatalf("fixture invalid: the tip was read %d time(s), so the two reads never diverged", reads)
+	}
+	if d, derr := hsync.ReadLandedDisposition(repo, pinProofRef); derr == nil && d != nil {
+		t.Fatalf("a disposition was recorded for an integration the receipt does not bind: %+v", d)
+	}
+
+	// THE SEAL STILL HAPPENED, and it binds the SECOND reading. Asserting the
+	// persisted artifact -- not merely that the invocation refused -- is what
+	// makes this a statement about the two readings diverging: a route that
+	// refused for any other reason would have left no receipt at all, and a
+	// receipt binding the first reading would mean the scenario never diverged.
+	raw, rerr := os.ReadFile(hsync.ReceiptPath(repo, pinProofRef))
+	if rerr != nil {
+		t.Fatalf("the seal that decides the disposition did not happen: %v", rerr)
+	}
+	var receipt hsync.CompletionReceipt
+	if uerr := json.Unmarshal(raw, &receipt); uerr != nil {
+		t.Fatalf("receipt unreadable: %v", uerr)
+	}
+	if receipt.MergeSHA != elsewhere {
+		t.Fatalf("receipt binds integration %s, want the second reading %s", receipt.MergeSHA, elsewhere)
+	}
+	if receipt.CandidateSHA != candidate {
+		t.Fatalf("receipt binds candidate %s, want the requested %s", receipt.CandidateSHA, candidate)
+	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -72,8 +73,23 @@ var errRetiredCarrierUnpinned = fmt.Errorf(
 // requirePinnedCandidateProved below closes the gap between the two.
 //
 // The dirty refusal still runs downstream, against the surface actually used.
-func resolveVerifyLandedSurface(branch string, binding verifyLandedBinding, lookup func(string) string, invokerRoot func() (string, error)) (verifyLandedSurface, error) {
-	if dir := strings.TrimSpace(lookup(branch)); dir != "" {
+//
+// A FAILED LOOKUP IS NOT AN ABSENT CARRIER. The lookup used to report every
+// failure as the empty string, which arrives here as "no worktree carries this
+// branch" and authorises the invoking checkout to stand in. Selection decides
+// proof SCOPE, so "I could not look" must refuse: an unreadable worktree list
+// says nothing about whether a live lane exists, and standing in for a lane
+// that may be live is not a fallback, it is a guess.
+func resolveVerifyLandedSurface(ctx context.Context, branch string, binding verifyLandedBinding, lookup func(context.Context, string) (string, error), invokerRoot func() (string, error)) (verifyLandedSurface, error) {
+	found, err := lookup(ctx, branch)
+	if err != nil {
+		return verifyLandedSurface{}, fmt.Errorf(
+			"could not determine whether a carrier worktree holds %s (%w). "+
+				"A lookup that failed is not an absent carrier, and the invoking checkout is not "+
+				"authorised as a proof surface on an unanswered question",
+			branch, err)
+	}
+	if dir := strings.TrimSpace(found); dir != "" {
 		return verifyLandedSurface{Dir: dir}, nil
 	}
 

@@ -48,8 +48,11 @@ func (g liveGit) BranchesContaining(_ context.Context, sha string) ([]string, er
 	return branches, nil
 }
 
-func (g liveGit) WorktreeForBranch(_ context.Context, branch string) (string, error) {
-	return worktreeForBranch(branch), nil
+func (g liveGit) WorktreeForBranch(ctx context.Context, branch string) (string, error) {
+	// The lookup's own error now reaches this interface instead of being
+	// flattened into "no worktree holds this branch" -- the two answers mean
+	// different things to every caller (review b70054a6 / BQ advisory).
+	return worktreeForBranch(ctx, branch)
 }
 
 func (g liveGit) ContainedInMain(_ context.Context, sha string) bool {

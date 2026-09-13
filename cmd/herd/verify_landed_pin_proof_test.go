@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -95,10 +94,10 @@ func receiptUnsealed(t *testing.T, repo string) {
 // against a gate that refuses everything.
 func TestVerifyLandedGateProvesAPinnedRetiredCandidate(t *testing.T) {
 	repo, base, candidate, landed := landedPinFixture(t)
-	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
-	proof, err := observeVerifyLanded(context.Background(), repo, gate, req)
+	proof, err := observeVerifyLandedUnderGate(t, repo, gate, req)
 	if err != nil {
 		t.Fatalf("a correct retired candidate was refused on the default allowance: %v", err)
 	}
@@ -111,10 +110,10 @@ func TestVerifyLandedGateProvesAPinnedRetiredCandidate(t *testing.T) {
 // repository does not hold is refused by the bounded proof.
 func TestVerifyLandedGateRefusesAnAbsentPin(t *testing.T) {
 	repo, base, _, landed := landedPinFixture(t)
-	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: strings.Repeat("0", 40)}
 
-	if _, err := observeVerifyLanded(context.Background(), repo, gate, req); err == nil {
+	if _, err := observeVerifyLandedUnderGate(t, repo, gate, req); err == nil {
 		t.Fatal("a candidate absent from this repository was proved landed")
 	}
 	receiptUnsealed(t, repo)
@@ -133,10 +132,10 @@ func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
 		}
 		return strings.TrimSpace(string(out))
 	}()
-	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: tree}
 
-	if _, err := observeVerifyLanded(context.Background(), repo, gate, req); err == nil {
+	if _, err := observeVerifyLandedUnderGate(t, repo, gate, req); err == nil {
 		t.Fatal("a tree id was proved landed as a candidate")
 	}
 	receiptUnsealed(t, repo)
@@ -147,10 +146,10 @@ func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
 // resolveCommit refuses a blank revision before spending any command.
 func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
 	repo, base, _, landed := landedPinFixture(t)
-	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
+	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: "   "}
 
-	_, err := observeVerifyLanded(context.Background(), repo, gate, req)
+	_, err := observeVerifyLandedUnderGate(t, repo, gate, req)
 	if err == nil {
 		t.Fatal("an empty candidate identity was proved landed")
 	}
@@ -164,12 +163,12 @@ func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
 // An exhausted allowance stops the route with its cause intact, and seals
 // nothing — it must never read as "the object is not there".
 func TestVerifyLandedGateStopsOnAnExhaustedAllowance(t *testing.T) {
-	repo, base, candidate, landed := landedPinFixture(t)
+	repo, base, candidate, _ := landedPinFixture(t)
 	// Positive MaxCommands is mandatory: zero means DEFAULT, not exhausted.
-	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: 1}, Live: mergeadmit.LiveState{OriginMainAt: mergeadmit.StaticOriginProbe(landed)}}
+	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: 1}, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
-	_, err := observeVerifyLanded(context.Background(), repo, gate, req)
+	_, err := observeVerifyLandedUnderGate(t, repo, gate, req)
 	if err == nil {
 		t.Fatal("an exhausted allowance proved a landing")
 	}
@@ -203,4 +202,17 @@ func TestRequirePinnedCandidateProvedBindsTheFallbackToThePin(t *testing.T) {
 	if err := requirePinnedCandidateProved(live, other); err != nil {
 		t.Fatalf("a live carrier was subjected to the pin binding: %v", err)
 	}
+}
+
+// observeVerifyLandedUnderGate runs the observation on THE GATE'S OWN allowance.
+//
+// CI 34749904639: these tests passed context.Background(), which carries no
+// budget, so ensureProofBudget installed the DEFAULTS and the gate's injected
+// MaxCommands was never applied -- an exhausted-allowance test that could not
+// exhaust. The context a caller owning the operation would use is the gate's.
+func observeVerifyLandedUnderGate(t *testing.T, repo string, gate *mergeadmit.Gate, req mergeadmit.Request) (*mergeadmit.Proof, error) {
+	t.Helper()
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+	return observeVerifyLanded(ctx, repo, gate, req)
 }

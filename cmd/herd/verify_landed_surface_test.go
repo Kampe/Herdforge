@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -51,12 +52,24 @@ func rootOf(dir string) func() (string, error) {
 	return func() (string, error) { return dir, nil }
 }
 
+// carrierAt is a lookup that ANSWERED: dir, or "" for a branch no worktree
+// holds. It is deliberately distinct from carrierLookupFailed below, because
+// those two used to be the same value.
+func carrierAt(dir string) func(context.Context, string) (string, error) {
+	return func(context.Context, string) (string, error) { return dir, nil }
+}
+
+// carrierLookupFailed is a lookup that COULD NOT ANSWER.
+func carrierLookupFailed(err error) func(context.Context, string) (string, error) {
+	return func(context.Context, string) (string, error) { return "", err }
+}
+
 // A live carrier is used exactly as before. This is the no-change half, and it
 // must stay true or the fix would have relaxed the active/dirty protection.
 func TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged(t *testing.T) {
 	dir := surfaceRepo(t)
-	surface, err := resolveVerifyLandedSurface("fix/x", verifyLandedBinding{},
-		func(string) string { return "/carrier/dir" }, rootOf(dir))
+	surface, err := resolveVerifyLandedSurface(context.Background(), "fix/x", verifyLandedBinding{},
+		carrierAt("/carrier/dir"), rootOf(dir))
 	if err != nil {
 		t.Fatalf("live carrier: %v", err)
 	}
@@ -84,8 +97,8 @@ func TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin(t *testing.T
 	}
 	// The invoking checkout HAS a perfectly good HEAD. It is still refused,
 	// because nothing ties that HEAD to the reviewed candidate.
-	surface, err := resolveVerifyLandedSurface("fix/x", verifyLandedBinding{},
-		func(string) string { return "" }, rootOf(dir))
+	surface, err := resolveVerifyLandedSurface(context.Background(), "fix/x", verifyLandedBinding{},
+		carrierAt(""), rootOf(dir))
 	if err == nil {
 		t.Fatalf("used %q as a proof surface with no pinned candidate", surface.Dir)
 	}
@@ -105,8 +118,8 @@ func TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidate(t *testing.T) {
 	dir := surfaceRepo(t)
 	candidate := surfaceCommit(t, dir, "a.txt", "one\n")
 
-	surface, err := resolveVerifyLandedSurface("fix/x", verifyLandedBinding{Candidate: candidate},
-		func(string) string { return "" }, rootOf(dir))
+	surface, err := resolveVerifyLandedSurface(context.Background(), "fix/x", verifyLandedBinding{Candidate: candidate},
+		carrierAt(""), rootOf(dir))
 	if err != nil {
 		t.Fatalf("pinned candidate refused: %v", err)
 	}
@@ -134,8 +147,8 @@ func TestResolveVerifyLandedSurfaceSelectsWithoutProvingTheRepository(t *testing
 	foreign := surfaceRepo(t)
 	surfaceCommit(t, foreign, "z.txt", "unrelated\n")
 
-	surface, err := resolveVerifyLandedSurface("fix/x", verifyLandedBinding{Candidate: candidate},
-		func(string) string { return "" }, rootOf(foreign))
+	surface, err := resolveVerifyLandedSurface(context.Background(), "fix/x", verifyLandedBinding{Candidate: candidate},
+		carrierAt(""), rootOf(foreign))
 	if err != nil {
 		t.Fatalf("selection ran a check of its own: %v", err)
 	}
@@ -154,5 +167,61 @@ func TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead(t *testing.T) 
 	}
 	if got := pinnedCandidateFor(verifyLandedBinding{}); got != "" {
 		t.Fatalf("an unpinned binding produced %q; only --candidate or an admitted PASS may pin", got)
+	}
+}
+
+// A FAILED LOOKUP IS NOT AN ABSENT CARRIER (review b70054a6 / BQ advisory).
+//
+// The lookup used to report every failure as the empty string, and "" arrives
+// here as "no worktree carries this branch" -- which authorises the invoking
+// checkout to stand in as the proof surface. An unreadable worktree list says
+// nothing about whether a live lane exists, so selection must refuse instead of
+// answering. A pinned candidate does NOT rescue it: the pin authorises an
+// object, not a scope.
+func TestResolveVerifyLandedSurfaceRefusesAFailedCarrierLookup(t *testing.T) {
+	dir := surfaceRepo(t)
+	candidate := surfaceCommit(t, dir, "a.txt", "one\n")
+	boom := errors.New("worktree list could not run")
+
+	surface, err := resolveVerifyLandedSurface(context.Background(), "fix/x",
+		verifyLandedBinding{Candidate: candidate}, carrierLookupFailed(boom), rootOf(dir))
+	if err == nil {
+		t.Fatalf("a failed carrier lookup authorised %q as a proof surface", surface.Dir)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the lookup failure preserved through errors.Is", err)
+	}
+	if errors.Is(err, errRetiredCarrierUnpinned) {
+		t.Fatalf("a failed lookup was reported as an absent carrier: %v", err)
+	}
+	if surface.Dir != "" || surface.CarrierRetired {
+		t.Fatalf("a refusal returned a surface: %+v", surface)
+	}
+}
+
+// The production lookup itself separates the two answers, against real git.
+// Without this the distinction above could hold in the selector while the
+// shipped lookup still reported both cases identically.
+func TestWorktreeForBranchSeparatesAnAbsentCarrierFromAFailedLookup(t *testing.T) {
+	dir := surfaceRepo(t)
+	surfaceCommit(t, dir, "a.txt", "one\n")
+	t.Chdir(dir)
+
+	got, err := worktreeForBranch(context.Background(), "branch/nobody/holds")
+	if err != nil {
+		t.Fatalf("an absent carrier must be an ANSWER, not a failure: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("dir = %q, want the empty answer for a branch no worktree holds", got)
+	}
+
+	// A directory that is not a repository at all: the lookup cannot answer.
+	t.Chdir(t.TempDir())
+	got, err = worktreeForBranch(context.Background(), "branch/nobody/holds")
+	if err == nil {
+		t.Fatalf("a lookup that could not run reported %q as an absent carrier", got)
+	}
+	if got != "" {
+		t.Fatalf("a failed lookup returned a directory: %q", got)
 	}
 }
