@@ -131,3 +131,6 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl
 .herd/review-ledger.jsonl.*
 .herd/harvest-queue.jsonl.*
+
+# FAC-827: mutation-control logs from scripts/verify-manifest-budget.zsh.
+.verify-budget-logs/

@@ -286,7 +286,7 @@ func TestDarwinFirstMatchProfileDeniesSharedParent(t *testing.T) {
 	if err := osb.proveGitObjectWrite(profile, root); err != nil {
 		t.Fatalf("git object write: %v", err)
 	}
-	gitDir, err := absoluteGitDir(root)
+	gitDir, err := AbsoluteGitDir(root)
 	if err != nil {
 		t.Fatal(err)
 	}
