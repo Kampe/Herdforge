@@ -4,6 +4,7 @@ package usage
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"time"
 
@@ -22,8 +23,14 @@ func withCacheFileLock(path string, wait time.Duration, fn func() error) error {
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+		// A lock someone else holds and a lock that is broken are different
+		// answers. Only the first becomes ErrCacheLockBusy; anything else
+		// surfaces unwrapped so it cannot be read as ordinary contention.
+		if !errors.Is(err, unix.EWOULDBLOCK) {
 			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w after %s: %w", ErrCacheLockBusy, wait, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

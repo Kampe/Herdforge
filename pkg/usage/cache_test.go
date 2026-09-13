@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +34,9 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 		return
 	}
 	url := os.Getenv("HERD_CACHE_FIXTURE_URL")
+	var polls atomic.Int32
 	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
+		polls.Add(1)
 		resp, err := http.Get(url)
 		if err != nil {
 			return ProviderUsage{}, err
@@ -52,8 +55,71 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 		if err == nil || pollErrorCode(err) != "rate-limited" {
 			t.Fatalf("expected persisted rate-limit result, got %v", err)
 		}
-	} else if err != nil {
-		t.Fatal(err)
+		return
+	}
+	// Report the outcome instead of demanding one. Under cross-process
+	// single-flight a caller legitimately ends in one of three states, and
+	// which one it reaches depends on the scheduler, not on the contract:
+	//
+	//   served    -- it won the lock and performed THE one poll
+	//   cached    -- it took the lock after the winner and was served from
+	//                the cache the winner had just written, polling nothing
+	//   contended -- the winner held the lock for the caller's whole bounded
+	//                wait, so it returned ErrCacheLockBusy, polling nothing
+	//
+	// All three preserve single-flight. Anything else is a real failure and is
+	// still reported as one below.
+	outcome := ""
+	switch {
+	case err == nil && polls.Load() == 1:
+		outcome = singleFlightServed
+	case err == nil && polls.Load() == 0:
+		outcome = singleFlightCached
+	case errors.Is(err, ErrCacheLockBusy) && polls.Load() == 0:
+		outcome = singleFlightContended
+	}
+	if outcome == "" {
+		t.Fatalf("%s%s polls=%d err=%v", singleFlightOutcomePrefix, "unexpected", polls.Load(), err)
+	}
+	fmt.Printf("%s%s polls=%d\n", singleFlightOutcomePrefix, outcome, polls.Load())
+}
+
+// The helper and its parent exchange outcomes through one stable line rather
+// than through exit codes, so a scheduler-dependent-but-legal result cannot be
+// mistaken for a failure, and an illegal one cannot hide behind exit 0.
+const (
+	singleFlightOutcomePrefix = "SINGLEFLIGHT-OUTCOME: "
+	singleFlightServed        = "served"
+	singleFlightCached        = "cached"
+	singleFlightContended     = "contended"
+)
+
+// singleFlightOutcome extracts the reported outcome from one helper's output.
+// An absent or unreadable line is a failure, never an assumed pass: a helper
+// that printed nothing proves nothing.
+func singleFlightOutcome(output string) (string, error) {
+	found := ""
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, singleFlightOutcomePrefix) {
+			continue
+		}
+		value := strings.TrimPrefix(trimmed, singleFlightOutcomePrefix)
+		if name, _, ok := strings.Cut(value, " "); ok {
+			value = name
+		}
+		if found != "" && found != value {
+			return "", fmt.Errorf("helper reported two different outcomes, %q then %q", found, value)
+		}
+		found = value
+	}
+	switch found {
+	case singleFlightServed, singleFlightCached, singleFlightContended:
+		return found, nil
+	case "":
+		return "", fmt.Errorf("helper reported no outcome line")
+	default:
+		return "", fmt.Errorf("helper reported an unrecognised outcome %q", found)
 	}
 }
 
@@ -364,24 +430,80 @@ func TestProviderCacheAcrossProcessesSingleFlight(t *testing.T) {
 		cmds[i] = exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
 		cmds[i].Env = baseEnv
 	}
-	results := make(chan error, len(cmds))
+	// Cleanup on EVERY path, including a t.Fatal from the first result while
+	// the second helper is still running. Killing a process that already
+	// exited is harmless; leaving one behind is not.
+	t.Cleanup(func() {
+		for _, cmd := range cmds {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
+	})
+
+	type helperResult struct {
+		outcome string
+		err     error
+	}
+	results := make(chan helperResult, len(cmds))
 	for _, cmd := range cmds {
 		go func(cmd *exec.Cmd) {
 			output, err := cmd.CombinedOutput()
+			text := strings.TrimSpace(string(output))
 			if err != nil {
-				results <- fmt.Errorf("helper failed: %w: %s", err, strings.TrimSpace(string(output)))
+				results <- helperResult{err: fmt.Errorf("helper failed: %w: %s", err, text)}
 				return
 			}
-			results <- nil
+			outcome, parseErr := singleFlightOutcome(text)
+			if parseErr != nil {
+				results <- helperResult{err: fmt.Errorf("%w: %s", parseErr, text)}
+				return
+			}
+			results <- helperResult{outcome: outcome}
 		}(cmd)
 	}
+
+	// Collect BOTH results before asserting. Returning early on the first
+	// failure would leave the second helper's outcome unread and its process
+	// competing with the next test for the same cache path.
+	outcomes := make([]string, 0, len(cmds))
+	var failures []error
 	for range cmds {
-		if err := <-results; err != nil {
-			t.Fatal(err)
+		r := <-results
+		if r.err != nil {
+			failures = append(failures, r.err)
+			continue
+		}
+		outcomes = append(outcomes, r.outcome)
+	}
+	if len(failures) > 0 {
+		t.Fatalf("helper(s) failed: %v", errors.Join(failures...))
+	}
+
+	// The single-flight contract, asserted on what was OBSERVED rather than on
+	// which process happened to be scheduled first: exactly one live poll
+	// reached the provider, exactly one caller performed it, and the other
+	// caller polled nothing -- whether it read the winner's cache or waited its
+	// bounded budget out. Neither outcome is a retry, a skip, or a longer
+	// timeout; they are the two legal ways to lose the race.
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("cross-process single-flight allowed %d fixture requests, want exactly 1 (outcomes %v)", got, outcomes)
+	}
+	served := 0
+	for _, outcome := range outcomes {
+		if outcome == singleFlightServed {
+			served++
 		}
 	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("cross-process cache lock allowed %d fixture requests, want 1", got)
+	if served != 1 {
+		t.Fatalf("expected exactly one caller to perform the poll, got %d (outcomes %v)", served, outcomes)
+	}
+	for _, outcome := range outcomes {
+		switch outcome {
+		case singleFlightServed, singleFlightCached, singleFlightContended:
+		default:
+			t.Fatalf("unrecognised single-flight outcome %q (outcomes %v)", outcome, outcomes)
+		}
 	}
 }
 
@@ -853,5 +975,105 @@ func TestUnusableReadingsFallThroughToLive(t *testing.T) {
 	os.WriteFile(path, body, 0o600)
 	if _, _, ok := readSnapshotFile(time.Minute); ok {
 		t.Error("a future timestamp must be treated as unusable, never as fresh")
+	}
+}
+
+// TestProviderCacheContendedLockIsBusyNotAPoll pins the losing half of
+// single-flight deterministically, without racing the scheduler.
+//
+// A holder subprocess takes the provider lock and announces it through a ready
+// file, so the contender does not start until the lock is provably held. The
+// holder then keeps it for a full second while the contender's wait is bounded
+// at 300ms, which makes the outcome determined rather than timing-dependent:
+// the contender MUST come back busy. What matters is what it does about it --
+// it must report the busy lock as such and must not poll the provider behind
+// the holder's back.
+func TestProviderCacheContendedLockIsBusyNotAPoll(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HERD_QUOTA_CACHE_PATH", filepath.Join(dir, "quota.json"))
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"contended-account"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	ready := filepath.Join(dir, "holder.ready")
+	baseEnv := append(os.Environ(),
+		"HERD_CACHE_SUBPROCESS_HELPER=1",
+		"HERD_CACHE_FIXTURE_URL="+server.URL,
+		"HERD_QUOTA_CACHE_PATH="+filepath.Join(dir, "quota.json"),
+		"HOME="+home,
+		"CODEX_HOME="+home,
+		"HERD_QUOTA_CACHE_SECONDS=45",
+	)
+	holder := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
+	holder.Env = append(append([]string{}, baseEnv...),
+		"HERD_CACHE_HOLD_PROVIDER=codex",
+		"HERD_CACHE_HOLDER_READY="+ready,
+	)
+	contender := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
+	contender.Env = baseEnv
+
+	// Cleanup on every path, including a t.Fatal while the holder still sleeps.
+	t.Cleanup(func() {
+		for _, cmd := range []*exec.Cmd{holder, contender} {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
+	})
+
+	if err := holder.Start(); err != nil {
+		t.Fatalf("start holder: %v", err)
+	}
+	holderDone := make(chan error, 1)
+	go func() { holderDone <- holder.Wait() }()
+
+	// Bounded wait for the announcement, polled rather than slept: the
+	// contender must not start before the lock is provably held, and a holder
+	// that never announces is a failure rather than a silent pass.
+	deadline := time.Now().Add(10 * time.Second)
+	held := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(ready); err == nil {
+			held = true
+			break
+		}
+		select {
+		case err := <-holderDone:
+			t.Fatalf("holder exited before announcing the lock: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if !held {
+		t.Fatal("holder never announced that it held the provider lock")
+	}
+
+	output, err := contender.CombinedOutput()
+	text := strings.TrimSpace(string(output))
+	if err != nil {
+		t.Fatalf("contender failed instead of reporting a busy lock: %v: %s", err, text)
+	}
+	outcome, parseErr := singleFlightOutcome(text)
+	if parseErr != nil {
+		t.Fatalf("%v: %s", parseErr, text)
+	}
+	if outcome != singleFlightContended {
+		t.Fatalf("contender reported %q while the lock was held for the whole wait, want %q",
+			outcome, singleFlightContended)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("a contender that could not take the lock still polled the provider %d time(s), want 0", got)
+	}
+	if err := <-holderDone; err != nil {
+		t.Fatalf("holder failed: %v", err)
 	}
 }

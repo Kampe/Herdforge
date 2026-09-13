@@ -137,3 +137,6 @@ TASK-PACKET.md
 .verify-mail-repair-logs/
 # FAC-827: mutation-control logs from scripts/verify-manifest-budget.zsh.
 .verify-budget-logs/
+
+# FAC-830: mutation-control logs from scripts/verify-quota-singleflight.zsh.
+.verify-singleflight-logs/
