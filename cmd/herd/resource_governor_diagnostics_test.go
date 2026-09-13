@@ -11,16 +11,13 @@ import (
 
 // FAC-613: a lifecycle refusal used to arrive with no way to tell WHICH census
 // phase spent the budget. Two native review-preparation refusals at the
-// unregistered-orphan census produced no phase attribution, although the
-// sweep had already built a report carrying per-stage timings and counts and
-// sweepResourceGovernor threw it away.
+// unregistered-orphan census produced no phase attribution, although the sweep
+// had already built a report carrying per-stage timings and counts.
 //
-// These drive the REAL boundary: a real Governor over the package's own
-// hermetic policy, through runLifecycleGovernorSweep, and the real
-// lifecycleSweepFailure that sweepResourceGovernor now calls.
+// These drive the REAL boundary and inspect the error it RETURNS. Nothing here
+// decorates the error itself: a test that called the decorator would still
+// pass if the boundary stopped calling it, which is the defect.
 
-// diagnosticsFailingWorktrees refuses the registered census immediately, which
-// is the path that records a stage and then returns the partial report.
 type diagnosticsFailingWorktrees struct{ err error }
 
 func (w diagnosticsFailingWorktrees) List(context.Context, string, string) ([]resources.RegisteredWorktree, error) {
@@ -37,8 +34,8 @@ func diagnosticsGovernor(t *testing.T, lister resources.WorktreeEnumerator) *res
 	}
 }
 
-// A refusal keeps the stage evidence the sweep already collected.
-func TestLifecycleRefusalRetainsCensusStages(t *testing.T) {
+// THE REGRESSION: the boundary's own error carries the stage evidence.
+func TestLifecycleBoundaryRefusalCarriesCensusStages(t *testing.T) {
 	governor := diagnosticsGovernor(t, diagnosticsFailingWorktrees{err: errDiagnosticsCensus})
 
 	report, err := runLifecycleGovernorSweep(context.Background(), governor, resources.SweepReviewBeforeRefusal)
@@ -48,62 +45,47 @@ func TestLifecycleRefusalRetainsCensusStages(t *testing.T) {
 	if len(report.Stages) == 0 {
 		t.Fatal("the sweep recorded no stages, so this test could not prove they survive")
 	}
-
-	wrapped := lifecycleSweepFailure(report, err)
-	if wrapped == nil {
-		t.Fatal("a refusal must stay a refusal")
-	}
-	if !strings.Contains(wrapped.Error(), "census stages:") {
-		t.Fatalf("refusal carries no stage summary: %v", wrapped)
+	if !strings.Contains(err.Error(), "census stages:") {
+		t.Fatalf("the boundary returned a refusal with no stage summary: %v", err)
 	}
 	for _, stage := range report.Stages {
-		if !strings.Contains(wrapped.Error(), stage.Name) {
-			t.Fatalf("refusal omits the %q stage it recorded: %v", stage.Name, wrapped)
+		if !strings.Contains(err.Error(), stage.Name) {
+			t.Fatalf("the refusal omits the %q stage the sweep recorded: %v", stage.Name, err)
 		}
 	}
 }
 
 // The refusal's IDENTITY is unchanged, which is what every caller gates on.
-func TestLifecycleRefusalPreservesErrorIdentity(t *testing.T) {
+func TestLifecycleBoundaryRefusalPreservesErrorIdentity(t *testing.T) {
 	governor := diagnosticsGovernor(t, diagnosticsFailingWorktrees{err: errDiagnosticsCensus})
 
-	report, err := runLifecycleGovernorSweep(context.Background(), governor, resources.SweepReviewBeforeRefusal)
+	_, err := runLifecycleGovernorSweep(context.Background(), governor, resources.SweepReviewBeforeRefusal)
 	if err == nil {
 		t.Fatal("the fixture census must refuse")
 	}
-	wrapped := lifecycleSweepFailure(report, err)
-	if !errors.Is(wrapped, errDiagnosticsCensus) {
-		t.Fatalf("errors.Is no longer answers for the cause: %v", wrapped)
-	}
-	if !errors.Is(wrapped, err) {
-		t.Fatalf("the original refusal is no longer reachable: %v", wrapped)
+	if !errors.Is(err, errDiagnosticsCensus) {
+		t.Fatalf("errors.Is no longer answers for the cause: %v", err)
 	}
 }
 
 // A CANCELLED caller still fails closed, and still as a cancellation.
-func TestLifecycleCancellationKeepsItsIdentityWithStages(t *testing.T) {
+func TestLifecycleBoundaryCancellationKeepsItsIdentity(t *testing.T) {
 	governor := diagnosticsGovernor(t, lifecycleCanceledAwareWorktrees{})
 	parent, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	report, err := runLifecycleGovernorSweep(parent, governor, resources.SweepReviewBeforeRefusal)
+	_, err := runLifecycleGovernorSweep(parent, governor, resources.SweepReviewBeforeRefusal)
 	if err == nil {
 		t.Fatal("a cancelled caller must fail closed")
 	}
-	wrapped := lifecycleSweepFailure(report, err)
-	if wrapped == nil {
-		t.Fatal("a cancelled sweep must not become success")
-	}
-	if !errors.Is(wrapped, context.Canceled) {
-		t.Fatalf("cancellation lost its identity: %v", wrapped)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost its identity: %v", err)
 	}
 }
 
-// SUCCESS IS NOT TOUCHED: a sweep that admitted must not acquire an error.
-//
-// The failure message deliberately does NOT format the error: under a mutant
-// that wraps a nil refusal, rendering it would panic, and a crash is not a
-// kill. The assertion is the fact, not the value.
+// SUCCESS IS NOT TOUCHED. The message deliberately does not format the error:
+// under a mutant that wraps a nil refusal, rendering it would panic, and a
+// crash is not a kill.
 func TestLifecycleSuccessIsNeverWrapped(t *testing.T) {
 	if err := lifecycleSweepFailure(resources.GovernorReport{
 		Stages: []resources.CensusStage{{Name: "registered_census", DurationMS: 5}},
@@ -112,37 +94,81 @@ func TestLifecycleSuccessIsNeverWrapped(t *testing.T) {
 	}
 }
 
-// The summary is BOUNDED and carries identifiers and numbers only. A refusal
-// is an operational line, not a report dump, and must not leak a path.
-func TestCensusStageSummaryIsBoundedAndPathFree(t *testing.T) {
-	many := make([]resources.CensusStage, 0, censusStageSummaryLimit+4)
-	for i := 0; i < censusStageSummaryLimit+4; i++ {
-		many = append(many, resources.CensusStage{
-			Name: "registered_census", DurationMS: 1234, Scanned: 7, Deferred: 2,
-			ProbeCompleted: 5, ProbeDeferred: 1,
-			CursorError: "/var/folders/zz/cursor.state: no space left on device",
-			Cause:       "stat /Users/someone/secret/path: permission denied",
-		})
+// representativeStages is the shape a real sweep produces: statfs first, the
+// registered census next, and the unregistered-orphan census LAST — the phase
+// the two field refusals stopped in.
+func representativeStages() []resources.CensusStage {
+	return []resources.CensusStage{
+		{Name: "statfs", DurationMS: 12},
+		{Name: "registered_census", DurationMS: 31500, Scanned: 148, Deferred: 22,
+			ProbeCompleted: 126, ProbeDeferred: 22},
+		{Name: "unregistered_orphan_census", DurationMS: 13200, Scanned: 64, Deferred: 9,
+			ProbeCompleted: 55, ProbeDeferred: 9,
+			CursorError: "/var/folders/zz/cursor.state: no space left on device"},
 	}
-	summary := censusStageSummary(many)
-	if len(summary) > censusStageSummaryBytes+3 {
+}
+
+// The failing phase and its numbers must survive, whatever else does not.
+func TestSummaryKeepsTheFailingPhaseAndItsCounts(t *testing.T) {
+	summary := censusStageSummary(representativeStages())
+
+	for _, want := range []string{
+		"unregistered_orphan_census", "ms=13200", "scanned=64", "deferred=9",
+		"probe_completed=55", "probe_deferred=9", "cursor_error",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("the failing phase lost %q: %s", want, summary)
+		}
+	}
+	if len(summary) > censusStageSummaryBytes {
+		t.Fatalf("summary is unbounded at %d bytes: %s", len(summary), summary)
+	}
+}
+
+// When the set does not fit, the EARLIEST stages go and the omission is
+// stated. Dropping from the end would discard the phase that refused.
+func TestSummaryDropsEarliestStagesAndSaysSo(t *testing.T) {
+	stages := representativeStages()
+	for i := 0; i < 30; i++ {
+		stages = append([]resources.CensusStage{{
+			Name: "registered_census", DurationMS: 9999, Scanned: 999, Deferred: 999,
+			ProbeCompleted: 999, ProbeDeferred: 999,
+		}}, stages...)
+	}
+
+	summary := censusStageSummary(stages)
+	if len(summary) > censusStageSummaryBytes {
 		t.Fatalf("summary is unbounded at %d bytes", len(summary))
 	}
+	if !strings.Contains(summary, "earlier stage(s) omitted") {
+		t.Fatalf("stages were dropped without saying so: %s", summary)
+	}
+	if !strings.Contains(summary, "unregistered_orphan_census ms=13200") {
+		t.Fatalf("truncation discarded the failing phase: %s", summary)
+	}
+}
+
+// Identifiers and numbers only: no path, and no verbatim stage cause.
+func TestSummaryCarriesNoPathOrCause(t *testing.T) {
+	summary := censusStageSummary([]resources.CensusStage{{
+		Name: "unregistered_orphan_census", DurationMS: 1,
+		CursorError: "/var/folders/zz/cursor.state: no space left on device",
+		Cause:       "stat /Users/someone/secret/path: permission denied",
+	}})
 	if strings.Contains(summary, "/") {
 		t.Fatalf("summary leaked a path: %q", summary)
-	}
-	if !strings.Contains(summary, "cursor_error") {
-		t.Fatalf("a failed cursor advance must still be visible as a flag: %q", summary)
 	}
 	if strings.Contains(summary, "permission denied") {
 		t.Fatalf("summary quoted a stage cause verbatim: %q", summary)
 	}
+	if !strings.Contains(summary, "cursor_error") {
+		t.Fatalf("a failed cursor advance must remain visible as a flag: %q", summary)
+	}
 }
 
-// An empty report changes nothing: the caller still receives its own error.
+// An empty report changes nothing: the caller receives its own error.
 func TestRefusalWithoutStagesIsReturnedUnchanged(t *testing.T) {
-	wrapped := lifecycleSweepFailure(resources.GovernorReport{}, errDiagnosticsCensus)
-	if wrapped != errDiagnosticsCensus {
-		t.Fatalf("a stageless refusal was rewritten: %v", wrapped)
+	if got := lifecycleSweepFailure(resources.GovernorReport{}, errDiagnosticsCensus); got != errDiagnosticsCensus {
+		t.Fatalf("a stageless refusal was rewritten: %v", got)
 	}
 }

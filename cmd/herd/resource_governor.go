@@ -144,70 +144,75 @@ func attachResourceGovernor(d *dispatch.Dispatcher, cfg *config.Config, root str
 // caller can never out-wait that path on the same global lock.
 const lifecycleSweepBudget = 45 * time.Second
 
-// runLifecycleGovernorSweep is the shared lifecycle boundary: every cmd/herd
-// lifecycle sweep reaches governor.Sweep through it, so the sweep always
-// carries a finite deadline. context.WithTimeout clamps to the earliest
-// deadline in the chain: an already-shorter caller deadline is preserved
-// verbatim, while an unbounded caller (e.g. context.Background() at the
-// review pre-refusal census) receives the operational budget. Cancellation
-// propagates unchanged and the error is returned fail-closed; the deferred
-// cancel releases the timer so no goroutine outlives the sweep.
-func runLifecycleGovernorSweep(ctx context.Context, governor *resources.Governor, trigger resources.SweepTrigger) (resources.GovernorReport, error) {
-	sweepCtx, cancel := context.WithTimeout(ctx, lifecycleSweepBudget)
-	defer cancel()
-	return governor.Sweep(sweepCtx, trigger, governor.LifecycleApply())
+// censusStageSummaryBytes bounds the rendered summary. A refusal is a one-line
+// operational message, not a report dump.
+const censusStageSummaryBytes = 512
+
+// censusStageRecord renders one stage compactly. Zero counts are the common
+// case and say nothing, so they are omitted: that is what keeps the stages
+// which DO carry numbers inside the bound.
+//
+// Identifiers and numbers only. Stage names are fixed constants in the
+// producers, and the stage's Cause is deliberately left out — it can carry a
+// path, and the error it came from is already the message this is attached
+// to. A failed durable-cursor advance appears as the bare flag "cursor_error".
+func censusStageRecord(stage resources.CensusStage) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s ms=%d", stage.Name, stage.DurationMS)
+	if stage.Scanned != 0 {
+		fmt.Fprintf(&b, " scanned=%d", stage.Scanned)
+	}
+	if stage.Deferred != 0 {
+		fmt.Fprintf(&b, " deferred=%d", stage.Deferred)
+	}
+	if stage.ProbeCompleted != 0 {
+		fmt.Fprintf(&b, " probe_completed=%d", stage.ProbeCompleted)
+	}
+	if stage.ProbeDeferred != 0 {
+		fmt.Fprintf(&b, " probe_deferred=%d", stage.ProbeDeferred)
+	}
+	if strings.TrimSpace(stage.CursorError) != "" {
+		b.WriteString(" cursor_error")
+	}
+	return b.String()
 }
 
-// censusStageSummaryLimit bounds how many stages a refusal quotes, and
-// censusStageSummaryBytes bounds the whole rendered summary. A refusal is a
-// one-line operational message, not a report dump.
-const (
-	censusStageSummaryLimit = 6
-	censusStageSummaryBytes = 240
-)
-
 // censusStageSummary renders the counts a refusal needs to say WHICH phase
-// spent the budget, from data the sweep already collected.
+// spent the budget.
 //
-// It carries identifiers and numbers only. Stage names are fixed constants
-// ("registered_census", "unregistered_orphan_census", ...), and the stage's
-// Cause is deliberately omitted: the error it came from is already the
-// message this summary is attached to, and a cause can carry a path. A failed
-// durable-cursor advance appears as the bare flag "cursor_error", never its
-// text.
+// When the whole set does not fit, the EARLIEST stages are dropped and the
+// omission is stated. The refusal is about the phase that stopped, which is
+// the last one recorded: a real sweep runs statfs, then the registered census,
+// then the unregistered-orphan census, and a cut from the end would discard
+// precisely the phase this exists to explain.
 func censusStageSummary(stages []resources.CensusStage) string {
 	if len(stages) == 0 {
 		return ""
 	}
-	var b strings.Builder
-	for i, stage := range stages {
-		if i >= censusStageSummaryLimit {
-			b.WriteString(" ...")
-			break
-		}
-		if i > 0 {
-			b.WriteString("; ")
-		}
-		fmt.Fprintf(&b, "%s ms=%d scanned=%d deferred=%d probe_completed=%d probe_deferred=%d",
-			stage.Name, stage.DurationMS, stage.Scanned, stage.Deferred,
-			stage.ProbeCompleted, stage.ProbeDeferred)
-		if strings.TrimSpace(stage.CursorError) != "" {
-			b.WriteString(" cursor_error")
-		}
+	records := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		records = append(records, censusStageRecord(stage))
 	}
-	summary := b.String()
-	if len(summary) > censusStageSummaryBytes {
-		summary = summary[:censusStageSummaryBytes] + "..."
+	omitted := 0
+	for {
+		summary := strings.Join(records, "; ")
+		if omitted > 0 {
+			summary = fmt.Sprintf("%d earlier stage(s) omitted; ", omitted) + summary
+		}
+		if len(summary) <= censusStageSummaryBytes || len(records) == 1 {
+			return summary
+		}
+		records = records[1:]
+		omitted++
 	}
-	return summary
 }
 
 // lifecycleSweepError is a refusal that still carries the stage counts.
 //
-// FAC-613: sweepResourceGovernor discarded the GovernorReport and returned the
-// bare error, so two native review-preparation refusals at the
-// unregistered-orphan census left no evidence assigning elapsed time to a
-// phase. The report was already built and already held those numbers.
+// FAC-613: the lifecycle boundary returned the bare error while the report it
+// had just built held per-stage timings and counts, so two native
+// review-preparation refusals at the unregistered-orphan census left no
+// evidence assigning elapsed time to a phase.
 type lifecycleSweepError struct {
 	err     error
 	summary string
@@ -221,11 +226,8 @@ func (e *lifecycleSweepError) Error() string {
 // context.DeadlineExceeded, context.Canceled and every governor sentinel.
 func (e *lifecycleSweepError) Unwrap() error { return e.err }
 
-// lifecycleSweepFailure is the whole of the observability boundary.
-//
-// A nil error stays nil: this never turns a deadline into a successful partial
-// admission, and it changes no decision, budget, window or guard. It only
-// stops the already-collected stage counts from being thrown away.
+// lifecycleSweepFailure attaches the summary to a refusal. A nil error stays
+// nil, so a deadline is never reinterpreted as a successful partial admission.
 func lifecycleSweepFailure(report resources.GovernorReport, err error) error {
 	if err == nil {
 		return nil
@@ -237,6 +239,26 @@ func lifecycleSweepFailure(report resources.GovernorReport, err error) error {
 	return &lifecycleSweepError{err: err, summary: summary}
 }
 
+// runLifecycleGovernorSweep is the shared lifecycle boundary: every cmd/herd
+// lifecycle sweep reaches governor.Sweep through it, so the sweep always
+// carries a finite deadline. context.WithTimeout clamps to the earliest
+// deadline in the chain: an already-shorter caller deadline is preserved
+// verbatim, while an unbounded caller (e.g. context.Background() at the
+// review pre-refusal census) receives the operational budget. Cancellation
+// propagates unchanged and the error is returned fail-closed; the deferred
+// cancel releases the timer so no goroutine outlives the sweep.
+//
+// The refusal is decorated HERE, at the boundary itself, rather than by each
+// caller. sweepResourceGovernor discarded the report and returned the bare
+// error, and a caller that has to remember to decorate is a caller that can
+// forget: deciding it once here is what makes the diagnostic structural.
+func runLifecycleGovernorSweep(ctx context.Context, governor *resources.Governor, trigger resources.SweepTrigger) (resources.GovernorReport, error) {
+	sweepCtx, cancel := context.WithTimeout(ctx, lifecycleSweepBudget)
+	defer cancel()
+	report, err := governor.Sweep(sweepCtx, trigger, governor.LifecycleApply())
+	return report, lifecycleSweepFailure(report, err)
+}
+
 func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string, trigger resources.SweepTrigger) error {
 	governor, err := newResourceGovernor(cfg, root)
 	if err != nil {
@@ -245,8 +267,9 @@ func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string,
 	if governor == nil {
 		return nil
 	}
-	report, err := runLifecycleGovernorSweep(ctx, governor, trigger)
-	return lifecycleSweepFailure(report, err)
+	// The boundary already carries the stage summary on its refusal.
+	_, err = runLifecycleGovernorSweep(ctx, governor, trigger)
+	return err
 }
 
 func parseForeignTargets(values []string, alertBytes uint64) ([]resources.ForeignTarget, error) {
