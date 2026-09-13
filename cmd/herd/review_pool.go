@@ -303,7 +303,30 @@ func runPoolReview(ref string) error {
 		return nil
 	}
 
-	p := worktree.NewPool(root, *poolRoot, 2)
+	// The pool root is resolved to an absolute RUNTIME path before the pool is
+	// built, while the flag text the caller gave is left untouched.
+	//
+	// A relative --pool-root means "relative to me", and that meaning is kept:
+	// filepath.Abs resolves it against the caller exactly as the caller wrote
+	// it. What it stops is the value being resolved THREE different ways
+	// afterwards. pkg/worktree anchors p.Root against the process directory
+	// for its state, Ensure stores slot.Path as filepath.Join(p.Root, name) —
+	// still relative — and repoPath then resolves that stored path against the
+	// REPOSITORY root, while the pin below hands lease.Path to `git -C` against
+	// the caller again. NewPool("/owned/repository", "given/pool") from
+	// "/owned/caller" therefore kept state under caller/given/pool, resolved
+	// slot worktrees under repository/given/pool, and pinned
+	// caller/given/pool — three locations for one pool.
+	//
+	// Resolving once here settles all of them without touching the public flag
+	// spelling or any global Pool semantics. It also repairs
+	// poolRelForPending, whose filepath.Rel against an absolute root silently
+	// returned "" for a relative lease path.
+	poolPath, err := filepath.Abs(*poolRoot)
+	if err != nil {
+		return fmt.Errorf("resolve review pool root: %w", err)
+	}
+	p := worktree.NewPool(root, poolPath, 2)
 	// FAC-591: teach the pool which lease holders are still alive so it can
 	// reclaim the rest itself. Every launch that died after leasing used to
 	// leave an ownerless lease no command could free, and the pool wedged at

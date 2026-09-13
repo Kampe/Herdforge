@@ -46,7 +46,7 @@ pool_src=cmd/herd/review_pool.go
 worktree_pkg=./cmd/herd/
 
 pool_run='TestPinnedCandidateAndBase|TestNeedsCandidateDirectory|TestUnpinnedBaseStillPrepares|TestExistingCandidateWorktree|TestRepeatedPinnedResolution|TestUnresolvableCandidate'
-pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier TestUnnamedReviewRootsAnchorToTheRepository TestNamedReviewRootsAreLeftExactlyAsGiven TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot'
+pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier TestUnnamedReviewRootsAnchorToTheRepository TestNamedReviewRootsAreLeftExactlyAsGiven TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot'
 
 go_timeout=${VERIFY_CARRIER_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -256,6 +256,15 @@ controls=(
 	if err != nil {
 		return fmt.Errorf(\"resolve repository root: %w\", err)
 	}${sep}TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot${sep}a relative repository root was refused"
+"pool-root-resolved-before-the-pool${sep}${pool_src}${sep}${worktree_pkg}${sep}	poolPath, err := filepath.Abs(*poolRoot)
+	if err != nil {
+		return fmt.Errorf(\"resolve review pool root: %w\", err)
+	}
+	p := worktree.NewPool(root, poolPath, 2)${sep}	poolPath, err := *poolRoot, error(nil) // MUTANT: the pool root is used unresolved
+	if err != nil {
+		return fmt.Errorf(\"resolve review pool root: %w\", err)
+	}
+	p := worktree.NewPool(root, poolPath, 2)${sep}TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot${sep}an explicit relative pool root was refused"
 )
 
 # ---------------------------------------------------------------------------

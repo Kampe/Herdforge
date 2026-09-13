@@ -225,14 +225,21 @@ func entryConfig(t *testing.T, root string) {
 // runEntry drives the real entry with real argv.
 func runEntry(t *testing.T, sha, base string) error {
 	t.Helper()
+	return runEntryWith(t, sha, base)
+}
+
+// runEntryWith drives the real entry with real argv, plus any extra flags the
+// caller needs.
+func runEntryWith(t *testing.T, sha, base string, extra ...string) error {
+	t.Helper()
 	previous := os.Args
 	t.Cleanup(func() { os.Args = previous })
-	os.Args = []string{"herd", "review", entryRef,
+	os.Args = append([]string{"herd", "review", entryRef,
 		"--pool", "--no-launch",
 		"--sha", sha,
 		"--base", base,
 		"--builder-family", "anthropic",
-	}
+	}, extra...)
 	return runPoolReview(entryRef)
 }
 
@@ -504,6 +511,55 @@ func TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot(t *testing.T) {
 	}
 	if dirt := strings.TrimSpace(entryGitOutput(t, root, "status", "--porcelain")); dirt != "" {
 		t.Fatalf("a relative root left undeclared dirt:\n%s", dirt)
+	}
+	assertCompleteCensusObserved(t, herdrCalls())
+}
+
+// AN EXPLICIT RELATIVE --pool-root, from a different directory.
+//
+// A relative --pool-root means "relative to me", and it used to be resolved
+// three ways: pkg/worktree anchored its STATE against the process directory,
+// stored slot.Path as a relative join, and then resolved that stored path
+// against the REPOSITORY root, while the pin handed lease.Path to `git -C`
+// against the caller again. This drives the real entry from a fixture-owned
+// caller directory with exactly that spelling and requires one location.
+func TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot(t *testing.T) {
+	root, sha, herdrCalls := entryFixture(t)
+	entryConfig(t, root)
+	base := strings.TrimSpace(entryGitOutput(t, root, "rev-parse", sha+"^"))
+
+	// A caller directory this test owns, outside the repository.
+	caller := filepath.Join(filepath.Dir(root), "caller-"+filepath.Base(root))
+	if err := os.MkdirAll(caller, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(caller) })
+	t.Chdir(caller)
+
+	if err := runEntryWith(t, sha, base, "--pool-root", "given/pool"); err != nil {
+		t.Fatalf("an explicit relative pool root was refused: %v", err)
+	}
+
+	// ONE location: the caller-relative spelling the caller actually wrote.
+	slot := filepath.Join(caller, "given", "pool", "pool-01")
+	if head := strings.TrimSpace(entryGitOutput(t, slot, "rev-parse", "HEAD")); head != sha {
+		t.Fatalf("leased slot HEAD = %s, want the exact candidate %s", head, sha)
+	}
+	state, err := os.ReadFile(filepath.Join(caller, "given", "pool", "pool.json"))
+	if err != nil {
+		t.Fatalf("pool state is not where the caller named it: %v", err)
+	}
+	if !strings.Contains(string(state), "\"lease_id\"") {
+		t.Fatalf("no-launch preparation released the lease it must hold: %s", state)
+	}
+
+	// NO SHADOW POOL under the repository, which is where the stored relative
+	// slot path used to be resolved.
+	if _, err := os.Stat(filepath.Join(root, "given")); !os.IsNotExist(err) {
+		t.Fatalf("a shadow pool was created under the repository root: %v", err)
+	}
+	if got := entryCarriers(t, root); len(got) != 0 {
+		t.Fatalf("an explicit relative pool root left an unowned carrier: %v", got)
 	}
 	assertCompleteCensusObserved(t, herdrCalls())
 }
