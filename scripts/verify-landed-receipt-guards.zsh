@@ -561,36 +561,55 @@ fi
 # Every control row is validated BEFORE the run starts, against the snapshot
 # taken above. A row with the wrong shape, or naming a file this driver never
 # hashed, would be mutated with no pristine hash to restore from -- and the
-# lookup that would have caught it only happens during mutation, after the
-# baseline suite has already been paid for. This block is placed after the
-# helpers it calls and before run_all_suites, so a registry defect costs a
-# second rather than a baseline and a child workload.
+# lookup that would otherwise catch it only happens during mutation, after the
+# baseline suite and its child workload have already been paid for.
+#
+# This block is IDENTICAL in both drivers on purpose. They drifted once: one
+# gained a test-package check the other did not have, and a registry defect that
+# one driver refused, the other carried into a baseline. Keeping one text in two
+# places is a duplicate rule, and the honest mitigation is that it is byte-for-
+# byte the same and audited as a pair, not paraphrased in each.
+#
+# It is placed AFTER the helpers it calls and BEFORE run_all_suites. The order
+# is load bearing in both directions: calling count_literal before it is defined
+# aborts under set -e, and validating after the baseline is the defect this
+# exists to remove.
 (( ${#mutations} > 0 )) || { print -u2 'error: no controls are declared; this driver would report success having proven nothing'; exit 1; }
+typeset -A control_ids
 for record in "${mutations[@]}"; do
 	fields=("${(@ps:$sep:)record}")
 	if (( ${#fields} != 7 )); then
 		print -u2 "error: control row ${fields[1]:-<unnamed>} has ${#fields} fields, want 7"
 		exit 1
 	fi
+	id=$fields[1]
+	# An unnamed or repeated id makes the evidence ambiguous: every line in the
+	# summary and every artifact stem is keyed on it, and a verdict that cannot
+	# be attributed to one control is not evidence about that control.
+	[[ -n "$id" ]] || { print -u2 'error: a control row has an empty id; its verdict would name nothing'; exit 1; }
+	[[ -z "${control_ids[$id]-}" ]] || { print -u2 "error: control id $id is declared twice; two verdicts would report under one name"; exit 1; }
+	control_ids[$id]=1
 	rel=$fields[2]
+	[[ -n "$rel" ]] || { print -u2 "error: control $id names no source to mutate"; exit 1; }
 	if [[ -z "${pristine[$rel]-}" ]]; then
-		print -u2 "error: control ${fields[1]} mutates $rel, which is not in sources and has no pristine hash"
+		print -u2 "error: control $id mutates $rel, which is not in sources and has no pristine hash"
 		exit 1
 	fi
-	[[ -n "$fields[3]" ]] || { print -u2 "error: control ${fields[1]} has no test package"; exit 1; }
-	[[ -n "$fields[4]" ]] || { print -u2 "error: control ${fields[1]} has an empty anchor"; exit 1; }
-	# Anchor uniqueness is checked HERE, against the ACTUAL source, not at
-	# mutation time: an anchor that drifted or that matches two sites is a
-	# control that cannot be applied, and finding that out from CI an hour later
-	# is the avoidable half of the cost.
+	[[ -n "$fields[3]" ]] || { print -u2 "error: control $id has no test package to run"; exit 1; }
+	[[ -n "$fields[4]" ]] || { print -u2 "error: control $id has an empty anchor"; exit 1; }
+	# Uniqueness is checked against the ACTUAL source, here rather than at
+	# mutation time: an anchor that drifted, or that matches two sites, is a
+	# control that cannot be applied, and learning that from CI an hour later is
+	# the avoidable half of the cost.
 	occurrences=$(count_literal "$fields[4]" "$(<$work/$rel)") || exit 1
 	if [[ "$occurrences" != 1 ]]; then
-		print -u2 "error: control ${fields[1]} anchor occurs $occurrences time(s) in $rel, want exactly 1"
+		print -u2 "error: control $id anchor occurs $occurrences time(s) in $rel, want exactly 1"
 		exit 1
 	fi
-	[[ -n "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} has an empty replacement"; exit 1; }
-	[[ "$fields[4]" != "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} replacement equals its anchor"; exit 1; }
-	[[ -n "$fields[6]" && -n "$fields[7]" ]] || { print -u2 "error: control ${fields[1]} has no killer or no required assertion"; exit 1; }
+	[[ -n "$fields[5]" ]] || { print -u2 "error: control $id has an empty replacement"; exit 1; }
+	[[ "$fields[4]" != "$fields[5]" ]] || { print -u2 "error: control $id replacement equals its anchor"; exit 1; }
+	[[ -n "$fields[6]" ]] || { print -u2 "error: control $id names no killer test"; exit 1; }
+	[[ -n "$fields[7]" ]] || { print -u2 "error: control $id names no required assertion"; exit 1; }
 done
 
 run_all_suites baseline || exit 1
