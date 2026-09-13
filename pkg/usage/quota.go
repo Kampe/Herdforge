@@ -43,6 +43,7 @@ type BurnState struct {
 	RunwayResource      string               `json:"runwayResource,omitempty"`
 	Available           bool                 `json:"available"`
 	Reason              string               `json:"reason"`
+	Cause               string               `json:"cause,omitempty"`
 	Unit                string               `json:"unit,omitempty"`
 	Pool                string               `json:"pool,omitempty"`
 	Account             *AccountIdentity     `json:"account,omitempty"`
@@ -51,6 +52,12 @@ type BurnState struct {
 	Windows             []BurnState          `json:"windows,omitempty"`
 	Pools               map[string]BurnState `json:"pools,omitempty"`
 }
+
+// reasonNoQuotaData is the routing gate's "we could not read quota" reason.
+// It is deliberately shared by an absent reading and a telemetry failure: both
+// mean unknown, and the read path (pkg/router available()) treats unknown as
+// pass-through rather than refusal. The distinguishing detail belongs in Cause.
+const reasonNoQuotaData = "no-quota-data"
 
 type QuotaEngine struct {
 	ExhaustedPct  float64
@@ -394,7 +401,7 @@ func poolResources(name string, prov ProviderUsage) map[string]map[string]bool {
 
 func decorate(bs *BurnState, stale bool, plan string, providerError bool, exhaustedPct float64) BurnState {
 	if bs == nil {
-		reason := "no-quota-data"
+		reason := reasonNoQuotaData
 		if stale {
 			reason = "stale"
 		} else if providerError {
@@ -459,7 +466,51 @@ func (e *QuotaEngine) ComputeAll(snap *UsageSnapshot) map[string]BurnState {
 			}
 		}
 	}
+	addTelemetryFailures(computed, snap)
 	return computed
+}
+
+// CauseTelemetryRateLimited is the stable machine token for "the provider's
+// USAGE-TELEMETRY endpoint refused us", as distinct from "the provider is out
+// of quota". It prefixes the classified poll error in BurnState.Cause.
+const CauseTelemetryRateLimited = "telemetry-rate-limited"
+
+// addTelemetryFailures gives a provider that produced no reading BECAUSE its
+// telemetry endpoint rate-limited us an explicit identity in the computed map.
+//
+// FAC-818: such a provider was previously absent from ComputeAll entirely, so
+// "we could not read this provider's quota" and "this provider does not exist"
+// were the same observation. Live consequence: with Anthropic's usage endpoint
+// answering 429 and no banked reading to fall back on, claude vanished from
+// the quota document while Opus lanes were executing normally.
+//
+// Two properties this deliberately preserves:
+//
+//   - It never invents quota. Used/Remaining/Class stay zero-valued; only the
+//     identity is added. A caller that wants numbers still finds none.
+//   - Reason stays reasonNoQuotaData, which is what the routing read path
+//     (pkg/router available(), effectivePressure) already treats as "unknown,
+//     pass through". Naming the cause must not silently start REFUSING a
+//     provider that routing accepts today -- the diagnostic belongs in Cause.
+//
+// Only the rate-limited class is admitted. Other failures (auth, unreachable,
+// decode) keep today's absent behavior rather than having their routing
+// treatment changed as a side effect of a telemetry fix.
+func addTelemetryFailures(computed map[string]BurnState, snap *UsageSnapshot) {
+	for name, detail := range snap.Errors {
+		if _, ok := computed[name]; ok {
+			continue
+		}
+		if pollErrorCodeFromDetail(detail) != "rate-limited" {
+			continue
+		}
+		computed[name] = BurnState{
+			Class:     BurnUntracked,
+			Available: false,
+			Reason:    reasonNoQuotaData,
+			Cause:     CauseTelemetryRateLimited + ": " + detail,
+		}
+	}
 }
 
 func (e *QuotaEngine) PickProvider(computed map[string]BurnState, among []string) (string, BurnState, error) {
@@ -566,7 +617,7 @@ func (e *QuotaEngine) ProviderOK(computed map[string]BurnState, provider string)
 	if !ok {
 		return BurnState{}, false
 	}
-	if p.Reason == "no-quota-data" {
+	if p.Reason == reasonNoQuotaData {
 		return p, false
 	}
 	if len(p.Pools) > 0 {

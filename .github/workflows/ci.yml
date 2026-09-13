@@ -87,6 +87,33 @@ jobs:
         env:
           CHAINSEER_BIN: chainseer/bin
 
+      # FAC-827: the budget guards are covered by tests that had never been
+      # shown to fail. This driver proves each mutant COMPILES and then dies on
+      # a named assertion, read from go test JSON, so the receipt cannot claim
+      # controls that never ran. It owns one ephemeral worktree under
+      # RUNNER_TEMP, removes only that, and fails the step if it cannot.
+      - name: FAC-827 manifest budget non-vacuity controls
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-manifest-budget.zsh
+
+      # The control logs land under a HIDDEN directory, and upload-artifact
+      # excludes hidden paths by default, so every run uploaded nothing and
+      # warned about it. The receipt then described controls whose raw output
+      # was not retained anywhere. Hidden files are included explicitly for
+      # this one controlled path, and a missing log set now FAILS the step:
+      # evidence that did not survive must not be reportable as green.
+      - name: Upload manifest budget control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-manifest-budget-logs
+          path: .verify-budget-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."

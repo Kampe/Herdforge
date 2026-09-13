@@ -41,6 +41,15 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 		if apiKey == "" {
 			return nil, fmt.Errorf("linear task provider credential is missing from %s", env)
 		}
+	case "jira":
+		env := strings.TrimSpace(cfg.TaskProvider.APIKeyEnv)
+		if env == "" {
+			return nil, fmt.Errorf("jira task_provider.api_key_env is required")
+		}
+		apiKey = strings.TrimSpace(os.Getenv(env))
+		if apiKey == "" {
+			return nil, fmt.Errorf("jira task provider credential is missing from %s", env)
+		}
 	case "kaneo":
 		// The operator-selected Kaneo profile is intentionally external to the
 		// repository; use its explicit environment origin when herd.yaml omits
@@ -82,6 +91,7 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 		UseCLI:              useCLI,
 		CoreTaskReads:       cfg.TaskProvider.CoreTaskReads,
 		APIKey:              apiKey,
+		UserEmail:           strings.TrimSpace(cfg.TaskProvider.UserEmail),
 		APIKeyTrustedOrigin: trustedOrigin,
 		Enabled:             cfg.TaskProvider.Enabled,
 		Get:                 g,

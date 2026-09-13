@@ -16,6 +16,8 @@ type TaskConfig struct {
 	CoreTaskReads bool
 	// APIKey for HTTP bulk graph fan-out (even when UseCLI is true).
 	APIKey string
+	// UserEmail is the account half of a Basic-auth credential (Jira).
+	UserEmail string
 	// APIKeyTrustedOrigin is operator-controlled (KANEO_API_URL or selected
 	// profile origin). It must never be inferred from repository APIURL.
 	APIKeyTrustedOrigin string
@@ -88,6 +90,30 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 		l.ProjectID = projectID
 		ApplyDeadlines(l, dls)
 		return NewBoundClient(l, dls), nil
+	case "jira":
+		// Jira is per-tenant, so unlike Linear the site origin MUST come from
+		// config. That makes it the URL the operator credential is sent to, so
+		// it is validated here rather than trusted: https only, a real host, and
+		// no embedded userinfo that could redirect the Basic-auth header.
+		baseURL, err := validateProviderBaseURL("jira", tc.APIURL)
+		if err != nil {
+			return nil, err
+		}
+		email := strings.TrimSpace(tc.UserEmail)
+		if email == "" {
+			return nil, fmt.Errorf("task_provider.user_email is required for jira")
+		}
+		if strings.TrimSpace(tc.APIKey) == "" {
+			return nil, fmt.Errorf("task_provider.api_key_env is required for jira")
+		}
+		projectKey := strings.TrimSpace(tc.ProjectID)
+		if projectKey == "" {
+			return nil, fmt.Errorf("jira task_provider.project_id is required")
+		}
+		jp := NewJiraProvider(baseURL, email, strings.TrimSpace(tc.APIKey))
+		jp.ProjectKey = projectKey
+		ApplyDeadlines(jp, dls)
+		return NewBoundClient(jp, dls), nil
 	case "memory":
 		// Explicit test/dev type — still bound so timeouts classify uniformly.
 		return NewBoundClient(NewMemoryProvider(), dls), nil
