@@ -47,6 +47,15 @@ var quotaCache struct {
 	fetchedAt time.Time
 }
 
+// defaultSnapshotTTL is how long a SUCCESSFUL reading is served from cache, and
+// maxRateLimitBackoff caps the escalation of a rate-limited provider's re-poll
+// interval. Both live here so rateLimitBackoff's "never poll a failing provider
+// more eagerly than a healthy one" floor is a compiler fact, not a comment.
+const (
+	defaultSnapshotTTL  = 45 * time.Second
+	maxRateLimitBackoff = 15 * time.Minute
+)
+
 // snapshotTTL is how long a quota reading may be reused. Short on purpose: it
 // exists to collapse the repeated fetches of one dispatch beat, not to remember
 // quota across a session.
@@ -56,7 +65,7 @@ func snapshotTTL() time.Duration {
 			return time.Duration(n) * time.Second
 		}
 	}
-	return 45 * time.Second
+	return defaultSnapshotTTL
 }
 
 // snapshotCachePath is per-user and outside any repository: quota is a property
@@ -85,6 +94,11 @@ type cachedProviderRecord struct {
 	AccountKey   string        `json:"account_key,omitempty"`
 	BackoffUntil time.Time     `json:"backoff_until,omitempty"`
 	Error        string        `json:"error,omitempty"`
+	// FailureStreak counts CONSECUTIVE rate-limited polls for this account.
+	// It drives backoff escalation and is reset by any successful poll (a
+	// success writes a fresh record) or by an account change, so a new
+	// credential never inherits the previous account's penalty.
+	FailureStreak int `json:"failure_streak,omitempty"`
 }
 
 // readSnapshotFile returns a persisted reading and its age when it is younger
@@ -490,7 +504,14 @@ func fetchProviderCached(provider string, force bool) (*UsageSnapshot, error) {
 			return withSnapshotFileLock(func() error { return mergeSnapshotFile(snap, nil) })
 		}
 		if pollErrorCode(err) == "rate-limited" {
-			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: accountKey, BackoffUntil: time.Now().Add(rateLimitBackoff(err)), Error: classifyPollError(err)}
+			// Escalate only within one account's streak: a different account
+			// key means different credentials and a fresh limit, so it starts
+			// over at 1 rather than inheriting the prior account's penalty.
+			streak := 1
+			if persistedOK && persisted.AccountKey == accountKey {
+				streak = persisted.FailureStreak + 1
+			}
+			record := cachedProviderRecord{ObservedAt: time.Now().UTC(), AccountKey: accountKey, BackoffUntil: time.Now().Add(rateLimitBackoff(err, streak)), Error: classifyPollError(err), FailureStreak: streak}
 			return withSnapshotFileLock(func() error {
 				return mergeSnapshotFile(&UsageSnapshot{Providers: map[string]ProviderUsage{}, Errors: map[string]string{name: classifyPollError(err)}}, &record)
 			})
@@ -556,25 +577,70 @@ func readProviderRecord(name string) (cachedProviderRecord, bool) {
 	return cachedProviderRecord{}, false
 }
 
-func rateLimitBackoff(err error) time.Duration {
-	const defaultBackoff = 15 * time.Second
+// retryAfterSeconds extracts a VALID upstream Retry-After from a classified
+// rate-limit error. "0", a negative, or an unparseable value is not valid and
+// reports false -- a server that says "retry immediately" while returning 429
+// is not evidence that immediately is safe.
+func retryAfterSeconds(err error) (time.Duration, bool) {
 	text := classifyPollError(err)
 	marker := "retry-after="
-	if i := strings.Index(text, marker); i >= 0 {
-		value := strings.TrimSpace(text[i+len(marker):])
-		if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil && seconds > 0 {
-			if seconds > int64((1<<63-1)/int64(time.Second)) {
-				return time.Duration(1<<63 - 1)
-			}
-			return time.Duration(seconds) * time.Second
+	i := strings.Index(text, marker)
+	if i < 0 {
+		return 0, false
+	}
+	value := strings.TrimSpace(text[i+len(marker):])
+	if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil {
+		if seconds <= 0 {
+			return 0, false
 		}
-		if retryAt, parseErr := http.ParseTime(value); parseErr == nil {
-			if delay := time.Until(retryAt); delay > 0 {
-				return delay
-			}
+		if seconds > int64((1<<63-1)/int64(time.Second)) {
+			return time.Duration(1<<63 - 1), true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	if retryAt, parseErr := http.ParseTime(value); parseErr == nil {
+		if delay := time.Until(retryAt); delay > 0 {
+			return delay, true
 		}
 	}
-	return defaultBackoff
+	return 0, false
+}
+
+// rateLimitBackoff is how long a rate-limited provider is left alone before
+// the next live poll, given how many consecutive failures it has had.
+//
+// FAC-818: the previous flat 15s default was SHORTER than the 45s success TTL,
+// so a throttled provider was re-polled three times more often than a healthy
+// one -- and because a provider with no reading is never served from the TTL
+// cache, that 15s was its only limiter. Observed live against Anthropic's
+// usage endpoint, which answers 429 with "retry-after=0": one live 429 per
+// host every ~15s, indefinitely, which helps sustain the very rate limit it is
+// probing.
+//
+// The floor is therefore the success TTL (never poll a failing provider more
+// eagerly than a healthy one), doubling per consecutive failure, capped. A
+// GREATER valid upstream Retry-After always wins: the server is authoritative
+// about its own limit and may ask for longer than our cap. A Retry-After
+// below the floor -- including the "0" that started this -- cannot undercut it.
+func rateLimitBackoff(err error, streak int) time.Duration {
+	floor := snapshotTTL()
+	if floor < defaultSnapshotTTL {
+		floor = defaultSnapshotTTL
+	}
+	if streak < 1 {
+		streak = 1
+	}
+	backoff := floor
+	for i := 1; i < streak && backoff < maxRateLimitBackoff; i++ {
+		backoff *= 2
+	}
+	if backoff > maxRateLimitBackoff {
+		backoff = maxRateLimitBackoff
+	}
+	if retryAfter, ok := retryAfterSeconds(err); ok && retryAfter > backoff {
+		return retryAfter
+	}
+	return backoff
 }
 
 // staleBackoffSnapshot surfaces the last known-good reading for a provider

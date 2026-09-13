@@ -925,6 +925,36 @@ type LSOFProcessInspector struct {
 
 const maxBatchProcessTargets = 64
 
+// NewSealedPopulationInspector returns an inspector whose census walks a
+// sealed process population — the given pids and owner table — instead of
+// the host's live process table. Fixtures for retirement flows use it to
+// stay independent of the host's process permissions (FAC-215): whether the
+// census answers at all is still decided by the real per-pid reference
+// probes, only the population they cover is fixed. The production census
+// keeps listing the real host population.
+func NewSealedPopulationInspector(pids []int, owners map[int]int) LSOFProcessInspector {
+	sealedPIDs := append([]int(nil), pids...)
+	sealedOwners := make(map[int]int, len(owners))
+	for pid, uid := range owners {
+		sealedOwners[pid] = uid
+	}
+	return LSOFProcessInspector{
+		Timeout:        2 * time.Second,
+		MaxOutputBytes: 1 << 20,
+		populationFn: func(context.Context) ([]int, map[int]int, error) {
+			return append([]int(nil), sealedPIDs...), cloneOwnerSnapshot(sealedOwners), nil
+		},
+	}
+}
+
+func cloneOwnerSnapshot(owners map[int]int) map[int]int {
+	cloned := make(map[int]int, len(owners))
+	for pid, uid := range owners {
+		cloned[pid] = uid
+	}
+	return cloned
+}
+
 // maxMetadataCauses bounds the per-pid cause sample retained on
 // ProcessUsage.MetadataCause: a churny host can error hundreds of probes and
 // the census report stays bounded while remaining actionable.
@@ -1773,7 +1803,7 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 	for _, path := range paths {
 		references[path] = false
 	}
-	if procData, procErr := readProcessProc(pid); procErr == nil {
+	if procData, procErr := readProcessProcFn(pid); procErr == nil {
 		for path := range references {
 			needle := []byte(path)
 			for _, data := range procData {
@@ -1791,7 +1821,7 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 			return references, nil
 		}
 		if runtime.GOOS == "darwin" {
-			args, argsErr := readDarwinProcessArgs(pid)
+			args, argsErr := readDarwinProcessArgsFn(pid)
 			if argsErr != nil {
 				if errors.Is(argsErr, os.ErrProcessDone) {
 					return references, nil
@@ -1803,6 +1833,13 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 			}
 			return references, nil
 		}
+		// A same-owner or owner-unknown failure remains an error and is
+		// fail-closed: the environment among the private metadata is one of
+		// the reference surfaces (a path held only in the environment, with
+		// no argv, cwd, open-file, or mapping evidence), and the public
+		// command surface proves argv only. An unreadable environment for a
+		// live same-owner process is an unknown observation, never a
+		// complete "no reference" answer.
 		return references, fmt.Errorf("read same-owner process metadata for pid %d: %w", pid, procErr)
 	} else if owners != nil {
 		if killErr := syscall.Kill(pid, 0); errors.Is(killErr, syscall.ESRCH) {
@@ -1814,6 +1851,17 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 	} else if gone || foreign {
 		return references, nil
 	}
+	return probeReferencesByProcessCommand(ctx, pid, references)
+}
+
+// probeReferencesByProcessCommand answers the reference question from the
+// PUBLIC command surface alone (ps -ww argv, plus the Darwin procargs
+// environment when the platform serves it). It is the one reference authority
+// for the owner-snapshot-unavailable path, whose process cannot be classified
+// as foreign or gone by any other means. It is deliberately NOT consulted for
+// a same-owner /proc read failure: ps command= proves argv and never the
+// environment, so a refusal there stays fail-closed.
+func probeReferencesByProcessCommand(ctx context.Context, pid int, references map[string]bool) (map[string]bool, error) {
 	ps, err := exec.LookPath("ps")
 	if err != nil {
 		return references, fmt.Errorf("process metadata unavailable for pid %d: %w", pid, err)
@@ -1842,7 +1890,7 @@ func processReferencesManyWithOwners(ctx context.Context, pid int, paths []strin
 		// kern.procargs2 is the unprivileged same-user Darwin process surface
 		// that includes the environment; ps -E is not reliable with custom
 		// output and launchctl procinfo is root-only.
-		if args, argsErr := readDarwinProcessArgs(pid); argsErr == nil {
+		if args, argsErr := readDarwinProcessArgsFn(pid); argsErr == nil {
 			for path := range references {
 				references[path] = bytes.Contains(args, []byte(path))
 			}
@@ -1929,6 +1977,16 @@ func processOwnerViaPS(ctx context.Context, pid int) (foreign, gone bool, err er
 	}
 	return uid != os.Getuid(), false, nil
 }
+
+// readProcessProcFn is the /proc metadata seam. A stub decides between the
+// kernel's definitive read-authority refusals and every other failure without
+// depending on a real /proc or a dumpable-cleared process being present.
+var readProcessProcFn = readProcessProc
+
+// readDarwinProcessArgsFn is the darwin argv/environment seam, the same
+// hermeticity contract as readProcessProcFn on the darwin branch of the
+// per-pid reference decision.
+var readDarwinProcessArgsFn = readDarwinProcessArgs
 
 func readProcessProc(pid int) ([][]byte, error) {
 	base := filepath.Join("/proc", strconv.Itoa(pid))
