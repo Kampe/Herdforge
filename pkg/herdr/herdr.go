@@ -1572,23 +1572,59 @@ func IsAvailable() bool {
 
 // AgentListContext returns all agents managed by herdr bounded by the provided context.
 func AgentListContext(ctx context.Context) ([]AgentEntry, error) {
-	output, err := runHerdrContext(ctx, "agent", "list")
+	agents, _, err := AgentListVerifiedContext(ctx)
+	return agents, err
+}
+
+// AgentListVerifiedContext is AgentListContext plus the one fact the bare
+// roster cannot carry: whether the reply proved it came from herdr.
+//
+// The second return is FALSE when the response was a success envelope without
+// the native identity the 0.9.0 contract requires. That distinction is the
+// whole point. Before it existed, any non-null result was accepted outright,
+// so an id-less {"result":{"agents":[]}} produced a clean, non-partial,
+// zero-agent digest that exited 0 — a malformed response presenting as a
+// healthy empty fleet, which is exactly the "I could not look" / "nothing is
+// there" confusion this command exists to avoid.
+//
+// It is a SEPARATE entry point rather than a hard requirement inside
+// AgentListContext deliberately. Roughly 124 fixtures across this repository
+// emit id-less result envelopes, and rejecting them outright would break
+// unrelated suites far outside this lane's scope. Callers that must not report
+// a clean fleet from an unproven roster ask for the flag; every existing caller
+// keeps working unchanged.
+func AgentListVerifiedContext(ctx context.Context) ([]AgentEntry, bool, error) {
+	// Bounded read transport (FAC-36): the roster is an observation, so it gets
+	// the same finite byte ceiling and owned-child cancellation as a pane read.
+	output, err := runHerdrReadContext(ctx, DefaultReadTransportLimit, "agent", "list")
 	if err != nil {
-		return nil, fmt.Errorf("herdr agent list: %w", err)
+		return nil, false, fmt.Errorf("herdr agent list: %w", err)
 	}
-	var resp struct {
-		Result struct {
-			Agents []AgentEntry `json:"agents"`
-			Type   string       `json:"type"`
-		} `json:"result"`
+	// Validate the TRANSPORT before trusting anything inside it. Checking only
+	// that result.agents was non-nil let an error envelope that also carried a
+	// result array be consumed as a roster.
+	reply, decodeErr := decodeHerdrTransport(output)
+	if decodeErr != nil {
+		return nil, false, fmt.Errorf("herdr agent list: %w", decodeErr)
 	}
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
-		return nil, fmt.Errorf("parsing agent list: %s: %w", output, err)
+	if !reply.Envelope {
+		// Output that never claimed to be a structured reply. A pane read can
+		// still use such text (flagged unverified); a ROSTER cannot, because
+		// there is nothing to parse and an empty result here would read as an
+		// empty fleet.
+		return nil, false, fmt.Errorf("herdr agent list: %w: response is not a transport envelope", ErrReadTransportEnvelope)
 	}
-	if resp.Result.Agents == nil {
-		return nil, fmt.Errorf("herdr agent list returned no agents inventory")
+	var body struct {
+		Agents []AgentEntry `json:"agents"`
+		Type   string       `json:"type"`
 	}
-	return resp.Result.Agents, nil
+	if err := json.Unmarshal(reply.Result, &body); err != nil {
+		return nil, false, fmt.Errorf("parsing agent list: %w: %v", ErrReadTransportUnsupportedResult, err)
+	}
+	if body.Agents == nil {
+		return nil, false, fmt.Errorf("herdr agent list returned no agents inventory")
+	}
+	return body.Agents, reply.Identified, nil
 }
 
 // AgentList returns all agents managed by herdr.

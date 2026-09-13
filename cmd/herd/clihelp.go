@@ -334,7 +334,7 @@ Commands:
 		"  Warm review-surface pool. release frees a held lease; list shows current holders.\n" +
 		"  A lease taken for a review must be released when that review settles, or the\n" +
 		"  surface stays held and the next exact SHA on the same branch cannot get one.",
-	"process":      "Usage: herd process [flags]\n  Process-engine inspection.",
+	"process":      "Usage: herd process [--json] [--workspace WS] [--lines N] [--deadline D]\n  Read-only fleet digest: classifies live pane text as advisory evidence.\n  --workspace  herdr workspace scope (default: fleet.herdr_workspace; required)\n  --lines      pane tail depth per agent (capped at 50)\n  --deadline   hard bound on the whole sweep (capped at 5m, default 30s)\n  Exits nonzero when the sweep is partial. A classification is evidence\n  about text, never authority to act on the agent it describes.",
 	"resolve-lane": "Usage: herd resolve-lane [flags]\n  Resolve canonical lane identity.",
 	"route":        "Usage: herd route [flags]\n  Model / surface routing helpers.",
 	"kick":         "Usage: herd kick [flags]\n  Nudge a stalled lane / agent; --cadence throttles repeat kicks and --repair bypasses freeze.",
@@ -348,11 +348,19 @@ Commands:
   herd mail import --source-host HOST --recipient NAME [--file path|-] [--mail path]
   herd mail status --recipient NAME --id ID [--mail path]
   herd mail ack --recipient NAME --id ID [--mail path]
-  herd mail inbox --recipient NAME [--mail path]
-  herd mail read --recipient NAME [--mail path]
+  herd mail inbox --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
+  herd mail read --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
   herd mail repair --id ID [--mail path] [--reason TEXT]
   herd mail repair --id ID --fingerprint SHA256 --actor NAME --act [--mail path] [--reason TEXT]
   herd mail control <issue|drain> [flags]
+
+Bounded paging (inbox/read): passing --after-cursor, --limit or --max-bytes
+returns {envelopes, next_cursor, truncated, retained_bytes} instead of the
+plain array. An unflagged call is unchanged. The cursor is versioned and bound
+to its recipient; a cursor from another recipient or another version is an
+error, never a silent resume. Paging bounds what is RETAINED and RETURNED, not
+the scan: JSONL has no index, so each page still walks the file. Paging never
+acknowledges, rewrites, or deletes anything.
 
 herd mail repair is a bounded operator recovery for ONE quarantined row whose
 only defect is a legacy non-RFC3339 timestamp: it normalizes that timestamp,
