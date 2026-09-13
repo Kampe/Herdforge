@@ -98,7 +98,8 @@ func runPoolReview(ref string) error {
 	}
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.
-	candidateDir, err := resolvePoolReviewCandidateAt(root, ref, strings.TrimSpace(*shaFlag))
+	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
+		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))
 	if err != nil {
 		return err
 	}
@@ -953,7 +954,34 @@ func resolvePoolReviewCandidate(root, ref string) (string, error) {
 // slot --hard to the exact SHA regardless, so what matters is that the surface
 // IS that SHA -- which is verified here rather than assumed from a branch name.
 // With no SHA to check, the old branch-only behaviour is unchanged.
+// needsCandidateDirectory reports whether anything downstream will actually
+// READ a candidate worktree, and therefore whether one is worth allocating.
+//
+// FAC-832: pool preparation allocated a detached carrier under .herd/worktrees
+// on every resolution, including the case where the caller already pinned both
+// the exact candidate sha and the exact review base. In that case nothing ever
+// opened the directory: the sha needs no HEAD read, and the base needs no
+// authenticated task context. The reviewer works in the LEASED POOL SLOT, and
+// the review "surface" is a symlink to that slot — the carrier was never the
+// reviewer's tree. It outlived the reviewer with no retirement owner, because
+// --no-launch records no manifest and worktree-reap deliberately keeps
+// detached review-pool surfaces.
+//
+// Discovery of an EXISTING worktree is unaffected and still preferred; only
+// speculative creation is withheld.
+func needsCandidateDirectory(sha, explicitBase string) bool {
+	return strings.TrimSpace(sha) == "" || strings.TrimSpace(explicitBase) == ""
+}
+
 func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
+	return resolvePoolReviewCandidateAtFor(root, ref, sha, true)
+}
+
+// resolvePoolReviewCandidateAtFor resolves the candidate surface. When
+// mayPrepare is false it will still FIND an existing worktree, but it will not
+// create one: it answers "" so the caller proceeds from the identities it was
+// given rather than from a directory nobody reads.
+func resolvePoolReviewCandidateAtFor(root, ref, sha string, mayPrepare bool) (string, error) {
 	// Probe both spellings: the raw-ref path for historical ticket-style refs and
 	// the launcher's sanitized path, so one sanitizer cannot hide the other's dir.
 	for _, dir := range candidateSurfaceDirs(root, ref) {
@@ -992,6 +1020,12 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 		// managed worktrees path, and only when the SHA is a real commit. It
 		// never checks out a branch, so it cannot move anyone's work, and it
 		// never reuses an existing directory.
+		// FAC-832: only when something will read it. A caller that pinned both
+		// the exact sha and the exact base gets no speculative carrier, and no
+		// orphan to retire afterwards.
+		if !mayPrepare {
+			return "", nil
+		}
 		if dir, err := prepareCandidateSurface(root, ref, sha); err == nil && dir != "" {
 			fmt.Printf("prepared review surface %s at %s\n", dir, shortSHA(sha))
 			return dir, nil
