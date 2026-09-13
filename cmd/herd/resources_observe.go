@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -152,4 +154,73 @@ func runResourcesObserverStatus(asJSON bool) int {
 		return observerExitRefused
 	}
 	return 0
+}
+
+// resourcesMode is which job one `herd resources` invocation selected. The
+// three are mutually exclusive and each accepts a different set of flags.
+type resourcesMode string
+
+const (
+	resourcesModeOneShot resourcesMode = "one-shot"
+	resourcesModeWatch   resourcesMode = "--watch"
+	resourcesModeStatus  resourcesMode = "--observer-status"
+)
+
+// resourcesModeFlags is what each mode legitimately accepts. Everything else
+// given alongside it is refused rather than ignored.
+//
+// The rule this encodes: a flag the operator typed is a request, and a request
+// this command cannot honour must be an error. Parsing --gate under --watch and
+// then returning early silently discarded a resource guard; parsing --interval
+// outside --watch and then dropping it silently discarded a bound the observer
+// would have refused as invalid. Both read as success.
+var resourcesModeFlags = map[resourcesMode]map[string]bool{
+	resourcesModeOneShot: {"json": true, "gate": true, "selftest": true},
+	resourcesModeWatch:   {"watch": true, "interval": true, "lifetime": true, "sample-timeout": true},
+	resourcesModeStatus:  {"observer-status": true, "json": true},
+}
+
+// validateResourcesMode resolves the mode from the flags ACTUALLY given and
+// refuses any flag that mode cannot honour.
+//
+// It is given fs.Visit's result, not the parsed values: an explicitly chosen
+// default is still an explicit choice, and `--interval=0` must reach the
+// observer's validation rather than being indistinguishable from silence.
+func validateResourcesMode(provided map[string]bool) (resourcesMode, error) {
+	if provided["watch"] && provided["observer-status"] {
+		return "", errors.New("--watch and --observer-status are different jobs; pick one")
+	}
+	mode := resourcesModeOneShot
+	switch {
+	case provided["watch"]:
+		mode = resourcesModeWatch
+	case provided["observer-status"]:
+		mode = resourcesModeStatus
+	}
+	allowed := resourcesModeFlags[mode]
+
+	// Sorted so the message is deterministic: an operator comparing two runs
+	// must not see the same mistake described in a different order.
+	rejected := make([]string, 0, len(provided))
+	for name := range provided {
+		if !allowed[name] {
+			rejected = append(rejected, "--"+name)
+		}
+	}
+	if len(rejected) == 0 {
+		return mode, nil
+	}
+	sort.Strings(rejected)
+	accepted := make([]string, 0, len(allowed))
+	for name := range allowed {
+		accepted = append(accepted, "--"+name)
+	}
+	sort.Strings(accepted)
+	if mode == resourcesModeOneShot {
+		return "", fmt.Errorf("%s accept no mode of their own; they belong to --watch. "+
+			"Plain `herd resources` accepts %s",
+			strings.Join(rejected, ", "), strings.Join(accepted, ", "))
+	}
+	return "", fmt.Errorf("%s cannot be combined with %s; %s accepts %s",
+		strings.Join(rejected, ", "), mode, mode, strings.Join(accepted, ", "))
 }

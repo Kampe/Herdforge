@@ -6,6 +6,7 @@ package main
 // the watch cases are refused during validation, before any probe runs.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -242,6 +243,110 @@ func TestObserverExitCodeCannotReachSuccessAfterAPublishFailure(t *testing.T) {
 			}
 			if tc.want != 0 && got == 0 {
 				t.Fatalf("%s reached the CLI success branch", name)
+			}
+		})
+	}
+}
+
+// TestRunResourcesRejectsFlagsTheModeCannotHonour is the command-level
+// contract: it drives the real argv path, not a helper.
+//
+// Every case here was previously ACCEPTED and silently ignored. --interval
+// outside --watch was parsed and dropped, including an explicit --interval=0
+// that the observer would have refused as invalid; --gate and --selftest under
+// --watch were skipped by an early return, so a resource guard the operator
+// asked for simply did not run and the command still exited 0. A discarded
+// guard that reports success is worse than one that fails.
+func TestRunResourcesRejectsFlagsTheModeCannotHonour(t *testing.T) {
+	cases := map[string][]string{
+		"observer bounds without watch":        {"--interval", "45s"},
+		"explicit zero interval without watch": {"--interval=0"},
+		"lifetime without watch":               {"--lifetime", "1h"},
+		"sample timeout without watch":         {"--sample-timeout", "5s"},
+		"gate under watch":                     {"--watch", "--gate"},
+		"selftest under watch":                 {"--watch", "--selftest"},
+		"json under watch":                     {"--watch", "--json"},
+		"gate under observer status":           {"--observer-status", "--gate"},
+		"selftest under observer status":       {"--observer-status", "--selftest"},
+		"bounds under observer status":         {"--observer-status", "--interval", "30s"},
+		"two modes at once":                    {"--watch", "--observer-status"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HERD_STATE_DIR", t.TempDir())
+			var stdout, stderr bytes.Buffer
+			code := runResourcesWithArgs(args, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("%s exited %d, want 2: an unsupported mix must be refused, never ignored", name, code)
+			}
+			// No sampling and no observer side effect may have happened: the
+			// refusal is decided before any observation.
+			if stdout.Len() != 0 {
+				t.Fatalf("%s produced stdout %q; a rejected invocation must observe nothing", name, stdout.String())
+			}
+			if _, err := os.Stat(resources.ObserverStatusPath()); err == nil {
+				t.Fatalf("%s wrote an observer status despite being rejected", name)
+			}
+			if stderr.Len() == 0 {
+				t.Fatalf("%s was refused without telling the operator why", name)
+			}
+		})
+	}
+}
+
+// TestRunResourcesAcceptsTheStatusModeAndItsJSON keeps the rejection table
+// honest: the combinations that ARE supported must still reach their job. Both
+// cases read a published snapshot and never sample the host, so this stays
+// hermetic.
+func TestRunResourcesAcceptsTheStatusModeAndItsJSON(t *testing.T) {
+	for name, args := range map[string][]string{
+		"status alone":    {"--observer-status"},
+		"status and json": {"--observer-status", "--json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HERD_STATE_DIR", t.TempDir())
+			var stdout, stderr bytes.Buffer
+			// No snapshot exists, so the reader refuses with 3 -- which proves
+			// the mode was DISPATCHED rather than refused at parse time.
+			if code := runResourcesWithArgs(args, &stdout, &stderr); code != observerExitRefused {
+				t.Fatalf("%s exited %d, want %d from the status reader", name, code, observerExitRefused)
+			}
+		})
+	}
+}
+
+// TestValidateResourcesModeAcceptsEverySupportedCombination pins the accepted
+// sets directly, including the one-shot and watch modes whose jobs this test
+// deliberately does not run: a rejection table alone could pass by refusing
+// everything.
+func TestValidateResourcesModeAcceptsEverySupportedCombination(t *testing.T) {
+	supported := []struct {
+		name     string
+		provided []string
+		want     resourcesMode
+	}{
+		{"plain resources", nil, resourcesModeOneShot},
+		{"one-shot json", []string{"json"}, resourcesModeOneShot},
+		{"one-shot gate", []string{"gate"}, resourcesModeOneShot},
+		{"one-shot selftest", []string{"selftest"}, resourcesModeOneShot},
+		{"one-shot gate and json", []string{"gate", "json"}, resourcesModeOneShot},
+		{"watch alone", []string{"watch"}, resourcesModeWatch},
+		{"watch with every bound", []string{"watch", "interval", "lifetime", "sample-timeout"}, resourcesModeWatch},
+		{"status alone", []string{"observer-status"}, resourcesModeStatus},
+		{"status with json", []string{"observer-status", "json"}, resourcesModeStatus},
+	}
+	for _, tc := range supported {
+		t.Run(tc.name, func(t *testing.T) {
+			provided := map[string]bool{}
+			for _, n := range tc.provided {
+				provided[n] = true
+			}
+			mode, err := validateResourcesMode(provided)
+			if err != nil {
+				t.Fatalf("%s must be supported, got %v", tc.name, err)
+			}
+			if mode != tc.want {
+				t.Fatalf("%s resolved to mode %q, want %q", tc.name, mode, tc.want)
 			}
 		})
 	}

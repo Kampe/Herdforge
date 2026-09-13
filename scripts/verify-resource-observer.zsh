@@ -37,9 +37,11 @@ for tool in git go timeout jq mktemp python3 rmdir; do
 done
 
 observer_src=pkg/resources/observer.go
+cli_src=cmd/herd/main.go
 run_src=pkg/resources/observer_run.go
 paths_src=pkg/resources/observer_paths.go
 resources_pkg=./pkg/resources/
+herd_pkg=./cmd/herd/
 
 # The baseline runs the WHOLE focus set; a mutant runs only its anchored killer,
 # so an unrelated failure elsewhere can never be reported as this control's kill.
@@ -47,6 +49,12 @@ observer_run='TestObserverDropsOverrunTicksWithoutCatchUp|TestObserverRefusesPub
 
 # Exit 0 alone is not a baseline: a selector that matched nothing also exits 0.
 # Every one of these must be seen PASSING at top level.
+# The CLI contract lives in cmd/herd, so it gets its own baseline: a mutant
+# that removes mode validation must be measured against a suite that was
+# passing beforehand in THAT package too.
+herd_run='TestRunResourcesRejectsFlagsTheModeCannotHonour|TestRunResourcesAcceptsTheStatusModeAndItsJSON|TestValidateResourcesModeAcceptsEverySupportedCombination|TestObserverStatusCommandFailsClosed|TestObserverWatchRefusesBadBoundsBeforeSampling'
+herd_expect='TestRunResourcesRejectsFlagsTheModeCannotHonour TestRunResourcesAcceptsTheStatusModeAndItsJSON TestValidateResourcesModeAcceptsEverySupportedCombination TestObserverStatusCommandFailsClosed TestObserverWatchRefusesBadBoundsBeforeSampling'
+
 observer_expect='TestObserverDropsOverrunTicksWithoutCatchUp TestObserverRefusesPublishBeforeObservation TestObserverStampsPublishTimeAtWriteTime TestObserverHistoryStaysBounded TestObserverConfigRefusesBusyLoopBounds TestObserverUsableAcceptsBothHealthyPlatformShapes TestObserverUsableRefusesContradictoryReports TestObserverUsableRefusesBrokenChronology TestObserverRecordsSampleFailureWithoutAdmitting TestObserverLockScopeIsReportedHonestly TestReadObserverStatusRefusesAnOversizedFile TestRunObserverPreservesPublishFailureThroughCancellation TestRunObserverCleanCancellationStaysSuccessful TestNormalizeObserverExitKeepsOtherCauses'
 
 # Finite and bounded at both ends BEFORE any arithmetic: an absurd or
@@ -316,6 +324,13 @@ restore_all() {
 #   TestObserverUsableAcceptsBothHealthyPlatformShapes, identical except that it
 #   honestly reports pressure as not known.
 #
+#   mode-validation-discarded defends the CLI contract itself. Every observer
+#   bound was parsed and then dropped outside --watch, and --gate and --selftest
+#   under --watch were skipped by an early return, so a resource guard the
+#   operator asked for silently did not run and the command still exited 0. The
+#   mutant feeds the validator an empty flag set, which compiles and restores
+#   exactly that behaviour, and the named CLI oracle catches it.
+#
 #   catch-up-burst is anchored to the assertion its oracle ACTUALLY emits.
 #   Replaying every missed tick makes each gap exactly one, so the test's
 #   zero-skipped-ticks assertion fires before its inter-sample spacing check.
@@ -342,6 +357,7 @@ mutations=(
 "failed-sample-keeps-admit${sep}${observer_src}${sep}			sample.Report.Admits = false${sep}			_ = sampleErr // MUTANT: a failed sample keeps its admit${sep}${resources_pkg}${sep}TestObserverRecordsSampleFailureWithoutAdmitting${sep}a failure must not keep its admit"
 "broken-chronology-ignored${sep}${observer_src}${sep}	if why := sampleChronologyProblem(status, at); why != \"\" {${sep}	if why := \"\"; why != \"\" { // MUTANT: stamps no longer have to be credible${sep}${resources_pkg}${sep}TestObserverUsableRefusesBrokenChronology/missing_published_at${sep}was reported usable"
 "publish-failure-swallowed-by-cancellation${sep}${run_src}${sep}	if errors.Is(err, ErrObserverPublishFailed) {${sep}	if false && errors.Is(err, ErrObserverPublishFailed) { // MUTANT: a cancellation hides a failed final write${sep}${resources_pkg}${sep}TestRunObserverPreservesPublishFailureThroughCancellation${sep}a failed terminal publication was reported as a clean shutdown"
+"mode-validation-discarded${sep}${cli_src}${sep}	mode, err := validateResourcesMode(provided)${sep}	mode, err := validateResourcesMode(map[string]bool{}) // MUTANT: the mode validator never sees the operator's flags${sep}${herd_pkg}${sep}TestRunResourcesRejectsFlagsTheModeCannotHonour${sep}an unsupported mix must be refused, never ignored"
 "unknown-scope-sounds-safe${sep}${paths_src}${sep}	return \"unknown scope: treat exclusivity as unproven\"${sep}	return \"exclusive\" // MUTANT: an unrecognised scope claims exclusivity${sep}${resources_pkg}${sep}TestObserverLockScopeIsReportedHonestly/an_unrecognised_scope_refuses_to_sound_safe${sep}it must state that exclusivity is unproven"
 )
 
@@ -378,16 +394,21 @@ for src in "${mutated_sources[@]}"; do
 	note "source $src (${pristine[$src]})"
 done
 
-baseline_exit=$(run_focused "$resources_pkg" "$observer_run" "$run_dir/baseline.json" "$run_dir/baseline.err")
-if (( baseline_exit != 0 )); then
-	note "baseline FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
-	exit 1
-fi
-if ! baseline_ok "$run_dir/baseline.json" "$observer_expect"; then
-	note "baseline FAILED - exit 0 but the required tests did not all pass at top level"
-	exit 1
-fi
-note "baseline PASS (every expected test passed at top level)"
+baseline_failed=0
+for spec in "${resources_pkg}${sep}${observer_run}${sep}resources${sep}${observer_expect}" "${herd_pkg}${sep}${herd_run}${sep}herd${sep}${herd_expect}"; do
+	fields=("${(@ps:$sep:)spec}")
+	baseline_exit=$(run_focused "$fields[1]" "$fields[2]" "$run_dir/baseline-$fields[3].json" "$run_dir/baseline-$fields[3].err")
+	if (( baseline_exit != 0 )); then
+		note "baseline $fields[3] FAILED (exit $baseline_exit) - the suite must pass before any mutant means anything"
+		baseline_failed=1
+	elif ! baseline_ok "$run_dir/baseline-$fields[3].json" "$fields[4]"; then
+		note "baseline $fields[3] FAILED - exit 0 but the required tests did not all pass at top level"
+		baseline_failed=1
+	else
+		note "baseline $fields[3] PASS (every expected test passed at top level)"
+	fi
+done
+(( baseline_failed == 0 )) || exit 1
 
 failures=0
 index=0
@@ -439,16 +460,19 @@ done
 
 restore_all
 
-restored_exit=$(run_focused "$resources_pkg" "$observer_run" "$run_dir/restored.json" "$run_dir/restored.err")
-if (( restored_exit != 0 )); then
-	note "restored baseline FAILED (exit $restored_exit) - the source did not come back clean"
-	failures=$(( failures + 1 ))
-elif ! baseline_ok "$run_dir/restored.json" "$observer_expect"; then
-	note "restored baseline FAILED - exit 0 but the required tests did not all pass"
-	failures=$(( failures + 1 ))
-else
-	note "restored baseline PASS"
-fi
+for spec in "${resources_pkg}${sep}${observer_run}${sep}resources${sep}${observer_expect}" "${herd_pkg}${sep}${herd_run}${sep}herd${sep}${herd_expect}"; do
+	fields=("${(@ps:$sep:)spec}")
+	restored_exit=$(run_focused "$fields[1]" "$fields[2]" "$run_dir/restored-$fields[3].json" "$run_dir/restored-$fields[3].err")
+	if (( restored_exit != 0 )); then
+		note "restored baseline $fields[3] FAILED (exit $restored_exit) - the source did not come back clean"
+		failures=$(( failures + 1 ))
+	elif ! baseline_ok "$run_dir/restored-$fields[3].json" "$fields[4]"; then
+		note "restored baseline $fields[3] FAILED - exit 0 but the required tests did not all pass"
+		failures=$(( failures + 1 ))
+	else
+		note "restored baseline $fields[3] PASS"
+	fi
+done
 
 # Cleanup runs BEFORE the verdict, and a leak is a failure of this run rather
 # than a warning nobody sees.
