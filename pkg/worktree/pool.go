@@ -201,7 +201,7 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			if slot.LeaseID != "" {
 				continue
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, err := gitClean(ctx, slot.Path)
 			if err != nil {
 				return fmt.Errorf("worktree pool: inspect %s: %w", slot.Name, err)
 			}
@@ -237,7 +237,7 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			if slot.LeaseID != "" {
 				continue
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, err := gitClean(ctx, slot.Path)
 			if err != nil || !clean {
 				continue
 			}
@@ -282,20 +282,26 @@ func (p *Pool) reclaimDeadLocked(ctx context.Context, state poolState) ([]string
 		if strings.TrimSpace(slot.Purpose) != "" && p.HolderLive(slot.Purpose) {
 			continue
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base).CombinedOutput(); err != nil {
+		// Same validator as Release. This path runs UNATTENDED from Lease,
+		// so an unanchored reset here is the more dangerous of the two.
+		slotPath, err := p.ownedSlotPath(ctx, *slot)
+		if err != nil {
+			return freed, err
+		}
+		if out, err := exec.CommandContext(ctx, "git", "-C", slotPath, "reset", "--hard", base).CombinedOutput(); err != nil {
 			return freed, fmt.Errorf("worktree pool: reclaim reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd").CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(ctx, "git", "-C", slotPath, "clean", "-fd").CombinedOutput(); err != nil {
 			return freed, fmt.Errorf("worktree pool: reclaim clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 		}
-		clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+		clean, err := gitClean(ctx, slotPath)
 		if err != nil {
 			return freed, err
 		}
 		if !clean {
 			continue
 		}
-		headOut, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "rev-parse", "HEAD").Output()
+		headOut, err := exec.CommandContext(ctx, "git", "-C", slotPath, "rev-parse", "HEAD").Output()
 		if err != nil {
 			return freed, fmt.Errorf("worktree pool: reclaim rev-parse %s: %w", slot.Name, err)
 		}
@@ -346,26 +352,34 @@ func (p *Pool) Release(ctx context.Context, leaseID string) error {
 			if slot.LeaseID != leaseID {
 				continue
 			}
+			// Anchored to the owning repository BEFORE anything destructive
+			// runs, and refused rather than guessed. A failure here returns
+			// with the lease still held: refusing to reset is always safer
+			// than resetting a directory we have not proven is ours.
+			slotPath, err := p.ownedSlotPath(ctx, *slot)
+			if err != nil {
+				return err
+			}
 			base := p.DefaultBase
 			if base == "" {
 				base = "origin/main"
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", slot.Path, "reset", "--hard", base)
+			cmd := exec.CommandContext(ctx, "git", "-C", slotPath, "reset", "--hard", base)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: reset %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			cmd = exec.CommandContext(ctx, "git", "-C", slot.Path, "clean", "-fd")
+			cmd = exec.CommandContext(ctx, "git", "-C", slotPath, "clean", "-fd")
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slot.Path)
+			clean, err := gitClean(ctx, slotPath)
 			if err != nil {
 				return err
 			}
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s remains dirty after release", slot.Name)
 			}
-			headOut, err := exec.CommandContext(ctx, "git", "-C", slot.Path, "rev-parse", "HEAD").Output()
+			headOut, err := exec.CommandContext(ctx, "git", "-C", slotPath, "rev-parse", "HEAD").Output()
 			if err != nil {
 				return fmt.Errorf("worktree pool: rev-parse %s: %w", slot.Name, err)
 			}
@@ -396,8 +410,7 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 			if slot.Name != slotName {
 				continue
 			}
-			slotPath := p.repoPath(slot.Path)
-			if slotPath != p.repoPath(wantPath) {
+			if !samePath(p.repoPath(slot.Path), p.repoPath(wantPath)) {
 				return fmt.Errorf("worktree pool: slot %s path changed", slotName)
 			}
 			if slot.LeaseID == "" {
@@ -405,6 +418,14 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 			}
 			if slot.LeaseID != leaseID || slot.LeasedAt.UnixNano() != leaseGeneration {
 				return fmt.Errorf("worktree pool: slot %s lease incarnation changed", slotName)
+			}
+			// The identity and idempotency answers above are unchanged and
+			// still come first, so an already-released slot still succeeds
+			// without inspecting a path that retirement may have removed.
+			// Ownership is proven only on the branch that actually resets.
+			slotPath, err := p.ownedSlotPath(ctx, *slot)
+			if err != nil {
+				return err
 			}
 			base := slot.Base
 			if base == "" {
@@ -421,7 +442,7 @@ func (p *Pool) ReleaseExact(ctx context.Context, slotName, leaseID string, lease
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: clean %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
-			clean, err := gitClean(ctx, p.RepoRoot, slotPath)
+			clean, err := gitClean(ctx, slotPath)
 			if err != nil {
 				return err
 			}
@@ -483,6 +504,56 @@ func canonicalDirPath(path string) string {
 		return cleaned
 	}
 	return filepath.Join(resolved, filepath.Base(cleaned))
+}
+
+// ownedSlotPath is the ONE ownership validator every destructive release and
+// reclaim step anchors on, so those paths cannot drift apart in what they
+// guarantee.
+//
+// FAC-764: Release and reclaimDeadLocked handed the STORED slot.Path straight
+// to `git -C`, and a `-C` argument is resolved against the process's own
+// working directory. A slot path persisted relative (which Ensure does
+// whenever the pool was created through a relative --pool-root) therefore
+// named a different directory for every caller. Run from the owning
+// repository it worked; run from anywhere else it either failed with "cannot
+// change to", or — wherever the same relative path happened to exist under the
+// caller — silently reset SOMEONE ELSE'S worktree. ReleaseExact already
+// normalized through repoPath and so was never exposed.
+//
+// It reuses the GC ownership validation rather than repeating it:
+// containedRepoPath anchors the path to the repository (never the caller),
+// refuses a symlinked slot, and proves containment in the pool root by path
+// COMPONENTS via filepath.Rel, not by string prefix — so "/pool-evil" cannot
+// pass as a child of "/pool". worktreeRegistered then requires that git itself
+// still registers that exact path as a worktree of this repository, which is
+// what makes it ours to reset rather than merely a directory that exists.
+func (p *Pool) ownedSlotPath(ctx context.Context, slot PoolSlot) (string, error) {
+	if strings.TrimSpace(slot.Path) == "" {
+		return "", fmt.Errorf("worktree pool: slot %s has no recorded path", slot.Name)
+	}
+	resolved, err := p.containedRepoPath(slot.Path)
+	if err != nil {
+		return "", fmt.Errorf("worktree pool: slot %s: %w", slot.Name, err)
+	}
+	registered, err := p.worktreeRegistered(ctx, resolved)
+	if err != nil {
+		return "", fmt.Errorf("worktree pool: slot %s: %w", slot.Name, err)
+	}
+	if !registered {
+		return "", fmt.Errorf("worktree pool: slot %s path %s is not a registered worktree of this repository; refusing to reset it", slot.Name, resolved)
+	}
+	return resolved, nil
+}
+
+// samePath answers whether two paths name the same directory. The same
+// directory is reachable through different strings (a tmpdir under macOS's
+// /var -> /private/var symlink is the everyday case), so an exact string
+// compare can report two names for one directory as a mismatch.
+func samePath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	return canonicalDirPath(a) == canonicalDirPath(b)
 }
 
 // RetireExact removes one already-released owned slot and preserves every
@@ -1170,7 +1241,11 @@ func (p *Pool) Slots() ([]PoolSlot, error) {
 	return append([]PoolSlot(nil), state.Slots...), nil
 }
 
-func gitClean(ctx context.Context, repoRoot, path string) (bool, error) {
+// gitClean reports whether the worktree AT path is clean. It takes the path it
+// inspects and nothing else: it used to accept a repoRoot it never read, which
+// made every call site read as anchored to the repository when the anchoring
+// was entirely the caller's responsibility.
+func gitClean(ctx context.Context, path string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
