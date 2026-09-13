@@ -234,6 +234,14 @@ func runMergeComplete() {
 
 // buildMergeGate wires the compiled gate to live authorities. prNumber may be
 // 0 for the completion phase, which only needs the git-side probe.
+// cliProofBudget is the allowance every CLI-built gate carries. Its ZERO VALUE
+// MEANS DEFAULT, so production behaviour is unchanged and nothing in production
+// writes it. It exists so a regression can drive the real public entry --
+// constructor and resolution included -- with a finite allowance and observe
+// WHERE the invocation stops, instead of testing a helper that skips the
+// constructor under test.
+var cliProofBudget mergeadmit.ProofBudget
+
 func buildMergeGate(ref, taskID string, prNumber int) (*mergeadmit.Gate, error) {
 	policy, err := preflight.LoadMergePolicy(".")
 	if err != nil {
@@ -260,7 +268,7 @@ func buildMergeGate(ref, taskID string, prNumber int) (*mergeadmit.Gate, error) 
 		live.TaskRevision = taskRevisionProbe(ref, taskID)
 	}
 
-	return &mergeadmit.Gate{RepoDir: ".", Ledger: ledger, Policy: policy, Live: live}, nil
+	return &mergeadmit.Gate{RepoDir: ".", Ledger: ledger, Policy: policy, Live: live, ProofBudget: cliProofBudget}, nil
 }
 
 // originMainProbeContext reports the exact integration tip INSIDE the caller's
