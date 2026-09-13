@@ -40,6 +40,8 @@ func runMail() {
 		runMailAck(args[1:])
 	case "inbox", "read":
 		runMailInbox(args[0], args[1:])
+	case "repair":
+		runMailRepair(args[1:])
 	case "control":
 		runControlArgs(args[1:])
 	case "help", "--help", "-h":
@@ -48,6 +50,78 @@ func runMail() {
 		fmt.Fprintf(os.Stderr, "mail: unknown mode %q\n%s\n", args[0], usageFor("mail"))
 		os.Exit(2)
 	}
+}
+
+// runMailRepair is the bounded operator recovery for ONE quarantined row.
+// It is report-only unless --act is given, so the default cannot mutate a
+// mailbox. Exit codes: 0 report or applied, 1 refused or failed, 2 usage.
+func runMailRepair(args []string) {
+	if code := mailRepairMain(args, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// mailRepairMain is the whole CLI behaviour of `herd mail repair` with the
+// process boundary lifted out: argument parsing, flag preconditions, the
+// provider call, the JSON on stdout and the exit code. runMailRepair is the
+// only thing that turns the code into os.Exit, so a test can exercise the real
+// argument and exit contract without building or spawning a binary.
+//
+// Exit codes: 0 report or applied, 1 refused or failed, 2 usage.
+func mailRepairMain(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mail repair", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	id := fs.String("id", "", "exact message id of the quarantined row")
+	mailPath := fs.String("mail", "", "mailbox path override")
+	fingerprint := fs.String("fingerprint", "", "sha256 of the exact malformed line the operator reviewed (REQUIRED with --act)")
+	reason := fs.String("reason", "", "why this recovery is being performed")
+	actor := fs.String("actor", "", "operator performing the recovery")
+	act := fs.Bool("act", false, "perform the repair (default is report-only)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	// A stray positional is a typo, not a no-op. Silently ignoring it would let
+	// `mail repair --act FAC-1` read as a report-only run of nothing.
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "mail repair: unexpected argument %q; every input is a flag\n", fs.Arg(0))
+		return 2
+	}
+	if strings.TrimSpace(*id) == "" {
+		fmt.Fprintln(stderr, "mail repair: --id is required")
+		return 2
+	}
+	if *act && strings.TrimSpace(*actor) == "" {
+		fmt.Fprintln(stderr, "mail repair: --actor is required with --act")
+		return 2
+	}
+	if *act && strings.TrimSpace(*fingerprint) == "" {
+		fmt.Fprintln(stderr, "mail repair: --fingerprint is required with --act; run without --act first and use the original_sha256 it reports")
+		return 2
+	}
+	path, err := controlMailPath(*mailPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: %v\n", err)
+		return 1
+	}
+	plan, err := mail.NewMailbox(path).RepairMalformedRow(context.Background(), mail.RepairRequest{
+		ID:          strings.TrimSpace(*id),
+		Fingerprint: strings.TrimSpace(*fingerprint),
+		Act:         *act,
+		Actor:       strings.TrimSpace(*actor),
+		Reason:      strings.TrimSpace(*reason),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: %v\n", err)
+		return 1
+	}
+	if err := json.NewEncoder(stdout).Encode(plan); err != nil {
+		fmt.Fprintf(stderr, "mail repair: encode plan: %v\n", err)
+		return 1
+	}
+	if !plan.Applied {
+		fmt.Fprintln(stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor <name> to apply")
+	}
+	return 0
 }
 
 func runMailPending(args []string) {

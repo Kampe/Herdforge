@@ -133,5 +133,8 @@ TASK-PACKET.md
 .herd/harvest-queue.jsonl.*
 .verify-bounds-logs/
 
+# FAC-824: operational artifacts from scripts/verify-mail-repair-guards.zsh.
+# The driver is checked in, so running it must not dirty a working tree.
+.verify-mail-repair-logs/
 # FAC-827: mutation-control logs from scripts/verify-manifest-budget.zsh.
 .verify-budget-logs/
