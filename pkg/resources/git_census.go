@@ -281,7 +281,45 @@ type GitWorktreeEnumerator struct {
 	// proof lives above this package and depending on it from here is a
 	// cycle. Nil keeps the ancestry default.
 	Landing LandingPredicate
+	// CensusWindow bounds one sweep's per-lane evidence to a deterministic
+	// rotating window of the registered ring, so an expensive lane can no
+	// longer consume the whole sweep budget before any lane qualifies (the
+	// measured 0/571 failure: batchGitStatus over every registered lane ate
+	// the registered phase's entire deadline). The full registered list is
+	// still enumerated, still returned, and still deduplicated for the
+	// report; unselected lanes are preserved fail-closed as unknown with the
+	// census_window_deferred reason and never reach any expensive probe.
+	// Non-positive uses registeredCensusWindow.
+	CensusWindow int
+	// WindowStart, when non-nil, activates windowing and reports where the
+	// rotating window starts for a registered ring of the given length. The
+	// durable-cursor convention (mirroring the orphan census): a valid
+	// persisted cursor takes precedence; a missing or unparsable one falls
+	// back to a deterministic stride and never infers eligibility. Nil
+	// disables windowing entirely: every existing caller keeps the
+	// evaluate-all-lanes behavior.
+	WindowStart func(entryCount int) int
+	// WindowAdvance, when non-nil, persists the next window start after the
+	// window's lanes were all accounted. The advance runs only after the
+	// per-lane loop completed, so an interrupted sweep re-processes the same
+	// window next time (idempotent) instead of silently skipping it.
+	WindowAdvance func(next int) error
+	// WindowAdvanceErr, when non-nil, receives a failed cursor advance as a
+	// partial diagnostic (same holder pattern as ProbeStats): broken
+	// progress persistence must not be silent, and it must never change any
+	// lane's evidence decision or eligibility.
+	WindowAdvanceErr *string
 }
+
+// registeredCensusWindow is the default bounded window for one registered
+// census sweep: wide enough to make steady progress per sweep, narrow enough
+// that the batch git-status and process population stay a small fraction of
+// the registered phase budget. Measured CI cost is ~78ms/lane for the batch
+// status (571 lanes took 44.6s on 8 workers), so a 16-lane window costs
+// ~1.3s of status plus one shared population capture and 16 bounded measure
+// walks — a small fraction of a 45s sweep — while still qualifying lanes
+// every sweep instead of starving the whole ring behind one slow probe.
+const registeredCensusWindow = 16
 
 // LandingProbe is the already-pinned identity one landing decision is made
 // about. HEAD and the base are resolved to object names before the probe
@@ -398,15 +436,65 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 	if processes == nil {
 		processes = LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20}
 	}
-	statusResults := batchGitStatus(ctx, lanes)
+	// Deterministic bounded rotating window: when the durable-cursor hook is
+	// wired, only the selected slice of the registered ring pays for the
+	// expensive per-lane operations this sweep. Selection happens by index
+	// before any probe runs, and the full ring stays in the returned report.
+	var statusResults map[string]gitStatusResult
+	selectedIdx := map[int]struct{}{}
+	windowActive := false
+	windowStart := 0
+	windowLimit := 0
+	if e.WindowStart != nil && len(lanes) > 0 {
+		windowActive = true
+		limit := e.CensusWindow
+		if limit <= 0 {
+			limit = registeredCensusWindow
+		}
+		if limit > len(lanes) {
+			limit = len(lanes)
+		}
+		windowLimit = limit
+		windowStart = e.WindowStart(len(lanes))
+		switch {
+		case windowStart < 0:
+			// A negative cursor is corrupt persisted state, not a position.
+			// Reducing it would NOT bring it into range: Go's % keeps the
+			// dividend's sign, so -5 % 16 stays -5 and the selection below
+			// indexes lanes[-5] and panics. The deterministic policy is to
+			// start at the ring's head: the sweep still makes progress, every
+			// lane remains reachable, and the advance at the end writes a
+			// sane cursor back over the corrupt one.
+			windowStart = 0
+		case windowStart >= len(lanes):
+			windowStart %= len(lanes)
+		}
+		for offset := 0; offset < limit; offset++ {
+			selectedIdx[(windowStart+offset)%len(lanes)] = struct{}{}
+		}
+		selected := make([]RegisteredWorktree, 0, limit)
+		for offset := 0; offset < limit; offset++ {
+			selected = append(selected, lanes[(windowStart+offset)%len(lanes)])
+		}
+		statusResults = batchGitStatus(ctx, selected)
+	} else {
+		statusResults = batchGitStatus(ctx, lanes)
+	}
 	var batchUsage map[string]ProcessUsage
 	var batchErr error
 	var batchStats BatchProbeStats
 	batchAttempted := false
 	if batch, ok := processes.(BatchProcessInspector); ok {
 		batchAttempted = true
+		// The population batch pays for the window's paths only: unselected
+		// lanes must not appear in any process probe this sweep.
 		paths := make([]string, 0, len(lanes))
 		for i := range lanes {
+			if windowActive {
+				if _, ok := selectedIdx[i]; !ok {
+					continue
+				}
+			}
 			resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 			if resolveErr == nil {
 				paths = append(paths, filepath.Clean(resolved))
@@ -444,7 +532,51 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 	// content probe then fails closed rather than proving against a ref that
 	// may move underneath it.
 	basePin := e.pinBase(ctx, root, baseRef)
-	for i := range lanes {
+	// Examination follows RING order, the same order the window was selected
+	// in, because the cursor advances from windowStart by the number of lanes
+	// examined. Walking the ring by ascending index instead would make those
+	// two disagree whenever the window wraps: with len 5, start 4 and width 3
+	// the window is [4,0,1] but ascending order examines [0,1,4], so a sweep
+	// cancelled after one lane would advance 4->0 and skip lane 4, which it
+	// never examined, while re-examining lane 0, which it did.
+	//
+	// Unselected lanes are preserved fail-closed up front, before any
+	// expensive per-lane operation: no status, process, ownership, landing or
+	// lease evidence call reaches them this sweep. The full ring stays in the
+	// report in its original order; only the visit order is the ring's.
+	order := make([]int, 0, len(lanes))
+	if windowActive {
+		for i := range lanes {
+			if _, ok := selectedIdx[i]; !ok {
+				lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "census_window_deferred"
+			}
+		}
+		for offset := 0; offset < windowLimit; offset++ {
+			order = append(order, (windowStart+offset)%len(lanes))
+		}
+	} else {
+		for i := range lanes {
+			order = append(order, i)
+		}
+	}
+	accounted := 0
+	for pos := 0; pos < len(order); pos++ {
+		i := order[pos]
+		// A cancelled sweep truncates the window: this lane and every
+		// selected lane after it in RING order stay unexamined and
+		// conservatively unknown, so the next sweep re-processes them
+		// instead of skipping them.
+		if windowActive && ctx.Err() != nil {
+			for _, j := range order[pos:] {
+				lanes[j].State, lanes[j].PreserveReason = LaneUnknown, "census_budget_exhausted"
+			}
+			break
+		}
+		// The lane is now EXAMINED. The cursor accounts for examination, not
+		// for success: eight paths below leave early with a conservative
+		// unknown state, and counting at the end of the body instead let a
+		// window of unprovable lanes advance by nothing and repeat forever.
+		accounted++
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State, lanes[i].PreserveReason = LaneUnknown, "worktree_realpath_unavailable"
@@ -520,6 +652,21 @@ func (e GitWorktreeEnumerator) evaluate(ctx context.Context, root string, lanes 
 			lanes[i].State = LaneDone
 		default:
 			lanes[i].State = LaneIdle
+		}
+	}
+	// The cursor advances by the lanes actually EXAMINED: a window whose
+	// selected lanes were all reached advances its full width whatever each
+	// lane concluded, and a sweep truncated by cancellation advances exactly
+	// the examined prefix so the unexamined remainder is re-processed next
+	// sweep instead of skipped. A failed persistence write is recorded as a
+	// partial diagnostic and never changes any lane's evidence or eligibility.
+	if accounted > windowLimit {
+		accounted = windowLimit
+	}
+	if windowActive && e.WindowAdvance != nil {
+		next := (windowStart + accounted) % len(lanes)
+		if err := e.WindowAdvance(next); err != nil && e.WindowAdvanceErr != nil {
+			*e.WindowAdvanceErr = fmt.Sprintf("registered census cursor advance: %v", err)
 		}
 	}
 	return lanes, nil

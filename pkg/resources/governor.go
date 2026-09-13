@@ -217,6 +217,11 @@ type Governor struct {
 	// registered census batch records its completed/deferred lsof probe
 	// counts here so the registered_census stage reports real progress.
 	ProbeStats *BatchProbeStats
+	// registeredCursorPersistErr receives the registered census's failed
+	// durable-cursor advance (partial diagnostic, same class as the orphan
+	// cursor's): broken progress persistence must be visible in the report
+	// without failing the sweep or changing any lane's eligibility.
+	registeredCursorPersistErr string
 }
 
 type TargetDecision string
@@ -396,6 +401,22 @@ func (g *Governor) defaults() {
 	if g.Worktrees == nil {
 		g.Worktrees = GitWorktreeEnumerator{}
 	}
+	// Wire the registered census's bounded rotating window onto the concrete
+	// enumerator (an external WorktreeEnumerator implementation is left
+	// untouched and keeps its own semantics). The hooks mirror the orphan
+	// census's durable cursor: a valid persisted start wins, a missing or
+	// unparsable one falls back to the deterministic minute-bucket stride,
+	// the advance persists only after the window was accounted, and a failed
+	// advance surfaces as a partial diagnostic on the report.
+	if we, ok := g.Worktrees.(GitWorktreeEnumerator); ok {
+		if we.CensusWindow <= 0 {
+			we.CensusWindow = registeredCensusWindow
+		}
+		we.WindowStart = g.registeredWindowStart
+		we.WindowAdvance = g.storeRegisteredCursor
+		we.WindowAdvanceErr = &g.registeredCursorPersistErr
+		g.Worktrees = we
+	}
 	if g.Measure == nil {
 		g.Measure = OSPhysicalMeasurer{}
 	}
@@ -514,9 +535,19 @@ func (g *Governor) recordStage(report *GovernorReport, stage CensusStage) {
 	report.Stages = append(report.Stages, stage)
 }
 
+// census runs against a policy that has ALREADY passed validate(). Both
+// callers, Run and AcquireDispatch, call defaults() then validate() before
+// reaching here, and the arithmetic downstream depends on it: setConcurrency
+// divides by the task reserve, which validate() requires to be nonzero. A
+// caller that reaches census without validating -- only a test can, since
+// census is unexported -- is using it outside its contract.
 func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	report := GovernorReport{}
 	start := g.now()
+	// The registered census's cursor diagnostics are per-run: a Governor
+	// instance serves repeated sweeps, so last run's partial diagnostic must
+	// never leak into this run's report.
+	g.registeredCursorPersistErr = ""
 	before, err := g.Capacity.StatFS(g.Policy.RepositoryRoot)
 	statfsStage := CensusStage{Name: "statfs", DurationMS: g.sinceMS(start)}
 	if err != nil {
@@ -576,24 +607,30 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	// findings (unknown lanes, duplicate realpath refusal) land on the same
 	// single record.
 	seen := make(map[string]struct{}, len(lanes))
-	unknownLanes := 0
 	for i := range lanes {
 		resolved, resolveErr := filepath.EvalSymlinks(lanes[i].Path)
 		if resolveErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_realpath_unavailable"
-			unknownLanes++
 			continue
 		}
 		lanes[i].Path = filepath.Clean(resolved)
 		if _, exists := seen[lanes[i].Path]; exists {
 			listStage.Cause = fmt.Sprintf("duplicate registered worktree realpath %q", lanes[i].Path)
-			listStage.Deferred = unknownLanes
+			listStage.Deferred = countUnknownLanes(lanes)
 			g.recordStage(&report, listStage)
 			report.Error = listStage.Cause
 			return report, fmt.Errorf("duplicate registered worktree realpath %q", lanes[i].Path)
 		}
 		seen[lanes[i].Path] = struct{}{}
+		// A lane the registered census's rotating window deferred carries an
+		// explicit fail-closed reason and must not pay for the allocation
+		// walk either: its evidence epoch is simply the next sweep, when the
+		// window rotates to it. The realpath above still ran so the
+		// duplicate check covers the full registered ring.
+		if lanes[i].PreserveReason == "census_window_deferred" {
+			continue
+		}
 		// The allocation walk is an unbounded fs descent. The context-aware
 		// measurer receives the REGISTERED phase deadline, not the outer
 		// sweep context, and observes it at cooperative checkpoints BETWEEN
@@ -616,7 +653,6 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 				}
 				lanes[j].State = LaneUnknown
 				lanes[j].PreserveReason = "census_budget_exhausted"
-				unknownLanes++
 			}
 			break
 		}
@@ -624,7 +660,6 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 		if measureErr != nil {
 			lanes[i].State = LaneUnknown
 			lanes[i].PreserveReason = "worktree_allocation_unavailable"
-			unknownLanes++
 			continue
 		}
 		lanes[i].AllocatedBytes = usage.Bytes
@@ -633,7 +668,12 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 			lanes[i].PreserveReason = "worktree_allocation_truncated"
 		}
 	}
-	listStage.Deferred = unknownLanes
+	listStage.Deferred = countUnknownLanes(lanes)
+	// The registered census's failed durable-cursor advance is a partial
+	// diagnostic on the stage (same field and contract as the orphan
+	// census's cursor): broken progress persistence must be visible without
+	// failing the sweep, and it never changes any lane's eligibility.
+	listStage.CursorError = g.registeredCursorPersistErr
 	g.recordStage(&report, listStage)
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].Path < lanes[j].Path })
 	report.HostID = g.Policy.HostID
@@ -707,6 +747,27 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	})
 	g.setConcurrency(&report)
 	return report, nil
+}
+
+// countUnknownLanes reports how many DISTINCT lanes the sweep is leaving in a
+// fail-closed unknown state.
+//
+// The stage used to carry a counter incremented at the three places this loop
+// marks a lane itself, which undercounted twice. Lanes already unknown when
+// the enumerator handed them over were never counted at all: with the rotating
+// window that is MOST of the ring on a normal sweep, every one of them
+// explicitly census_window_deferred, plus any lane the enumerator could not
+// prove. A normal windowed census therefore reported Deferred=0. Counting the
+// final states instead is inherently one-per-lane, so a lane that arrives
+// unknown and then also fails measurement still counts exactly once.
+func countUnknownLanes(lanes []RegisteredWorktree) int {
+	unknown := 0
+	for i := range lanes {
+		if lanes[i].State == LaneUnknown {
+			unknown++
+		}
+	}
+	return unknown
 }
 
 func (g *Governor) censusOrphans(ctx context.Context, registered []RegisteredWorktree, before Capacity) (orphanCensusResult, error) {
@@ -920,6 +981,54 @@ func (g *Governor) orphanCensusLimit() int {
 		limit = 64
 	}
 	return limit
+}
+
+// registeredWindowStart picks where the registered census's bounded rotating
+// window starts for a ring of the given length, mirroring the orphan census's
+// durable cursor: a valid persisted start takes precedence so repeated sweeps
+// keep advancing through the ring; a missing, unparsable, or out-of-range
+// cursor falls back to the deterministic minute-bucket stride. It never gates
+// or infers any lane's eligibility, which stays a per-lane evidence decision.
+// Cursor IO runs under the run's governor file lock, so read-advance is
+// serialized per repository.
+func (g *Governor) registeredWindowStart(entryCount int) int {
+	bucket := (g.Now().Unix() / int64(time.Minute/time.Second)) % int64(entryCount)
+	if bucket < 0 {
+		bucket += int64(entryCount)
+	}
+	fallback := int((bucket * int64(registeredCensusWindow)) % int64(entryCount))
+	raw, err := os.ReadFile(g.registeredCursorPath())
+	if err != nil {
+		return fallback
+	}
+	cursor, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || cursor < 0 {
+		return fallback
+	}
+	return cursor % entryCount
+}
+
+// storeRegisteredCursor persists the next window start for the registered
+// census. Best-effort by design: a failed write only drops the progress
+// optimization (the next run falls back to the time-bucket stride); it must
+// never fail the census or alter any lane's eligibility decision. The failure
+// is still returned so the caller can record it as a partial diagnostic
+// instead of silently hiding broken progress persistence (e.g. a full disk).
+func (g *Governor) storeRegisteredCursor(next int) error {
+	path := g.registeredCursorPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("prepare cursor dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(next)), 0o600); err != nil {
+		return fmt.Errorf("write cursor: %w", err)
+	}
+	return nil
+}
+
+// registeredCursorPath is the registered census's fixed durable-cursor file
+// under the repository's canonical state directory.
+func (g *Governor) registeredCursorPath() string {
+	return filepath.Join(g.Policy.RepositoryRoot, ".herd", "governor", "registered-cursor.txt")
 }
 
 func orphanBatchPaths(entries []os.DirEntry, root string, known map[string]struct{}, limit int, targets []string) []string {
