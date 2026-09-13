@@ -140,6 +140,38 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-824: the mailbox-repair guards refuse stale or conflicting
+      # identity, malformed unrelated rows, privileged records and concurrent
+      # change, and they bound the durable prepare/recovery/completion
+      # boundaries. Refusal tests alone cannot show those guards are load
+      # bearing, so this step removes each one from the REAL source, in its own
+      # ephemeral worktree, and requires the named test to fail on its named
+      # assertion. Serial by construction: one checkout, one mutant at a time.
+      # Finite and explicit. The driver bounds each compile and each serial
+      # package run itself; this is the outer ceiling so a wedged step cannot
+      # hold a runner indefinitely. Eight mutants, each one compile plus one
+      # anchored package run, plus a baseline and a restored run, all serial.
+      - name: Verify mail repair guard controls
+        timeout-minutes: 30
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-mail-repair-guards.zsh
+
+      # The control logs land under a HIDDEN directory, and upload-artifact
+      # excludes hidden paths by default, so without this the step would
+      # describe controls whose raw output was retained nowhere. A missing log
+      # set FAILS: evidence that did not survive must not be reportable as
+      # green.
+      - name: Upload mail repair guard control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-mail-repair-guard-logs
+          path: .verify-mail-repair-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # FAC-827: the budget guards are covered by tests that had never been
       # shown to fail. This driver proves each mutant COMPILES and then dies on
       # a named assertion, read from go test JSON, so the receipt cannot claim
