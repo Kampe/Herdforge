@@ -222,6 +222,13 @@ type Governor struct {
 	// cursor's): broken progress persistence must be visible in the report
 	// without failing the sweep or changing any lane's eligibility.
 	registeredCursorPersistErr string
+	// registeredCursorReadErr receives a registered-census cursor READ or PARSE
+	// failure. It is separate from the advance error on purpose: a read failure
+	// followed by a SUCCESSFUL advance write left CursorError empty, so a lost
+	// durable position was invisible and the fallback could repeat with no
+	// observable cause (FAC-825). Absence is NOT recorded here — a missing
+	// cursor is the documented first-run state and its fallback is correct.
+	registeredCursorReadErr string
 }
 
 type TargetDecision string
@@ -548,6 +555,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	// instance serves repeated sweeps, so last run's partial diagnostic must
 	// never leak into this run's report.
 	g.registeredCursorPersistErr = ""
+	g.registeredCursorReadErr = ""
 	before, err := g.Capacity.StatFS(g.Policy.RepositoryRoot)
 	statfsStage := CensusStage{Name: "statfs", DurationMS: g.sinceMS(start)}
 	if err != nil {
@@ -673,7 +681,7 @@ func (g *Governor) census(ctx context.Context) (GovernorReport, error) {
 	// diagnostic on the stage (same field and contract as the orphan
 	// census's cursor): broken progress persistence must be visible without
 	// failing the sweep, and it never changes any lane's eligibility.
-	listStage.CursorError = g.registeredCursorPersistErr
+	listStage.CursorError = registeredCursorDiagnostic(g.registeredCursorReadErr, g.registeredCursorPersistErr)
 	g.recordStage(&report, listStage)
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].Path < lanes[j].Path })
 	report.HostID = g.Policy.HostID
@@ -999,13 +1007,46 @@ func (g *Governor) registeredWindowStart(entryCount int) int {
 	fallback := int((bucket * int64(registeredCensusWindow)) % int64(entryCount))
 	raw, err := os.ReadFile(g.registeredCursorPath())
 	if err != nil {
+		// ABSENCE is the documented first-run state and its fallback is
+		// correct, so it stays silent. Any OTHER read failure means a durable
+		// position was lost: the fallback is still taken (eligibility and
+		// fairness are unchanged) but the cause is retained, because a
+		// fallback that repeats with no observable reason is indistinguishable
+		// from one that is working (FAC-825).
+		if !errors.Is(err, os.ErrNotExist) {
+			g.registeredCursorReadErr = fmt.Sprintf("registered census cursor read: %v", err)
+		}
 		return fallback
 	}
 	cursor, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || cursor < 0 {
+	if err != nil {
+		g.registeredCursorReadErr = fmt.Sprintf("registered census cursor parse: %v", err)
+		return fallback
+	}
+	if cursor < 0 {
+		g.registeredCursorReadErr = fmt.Sprintf("registered census cursor parse: negative cursor %d", cursor)
 		return fallback
 	}
 	return cursor % entryCount
+}
+
+// registeredCursorDiagnostic joins the read and advance diagnostics for the
+// stage.
+//
+// Both are kept because they are different facts: the read says a durable
+// position was lost, the advance says a new one could not be stored. Before
+// this, only the advance was reported, so a read failure followed by a
+// successful write emitted nothing at all. When only one is present the string
+// is exactly that one, so the existing advance-only contract is unchanged.
+func registeredCursorDiagnostic(readErr, advanceErr string) string {
+	switch {
+	case readErr == "":
+		return advanceErr
+	case advanceErr == "":
+		return readErr
+	default:
+		return readErr + "; " + advanceErr
+	}
 }
 
 // storeRegisteredCursor persists the next window start for the registered
