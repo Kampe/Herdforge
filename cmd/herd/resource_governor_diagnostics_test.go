@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -104,7 +105,7 @@ func representativeStages() []resources.CensusStage {
 			ProbeCompleted: 126, ProbeDeferred: 22},
 		{Name: "unregistered_orphan_census", DurationMS: 13200, Scanned: 64, Deferred: 9,
 			ProbeCompleted: 55, ProbeDeferred: 9,
-			CursorError: "/var/folders/zz/cursor.state: no space left on device"},
+			CursorError: "durable cursor advance failed"},
 	}
 }
 
@@ -150,10 +151,17 @@ func TestSummaryDropsEarliestStagesAndSaysSo(t *testing.T) {
 
 // Identifiers and numbers only: no path, and no verbatim stage cause.
 func TestSummaryCarriesNoPathOrCause(t *testing.T) {
+	// The paths are REAL and owned by this test. A host path written into a
+	// fixture is itself a repository boundary violation -- preflight rejects it
+	// and the whole self-test suite fails -- and an invented one proves nothing
+	// a genuine one does not. t.TempDir() is absolute on every host this runs
+	// on, so a summary that echoed the cursor text would still carry a
+	// separator here.
+	dir := t.TempDir()
 	summary := censusStageSummary([]resources.CensusStage{{
 		Name: "unregistered_orphan_census", DurationMS: 1,
-		CursorError: "/var/folders/zz/cursor.state: no space left on device",
-		Cause:       "stat /Users/someone/secret/path: permission denied",
+		CursorError: filepath.Join(dir, "cursor.state") + ": no space left on device",
+		Cause:       "stat " + filepath.Join(dir, "secret", "state.json") + ": permission denied",
 	}})
 	if strings.Contains(summary, "/") {
 		t.Fatalf("summary leaked a path: %q", summary)
