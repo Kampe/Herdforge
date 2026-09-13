@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/config"
-	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/provider"
 )
 
@@ -17,9 +16,11 @@ import (
 // runPoolReview is the production `herd review <ref> --pool` route. It reads
 // os.Args, so this saves and restores them and drives the real function: the
 // real config load, the real capacity gate, the real candidate resolution, the
-// real pool Ensure/Lease, the real slot pin, the real surface symlink and the
-// real packet. --no-launch returns before Herdr is consulted, so no external
-// host or provider call happens on this path.
+// real pool Ensure/Lease, the real slot pin, the real pane census, the real
+// surface symlink and the real packet. --no-launch returns before a reviewer is
+// LAUNCHED, but Herdr IS consulted before that: the pane census runs after the
+// lease and refuses on error. That boundary is an owned fixture CLI, never the
+// operator's.
 //
 // The ONLY seam is loadReviewTaskProvider, because the "memory" provider type
 // constructs an EMPTY provider and a fixture otherwise cannot make the entry's
@@ -79,37 +80,39 @@ func entryFixture(t *testing.T) (root, sha string) {
 	if dirty := git("status", "--porcelain"); dirty != "" {
 		t.Fatalf("fixture checkout is dirty: %s", dirty)
 	}
-	// HERMETICITY, using this repository's own production-supported overrides.
-	// The REAL admission gate, the REAL absence handling and the REAL entry all
-	// still run; only the state they touch is test-owned.
+	// HERMETICITY. cmd/herd's TestMain already calls laneenv.Strip and
+	// laneenv.Isolate, which cover HERD_ROLE/HERD_ROOT/HERD_WORKSPACE, the
+	// HERDR_ pane prefix and HERD_STATE_DIR. They do NOT cover HERD_HERDR_BIN,
+	// the admission lease path, or HOME.
 	//
-	// cmd/herd's TestMain already calls laneenv.Strip and laneenv.Isolate, so
-	// HERD_ROLE/HERD_ROOT/HERD_WORKSPACE/HERDR_* pane vars and HERD_STATE_DIR
-	// are handled package-wide. Three things it does not cover:
+	// The entry DOES consult Herdr before its --no-launch return:
+	// evictPoolSlotOccupants calls herdr.PaneList after Pool.Lease and REFUSES
+	// on error, and herdr.RequireWorkspace and liveReviewerFor's
+	// herdr.AgentList are reached too. So the boundary must be a real owned
+	// CLI, not an absent one.
 	//
-	//  1. the admission lease. admissionLeasePath honours
-	//     HERD_ADMISSION_LEASE_PATH and otherwise falls back to
-	//     $HOME/.herd/state/admission.lease — a HOST-WIDE file. Left alone, this
-	//     test would contend with, or take, the developer's or another runner's
-	//     real lease. Pointing it into the fixture keeps the exclusive-lease
-	//     logic exactly as production runs it, against state this test owns.
-	//  2. HOME itself, so nothing that falls back to it can reach the
-	//     developer's state.
-	//  3. the herdr CLI. liveReviewerFor calls herdr.AgentList, which on a host
-	//     with herdr installed would list the OPERATOR'S LIVE FLEET.
-	//     herdr.NoLiveEnv is the FAC-145 guard for exactly this: with it set and
-	//     no binary override, binaryPath refuses rather than reaching the live
-	//     fleet, so the entry takes its genuine missing-Herdr branch. That is the
-	//     real code path, not a bypass: --no-launch returns before Herdr is
-	//     required, and liveReviewerFor already treats an unavailable roster as
-	//     "not known", which is what a host without herdr does.
+	// installProtocolFakeHerdr is this package's existing protocol-faithful
+	// fixture (FAC-145). It writes an owned executable, points HERD_HERDR_BIN
+	// at it — which REPLACES any inherited override, the thing NoLiveEnv alone
+	// does not do, because binaryPath honours that variable BEFORE the no-live
+	// guard — and also sets NoLiveEnv so a lost override refuses instead of
+	// reaching the operator's CLI. With no pane state seeded it answers
+	// `pane list` and `agent list` with correctly shaped EMPTY inventories and
+	// `workspace list` with its own wFAKE, so no developer binary, fleet, pane
+	// or workspace is reachable.
+	_, herdrCalls := installProtocolFakeHerdr(t)
+	// Every test built on this fixture inherits the guard: reaching Herdr for
+	// anything the fixture does not model fails the test rather than escaping.
+	t.Cleanup(func() { assertOnlyCensusCommands(t, herdrCalls()) })
 	home := filepath.Join(root, "fixture-home")
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("HERD_ADMISSION_LEASE_PATH", filepath.Join(root, ".herd", "state", "admission.lease"))
-	t.Setenv(herdr.NoLiveEnv, "1")
+	// The protocol fake reports exactly this workspace id (fakeherdr_test.go),
+	// so RequireWorkspace resolves against the fixture rather than any host.
+	t.Setenv("HERD_WORKSPACE", "wFAKE")
 	t.Setenv("HERD_ROOT", root)
 	t.Setenv("HERD_REPO_ROOT", root)
 	// Keep the real capacity gate in play but guarantee it admits on any host.
@@ -244,4 +247,24 @@ func entryGitOutput(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v in %s: %v", args, dir, err)
 	}
 	return string(out)
+}
+
+// assertOnlyCensusCommands fails when the entry reached Herdr for anything
+// other than the reads this fixture models. The shared fake answers an
+// unknown command with an empty result rather than erroring, so the guard
+// against an unexpected invocation lives here instead of mutating a fixture
+// other tests depend on.
+func assertOnlyCensusCommands(t *testing.T, calls []string) {
+	t.Helper()
+	allowed := map[string]bool{
+		"pane list":      true,
+		"agent list":     true,
+		"workspace list": true,
+	}
+	for _, call := range calls {
+		fields := strings.Fields(call)
+		if len(fields) < 2 || !allowed[fields[0]+" "+fields[1]] {
+			t.Errorf("the no-launch entry invoked an unmodelled herdr command: %q", call)
+		}
+	}
 }
