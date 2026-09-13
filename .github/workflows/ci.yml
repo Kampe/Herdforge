@@ -87,6 +87,25 @@ jobs:
         env:
           CHAINSEER_BIN: chainseer/bin
 
+      # FAC-828: the bounded inbox's limits are covered by tests that must be
+      # shown to fail. Every mutant compiles first, so a compile error is never
+      # counted as a kill, and the source is restored and re-proved after each.
+      - name: FAC-828 bounded inbox non-vacuity controls
+        timeout-minutes: 20
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-mail-bounds.zsh
+
+      - name: Upload bounded inbox control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-mail-bounds-logs
+          path: .verify-bounds-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # FAC-826: the admission guards are covered by tests that had never been
       # shown to fail. This driver mutates the real source one guard at a time,
       # proves each mutant COMPILES, then requires the named killer test to fail
