@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // FAC-764. Release and reclaimDeadLocked handed the STORED slot.Path to
@@ -280,8 +281,14 @@ func TestReleaseRefusesAnUnknownLeaseAndLeavesTheOwnerHeld(t *testing.T) {
 }
 
 // CORRUPT RECORD, refusal: a stored path escaping the pool root is refused by
-// path components, and the lease stays held. The state is corrupted here
-// deliberately and only to reach this refusal.
+// path components, and the lease stays held.
+//
+// The escaped target is a REAL registered worktree of THIS repository, with
+// its own HEAD and an untracked marker. That is the whole point: an
+// unregistered scratch directory would be refused by the registration guard
+// instead, so the test would still go red with containment removed but for the
+// wrong reason, and nothing outside the pool would ever have been at risk. The
+// state assertions come first, because the destruction is the finding.
 func TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease(t *testing.T) {
 	f := newOwningFixture(t)
 	ctx := context.Background()
@@ -289,30 +296,41 @@ func TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease(t *testing.
 	if err != nil {
 		t.Fatalf("lease: %v", err)
 	}
-	escape := t.TempDir()
-	marker := filepath.Join(escape, "keep.txt")
+	outside := filepath.Join(t.TempDir(), "outside-worktree")
+	owningGit(t, f.repo, "worktree", "add", "--detach", outside, f.decoyRef)
+	marker := filepath.Join(outside, "marker.txt")
 	if err := os.WriteFile(marker, []byte("outside the pool\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f.corruptStoredPath(t, escape)
+	f.corruptStoredPath(t, outside)
 
 	err = f.pool().Release(ctx, lease.LeaseID)
+
+	if head := owningGit(t, outside, "rev-parse", "HEAD"); head != f.decoyRef {
+		t.Fatalf("containment did not protect the outside worktree: HEAD %s, want %s", head, f.decoyRef)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("containment did not protect the outside worktree's untracked marker: %v", statErr)
+	}
 	if err == nil {
-		t.Fatal("a slot path outside the pool root was reset")
+		t.Fatal("a registered worktree outside the pool root was reset")
 	}
 	if !strings.Contains(err.Error(), "outside the pool root") {
 		t.Fatalf("err = %v, want the containment refusal", err)
-	}
-	if _, statErr := os.Stat(marker); statErr != nil {
-		t.Fatalf("the refused path was touched anyway: %v", statErr)
 	}
 	if got := f.slot(t); got.LeaseID != lease.LeaseID {
 		t.Fatalf("a refused release cleared the lease: %+v", got)
 	}
 }
 
-// CORRUPT RECORD, refusal: a directory inside the pool root that git does not
-// register as a worktree is not ours to reset.
+// CORRUPT RECORD, refusal: a real git checkout UNDER the pool root that this
+// repository does not register as one of its worktrees is not ours to reset.
+//
+// The target is a SEPARATE repository, not a plain directory: `git -C` in a
+// plain nested directory discovers the enclosing repository and operates on
+// that instead, so a non-git target proves nothing about the registration
+// boundary. This one owns its own HEAD, its own main, and an untracked marker,
+// so removing the guard is destructive in a way the test can see.
 func TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease(t *testing.T) {
 	f := newOwningFixture(t)
 	ctx := context.Background()
@@ -320,15 +338,46 @@ func TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lease: %v", err)
 	}
-	stranger := filepath.Join(f.poolDir, "not-a-worktree")
+	stranger := filepath.Join(f.poolDir, "foreign-checkout")
 	if err := os.MkdirAll(stranger, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	owningGit(t, stranger, "init", "-q", "-b", "main")
+	for _, kv := range [][2]string{
+		{"user.email", "t@example.invalid"}, {"user.name", "t"},
+		{"commit.gpgsign", "false"}, {"gc.auto", "0"},
+	} {
+		owningGit(t, stranger, "config", kv[0], kv[1])
+	}
+	if err := os.WriteFile(filepath.Join(stranger, "a.txt"), []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owningGit(t, stranger, "add", "a.txt")
+	owningGit(t, stranger, "commit", "-q", "-m", "foreign first")
+	strangerHead := owningGit(t, stranger, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(stranger, "a.txt"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	owningGit(t, stranger, "add", "a.txt")
+	owningGit(t, stranger, "commit", "-q", "-m", "foreign second")
+	// HEAD sits behind its own main, so a `reset --hard main` MOVES it.
+	owningGit(t, stranger, "checkout", "-q", "--detach", strangerHead)
+	strangerMarker := filepath.Join(stranger, "marker.txt")
+	if err := os.WriteFile(strangerMarker, []byte("someone else's repository\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	f.corruptStoredPath(t, stranger)
 
 	err = f.pool().Release(ctx, lease.LeaseID)
+
+	if head := owningGit(t, stranger, "rev-parse", "HEAD"); head != strangerHead {
+		t.Fatalf("the registration guard did not protect the foreign checkout: HEAD %s, want %s", head, strangerHead)
+	}
+	if _, statErr := os.Stat(strangerMarker); statErr != nil {
+		t.Fatalf("the registration guard did not protect the foreign checkout's untracked marker: %v", statErr)
+	}
 	if err == nil {
-		t.Fatal("a directory git does not register as a worktree was reset")
+		t.Fatal("a checkout this repository does not register as a worktree was reset")
 	}
 	if !strings.Contains(err.Error(), "not a registered worktree") {
 		t.Fatalf("err = %v, want the registration refusal", err)
@@ -354,5 +403,160 @@ func TestReleaseKeepsTheLeaseWhenTheSlotIsGone(t *testing.T) {
 	}
 	if got := f.slot(t); got.LeaseID != lease.LeaseID {
 		t.Fatalf("a failed release cleared the lease: %+v", got)
+	}
+}
+
+// RELATIVE CONSTRUCTOR. NewPool(".", ".herd/pool") is in live use, and the
+// review found that anchoring only the slot path left the ANCHOR itself
+// moving: statePath, lockPath and containment all resolved against whatever
+// directory the process had reached. With a matching decoy state under the
+// caller, the checks validated the decoy and the reset landed there.
+//
+// The roots are captured while the caller's directory is still the one the
+// spellings were written against, so a later move cannot redirect them.
+func TestRelativeConstructorAnchorsBeforeTheCallerMoves(t *testing.T) {
+	f := newOwningFixture(t)
+	ctx := context.Background()
+
+	// Built with RELATIVE spellings from inside the repository, exactly as
+	// idlepool and the retirement authority build theirs.
+	t.Chdir(f.repo)
+	rel := NewPool(".", filepath.Join(".herd", "pool"), 1)
+	rel.DefaultBase = "main"
+	lease, err := rel.Lease(ctx, "review-relative")
+	if err != nil {
+		t.Fatalf("lease through a relative constructor: %v", err)
+	}
+	owningGit(t, f.slotPath, "checkout", "-q", "--detach", f.decoyRef)
+
+	// A complete decoy pool under the caller: same relative spelling, its own
+	// state file, its own registered worktree. Before the fix this is what the
+	// relative roots resolved to.
+	decoyPool := filepath.Join(f.foreign, ".herd", "pool")
+	if err := os.MkdirAll(decoyPool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	decoyState, err := os.ReadFile(filepath.Join(f.poolDir, "pool.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoyPool, "pool.json"), decoyState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(f.foreign)
+	if err := rel.Release(ctx, lease.LeaseID); err != nil {
+		t.Fatalf("release after the caller moved: %v", err)
+	}
+
+	if head := owningGit(t, f.slotPath, "rev-parse", "HEAD"); head != f.mainRef {
+		t.Fatalf("the owning slot was not the one released: HEAD %s, want %s", head, f.mainRef)
+	}
+	f.decoyIntact(t)
+	if got := f.slot(t); got.LeaseID != "" {
+		t.Fatalf("the owning pool state was not updated: %+v", got)
+	}
+}
+
+// FIXED CLOCK. Pool.Now is an exposed deterministic seam, so a later
+// assignment could receive the same public lease id AND the same generation as
+// a retired one. The retired holder then released its slot's new owner.
+//
+// This drives the real public paths repeatedly, and across a rebuilt Pool
+// object, so the guarantee cannot come from in-memory state.
+func TestFixedClockMintsAUniqueIncarnationForEveryAssignment(t *testing.T) {
+	f := newOwningFixture(t)
+	ctx := context.Background()
+	frozen := time.Unix(0, 1_700_000_000_000_000_000).UTC()
+
+	fixed := func() *Pool {
+		p := f.pool()
+		p.Now = func() time.Time { return frozen }
+		return p
+	}
+
+	seen := map[string]bool{}
+	var previous []string
+	for cycle := 0; cycle < 3; cycle++ {
+		// A REBUILT pool each cycle: the high-water mark must come back from
+		// the state file, not from memory.
+		p := fixed()
+		lease, err := p.Lease(ctx, "review-fixed")
+		if err != nil {
+			t.Fatalf("cycle %d lease: %v", cycle, err)
+		}
+		if seen[lease.LeaseID] {
+			t.Fatalf("cycle %d reissued the retired lease identity %q under a fixed clock", cycle, lease.LeaseID)
+		}
+		seen[lease.LeaseID] = true
+
+		// Every previously retired identity must be refused by the ORDINARY
+		// path while this owner holds the slot.
+		for _, old := range previous {
+			if err := fixed().Release(ctx, old); err == nil {
+				t.Fatalf("cycle %d: retired identity %q released the new owner through Release", cycle, old)
+			}
+		}
+		// ...and by the EXACT path, which compares id AND generation.
+		for _, old := range previous {
+			if err := fixed().ReleaseExact(ctx, "pool-01", old, lease.LeasedAt.UnixNano(), f.slotPath); err == nil {
+				t.Fatalf("cycle %d: retired identity %q released the new owner through ReleaseExact", cycle, old)
+			}
+		}
+		if got := f.slot(t); got.LeaseID != lease.LeaseID {
+			t.Fatalf("cycle %d: a retired identity disturbed the owner: %+v", cycle, got)
+		}
+		previous = append(previous, lease.LeaseID)
+
+		if err := fixed().Release(ctx, lease.LeaseID); err != nil {
+			t.Fatalf("cycle %d release: %v", cycle, err)
+		}
+	}
+}
+
+// The generation must also survive a slot being removed and recreated under
+// the same name, or GC followed by Ensure resurrects a retired identity.
+func TestARecreatedSlotDoesNotResurrectARetiredIdentity(t *testing.T) {
+	f := newOwningFixture(t)
+	ctx := context.Background()
+	frozen := time.Unix(0, 1_700_000_000_000_000_000).UTC()
+	fixed := func() *Pool {
+		p := f.pool()
+		p.Now = func() time.Time { return frozen }
+		return p
+	}
+
+	first, err := fixed().Lease(ctx, "review-recreate")
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if err := fixed().Release(ctx, first.LeaseID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// Remove the slot RECORD, as GC does, then let Ensure rebuild it.
+	state, err := fixed().readState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Slots = nil
+	if err := fixed().writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	owningGit(t, f.repo, "worktree", "remove", "--force", f.slotPath)
+	rebuilt := fixed()
+	if err := rebuilt.Ensure(ctx); err != nil {
+		t.Fatalf("ensure after removal: %v", err)
+	}
+
+	second, err := fixed().Lease(ctx, "review-recreated")
+	if err != nil {
+		t.Fatalf("lease after recreation: %v", err)
+	}
+	if second.LeaseID == first.LeaseID {
+		t.Fatalf("a recreated slot resurrected the retired identity %q", first.LeaseID)
+	}
+	if err := fixed().Release(ctx, first.LeaseID); err == nil {
+		t.Fatal("the retired identity released the recreated slot's owner")
 	}
 }

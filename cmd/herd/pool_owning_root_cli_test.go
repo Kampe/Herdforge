@@ -248,3 +248,34 @@ func TestPoolReleaseCLIRefusesARetiredLeaseIdentity(t *testing.T) {
 		t.Fatalf("the new owner's lease was disturbed: %+v", got)
 	}
 }
+
+// The field reproduction used a RELATIVE --pool-root from the orchestrator's
+// directory (`--pool-root ../../.herd/pool`), which resolves to the owning
+// pool from there. That spelling must reach the same owning slot as an
+// absolute one, with the caller-relative decoy left alone.
+func TestPoolReleaseCLIWithARelativePoolRootFromAForeignCaller(t *testing.T) {
+	f := newPoolCLIFixture(t)
+	leaseID := f.lease(t)
+	poolCLIGit(t, f.slotPath, "checkout", "-q", "--detach", f.decoyRef)
+
+	relPool, err := filepath.Rel(f.foreign, f.poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.IsAbs(relPool) {
+		t.Fatalf("fixture produced an absolute pool root %q; the relative path is the case under test", relPool)
+	}
+
+	_, stderr, code := f.herdPool(t, f.foreign, "--pool-root", relPool, "release", leaseID)
+	if code != 0 {
+		t.Fatalf("herd pool release with a relative pool root: exit %d (%s)", code, stderr)
+	}
+
+	if head := poolCLIGit(t, f.slotPath, "rev-parse", "HEAD"); head != f.mainRef {
+		t.Fatalf("owning slot HEAD = %s, want the base %s", head, f.mainRef)
+	}
+	if got := f.slots(t)[0]; got.LeaseID != "" || got.LastReleaseLeaseID != leaseID {
+		t.Fatalf("owning slot was not recorded as released: %+v", got)
+	}
+	f.decoyIntact(t)
+}
