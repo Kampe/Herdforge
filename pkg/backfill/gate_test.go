@@ -49,16 +49,52 @@ func TestFleetGate_PassesHealthyReadingThrough(t *testing.T) {
 	}
 }
 
-// TIGHT is a warning, not a refusal — a fleet at 2% free with zero swap is
-// macOS steady state (see pkg/resources).
-func TestFleetGate_TightMemoryStillLaunches(t *testing.T) {
-	g := &FleetGate{Lanes: lanes(2), Reviews: reviews(0), Memory: func() (string, error) { return resources.VerdictTight, nil }}
+// TestFleetGate_TightMemoryZeroesBuilders REPLACES
+// TestFleetGate_TightMemoryStillLaunches.
+//
+// CONTRACT CHANGE, stated rather than slipped in. TIGHT used to mean "warning,
+// still launch", on the reasoning that a fleet at 2% free with zero swap is
+// macOS steady state. That reasoning survives -- Darwin's free percentage no
+// longer gates anything (pkg/resources reads the kernel pressure level
+// instead) -- but the WORD was repurposed: TIGHT now names a refusal backed by
+// a measurement, a saturated cpu or kernel memory pressure. Launching on it
+// would launch on exactly the conditions the new policy refuses.
+//
+// Coverage is kept, not deleted: the fixture still asserts what TIGHT does, and
+// the review-drain half below still proves refusals do not deadlock.
+func TestFleetGate_TightMemoryZeroesBuilders(t *testing.T) {
+	g := &FleetGate{Lanes: lanes(2), Reviews: reviews(3), Memory: func() (string, error) { return resources.VerdictTight, nil }}
+	got, err := g.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("capacity: %v", err)
+	}
+	if got.FreeBuilderLanes != 0 {
+		t.Fatalf("TIGHT still launched %d builder lane(s); a measured refusal must zero them", got.FreeBuilderLanes)
+	}
+	// Review drain survives the refusal, which is what releases the pressure.
+	if got.PendingReviews != 3 {
+		t.Fatalf("TIGHT blocked review drain (%d pending); draining is what clears the condition", got.PendingReviews)
+	}
+}
+
+// The causal control for the change above: OK still launches, so the refusal is
+// specific to the verdict and not a gate that now refuses everything.
+func TestFleetGate_OKMemoryStillLaunches(t *testing.T) {
+	g := &FleetGate{Lanes: lanes(2), Reviews: reviews(0), Memory: func() (string, error) { return resources.VerdictOK, nil }}
 	got, err := g.Capacity(context.Background())
 	if err != nil {
 		t.Fatalf("capacity: %v", err)
 	}
 	if got.FreeBuilderLanes != 2 {
-		t.Fatalf("TIGHT refused builders: %+v", got)
+		t.Fatalf("OK refused builders: %+v", got)
+	}
+}
+
+// An unrecognized verdict is an error, not a silent pass.
+func TestFleetGate_UnknownVerdictIsAnError(t *testing.T) {
+	g := &FleetGate{Lanes: lanes(2), Reviews: reviews(0), Memory: func() (string, error) { return "SOMETHING_ELSE", nil }}
+	if _, err := g.Capacity(context.Background()); err == nil {
+		t.Fatal("an unrecognized memory verdict was accepted")
 	}
 }
 
