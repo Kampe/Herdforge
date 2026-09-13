@@ -106,6 +106,14 @@ func pinnedCandidateFor(binding verifyLandedBinding) string {
 // requireObjectPresent proves the repository actually holds the object, so a
 // foreign checkout cannot stand in for the reviewed one.
 func requireObjectPresent(repoDir, sha string) error {
+	// An empty identity is refused BEFORE any command. `git cat-file -t ""`
+	// spends a subprocess to answer "Not a valid object name" and reports it
+	// with a blank SHA, which reads as a repository problem rather than the
+	// missing pin it actually is. Seen in CI 34742740503 m03, where removing
+	// the pin guard let an empty candidate reach here.
+	if strings.TrimSpace(sha) == "" {
+		return fmt.Errorf("no candidate identity to look up")
+	}
 	out, err := exec.Command("git", "-C", repoDir, "cat-file", "-t", sha).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git cat-file -t %s: %s", shortSHA12(sha), strings.TrimSpace(string(out)))

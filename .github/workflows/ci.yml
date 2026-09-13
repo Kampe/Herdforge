@@ -203,23 +203,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # FAC-824: the mailbox-repair guards refuse stale or conflicting
-      # identity, malformed unrelated rows, privileged records and concurrent
-      # change, and they bound the durable prepare/recovery/completion
-      # boundaries. Refusal tests alone cannot show those guards are load
-      # bearing, so this step removes each one from the REAL source, in its own
-      # ephemeral worktree, and requires the named test to fail on its named
-      # assertion. Serial by construction: one checkout, one mutant at a time.
-      # Finite and explicit. The driver bounds each compile and each serial
-      # package run itself; this is the outer ceiling so a wedged step cannot
-      # hold a runner indefinitely. Eight mutants, each one compile plus one
-      # anchored package run, plus a baseline and a restored run, all serial.
       # FAC-831: the landed-receipt producer is defended by NEGATIVE assertions
       # -- it must not seal a patch carrier as MergeSHA, must not reach for a
       # later commit that merely contains the base, and must not observe a
       # landing against the invoking checkout without a pinned candidate. Each
       # is removed from the REAL source here and its named test must fail on its
       # named assertion; a mutant that does not build is BROKEN-RUN, not a kill.
+      #
+      # Serial by construction: one ephemeral checkout, one mutant at a time,
+      # each a compile plus one anchored package run, plus a baseline and a
+      # restored run. The mutant COUNT is deliberately not written here: two
+      # authors change this driver independently, and a number in a comment goes
+      # stale silently. The driver's own mutations array is the count.
       - name: Verify landed receipt guard controls
         timeout-minutes: 30
         run: |
@@ -261,6 +256,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-824: the mailbox-repair guards refuse stale or conflicting
+      # identity, malformed unrelated rows, privileged records and concurrent
+      # change, and they bound the durable prepare/recovery/completion
+      # boundaries. Refusal tests alone cannot show those guards are load
+      # bearing, so this step removes each one from the REAL source, in its own
+      # ephemeral worktree, and requires the named test to fail on its named
+      # assertion. Serial by construction: one checkout, one mutant at a time.
+      # Finite and explicit. The driver bounds each compile and each serial
+      # package run itself; this is the outer ceiling so a wedged step cannot
+      # hold a runner indefinitely. Eight mutants, each one compile plus one
+      # anchored package run, plus a baseline and a restored run, all serial.
       - name: Verify mail repair guard controls
         timeout-minutes: 30
         run: |
