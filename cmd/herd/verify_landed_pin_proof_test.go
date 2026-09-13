@@ -109,7 +109,7 @@ func TestVerifyLandedGateProvesAPinnedRetiredCandidate(t *testing.T) {
 // The object-presence guard, at its new home. A pin naming an object this
 // repository does not hold is refused by the bounded proof.
 func TestVerifyLandedGateRefusesAnAbsentPin(t *testing.T) {
-	repo, base, _, landed := landedPinFixture(t)
+	repo, base, _, _ := landedPinFixture(t)
 	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: strings.Repeat("0", 40)}
 
@@ -122,7 +122,7 @@ func TestVerifyLandedGateRefusesAnAbsentPin(t *testing.T) {
 // The object-TYPE guard, at its new home. A tree id resolves in git but is not
 // a candidate; `^{commit}` is what refuses it.
 func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
-	repo, base, candidate, landed := landedPinFixture(t)
+	repo, base, candidate, _ := landedPinFixture(t)
 	tree := func() string {
 		c := exec.Command("git", "rev-parse", candidate+"^{tree}")
 		c.Dir = repo
@@ -145,7 +145,7 @@ func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
 // the semantics CI 34742740503 m03 established, preserved after the move:
 // resolveCommit refuses a blank revision before spending any command.
 func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
-	repo, base, _, landed := landedPinFixture(t)
+	repo, base, _, _ := landedPinFixture(t)
 	gate := &mergeadmit.Gate{RepoDir: repo, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: "   "}
 
