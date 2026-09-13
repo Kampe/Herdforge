@@ -40,10 +40,13 @@
 # own value. It does NOT prove that removing any of the other four pins is
 # caught; those are asserted by the same test but are not separately mutated.
 #
-# LIMIT worth knowing: that one control mutates a herdfixture-TAGGED file, which
-# `go test -c` does not compile without the tag. Its compile step therefore
-# proves the untagged package builds, not the mutant; a syntax error there would
-# surface as BROKEN-RUN from the subprocess build instead of COMPILE-FAIL.
+# BUILD TAGS: one control mutates a herdfixture-TAGGED file, and `go test -c`
+# without that tag compiles a source set the mutant is not even in. Every row
+# therefore DECLARES the tags its source needs, each row gets a distinct bounded
+# compile of exactly that set before its killer runs, and the declaration is
+# checked against the file's own //go:build line before any mutation. A row that
+# understates its tags is a harness error, not a quiet pass, so this class
+# cannot recur by someone adding a tagged source and forgetting the flag.
 #
 # All mutation happens in one ephemeral detached worktree this invocation
 # creates and owns. The invoking checkout is never written to, and this script
@@ -159,10 +162,26 @@ mutated_sources=()
 # assertion evidence: "the build broke" and "the test saw the guard" are
 # different claims.
 compile_check() {
-	local pkg=$1 log=$2 exit_code=0
-	( cd "$work" && timeout -k 10s "${compile_timeout}s" \
-		go test -p 1 -c -o /dev/null "$pkg" ) >"$log" 2>&1 || exit_code=$?
+	local pkg=$1
+	local log=$2
+	local tags=${3-}
+	local exit_code=0
+	if [[ -n "$tags" ]]; then
+		( cd "$work" && timeout -k 10s "${compile_timeout}s" \
+			go test -p 1 -c -o /dev/null -tags "$tags" "$pkg" ) >"$log" 2>&1 || exit_code=$?
+	else
+		( cd "$work" && timeout -k 10s "${compile_timeout}s" \
+			go test -p 1 -c -o /dev/null "$pkg" ) >"$log" 2>&1 || exit_code=$?
+	fi
 	print -r -- "$exit_code"
+}
+
+# source_build_tags reads the //go:build constraint a file declares, or the
+# empty string when it has none. Only the leading comment block is consulted:
+# a build constraint has to appear before the package clause.
+source_build_tags() {
+	local file=$1
+	awk '/^package /{exit} /^\/\/go:build /{sub(/^\/\/go:build[ \t]+/, ""); print; exit}' "$file"
 }
 
 # run_focused executes one -run selection serially and records machine-readable
@@ -362,19 +381,24 @@ classify_run() {
 # claims -- cpu, memory pressure and UNKNOWN each reaching the pool gate -- and
 # each is bound to its own subtest, so a kill in one cannot be reported as
 # evidence for another.
+# Row: id | source | anchor | replacement | anchor2 | replacement2 | package |
+# killer test | required assertion text | BUILD TAGS the source needs.
+#
+# The tags field is not decoration: it selects the source set the mutant is
+# compiled in, and it is verified against the file's own //go:build line below.
 sep=$'\x1f'
 mutations=(
-"cpu-threshold-removed${sep}${admission_src}${sep}		if normalized >= limits.CPURefuseLoad {${sep}		if false { // MUTANT: cpu threshold removed${sep}${sep}${sep}${resources_pkg}${sep}TestCPUAndMemoryRefuseIndependently${sep}saturated cpu with healthy memory admitted"
-"memory-reserve-removed${sep}${admission_src}${sep}		case head.FreePctGates && head.FreePct < limits.MemReservePct:${sep}		case false: // MUTANT: os reserve removed${sep}${sep}${sep}${resources_pkg}${sep}TestHealthyAdmitsAtTheReserveBoundary${sep}headroom one point below the reserve admitted"
-"kernel-pressure-ignored${sep}${admission_src}${sep}		case head.Pressure.Unsafe():${sep}		case false: // MUTANT: kernel pressure ignored${sep}${sep}${sep}${resources_pkg}${sep}TestKernelPressureRefusesRegardlessOfFreePercent${sep}admitted at 95% free"
-"stale-age-never-expires${sep}${admission_src}${sep}	if age := now.Sub(observedAt); age > limits.StaleAfter {${sep}	if age := now.Sub(observedAt); false { // MUTANT: age never expires${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an hour-old FRESH reading admitted"
-"unrecognized-posture-accepted${sep}${admission_src}${sep}		return fmt.Sprintf(\"%s carries an unrecognized freshness state %q; an unset posture is not an observation\", what, string(state))${sep}		return \"\" // MUTANT: unrecognised posture accepted${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an unrecognized freshness state admitted"
-"unmeasured-host-not-alert${sep}${admission_src}${sep}	if !a.cpuUsable || !a.memUsable {${sep}	if false { // MUTANT: an unmeasured host stops reporting ALERT${sep}${sep}${sep}${resources_pkg}${sep}TestUnknownObservationsRefuse${sep}want \"ALERT\" for an unmeasured host"
-"capacity-ignores-refusal${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/cpu-saturated${sep}an unsafe host must refuse the launch"
-"capacity-ignores-unknown-host${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/not-a-known-host${sep}an unsafe host must refuse the launch"
-"capacity-ignores-memory-pressure${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/memory-pressure${sep}an unsafe host must refuse the launch"
-"capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: paired, so the nil case cannot be dereferenced${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted"
-"fixture-census-pin-wrong-value${sep}cmd/herd/capacity_shared_admission_fixture.go${sep}	o.MemAvailMiB = fixtureMemAvailMiB${sep}	o.MemAvailMiB = 1234 // MUTANT: a DETERMINISTIC wrong pin, never the runner value${sep}${sep}${sep}${herd_pkg}${sep}TestFixtureCensusPinsEveryPostAdmissionInput${sep}the fixture census did not reach this arm"
+"cpu-threshold-removed${sep}${admission_src}${sep}		if normalized >= limits.CPURefuseLoad {${sep}		if false { // MUTANT: cpu threshold removed${sep}${sep}${sep}${resources_pkg}${sep}TestCPUAndMemoryRefuseIndependently${sep}saturated cpu with healthy memory admitted${sep}"
+"memory-reserve-removed${sep}${admission_src}${sep}		case head.FreePctGates && head.FreePct < limits.MemReservePct:${sep}		case false: // MUTANT: os reserve removed${sep}${sep}${sep}${resources_pkg}${sep}TestHealthyAdmitsAtTheReserveBoundary${sep}headroom one point below the reserve admitted${sep}"
+"kernel-pressure-ignored${sep}${admission_src}${sep}		case head.Pressure.Unsafe():${sep}		case false: // MUTANT: kernel pressure ignored${sep}${sep}${sep}${resources_pkg}${sep}TestKernelPressureRefusesRegardlessOfFreePercent${sep}admitted at 95% free${sep}"
+"stale-age-never-expires${sep}${admission_src}${sep}	if age := now.Sub(observedAt); age > limits.StaleAfter {${sep}	if age := now.Sub(observedAt); false { // MUTANT: age never expires${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an hour-old FRESH reading admitted${sep}"
+"unrecognized-posture-accepted${sep}${admission_src}${sep}		return fmt.Sprintf(\"%s carries an unrecognized freshness state %q; an unset posture is not an observation\", what, string(state))${sep}		return \"\" // MUTANT: unrecognised posture accepted${sep}${sep}${sep}${resources_pkg}${sep}TestConsumerPolicyEnforcesWhatFreshnessDoesNot${sep}an unrecognized freshness state admitted${sep}"
+"unmeasured-host-not-alert${sep}${admission_src}${sep}	if !a.cpuUsable || !a.memUsable {${sep}	if false { // MUTANT: an unmeasured host stops reporting ALERT${sep}${sep}${sep}${resources_pkg}${sep}TestUnknownObservationsRefuse${sep}want \"ALERT\" for an unmeasured host${sep}"
+"capacity-ignores-refusal${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/cpu-saturated${sep}an unsafe host must refuse the launch${sep}"
+"capacity-ignores-unknown-host${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/not-a-known-host${sep}an unsafe host must refuse the launch${sep}"
+"capacity-ignores-memory-pressure${sep}${capacity_src}${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: pool gate ignores the shared refusal${sep}${sep}${sep}${herd_pkg}${sep}TestPoolReviewRefusesUnsafeHostBeforeCandidatePreparation/memory-pressure${sep}an unsafe host must refuse the launch${sep}"
+"capacity-admits-without-decision${sep}${capacity_src}${sep}	case o.admission == nil || o.Admission == nil:${sep}	case false: // MUTANT: unevaluated observation admitted${sep}	case !o.Admission.Admits:${sep}	case false: // MUTANT: paired, so the nil case cannot be dereferenced${sep}${herd_pkg}${sep}TestCapacityRefusesWithoutAnAdmission${sep}an unevaluated observation admitted${sep}"
+"fixture-census-pin-wrong-value${sep}cmd/herd/capacity_shared_admission_fixture.go${sep}	o.MemAvailMiB = fixtureMemAvailMiB${sep}	o.MemAvailMiB = 1234 // MUTANT: a DETERMINISTIC wrong pin, never the runner value${sep}${sep}${sep}${herd_pkg}${sep}TestFixtureCensusPinsEveryPostAdmissionInput${sep}the fixture census did not reach this arm${sep}herdfixture"
 )
 
 # Snapshot EVERY source a control declares, exactly once, before anything is
@@ -398,6 +422,25 @@ for record in "${mutations[@]}"; do
 		exit 1
 	fi
 	mutated_sources+=("$src")
+done
+
+# Build-tag audit. A row whose source carries a //go:build constraint MUST
+# declare it, or the compile phase would build a source set the mutant is not
+# in and certify a file it never saw. Checked before anything is mutated, and a
+# mismatch stops the run: this is a harness fault, not a failed control.
+for record in "${mutations[@]}"; do
+	fields=("${(@ps:$sep:)record}")
+	src=$fields[2]
+	declared=$fields[10]
+	actual=$(source_build_tags "$work/$src")
+	# Exact equality, deliberately. A constraint this comparison cannot satisfy
+	# -- a negation or a compound expression that is not a usable -tags value --
+	# stops the run rather than being guessed at, which is the whole point: an
+	# unbuildable declaration is visible, a silently wrong source set is not.
+	if [[ "$actual" != "$declared" ]]; then
+		print -u2 "harness error: $src declares build tags ${actual:-(none)} but its control row says ${declared:-(none)}; the mutant would be compiled in the wrong source set"
+		exit 1
+	fi
 done
 
 note "pin $pin"
@@ -435,25 +478,47 @@ for record in "${mutations[@]}"; do
 	id=$fields[1]; src=$fields[2]; anchor=$fields[3]; replacement=$fields[4]
 	anchor2=$fields[5]; replacement2=$fields[6]
 	pkg=$fields[7]; killer=$fields[8]; want=$fields[9]
+	tags=$fields[10]
 	stem=$run_dir/$(printf 'm%02d-%s' "$index" "$id")
 
 	patch_source "$src" "$anchor" "$replacement"
 	if [[ -n "$anchor2" ]]; then
 		patch_source "$src" "$anchor2" "$replacement2"
 	fi
+	# Phase one: the shipped, untagged source set must still build. Every row
+	# gets this, so a mutation that breaks the default build is caught even
+	# when the mutant itself lives behind a tag.
 	compile_exit=$(compile_check "$pkg" "$stem.compile.log")
 	if (( compile_exit != 0 )); then
 		restore_source "$src"
-		note "mutant $id: COMPILE-FAIL (exit $compile_exit) - a mutant that does not build proves nothing"
+		note "mutant $id: COMPILE-FAIL untagged (exit $compile_exit) - a mutant that does not build proves nothing"
 		(( failures += 1 ))
 		continue
+	fi
+	# Phase two, for a tagged row only: compile the source set the mutant is
+	# ACTUALLY in. Without this the untagged build above says nothing about the
+	# mutated file, and a syntax or type error in it would reach the killer as
+	# a broken subprocess build rather than as a compile result. The log is kept
+	# separately so the two claims never merge.
+	if [[ -n "$tags" ]]; then
+		tagged_exit=$(compile_check "$pkg" "$stem.compile-tags.log" "$tags")
+		if (( tagged_exit != 0 )); then
+			restore_source "$src"
+			note "mutant $id: COMPILE-FAIL tagged:$tags (exit $tagged_exit) - the tagged mutant does not build, so nothing it could assert counts"
+			(( failures += 1 ))
+			continue
+		fi
 	fi
 	# Anchored to this mutant's one killer, subtests included.
 	run_exit=$(run_focused "$pkg" "^${killer}$" "$stem.json" "$stem.err")
 	verdict=$(classify_run "$run_exit" "$stem.json" "$killer" "$want")
 	restore_source "$src"
 
-	note "mutant $id: compile PASS, run $verdict (killer $killer, exit $run_exit)"
+	if [[ -n "$tags" ]]; then
+		note "mutant $id: compile PASS (untagged + tagged:$tags), run $verdict (killer $killer, exit $run_exit)"
+	else
+		note "mutant $id: compile PASS, run $verdict (killer $killer, exit $run_exit)"
+	fi
 	if [[ "$verdict" != KILLED ]]; then
 		(( failures += 1 ))
 		[[ -s "$stem.err" ]] && tail -n 20 -- "$stem.err" >&2
