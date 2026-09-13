@@ -75,6 +75,11 @@ type Pool struct {
 	// containment and registration checks validated the DECOY and the reset
 	// landed there. Anchoring only the slot path was not enough, because the
 	// anchor itself moved.
+	// constructed records that NewPool captured the roots while the caller's
+	// working directory was still the one the spellings were written against.
+	// A Pool assembled as a struct literal has no such moment, so a relative
+	// spelling there cannot be anchored and is refused rather than guessed.
+	constructed   bool
 	rootsOnce     sync.Once
 	canonRepoRoot string
 	canonRoot     string
@@ -122,6 +127,7 @@ func NewPool(repoRoot, root string, size int) *Pool {
 	// Captured at CONSTRUCTION, while the caller's working directory is still
 	// the one the spellings were written against. Resolving later would anchor
 	// to wherever the process had moved to by then.
+	p.constructed = true
 	_ = p.canonicalRoots()
 	return p
 }
@@ -141,6 +147,16 @@ func (p *Pool) canonicalRoots() error {
 		}
 		if strings.TrimSpace(p.RepoRoot) == "" {
 			p.rootsErr = errors.New("worktree pool: repository root is required")
+			return
+		}
+		// A Pool assembled as a struct literal has no construction moment to
+		// anchor against: by the time anything resolves, the caller may have
+		// changed directory, and a relative spelling cannot be recovered from
+		// a directory that is no longer the one it was written against.
+		// Refuse it outright rather than reading ./pool.json and calling that
+		// the owning pool.
+		if !p.constructed && (!filepath.IsAbs(p.RepoRoot) || !filepath.IsAbs(p.Root)) {
+			p.rootsErr = fmt.Errorf("worktree pool: a pool built without NewPool must use absolute roots; %q and %q cannot be anchored after the caller's working directory may have changed", p.RepoRoot, p.Root)
 			return
 		}
 		if p.canonRepoRoot, p.rootsErr = canonicalOwningRoot(p.RepoRoot); p.rootsErr != nil {
@@ -187,7 +203,24 @@ func (p *Pool) withLock(fn func() error) error {
 	return fn()
 }
 
+// readState loads the pool record, anchoring the owning roots FIRST so a state
+// read can never resolve against the caller's working directory, and deriving
+// the allocation high-water mark from whatever the record retains.
+//
+// FAC-764 review: LastAssignedGeneration is new, and legacy version-1 state
+// omits it. A legacy slot released at generation G loaded a zero high-water,
+// so with a fixed or rolled-back clock the next allocation reissued exactly
+// "<slot>-G" and the retired holder could release the new incarnation. The
+// previous schema already retained the evidence needed to prevent that: the
+// active LeasedAt of a held slot and the LastReleaseGeneration of a released
+// one. Both are read here, before any allocation runs and before a release or
+// reclaim can overwrite them, and the maximum becomes the high-water mark.
+// Those release fields are only READ: they remain exact-release evidence and
+// are never repurposed to carry allocation metadata.
 func (p *Pool) readState() (poolState, error) {
+	if err := p.canonicalRoots(); err != nil {
+		return poolState{}, err
+	}
 	data, err := os.ReadFile(p.statePath())
 	if errors.Is(err, fs.ErrNotExist) {
 		return poolState{Version: 1, Slots: []PoolSlot{}}, nil
@@ -202,7 +235,25 @@ func (p *Pool) readState() (poolState, error) {
 	if state.Version != 1 {
 		return poolState{}, fmt.Errorf("worktree pool: unsupported state version %d", state.Version)
 	}
+	state.LastAssignedGeneration = retainedGenerationHighWater(state)
 	return state, nil
+}
+
+// retainedGenerationHighWater is the largest lease generation the record can
+// still account for. It never lowers an existing mark.
+func retainedGenerationHighWater(state poolState) int64 {
+	high := state.LastAssignedGeneration
+	for _, slot := range state.Slots {
+		if slot.LeaseID != "" && !slot.LeasedAt.IsZero() {
+			if n := slot.LeasedAt.UnixNano(); n > high {
+				high = n
+			}
+		}
+		if slot.LastReleaseGeneration > high {
+			high = slot.LastReleaseGeneration
+		}
+	}
+	return high
 }
 
 func (p *Pool) writeState(state poolState) error {
