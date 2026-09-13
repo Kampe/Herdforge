@@ -117,6 +117,12 @@ type Decision struct {
 // Gate is the single compiled merge authority. Construct one per repository.
 type Gate struct {
 	RepoDir string
+	// ProofBudget is the finite allowance one landed proof may spend: its
+	// deadline, its git command count, its per-command output bytes and its
+	// range size. The zero value takes the package defaults, so an existing
+	// caller is bounded without doing anything; a caller that needs a tighter
+	// allowance sets only the field it cares about.
+	ProofBudget ProofBudget
 	// Ledger is the durable review-verdict ledger. Nil refuses everything:
 	// with no ledger there is no verdict, and no verdict is not a PASS.
 	Ledger *reviewledger.Ledger

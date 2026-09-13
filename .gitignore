@@ -154,3 +154,6 @@ TASK-PACKET.md
 
 # FAC-830: mutation-control logs from scripts/verify-quota-singleflight.zsh.
 .verify-singleflight-logs/
+
+# FAC-831: mutation-control logs from scripts/verify-landed-proof-bounds.zsh.
+.verify-landed-proof-bounds-logs/

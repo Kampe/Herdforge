@@ -44,7 +44,16 @@ func prShapedLanding(t *testing.T) (dir, base, carrier, candidate, mergeCommit s
 	run(t, dir, "git", "merge", "--no-ff", "--no-edit", "-m", "bring the reviewed base into the pull request", base)
 	candidate = commit(t, dir, "d.txt", "final reviewed change\n", "candidate tip")
 
-	mergeCommit = prMergeAfterBaseAdvanced(t, dir, base, candidate, "b.txt", "Merge pull request #836")
+	// Main moves on AGAIN, with a change the pull-request line never took in.
+	// Without this the candidate subsumes main, the merge tree equals the
+	// candidate's, and the landing degenerates into the empty administrative
+	// merge githubEmptyMerge models. The real PR836 merge fb351fa8 has a tree
+	// that differs from BOTH its parents, which is only true while main holds
+	// something the pull request does not.
+	run(t, dir, "git", "checkout", "-q", "main")
+	mainAhead := commit(t, dir, "e.txt", "main moved on\n", "later unrelated main work")
+
+	mergeCommit = prMergeAfterBaseAdvanced(t, dir, mainAhead, candidate, "b.txt", "Merge pull request #836")
 
 	// Prove the fixture really has the measured shape, or the tests below would
 	// pass against a topology that cannot exhibit the defect.
