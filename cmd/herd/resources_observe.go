@@ -95,17 +95,29 @@ func runResourcesObserver(f observerFlags) int {
 	fmt.Fprintln(os.Stderr, "resources observer: "+resources.ObserverAuthorityNote)
 
 	status, err := resources.RunObserver(ctx, validated, nil)
-	if err != nil {
-		if errors.Is(err, resources.ErrObserverBusy) {
-			fmt.Fprintf(os.Stderr, "resources --watch: %v\n", err)
-			return observerExitRefused
-		}
+	if code := observerExitCodeFor(err); code != 0 {
 		fmt.Fprintf(os.Stderr, "resources --watch: %v\n", err)
-		return 1
+		return code
 	}
 	fmt.Fprintf(os.Stderr, "resources observer: stopped after %d tick(s), %d skipped\n",
 		status.TotalTicks, status.SkippedTicks)
 	return 0
+}
+
+// observerExitCodeFor maps a RunObserver result to an exit code.
+//
+// It is separate so the mapping can be asserted directly: a run whose terminal
+// status failed to publish must never reach the success branch, however it was
+// stopped. A clean shutdown is the ONLY path to zero.
+func observerExitCodeFor(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, resources.ErrObserverBusy):
+		return observerExitRefused
+	default:
+		return 1
+	}
 }
 
 // runResourcesObserverStatus reads the published status and reports whether it

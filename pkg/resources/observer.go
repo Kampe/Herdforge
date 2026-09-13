@@ -74,6 +74,16 @@ const (
 // path would interleave writes and neither could be trusted.
 var ErrObserverBusy = errors.New("resources: another observer holds the canonical observer lock")
 
+// ErrObserverPublishFailed marks a failure to WRITE the status, as distinct
+// from a failure to observe.
+//
+// It exists because a publication failure can be joined with an ordinary
+// cancellation, and cancellation on its own is a clean shutdown. Without a
+// distinguishable marker the join reads as "the operator stopped it", the exit
+// is reported as success, and the terminal artifact silently never lands --
+// leaving an older, non-terminal report in place for a consumer to trust.
+var ErrObserverPublishFailed = errors.New("resources: observer status publication failed")
+
 // ObserverConfig is the validated shape of one observer run.
 type ObserverConfig struct {
 	Interval      time.Duration
@@ -384,7 +394,10 @@ func publishAt(deps observerDeps, status *ObserverStatus, at time.Time, interval
 	}
 	status.PublishedAt = stampUTC(at)
 	status.ExpiresAt = stampUTC(observerExpiry(at, interval, status.Latest))
-	return deps.publish(*status)
+	if err := deps.publish(*status); err != nil {
+		return fmt.Errorf("%w: %w", ErrObserverPublishFailed, err)
+	}
+	return nil
 }
 
 // observerExpiry is the earlier of two deadlines, never the later.
@@ -442,7 +455,10 @@ func metricWindowEnd(report AdmissionReport) (time.Time, bool) {
 // than extending it: an exited observer must not look fresher for stopping.
 func publishFinal(deps observerDeps, status *ObserverStatus) error {
 	status.PublishedAt = stampUTC(deps.now())
-	return deps.publish(*status)
+	if err := deps.publish(*status); err != nil {
+		return fmt.Errorf("%w: %w", ErrObserverPublishFailed, err)
+	}
+	return nil
 }
 
 // appendBounded keeps at most ObserverHistoryMax entries, newest last, by

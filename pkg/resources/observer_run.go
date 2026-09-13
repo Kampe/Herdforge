@@ -30,12 +30,22 @@ const observerLockRetry = 200 * time.Millisecond
 // file writes, and the survivor would be whichever wrote last -- which is not
 // exclusivity, it is a race with a tidy filename.
 func RunObserver(ctx context.Context, cfg ObserverConfig, lockProvider LockProvider) (ObserverStatus, error) {
+	return runObserverPublishing(ctx, cfg, lockProvider, nil)
+}
+
+// runObserverPublishing is RunObserver with the status writer injectable. The
+// seam exists so the public error-normalization path can be exercised without a
+// filesystem: a nil publisher means the real atomic write.
+func runObserverPublishing(ctx context.Context, cfg ObserverConfig, lockProvider LockProvider, publish func(ObserverStatus) error) (ObserverStatus, error) {
 	cfg, err := cfg.Validate()
 	if err != nil {
 		return ObserverStatus{}, fmt.Errorf("observer configuration refused: %w", err)
 	}
 	if lockProvider == nil {
 		lockProvider = FileLockProvider{}
+	}
+	if publish == nil {
+		publish = func(st ObserverStatus) error { return writeObserverStatus(cfg.StatusPath, st) }
 	}
 
 	// The scope published with every observation must describe the path that
@@ -100,19 +110,36 @@ func RunObserver(ctx context.Context, cfg ObserverConfig, lockProvider LockProvi
 			}
 			return report, nil
 		},
-		publish: func(status ObserverStatus) error {
-			return writeObserverStatus(cfg.StatusPath, status)
-		},
+		publish: publish,
 	}
 
 	status, err := runObserverLoop(runCtx, cfg, id, deps)
-	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		// Operator-initiated shutdown and lifetime expiry are both normal
-		// exits, and the terminal status has already been published by the
-		// loop.
-		return status, nil
+	return status, normalizeObserverExit(err)
+}
+
+// normalizeObserverExit decides which loop errors are a clean shutdown.
+//
+// Operator cancellation and lifetime expiry are normal exits -- but ONLY when
+// the terminal status actually landed. The loop joins a publication failure
+// with the cancellation that triggered it, so treating the presence of a
+// cancellation anywhere in the tree as proof that nothing else went wrong
+// converted errors.Join(context.Canceled, writeFailure) into a success, and the
+// command then reported a normal stop while an older, non-terminal report was
+// still on disk.
+//
+// Both causes are preserved in the returned error: the caller can see that the
+// observer was cancelled AND that its final write failed.
+func normalizeObserverExit(err error) error {
+	if err == nil {
+		return nil
 	}
-	return status, err
+	if errors.Is(err, ErrObserverPublishFailed) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	return err
 }
 
 // waitFor blocks for d, or until ctx is done, whichever comes first.

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -227,5 +228,116 @@ func TestReadObserverStatusRefusesAnUnknownSchema(t *testing.T) {
 	}
 	if !observerReadSupported && !errors.Is(err, ErrObserverReadUnsupported) {
 		t.Fatalf("on a platform without a bounded open the read must refuse as unsupported, got %v", err)
+	}
+}
+
+// grantingLock stands in for an acquired lock so the public run path can be
+// exercised without touching a real lock file.
+type grantingLock struct{}
+
+func (grantingLock) Acquire(context.Context, string, time.Duration, time.Duration) (io.Closer, error) {
+	return nopCloser{}, nil
+}
+
+type nopCloser struct{}
+
+func (nopCloser) Close() error { return nil }
+
+// errPublishRefused is the sentinel a failing writer returns, so the test can
+// prove the SAME error survived the public boundary.
+var errPublishRefused = errors.New("sentinel: status write refused")
+
+// TestRunObserverPreservesPublishFailureThroughCancellation is the regression
+// for a shutdown that reported success while its terminal artifact never landed.
+//
+// The loop joins the publication failure with the cancellation that triggered
+// it. Normalizing on "a cancellation appears anywhere in the tree" turned that
+// join into nil, so the command exited 0 and an older, non-terminal report
+// stayed on disk for a consumer to trust. Exercising runObserverLoop alone
+// would not catch it: that function already returns the joined error correctly.
+func TestRunObserverPreservesPublishFailureThroughCancellation(t *testing.T) {
+	t.Setenv("HERD_STATE_DIR", t.TempDir())
+	cfg := DefaultObserverConfig()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // deterministic: no sleeping, no probes, no host pressure
+
+	_, err := runObserverPublishing(ctx, cfg, grantingLock{}, func(ObserverStatus) error {
+		return errPublishRefused
+	})
+
+	if err == nil {
+		t.Fatalf("a failed terminal publication was reported as a clean shutdown")
+	}
+	if !errors.Is(err, ErrObserverPublishFailed) {
+		t.Fatalf("the publication failure is not observable in %v", err)
+	}
+	if !errors.Is(err, errPublishRefused) {
+		t.Fatalf("the underlying write error was lost: %v", err)
+	}
+	// Both causes, not one: the caller must be able to see that the observer
+	// was cancelled AND that its final write failed.
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cancellation cause was lost: %v", err)
+	}
+}
+
+// TestRunObserverCleanCancellationStaysSuccessful is the positive control. A
+// cancellation whose terminal publication SUCCEEDED is still a clean shutdown,
+// so the fix above must not turn every stop into a failure.
+func TestRunObserverCleanCancellationStaysSuccessful(t *testing.T) {
+	t.Setenv("HERD_STATE_DIR", t.TempDir())
+	cfg := DefaultObserverConfig()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	published := 0
+	_, err := runObserverPublishing(ctx, cfg, grantingLock{}, func(ObserverStatus) error {
+		published++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("a cancellation with a successful terminal publication must stay successful, got %v", err)
+	}
+	if published == 0 {
+		t.Fatalf("the terminal status was never published")
+	}
+}
+
+// TestNormalizeObserverExitKeepsOtherCauses pins the rule directly at the
+// normalization boundary, including the joined shape the loop actually returns.
+func TestNormalizeObserverExitKeepsOtherCauses(t *testing.T) {
+	publishFailure := fmt.Errorf("%w: %w", ErrObserverPublishFailed, errPublishRefused)
+
+	cases := map[string]struct {
+		in        error
+		wantNil   bool
+		wantCause error
+	}{
+		"nil stays nil":                    {in: nil, wantNil: true},
+		"bare cancellation is clean":       {in: context.Canceled, wantNil: true},
+		"bare deadline is clean":           {in: context.DeadlineExceeded, wantNil: true},
+		"cancel joined with publish fails": {in: errors.Join(context.Canceled, publishFailure), wantCause: ErrObserverPublishFailed},
+		"deadline joined with publish":     {in: errors.Join(context.DeadlineExceeded, publishFailure), wantCause: ErrObserverPublishFailed},
+		"publish alone fails":              {in: publishFailure, wantCause: ErrObserverPublishFailed},
+		"unrelated error survives":         {in: errPublishRefused, wantCause: errPublishRefused},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := normalizeObserverExit(tc.in)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("%s: expected a clean shutdown, got %v", name, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("%s: a real failure was normalized away", name)
+			}
+			if !errors.Is(got, tc.wantCause) {
+				t.Fatalf("%s: cause %v is not observable in %v", name, tc.wantCause, got)
+			}
+		})
 	}
 }

@@ -6,7 +6,10 @@ package main
 // the watch cases are refused during validation, before any probe runs.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -173,6 +176,35 @@ func TestObserverWatchRefusesBadBoundsBeforeSampling(t *testing.T) {
 			// Nothing may have been published by a refused start.
 			if _, err := os.Stat(resources.ObserverStatusPath()); err == nil {
 				t.Fatalf("%s wrote a status file despite being refused", name)
+			}
+		})
+	}
+}
+
+// TestObserverExitCodeCannotReachSuccessAfterAPublishFailure is the CLI half of
+// the propagation regression: whatever stopped the observer, a run whose
+// terminal status failed to publish must not take the success branch.
+func TestObserverExitCodeCannotReachSuccessAfterAPublishFailure(t *testing.T) {
+	publishFailure := fmt.Errorf("%w: write refused", resources.ErrObserverPublishFailed)
+
+	cases := map[string]struct {
+		err  error
+		want int
+	}{
+		"clean shutdown":                  {err: nil, want: 0},
+		"publish failure alone":           {err: publishFailure, want: 1},
+		"cancel joined with publish":      {err: errors.Join(context.Canceled, publishFailure), want: 1},
+		"deadline joined with publish":    {err: errors.Join(context.DeadlineExceeded, publishFailure), want: 1},
+		"another observer holds the lock": {err: fmt.Errorf("%w: held", resources.ErrObserverBusy), want: observerExitRefused},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := observerExitCodeFor(tc.err)
+			if got != tc.want {
+				t.Fatalf("%s produced exit %d, expected %d", name, got, tc.want)
+			}
+			if tc.want != 0 && got == 0 {
+				t.Fatalf("%s reached the CLI success branch", name)
 			}
 		})
 	}

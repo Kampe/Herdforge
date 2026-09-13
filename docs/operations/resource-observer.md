@@ -47,6 +47,10 @@ Guaranteed:
   path is replaced with a FIFO.
 - Unknown, stale or unsupported data refuses. A consumer revalidates the
   published readings through the same `Decide` the writer used.
+- A shutdown is reported as successful only when its terminal status actually
+  landed. A publication failure is preserved through `RunObserver` and the exit
+  code even when it is joined with the cancellation that triggered it, so a
+  stale report can never sit behind a green exit.
 
 NOT guaranteed:
 
@@ -78,7 +82,8 @@ lock, and the observer never holds that lock for its lifetime.
 
 ## Verification
 
-`scripts/verify-resource-observer.zsh` is the non-vacuity driver, wired into CI.
+`scripts/verify-resource-observer.zsh` is the non-vacuity driver, wired into CI,
+carrying twelve controls.
 It runs the observer suites as baselines, then mutates the real production
 source one guard at a time. A mutant counts as killed only when it **compiles**,
 the run exits **non-zero**, the **named** killer test emits a failure, and that

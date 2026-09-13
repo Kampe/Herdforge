@@ -37,16 +37,17 @@ for tool in git go timeout jq mktemp python3 rmdir; do
 done
 
 observer_src=pkg/resources/observer.go
+run_src=pkg/resources/observer_run.go
 paths_src=pkg/resources/observer_paths.go
 resources_pkg=./pkg/resources/
 
 # The baseline runs the WHOLE focus set; a mutant runs only its anchored killer,
 # so an unrelated failure elsewhere can never be reported as this control's kill.
-observer_run='TestObserverDropsOverrunTicksWithoutCatchUp|TestObserverRefusesPublishBeforeObservation|TestObserverStampsPublishTimeAtWriteTime|TestObserverHistoryStaysBounded|TestObserverHistoryNeverRestampsEarlierSamples|TestObserverConfigRefusesBusyLoopBounds|TestObserverConfigAcceptsDefaults|TestObserverUsableFailsClosed|TestObserverUsableAcceptsBothHealthyPlatformShapes|TestObserverUsableRefusesContradictoryReports|TestObserverUsableRefusesBrokenChronology|TestObserverRecordsSampleFailureWithoutAdmitting|TestObserverStopsAtLifetime|TestObserverStopsOnCancellationAndPublishesTermination|TestObserverLockScopeIsReportedHonestly|TestObserverLockIsDistinctFromCapacityAndReaperLocks|TestObserverPathsHaveNoCallerOverride|TestObserverStatusPathCannotBeTheGuardReport|TestReadObserverStatusRefusesAnOversizedFile|TestReadObserverStatusRefusesAnUnknownSchema|TestObserverStatusRoundTripsAtomically|TestRunObserverRefusesWhenTheLockIsHeld|TestRunObserverRefusalDoesNotTouchTheStatusFile'
+observer_run='TestObserverDropsOverrunTicksWithoutCatchUp|TestObserverRefusesPublishBeforeObservation|TestObserverStampsPublishTimeAtWriteTime|TestObserverHistoryStaysBounded|TestObserverHistoryNeverRestampsEarlierSamples|TestObserverConfigRefusesBusyLoopBounds|TestObserverConfigAcceptsDefaults|TestObserverUsableFailsClosed|TestObserverUsableAcceptsBothHealthyPlatformShapes|TestObserverUsableRefusesContradictoryReports|TestObserverUsableRefusesBrokenChronology|TestObserverRecordsSampleFailureWithoutAdmitting|TestObserverStopsAtLifetime|TestObserverStopsOnCancellationAndPublishesTermination|TestObserverLockScopeIsReportedHonestly|TestObserverLockIsDistinctFromCapacityAndReaperLocks|TestObserverPathsHaveNoCallerOverride|TestObserverStatusPathCannotBeTheGuardReport|TestReadObserverStatusRefusesAnOversizedFile|TestReadObserverStatusRefusesAnUnknownSchema|TestObserverStatusRoundTripsAtomically|TestRunObserverRefusesWhenTheLockIsHeld|TestRunObserverRefusalDoesNotTouchTheStatusFile|TestRunObserverPreservesPublishFailureThroughCancellation|TestRunObserverCleanCancellationStaysSuccessful|TestNormalizeObserverExitKeepsOtherCauses'
 
 # Exit 0 alone is not a baseline: a selector that matched nothing also exits 0.
 # Every one of these must be seen PASSING at top level.
-observer_expect='TestObserverDropsOverrunTicksWithoutCatchUp TestObserverRefusesPublishBeforeObservation TestObserverStampsPublishTimeAtWriteTime TestObserverHistoryStaysBounded TestObserverConfigRefusesBusyLoopBounds TestObserverUsableAcceptsBothHealthyPlatformShapes TestObserverUsableRefusesContradictoryReports TestObserverUsableRefusesBrokenChronology TestObserverRecordsSampleFailureWithoutAdmitting TestObserverLockScopeIsReportedHonestly TestReadObserverStatusRefusesAnOversizedFile'
+observer_expect='TestObserverDropsOverrunTicksWithoutCatchUp TestObserverRefusesPublishBeforeObservation TestObserverStampsPublishTimeAtWriteTime TestObserverHistoryStaysBounded TestObserverConfigRefusesBusyLoopBounds TestObserverUsableAcceptsBothHealthyPlatformShapes TestObserverUsableRefusesContradictoryReports TestObserverUsableRefusesBrokenChronology TestObserverRecordsSampleFailureWithoutAdmitting TestObserverLockScopeIsReportedHonestly TestReadObserverStatusRefusesAnOversizedFile TestRunObserverPreservesPublishFailureThroughCancellation TestRunObserverCleanCancellationStaysSuccessful TestNormalizeObserverExitKeepsOtherCauses'
 
 # Finite and bounded at both ends BEFORE any arithmetic: an absurd or
 # overflowing override must be rejected, never added to.
@@ -320,6 +321,7 @@ mutations=(
 "catch-up-burst${sep}${observer_src}${sep}		next := int64(elapsed/cfg.Interval) + 1${sep}		next := tickIndex + 1 // MUTANT: replay every missed tick${sep}${resources_pkg}${sep}TestObserverDropsOverrunTicksWithoutCatchUp${sep}that is a catch-up burst"
 "failed-sample-keeps-admit${sep}${observer_src}${sep}			sample.Report.Admits = false${sep}			_ = sampleErr // MUTANT: a failed sample keeps its admit${sep}${resources_pkg}${sep}TestObserverRecordsSampleFailureWithoutAdmitting${sep}a failure must not keep its admit"
 "broken-chronology-ignored${sep}${observer_src}${sep}	if why := sampleChronologyProblem(status, at); why != \"\" {${sep}	if why := \"\"; why != \"\" { // MUTANT: stamps no longer have to be credible${sep}${resources_pkg}${sep}TestObserverUsableRefusesBrokenChronology/missing_published_at${sep}was reported usable"
+"publish-failure-swallowed-by-cancellation${sep}${run_src}${sep}	if errors.Is(err, ErrObserverPublishFailed) {${sep}	if false && errors.Is(err, ErrObserverPublishFailed) { // MUTANT: a cancellation hides a failed final write${sep}${resources_pkg}${sep}TestRunObserverPreservesPublishFailureThroughCancellation${sep}a failed terminal publication was reported as a clean shutdown"
 "unknown-scope-sounds-safe${sep}${paths_src}${sep}	return \"unknown scope: treat exclusivity as unproven\"${sep}	return \"exclusive\" // MUTANT: an unrecognised scope claims exclusivity${sep}${resources_pkg}${sep}TestObserverLockScopeIsReportedHonestly/an_unrecognised_scope_refuses_to_sound_safe${sep}it must state that exclusivity is unproven"
 )
 
