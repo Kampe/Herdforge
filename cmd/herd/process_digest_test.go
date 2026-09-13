@@ -32,7 +32,9 @@ func stubProcessSources(t *testing.T, available bool, agents []herdr.AgentEntry,
 	var reads int32
 	prevAvail, prevList, prevRead := processHerdrAvailable, processAgentList, processPaneRead
 	processHerdrAvailable = func() bool { return available }
-	processAgentList = func(context.Context) ([]herdr.AgentEntry, error) { return agents, listErr }
+	// Existing fixtures describe a roster that DID prove its identity; the
+	// unverified case is exercised explicitly by its own tests below.
+	processAgentList = func(context.Context) ([]herdr.AgentEntry, bool, error) { return agents, true, listErr }
 	processPaneRead = func(ctx context.Context, pane string, lines int) (herdr.PaneObservation, error) {
 		atomic.AddInt32(&reads, 1)
 		if read == nil {
@@ -672,5 +674,85 @@ func TestProcessDigestNamesStructuredTransportFailures(t *testing.T) {
 				t.Fatalf("classified %s despite a failed read, want UNKNOWN", item.Class)
 			}
 		})
+	}
+}
+
+// REGRESSION (FAC-36 / PR839): a roster that did not prove it came from herdr
+// can never produce a clean digest, and an EMPTY one least of all.
+//
+// The decoder used to accept any non-null result, so an id-less
+// {"result":{"agents":[]}} reached this adapter as a perfectly ordinary empty
+// fleet: zero items, partial false, exit 0. "I could not establish that I was
+// talking to herdr" and "the fleet is empty" are opposite operational facts.
+func TestProcessDigestUnverifiedRosterIsNeverACleanFleet(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		agents []herdr.AgentEntry
+	}{
+		{"empty", nil},
+		{"populated", []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prevList := processAgentList
+			prevAvail := processHerdrAvailable
+			prevRead := processPaneRead
+			processHerdrAvailable = func() bool { return true }
+			processAgentList = func(context.Context) ([]herdr.AgentEntry, bool, error) {
+				return tc.agents, false, nil // decoded, but identity was absent
+			}
+			processPaneRead = func(context.Context, string, int) (herdr.PaneObservation, error) {
+				return herdr.PaneObservation{Text: "ok"}, nil
+			}
+			t.Cleanup(func() {
+				processAgentList, processHerdrAvailable, processPaneRead = prevList, prevAvail, prevRead
+			})
+
+			result, err := scan(t, defaultProcessScanLimits())
+			if err != nil {
+				t.Fatalf("an unverified roster is a partial result, not a hard error: %v", err)
+			}
+			if !result.Partial {
+				t.Fatal("an unverified roster produced a digest that called itself complete")
+			}
+			if got := strings.Join(result.Unknowns, "; "); !strings.Contains(got, "no valid herdr identity") {
+				t.Fatalf("the unverified roster was not reported: %q", got)
+			}
+		})
+	}
+}
+
+// The positive half: a verified roster with zero in-scope agents is still a
+// clean, complete, empty digest, so the rule above cannot be satisfied by
+// marking every sweep partial.
+func TestProcessDigestVerifiedEmptyRosterStaysClean(t *testing.T) {
+	stubProcessSources(t, true, nil, nil, nil)
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Partial || len(result.Unknowns) != 0 {
+		t.Fatalf("a verified empty fleet was reported partial: %v", result.Unknowns)
+	}
+	if len(result.Digest.Items) != 0 || result.PaneReads != 0 {
+		t.Fatalf("items=%d reads=%d, want a clean zero digest", len(result.Digest.Items), result.PaneReads)
+	}
+}
+
+// An unverified PANE read is reported too, and its text still reaches the
+// classifier rather than being discarded.
+func TestProcessDigestUnverifiedPaneReadIsReportedNotTrusted(t *testing.T) {
+	stubProcessSources(t, true, []herdr.AgentEntry{agentIn("a", "wT:p1", "idle")}, nil,
+		func(context.Context, string, int) (herdr.PaneObservation, error) {
+			return herdr.PaneObservation{Text: "PASS: 12 tests", Unverified: true}, nil
+		})
+	result, err := scan(t, defaultProcessScanLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial {
+		t.Fatal("an unverified pane read produced a complete digest")
+	}
+	if len(result.Digest.Items) != 1 || result.Digest.Items[0].Tail == "" {
+		t.Fatalf("unverified text was dropped instead of flagged: %+v", result.Digest.Items)
 	}
 }

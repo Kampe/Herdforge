@@ -103,6 +103,10 @@ case "$1 $2" in
         b=$b$b$b$b ; b=$b$b$b$b ; b=$b$b$b$b ; b=$b$b$b$b
         printf '{"id":1,"result":{"text":"%s%s%sVERDICT-AT-THE-END","truncated":false}}\n' "$b" "$b" "$b"
         ;;
+      # A success envelope with NO native identity. herdr 0.9.0 requires
+      # {id, result}, so this never proved it came from herdr and must not
+      # yield a verified pane read.
+      noid)     printf '{"result":{"text":"PASS: 12 tests, 0 failures","truncated":false}}\n' ;;
       # No envelope at all: legacy raw text.
       rawtext)  printf 'PASS: 12 tests, 0 failures\n' ;;
       empty)    printf '{"id":1,"result":{"text":"","truncated":false}}\n' ;;
@@ -644,4 +648,93 @@ func firstBytes(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "...(truncated)"
+}
+
+// REGRESSION (FAC-36 / PR839), end to end: an id-less EMPTY roster must not
+// come out of the real binary as a clean fleet.
+//
+// This is the exact payload the defect produced: `herd process --json` exited
+// 0 with zero agents and no partial flag, so a malformed response was
+// indistinguishable from a healthy idle fleet. herdr 0.9.0's success_response
+// requires {id, result}; a reply without one never proved it came from herdr.
+func TestProcessCLIUnidentifiedEmptyRosterIsNotACleanFleet(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		roster string
+	}{
+		{"no id", `{"result":{"agents":[]}}`},
+		{"null id", `{"id":null,"result":{"agents":[]}}`},
+		{"blank string id", `{"id":"   ","result":{"agents":[]}}`},
+		{"object id", `{"id":{"n":1},"result":{"agents":[]}}`},
+		{"ok true without id", `{"ok":true,"result":{"agents":[]}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			env, logPath := installProcessFake(t, tc.roster, "healthy")
+			out, err := runHerd(t, dir, env, "process", "--json", "--workspace", fakeProcessWorkspace)
+			if err == nil {
+				t.Fatalf("an unidentified empty roster exited 0 as a clean fleet:\n%s", out)
+			}
+			envelope := decodeProcessJSON(t, out)
+			if !envelope.Partial {
+				t.Fatalf("an unidentified roster produced a complete digest:\n%s", out)
+			}
+			if got := strings.Join(envelope.Unknowns, "; "); !strings.Contains(got, "no valid herdr identity") {
+				t.Fatalf("the unverified roster was not reported: %q", got)
+			}
+			// No pane was invented, and nothing was read for a fleet of zero.
+			if envelope.PaneReads != 0 || len(envelope.Items) != 0 {
+				t.Fatalf("reads=%d items=%d, want zero of each", envelope.PaneReads, len(envelope.Items))
+			}
+			if got := countCalls(processCalls(t, logPath), "pane read"); got != 0 {
+				t.Fatalf("pane read %d times for an empty unverified roster", got)
+			}
+		})
+	}
+}
+
+// An id-less PANE reply is likewise not a verified read, end to end.
+func TestProcessCLIUnidentifiedPaneReadIsNotVerified(t *testing.T) {
+	dir := t.TempDir()
+	env, _ := installProcessFake(t, processFakeRoster, "noid")
+	out, err := runHerd(t, dir, env, "process", "--json", "--workspace", fakeProcessWorkspace)
+	if err == nil {
+		t.Fatalf("an unidentified pane read exited 0:\n%s", out)
+	}
+	envelope := decodeProcessJSON(t, out)
+	if !envelope.Partial {
+		t.Fatalf("an unidentified pane read produced a complete digest:\n%s", out)
+	}
+	if got := strings.Join(envelope.Unknowns, "; "); !strings.Contains(got, "classification is unverified") {
+		t.Fatalf("the unverified pane read was not reported: %q", got)
+	}
+	// The text is still real evidence and is not discarded.
+	for _, item := range envelope.Items {
+		if !strings.Contains(item.Tail, "PASS: 12 tests") {
+			t.Fatalf("unverified pane text was dropped instead of flagged: %+v", item)
+		}
+	}
+}
+
+// The positive half, end to end: the identified 0.9.0 shapes the other fixtures
+// already use still produce a clean, complete, exit-0 digest — including a
+// legitimately EMPTY fleet. Without this, the two regressions above could be
+// satisfied by marking every sweep partial.
+func TestProcessCLIIdentifiedEmptyRosterIsStillACleanFleet(t *testing.T) {
+	dir := t.TempDir()
+	env, logPath := installProcessFake(t, `{"id":7,"result":{"agents":[]}}`, "healthy")
+	out, err := runHerd(t, dir, env, "process", "--json", "--workspace", fakeProcessWorkspace)
+	if err != nil {
+		t.Fatalf("an identified empty fleet must still succeed: %v\n%s", err, out)
+	}
+	envelope := decodeProcessJSON(t, out)
+	if envelope.Partial || len(envelope.Unknowns) != 0 {
+		t.Fatalf("an identified empty fleet was reported partial: %v", envelope.Unknowns)
+	}
+	if envelope.PaneReads != 0 || len(envelope.Items) != 0 {
+		t.Fatalf("reads=%d items=%d, want zero of each", envelope.PaneReads, len(envelope.Items))
+	}
+	if len(processCalls(t, logPath)) != 1 {
+		t.Fatalf("an empty fleet issued %v", processCalls(t, logPath))
+	}
 }

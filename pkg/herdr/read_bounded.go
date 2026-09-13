@@ -186,6 +186,60 @@ func presentAndNotNull(raw json.RawMessage) bool {
 	return len(raw) > 0 && string(raw) != "null"
 }
 
+// validIdentity reports whether a reply carries the native response identity
+// the 0.9.0 contract requires. success_response and error_response BOTH list
+// "id" as required, so a reply without one did not come from that contract and
+// its success cannot be taken at face value.
+//
+// The concrete id TYPE is deliberately not pinned. This repository contains no
+// recorded native herdr transport response to read one from -- the only
+// {"id":...,"result":...} payloads in the tree are this lane's own fixtures --
+// and the schema was not captured at that granularity. So the rule is the one
+// that is defensible from what is actually known: identity must be PRESENT,
+// non-null, a JSON scalar rather than an object or array, and non-blank if it
+// is a string. Any string or number id passes; nothing is rejected for being
+// the wrong flavour of scalar.
+func validIdentity(raw json.RawMessage) bool {
+	if !presentAndNotNull(raw) {
+		return false
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return false
+	}
+	switch token[0] {
+	case '{', '[':
+		return false // a structure is not an identity
+	case 't', 'f':
+		return false // true/false is not an identity
+	case '"':
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return false
+		}
+		return strings.TrimSpace(s) != ""
+	}
+	var n json.Number
+	return json.Unmarshal(raw, &n) == nil && strings.TrimSpace(n.String()) != ""
+}
+
+// transportReply is one decoded herdr reply.
+//
+// Identified is separate from Envelope on purpose. A reply can be a
+// well-formed success envelope and still lack the native identity the contract
+// requires, and that combination must never be reported as a VERIFIED read:
+// before this, any non-null result was accepted outright, so an id-less
+// {"result":{"agents":[]}} became a clean, non-partial, zero-agent digest that
+// exited 0 -- a malformed response presenting as a healthy empty fleet.
+type transportReply struct {
+	// Result is the success payload, set only when the reply is a success.
+	Result json.RawMessage
+	// Envelope is true when the payload claimed to be a structured reply.
+	Envelope bool
+	// Identified is true when the reply carried valid native identity.
+	Identified bool
+}
+
 // decodeHerdrTransport separates a TRANSPORT reply from raw pane text, and
 // fails closed on everything in between.
 //
@@ -203,28 +257,36 @@ func presentAndNotNull(raw json.RawMessage) bool {
 // through to the raw-text path and be classified as a healthy pane tail. Only
 // output that never claimed to be structured reaches that path now, and the
 // caller is told it is unverified.
-func decodeHerdrTransport(raw string) (result json.RawMessage, isEnvelope bool, err error) {
+func decodeHerdrTransport(raw string) (transportReply, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || trimmed[0] != '{' {
 		// Never claimed to be a structured reply. Legacy raw text: usable, but
 		// nothing in it proves the read succeeded.
-		return nil, false, nil
+		return transportReply{}, nil
 	}
 	var envelope herdrEnvelope
 	if decErr := json.Unmarshal([]byte(trimmed), &envelope); decErr != nil {
-		return nil, true, fmt.Errorf("%w: %v", ErrReadTransportMalformed, decErr)
+		return transportReply{Envelope: true}, fmt.Errorf("%w: %v", ErrReadTransportMalformed, decErr)
 	}
+	identified := validIdentity(envelope.ID)
 	hasResult := presentAndNotNull(envelope.Result)
 	hasError := presentAndNotNull(envelope.Error)
 	switch {
 	case hasError && hasResult:
-		return nil, true, fmt.Errorf("%w: %s", ErrReadTransportContradiction, strings.TrimSpace(string(envelope.Error)))
+		return transportReply{Envelope: true, Identified: identified},
+			fmt.Errorf("%w: %s", ErrReadTransportContradiction, strings.TrimSpace(string(envelope.Error)))
 	case hasError:
-		return nil, true, fmt.Errorf("%w: %s", ErrReadTransportEnvelope, strings.TrimSpace(string(envelope.Error)))
+		return transportReply{Envelope: true, Identified: identified},
+			fmt.Errorf("%w: %s", ErrReadTransportEnvelope, strings.TrimSpace(string(envelope.Error)))
 	case envelope.OK != nil && !*envelope.OK:
-		return nil, true, fmt.Errorf("%w: response reported ok=false", ErrReadTransportEnvelope)
+		return transportReply{Envelope: true, Identified: identified},
+			fmt.Errorf("%w: response reported ok=false", ErrReadTransportEnvelope)
 	case hasResult:
-		return envelope.Result, true, nil
+		// A success payload. Identified says whether it may be reported as a
+		// VERIFIED read; an id-less success is still returned, because the
+		// repository's existing fixtures and older callers depend on it, but
+		// it is never verified and so can never become a clean digest.
+		return transportReply{Result: envelope.Result, Envelope: true, Identified: identified}, nil
 	}
 	// A structured reply carrying neither. Against the 0.9.0 contract it is
 	// neither a success nor an error, so the pane was not read — including the
@@ -232,9 +294,11 @@ func decodeHerdrTransport(raw string) (result json.RawMessage, isEnvelope bool, 
 	// distinguished from a malformed envelope and must not be given the
 	// benefit of the doubt.
 	if presentAndNotNull(envelope.ID) {
-		return nil, true, fmt.Errorf("%w: response carried an id but neither a result nor an error", ErrReadTransportEnvelope)
+		return transportReply{Envelope: true, Identified: identified},
+			fmt.Errorf("%w: response carried an id but neither a result nor an error", ErrReadTransportEnvelope)
 	}
-	return nil, true, fmt.Errorf("%w: top-level object is neither a result nor an error envelope", ErrReadTransportEnvelope)
+	return transportReply{Envelope: true},
+		fmt.Errorf("%w: top-level object is neither a result nor an error envelope", ErrReadTransportEnvelope)
 }
 
 // PaneObservation is one bounded pane read. It exists so the caller is not
@@ -246,10 +310,11 @@ type PaneObservation struct {
 	// carries it as a required field, and a truncated tail is different
 	// evidence from a complete one, so it is preserved rather than dropped.
 	Truncated bool
-	// Unverified is true when the reply never claimed to be a structured herdr
-	// response — legacy raw text. The text is returned because it is usable,
-	// but nothing in it proved the read succeeded, so a caller must not
-	// present it as a healthy observation without saying so.
+	// Unverified is true when nothing in the reply proved the read succeeded:
+	// either it never claimed to be a structured herdr response (legacy raw
+	// text), or it was a success envelope WITHOUT the native identity the
+	// 0.9.0 contract requires. The text is returned because it is usable, but
+	// a caller must not present it as a healthy observation without saying so.
 	Unverified bool
 }
 
@@ -273,13 +338,18 @@ func PaneReadContext(ctx context.Context, paneID string, lines int) (PaneObserva
 	if err != nil {
 		return PaneObservation{}, fmt.Errorf("herdr pane read %s: %w", paneID, err)
 	}
-	result, isEnvelope, decodeErr := decodeHerdrTransport(out)
+	reply, decodeErr := decodeHerdrTransport(out)
 	if decodeErr != nil {
 		return PaneObservation{}, fmt.Errorf("herdr pane read %s: %w", paneID, decodeErr)
 	}
-	if !isEnvelope {
+	if !reply.Envelope {
 		return PaneObservation{Text: out, Unverified: true}, nil
 	}
+	// A success envelope without native identity is NOT a verified pane read.
+	// The text is still handed back, but flagged, so the digest reports it and
+	// refuses to call itself complete.
+	unverified := !reply.Identified
+	result := reply.Result
 	// Pointer and nil-slice presence, not emptiness: an envelope that reports
 	// an EMPTY pane and one whose body this code does not recognise are
 	// different facts, and collapsing both to "" discards the second.
@@ -294,9 +364,9 @@ func PaneReadContext(ctx context.Context, paneID string, lines int) (PaneObserva
 	}
 	switch {
 	case body.Text != nil:
-		return PaneObservation{Text: *body.Text, Truncated: body.Truncated}, nil
+		return PaneObservation{Text: *body.Text, Truncated: body.Truncated, Unverified: unverified}, nil
 	case body.Lines != nil:
-		return PaneObservation{Text: strings.Join(body.Lines, "\n"), Truncated: body.Truncated}, nil
+		return PaneObservation{Text: strings.Join(body.Lines, "\n"), Truncated: body.Truncated, Unverified: unverified}, nil
 	}
 	return PaneObservation{}, fmt.Errorf("herdr pane read %s: %w: result has neither text nor lines",
 		paneID, ErrReadTransportUnsupportedResult)

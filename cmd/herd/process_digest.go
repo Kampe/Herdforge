@@ -31,7 +31,7 @@ import (
 // production implementation and one test implementation.
 var (
 	processHerdrAvailable = herdr.IsAvailable
-	processAgentList      = herdr.AgentListContext
+	processAgentList      = herdr.AgentListVerifiedContext
 	processPaneRead       = herdr.PaneReadContext
 )
 
@@ -223,9 +223,22 @@ func collectProcessDigest(ctx context.Context, workspace string, limits processS
 	if !processHerdrAvailable() {
 		return result, errors.New("herd process: herdr is not available on PATH; refusing to report an empty fleet")
 	}
-	agents, err := processAgentList(ctx)
+	agents, rosterVerified, err := processAgentList(ctx)
 	if err != nil {
 		return result, fmt.Errorf("herd process: roster unreadable: %w", err)
+	}
+	// A roster that did not prove it came from herdr cannot produce a clean
+	// digest, and an EMPTY one least of all. Before this, an id-less
+	// {"result":{"agents":[]}} was accepted outright and the command exited 0
+	// reporting zero agents and no partial flag — a malformed response reading
+	// as a healthy empty fleet. The entries are still classified, because
+	// discarding a roster that may well be real would lose more than it saved,
+	// but the sweep says what it could not establish and refuses to call
+	// itself complete.
+	if !rosterVerified {
+		result.Partial = true
+		result.Unknowns = append(result.Unknowns,
+			"roster response carried no valid herdr identity; the fleet listing is unverified")
 	}
 
 	scoped := make([]herdr.AgentEntry, 0, len(agents))

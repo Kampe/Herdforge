@@ -129,12 +129,12 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./cmd/herd/${sep}^(TestProcessDigestReportsEveryRealPaneIdentity|TestProcessDigestCanceledSweepStopsAndReportsPartial|TestProcessDigestCapsPaneTextBeforeClassification|TestProcessDigestVerifiedReadStaysComplete|TestProcessDigestEmptyFleetSucceedsWithZeroItems|TestProcessDigestLiteralErrorJSONFromAPaneIsAgentContent)\$${sep}TestProcessDigestReportsEveryRealPaneIdentity TestProcessDigestCanceledSweepStopsAndReportsPartial TestProcessDigestCapsPaneTextBeforeClassification TestProcessDigestVerifiedReadStaysComplete TestProcessDigestEmptyFleetSucceedsWithZeroItems TestProcessDigestLiteralErrorJSONFromAPaneIsAgentContent"
-"./pkg/herdr/${sep}^(TestCappedWriterBoundsAndStopsOnce|TestDecodeHerdrTransportFailsClosedOnStructuredReplies|TestPaneReadContextAcceptsKnownResultBodies|TestPaneReadContextPreservesLiteralErrorJSONInsideAResult|TestRunHerdrReadContextReadsAHealthyChild)\$${sep}TestCappedWriterBoundsAndStopsOnce TestDecodeHerdrTransportFailsClosedOnStructuredReplies TestPaneReadContextAcceptsKnownResultBodies TestPaneReadContextPreservesLiteralErrorJSONInsideAResult TestRunHerdrReadContextReadsAHealthyChild"
+"./cmd/herd/${sep}^(TestProcessDigestReportsEveryRealPaneIdentity|TestProcessDigestCanceledSweepStopsAndReportsPartial|TestProcessDigestCapsPaneTextBeforeClassification|TestProcessDigestVerifiedReadStaysComplete|TestProcessDigestEmptyFleetSucceedsWithZeroItems|TestProcessDigestLiteralErrorJSONFromAPaneIsAgentContent|TestProcessDigestUnverifiedRosterIsNeverACleanFleet|TestProcessDigestVerifiedEmptyRosterStaysClean)\$${sep}TestProcessDigestReportsEveryRealPaneIdentity TestProcessDigestCanceledSweepStopsAndReportsPartial TestProcessDigestCapsPaneTextBeforeClassification TestProcessDigestVerifiedReadStaysComplete TestProcessDigestEmptyFleetSucceedsWithZeroItems TestProcessDigestLiteralErrorJSONFromAPaneIsAgentContent TestProcessDigestUnverifiedRosterIsNeverACleanFleet TestProcessDigestVerifiedEmptyRosterStaysClean"
+"./pkg/herdr/${sep}^(TestCappedWriterBoundsAndStopsOnce|TestDecodeHerdrTransportFailsClosedOnStructuredReplies|TestPaneReadContextAcceptsKnownResultBodies|TestPaneReadContextPreservesLiteralErrorJSONInsideAResult|TestRunHerdrReadContextReadsAHealthyChild|TestPaneReadContextMarksUnidentifiedSuccessUnverified|TestPaneReadContextVerifiesIdentifiedSuccess|TestAgentListVerifiedContextRefusesToVerifyUnidentifiedRosters)\$${sep}TestCappedWriterBoundsAndStopsOnce TestDecodeHerdrTransportFailsClosedOnStructuredReplies TestPaneReadContextAcceptsKnownResultBodies TestPaneReadContextPreservesLiteralErrorJSONInsideAResult TestRunHerdrReadContextReadsAHealthyChild TestPaneReadContextMarksUnidentifiedSuccessUnverified TestPaneReadContextVerifiesIdentifiedSuccess TestAgentListVerifiedContextRefusesToVerifyUnidentifiedRosters"
 )
 
 # ---------------------------------------------------------------------------
-# Controls. Five independent guards, each the subject of a review finding.
+# Controls. Six independent guards, each the subject of a review finding.
 #
 # What each one ACTUALLY proves, stated at its real strength:
 #
@@ -155,17 +155,38 @@ suites=(
 #                          substitute for it.
 #   finite-transport-bytes reads are capped at the process boundary
 #   error-envelope-closed  a transport error envelope fails closed
+#   native-identity-required
+#                          a success envelope WITHOUT the native response
+#                          identity the installed 0.9.0 contract requires is
+#                          never reported as a VERIFIED read. This is the PR839
+#                          defect: any non-null result was accepted outright,
+#                          so an id-less {"result":{"agents":[]}} produced a
+#                          clean, non-partial, zero-agent digest that exited 0.
+#                          Scope, stated honestly: the control proves the
+#                          identity gate is load bearing. It does NOT pin the
+#                          concrete id type, because this repository holds no
+#                          recorded native herdr response to read one from.
+#   native-identity-required
+#                          a success envelope WITHOUT the native identity the
+#                          installed 0.9.0 contract requires is never reported
+#                          as a verified read. This is the PR839 defect: an
+#                          id-less {"result":{"agents":[]}} became a clean,
+#                          non-partial, zero-agent digest that exited 0.
 #   partial-truncation     a tail this sweep cut makes the digest incomplete
 #
 # id | source | test package | anchor | replacement | killer | required assertion
 # ---------------------------------------------------------------------------
 mutations=(
-"real-roster-wiring${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}	agents, err := processAgentList(ctx)${sep}	agents, err := []herdr.AgentEntry(nil), error(nil) // MUTANT: empty result instead of the live roster${sep}TestProcessDigestReportsEveryRealPaneIdentity${sep}want 3 items, got 0"
+"real-roster-wiring${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}	agents, rosterVerified, err := processAgentList(ctx)${sep}	agents, rosterVerified, err := []herdr.AgentEntry(nil), true, error(nil) // MUTANT: empty result instead of the live roster${sep}TestProcessDigestReportsEveryRealPaneIdentity${sep}want 3 items, got 0"
 "sweep-context-checked-between-panes${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}		if ctxErr := ctx.Err(); ctxErr != nil {${sep}		if ctxErr := error(nil); ctxErr != nil { // MUTANT: sweep context ignored between panes${sep}TestProcessDigestCanceledSweepStopsAndReportsPartial${sep}a canceled sweep still issued"
 "partial-truncation${sep}cmd/herd/process_digest.go${sep}./cmd/herd/${sep}				result.Partial = true
 				note := fmt.Sprintf(\"%s: pane tail truncated to %d bytes by this sweep\", agent.Name, limits.MaxTailBytes)${sep}				note := fmt.Sprintf(\"%s: pane tail truncated to %d bytes by this sweep\", agent.Name, limits.MaxTailBytes) // MUTANT: a cut tail no longer makes the sweep partial${sep}TestProcessDigestCapsPaneTextBeforeClassification${sep}a sweep-truncated tail left the digest claiming to be complete"
 "finite-transport-bytes${sep}pkg/herdr/read_bounded.go${sep}./pkg/herdr/${sep}	remaining := w.limit - w.buf.Len()${sep}	remaining := len(p) // MUTANT: byte bound removed, every write is accepted${sep}TestCappedWriterBoundsAndStopsOnce${sep}bytes past a limit of 8"
-"error-envelope-closed${sep}pkg/herdr/read_bounded.go${sep}./pkg/herdr/${sep}		return nil, true, fmt.Errorf(\"%w: %s\", ErrReadTransportEnvelope, strings.TrimSpace(string(envelope.Error)))${sep}		return envelope.Result, true, nil // MUTANT: error envelope accepted as a result${sep}TestDecodeHerdrTransportFailsClosedOnStructuredReplies${sep}want herdr read: transport reported an error"
+"error-envelope-closed${sep}pkg/herdr/read_bounded.go${sep}./pkg/herdr/${sep}	case hasError:
+		return transportReply{Envelope: true, Identified: identified},
+			fmt.Errorf(\"%w: %s\", ErrReadTransportEnvelope, strings.TrimSpace(string(envelope.Error)))${sep}	case hasError:
+		return transportReply{Result: envelope.Result, Envelope: true, Identified: identified}, nil // MUTANT: error envelope accepted as a result${sep}TestDecodeHerdrTransportFailsClosedOnStructuredReplies${sep}want herdr read: transport reported an error"
+"native-identity-required${sep}pkg/herdr/read_bounded.go${sep}./pkg/herdr/${sep}	identified := validIdentity(envelope.ID)${sep}	identified := true // MUTANT: native response identity no longer required for a verified success${sep}TestPaneReadContextMarksUnidentifiedSuccessUnverified${sep}a success envelope with no valid native identity was reported as a VERIFIED pane read"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from
