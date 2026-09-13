@@ -157,6 +157,7 @@ type ownedHelper struct {
 	output   *bytes.Buffer
 	finished chan struct{}
 	waitErr  error
+	stopErr  error
 	stopped  sync.Once
 }
 
@@ -182,7 +183,7 @@ func startOwnedHelper(t *testing.T, name string, env []string) *ownedHelper {
 		h.waitErr = cmd.Wait()
 		close(h.finished)
 	}()
-	t.Cleanup(h.stop)
+	t.Cleanup(func() { h.stopAndReport(t) })
 	return h
 }
 
@@ -201,7 +202,14 @@ func (h *ownedHelper) wait(budget time.Duration) (string, error) {
 		}
 		return text, nil
 	case <-time.After(budget):
-		h.stop()
+		// Report what actually happened. Claiming the child was reaped when
+		// the reap budget also expired would turn an escaped process into a
+		// tidy-looking sentence, which is the failure this whole type exists
+		// to stop hiding.
+		if stopErr := h.stop(); stopErr != nil {
+			return "", fmt.Errorf("%s helper did not finish within %s and could not be reaped: %w",
+				h.name, budget, stopErr)
+		}
 		return "", fmt.Errorf("%s helper did not finish within %s; killed and reaped, result discarded", h.name, budget)
 	}
 }
@@ -217,16 +225,35 @@ func (h *ownedHelper) exited() bool {
 	}
 }
 
-// stop cancels the process and waits for it to be reaped. Idempotent, and safe
-// to call from cleanup after wait has already consumed the completion.
-func (h *ownedHelper) stop() {
+// stop cancels the process and waits for it to be reaped, returning a non-nil
+// error when the reap budget expired and the child therefore escaped.
+//
+// Idempotent, and the verdict is retained: sync.Once.Do blocks until the first
+// caller's function returns, so every later caller reads a stopErr that is
+// already written. A silent return here is not acceptable -- it let wait report
+// "killed and reaped" on a child that was still running, and it let a passing
+// test's cleanup hide a leaked process entirely.
+func (h *ownedHelper) stop() error {
 	h.stopped.Do(func() {
 		h.cancel()
 		select {
 		case <-h.finished:
 		case <-time.After(helperReapBudget):
+			h.stopErr = fmt.Errorf("%s helper was not reaped within %s after cancellation; it may still be running",
+				h.name, helperReapBudget)
 		}
 	})
+	return h.stopErr
+}
+
+// stopAndReport is the cleanup entry point. A failed reap fails the test even
+// when every assertion passed: a test that leaves a child behind has not
+// finished, whatever its assertions said.
+func (h *ownedHelper) stopAndReport(t *testing.T) {
+	t.Helper()
+	if err := h.stop(); err != nil {
+		t.Errorf("cleanup: %v", err)
+	}
 }
 
 // singleFlightOutcome extracts the reported outcome from one helper's output.
@@ -1092,15 +1119,18 @@ func TestUnusableReadingsFallThroughToLive(t *testing.T) {
 }
 
 // TestProviderCacheContendedLockIsBusyNotAPoll pins the losing half of
-// single-flight deterministically, without racing the scheduler.
+// single-flight.
 //
-// A holder subprocess takes the provider lock and announces it through a ready
-// file, so the contender does not start until the lock is provably held. The
-// holder then keeps it for a full second while the contender's wait is bounded
-// at 300ms, which makes the outcome determined rather than timing-dependent:
-// the contender MUST come back busy. What matters is what it does about it --
-// it must report the busy lock as such and must not poll the provider behind
-// the holder's back.
+// A holder subprocess takes the provider lock, announces it through a ready
+// file, and then KEEPS it until this test explicitly releases it -- which
+// happens only after the contender's result is in hand. The hold covers the
+// contender's whole attempt because of that ordering, not because any interval
+// is long enough: a fixed hold can expire between the ready file appearing and
+// the contender reaching the lock, and the contender would then legitimately
+// succeed while this test called it a failure.
+//
+// What is asserted is what the contender does about the busy lock: it must
+// report it as busy and must not poll the provider behind the holder's back.
 func TestProviderCacheContendedLockIsBusyNotAPoll(t *testing.T) {
 	dir := t.TempDir()
 	home := t.TempDir()
