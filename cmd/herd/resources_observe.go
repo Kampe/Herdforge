@@ -239,3 +239,18 @@ func validateResourcesMode(provided map[string]bool, watch, observerStatus bool)
 	return "", fmt.Errorf("%s cannot be combined with %s; %s accepts %s",
 		strings.Join(rejected, ", "), mode, mode, strings.Join(accepted, ", "))
 }
+
+// The two observer jobs are dispatched through these seams so a CLI test can
+// prove that a refused invocation started NO job, and stay bounded while doing
+// it. Production values are the real functions and are never reassigned outside
+// tests; the indirection changes no behaviour.
+//
+// It exists because of a demonstrated failure, not a preference: when the mode
+// validation was mutated away, the rejection test fell through to a real
+// foreground observer with default bounds and ran until the package test
+// timeout, reporting CRASHED-OR-TIMED-OUT instead of the named assertion. A
+// timeout is not a kill, so the control proved nothing.
+var (
+	runResourcesObserverFn       = runResourcesObserver
+	runResourcesObserverStatusFn = runResourcesObserverStatus
+)
