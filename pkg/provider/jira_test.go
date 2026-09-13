@@ -13,6 +13,11 @@ func TestJiraProvider_GetTaskAndListTasks(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case strings.Contains(r.URL.Path, "/transitions") && r.Method == http.MethodGet:
+			// Real Jira answers the available-transitions read with ids; the
+			// adapter resolves one before it may post anything.
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"transitions":[{"id":"31","name":"Done","to":{"name":"Done"}}]}`))
 		case strings.Contains(r.URL.Path, "/transitions"):
 			statusName = "Done"
 			w.WriteHeader(http.StatusOK)
