@@ -340,6 +340,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-832: review preparation allocated a detached carrier under
+      # .herd/worktrees on every resolution, including when the caller had
+      # already pinned both the exact candidate sha and the exact base. Nothing
+      # read that directory — the reviewer works in the leased pool slot — and
+      # --no-launch records no manifest, so it outlived its reviewer with no
+      # retirement owner. This driver removes the allocation guard and requires
+      # the named oracle to die on its named assertion.
+      - name: FAC-832 review carrier allocation controls
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-review-carrier.zsh
+
+      - name: Upload review carrier control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-review-carrier-logs
+          path: .verify-review-carrier-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # FAC-764: `herd pool release` from the orchestrator's working directory
       # failed with "cannot change to '.herd/pool/pool-01'" while the identical
       # release from the canonical checkout succeeded. The stored slot path is

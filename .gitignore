@@ -163,3 +163,6 @@ TASK-PACKET.md
 
 # FAC-613: mutation-control logs from scripts/verify-lifecycle-diagnostics.zsh.
 .verify-lifecycle-diagnostics-logs/
+
+# FAC-832: mutation-control logs from scripts/verify-review-carrier.zsh.
+.verify-review-carrier-logs/

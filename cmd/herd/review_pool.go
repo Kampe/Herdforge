@@ -34,6 +34,17 @@ import (
 // runPoolReview exposes the warm-pool reviewer path for use while the signed
 // review admission path is unavailable. The lease remains held for the
 // review supervisor to release after verdict ingest.
+// loadReviewTaskProvider is the ONLY external boundary this entry cannot reach
+// hermetically: the "memory" provider type constructs an EMPTY provider, so a
+// fixture has no way to make the entry's own task lookup resolve.
+//
+// FAC-832: the acceptance is the ACTUAL `review --pool --no-launch` route, not
+// a helper. Everything else on that route runs for real against a real
+// repository — capacity, candidate resolution, the pool lease, the slot pin,
+// the surface symlink and the packet. Production assigns loadTaskProvider and
+// nothing reassigns it outside tests.
+var loadReviewTaskProvider = loadTaskProvider
+
 func runPoolReview(ref string) error {
 	if strings.TrimSpace(ref) == "" {
 		return errors.New("candidate ref is required (usage: herd review <ref> --pool)")
@@ -62,7 +73,25 @@ func runPoolReview(ref string) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	// The selected repository root is resolved to an ABSOLUTE runtime path
+	// before anything is built from it.
+	//
+	// firstEnv falls back to "." and HERD_ROOT may itself be relative. A
+	// non-dot relative root broke downstream: the anchored default became
+	// "repo/.herd/pool", Pool persisted slot paths composed from that spelling,
+	// and repoPath then joined the persisted "repo/.herd/pool/pool-01" onto a
+	// canonical repository root that ALREADY ended in "repo" — resolving to
+	// repo/repo/.herd/pool/pool-01. "." happened to work and an absolute root
+	// happened to work; everything between them did not. Resolving once here
+	// removes the class rather than the instance, and a root that cannot be
+	// resolved refuses instead of being guessed at.
+	root, err := filepath.Abs(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
+	// The roots the caller did not name belong to THIS repository, not to
+	// whatever directory the process happens to be in.
+	anchorDefaultReviewRoots(fs, opts, root)
 	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
 	if err != nil {
 		return fmt.Errorf("review task identity: load config: %w", err)
@@ -84,7 +113,7 @@ func runPoolReview(ref string) error {
 	if err := capacityLease.update(admissionPhaseCandidate); err != nil {
 		return fmt.Errorf("advance admission phase to candidate: %w", err)
 	}
-	tasks, err := loadTaskProvider(cfg)
+	tasks, err := loadReviewTaskProvider(cfg)
 	if err != nil {
 		return fmt.Errorf("review task identity: load provider: %w", err)
 	}
@@ -98,7 +127,8 @@ func runPoolReview(ref string) error {
 	}
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.
-	candidateDir, err := resolvePoolReviewCandidateAt(root, ref, strings.TrimSpace(*shaFlag))
+	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
+		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))
 	if err != nil {
 		return err
 	}
@@ -273,7 +303,30 @@ func runPoolReview(ref string) error {
 		return nil
 	}
 
-	p := worktree.NewPool(root, *poolRoot, 2)
+	// The pool root is resolved to an absolute RUNTIME path before the pool is
+	// built, while the flag text the caller gave is left untouched.
+	//
+	// A relative --pool-root means "relative to me", and that meaning is kept:
+	// filepath.Abs resolves it against the caller exactly as the caller wrote
+	// it. What it stops is the value being resolved THREE different ways
+	// afterwards. pkg/worktree anchors p.Root against the process directory
+	// for its state, Ensure stores slot.Path as filepath.Join(p.Root, name) —
+	// still relative — and repoPath then resolves that stored path against the
+	// REPOSITORY root, while the pin below hands lease.Path to `git -C` against
+	// the caller again. NewPool("/owned/repository", "given/pool") from
+	// "/owned/caller" therefore kept state under caller/given/pool, resolved
+	// slot worktrees under repository/given/pool, and pinned
+	// caller/given/pool — three locations for one pool.
+	//
+	// Resolving once here settles all of them without touching the public flag
+	// spelling or any global Pool semantics. It also repairs
+	// poolRelForPending, whose filepath.Rel against an absolute root silently
+	// returned "" for a relative lease path.
+	poolPath, err := filepath.Abs(*poolRoot)
+	if err != nil {
+		return fmt.Errorf("resolve review pool root: %w", err)
+	}
+	p := worktree.NewPool(root, poolPath, 2)
 	// FAC-591: teach the pool which lease holders are still alive so it can
 	// reclaim the rest itself. Every launch that died after leasing used to
 	// leave an ownerless lease no command could free, and the pool wedged at
@@ -953,7 +1006,34 @@ func resolvePoolReviewCandidate(root, ref string) (string, error) {
 // slot --hard to the exact SHA regardless, so what matters is that the surface
 // IS that SHA -- which is verified here rather than assumed from a branch name.
 // With no SHA to check, the old branch-only behaviour is unchanged.
+// needsCandidateDirectory reports whether anything downstream will actually
+// READ a candidate worktree, and therefore whether one is worth allocating.
+//
+// FAC-832: pool preparation allocated a detached carrier under .herd/worktrees
+// on every resolution, including the case where the caller already pinned both
+// the exact candidate sha and the exact review base. In that case nothing ever
+// opened the directory: the sha needs no HEAD read, and the base needs no
+// authenticated task context. The reviewer works in the LEASED POOL SLOT, and
+// the review "surface" is a symlink to that slot — the carrier was never the
+// reviewer's tree. It outlived the reviewer with no retirement owner, because
+// --no-launch records no manifest and worktree-reap deliberately keeps
+// detached review-pool surfaces.
+//
+// Discovery of an EXISTING worktree is unaffected and still preferred; only
+// speculative creation is withheld.
+func needsCandidateDirectory(sha, explicitBase string) bool {
+	return strings.TrimSpace(sha) == "" || strings.TrimSpace(explicitBase) == ""
+}
+
 func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
+	return resolvePoolReviewCandidateAtFor(root, ref, sha, true)
+}
+
+// resolvePoolReviewCandidateAtFor resolves the candidate surface. When
+// mayPrepare is false it will still FIND an existing worktree, but it will not
+// create one: it answers "" so the caller proceeds from the identities it was
+// given rather than from a directory nobody reads.
+func resolvePoolReviewCandidateAtFor(root, ref, sha string, mayPrepare bool) (string, error) {
 	// Probe both spellings: the raw-ref path for historical ticket-style refs and
 	// the launcher's sanitized path, so one sanitizer cannot hide the other's dir.
 	for _, dir := range candidateSurfaceDirs(root, ref) {
@@ -992,6 +1072,12 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 		// managed worktrees path, and only when the SHA is a real commit. It
 		// never checks out a branch, so it cannot move anyone's work, and it
 		// never reuses an existing directory.
+		// FAC-832: only when something will read it. A caller that pinned both
+		// the exact sha and the exact base gets no speculative carrier, and no
+		// orphan to retire afterwards.
+		if !mayPrepare {
+			return "", nil
+		}
 		if dir, err := prepareCandidateSurface(root, ref, sha); err == nil && dir != "" {
 			fmt.Printf("prepared review surface %s at %s\n", dir, shortSHA(sha))
 			return dir, nil
@@ -1349,6 +1435,46 @@ func (o *poolReviewOptions) Validate() error {
 		return errors.New("--model requires --provider (a model without its surface is not a route)")
 	}
 	return nil
+}
+
+// anchorDefaultReviewRoots points the review roots at the OWNING repository
+// when the caller did not name them.
+//
+// FAC-832: these three defaults were relative — ".herd/pool",
+// ".herd/review-surfaces", ".herd/review-packets" — so they resolved against
+// the PROCESS working directory while HERD_ROOT named a different repository.
+// `herd pool` has never done that: it builds its default as
+// filepath.Join(root, ".herd", "pool") (pool.go:33). This path disagreed with
+// its own sibling command.
+//
+// The consequences are not cosmetic. Run with HERD_ROOT pointing elsewhere,
+// the warm pool, its lease state, the surface symlinks and the packets were
+// all created under the caller's directory instead of the repository's, so
+// two invocations from different directories used DIFFERENT pools for the
+// same repository, and the slot pin then ran `git -C <relative>` against the
+// caller again and failed outright. Hosted CI 34756430220 hit both halves:
+// a pool slot that did not exist where the pin looked, and a pool-02 that
+// belonged to an unrelated directory's state.
+//
+// An explicitly supplied root is left exactly as the caller wrote it —
+// fs.Visit reports only flags that were actually set — so this changes the
+// meaning of the DEFAULT alone, to the repository it was always describing.
+func anchorDefaultReviewRoots(fs *flag.FlagSet, opts *poolReviewOptions, root string) {
+	named := make(map[string]bool, 3)
+	fs.Visit(func(f *flag.Flag) { named[f.Name] = true })
+	for _, anchor := range []struct {
+		flag    string
+		target  *string
+		segment string
+	}{
+		{"pool-root", opts.PoolRoot, "pool"},
+		{"surface-root", opts.SurfaceRoot, "review-surfaces"},
+		{"packet-root", opts.PacketRoot, "review-packets"},
+	} {
+		if !named[anchor.flag] {
+			*anchor.target = filepath.Join(root, ".herd", anchor.segment)
+		}
+	}
 }
 
 // registerPoolReviewFlags registers the complete pool option schema on fs.
