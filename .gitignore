@@ -160,3 +160,6 @@ TASK-PACKET.md
 
 # FAC-764: mutation-control logs from scripts/verify-pool-owning-root.zsh.
 .verify-pool-owning-root-logs/
+
+# FAC-613: mutation-control logs from scripts/verify-lifecycle-diagnostics.zsh.
+.verify-lifecycle-diagnostics-logs/

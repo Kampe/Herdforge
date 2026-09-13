@@ -158,6 +158,85 @@ func runLifecycleGovernorSweep(ctx context.Context, governor *resources.Governor
 	return governor.Sweep(sweepCtx, trigger, governor.LifecycleApply())
 }
 
+// censusStageSummaryLimit bounds how many stages a refusal quotes, and
+// censusStageSummaryBytes bounds the whole rendered summary. A refusal is a
+// one-line operational message, not a report dump.
+const (
+	censusStageSummaryLimit = 6
+	censusStageSummaryBytes = 240
+)
+
+// censusStageSummary renders the counts a refusal needs to say WHICH phase
+// spent the budget, from data the sweep already collected.
+//
+// It carries identifiers and numbers only. Stage names are fixed constants
+// ("registered_census", "unregistered_orphan_census", ...), and the stage's
+// Cause is deliberately omitted: the error it came from is already the
+// message this summary is attached to, and a cause can carry a path. A failed
+// durable-cursor advance appears as the bare flag "cursor_error", never its
+// text.
+func censusStageSummary(stages []resources.CensusStage) string {
+	if len(stages) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, stage := range stages {
+		if i >= censusStageSummaryLimit {
+			b.WriteString(" ...")
+			break
+		}
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "%s ms=%d scanned=%d deferred=%d probe_completed=%d probe_deferred=%d",
+			stage.Name, stage.DurationMS, stage.Scanned, stage.Deferred,
+			stage.ProbeCompleted, stage.ProbeDeferred)
+		if strings.TrimSpace(stage.CursorError) != "" {
+			b.WriteString(" cursor_error")
+		}
+	}
+	summary := b.String()
+	if len(summary) > censusStageSummaryBytes {
+		summary = summary[:censusStageSummaryBytes] + "..."
+	}
+	return summary
+}
+
+// lifecycleSweepError is a refusal that still carries the stage counts.
+//
+// FAC-613: sweepResourceGovernor discarded the GovernorReport and returned the
+// bare error, so two native review-preparation refusals at the
+// unregistered-orphan census left no evidence assigning elapsed time to a
+// phase. The report was already built and already held those numbers.
+type lifecycleSweepError struct {
+	err     error
+	summary string
+}
+
+func (e *lifecycleSweepError) Error() string {
+	return e.err.Error() + " (census stages: " + e.summary + ")"
+}
+
+// Unwrap keeps the refusal's IDENTITY intact, so errors.Is still answers for
+// context.DeadlineExceeded, context.Canceled and every governor sentinel.
+func (e *lifecycleSweepError) Unwrap() error { return e.err }
+
+// lifecycleSweepFailure is the whole of the observability boundary.
+//
+// A nil error stays nil: this never turns a deadline into a successful partial
+// admission, and it changes no decision, budget, window or guard. It only
+// stops the already-collected stage counts from being thrown away.
+func lifecycleSweepFailure(report resources.GovernorReport, err error) error {
+	if err == nil {
+		return nil
+	}
+	summary := censusStageSummary(report.Stages)
+	if summary == "" {
+		return err
+	}
+	return &lifecycleSweepError{err: err, summary: summary}
+}
+
 func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string, trigger resources.SweepTrigger) error {
 	governor, err := newResourceGovernor(cfg, root)
 	if err != nil {
@@ -166,8 +245,8 @@ func sweepResourceGovernor(ctx context.Context, cfg *config.Config, root string,
 	if governor == nil {
 		return nil
 	}
-	_, err = runLifecycleGovernorSweep(ctx, governor, trigger)
-	return err
+	report, err := runLifecycleGovernorSweep(ctx, governor, trigger)
+	return lifecycleSweepFailure(report, err)
 }
 
 func parseForeignTargets(values []string, alertBytes uint64) ([]resources.ForeignTarget, error) {
