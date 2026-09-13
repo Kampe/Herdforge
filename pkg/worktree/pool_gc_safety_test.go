@@ -196,7 +196,7 @@ func TestPoolGCRefusesIgnoredContent(t *testing.T) {
 	// gitClean (used by Lease) does not see this: it is plain `git status
 	// --porcelain`, which omits ignored paths -- proving GC's stricter
 	// gitFullyClean check is doing real, additional work.
-	if clean, err := gitClean(context.Background(), pool.RepoRoot, slotPath); err != nil || !clean {
+	if clean, err := gitClean(context.Background(), slotPath); err != nil || !clean {
 		t.Fatalf("precondition: gitClean should report clean for ignored-only content, clean=%v err=%v", clean, err)
 	}
 
