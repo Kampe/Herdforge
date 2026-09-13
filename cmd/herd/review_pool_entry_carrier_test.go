@@ -6,9 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/freshness"
 	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/resources"
 )
 
 // FAC-832, THROUGH THE ACTUAL ENTRY.
@@ -100,6 +103,7 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	// `pane list` and `agent list` with correctly shaped EMPTY inventories and
 	// `workspace list` with its own wFAKE, so no developer binary, fleet, pane
 	// or workspace is reachable.
+	bindOwnedHostObservation(t)
 	_, herdrCalls = installProtocolFakeHerdr(t)
 	// Every test built on this fixture inherits the guard: reaching Herdr for
 	// anything the fixture does not model fails the test rather than escaping.
@@ -357,3 +361,54 @@ if [ "$1" = "status" ] && [ "$2" = "server" ]; then
 fi
 exec "$HERD_HERDR_BIN" "$@"
 `
+
+// bindOwnedHostObservation makes the host readings this entry's admission
+// judges DETERMINISTIC, without touching the policy that judges them.
+//
+// CI 34754690586 refused both entry oracles with "resource admission refuses
+// this host: ... normalized load 1.43 (load1 5.72 over 4 cpus) is at or above
+// the 0.75 limit". The earlier fixture isolated the capacity gate's ENV knobs
+// and both Herdr transports, but the shared resource admission is neither: it
+// is read from the live runner inside observeCapacity, so a busy GitHub runner
+// decided the outcome. It never fired locally because this Mac is not loaded.
+//
+// poolCapacityObserve is a package var, so this saves and restores it, and it
+// DELEGATES to the live observer first — the real herdr status probe, the real
+// process census and the real lease all still run. Only the host readings are
+// replaced, and they are replaced exactly the way the herdfixture twin does it
+// (capacity_shared_admission_fixture.go): the numbers go through the real
+// resources.Decide with the real resources.DefaultLimits, so the policy is
+// untouched and a saturated reading would still refuse with the production
+// text. The values mirror that twin's "healthy" arm and its pinned census,
+// which cannot be referenced directly here because that file is behind the
+// herdfixture build tag and these tests run untagged.
+//
+// Herdr liveness, the agent census and reviewer counts are deliberately left
+// live, as pinFixtureCensus documents: this fixture's own stubs control those,
+// and overriding them would hide a real failure in that plumbing.
+func bindOwnedHostObservation(t *testing.T) {
+	t.Helper()
+	live := poolCapacityObserve
+	t.Cleanup(func() { poolCapacityObserve = live })
+	poolCapacityObserve = func() CapacityObservation {
+		o := live()
+		now := time.Now()
+		const source = "fac832-entry-fixture"
+		decision := resources.Decide(now,
+			freshness.Fresh(source, now, resources.CPULoad{Load1: 1, CPUs: 8, Normalized: 0.125}),
+			freshness.Fresh(source, now, resources.MemHeadroom{
+				Pressure: resources.PressureNormal, FreePct: 80, FreePctGates: true,
+			}),
+			resources.DefaultLimits())
+		o.admission = &decision
+		// The arms decideCapacity evaluates AFTER the admission read the
+		// runner's census too, so pinning only the admission would leave the
+		// oracle half controlled. Same values as the tagged twin's.
+		o.PressurePct = 0
+		o.SwapTotalMiB = 8192
+		o.SwapUsedMiB = 0
+		o.MemTotalMiB = 65536
+		o.MemAvailMiB = 49152
+		return o
+	}
+}
