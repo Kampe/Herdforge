@@ -267,6 +267,14 @@ func TestObserverConfigRefusesBusyLoopBounds(t *testing.T) {
 		{"negative interval", func(c *ObserverConfig) { c.Interval = -time.Second }},
 		{"interval below floor", func(c *ObserverConfig) { c.Interval = MinObserverInterval - time.Millisecond }},
 		{"interval above ceiling", func(c *ObserverConfig) { c.Interval = MaxObserverInterval + time.Second }},
+		// Only the interval ceiling is violated here: the timeout and lifetime
+		// are scaled to stay legal, so this case isolates that one bound
+		// instead of being refused by a neighbouring rule.
+		{"interval above ceiling only", func(c *ObserverConfig) {
+			c.Interval = MaxObserverInterval + time.Second
+			c.SampleTimeout = c.Interval / 2
+			c.Lifetime = 4 * c.Interval
+		}},
 		{"zero lifetime", func(c *ObserverConfig) { c.Lifetime = 0 }},
 		{"negative lifetime", func(c *ObserverConfig) { c.Lifetime = -time.Hour }},
 		{"lifetime shorter than interval", func(c *ObserverConfig) { c.Lifetime = time.Minute; c.Interval = 5 * time.Minute }},
@@ -450,6 +458,12 @@ func TestObserverUsableRefusesContradictoryReports(t *testing.T) {
 		"decided in the future": func(r *AdmissionReport) {
 			r.DecidedAt = stampUTC(now.Add(time.Hour))
 		},
+		"decided_at missing": func(r *AdmissionReport) {
+			r.DecidedAt = ""
+		},
+		"rendered_at missing": func(r *AdmissionReport) {
+			r.RenderedAt = ""
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -566,12 +580,18 @@ func TestObserverStopsAtLifetime(t *testing.T) {
 }
 
 // TestObserverRecordsSampleFailureWithoutAdmitting proves a failed sample is
-// carried as a failure, never smoothed into a healthy tick.
+// carried as a failure and, specifically, that the EMITTED report no longer
+// admits.
+//
+// The published Admits flag is asserted directly. Asserting only that the final
+// status is unusable would pass even with the forced refusal removed, because
+// termination and the recorded SampleError reject it on their own.
 func TestObserverRecordsSampleFailureWithoutAdmitting(t *testing.T) {
 	clock := &fakeObserverClock{now: time.Date(2026, 9, 12, 22, 0, 0, 0, time.UTC)}
 	cfg := baseObserverConfig()
 	cfg.Lifetime = 90 * time.Second
 
+	var published []ObserverStatus
 	deps := observerDeps{
 		now:  clock.Now,
 		wait: clock.wait,
@@ -581,16 +601,34 @@ func TestObserverRecordsSampleFailureWithoutAdmitting(t *testing.T) {
 			// refusal be removed without any test noticing.
 			return admittingReport(at), errors.New("probe unavailable")
 		},
-		publish: func(ObserverStatus) error { return nil },
+		publish: func(st ObserverStatus) error { published = append(published, st); return nil },
 	}
 
 	status, err := runObserverLoop(context.Background(), cfg, ObserverIdentity{}, deps)
 	if err != nil {
 		t.Fatalf("a failing probe is a recorded refusal, not a loop error: %v", err)
 	}
+	if len(published) == 0 {
+		t.Fatalf("the observer published nothing")
+	}
 	if status.Latest.SampleError == "" {
 		t.Fatalf("a failed sample published no error")
 	}
+	// The emitted flag itself, on the retained sample and on what was written.
+	if status.Latest.Report.Admits {
+		t.Fatalf("a failed sample published report.Admits=true; a failure must not keep its admit")
+	}
+	if status.Latest.Report.Decision != string(DecisionRefuse) {
+		t.Fatalf("a failed sample published decision %q, expected %q",
+			status.Latest.Report.Decision, string(DecisionRefuse))
+	}
+	for i, st := range published {
+		if st.Latest.SampleError != "" && st.Latest.Report.Admits {
+			t.Fatalf("publication %d wrote report.Admits=true beside a sample error", i)
+		}
+	}
+	// The broader consumer refusal is kept as a SEPARATE check, so neither
+	// assertion can stand in for the other.
 	if ok, _ := ObserverUsable(status, clock.Now()); ok {
 		t.Fatalf("a status whose latest sample failed was reported usable")
 	}

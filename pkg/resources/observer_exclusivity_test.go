@@ -6,6 +6,7 @@ package resources
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -120,6 +121,12 @@ func TestObserverStatusRoundTripsAtomically(t *testing.T) {
 	}
 
 	got, err := ReadObserverStatus(path)
+	if !observerReadSupported {
+		if !errors.Is(err, ErrObserverReadUnsupported) {
+			t.Fatalf("on a platform without a bounded open the read must refuse as unsupported, got %v", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatalf("read status: %v", err)
 	}
@@ -146,20 +153,65 @@ func TestObserverStatusRoundTripsAtomically(t *testing.T) {
 	}
 }
 
-// TestReadObserverStatusRefusesAnOversizedFile proves the read is bounded: a
-// file larger than this observer could have written is refused, not parsed.
+// TestReadObserverStatusRefusesAnOversizedFile proves the SIZE bound is what
+// rejects an oversized file.
+//
+// The fixture is deliberately VALID: a well-formed, supported-schema status
+// padded with legal JSON whitespace to exactly MaxObserverStatusBytes+1. A
+// fixture of raw spaces would have been rejected by the decoder instead, so
+// removing the size check entirely would still produce an error and the control
+// would prove nothing.
 func TestReadObserverStatusRefusesAnOversizedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resources-observer.json")
-	oversize := make([]byte, MaxObserverStatusBytes+1)
-	for i := range oversize {
-		oversize[i] = ' '
+	body := oversizeValidStatus(t)
+	if len(body) != MaxObserverStatusBytes+1 {
+		t.Fatalf("fixture is %d bytes, expected exactly %d", len(body), MaxObserverStatusBytes+1)
 	}
-	if err := os.WriteFile(path, oversize, 0o600); err != nil {
+	// The padded fixture must still be valid JSON of the supported schema, or
+	// this test would pass for the wrong reason.
+	var probe ObserverStatus
+	if err := json.Unmarshal(body, &probe); err != nil {
+		t.Fatalf("fixture is not valid JSON: %v", err)
+	}
+	if probe.SchemaVersion != ObserverSchemaVersion {
+		t.Fatalf("fixture carries schema %d, expected the supported %d", probe.SchemaVersion, ObserverSchemaVersion)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write oversized status: %v", err)
 	}
-	if _, err := ReadObserverStatus(path); err == nil {
-		t.Fatalf("an oversized status file was read; the bound is not enforced")
+
+	_, err := ReadObserverStatus(path)
+	if err == nil {
+		t.Fatalf("an oversized status file was read; the size bound is not enforced")
 	}
+	if !observerReadSupported {
+		if !errors.Is(err, ErrObserverReadUnsupported) {
+			t.Fatalf("on a platform without a bounded open the read must refuse as unsupported, got %v", err)
+		}
+		return
+	}
+	if !strings.Contains(err.Error(), "exceeds the") {
+		t.Fatalf("a valid oversized status was rejected by something other than the size bound: %v", err)
+	}
+}
+
+// oversizeValidStatus builds a valid status padded with legal whitespace to
+// exactly one byte past the bound.
+func oversizeValidStatus(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(ObserverStatus{SchemaVersion: ObserverSchemaVersion})
+	if err != nil {
+		t.Fatalf("encode fixture status: %v", err)
+	}
+	want := MaxObserverStatusBytes + 1
+	if len(body) >= want {
+		t.Fatalf("the minimal status is already %d bytes, at or past the %d bound", len(body), want)
+	}
+	padding := make([]byte, want-len(body))
+	for i := range padding {
+		padding[i] = ' '
+	}
+	return append(body, padding...)
 }
 
 // TestReadObserverStatusRefusesAnUnknownSchema keeps a future incompatible
@@ -169,7 +221,11 @@ func TestReadObserverStatusRefusesAnUnknownSchema(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"schema_version":999}`), 0o600); err != nil {
 		t.Fatalf("write status: %v", err)
 	}
-	if _, err := ReadObserverStatus(path); err == nil {
+	_, err := ReadObserverStatus(path)
+	if err == nil {
 		t.Fatalf("an unrecognised schema version was accepted")
+	}
+	if !observerReadSupported && !errors.Is(err, ErrObserverReadUnsupported) {
+		t.Fatalf("on a platform without a bounded open the read must refuse as unsupported, got %v", err)
 	}
 }

@@ -737,8 +737,13 @@ func reportSelfConsistent(report AdmissionReport, at time.Time) (bool, string) {
 		what  string
 		value string
 	}{{"decided_at", report.DecidedAt}, {"rendered_at", report.RenderedAt}} {
+		// Both stamps are REQUIRED. A report that does not say when it was
+		// decided or when it was rendered cannot establish that anything it
+		// carries is current, and treating an absent stamp as acceptable is
+		// the same absence-reads-as-safe mistake the rest of this file exists
+		// to prevent.
 		if stamp.value == "" {
-			continue
+			return false, "report " + stamp.what + " is missing"
 		}
 		when, err := time.Parse(time.RFC3339Nano, stamp.value)
 		if err != nil {
@@ -748,12 +753,10 @@ func reportSelfConsistent(report AdmissionReport, at time.Time) (bool, string) {
 			return false, "report " + stamp.what + " is in the future"
 		}
 	}
-	if report.DecidedAt != "" && report.RenderedAt != "" {
-		decided, derr := time.Parse(time.RFC3339Nano, report.DecidedAt)
-		rendered, rerr := time.Parse(time.RFC3339Nano, report.RenderedAt)
-		if derr == nil && rerr == nil && rendered.Before(decided) {
-			return false, "report was rendered before it was decided"
-		}
+	decided, derr := time.Parse(time.RFC3339Nano, report.DecidedAt)
+	rendered, rerr := time.Parse(time.RFC3339Nano, report.RenderedAt)
+	if derr == nil && rerr == nil && rendered.Before(decided) {
+		return false, "report was rendered before it was decided"
 	}
 
 	cpu, why := rebuildCPUReading(report.CPU)

@@ -40,6 +40,11 @@ Guaranteed:
   marshal, and reads are bounded with the mode verified on the descriptor.
 - Expiry is the earlier of the cadence deadline and the oldest metric's own
   staleness window, so a slow publication cannot renew aged-out metrics.
+- On Darwin, Linux and the BSDs the status read opens non-blocking and validates
+  the mode on the descriptor it holds. On any other platform the read is refused
+  outright with `ErrObserverReadUnsupported`: there is no bounded-open primitive
+  there, and a check-then-open sequence cannot close the window in which the
+  path is replaced with a FIFO.
 - Unknown, stale or unsupported data refuses. A consumer revalidates the
   published readings through the same `Decide` the writer used.
 
@@ -75,11 +80,21 @@ lock, and the observer never holds that lock for its lifetime.
 
 `scripts/verify-resource-observer.zsh` is the non-vacuity driver, wired into CI.
 It runs the observer suites as baselines, then mutates the real production
-source one guard at a time. A mutant counts as killed only when it **compiles**
-and its **named** killer test fails with the **named** assertion text, read from
-`go test -json`. A compile error, timeout, skip or unrelated assertion is not a
-kill. Baselines must pass before any mutant means anything, and again after the
-source is restored. Logs are retained as a CI artifact.
+source one guard at a time. A mutant counts as killed only when it **compiles**,
+the run exits **non-zero**, the **named** killer test emits a failure, and that
+test's own output carries the **named** assertion text — all read from
+`go test -json`. A compile error, a panic, a Go-internal test timeout, an
+external timeout, a skip or an unrelated assertion each get their own non-kill
+verdict. Baselines must pass before any mutant means anything, and again after
+the source is restored; cleanup runs before the verdict, so a leaked worktree
+fails the run rather than passing with a warning. Logs are retained as a CI
+artifact.
+
+One guard is deliberately not mutated: `reportSelfConsistent` refuses a missing
+`decided_at`/`rendered_at` with a named message, but an absent stamp also fails
+the RFC3339 parse immediately after, so no compiling mutation can isolate it.
+The requirement is covered by the `decided_at missing` and `rendered_at missing`
+subtests instead of by a control that would pass for the wrong reason.
 
 ## Dependencies
 
