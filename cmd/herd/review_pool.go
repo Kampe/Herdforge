@@ -34,6 +34,17 @@ import (
 // runPoolReview exposes the warm-pool reviewer path for use while the signed
 // review admission path is unavailable. The lease remains held for the
 // review supervisor to release after verdict ingest.
+// loadReviewTaskProvider is the ONLY external boundary this entry cannot reach
+// hermetically: the "memory" provider type constructs an EMPTY provider, so a
+// fixture has no way to make the entry's own task lookup resolve.
+//
+// FAC-832: the acceptance is the ACTUAL `review --pool --no-launch` route, not
+// a helper. Everything else on that route runs for real against a real
+// repository — capacity, candidate resolution, the pool lease, the slot pin,
+// the surface symlink and the packet. Production assigns loadTaskProvider and
+// nothing reassigns it outside tests.
+var loadReviewTaskProvider = loadTaskProvider
+
 func runPoolReview(ref string) error {
 	if strings.TrimSpace(ref) == "" {
 		return errors.New("candidate ref is required (usage: herd review <ref> --pool)")
@@ -84,7 +95,7 @@ func runPoolReview(ref string) error {
 	if err := capacityLease.update(admissionPhaseCandidate); err != nil {
 		return fmt.Errorf("advance admission phase to candidate: %w", err)
 	}
-	tasks, err := loadTaskProvider(cfg)
+	tasks, err := loadReviewTaskProvider(cfg)
 	if err != nil {
 		return fmt.Errorf("review task identity: load provider: %w", err)
 	}

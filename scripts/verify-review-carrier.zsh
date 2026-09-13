@@ -48,7 +48,7 @@ pool_src=cmd/herd/review_pool.go
 worktree_pkg=./cmd/herd/
 
 pool_run='TestPinnedCandidateAndBase|TestNeedsCandidateDirectory|TestUnpinnedBaseStillPrepares|TestExistingCandidateWorktree|TestRepeatedPinnedResolution|TestUnresolvableCandidate'
-pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses'
+pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier'
 
 go_timeout=${VERIFY_CARRIER_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -247,6 +247,9 @@ controls=(
 			return \"\", nil
 		}${sep}TestPinnedCandidateAndBaseAllocateNoCarrier${sep}a fully pinned resolution allocated a carrier at"
 "pinned-identities-need-no-directory${sep}${pool_src}${sep}${worktree_pkg}${sep}	return strings.TrimSpace(sha) == \"\" || strings.TrimSpace(explicitBase) == \"\"${sep}	return true // MUTANT: every resolution claims it needs a directory${sep}TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead/both_pinned_reads_nothing${sep}needsCandidateDirectory("
+"entry-allocates-no-redundant-carrier${sep}${pool_src}${sep}${worktree_pkg}${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
+		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
+		true) // MUTANT: the production entry allocates unconditionally, as it did before${sep}TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier${sep}no-launch preparation left an unowned carrier"
 )
 
 # ---------------------------------------------------------------------------
