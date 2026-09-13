@@ -319,3 +319,73 @@ func TestGateProveLandedSucceedsOnTheDefaultBudget(t *testing.T) {
 		t.Fatalf("exported-entry proof is empty: %+v", proof)
 	}
 }
+
+// CHARGING-BOUNDARY observers.
+//
+// TestProofCommandBudgetRefusesInsteadOfRunningUnbounded proves the allowance
+// is reached by real work, but it cannot attribute the charge: with three
+// independent charge sites, removing any one still lets the other two exhaust
+// the budget and produce the identical refusal. Root's audit caught exactly
+// that — the gitOutBytes mutant was masked by four separately charged patch-id
+// commands in the same run.
+//
+// These count instead. Each drives ONE charge site in isolation and asserts the
+// exact number of commands charged, so removing that site's charge changes the
+// count and the assertion fails.
+func TestGitOutBytesIsTheChargingBoundaryForGitReads(t *testing.T) {
+	dir, base, _ := boundedProofRepo(t, 1)
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{})
+	defer cancel()
+	ledger := ledgerFrom(ctx)
+	if ledger == nil {
+		t.Fatal("no allowance was installed")
+	}
+
+	before := ledger.spentCount()
+	const reads = 3
+	for i := 0; i < reads; i++ {
+		// rev-parse goes through gitOutBytes and through NO other charge site:
+		// it is not a patch-id and not an ancestry probe.
+		if _, err := gitOut(ctx, dir, "rev-parse", "--verify", "-q", base+"^{commit}"); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+	}
+	if got := ledger.spentCount() - before; got != reads {
+		t.Fatalf("%d git reads charged %d commands, want %d; gitOutBytes is not charging and the budget can be bypassed through it",
+			reads, got, reads)
+	}
+}
+
+// stablePatchID runs once per commit in a range, so it must charge too.
+func TestStablePatchIDChargesItsOwnCommand(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 1)
+	_ = base
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{})
+	defer cancel()
+	ledger := ledgerFrom(ctx)
+
+	before := ledger.spentCount()
+	if _, err := commitPatchID(ctx, dir, candidate); err != nil {
+		t.Fatalf("patch id: %v", err)
+	}
+	// One diff-tree through gitOutBytes plus one patch-id of its own.
+	if got := ledger.spentCount() - before; got != 2 {
+		t.Fatalf("one patch id charged %d commands, want 2 (the diff-tree read and the patch-id itself)", got)
+	}
+}
+
+// ancestorProven runs inside the integration search loop, so it must charge.
+func TestAncestorProvenChargesItsOwnCommand(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 1)
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{})
+	defer cancel()
+	ledger := ledgerFrom(ctx)
+
+	before := ledger.spentCount()
+	if _, err := ancestorProven(ctx, dir, base, candidate); err != nil {
+		t.Fatalf("ancestry probe: %v", err)
+	}
+	if got := ledger.spentCount() - before; got != 1 {
+		t.Fatalf("one ancestry probe charged %d commands, want 1; the search loop could then run unbounded", got)
+	}
+}

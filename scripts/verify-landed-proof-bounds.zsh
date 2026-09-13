@@ -128,7 +128,7 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget"
+"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget|TestGitOutBytesIsTheChargingBoundaryForGitReads|TestStablePatchIDChargesItsOwnCommand|TestAncestorProvenChargesItsOwnCommand)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget TestGitOutBytesIsTheChargingBoundaryForGitReads TestStablePatchIDChargesItsOwnCommand TestAncestorProvenChargesItsOwnCommand"
 )
 
 # ---------------------------------------------------------------------------
@@ -214,9 +214,20 @@ sources=(
 )
 
 mutations=(
-"command-budget-not-charged${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}	if err := ledger.spendCommand(args); err != nil {
+# Three INDEPENDENT charge sites, three controls. An end-to-end "the proof
+# refuses" killer cannot attribute a charge: remove one site and the other two
+# still exhaust the allowance and produce the identical refusal, which is how
+# the gitOutBytes mutant survived while four patch-id commands paid for it. Each
+# control below is killed by an observer that COUNTS the charge at its own site.
+"gitoutbytes-not-charged${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}	if err := ledger.spendCommand(args); err != nil {
 		return nil, err
-	}${sep}	_ = ledger // MUTANT: git commands are no longer charged against the budget${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded${sep}the command budget is not consulted by real work"
+	}${sep}	_ = ledger // MUTANT: git reads are not charged against the budget${sep}TestGitOutBytesIsTheChargingBoundaryForGitReads${sep}gitOutBytes is not charging and the budget can be bypassed through it"
+"patchid-not-charged${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}	if err := ledger.spendCommand([]string{\"patch-id\", \"--stable\"}); err != nil {
+		return \"\", err
+	}${sep}	_ = ledger // MUTANT: patch-id is not charged against the budget${sep}TestStablePatchIDChargesItsOwnCommand${sep}want 2 (the diff-tree read and the patch-id itself)"
+"ancestry-not-charged${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}	if err := ledgerFrom(ctx).spendCommand([]string{\"merge-base\", \"--is-ancestor\"}); err != nil {
+		return false, err
+	}${sep}	_ = ctx // MUTANT: ancestry probes are not charged, the search loop is unbounded${sep}TestAncestorProvenChargesItsOwnCommand${sep}the search loop could then run unbounded"
 "range-budget-not-enforced${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}			if len(commits) >= maxCommits {
 				return nil, fmt.Errorf(\"%w: %s..%s holds more than %d commits\",
 					ErrProofBudgetRange, short(base), short(tip), maxCommits)

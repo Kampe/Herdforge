@@ -226,3 +226,19 @@ func resolveFailure(role, rev, repoDir string, err error) error {
 	}
 	return fmt.Errorf("%s revision %q does not resolve to a commit in %s: %w", role, rev, repoDir, err)
 }
+
+// spentCount reports how many git commands this proof has charged so far.
+//
+// It exists so a control can observe the CHARGING BOUNDARY itself. An
+// end-to-end "the proof refuses" assertion cannot do that: the three charge
+// sites are independent, so removing one still leaves the others able to
+// exhaust the allowance and produce the same refusal. Counting is what
+// distinguishes "this site charges" from "something charged".
+func (l *proofLedger) spentCount() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.spent
+}
