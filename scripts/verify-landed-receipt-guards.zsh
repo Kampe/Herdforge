@@ -329,7 +329,7 @@ mutations=(
 		return g.Live.OriginMain.Read(role)
 	}
 	if g == nil || g.Live.OriginMainAt == nil {${sep}TestProofRoutesRefuseAValueOnlyOriginProbe${sep}a proof route accepted a value-only probe"
-"cli-seal-must-spend-the-same-allowance${sep}cmd/herd/reviewingest.go${sep}./cmd/herd/${sep}	receipt, err := gate.ReconcileLandedContext(ctx, req)${sep}	receipt, err := gate.ReconcileLanded(req) // MUTANT: the seal mints a fresh allowance instead of spending this invocation${sep}TestRunHarvestVerifyLandedRecordsNothingWhenSealingExhausts${sep}still completed it"
+"cli-seal-must-spend-the-same-allowance${sep}cmd/herd/reviewingest.go${sep}./cmd/herd/${sep}	receipt, err := gate.ReconcileLandedContext(ctx, req)${sep}	receipt, err := gate.ReconcileLanded(req) // MUTANT: the seal mints a fresh allowance instead of spending this invocation${sep}TestRunHarvestVerifyLandedRecordsNothingWhenSealingExhausts${sep}it did not spend this invocation's budget"
 "disposition-must-follow-the-seal${sep}cmd/herd/reviewingest.go${sep}./cmd/herd/${sep}	receipt, err := gate.ReconcileLandedContext(ctx, req)
 	if err != nil {
 		return fmt.Errorf(\"receipt reconcile: %w\", err)

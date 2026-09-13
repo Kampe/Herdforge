@@ -112,19 +112,38 @@ func TestRunHarvestVerifyLandedSealsAndRecordsOnTheDefaultAllowance(t *testing.T
 // The boundary is DERIVED, not guessed: the sweep raises the allowance until the
 // invocation completes, then re-runs one command short, so the failure is
 // guaranteed to fall after observation and before the seal completes.
+// The contract the repair exists for, at the public entry: an allowance that
+// covers OBSERVATION and nothing more. Neither artifact may exist.
+//
+// The threshold is derived from an INDEPENDENT observation-only measurement, not
+// from the whole composition. Measuring the composition and subtracting one is
+// not an oracle: the very mutant this is meant to catch -- a seal that mints its
+// own budget instead of spending this invocation's -- REDUCES what the whole
+// composition costs, so the measured minimum collapses to the observation cost,
+// "one less" then fails during observation with no artifacts, and the mutant
+// survives a green test. A threshold that moves with the mutation cannot certify
+// that the seal shared the original allowance.
+//
+// So the allowance is exactly what observation alone needs, and the test proves
+// both halves explicitly: that observation COMPLETES on it, and that the
+// invocation as a whole does NOT.
 func TestRunHarvestVerifyLandedRecordsNothingWhenSealingExhausts(t *testing.T) {
-	full := publicEntryAllowanceForSuccess(t)
-	if full < 2 {
-		t.Fatalf("a complete invocation spent %d commands; too few to place a late exhaustion", full)
-	}
+	observation := observationOnlyCost(t)
 
 	repo, _, binding := publicEntryFixture(t)
-	cliProofBudget = mergeadmit.ProofBudget{MaxCommands: full - 1}
+	// Half one, stated rather than assumed: on this allowance the observation
+	// stage of this very fixture completes. Any failure below is therefore after
+	// observation, which is what makes it a statement about the seal.
+	if err := observationCompletesOn(t, binding, observation); err != nil {
+		t.Fatalf("fixture invalid: observation does not complete on %d commands: %v", observation, err)
+	}
+
+	cliProofBudget = mergeadmit.ProofBudget{MaxCommands: observation}
 	t.Cleanup(func() { cliProofBudget = mergeadmit.ProofBudget{} })
 
 	err := runHarvestVerifyLanded("work", binding)
 	if err == nil {
-		t.Fatal("an allowance one command short of the whole invocation still completed it")
+		t.Fatal("the seal completed on an allowance that only covers observation; it did not spend this invocation's budget")
 	}
 	receipt, disposition := publicEntryArtifacts(t, repo)
 	if receipt {
@@ -135,22 +154,42 @@ func TestRunHarvestVerifyLandedRecordsNothingWhenSealingExhausts(t *testing.T) {
 	}
 }
 
-// publicEntryAllowanceForSuccess finds the smallest allowance the whole public
-// invocation completes on, using a fresh fixture per attempt so no attempt sees
-// another's artifacts.
-func publicEntryAllowanceForSuccess(t *testing.T) int {
+// observationCompletesOn runs ONLY the observation stage of an already-prepared
+// fixture, on the given allowance, with the gate the CLI itself builds.
+func observationCompletesOn(t *testing.T, binding verifyLandedBinding, allowance int) error {
+	t.Helper()
+	prev := cliProofBudget
+	cliProofBudget = mergeadmit.ProofBudget{MaxCommands: allowance}
+	defer func() { cliProofBudget = prev }()
+
+	req, err := resolveVerifyLandedRequest(binding, binding.Candidate)
+	if err != nil {
+		t.Fatalf("resolve request: %v", err)
+	}
+	gate, err := buildMergeGate(req.Ref, req.TaskID, 0)
+	if err != nil {
+		t.Fatalf("build gate: %v", err)
+	}
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+	_, err = observeVerifyLanded(ctx, ".", gate, req)
+	return err
+}
+
+// observationOnlyCost is the smallest allowance on which the OBSERVATION stage
+// alone completes, measured through the gate the CLI builds so the count matches
+// what the real invocation spends before it seals.
+//
+// It is independent of the seal by construction: no control mutates
+// observeVerifyLanded, so this number does not move when the seal does.
+func observationOnlyCost(t *testing.T) int {
 	t.Helper()
 	for n := 1; n < 256; n++ {
-		ok := func() bool {
-			_, _, binding := publicEntryFixture(t)
-			cliProofBudget = mergeadmit.ProofBudget{MaxCommands: n}
-			defer func() { cliProofBudget = mergeadmit.ProofBudget{} }()
-			return runHarvestVerifyLanded("work", binding) == nil
-		}()
-		if ok {
+		_, _, binding := publicEntryFixture(t)
+		if observationCompletesOn(t, binding, n) == nil {
 			return n
 		}
 	}
-	t.Fatal("the public entry never completed within a sane allowance")
+	t.Fatal("observation never completed within a sane allowance")
 	return 0
 }
