@@ -181,7 +181,7 @@ func TestProofBudgetSurvivesRevisionResolution(t *testing.T) {
 		budget ProofBudget
 		want   error
 	}{
-		{"commands exhausted at the first resolve", ProofBudget{MaxCommands: 0}, ErrProofBudgetCommands},
+		{"commands exhausted during resolution", ProofBudget{MaxCommands: 1}, ErrProofBudgetCommands},
 		{"output exhausted at the first resolve", ProofBudget{MaxOutputBytes: 1}, ErrProofBudgetOutput},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,7 +206,11 @@ func TestProofBudgetSurvivesRevisionResolution(t *testing.T) {
 func TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse(t *testing.T) {
 	dir, base, carrier, candidate, mergeCommit := prShapedLanding(t)
 	_ = carrier
-	ctx, cancel := withProofBudget(context.Background(), ProofBudget{MaxCommands: 0})
+	// MaxCommands 1, not 0: withDefaults treats a non-positive field as "take
+	// the default", so 0 would silently grant the full 512-command allowance
+	// and this fixture would prove nothing. One command lets the parent resolve
+	// succeed and the replay refuse, which is the path under test.
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{MaxCommands: 1})
 	defer cancel()
 
 	ok, err := contentPreservedAt(ctx, dir, base, candidate, mergeCommit)
@@ -223,11 +227,16 @@ func TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse(t *testing.T) 
 
 // The exported replay wrappers must carry the same finite allowance. Before
 // this, ReplayTreeContext reached the primitive without installing one.
+//
+// The bound asserted here is the DEADLINE rather than a command count: the
+// wrapper issues a single merge-tree, so no positive command allowance can be
+// exhausted by it, and a zero one would be read as "take the default".
 func TestReplayTreeContextCarriesAnAllowance(t *testing.T) {
 	dir, base, candidate := boundedProofRepo(t, 1)
-	ctx, cancel := withProofBudget(context.Background(), ProofBudget{MaxCommands: 0})
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{Deadline: time.Nanosecond})
 	defer cancel()
-	if _, err := ReplayTreeContext(ctx, dir, base, base, candidate); !errors.Is(err, ErrProofBudgetCommands) {
+	time.Sleep(2 * time.Millisecond)
+	if _, err := ReplayTreeContext(ctx, dir, base, base, candidate); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want the exported wrapper to honour the allowance", err)
 	}
 }
@@ -270,5 +279,43 @@ func TestGitrootReplayArgsIsTheSoleDefinition(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("argv = %v, want %v", got, want)
 		}
+	}
+}
+
+// REGRESSION: the EXPORTED entry must carry the allowance.
+//
+// Gate.ProveLanded is the entry the review found unbounded, and the control for
+// it previously named a helper test that never calls it — so restoring
+// context.Background() there left every test green. This drives the real
+// exported method on a real repository with a tiny injected allowance, so the
+// allowance has to reach actual work for the assertion to hold.
+func TestGateProveLandedCarriesItsInjectedBudget(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 2)
+	// One command: the base resolves, the next resolution refuses. A zero here
+	// would be read as "take the default" by withDefaults and prove nothing.
+	g := &Gate{RepoDir: dir, ProofBudget: ProofBudget{MaxCommands: 1}}
+
+	_, err := g.ProveLanded(Request{BaseSHA: base, CandidateSHA: candidate}, candidate)
+	if err == nil {
+		t.Fatal("Gate.ProveLanded ignored its injected allowance and proved a landing")
+	}
+	if !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want ErrProofBudgetCommands from the exported entry", err)
+	}
+}
+
+// POSITIVE half: the SAME topology through the SAME exported entry succeeds on
+// the default allowance, so the refusal above cannot be satisfied by an entry
+// that refuses everything.
+func TestGateProveLandedSucceedsOnTheDefaultBudget(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 2)
+	g := &Gate{RepoDir: dir}
+
+	proof, err := g.ProveLanded(Request{BaseSHA: base, CandidateSHA: candidate}, candidate)
+	if err != nil {
+		t.Fatalf("the default allowance refused an ordinary landing through the exported entry: %v", err)
+	}
+	if proof == nil || proof.MergeSHA == "" {
+		t.Fatalf("exported-entry proof is empty: %+v", proof)
 	}
 }

@@ -111,12 +111,6 @@ sep=$'\x1f'
 # Sources under mutation. Each is hashed pristine up front so a restore can be
 # proven byte-for-byte rather than assumed.
 # ---------------------------------------------------------------------------
-sources=(
-	pkg/mergeadmit/landed_integration.go
-	pkg/mergeadmit/reconcile.go
-	pkg/sync/donereceipt.go
-	cmd/herd/verify_landed_surface.go
-)
 typeset -A pristine
 for rel in "${sources[@]}"; do
 	h=$(git -C "$work" hash-object -- "$rel") || { print -u2 "error: cannot hash $rel"; exit 1; }
@@ -134,7 +128,7 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities"
+"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget"
 )
 
 # ---------------------------------------------------------------------------
@@ -209,6 +203,10 @@ suites=(
 # reports coverage that does not exist.
 # id | source | test package | anchor | replacement | killer | required assertion
 # ---------------------------------------------------------------------------
+# Sources this driver may mutate. Scoped to my ownership: pkg/mergeadmit only.
+# The seeded copy of this file carried pkg/sync and cmd/herd entries from the
+# receipt-guards driver; those belong to C5 and are removed rather than left to
+# let this driver write into another author's files.
 sources=(
 	pkg/mergeadmit/proof_bounds.go
 	pkg/mergeadmit/proof.go
@@ -223,10 +221,16 @@ mutations=(
 				return nil, fmt.Errorf(\"%w: %s..%s holds more than %d commits\",
 					ErrProofBudgetRange, short(base), short(tip), maxCommits)
 			}${sep}			_ = maxCommits // MUTANT: the range is materialised without a bound${sep}TestProofRangeBudgetRefusesAnOversizedRange${sep}materialised a four-commit range"
-"entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)${sep}	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: the entry path loses its allowance${sep}TestEnsureProofBudgetInstallsOnceAndNeverReplaces${sep}was left without an allowance"
-"budget-error-flattened${sep}pkg/mergeadmit/proof.go${sep}./pkg/mergeadmit/${sep}		if isProofBudgetError(err) {
-			return \"\", err
-		}${sep}		_ = isProofBudgetError // MUTANT: a budget refusal is flattened into a resolution failure${sep}TestProofBudgetSurvivesRevisionResolution/commands_exhausted_at_the_first_resolve${sep}a flattened budget error reads as an ordinary resolution failure"
+"entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)${sep}	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: the entry path loses its allowance${sep}TestGateProveLandedCarriesItsInjectedBudget${sep}ignored its injected allowance and proved a landing"
+# ONE control, not two. An earlier revision split this into a passthrough mutant
+# and a %w mutant; NEITHER could kill, because each half alone still lets
+# errors.Is reach the sentinel through the other. Only restoring the original
+# flattening -- the budget passthrough gone AND the cause dropped -- reproduces
+# the CI 34741746509 regression, so that is the one mutation worth making.
+"budget-error-flattened${sep}pkg/mergeadmit/proof_bounds.go${sep}./pkg/mergeadmit/${sep}	if isProofBudgetError(err) {
+		return err
+	}
+	return fmt.Errorf(\"%s revision %q does not resolve to a commit in %s: %w\", role, rev, repoDir, err)${sep}	return fmt.Errorf(\"%s revision %q does not resolve to a commit in %s\", role, rev, repoDir) // MUTANT: the original flattening, cause and sentinel both lost${sep}TestProofBudgetSurvivesRevisionResolution/commands_exhausted_during_resolution${sep}a flattened budget error reads as an ordinary resolution failure"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from

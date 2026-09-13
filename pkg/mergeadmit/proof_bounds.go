@@ -211,3 +211,18 @@ func proofRunAborted(ctx context.Context, err error) bool {
 	}
 	return isProofBudgetError(err)
 }
+
+// resolveFailure turns a failed revision resolution into the error the caller
+// should see, WITHOUT losing what actually went wrong.
+//
+// CI 34741746509: resolveCommit reported "base revision does not resolve" for a
+// run that had merely spent its allowance, because it dropped the cause. Both
+// halves below are needed and neither is sufficient alone — a budget refusal is
+// returned as itself so it is not buried under a resolution message, and every
+// other cause is wrapped with %w so no sentinel further down is lost either.
+func resolveFailure(role, rev, repoDir string, err error) error {
+	if isProofBudgetError(err) {
+		return err
+	}
+	return fmt.Errorf("%s revision %q does not resolve to a commit in %s: %w", role, rev, repoDir, err)
+}
