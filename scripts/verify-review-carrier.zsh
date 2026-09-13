@@ -1,18 +1,16 @@
 #!/usr/bin/env zsh
-# FAC-832: non-vacuity driver for review-preparation carrier allocation.
+# FAC-832: non-vacuity driver for review preparation — the carrier that is not
+# allocated, and the review roots that belong to the repository.
 #
-# Release and reclaimDeadLocked handed the STORED slot.Path to `git -C`, and
-# git resolves a -C argument against the process's own working directory. A
-# slot path persisted relative — which Ensure does whenever the pool was
-# created through a relative pool root — therefore named a different directory
-# for every caller. From the owning repository it worked; from anywhere else it
-# either failed, or silently reset whatever sat at that relative path under the
-# caller.
+# Pool preparation created a detached carrier under .herd/worktrees on every
+# candidate resolution, including when the caller had already pinned both the
+# exact sha and the exact base. Nothing read that directory: the reviewer works
+# in the LEASED POOL SLOT and the review surface is a symlink to it, so the
+# carrier outlived its reviewer with no retirement owner.
 #
-# The tests pass. That says nothing about whether they would NOTICE the
-# anchoring being removed. This driver removes each guard from the REAL
-# production source one at a time and requires the named oracle to die on its
-# named assertion.
+# The review roots defaulted to relative paths and so resolved against the
+# process working directory while HERD_ROOT named a different repository, which
+# put the pool, its leases, the surfaces and the packets under the caller.
 #
 # A mutant counts as KILLED only when ALL of these hold, as separate evidence:
 #
@@ -48,7 +46,7 @@ pool_src=cmd/herd/review_pool.go
 worktree_pkg=./cmd/herd/
 
 pool_run='TestPinnedCandidateAndBase|TestNeedsCandidateDirectory|TestUnpinnedBaseStillPrepares|TestExistingCandidateWorktree|TestRepeatedPinnedResolution|TestUnresolvableCandidate'
-pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier'
+pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier TestUnnamedReviewRootsAnchorToTheRepository TestNamedReviewRootsAreLeftExactlyAsGiven'
 
 go_timeout=${VERIFY_CARRIER_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -250,6 +248,7 @@ controls=(
 "entry-allocates-no-redundant-carrier${sep}${pool_src}${sep}${worktree_pkg}${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
 		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
 		true) // MUTANT: the production entry allocates unconditionally, as it did before${sep}TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier${sep}no-launch preparation left an unowned carrier"
+"review-roots-anchor-to-the-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}			*anchor.target = filepath.Join(root, ".herd", anchor.segment)${sep}			*anchor.target = filepath.Join(".herd", anchor.segment) // MUTANT: the default resolves against the caller again${sep}TestUnnamedReviewRootsAnchorToTheRepository${sep}want the repository-anchored"
 )
 
 # ---------------------------------------------------------------------------

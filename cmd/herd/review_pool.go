@@ -74,6 +74,9 @@ func runPoolReview(ref string) error {
 		return err
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	// The roots the caller did not name belong to THIS repository, not to
+	// whatever directory the process happens to be in.
+	anchorDefaultReviewRoots(fs, opts, root)
 	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
 	if err != nil {
 		return fmt.Errorf("review task identity: load config: %w", err)
@@ -1398,6 +1401,46 @@ func (o *poolReviewOptions) Validate() error {
 
 // registerPoolReviewFlags registers the complete pool option schema on fs.
 // Callers that only need the command line accepted may discard the result.
+
+// anchorDefaultReviewRoots points the review roots at the OWNING repository
+// when the caller did not name them.
+//
+// FAC-832: these three defaults were relative — ".herd/pool",
+// ".herd/review-surfaces", ".herd/review-packets" — so they resolved against
+// the PROCESS working directory while HERD_ROOT named a different repository.
+// `herd pool` has never done that: it builds its default as
+// filepath.Join(root, ".herd", "pool") (pool.go:33). This path disagreed with
+// its own sibling command.
+//
+// The consequences are not cosmetic. Run with HERD_ROOT pointing elsewhere,
+// the warm pool, its lease state, the surface symlinks and the packets were
+// all created under the caller's directory instead of the repository's, so
+// two invocations from different directories used DIFFERENT pools for the
+// same repository, and the slot pin then ran `git -C <relative>` against the
+// caller again and failed outright. Hosted CI 34756430220 hit both halves:
+// a pool slot that did not exist where the pin looked, and a pool-02 that
+// belonged to an unrelated directory's state.
+//
+// An explicitly supplied root is left exactly as the caller wrote it —
+// fs.Visit reports only flags that were actually set — so this changes the
+// meaning of the DEFAULT alone, to the repository it was always describing.
+func anchorDefaultReviewRoots(fs *flag.FlagSet, opts *poolReviewOptions, root string) {
+	named := make(map[string]bool, 3)
+	fs.Visit(func(f *flag.Flag) { named[f.Name] = true })
+	for _, anchor := range []struct {
+		flag    string
+		target  *string
+		segment string
+	}{
+		{"pool-root", opts.PoolRoot, "pool"},
+		{"surface-root", opts.SurfaceRoot, "review-surfaces"},
+		{"packet-root", opts.PacketRoot, "review-packets"},
+	} {
+		if !named[anchor.flag] {
+			*anchor.target = filepath.Join(root, ".herd", anchor.segment)
+		}
+	}
+}
 func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 	return &poolReviewOptions{
 		Pool:     fs.Bool("pool", false, "Select the warm-pool review path"),

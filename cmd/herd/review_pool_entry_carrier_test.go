@@ -25,10 +25,13 @@ import (
 // lease and refuses on error. That boundary is an owned fixture CLI, never the
 // operator's.
 //
-// The ONLY seam is loadReviewTaskProvider, because the "memory" provider type
-// constructs an EMPTY provider and a fixture otherwise cannot make the entry's
-// own task lookup resolve. Everything the card is about — candidate identity,
-// pool readiness, carrier allocation — runs for real.
+// The only PROVIDER seam is loadReviewTaskProvider, because the "memory"
+// provider type constructs an EMPTY provider and a fixture otherwise cannot
+// make the entry's own task lookup resolve. The host READINGS are bound too,
+// through the saved and restored poolCapacityObserve var, which delegates to
+// the live observer and replaces only the numbers. Everything the card is
+// about — candidate identity, pool readiness and carrier allocation — runs for
+// real.
 
 const entryRef = "FAC-9320"
 

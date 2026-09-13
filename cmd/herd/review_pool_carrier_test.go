@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,5 +198,60 @@ func TestUnresolvableCandidateAllocatesNothingAndRefuses(t *testing.T) {
 	}
 	if got := managedWorktrees(t, root); len(got) != 0 {
 		t.Fatalf("a refused resolution left a carrier: %v", got)
+	}
+}
+
+// FAC-832: the review roots defaulted to relative paths, so they resolved
+// against the PROCESS working directory while HERD_ROOT named a different
+// repository — unlike `herd pool`, whose default has always been
+// filepath.Join(root, ".herd", "pool"). Two invocations from different
+// directories then used different pools for the same repository, and the slot
+// pin ran `git -C <relative>` against the caller and failed.
+func TestUnnamedReviewRootsAnchorToTheRepository(t *testing.T) {
+	root := t.TempDir()
+	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
+	opts := registerPoolReviewFlags(fs)
+	if err := fs.Parse([]string{"--pool"}); err != nil {
+		t.Fatal(err)
+	}
+
+	anchorDefaultReviewRoots(fs, opts, root)
+
+	for _, want := range []struct {
+		name string
+		got  string
+		dir  string
+	}{
+		{"pool-root", *opts.PoolRoot, "pool"},
+		{"surface-root", *opts.SurfaceRoot, "review-surfaces"},
+		{"packet-root", *opts.PacketRoot, "review-packets"},
+	} {
+		expect := filepath.Join(root, ".herd", want.dir)
+		if want.got != expect {
+			t.Errorf("%s = %q, want the repository-anchored %q", want.name, want.got, expect)
+		}
+	}
+}
+
+// An explicitly supplied root is the caller's to interpret and must survive
+// verbatim, relative or not.
+func TestNamedReviewRootsAreLeftExactlyAsGiven(t *testing.T) {
+	fs := flag.NewFlagSet("review --pool", flag.ContinueOnError)
+	opts := registerPoolReviewFlags(fs)
+	if err := fs.Parse([]string{"--pool", "--pool-root", "given/pool", "--packet-root", "/abs/packets"}); err != nil {
+		t.Fatal(err)
+	}
+
+	anchorDefaultReviewRoots(fs, opts, t.TempDir())
+
+	if *opts.PoolRoot != "given/pool" {
+		t.Errorf("an explicit relative pool root was rewritten to %q", *opts.PoolRoot)
+	}
+	if *opts.PacketRoot != "/abs/packets" {
+		t.Errorf("an explicit absolute packet root was rewritten to %q", *opts.PacketRoot)
+	}
+	// The one the caller did NOT name is still anchored.
+	if filepath.IsAbs(*opts.SurfaceRoot) == false {
+		t.Errorf("the unnamed surface root stayed caller-relative: %q", *opts.SurfaceRoot)
 	}
 }
