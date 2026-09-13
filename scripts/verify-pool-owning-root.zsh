@@ -48,7 +48,7 @@ pool_src=pkg/worktree/pool.go
 worktree_pkg=./pkg/worktree/
 
 pool_run='TestReleaseFromAForeignCaller|TestReclaimFromAForeignCaller|TestAReassignedSlotRefuses|TestReleaseRefuses|TestReleaseKeepsTheLease'
-pool_expect='TestReleaseFromAForeignCallerResetsTheOwningSlot TestReclaimFromAForeignCallerResetsTheOwningSlot TestAReassignedSlotRefusesTheRetiredLeaseIdentity TestReleaseRefusesAnUnknownLeaseAndLeavesTheOwnerHeld TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease TestReleaseKeepsTheLeaseWhenTheSlotIsGone TestRelativeConstructorAnchorsBeforeTheCallerMoves TestFixedClockMintsAUniqueIncarnationForEveryAssignment TestARecreatedSlotDoesNotResurrectARetiredIdentity'
+pool_expect='TestReleaseFromAForeignCallerResetsTheOwningSlot TestReclaimFromAForeignCallerResetsTheOwningSlot TestAReassignedSlotRefusesTheRetiredLeaseIdentity TestReleaseRefusesAnUnknownLeaseAndLeavesTheOwnerHeld TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease TestReleaseKeepsTheLeaseWhenTheSlotIsGone TestRelativeConstructorAnchorsBeforeTheCallerMoves TestFixedClockMintsAUniqueIncarnationForEveryAssignment TestARecreatedSlotDoesNotResurrectARetiredIdentity TestLegacyStateDoesNotReissueAReleasedGeneration TestLegacyHeldSlotDoesNotReissueItsOwnGenerationAfterReclaim TestStructLiteralPoolRefusesRelativeRootsOnItsFirstStateRead'
 
 go_timeout=${VERIFY_POOL_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -251,10 +251,10 @@ controls=(
 			}
 			cmd := exec.CommandContext(ctx, \"git\", \"-C\", slot.Path, \"reset\", \"--hard\", base) // MUTANT: the stored path is resolved against the caller${sep}TestReleaseFromAForeignCallerResetsTheOwningSlot${sep}owning slot HEAD ="
 "reclaim-anchored-to-the-owning-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}		if out, err := exec.CommandContext(ctx, \"git\", \"-C\", slotPath, \"reset\", \"--hard\", base).CombinedOutput(); err != nil {${sep}		if out, err := exec.CommandContext(ctx, \"git\", \"-C\", slot.Path, \"reset\", \"--hard\", base).CombinedOutput(); err != nil { // MUTANT: unattended reclaim resolved against the caller${sep}TestReclaimFromAForeignCallerResetsTheOwningSlot${sep}reclaimed slot HEAD ="
-"slot-path-contained-in-the-pool-root${sep}${pool_src}${sep}${worktree_pkg}${sep}	if err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel) {${sep}	if false && (err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel)) { // MUTANT: containment no longer refuses an escaping path${sep}TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease${sep}want the containment refusal"
+"slot-path-contained-in-the-pool-root${sep}${pool_src}${sep}${worktree_pkg}${sep}	if err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel) {${sep}	if false && (err != nil || rel == \"..\" || strings.HasPrefix(rel, \"..\"+string(filepath.Separator)) || filepath.IsAbs(rel)) { // MUTANT: containment no longer refuses an escaping path${sep}TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease${sep}containment did not protect the outside worktree"
 "slot-must-be-a-registered-worktree${sep}${pool_src}${sep}${worktree_pkg}${sep}	if !registered {
 		return \"\", fmt.Errorf(\"worktree pool: slot %s path %s is not a registered worktree of this repository; refusing to reset it\", slot.Name, resolved)${sep}	if false && !registered { // MUTANT: any contained directory counts as ours
-		return \"\", fmt.Errorf(\"worktree pool: slot %s path %s is not a registered worktree of this repository; refusing to reset it\", slot.Name, resolved)${sep}TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease${sep}want the registration refusal"
+		return \"\", fmt.Errorf(\"worktree pool: slot %s path %s is not a registered worktree of this repository; refusing to reset it\", slot.Name, resolved)${sep}TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease${sep}the registration guard did not protect the foreign checkout"
 "refused-release-keeps-the-lease${sep}${pool_src}${sep}${worktree_pkg}${sep}			// Anchored to the owning repository BEFORE anything destructive
 			// runs, and refused rather than guessed. A failure here returns
 			// with the lease still held: refusing to reset is always safer
@@ -271,6 +271,8 @@ controls=(
 			}${sep}TestReleaseKeepsTheLeaseWhenTheSlotIsGone${sep}a failed release cleared the lease"
 "owning-roots-canonical-before-state-access${sep}${pool_src}${sep}${worktree_pkg}${sep}	abs, err := filepath.Abs(path)${sep}	abs, err := path, error(nil) // MUTANT: the owning roots keep the caller's spelling${sep}TestRelativeConstructorAnchorsBeforeTheCallerMoves${sep}the owning slot was not the one released"
 "lease-incarnation-unique-per-assignment${sep}${pool_src}${sep}${worktree_pkg}${sep}	if n <= state.LastAssignedGeneration {${sep}	if false && n <= state.LastAssignedGeneration { // MUTANT: a fixed clock reissues a retired identity${sep}TestFixedClockMintsAUniqueIncarnationForEveryAssignment${sep}reissued the retired lease identity"
+"legacy-state-generation-high-water${sep}${pool_src}${sep}${worktree_pkg}${sep}	state.LastAssignedGeneration = retainedGenerationHighWater(state)${sep}	// MUTANT: legacy state loads no derived high-water mark${sep}TestLegacyStateDoesNotReissueAReleasedGeneration${sep}is not above the retained"
+"struct-literal-relative-roots-refused${sep}${pool_src}${sep}${worktree_pkg}${sep}		if !p.constructed && (!filepath.IsAbs(p.RepoRoot) || !filepath.IsAbs(p.Root)) {${sep}		if false && !p.constructed && (!filepath.IsAbs(p.RepoRoot) || !filepath.IsAbs(p.Root)) { // MUTANT: an unanchorable relative spelling reads the caller's state${sep}TestStructLiteralPoolRefusesRelativeRootsOnItsFirstStateRead${sep}read state instead of refusing"
 )
 
 # ---------------------------------------------------------------------------

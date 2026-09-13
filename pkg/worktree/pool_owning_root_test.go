@@ -560,3 +560,175 @@ func TestARecreatedSlotDoesNotResurrectARetiredIdentity(t *testing.T) {
 		t.Fatal("the retired identity released the recreated slot's owner")
 	}
 }
+
+// writeLegacyState rewrites the record in the version-1 shape that every pool
+// created before this change still has on disk: no last_assigned_generation.
+// This is TEST-OWNED state reconstructed to reach the legacy path, and it is
+// the only thing these two tests corrupt.
+func writeLegacyState(t *testing.T, f *owningFixture, slot PoolSlot) {
+	t.Helper()
+	legacy := struct {
+		Version int        `json:"version"`
+		Slots   []PoolSlot `json:"slots"`
+	}{Version: 1, Slots: []PoolSlot{slot}}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "last_assigned_generation") {
+		t.Fatalf("the legacy fixture still carries the new field: %s", raw)
+	}
+	if err := os.WriteFile(filepath.Join(f.poolDir, "pool.json"), append(raw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// LEGACY STATE, released slot. The prior schema retained
+// last_release_generation, so the high-water mark must be derived from it
+// before any allocation runs. Without that, a fixed or rolled-back clock
+// reissues exactly the retired identity and its holder can release the new
+// owner.
+func TestLegacyStateDoesNotReissueAReleasedGeneration(t *testing.T) {
+	f := newOwningFixture(t)
+	ctx := context.Background()
+
+	retiredGen := int64(1_700_000_000_000_000_000)
+	retiredID := leaseIdentity("pool-01", time.Unix(0, retiredGen).UTC())
+	writeLegacyState(t, f, PoolSlot{
+		Name:                  "pool-01",
+		Path:                  filepath.Join(".herd", "pool", "pool-01"),
+		LastReleaseLeaseID:    retiredID,
+		LastReleaseGeneration: retiredGen,
+		LastReleasePath:       filepath.Join(".herd", "pool", "pool-01"),
+	})
+
+	// A clock rolled back BEHIND the retained generation is the worst case.
+	rolledBack := func() *Pool {
+		p := f.pool()
+		p.Now = func() time.Time { return time.Unix(0, retiredGen-5).UTC() }
+		return p
+	}
+
+	lease, err := rolledBack().Lease(ctx, "review-legacy")
+	if err != nil {
+		t.Fatalf("lease from legacy state: %v", err)
+	}
+	if lease.LeaseID == retiredID {
+		t.Fatalf("reissued the retired lease identity from legacy state: %q", retiredID)
+	}
+	if lease.LeasedAt.UnixNano() <= retiredGen {
+		t.Fatalf("legacy state issued generation %d, which is not above the retained %d", lease.LeasedAt.UnixNano(), retiredGen)
+	}
+
+	// The retired identity must be refused by BOTH release paths.
+	if err := rolledBack().Release(ctx, retiredID); err == nil {
+		t.Fatal("the retired legacy identity released the new owner through Release")
+	}
+	if err := rolledBack().ReleaseExact(ctx, "pool-01", retiredID, retiredGen, f.slotPath); err == nil {
+		t.Fatal("the retired legacy identity released the new owner through ReleaseExact")
+	}
+	if got := f.slot(t); got.LeaseID != lease.LeaseID {
+		t.Fatalf("a retired legacy identity disturbed the owner: %+v", got)
+	}
+
+	// The derived mark must be durable: a rebuilt Pool reading the record back
+	// must not fall to zero again.
+	if err := rolledBack().Release(ctx, lease.LeaseID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	next, err := rolledBack().Lease(ctx, "review-legacy-again")
+	if err != nil {
+		t.Fatalf("second lease: %v", err)
+	}
+	if next.LeaseID == lease.LeaseID || next.LeaseID == retiredID {
+		t.Fatalf("the derived high-water mark did not persist: %q after %q", next.LeaseID, lease.LeaseID)
+	}
+}
+
+// LEGACY STATE, still-held slot. Here the only retained evidence is the active
+// LeasedAt, and dead-holder reclaim is what frees it. The mark must be derived
+// from that active value at read time, before reclaim rewrites it.
+func TestLegacyHeldSlotDoesNotReissueItsOwnGenerationAfterReclaim(t *testing.T) {
+	f := newOwningFixture(t)
+	ctx := context.Background()
+
+	heldGen := int64(1_700_000_000_000_000_000)
+	heldID := leaseIdentity("pool-01", time.Unix(0, heldGen).UTC())
+	writeLegacyState(t, f, PoolSlot{
+		Name:     "pool-01",
+		Path:     filepath.Join(".herd", "pool", "pool-01"),
+		Purpose:  "review-legacy-held",
+		LeaseID:  heldID,
+		LeasedAt: time.Unix(0, heldGen).UTC(),
+	})
+
+	fixed := func() *Pool {
+		p := f.pool()
+		p.Now = func() time.Time { return time.Unix(0, heldGen).UTC() }
+		p.HolderLive = func(string) bool { return false }
+		return p
+	}
+
+	freed, err := fixed().ReclaimDead(ctx)
+	if err != nil {
+		t.Fatalf("reclaim legacy held slot: %v", err)
+	}
+	if len(freed) != 1 {
+		t.Fatalf("freed = %v, want the legacy slot", freed)
+	}
+
+	next, err := fixed().Lease(ctx, "review-after-reclaim")
+	if err != nil {
+		t.Fatalf("lease after reclaim: %v", err)
+	}
+	if next.LeaseID == heldID {
+		t.Fatalf("reclaim reissued the legacy identity %q under a fixed clock", heldID)
+	}
+	if err := fixed().Release(ctx, heldID); err == nil {
+		t.Fatal("the retired legacy identity released the slot reclaim handed on")
+	}
+}
+
+// STRUCT LITERAL. A Pool assembled without NewPool has no construction moment
+// to anchor a relative spelling against, and its first call may well be a READ.
+// It must refuse rather than read ./pool.json from wherever the caller stands.
+func TestStructLiteralPoolRefusesRelativeRootsOnItsFirstStateRead(t *testing.T) {
+	f := newOwningFixture(t)
+
+	// A complete decoy pool under the caller, so a refusal cannot be mistaken
+	// for "there was nothing to read".
+	decoyPool := filepath.Join(f.foreign, ".herd", "pool")
+	if err := os.MkdirAll(decoyPool, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoyPool, "pool.json"),
+		[]byte(`{"version":1,"slots":[{"name":"decoy-01","path":"decoy"}]}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(f.foreign)
+	relative := &Pool{RepoRoot: ".", Root: filepath.Join(".herd", "pool")}
+	slots, err := relative.Slots()
+	if err == nil {
+		t.Fatalf("a struct-literal pool with relative roots read state instead of refusing: %+v", slots)
+	}
+	if !strings.Contains(err.Error(), "must use absolute roots") {
+		t.Fatalf("err = %v, want the explicit struct-literal refusal", err)
+	}
+	for _, s := range slots {
+		if s.Name == "decoy-01" {
+			t.Fatal("the caller's decoy state was returned")
+		}
+	}
+
+	// The supported struct-literal spelling still works and reads the OWNING
+	// pool, from the same foreign directory.
+	absolute := &Pool{RepoRoot: f.repo, Root: f.poolDir}
+	owned, err := absolute.Slots()
+	if err != nil {
+		t.Fatalf("an absolute struct-literal pool was refused: %v", err)
+	}
+	if len(owned) != 1 || owned[0].Name != "pool-01" {
+		t.Fatalf("absolute struct-literal pool read the wrong state: %+v", owned)
+	}
+}
