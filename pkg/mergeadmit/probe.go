@@ -1,6 +1,7 @@
 package mergeadmit
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -39,6 +40,64 @@ func (p Probe) Read(name string) (string, error) {
 		return "", fmt.Errorf("live probe %q returned empty; an empty read is not evidence of an absent condition", name)
 	}
 	return strings.TrimSpace(v), nil
+}
+
+// OriginProbe reads the integration tip INSIDE the caller's allowance.
+//
+// FAC-831 review 6c93cc2b: the integration tip is not checkout hygiene. Which
+// commit origin/main names is what the proof then proves and what the receipt
+// then seals, so reading it is a proof operation and belongs inside the one
+// finite context the public entry installs -- its deadline, its command and
+// output budget, and its owned process group. The production probe fetches,
+// and an unbounded fetch could hang or flood ahead of every budgeted command
+// that follows it.
+//
+// Probe (no context) is kept for static and test wiring, which starts no
+// process. This type is what production uses.
+type OriginProbe func(ctx context.Context) (string, error)
+
+// StaticOriginProbe is the context-aware form of a fixed reading. A static
+// value starts no process, so it is safe at any budget; it exists so fixtures
+// migrate to the required probe explicitly instead of being carried by a
+// fallback.
+func StaticOriginProbe(v string) OriginProbe {
+	return func(context.Context) (string, error) { return v, nil }
+}
+
+// currentOriginMain is the ONE resolver for the integration tip on a PROOF
+// route, and it REQUIRES the context-aware probe.
+//
+// There is deliberately no fallback to the value-only Probe. That field holds
+// an arbitrary closure, and an arbitrary closure can shell out unbounded --
+// cmd/herd wired exactly that, twice. A silent fallback would mean a proof
+// route could still reach an unbounded command while every visible bound said
+// otherwise, so a missing context-aware probe is a REFUSAL and the caller is
+// told which field to set. Static readings are fine; hidden context-free
+// executables are not.
+func (g *Gate) currentOriginMain(ctx context.Context, role string) (string, error) {
+	if g == nil || g.Live.OriginMainAt == nil {
+		return "", fmt.Errorf(
+			"live probe %q is not configured for a proof route: set LiveState.OriginMainAt, "+
+				"which reads the integration tip inside this invocation's allowance; "+
+				"the value-only OriginMain field is not accepted here because it can run unbounded commands",
+			role)
+	}
+	v, err := g.Live.OriginMainAt(ctx)
+	if err != nil {
+		return "", fmt.Errorf("live probe %q failed: %w", role, err)
+	}
+	if strings.TrimSpace(v) == "" {
+		return "", fmt.Errorf("live probe %q returned empty; an empty read is not evidence of an absent condition", role)
+	}
+	return strings.TrimSpace(v), nil
+}
+
+// CurrentOriginMain exposes the resolver so a caller that composes an operation
+// -- the CLI verify-landed route -- observes the tip through the GATE'S injected
+// probe on the shared context, instead of constructing a second origin path of
+// its own.
+func (g *Gate) CurrentOriginMain(ctx context.Context, role string) (string, error) {
+	return g.currentOriginMain(ctx, role)
 }
 
 // CommandProbe builds a Probe from a single command with NO shell and NO
@@ -80,8 +139,14 @@ func FailingProbe(err error) Probe { return func() (string, error) { return "", 
 // value captured minutes earlier during review is not current state, and the
 // serial integration train invalidates receipts precisely by advancing these.
 type LiveState struct {
-	// OriginMain is the exact current integration base.
+	// OriginMain is the exact current integration base. Static and test wiring
+	// use this; it starts no process.
 	OriginMain Probe
+	// OriginMainAt is the same reading, taken INSIDE the caller's allowance.
+	// Production sets this so the fetch and rev-parse that decide the landed
+	// commit are charged, deadlined and owned like every other proof command.
+	// When set it is preferred over OriginMain.
+	OriginMainAt OriginProbe
 	// CandidateHead is the exact current tip of the candidate being merged
 	// (the PR head), read from the authority that owns it.
 	CandidateHead Probe

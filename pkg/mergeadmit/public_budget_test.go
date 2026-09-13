@@ -95,7 +95,7 @@ func reconcileFixture(t *testing.T) (*Gate, Request, string) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain:    StaticProbe(advanced),
+			OriginMain: StaticProbe(advanced), OriginMainAt: StaticOriginProbe(advanced),
 			CandidateHead: StaticProbe(candidate),
 			Mergeable:     StaticProbe("CLEAN"),
 			TaskRevision:  StaticProbe(testRevision),
@@ -159,7 +159,7 @@ func reducedFixture(t *testing.T) (*Gate, Request, string) {
 	verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
-		Live: LiveState{OriginMain: StaticProbe(landed)},
+		Live: LiveState{OriginMain: StaticProbe(landed), OriginMainAt: StaticOriginProbe(landed)},
 	}
 	req := Request{Ref: testRef, CandidateSHA: candidate, BaseSHA: base,
 		ReducedProvenance: &ReducedProvenance{PullRequest: 2864, VerifyLanded: true}}
@@ -237,7 +237,7 @@ func followUpFixture(t *testing.T) (*Gate, Request, Request, string) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain:    StaticProbe(advanced),
+			OriginMain: StaticProbe(advanced), OriginMainAt: StaticOriginProbe(advanced),
 			CandidateHead: StaticProbe(candidate),
 			Mergeable:     StaticProbe("CLEAN"),
 			TaskRevision:  StaticProbe(testRevision),
@@ -258,6 +258,7 @@ func followUpFixture(t *testing.T) (*Gate, Request, Request, string) {
 func landFollowUp(t *testing.T, g *Gate, dir, secondCandidate string) {
 	t.Helper()
 	g.Live.OriginMain = StaticProbe(revParse(t, dir, "landed-followup"))
+	g.Live.OriginMainAt = StaticOriginProbe(revParse(t, dir, "landed-followup"))
 	g.Live.CandidateHead = StaticProbe(secondCandidate)
 }
 

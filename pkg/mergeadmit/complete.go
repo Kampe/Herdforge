@@ -54,19 +54,22 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		return nil, fmt.Errorf("herd-merge-completion: admitted verdict carries no verification digest")
 	}
 
-	// Re-read the integration tip AFTER the merge. This is the same live probe
+	// ONE allowance for the whole invocation: the integration-tip read, the
+	// proof, the identity read and every git below share it. Prove() would have
+	// installed a second (review 212), and the tip read ran outside any at all
+	// (review 6c93cc2b) -- an unbounded fetch could hang ahead of every command
+	// this budget governs.
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+
+	// Re-read the integration tip AFTER the merge. This is the same live reading
 	// Admit used to assert the base had not moved; now its whole job is to
-	// report where the merge actually put things.
-	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	// report where the merge actually put things -- and which commit this receipt
+	// will seal, which is why it is charged to the allowance above.
+	landed, err := g.currentOriginMain(ctx, "origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-completion: %w", err)
 	}
-
-	// ONE allowance for the whole invocation: the proof, the identity read and
-	// every git below share it. Prove() would have installed a second, and the
-	// identity read ran outside any (review 212).
-	ctx, cancel := g.gateProofContext()
-	defer cancel()
 
 	proof, err := proveContext(ctx, g.RepoDir, ProofRequest{
 		Mode:         d.Mode,

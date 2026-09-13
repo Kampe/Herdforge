@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -89,7 +90,7 @@ func TestVerifyLandedGateProvesAPinnedRetiredCandidate(t *testing.T) {
 	gate := &mergeadmit.Gate{RepoDir: repo}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
-	proof, err := observeVerifyLanded(repo, gate, req)
+	proof, err := observeVerifyLanded(context.Background(), repo, gate, req)
 	if err != nil {
 		t.Fatalf("a correct retired candidate was refused on the default allowance: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestVerifyLandedGateRefusesAnAbsentPin(t *testing.T) {
 	gate := &mergeadmit.Gate{RepoDir: repo}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: strings.Repeat("0", 40)}
 
-	if _, err := observeVerifyLanded(repo, gate, req); err == nil {
+	if _, err := observeVerifyLanded(context.Background(), repo, gate, req); err == nil {
 		t.Fatal("a candidate absent from this repository was proved landed")
 	}
 	receiptUnsealed(t, repo)
@@ -127,7 +128,7 @@ func TestVerifyLandedGateRefusesANonCommitPin(t *testing.T) {
 	gate := &mergeadmit.Gate{RepoDir: repo}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: tree}
 
-	if _, err := observeVerifyLanded(repo, gate, req); err == nil {
+	if _, err := observeVerifyLanded(context.Background(), repo, gate, req); err == nil {
 		t.Fatal("a tree id was proved landed as a candidate")
 	}
 	receiptUnsealed(t, repo)
@@ -141,7 +142,7 @@ func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
 	gate := &mergeadmit.Gate{RepoDir: repo}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: "   "}
 
-	_, err := observeVerifyLanded(repo, gate, req)
+	_, err := observeVerifyLanded(context.Background(), repo, gate, req)
 	if err == nil {
 		t.Fatal("an empty candidate identity was proved landed")
 	}
@@ -160,7 +161,7 @@ func TestVerifyLandedGateStopsOnAnExhaustedAllowance(t *testing.T) {
 	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: 1}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
-	_, err := observeVerifyLanded(repo, gate, req)
+	_, err := observeVerifyLanded(context.Background(), repo, gate, req)
 	if err == nil {
 		t.Fatal("an exhausted allowance proved a landing")
 	}

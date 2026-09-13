@@ -93,7 +93,7 @@ func TestReconcileSquashStackRequiresExactPASS(t *testing.T) {
 			if pass {
 				verdict(t, l, candidate, "reviewer-a", reviewledger.VerdictPASS)
 			}
-			g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(landed)}}
+			g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(landed), OriginMainAt: StaticOriginProbe(landed)}}
 			receipt, err := g.ReconcileLanded(Request{Ref: testRef, CandidateSHA: candidate, BaseSHA: base, ReducedProvenance: &ReducedProvenance{PullRequest: 758, VerifyLanded: true}})
 			if !pass {
 				if err == nil {

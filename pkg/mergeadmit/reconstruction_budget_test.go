@@ -43,7 +43,7 @@ func reconstructionFixture(t *testing.T) (*Gate, Request, string) {
 	if err := l.Reconstruction(reviewledger.ReconstructionOpts{SHA: rebuilt, CandidateSHA: candidate, ContentProof: "same row reanchored"}); err != nil {
 		t.Fatal(err)
 	}
-	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(rebuilt)}}
+	g := &Gate{RepoDir: dir, Ledger: l, Policy: testPolicy(), Live: LiveState{OriginMain: StaticProbe(rebuilt), OriginMainAt: StaticOriginProbe(rebuilt)}}
 	req := Request{
 		Ref:               testRef,
 		CandidateSHA:      candidate,

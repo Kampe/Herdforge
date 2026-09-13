@@ -52,7 +52,7 @@ func newCompleteFixture(t *testing.T, mode Mode) *completeFixture {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain:    StaticProbe(base), // pre-merge; flipped to landed below
+			OriginMain: StaticProbe(base), OriginMainAt: StaticOriginProbe(base), // pre-merge; flipped to landed below
 			CandidateHead: StaticProbe(candidate),
 			Mergeable:     StaticProbe("CLEAN"),
 			TaskRevision:  StaticProbe(testRevision),
@@ -66,7 +66,10 @@ func newCompleteFixture(t *testing.T, mode Mode) *completeFixture {
 
 // merged flips the live integration tip to post-merge state, which is what the
 // probe would report once the merge has actually happened.
-func (f *completeFixture) merged() { f.gate.Live.OriginMain = StaticProbe(f.landed) }
+func (f *completeFixture) merged() {
+	f.gate.Live.OriginMain = StaticProbe(f.landed)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(f.landed)
+}
 
 // A completed merge must leave behind exactly the receipt pkg/sync.BoardDone
 // demands. Before FAC-156 nothing in production called WriteReceipt at all, so
@@ -250,7 +253,7 @@ func TestCompleteRefusesDecisionForAnotherCandidate(t *testing.T) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain: StaticProbe(base), CandidateHead: StaticProbe(candidateA),
+			OriginMain: StaticProbe(base), OriginMainAt: StaticOriginProbe(base), CandidateHead: StaticProbe(candidateA),
 			Mergeable: StaticProbe("CLEAN"), TaskRevision: StaticProbe(testRevision),
 			Checks: func() (map[string]string, error) { return map[string]string{testCheck: "success"}, nil },
 		},
@@ -258,6 +261,8 @@ func TestCompleteRefusesDecisionForAnotherCandidate(t *testing.T) {
 	reqA := okRequest(base, candidateA)
 	d := mustAdmit(t, g, reqA)
 	g.Live.OriginMain = StaticProbe(landed)
+	g.Live.OriginMainAt = StaticOriginProbe(landed)
+	g.Live.OriginMainAt = StaticOriginProbe(landed)
 
 	// Confirm the fixture: candidate B's own proof is sound, so only the
 	// decision binding can refuse this.
@@ -308,6 +313,8 @@ func TestCompleteRefusesWhenTheProofFails(t *testing.T) {
 	run(t, f.dir, "git", "checkout", "-q", "-B", "elsewhere", f.base)
 	unrelated := commit(t, f.dir, "z.txt", "unrelated\n", "someone else")
 	f.gate.Live.OriginMain = StaticProbe(unrelated)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(unrelated)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(unrelated)
 
 	_, err := f.gate.Complete(d, f.req)
 	if err == nil {
@@ -327,6 +334,8 @@ func TestCompleteRefusesWhenPostMergeProbeFails(t *testing.T) {
 	f := newCompleteFixture(t, ModeMerge)
 	d := mustAdmit(t, f.gate, f.req)
 	f.gate.Live.OriginMain = StaticProbe("")
+	f.gate.Live.OriginMainAt = StaticOriginProbe("")
+	f.gate.Live.OriginMainAt = StaticOriginProbe("")
 
 	if _, err := f.gate.Complete(d, f.req); err == nil {
 		t.Fatal("Complete proceeded on an empty post-merge read")
@@ -379,6 +388,8 @@ func TestCompleteSpendsTheAdmissionExactlyOnce(t *testing.T) {
 	}
 	// Re-admitting the same candidate must now refuse: the admission is spent.
 	f.gate.Live.OriginMain = StaticProbe(f.base)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(f.base)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(f.base)
 	mustRefuse(t, f.gate, f.req, CodeLedgerRefused)
 }
 
@@ -396,7 +407,7 @@ func TestCompleteRefusesEmptyCandidateEndToEnd(t *testing.T) {
 	g := &Gate{
 		RepoDir: dir, Ledger: l, Policy: testPolicy(),
 		Live: LiveState{
-			OriginMain: StaticProbe(base), CandidateHead: StaticProbe(base),
+			OriginMain: StaticProbe(base), OriginMainAt: StaticOriginProbe(base), CandidateHead: StaticProbe(base),
 			Mergeable: StaticProbe("CLEAN"), TaskRevision: StaticProbe(testRevision),
 			Checks: func() (map[string]string, error) { return map[string]string{testCheck: "success"}, nil },
 		},
@@ -422,6 +433,8 @@ func TestFAC601CompletionRemainsBoundAfterTrunkAdvance(t *testing.T) {
 	}
 	later := commit(t, f.dir, "later.txt", "unrelated later main\n", "later main")
 	f.gate.Live.OriginMain = StaticProbe(later)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(later)
+	f.gate.Live.OriginMainAt = StaticOriginProbe(later)
 	resumed, err := f.gate.Complete(d, f.req)
 	if err != nil || resumed.Digest != first.Digest || resumed.MergeSHA != f.candidate {
 		t.Fatalf("resume replaced the recorded merge with new main: %+v %v", resumed, err)

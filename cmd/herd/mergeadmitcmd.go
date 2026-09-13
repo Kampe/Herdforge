@@ -244,7 +244,12 @@ func buildMergeGate(ref, taskID string, prNumber int) (*mergeadmit.Gate, error) 
 		return nil, fmt.Errorf("open review ledger: %w", err)
 	}
 
-	live := mergeadmit.LiveState{OriginMain: originMainProbe(".")}
+	// OriginMainAt is what every receipt proof route uses: the tip read is
+	// charged to that invocation's allowance. OriginMain remains for Admit,
+	// the pre-merge gate, which has no proof context of its own; the resolver
+	// prefers OriginMainAt whenever it is set, so no proof route can fall back
+	// to the unbounded form.
+	live := mergeadmit.LiveState{OriginMain: originMainProbe("."), OriginMainAt: originMainProbeContext(".")}
 	if prNumber > 0 {
 		pr := newPRProbes(prNumber)
 		live.CandidateHead = pr.head
@@ -258,9 +263,33 @@ func buildMergeGate(ref, taskID string, prNumber int) (*mergeadmit.Gate, error) 
 	return &mergeadmit.Gate{RepoDir: ".", Ledger: ledger, Policy: policy, Live: live}, nil
 }
 
-// originMainProbe reports the exact integration tip. It fetches first so the
-// read is CURRENT — a stale remote-tracking ref would let a merge proceed
-// against a base that moved (FAC-94's serial-train invalidation).
+// originMainProbeContext reports the exact integration tip INSIDE the caller's
+// allowance. It fetches first so the read is CURRENT — a stale remote-tracking
+// ref would let a merge proceed against a base that moved (FAC-94's
+// serial-train invalidation).
+//
+// FAC-831 review 6c93cc2b: this reading decides which commit the proof proves
+// and the receipt seals, so it is a proof operation, not checkout hygiene. Both
+// commands now run through the gate's bounded runner: charged to the one
+// ledger, killed by the one deadline, read through the output cap, and started
+// in the owned process group. Before this an unbounded fetch could hang or
+// flood ahead of every budgeted command that followed it.
+func originMainProbeContext(dir string) mergeadmit.OriginProbe {
+	return func(ctx context.Context) (string, error) {
+		git := mergeadmit.BoundedGit(ctx, dir)
+		if _, err := git("fetch", "-q", "origin", "main"); err != nil {
+			return "", fmt.Errorf("fetch origin/main: %w", err)
+		}
+		tip, err := git("rev-parse", "--verify", "-q", "origin/main^{commit}")
+		if err != nil {
+			return "", fmt.Errorf("rev-parse origin/main: %w", err)
+		}
+		return tip, nil
+	}
+}
+
+// originMainProbe is the value-only form, kept for the admission gate, which
+// has no proof context of its own. It is NOT used by any receipt proof route.
 func originMainProbe(dir string) mergeadmit.Probe {
 	return func() (string, error) {
 		if out, err := exec.Command("git", "-C", dir, "fetch", "-q", "origin", "main").CombinedOutput(); err != nil {

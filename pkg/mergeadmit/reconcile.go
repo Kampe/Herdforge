@@ -36,6 +36,16 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 	return g.reconcileLandedContext(ctx, req)
 }
 
+// ReconcileLandedContext is ReconcileLanded inside an allowance the CALLER
+// installed, so a composition that observes, proves, seals and records shares
+// ONE budget across all of it. ensureProofBudget installs only when the context
+// carries none, so this never re-mints and never widens what the caller set.
+func (g *Gate) ReconcileLandedContext(ctx context.Context, req Request) (*hsync.CompletionReceipt, error) {
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
+	return g.reconcileLandedContext(ctx, req)
+}
+
 func (g *Gate) reconcileLandedContext(ctx context.Context, req Request) (*hsync.CompletionReceipt, error) {
 	if g == nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: no gate configured")
@@ -131,7 +141,7 @@ func (g *Gate) reconcileLandedContext(ctx context.Context, req Request) (*hsync.
 		return nil, fmt.Errorf("herd-merge-reconcile: %s: admitted verdict carries no reviewer family", CodeLedgerRefused)
 	}
 
-	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	landed, err := g.currentOriginMain(ctx, "origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}
@@ -246,7 +256,7 @@ func (g *Gate) reconcileLandedReduced(ctx context.Context, req Request) (*hsync.
 			return nil, fmt.Errorf("herd-merge-reconcile: reconstruction current verdict gate refused: %s", readiness.Reason)
 		}
 	}
-	landed, err := g.Live.OriginMain.Read("origin_main_post_merge")
+	landed, err := g.currentOriginMain(ctx, "origin_main_post_merge")
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: %w", err)
 	}

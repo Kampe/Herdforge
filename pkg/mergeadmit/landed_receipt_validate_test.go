@@ -177,7 +177,7 @@ func TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt(t *
 
 	gate := &Gate{
 		RepoDir: dir, Ledger: ledger, Policy: testPolicy(),
-		Live: LiveState{OriginMain: StaticProbe(mergeCommit)},
+		Live: LiveState{OriginMain: StaticProbe(mergeCommit), OriginMainAt: StaticOriginProbe(mergeCommit)},
 	}
 	receipt, err := gate.ReconcileLanded(okRequest(base, candidate))
 	if err != nil {
@@ -205,7 +205,7 @@ func TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAccept
 
 	gate := &Gate{
 		RepoDir: dir, Ledger: ledger, Policy: testPolicy(),
-		Live: LiveState{OriginMain: StaticProbe(mergeCommit)},
+		Live: LiveState{OriginMain: StaticProbe(mergeCommit), OriginMainAt: StaticOriginProbe(mergeCommit)},
 	}
 	request := okRequest(base, candidate)
 	request.ReducedProvenance = &ReducedProvenance{PullRequest: 843, VerifyLanded: true}

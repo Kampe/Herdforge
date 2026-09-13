@@ -1935,12 +1935,41 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 	if err != nil {
 		return fmt.Errorf("receipt reconcile: %w", err)
 	}
-	proof, err := observeVerifyLanded(wtDir, gate, req)
+	return proveSealAndRecordLanded(gate, wtDir, branch, candidate, req)
+}
+
+// proveSealAndRecordLanded is the proof-and-seal COMPOSITION of the
+// verify-landed route, extracted so the ordering contract it carries can be
+// driven directly by a fixture. runHarvestVerifyLanded resolves the surface,
+// the candidate and the request, and then this performs every step that spends
+// the allowance or mutates state.
+func proveSealAndRecordLanded(gate *mergeadmit.Gate, wtDir, branch, candidate string, req mergeadmit.Request) error {
+	// ONE allowance for this ENTIRE invocation: the worktree status read, the
+	// integration-tip fetch and rev-parse, the landing proof, the identity read,
+	// the ancestry and replay, and the seal. Each public entry used to mint its
+	// own, so a single `harvest-merge --verify-landed` could spend several full
+	// budgets and prove the same landing twice (FAC-831 review 6c93cc2b).
+	ctx, cancel := gate.ProofContext()
+	defer cancel()
+
+	proof, err := observeVerifyLanded(ctx, wtDir, gate, req)
 	if err != nil {
 		return fmt.Errorf("LANDING UNPROVEN — %w", err)
 	}
 	fmt.Printf("herd harvest-merge: LANDED — %s candidate %s as %s (%s)\n", branch, candidate, proof.MergeSHA, proof.Method)
-	// Content observation is separate from the review/receipt authority below.
+
+	// THE SEAL COMES BEFORE THE DISPOSITION, and that order is the contract.
+	// One shared allowance alone does not prevent a partial mutation: observation
+	// can succeed, the disposition can be written, and the reconcile proof can
+	// then exhaust, leaving a recorded landing for a receipt that was never
+	// minted. Nothing reads the disposition on this path, so writing it after the
+	// receipt costs nothing and makes exhaustion at ANY stage leave neither.
+	receipt, err := gate.ReconcileLandedContext(ctx, req)
+	if err != nil {
+		return fmt.Errorf("receipt reconcile: %w", err)
+	}
+
+	// Content observation is separate from the review/receipt authority above.
 	if rec, err := hsync.WriteLandedDisposition(".", hsync.LandedDisposition{
 		Ref: req.Ref, CandidateSHA: candidate, MergeSHA: proof.MergeSHA,
 		Branch: branch, Method: proof.Method,
@@ -1948,11 +1977,6 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 		return fmt.Errorf("landed disposition: %w", err)
 	} else {
 		fmt.Printf("herd harvest-merge: DISPOSITION — %s (%s)\n", rec.Ref, rec.Method)
-	}
-
-	receipt, err := gate.ReconcileLanded(req)
-	if err != nil {
-		return fmt.Errorf("receipt reconcile: %w", err)
 	}
 	fmt.Printf("herd harvest-merge: RECEIPT — %s candidate %s landed as %s\n  receipt %s at %s\n",
 		receipt.TaskRef, shortSHA12(receipt.CandidateSHA), shortSHA12(receipt.MergeSHA),

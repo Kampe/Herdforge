@@ -27,6 +27,20 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 	return g.proveLandedContext(ctx, req, landed)
 }
 
+// ProveLandedContext is ProveLanded inside an allowance the CALLER installed.
+//
+// FAC-831 review 6c93cc2b: the `harvest-merge --verify-landed` route proved a
+// landing, wrote a disposition, then reconciled -- and each public entry minted
+// its own budget, so one CLI invocation could spend several full allowances and
+// prove the same landing twice. A caller that owns the whole operation passes
+// its context here and to ReconcileLandedContext, and the two share one ledger,
+// one deadline and one output budget.
+func (g *Gate) ProveLandedContext(ctx context.Context, req Request, landed string) (*Proof, error) {
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
+	return g.proveLandedContext(ctx, req, landed)
+}
+
 // proveLandedContext is ProveLanded inside an allowance the CALLER already
 // installed, so a public entry that also seals a receipt spends ONE budget
 // across proof, identity and every follow-up read instead of resetting.

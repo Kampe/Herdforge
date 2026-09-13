@@ -262,6 +262,18 @@ func (g *Gate) gateProofContext() (context.Context, context.CancelFunc) {
 	return withProofBudget(context.Background(), budget)
 }
 
+// ProofContext installs THE allowance for one caller-owned operation and
+// returns it with the cancel that releases it.
+//
+// This is what makes a composition possible from outside the package: the CLI
+// route that observes a landing, proves it, seals a receipt and records a
+// disposition creates one of these and passes it to every entry, so the whole
+// invocation shares one deadline, one command ledger, one output cap and one
+// owned process group instead of minting a fresh budget per public call.
+func (g *Gate) ProofContext() (context.Context, context.CancelFunc) {
+	return g.gateProofContext()
+}
+
 // boundedGit is the runner handed to leaf packages so their reads are charged
 // against THIS invocation's allowance. It carries the repository directory, so
 // a leaf never chooses it, and it adds no error text, so a budget or
@@ -270,6 +282,18 @@ func boundedGit(ctx context.Context, repoDir string) func(args ...string) (strin
 	return func(args ...string) (string, error) {
 		return gitOut(ctx, repoDir, args...)
 	}
+}
+
+// BoundedGit is the runner a CALLER outside this package uses to spend THIS
+// invocation's allowance instead of re-implementing bounds.
+//
+// The CLI's integration-tip probe uses it: its fetch and rev-parse are then
+// charged to the same ledger, killed by the same deadline, read through the
+// same output cap and run in the same owned process group as every other proof
+// command. Exporting the runner is deliberate -- the alternative is a second
+// definition of "bounded git" in cmd/herd, which is how the two drift.
+func BoundedGit(ctx context.Context, repoDir string) func(args ...string) (string, error) {
+	return boundedGit(ctx, repoDir)
 }
 
 // repositoryIdentity reads the origin binding inside the shared allowance.

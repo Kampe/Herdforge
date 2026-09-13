@@ -73,7 +73,7 @@ func okGate(t *testing.T, l *reviewledger.Ledger, base, head string) *Gate {
 		Ledger:  l,
 		Policy:  testPolicy(),
 		Live: LiveState{
-			OriginMain:    StaticProbe(base),
+			OriginMain: StaticProbe(base), OriginMainAt: StaticOriginProbe(base),
 			CandidateHead: StaticProbe(head),
 			Mergeable:     StaticProbe("CLEAN"),
 			TaskRevision:  StaticProbe(testRevision),
@@ -362,6 +362,8 @@ func TestAdmitRefusesWhenLiveStateAdvanced(t *testing.T) {
 	t.Run("origin main advanced", func(t *testing.T) {
 		g, req := newFixture(t)
 		g.Live.OriginMain = StaticProbe("9907722000000000000000000000000000000000")
+		g.Live.OriginMainAt = StaticOriginProbe("9907722000000000000000000000000000000000")
+		g.Live.OriginMainAt = StaticOriginProbe("9907722000000000000000000000000000000000")
 		d := mustRefuse(t, g, req, CodeBaseAdvanced)
 		if _, err := g.Admit(req); !errors.Is(err, ErrRestartAdmission) {
 			t.Fatal("a base advance must be signalled as restart-admission, not as a candidate defect")
@@ -544,7 +546,7 @@ func TestAdmitRequiredFieldsFailClosed(t *testing.T) {
 // No ledger means no verdict, and no verdict is not a PASS.
 func TestAdmitWithoutLedgerRefuses(t *testing.T) {
 	g := &Gate{RepoDir: t.TempDir(), Policy: testPolicy(), Live: LiveState{
-		OriginMain: StaticProbe(shaBase), CandidateHead: StaticProbe(shaCurrent),
+		OriginMain: StaticProbe(shaBase), OriginMainAt: StaticOriginProbe(shaBase), CandidateHead: StaticProbe(shaCurrent),
 		Mergeable: StaticProbe("CLEAN"), TaskRevision: StaticProbe(testRevision),
 		Checks: func() (map[string]string, error) { return map[string]string{testCheck: "success"}, nil },
 	}}
