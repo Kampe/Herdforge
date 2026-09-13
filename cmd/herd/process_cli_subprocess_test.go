@@ -242,7 +242,15 @@ func TestProcessCLIHealthyPopulatedFleet(t *testing.T) {
 // This is the case that must stay distinguishable from a broken roster.
 func TestProcessCLIEmptyFleetSucceedsWithoutReadingAnyPane(t *testing.T) {
 	dir := t.TempDir()
-	env, logPath := installProcessFake(t, `{"result":{"agents":[]}}`, "healthy")
+	// The roster carries native identity, because herdr 0.9.0's contract is
+	// {id, result} and a reply without an id never proved it came from herdr.
+	// This fixture used to omit it, which made the POSITIVE empty-fleet case
+	// indistinguishable from the id-less roster that
+	// TestProcessCLIUnidentifiedEmptyRosterIsNotACleanFleet asserts must be
+	// refused: the sweep was right to report partial and exit 1, and the
+	// fixture was what was wrong. The id-less form stays exactly where it
+	// belongs, in that negative table.
+	env, logPath := installProcessFake(t, `{"id":1,"result":{"agents":[]}}`, "healthy")
 	out, err := runHerd(t, dir, env, "process", "--json", "--workspace", fakeProcessWorkspace)
 	if err != nil {
 		t.Fatalf("an empty fleet must succeed: %v\n%s", err, out)
