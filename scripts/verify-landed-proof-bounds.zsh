@@ -135,6 +135,8 @@ sources=(
 	pkg/mergeadmit/proof.go
 	pkg/mergeadmit/squash_landing.go
 	pkg/mergeadmit/reconcile.go
+	pkg/mergeadmit/complete.go
+	pkg/mergeadmit/reconstruction.go
 )
 
 # An EMPTY source set is not "nothing to protect": it is a driver that would run
@@ -162,7 +164,7 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget|TestGitOutBytesIsTheChargingBoundaryForGitReads|TestStablePatchIDChargesItsOwnCommand|TestAncestorProvenChargesItsOwnCommand|TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable|TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal|TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry|TestPublicProveMergeModeSucceedsOnTheDefaultBudget|TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation|TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing|TestCompletePublicEntrySucceedsOnTheDefaultAllowance|TestReconcileLandedPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedPublicEntrySucceedsOnTheDefaultAllowance|TestReconcileLandedReducedPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedReducedPublicEntrySucceedsOnTheDefaultAllowance|TestFollowUpPublicEntryStopsOnTheSharedAllowance)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget TestGitOutBytesIsTheChargingBoundaryForGitReads TestStablePatchIDChargesItsOwnCommand TestAncestorProvenChargesItsOwnCommand TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry TestPublicProveMergeModeSucceedsOnTheDefaultBudget TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing TestCompletePublicEntrySucceedsOnTheDefaultAllowance TestReconcileLandedPublicEntryStopsOnTheSharedAllowance TestReconcileLandedPublicEntrySucceedsOnTheDefaultAllowance TestReconcileLandedReducedPublicEntryStopsOnTheSharedAllowance TestReconcileLandedReducedPublicEntrySucceedsOnTheDefaultAllowance TestFollowUpPublicEntryStopsOnTheSharedAllowance"
+"./pkg/mergeadmit/${sep}^(TestProofCommandBudgetRefusesInsteadOfRunningUnbounded|TestProofRangeBudgetRefusesAnOversizedRange|TestProofOutputBudgetRefusesOversizedCommandOutput|TestProofDeadlineIsSharedAndRefusesExpired|TestProofDefaultBudgetStillProvesAnOrdinaryLanding|TestEnsureProofBudgetInstallsOnceAndNeverReplaces|TestProofLedgerRefusesPastItsAllowance|TestBoundedBufferRefusesRatherThanTruncating|TestProofBudgetSurvivesRevisionResolution|TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse|TestReplayTreeContextCarriesAnAllowance|TestGitrootReplayRefusesNilRunnerAndEmptyIdentities|TestGateProveLandedCarriesItsInjectedBudget|TestGateProveLandedSucceedsOnTheDefaultBudget|TestGitOutBytesIsTheChargingBoundaryForGitReads|TestStablePatchIDChargesItsOwnCommand|TestAncestorProvenChargesItsOwnCommand|TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable|TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal|TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry|TestPublicProveMergeModeSucceedsOnTheDefaultBudget|TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation|TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing|TestCompletePublicEntrySucceedsOnTheDefaultAllowance|TestReconcileLandedPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedPublicEntrySucceedsOnTheDefaultAllowance|TestReconcileLandedReducedPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedReducedPublicEntrySucceedsOnTheDefaultAllowance|TestFollowUpPublicEntryStopsOnTheSharedAllowance|TestReconcileLandedReconstructionSucceedsOnTheDefaultAllowance|TestReconcileLandedReconstructionAncestrySpendsTheSharedAllowance)\$${sep}TestProofCommandBudgetRefusesInsteadOfRunningUnbounded TestProofRangeBudgetRefusesAnOversizedRange TestProofOutputBudgetRefusesOversizedCommandOutput TestProofDeadlineIsSharedAndRefusesExpired TestProofDefaultBudgetStillProvesAnOrdinaryLanding TestEnsureProofBudgetInstallsOnceAndNeverReplaces TestProofLedgerRefusesPastItsAllowance TestBoundedBufferRefusesRatherThanTruncating TestProofBudgetSurvivesRevisionResolution TestContentPreservedAtAbortsOnBudgetRatherThanAnsweringFalse TestReplayTreeContextCarriesAnAllowance TestGitrootReplayRefusesNilRunnerAndEmptyIdentities TestGateProveLandedCarriesItsInjectedBudget TestGateProveLandedSucceedsOnTheDefaultBudget TestGitOutBytesIsTheChargingBoundaryForGitReads TestStablePatchIDChargesItsOwnCommand TestAncestorProvenChargesItsOwnCommand TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry TestPublicProveMergeModeSucceedsOnTheDefaultBudget TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing TestCompletePublicEntrySucceedsOnTheDefaultAllowance TestReconcileLandedPublicEntryStopsOnTheSharedAllowance TestReconcileLandedPublicEntrySucceedsOnTheDefaultAllowance TestReconcileLandedReducedPublicEntryStopsOnTheSharedAllowance TestReconcileLandedReducedPublicEntrySucceedsOnTheDefaultAllowance TestFollowUpPublicEntryStopsOnTheSharedAllowance TestReconcileLandedReconstructionSucceedsOnTheDefaultAllowance TestReconcileLandedReconstructionAncestrySpendsTheSharedAllowance"
 )
 
 # ---------------------------------------------------------------------------
@@ -236,6 +238,23 @@ suites=(
 #                          validatePriorReceipt -- and a two-site anchor is a
 #                          control that cannot be applied.
 #
+#   complete-installs-second-budget
+#                          the public Complete entry spends THIS invocation's
+#                          allowance. The mutant takes a throwaway gate's instead,
+#                          which is a DEFAULT budget, so an injected allowance of
+#                          one is ignored and Complete seals anyway. Import-free
+#                          on purpose: complete.go does not import context, and a
+#                          mutant that does not build is BROKEN-RUN, not a kill.
+#   reconstruction-ancestry-unbounded
+#                          the reconstruction ancestry probes are charged to the
+#                          shared allowance rather than run on a fresh context.
+#                          Its killer does not hardcode a command count: it
+#                          sweeps the allowance upward and stops at the first one
+#                          whose refusal names the path-set read, so the boundary
+#                          IS the number of commands charged before that stage.
+#                          Correct source gives 2 (both probes charged); the
+#                          mutant gives 1. Derived, not assumed.
+#
 # id | source | test package | anchor | replacement | killer | required assertion
 # ---------------------------------------------------------------------------
 mutations=(
@@ -257,9 +276,9 @@ mutations=(
 				return nil, fmt.Errorf(\"%w: %s..%s holds more than %d commits\",
 					ErrProofBudgetRange, short(base), short(tip), maxCommits)
 			}${sep}			_ = maxCommits // MUTANT: the range is materialised without a bound${sep}TestProofRangeBudgetRefusesAnOversizedRange${sep}materialised a four-commit range"
-"entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	// per-command output bytes and range size.
-	ctx, cancel := g.gateProofContext()${sep}	// per-command output bytes and range size.
-	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: the entry path loses its allowance${sep}TestGateProveLandedCarriesItsInjectedBudget${sep}ignored its injected allowance and proved a landing"
+"entry-path-unbounded-again${sep}pkg/mergeadmit/squash_landing.go${sep}./pkg/mergeadmit/${sep}	// used to be checked here has been dropped.
+	ctx, cancel := g.gateProofContext()${sep}	// used to be checked here has been dropped.
+	ctx, cancel := (&Gate{}).gateProofContext() // MUTANT: the entry spends a throwaway gate allowance, not this invocation${sep}TestGateProveLandedCarriesItsInjectedBudget${sep}ignored its injected allowance and proved a landing"
 # ONE control, not two. An earlier revision split this into a passthrough mutant
 # and a %w mutant; NEITHER could kill, because each half alone still lets
 # errors.Is reach the sentinel through the other. Only restoring the original
@@ -273,7 +292,9 @@ mutations=(
 "ancestry-absence-vs-refusal${sep}pkg/mergeadmit/proof_bounds.go${sep}./pkg/mergeadmit/${sep}	if !proven {${sep}	if false && !proven { // MUTANT: absence and refusal conflated${sep}TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal${sep}a non-ancestor was accepted"
 "reconcile-installs-second-budget${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}	// those previously installed its own or ran outside any (review 212).
 	ctx, cancel := g.gateProofContext()${sep}	// those previously installed its own or ran outside any (review 212).
-	ctx, cancel := context.WithCancel(context.Background()) // MUTANT: ReconcileLanded takes no allowance${sep}TestReconcileLandedPublicEntryStopsOnTheSharedAllowance${sep}ReconcileLanded sealed a receipt on an exhausted allowance"
+	ctx, cancel := (&Gate{}).gateProofContext() // MUTANT: ReconcileLanded spends a throwaway gate allowance, not this invocation${sep}TestReconcileLandedPublicEntryStopsOnTheSharedAllowance${sep}ReconcileLanded sealed a receipt on an exhausted allowance"
+"complete-installs-second-budget${sep}pkg/mergeadmit/complete.go${sep}./pkg/mergeadmit/${sep}	ctx, cancel := g.gateProofContext()${sep}	ctx, cancel := (\&Gate{}).gateProofContext() // MUTANT: Complete spends a throwaway gate allowance, not this invocation${sep}TestCompletePublicEntryStopsOnTheSharedAllowanceBeforeSealing${sep}Complete sealed a receipt on an exhausted allowance"
+"reconstruction-ancestry-unbounded${sep}pkg/mergeadmit/reconstruction.go${sep}./pkg/mergeadmit/${sep}		if err := requireAncestorBounded(ctx, g.RepoDir, pair[0], pair[1], \"reconstruction base\"); err != nil {${sep}		if err := requireAncestorBounded(context.Background(), g.RepoDir, pair[0], pair[1], \"reconstruction base\"); err != nil { // MUTANT: reconstruction ancestry runs outside the shared allowance${sep}TestReconcileLandedReconstructionAncestrySpendsTheSharedAllowance${sep}the reconstruction ancestry probes did not spend the shared allowance:"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from
