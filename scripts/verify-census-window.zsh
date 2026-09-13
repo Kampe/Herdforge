@@ -267,14 +267,38 @@ restore_source() {
 # rather than a bare `false`, or an explicit `_ =` -- because a mutant that
 # leaves an identifier unused does not compile, and a control that cannot build
 # proves nothing.
+#
+# Two assertions were narrowed after CI 34736769975 showed them landing on an
+# EARLIER failure than the one anchored. Both earlier failures are strictly more
+# causal than what they replaced, so the claims were tightened rather than the
+# checks loosened:
+#
+#   examination-covers-whole-ring was anchored to the lease-read order, but the
+#   oracle fails first on a DEFERRED lane that came back carrying a real probe
+#   reason. That is the same defect stated closer to its cause: widening the
+#   examination loop does not merely read extra evidence, it overwrites the
+#   fail-closed deferral the window had already applied. The anchor now includes
+#   the observed reason, git_status_unavailable, so this control cannot be
+#   satisfied by the neighbouring unselected-lanes-not-deferred mutant, which
+#   reaches the same assertion with no reason at all.
+#
+#   cancelled-sweep-is-not-truncated was anchored to the cursor advance, but the
+#   oracle fails first on a lane the cancelled sweep should never have touched
+#   coming back with merge_state_unavailable. Again closer to the cause: the
+#   cursor is only wrong because the lane was examined. The observed reason is
+#   part of the anchor for the same reason as above.
+#
+# Neither narrowing removes a check: both oracles still assert everything they
+# did before, including the lease-read order and the cursor advance, and a
+# regression in those still fails the baseline.
 sep=$'\x1f'
 mutations=(
 "population-probes-whole-ring${sep}${census_src}${sep}			if windowActive {${sep}			if false && windowActive { // MUTANT: the population batch pays for every lane${sep}TestRegisteredCensusWindowBoundsExpensiveOpsAndQualifiesSelected${sep}process probe reached unselected lane"
 "unselected-lanes-not-deferred${sep}${census_src}${sep}				lanes[i].State, lanes[i].PreserveReason = LaneUnknown, \"census_window_deferred\"${sep}				_ = i // MUTANT: unselected lanes are not preserved fail-closed${sep}TestRegisteredCensusWindowBoundsExpensiveOpsAndQualifiesSelected${sep}must be preserved as census_window_deferred unknown"
-"examination-covers-whole-ring${sep}${census_src}${sep}		for offset := 0; offset < windowLimit; offset++ {${sep}		for offset := 0; offset < len(lanes); offset++ { // MUTANT: every lane pays for evidence${sep}TestRegisteredCensusWindowBoundsExpensiveOpsAndQualifiesSelected${sep}lease evidence must be read for exactly the selected lanes in order"
+"examination-covers-whole-ring${sep}${census_src}${sep}		for offset := 0; offset < windowLimit; offset++ {${sep}		for offset := 0; offset < len(lanes); offset++ { // MUTANT: every lane pays for evidence${sep}TestRegisteredCensusWindowBoundsExpensiveOpsAndQualifiesSelected${sep}must be preserved as census_window_deferred unknown, got state=unknown reason=\\\"git_status_unavailable\\\""
 "window-never-rotates${sep}${census_src}${sep}		next := (windowStart + accounted) % len(lanes)${sep}		next := windowStart % len(lanes) // MUTANT: the cursor never leaves this window${sep}TestRegisteredCensusWindowRotatesToNextSlice${sep}first sweep must advance the cursor to 2"
 "cursor-never-accounts-examination${sep}${census_src}${sep}		accounted++${sep}		_ = pos // MUTANT: examination is never accounted${sep}TestRegisteredCensusWindowAdvancesWhenEverySelectedLaneIsUnproven${sep}a fully unproven window must still advance by its width"
-"cancelled-sweep-is-not-truncated${sep}${census_src}${sep}		if windowActive && ctx.Err() != nil {${sep}		if false && windowActive && ctx.Err() != nil { // MUTANT: cancellation no longer truncates the window${sep}TestRegisteredCensusWindowCancellationLeavesUnexaminedLaneForNextSweep${sep}cursor must advance by the one examined lane only"
+"cancelled-sweep-is-not-truncated${sep}${census_src}${sep}		if windowActive && ctx.Err() != nil {${sep}		if false && windowActive && ctx.Err() != nil { // MUTANT: cancellation no longer truncates the window${sep}TestRegisteredCensusWindowCancellationLeavesUnexaminedLaneForNextSweep${sep}must be unknown/census_budget_exhausted, got state=unknown reason=\\\"merge_state_unavailable\\\""
 "deferred-lane-pays-allocation-walk${sep}${governor_src}${sep}		if lanes[i].PreserveReason == \"census_window_deferred\" {${sep}		if false && lanes[i].PreserveReason == \"census_window_deferred\" { // MUTANT: deferred lanes walk the allocation tree${sep}TestGovernorCensusStageCountsDeferredAndUnknownLanes${sep}paid for the allocation walk"
 "deferral-is-not-counted${sep}${governor_src}${sep}		if lanes[i].State == LaneUnknown {${sep}		if false && lanes[i].State == LaneUnknown { // MUTANT: unknown lanes are not counted as deferred${sep}TestGovernorCensusStageCountsDeferredAndUnknownLanes${sep}lanes left unknown"
 "broken-cursor-is-invisible${sep}${governor_src}${sep}	listStage.CursorError = g.registeredCursorPersistErr${sep}	_ = g.registeredCursorPersistErr // MUTANT: a failed cursor advance is hidden${sep}TestGovernorCensusCursorWriteFailureIsVisibleAndChangesNoLane${sep}a failed cursor advance must surface as a partial diagnostic on the stage"
