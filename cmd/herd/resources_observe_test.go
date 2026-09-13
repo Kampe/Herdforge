@@ -279,10 +279,36 @@ func TestRunResourcesRejectsFlagsTheModeCannotHonour(t *testing.T) {
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("HERD_STATE_DIR", t.TempDir())
+			// Bound the test against its own subject. If the refusal under
+			// test is ever absent, this must still finish and report the
+			// NAMED failure: previously it fell through to a real foreground
+			// observer with default bounds and ran to the package timeout,
+			// which is not a kill and proves nothing. The stubs also make the
+			// no-side-effect claim direct rather than inferred -- a refused
+			// invocation must start no job at all.
+			started := make([]string, 0, 2)
+			restoreObserver := runResourcesObserverFn
+			restoreStatus := runResourcesObserverStatusFn
+			t.Cleanup(func() {
+				runResourcesObserverFn = restoreObserver
+				runResourcesObserverStatusFn = restoreStatus
+			})
+			runResourcesObserverFn = func(observerFlags) int {
+				started = append(started, "watch")
+				return 0
+			}
+			runResourcesObserverStatusFn = func(bool) int {
+				started = append(started, "observer-status")
+				return 0
+			}
+
 			var stdout, stderr bytes.Buffer
 			code := runResourcesWithArgs(args, &stdout, &stderr)
 			if code != 2 {
 				t.Fatalf("%s exited %d, want 2: an unsupported mix must be refused, never ignored", name, code)
+			}
+			if len(started) != 0 {
+				t.Fatalf("%s started %v despite being refused; a rejected invocation must dispatch no job", name, started)
 			}
 			// No sampling and no observer side effect may have happened: the
 			// refusal is decided before any observation.

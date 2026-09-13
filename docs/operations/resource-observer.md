@@ -83,7 +83,9 @@ lock, and the observer never holds that lock for its lifetime.
 ## Verification
 
 `scripts/verify-resource-observer.zsh` is the non-vacuity driver, wired into CI,
-carrying twelve controls.
+carrying thirteen controls: twelve over the observer package and one over the
+`herd resources` mode dispatch, which has its own baseline because it lives in
+`cmd/herd`.
 It runs the observer suites as baselines, then mutates the real production
 source one guard at a time. A mutant counts as killed only when it **compiles**,
 the run exits **non-zero**, the **named** killer test emits a failure, and that
