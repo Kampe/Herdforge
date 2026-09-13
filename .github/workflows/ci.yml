@@ -287,6 +287,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-764: `herd pool release` from the orchestrator's working directory
+      # failed with "cannot change to '.herd/pool/pool-01'" while the identical
+      # release from the canonical checkout succeeded. The stored slot path is
+      # deliberately repository-relative, and ordinary Release handed it to
+      # `git -C`, which resolves against the CALLER's working directory — so
+      # wherever that relative path existed under the caller, the wrong tree was
+      # reset. This driver removes each anchoring and ownership guard from the
+      # real source and requires the named oracle to die on its named assertion.
+      - name: FAC-764 pool owning-root anchoring controls
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-pool-owning-root.zsh
+
+      # Hidden directory: without these settings the run reports green while
+      # retaining none of the baseline, compile, mutant or restored evidence it
+      # claims. Restricted to run-*, so only this driver's own logs upload.
+      - name: Upload pool owning-root control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-pool-owning-root-logs
+          path: .verify-pool-owning-root-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # FAC-830: the cross-process single-flight test failed on main under one
       # specific shuffle order. This replays that exact seed a bounded number of
       # times, so an order- or contention-sensitive test fails here rather than
