@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -49,16 +48,28 @@ var errRetiredCarrierUnpinned = fmt.Errorf(
 // resolveVerifyLandedSurface picks the directory the landing proof is observed
 // in, and refuses rather than guessing.
 //
-// A live carrier is used exactly as before — this changes nothing for it, and
-// its dirty/active protection is unchanged. Only when NO worktree carries the
-// branch does the invoking checkout stand in, and then only after:
+// This is SELECTION ONLY. It runs no git and proves nothing about the
+// repository it returns. A live carrier is used exactly as before — this
+// changes nothing for it, and its dirty/active protection is unchanged. Only
+// when NO worktree carries the branch does the invoking checkout stand in, and
+// then only when the candidate is PINNED, by an explicit --candidate or by the
+// ref's current admitted PASS. The branch head is never consulted, because for
+// a retired carrier it either does not exist or has moved on.
 //
-//  1. the candidate is PINNED, by an explicit --candidate or by the ref's
-//     current admitted PASS. The branch head is never consulted, because for a
-//     retired carrier it either does not exist or has moved on;
-//  2. the pinned candidate object is PRESENT in the invoking repository, which
-//     is what makes it the right repository rather than a foreign one that
-//     happens to be the working directory.
+// Selecting a surface authorises NOTHING on its own. Whether the invoking
+// repository actually holds the pinned object, and whether that object is a
+// commit at all, is proved by the bounded gate proof downstream:
+// ProveEquivalentLandedContext resolves every identity with
+// `rev-parse --verify -q <sha>^{commit}` inside the ONE allowance the public
+// entry installs, using the package's owned process group. That proof runs
+// before the landed disposition is written and before any receipt is sealed.
+//
+// PR843/3d645a26: this function used to run its own `git cat-file -t` through
+// exec.Command — outside that process group, deadline, command budget and
+// output budget, and against the PINNED sha, which is not necessarily the sha
+// the proof then used. The check has not been dropped; it has moved to the one
+// place that checks the object actually being proved, under the allowance.
+// requirePinnedCandidateProved below closes the gap between the two.
 //
 // The dirty refusal still runs downstream, against the surface actually used.
 func resolveVerifyLandedSurface(branch string, binding verifyLandedBinding, lookup func(string) string, invokerRoot func() (string, error)) (verifyLandedSurface, error) {
@@ -75,14 +86,33 @@ func resolveVerifyLandedSurface(branch string, binding verifyLandedBinding, look
 	if err != nil {
 		return verifyLandedSurface{}, fmt.Errorf("resolve invoking repository root: %w", err)
 	}
-	if err := requireObjectPresent(root, pinned); err != nil {
-		return verifyLandedSurface{}, fmt.Errorf(
-			"carrier retired and the pinned candidate %s is not present in the invoking repository: %w. "+
-				"Run this from the repository the candidate was reviewed in; a landing cannot be proved "+
-				"against a repository that does not hold the reviewed object",
-			shortSHA12(pinned), err)
-	}
 	return verifyLandedSurface{Dir: root, CarrierRetired: true, PinnedCandidate: pinned}, nil
+}
+
+// requirePinnedCandidateProved refuses when a retired-carrier fallback was
+// authorised by one identity and the proof would then be run against another.
+//
+// The fallback's whole justification is that the PINNED candidate ties the
+// invoking checkout to the reviewed work. If the request carries a different
+// candidate — an admission record for the ref can hold one — then the identity
+// that authorised standing in is not the identity being proved, and the pin has
+// authorised nothing. Refuse instead of proving the wrong object in a surface
+// that was never justified for it.
+//
+// This runs no git: it compares the two identities the caller already holds.
+func requirePinnedCandidateProved(surface verifyLandedSurface, candidate string) error {
+	if !surface.CarrierRetired {
+		return nil
+	}
+	got, want := strings.TrimSpace(candidate), strings.TrimSpace(surface.PinnedCandidate)
+	if got != want {
+		return fmt.Errorf(
+			"carrier retired: the invoking checkout was authorised as a proof surface by pinned candidate %s, "+
+				"but the request would prove %s. Re-run with --candidate %s, or resolve the admission record "+
+				"that names the other object; a pin authorises only the object it names",
+			shortSHA12(want), shortSHA12(got), shortSHA12(want))
+	}
+	return nil
 }
 
 // pinnedCandidateFor returns the candidate identity that may authorise a
@@ -101,27 +131,6 @@ func pinnedCandidateFor(binding verifyLandedBinding) string {
 		return ""
 	}
 	return strings.TrimSpace(ev.CandidateSHA)
-}
-
-// requireObjectPresent proves the repository actually holds the object, so a
-// foreign checkout cannot stand in for the reviewed one.
-func requireObjectPresent(repoDir, sha string) error {
-	// An empty identity is refused BEFORE any command. `git cat-file -t ""`
-	// spends a subprocess to answer "Not a valid object name" and reports it
-	// with a blank SHA, which reads as a repository problem rather than the
-	// missing pin it actually is. Seen in CI 34742740503 m03, where removing
-	// the pin guard let an empty candidate reach here.
-	if strings.TrimSpace(sha) == "" {
-		return fmt.Errorf("no candidate identity to look up")
-	}
-	out, err := exec.Command("git", "-C", repoDir, "cat-file", "-t", sha).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git cat-file -t %s: %s", shortSHA12(sha), strings.TrimSpace(string(out)))
-	}
-	if got := strings.TrimSpace(string(out)); got != "commit" {
-		return fmt.Errorf("object %s is a %s, not a commit", shortSHA12(sha), got)
-	}
-	return nil
 }
 
 // invokingRepoRoot is the production proof surface when the carrier is gone.
