@@ -73,7 +73,22 @@ func runPoolReview(ref string) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
-	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	// The selected repository root is resolved to an ABSOLUTE runtime path
+	// before anything is built from it.
+	//
+	// firstEnv falls back to "." and HERD_ROOT may itself be relative. A
+	// non-dot relative root broke downstream: the anchored default became
+	// "repo/.herd/pool", Pool persisted slot paths composed from that spelling,
+	// and repoPath then joined the persisted "repo/.herd/pool/pool-01" onto a
+	// canonical repository root that ALREADY ended in "repo" — resolving to
+	// repo/repo/.herd/pool/pool-01. "." happened to work and an absolute root
+	// happened to work; everything between them did not. Resolving once here
+	// removes the class rather than the instance, and a root that cannot be
+	// resolved refuses instead of being guessed at.
+	root, err := filepath.Abs(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
 	// The roots the caller did not name belong to THIS repository, not to
 	// whatever directory the process happens to be in.
 	anchorDefaultReviewRoots(fs, opts, root)
@@ -1399,9 +1414,6 @@ func (o *poolReviewOptions) Validate() error {
 	return nil
 }
 
-// registerPoolReviewFlags registers the complete pool option schema on fs.
-// Callers that only need the command line accepted may discard the result.
-
 // anchorDefaultReviewRoots points the review roots at the OWNING repository
 // when the caller did not name them.
 //
@@ -1441,6 +1453,9 @@ func anchorDefaultReviewRoots(fs *flag.FlagSet, opts *poolReviewOptions, root st
 		}
 	}
 }
+
+// registerPoolReviewFlags registers the complete pool option schema on fs.
+// Callers that only need the command line accepted may discard the result.
 func registerPoolReviewFlags(fs *flag.FlagSet) *poolReviewOptions {
 	return &poolReviewOptions{
 		Pool:     fs.Bool("pool", false, "Select the warm-pool review path"),

@@ -46,7 +46,7 @@ pool_src=cmd/herd/review_pool.go
 worktree_pkg=./cmd/herd/
 
 pool_run='TestPinnedCandidateAndBase|TestNeedsCandidateDirectory|TestUnpinnedBaseStillPrepares|TestExistingCandidateWorktree|TestRepeatedPinnedResolution|TestUnresolvableCandidate'
-pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier TestUnnamedReviewRootsAnchorToTheRepository TestNamedReviewRootsAreLeftExactlyAsGiven'
+pool_expect='TestPinnedCandidateAndBaseAllocateNoCarrier TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead TestUnpinnedBaseStillPreparesTheCandidateCarrier TestExistingCandidateWorktreeIsStillUsedWhenNothingMayBePrepared TestRepeatedPinnedResolutionStaysAllocationFree TestUnresolvableCandidateAllocatesNothingAndRefuses TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier TestPoolNoLaunchEntryRetryLeavesNoCarrier TestPoolNoLaunchEntryFailureLeavesNoCarrier TestUnnamedReviewRootsAnchorToTheRepository TestNamedReviewRootsAreLeftExactlyAsGiven TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot'
 
 go_timeout=${VERIFY_CARRIER_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
@@ -248,7 +248,14 @@ controls=(
 "entry-allocates-no-redundant-carrier${sep}${pool_src}${sep}${worktree_pkg}${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
 		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
 		true) // MUTANT: the production entry allocates unconditionally, as it did before${sep}TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier${sep}no-launch preparation left an unowned carrier"
-"review-roots-anchor-to-the-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}			*anchor.target = filepath.Join(root, ".herd", anchor.segment)${sep}			*anchor.target = filepath.Join(".herd", anchor.segment) // MUTANT: the default resolves against the caller again${sep}TestUnnamedReviewRootsAnchorToTheRepository${sep}want the repository-anchored"
+"review-roots-anchor-to-the-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}			*anchor.target = filepath.Join(root, \".herd\", anchor.segment)${sep}			*anchor.target = filepath.Join(\".herd\", anchor.segment) // MUTANT: the default resolves against the caller again${sep}TestUnnamedReviewRootsAnchorToTheRepository${sep}want the repository-anchored"
+"repository-root-resolved-absolutely${sep}${pool_src}${sep}${worktree_pkg}${sep}	root, err := filepath.Abs(firstEnv(\"HERD_ROOT\", \"HERD_REPO_ROOT\", \".\"))
+	if err != nil {
+		return fmt.Errorf(\"resolve repository root: %w\", err)
+	}${sep}	root, err := firstEnv(\"HERD_ROOT\", \"HERD_REPO_ROOT\", \".\"), error(nil) // MUTANT: the selected root is used unresolved
+	if err != nil {
+		return fmt.Errorf(\"resolve repository root: %w\", err)
+	}${sep}TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot${sep}a relative repository root was refused"
 )
 
 # ---------------------------------------------------------------------------

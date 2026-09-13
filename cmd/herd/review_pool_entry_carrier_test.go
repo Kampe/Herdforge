@@ -473,3 +473,37 @@ func bindOwnedHostObservation(t *testing.T) {
 		return o
 	}
 }
+
+// A NON-DOT RELATIVE repository root, from a different working directory.
+//
+// firstEnv falls back to "." and HERD_ROOT may itself be relative. "." worked
+// and an absolute root worked; "repo" from its parent did not, because the
+// anchored default became "repo/.herd/pool", the pool persisted slot paths
+// composed from that spelling, and repoPath then joined them onto a canonical
+// root that already ended in "repo". This drives the real entry from the
+// parent directory with exactly that spelling.
+func TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot(t *testing.T) {
+	root, sha, herdrCalls := entryFixture(t)
+	entryConfig(t, root)
+	base := strings.TrimSpace(entryGitOutput(t, root, "rev-parse", sha+"^"))
+
+	// The caller stands in the PARENT and names the repository relatively.
+	t.Chdir(filepath.Dir(root))
+	t.Setenv("HERD_ROOT", filepath.Base(root))
+	t.Setenv("HERD_REPO_ROOT", filepath.Base(root))
+
+	if err := runEntry(t, sha, base); err != nil {
+		t.Fatalf("a relative repository root was refused: %v", err)
+	}
+	if got := entryCarriers(t, root); len(got) != 0 {
+		t.Fatalf("a relative root left an unowned carrier: %v", got)
+	}
+	slot := filepath.Join(root, ".herd", "pool", "pool-01")
+	if head := strings.TrimSpace(entryGitOutput(t, slot, "rev-parse", "HEAD")); head != sha {
+		t.Fatalf("leased slot HEAD = %s, want the exact candidate %s", head, sha)
+	}
+	if dirt := strings.TrimSpace(entryGitOutput(t, root, "status", "--porcelain")); dirt != "" {
+		t.Fatalf("a relative root left undeclared dirt:\n%s", dirt)
+	}
+	assertCompleteCensusObserved(t, herdrCalls())
+}
