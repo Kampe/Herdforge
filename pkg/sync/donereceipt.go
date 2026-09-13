@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -499,18 +500,71 @@ func ReadDoneLog(repoDir string) ([]DoneRecord, error) {
 
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+// mergePathBatch bounds how many paths one git invocation may carry. The
+// pathspec is argv, so a carrier touching thousands of files would otherwise be
+// refused for exceeding ARG_MAX rather than for anything about its content.
+const mergePathBatch = 64
+
+// gitPredicate runs a git command whose EXIT STATUS is the answer: true for 0,
+// false for the documented "no" status 1, and an error for anything else.
+//
+// A missing object, a broken repository, or a killed process exits with neither
+// 0 nor 1, and reporting that as a clean "no" turns an infrastructure failure
+// into a content verdict -- `git diff --quiet` exiting 128 must never read as
+// "these paths differ".
+func gitPredicate(repoDir string, args ...string) (bool, error) {
+	out, err := git(repoDir, args...)
+	if err == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+}
+
+// pathsIdentical reports whether two commits hold the same bytes at every one
+// of these paths.
+func pathsIdentical(repoDir, from, to string, paths []string) (bool, error) {
+	args := append([]string{"diff", "--quiet", from, to, "--"}, paths...)
+	return gitPredicate(repoDir, args...)
+}
+
 // contentPreservedInMerge proves the merge actually KEPT what the carrier
 // changed, rather than merely descending from it.
 //
 // Two real landings satisfy ancestry and still land something else: an ours
 // merge that discards every reviewed hunk, and a merge amended to substitute
 // different bytes. Both leave the carrier an ancestor of the merge, so the
-// graph says yes while the tree says no. Comparing the carrier's own paths
-// between the two trees is what tells them apart.
+// graph says yes while the tree says no. Comparing the carrier's own paths is
+// what tells them apart; the whole tree is the wrong scope, because later
+// unrelated commits legitimately change other files.
 //
-// Scope is deliberately the carrier's paths, not the whole tree: later
-// unrelated commits legitimately change other files, and requiring the trees to
-// match outright would refuse every honest landing that was not the tip.
+// Byte identity WITH THE CARRIER is the right test only while nothing revised
+// those paths afterwards, and that assumption does not hold. The producer seals
+// the landed commit matching the candidate's last patch, which is routinely an
+// INTERMEDIATE commit on an iterated pull-request line whose own files are
+// revised again before the merge -- this repository produces that shape
+// constantly (merge 16de886a revises scripts/verify-mail-bounds.zsh five times
+// after the matched carrier, with no edit from main at all). Demanding byte
+// identity there refuses a landing that genuinely happened: the same false
+// refusal FAC-831 removed from the producer, reintroduced at the consumer.
+//
+// So a path that differs is not immediately a refusal. It is admitted on ONE
+// shape and nothing else: a commit DESCENDING FROM THE CARRIER, contained in
+// the merge, revised that path again, and the merged tree holds THAT commit's
+// bytes. What that still refuses, which is the point:
+//
+//   - an ours merge keeps main's bytes on the path. Main's commits do not
+//     descend from the carrier, and the reviewed line's own last revision is
+//     not what the merge holds, so it is refused either way.
+//   - a merge amended to substitute bytes introduces them at the merge itself,
+//     which is never accepted as a revision OF the content.
+//   - a path that both main and the reviewed line changed is refused,
+//     fail-closed. Telling an honest conflict resolution from a substitution
+//     needs the reviewed-delta replay the producer performs, and this consumer
+//     deliberately does not re-run it.
 func contentPreservedInMerge(repoDir, contentSHA, mergeSHA string) error {
 	changed, err := git(repoDir, "diff-tree", "--no-commit-id", "--name-only", "-r", contentSHA)
 	if err != nil {
@@ -528,13 +582,84 @@ func contentPreservedInMerge(repoDir, contentSHA, mergeSHA string) error {
 		// well keeps the reason specific instead of arriving as "no patch".
 		return fmt.Errorf("content sha %s changed no path; it cannot be the landed content", contentSHA)
 	}
-	args := append([]string{"diff", "--quiet", contentSHA, mergeSHA, "--"}, paths...)
-	if _, err := git(repoDir, args...); err != nil {
-		return fmt.Errorf(
-			"merge sha %s does not preserve the content of %s: the paths it changed differ in the merged tree",
-			mergeSHA, contentSHA)
+	for start := 0; start < len(paths); start += mergePathBatch {
+		end := start + mergePathBatch
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := paths[start:end]
+		// The batch check is the fast path for the ordinary landing, where the
+		// carrier's bytes are in the merge untouched.
+		same, err := pathsIdentical(repoDir, contentSHA, mergeSHA, batch)
+		if err != nil {
+			return err
+		}
+		if same {
+			continue
+		}
+		// Something in this batch moved. WHICH path moved, and whether the move
+		// is the reviewed line revising its own work, is decided per path.
+		for _, path := range batch {
+			same, err := pathsIdentical(repoDir, contentSHA, mergeSHA, []string{path})
+			if err != nil {
+				return err
+			}
+			if same {
+				continue
+			}
+			if err := revisedOnTheReviewedLine(repoDir, contentSHA, mergeSHA, path); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// revisedOnTheReviewedLine decides one path whose bytes are not the carrier's.
+//
+// --full-history so a revision on the pull request's side is never simplified
+// away when the merge is treesame to main, and --topo-order so the reviewed
+// line's LAST word on this path is seen first: that revision, not merely some
+// revision, is what the merge has to hold.
+func revisedOnTheReviewedLine(repoDir, contentSHA, mergeSHA, path string) error {
+	out, err := git(repoDir, "rev-list", "--full-history", "--topo-order", contentSHA+".."+mergeSHA, "--", path)
+	if err != nil {
+		return fmt.Errorf("merge sha %s: cannot list what revised %s after %s: %w", mergeSHA, path, contentSHA, err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		rev := strings.TrimSpace(line)
+		if rev == "" {
+			continue
+		}
+		// The merge is not a revision OF the content. Bytes appearing for the
+		// first time in the merge commit are exactly the substitution this
+		// function exists to refuse.
+		if strings.EqualFold(rev, mergeSHA) {
+			continue
+		}
+		descends, err := gitPredicate(repoDir, "merge-base", "--is-ancestor", contentSHA, rev)
+		if err != nil {
+			return err
+		}
+		if !descends {
+			// Main's own work on the same path is not the reviewed line
+			// revising itself, and must never license a discarded hunk.
+			continue
+		}
+		same, err := pathsIdentical(repoDir, rev, mergeSHA, []string{path})
+		if err != nil {
+			return err
+		}
+		if !same {
+			return fmt.Errorf(
+				"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither",
+				mergeSHA, contentSHA, path, rev)
+		}
+		return nil
+	}
+	return fmt.Errorf(
+		"merge sha %s does not preserve the content of %s: %s differs in the merged tree and no commit descending from the carrier revised it",
+		mergeSHA, contentSHA, path)
 }
 
 // validateContentBinding is the content half of Validate, extracted so the

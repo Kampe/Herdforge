@@ -113,6 +113,8 @@ sep=$'\x1f'
 # ---------------------------------------------------------------------------
 sources=(
 	pkg/mergeadmit/landed_integration.go
+	pkg/mergeadmit/reconcile.go
+	pkg/sync/donereceipt.go
 	cmd/herd/verify_landed_surface.go
 )
 typeset -A pristine
@@ -132,52 +134,61 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt"
+"./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt|TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt|TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt"
 "./cmd/herd/${sep}^(TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged|TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin|TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo|TestResolveVerifyLandedSurfaceRefusesAForeignRepository|TestRequireObjectPresentDemandsACommit|TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead)\$${sep}TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo TestResolveVerifyLandedSurfaceRefusesAForeignRepository TestRequireObjectPresentDemandsACommit TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead"
-"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedDiscardedAndAlteredCarriers|TestSealedCarrierIsCoveredByTheDigest)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedDiscardedAndAlteredCarriers TestSealedCarrierIsCoveredByTheDigest"
+"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedDiscardedAndAlteredCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedDiscardedAndAlteredCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath"
 )
 
 # ---------------------------------------------------------------------------
-# Controls. Six independent guards, each the subject of a review finding.
+# Controls. Each is the subject of a review finding, and each mutates REAL
+# production source.
 #
 # What each one ACTUALLY proves, stated at its real strength:
 #
-#   real-roster-wiring     the digest reads the LIVE roster, not a demo record
-#                          or an empty result that still exits 0
-#   sweep-context-checked-between-panes
-#                          the sweep consults its context BETWEEN panes. That
-#                          is the whole claim. It does NOT prove the same
-#                          context reaches each pane read, because the killer
-#                          is an in-memory helper test with the transport
-#                          stubbed out. The end-to-end claim -- one shared
-#                          deadline bounding the roster read and every pane
-#                          read of a real child -- is carried by
-#                          TestProcessCLIHungPanesStopAtTheSweepDeadline, a
-#                          subprocess fixture that this driver deliberately
-#                          excludes and that the ordinary CI test job runs.
-#                          That test remains required; this control is not a
-#                          substitute for it.
-#   finite-transport-bytes reads are capped at the process boundary
-#   error-envelope-closed  a transport error envelope fails closed
-#   native-identity-required
-#                          a success envelope WITHOUT the native response
-#                          identity the installed 0.9.0 contract requires is
-#                          never reported as a VERIFIED read. This is the PR839
-#                          defect: any non-null result was accepted outright,
-#                          so an id-less {"result":{"agents":[]}} produced a
-#                          clean, non-partial, zero-agent digest that exited 0.
-#                          Scope, stated honestly: the control proves the
-#                          identity gate is load bearing. It does NOT pin the
-#                          concrete id type, because this repository holds no
-#                          recorded native herdr response to read one from.
-#   native-identity-required
-#                          a success envelope WITHOUT the native identity the
-#                          installed 0.9.0 contract requires is never reported
-#                          as a verified read. This is the PR839 defect: an
-#                          id-less {"result":{"agents":[]}} became a clean,
-#                          non-partial, zero-agent digest that exited 0.
-#   partial-truncation     a tail this sweep cut makes the digest incomplete
+#   integration-commit-required
+#                          the producer promotes a patch carrier that sits off
+#                          the integrated line to the commit that INTEGRATED it.
+#                          Without the promotion the carrier is sealed as
+#                          MergeSHA and the consumer refuses a landing that
+#                          genuinely happened (PR836).
+#   integration-content-replay-required
+#                          selection is a CONTENT claim, not a graph claim: a
+#                          merge that kept the reviewed commit as an ancestor
+#                          while discarding every reviewed hunk must not be
+#                          selected. Ancestry alone accepts it; the replay is
+#                          what rejects it.
+#   retired-carrier-pin-required
+#                          a retired carrier with no pinned candidate is refused
+#                          rather than handed to the invoker as a proof surface.
+#   sealed-carrier-copied-into-the-receipt
+#                          the full-provenance producer COPIES the proved
+#                          content carrier into the receipt it seals. This is
+#                          the exact field-copy defect the FAC-831 review found:
+#                          Proof carried ContentSHA and CompletionReceipt did
+#                          not, so a pull-request landing sealed content against
+#                          a merge commit with no patch of its own and public
+#                          Validate refused it. The killer runs the real
+#                          ReconcileLanded and then the shipped consumer gate.
+#   sealed-carrier-copied-into-the-reduced-receipt
+#                          the same copy in the SEPARATE reduced-provenance
+#                          receipt literal, which is the path an actual
+#                          `--verify-landed` pull request reconciliation takes.
+#                          It is its own copy site and the full-provenance
+#                          control cannot speak for it.
 #
+#   later-revision-must-be-the-one-that-landed
+#                          the consumer's allowance for a carrier whose paths
+#                          were revised again before the merge is narrow: the
+#                          merged tree must hold the REVIEWED LINE'S LAST
+#                          revision of that path. Without that the allowance
+#                          degrades into "somebody touched it later", and an
+#                          ours merge that discarded every reviewed hunk walks
+#                          straight through it.
+#
+# Gate.Complete's copy of the same field has NO control here, deliberately: its
+# producer is Prove, which never sets ContentSHA on any of its three modes, so
+# no test can distinguish the copy from its absence. A control that cannot kill
+# reports coverage that does not exist.
 # id | source | test package | anchor | replacement | killer | required assertion
 # ---------------------------------------------------------------------------
 mutations=(
@@ -200,9 +211,22 @@ mutations=(
 		}${sep}TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent${sep}an ours merge that discarded every reviewed hunk was sealed"
 "retired-carrier-pin-required${sep}cmd/herd/verify_landed_surface.go${sep}./cmd/herd/${sep}	if pinned == \"\" {
 		return verifyLandedSurface{}, errRetiredCarrierUnpinned
-	}${sep}	if false && pinned == "" { // MUTANT: an unpinned retired carrier falls through to the invoker
+	}${sep}	if false && pinned == \"\" { // MUTANT: an unpinned retired carrier falls through to the invoker
 		return verifyLandedSurface{}, errRetiredCarrierUnpinned
 	}${sep}TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin${sep}as a proof surface with no pinned candidate"
+"sealed-carrier-copied-into-the-receipt${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}		MergeSHA:           proof.MergeSHA,
+		ContentSHA:         proof.ContentSHA,${sep}		MergeSHA:           proof.MergeSHA,
+		// MUTANT: the sealed carrier is dropped, so the receipt binds content to the merge alone${sep}TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}full-provenance producer did not seal the content carrier"
+"sealed-carrier-copied-into-the-reduced-receipt${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}MergeSHA: proof.MergeSHA, ContentSHA: proof.ContentSHA, PatchID: proof.PatchID,${sep}MergeSHA: proof.MergeSHA, /* MUTANT: the reduced receipt drops the sealed carrier */ PatchID: proof.PatchID,${sep}TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}reduced-provenance producer did not seal the content carrier"
+"later-revision-must-be-the-one-that-landed${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		if !same {
+			return fmt.Errorf(
+				\"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither\",
+				mergeSHA, contentSHA, path, rev)
+		}${sep}		if false && !same { // MUTANT: a later revision alone licenses the path, so a discarded hunk passes
+			return fmt.Errorf(
+				\"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither\",
+				mergeSHA, contentSHA, path, rev)
+		}${sep}TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath${sep}was accepted because the path was revised later"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from

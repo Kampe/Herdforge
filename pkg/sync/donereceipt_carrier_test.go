@@ -252,3 +252,109 @@ func TestSealedCarrierIsCoveredByTheDigest(t *testing.T) {
 		t.Fatal("a receipt with no carrier must digest exactly as it did before the field existed")
 	}
 }
+
+// iteratedPRRepo builds the shape an iterated lane actually produces: the
+// carrier is an INTERMEDIATE commit on the pull request's line, and the same
+// path is revised again before the landing.
+//
+//	root ─── base ────────────────── merge          (main, and origin/main)
+//	          └── carrier ── tip ──────┘            (the pull request's line)
+//
+// discarded selects the adversarial twin of the same shape: main revises the
+// path too and the landing is an `ours` merge, so the reviewed hunks are gone
+// while the carrier is still an ancestor and the path was still revised later.
+// The allowance for a later revision must not admit that.
+func iteratedPRRepo(t *testing.T, discarded bool) (dir, baseSHA, carrierSHA, mergeSHA string) {
+	t.Helper()
+	dir = t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(name, body, msg string) string {
+		t.Helper()
+		writeFileTest(t, dir, name, body)
+		run("add", name)
+		run("commit", "-q", "-m", msg)
+		return run("rev-parse", "HEAD")
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "fixture@example.com")
+	run("config", "user.name", "fixture")
+
+	commit("a.txt", "root\n", "root")
+	// The reviewed path already exists on main, so `ours` can keep main's
+	// bytes at it rather than simply dropping a file.
+	baseSHA = commit("shared.txt", "base\n", "reviewed base")
+
+	run("checkout", "-q", "-b", "pr")
+	carrierSHA = commit("shared.txt", "reviewed v1\n", "reviewed candidate work")
+	tip := commit("shared.txt", "reviewed v2\n", "revise the same path inside the pull request")
+
+	run("checkout", "-q", "main")
+	if discarded {
+		mainRevision := commit("shared.txt", "main revision\n", "main revises the same path")
+		run("merge", "-q", "--no-ff", "-s", "ours", "-m", "Merge pull request #831 (ours)", "pr")
+		mergeSHA = run("rev-parse", "HEAD")
+		if run("rev-parse", mergeSHA+"^{tree}") != run("rev-parse", mainRevision+"^{tree}") {
+			t.Fatal("fixture invalid: the ours merge did not keep main's tree")
+		}
+	} else {
+		run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
+		mergeSHA = run("rev-parse", "HEAD")
+		if run("rev-parse", mergeSHA+":shared.txt") != run("rev-parse", tip+":shared.txt") {
+			t.Fatal("fixture invalid: the merge does not hold the reviewed line's last revision")
+		}
+	}
+	run("update-ref", "refs/remotes/origin/main", mergeSHA)
+
+	// Both shapes must be NON-VACUOUS: the carrier's own bytes must differ from
+	// the merged tree, or the fast byte-identity path would answer and the case
+	// under test would never be reached.
+	if run("rev-parse", mergeSHA+":shared.txt") == run("rev-parse", carrierSHA+":shared.txt") {
+		t.Fatal("fixture invalid: the merge still holds the carrier's own bytes, so no later revision is under test")
+	}
+	return dir, baseSHA, carrierSHA, mergeSHA
+}
+
+// TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath is the FAC-831
+// follow-up regression: requiring the carrier's paths to be byte-identical in
+// the merge refused honest landings, because the producer seals the commit
+// matching the candidate's LAST patch and that is routinely an intermediate
+// commit whose files are revised again inside the same pull request. The
+// allowance is narrow, and the second case is what keeps it narrow.
+func TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath(t *testing.T) {
+	t.Run("the reviewed line revised its own path before the merge", func(t *testing.T) {
+		dir, base, carrier, merge := iteratedPRRepo(t, false)
+		patch, err := PatchID(dir, carrier)
+		if err != nil {
+			t.Fatalf("carrier must have a patch id: %v", err)
+		}
+		r := CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
+		if err := r.validateContentBinding(dir); err != nil {
+			t.Fatalf("an honest landing whose carrier was revised again inside the pull request was refused: %v", err)
+		}
+	})
+
+	t.Run("an ours merge on a path the reviewed line also revised", func(t *testing.T) {
+		dir, base, carrier, merge := iteratedPRRepo(t, true)
+		patch, err := PatchID(dir, carrier)
+		if err != nil {
+			t.Fatalf("carrier must have a patch id: %v", err)
+		}
+		r := CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
+		err = r.validateContentBinding(dir)
+		if err == nil {
+			t.Fatal("an ours merge that discarded the reviewed hunks was accepted because the path was revised later")
+		}
+		if !strings.Contains(err.Error(), "does not preserve the content of") {
+			t.Fatalf("refusal did not name the content rule: %v", err)
+		}
+	})
+}
