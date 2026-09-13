@@ -223,6 +223,10 @@ func followUpFixture(t *testing.T) (*Gate, Request, Request, string) {
 	if landed := rewriteOnto(t, dir, "landed-followup", advanced, []string{second}); landed == second {
 		t.Fatal("fixture did not rewrite the follow-up candidate sha")
 	}
+	// origin/main advances past the follow-up landing too, so the landed tip is
+	// never the equivalent commit itself. This is the same shape the first
+	// delivery uses, and the shape reconcileFixture already proves reconcilable.
+	commit(t, dir, "later2.txt", "unrelated again\n", "advance after follow-up")
 
 	l := newLedger(t, dir)
 	launch(t, l, candidate, "reviewer-a", "anthropic", "builder-session-1")
@@ -296,10 +300,14 @@ func TestFollowUpPublicEntryStopsOnTheSharedAllowance(t *testing.T) {
 	}
 }
 
-// The SAME follow-up request on the default allowance is NOT stopped by the
-// command budget. Without this the refusal above could be caused by a
-// malformed request rather than by the allowance, and would prove nothing.
-func TestFollowUpPublicEntryIsNotBudgetStoppedOnTheDefaultAllowance(t *testing.T) {
+// The REAL positive witness: the same follow-up request, on the default
+// allowance, must actually reconcile and mint a NEW receipt correctly bound to
+// the second delivery, with the prior receipt still resolvable.
+//
+// An earlier version of this test only asserted that the default allowance was
+// not stopped by the command budget. That was too weak to be coverage: a gate
+// that refused every follow-up for some other reason would have passed it.
+func TestFollowUpPublicEntrySucceedsOnTheDefaultAllowance(t *testing.T) {
 	g, first, follow, dir := followUpFixture(t)
 
 	prior, err := g.ReconcileLanded(first)
@@ -309,7 +317,47 @@ func TestFollowUpPublicEntryIsNotBudgetStoppedOnTheDefaultAllowance(t *testing.T
 	landFollowUp(t, g, dir, follow.CandidateSHA)
 	follow.PriorReceiptDigest = prior.Digest
 
-	if _, err := g.ReconcileLanded(follow); errors.Is(err, ErrProofBudgetCommands) {
-		t.Fatalf("the default allowance ran out of git commands on the follow-up path: %v", err)
+	receipt, err := g.ReconcileLanded(follow)
+	if err != nil {
+		t.Fatalf("the default allowance refused an honest follow-up: %v", err)
+	}
+	if receipt == nil || receipt.Digest == "" {
+		t.Fatalf("the follow-up sealed no receipt: %+v", receipt)
+	}
+	if receipt.Digest == prior.Digest {
+		t.Fatal("the follow-up returned the prior receipt instead of minting a new one")
+	}
+
+	// Bound to the SECOND delivery, not the first.
+	if !sameSHA(receipt.CandidateSHA, follow.CandidateSHA) {
+		t.Fatalf("receipt candidate = %s, want the follow-up candidate %s",
+			short(receipt.CandidateSHA), short(follow.CandidateSHA))
+	}
+	if !sameSHA(receipt.BaseSHA, follow.BaseSHA) {
+		t.Fatalf("receipt base = %s, want the follow-up reviewed base %s",
+			short(receipt.BaseSHA), short(follow.BaseSHA))
+	}
+	if receipt.TaskRef != hsync.NormalizeRef(testRef) || receipt.Verdict != "PASS" ||
+		receipt.IntegrationResult != hsync.IntegrationMerged {
+		t.Fatalf("follow-up receipt is not a sealed PASS for this task: %+v", receipt)
+	}
+
+	// The sealed receipt on disk is the new one.
+	current, err := hsync.LoadReceipt(hsync.ReceiptPath(dir, testRef))
+	if err != nil {
+		t.Fatalf("sealed follow-up receipt unreadable: %v", err)
+	}
+	if current.Digest != receipt.Digest {
+		t.Fatalf("on-disk receipt %s is not the returned follow-up %s", current.Digest, receipt.Digest)
+	}
+
+	// The prior link is retained: the superseded receipt is still resolvable by
+	// its own digest, and still names the first delivery.
+	kept, err := hsync.LoadPriorReceipt(dir, testRef, prior.Digest)
+	if err != nil {
+		t.Fatalf("the superseded prior receipt was not retained: %v", err)
+	}
+	if kept.Digest != prior.Digest || !sameSHA(kept.CandidateSHA, first.CandidateSHA) {
+		t.Fatalf("retained prior receipt does not bind the first delivery: %+v", kept)
 	}
 }
