@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/gitroot"
@@ -34,18 +36,49 @@ type PoolSlot struct {
 }
 
 type poolState struct {
-	Version int        `json:"version"`
-	Slots   []PoolSlot `json:"slots"`
+	Version int `json:"version"`
+	// LastAssignedGeneration is the high-water mark of every lease generation
+	// this pool has ever issued. It is ALLOCATION metadata and deliberately
+	// separate from the LastRelease* fields, which are idempotent RELEASE
+	// evidence that RetireExact and the retirement manifests compare for
+	// equality; overloading those would replace evidence with bookkeeping.
+	//
+	// It lives on the pool rather than on the slot so that a slot removed by
+	// GC and recreated by Ensure under the same name cannot resurrect a
+	// retired identity, and so that it survives reconstruction of the Pool
+	// object — it is read back from the state file, not held in memory.
+	LastAssignedGeneration int64      `json:"last_assigned_generation,omitempty"`
+	Slots                  []PoolSlot `json:"slots"`
 }
 
 // Pool manages long-lived, dependency-bearing worktrees. The state file is
 // deliberately repo-relative so it can be moved with a worktree.
 type Pool struct {
+	// RepoRoot and Root keep the CALLER'S spelling. They are what the
+	// persisted slot.Path is composed from, so the state file stays
+	// deliberately repo-relative and movable with a worktree. Nothing
+	// resolves a path through them; see canonicalRoots.
 	RepoRoot    string
 	Root        string
 	Size        int
 	DefaultBase string
 	Now         func() time.Time
+
+	// canonical owning roots, captured once BEFORE any state access.
+	//
+	// FAC-764 review: the constructor accepted relative spellings, and
+	// NewPool(".", ".herd/pool-...") is in live use. Every resolution below
+	// then ran against the process's own working directory: statePath,
+	// lockPath, repoPath, and containedRepoPath's EvalSymlinks(p.Root). A
+	// caller that changed directory did not merely fail — where a matching
+	// pool state and registration existed under the new directory, the
+	// containment and registration checks validated the DECOY and the reset
+	// landed there. Anchoring only the slot path was not enough, because the
+	// anchor itself moved.
+	rootsOnce     sync.Once
+	canonRepoRoot string
+	canonRoot     string
+	rootsErr      error
 	// HolderLive reports whether a lease's holder is still a live, unsettled
 	// worker. It is injected so this package stays free of any dependency on the
 	// terminal plane.
@@ -84,18 +117,66 @@ func NewPool(repoRoot, root string, size int) *Pool {
 	if size < 0 {
 		size = 0
 	}
-	return &Pool{RepoRoot: repoRoot, Root: root, Size: size, DefaultBase: "origin/main", Now: time.Now,
+	p := &Pool{RepoRoot: repoRoot, Root: root, Size: size, DefaultBase: "origin/main", Now: time.Now,
 		ProcessInspector: resources.LSOFProcessInspector{Timeout: 2 * time.Second}}
+	// Captured at CONSTRUCTION, while the caller's working directory is still
+	// the one the spellings were written against. Resolving later would anchor
+	// to wherever the process had moved to by then.
+	_ = p.canonicalRoots()
+	return p
 }
 
-func (p *Pool) statePath() string { return filepath.Join(p.Root, "pool.json") }
-func (p *Pool) lockPath() string  { return filepath.Join(p.Root, "pool.lock") }
+// canonicalRoots resolves both owning roots exactly once. It is also called
+// lazily from every entry below, so a Pool built as a struct literal cannot
+// skip it, and a failure is returned rather than falling back to the caller's
+// spelling: an unresolvable root must refuse, never guess.
+func (p *Pool) canonicalRoots() error {
+	if p == nil {
+		return errors.New("worktree pool: no pool configured")
+	}
+	p.rootsOnce.Do(func() {
+		if strings.TrimSpace(p.Root) == "" {
+			p.rootsErr = errors.New("worktree pool: root is required")
+			return
+		}
+		if strings.TrimSpace(p.RepoRoot) == "" {
+			p.rootsErr = errors.New("worktree pool: repository root is required")
+			return
+		}
+		if p.canonRepoRoot, p.rootsErr = canonicalOwningRoot(p.RepoRoot); p.rootsErr != nil {
+			p.rootsErr = fmt.Errorf("worktree pool: resolve repository root: %w", p.rootsErr)
+			return
+		}
+		if p.canonRoot, p.rootsErr = canonicalOwningRoot(p.Root); p.rootsErr != nil {
+			p.rootsErr = fmt.Errorf("worktree pool: resolve pool root: %w", p.rootsErr)
+		}
+	})
+	return p.rootsErr
+}
+
+// canonicalOwningRoot makes a spelling absolute and, when the directory
+// already exists, symlink-resolved. A root that does not exist yet is still
+// anchored absolutely — the pool root is created later by withLock — so the
+// anchor never depends on the caller's working directory.
+func canonicalOwningRoot(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	return filepath.Clean(abs), nil
+}
+
+func (p *Pool) statePath() string { return filepath.Join(p.canonRoot, "pool.json") }
+func (p *Pool) lockPath() string  { return filepath.Join(p.canonRoot, "pool.lock") }
 
 func (p *Pool) withLock(fn func() error) error {
-	if p == nil || strings.TrimSpace(p.Root) == "" {
-		return errors.New("worktree pool: root is required")
+	if err := p.canonicalRoots(); err != nil {
+		return err
 	}
-	if err := os.MkdirAll(p.Root, 0o755); err != nil {
+	if err := os.MkdirAll(p.canonRoot, 0o755); err != nil {
 		return fmt.Errorf("worktree pool: create root: %w", err)
 	}
 	f, err := os.OpenFile(p.lockPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -165,17 +246,22 @@ func (p *Pool) Ensure(ctx context.Context) error {
 			base = "origin/main"
 		}
 		for _, slot := range state.Slots {
-			_, statErr := os.Stat(slot.Path)
+			// The RECORD stays as composed from the caller's spelling; only
+			// the filesystem work is anchored. Leaving these two on the
+			// process's working directory while the roots are canonical is
+			// exactly the split this change exists to close.
+			createPath := p.repoPath(slot.Path)
+			_, statErr := os.Stat(createPath)
 			if statErr == nil {
 				continue
 			}
 			if !errors.Is(statErr, fs.ErrNotExist) {
 				return fmt.Errorf("worktree pool: inspect %s: %w", slot.Name, statErr)
 			}
-			if err := os.MkdirAll(filepath.Dir(slot.Path), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(createPath), 0o755); err != nil {
 				return fmt.Errorf("worktree pool: create parent: %w", err)
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "add", "--detach", slot.Path, base)
+			cmd := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "add", "--detach", createPath, base)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: create %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
@@ -201,19 +287,19 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			if slot.LeaseID != "" {
 				continue
 			}
-			clean, err := gitClean(ctx, slot.Path)
+			clean, err := gitClean(ctx, p.repoPath(slot.Path))
 			if err != nil {
 				return fmt.Errorf("worktree pool: inspect %s: %w", slot.Name, err)
 			}
 			if !clean {
 				return fmt.Errorf("worktree pool: slot %s is dirty; refusing lease", slot.Name)
 			}
-			stamp := p.Now
-			if stamp == nil {
-				stamp = time.Now
+			at, err := p.assignmentInstant(&state)
+			if err != nil {
+				return err
 			}
-			slot.Purpose, slot.LeasedAt = purpose, stamp().UTC()
-			slot.LeaseID = fmt.Sprintf("%s-%d", slot.Name, slot.LeasedAt.UnixNano())
+			slot.Purpose, slot.LeasedAt = purpose, at
+			slot.LeaseID = leaseIdentity(slot.Name, slot.LeasedAt)
 			copy := *slot
 			result = &copy
 			return p.writeState(state)
@@ -237,16 +323,16 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			if slot.LeaseID != "" {
 				continue
 			}
-			clean, err := gitClean(ctx, slot.Path)
+			clean, err := gitClean(ctx, p.repoPath(slot.Path))
 			if err != nil || !clean {
 				continue
 			}
-			stamp := p.Now
-			if stamp == nil {
-				stamp = time.Now
+			at, err := p.assignmentInstant(&state)
+			if err != nil {
+				return err
 			}
-			slot.Purpose, slot.LeasedAt = purpose, stamp().UTC()
-			slot.LeaseID = fmt.Sprintf("%s-%d", slot.Name, slot.LeasedAt.UnixNano())
+			slot.Purpose, slot.LeasedAt = purpose, at
+			slot.LeaseID = leaseIdentity(slot.Name, slot.LeasedAt)
 			copy := *slot
 			result = &copy
 			return p.writeState(state)
@@ -254,6 +340,51 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 		return fmt.Errorf("worktree pool: reclaimed %d dead lease(s) but no slot became leasable", len(reclaimed))
 	})
 	return result, err
+}
+
+// leaseIdentity is the ONE place the public lease id is composed. The shape is
+// unchanged — "<slot>-<generation nanoseconds>" — because ReleaseExact and the
+// retirement manifests compare the id and the generation for equality, and
+// operators read it from `herd pool list`.
+func leaseIdentity(name string, at time.Time) string {
+	return fmt.Sprintf("%s-%d", name, at.UnixNano())
+}
+
+// assignmentInstant returns the instant a NEW assignment is recorded at,
+// strictly after every generation this pool has already issued, and advances
+// the pool's high-water mark. The caller must persist the state it mutates.
+//
+// FAC-764 review: the identity was timestamp-only, and Pool.Now is an exposed
+// deterministic seam. Under a fixed clock a later assignment received the SAME
+// public lease id and the same generation, so the retired holder could release
+// its slot's new owner — through ordinary Release, which matches on the id,
+// and through ReleaseExact, which matches id and generation. Both saw an
+// incarnation that looked current.
+//
+// The high-water mark is consulted for EVERY assignment rather than any single
+// retirement route, so it does not depend on ordinary Release, dead-holder
+// reclaim and ReleaseExact all recording the same evidence.
+//
+// The bump is one nanosecond and applies only when the clock did not advance,
+// so wall-clock behaviour is unchanged and the id format stays exact. An
+// exhausted generation space refuses rather than wrapping into a value the
+// pool has already handed out.
+func (p *Pool) assignmentInstant(state *poolState) (time.Time, error) {
+	stamp := p.Now
+	if stamp == nil {
+		stamp = time.Now
+	}
+	at := stamp().UTC()
+	n := at.UnixNano()
+	if n <= state.LastAssignedGeneration {
+		if state.LastAssignedGeneration >= math.MaxInt64 {
+			return time.Time{}, errors.New("worktree pool: lease generation space is exhausted; refusing to reissue a retired identity")
+		}
+		n = state.LastAssignedGeneration + 1
+		at = time.Unix(0, n).UTC()
+	}
+	state.LastAssignedGeneration = n
+	return at, nil
 }
 
 // reclaimDeadLocked frees leases whose holder is no longer live. The caller
@@ -477,7 +608,7 @@ var retireStateFenceProbe = func(context.Context, *Pool, string) {}
 // and never a substring match, so a replacement or sibling path cannot read
 // as this one.
 func (p *Pool) worktreeRegistered(ctx context.Context, slotPath string) (bool, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "list", "--porcelain").Output()
+	out, err := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return false, fmt.Errorf("git worktree list --porcelain: %w", err)
 	}
@@ -636,7 +767,7 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 				// an existing directory, so this refuses unconditionally.
 				return fmt.Errorf("worktree pool: slot %s path holds unregistered content; refusing possible replacement", slot.Name)
 			}
-			cmd := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", "--force", slotPath)
+			cmd := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "remove", "--force", slotPath)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("worktree pool: remove %s: %v (%s)", slot.Name, err, strings.TrimSpace(string(out)))
 			}
@@ -648,18 +779,27 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 		return nil
 	})
 	if err == nil {
-		if entries, readErr := os.ReadDir(p.Root); readErr == nil && len(entries) == 0 {
-			_ = os.Remove(p.Root)
+		if entries, readErr := os.ReadDir(p.canonRoot); readErr == nil && len(entries) == 0 {
+			_ = os.Remove(p.canonRoot)
 		}
 	}
 	return err
 }
 
+// repoPath resolves a persisted slot path against the CANONICAL repository
+// root. The stored spelling stays relative on purpose; only its resolution is
+// anchored.
 func (p *Pool) repoPath(path string) string {
 	if filepath.IsAbs(path) {
 		return filepath.Clean(path)
 	}
-	return filepath.Clean(filepath.Join(p.RepoRoot, path))
+	// Resolve the anchor if it has not been captured yet. There is NO fallback
+	// to the caller's spelling: when canonicalisation failed, every public
+	// entry has already returned that error through withLock or
+	// containedRepoPath, and joining against an unanchored root here would
+	// reintroduce exactly the defect this removes.
+	_ = p.canonicalRoots()
+	return filepath.Clean(filepath.Join(p.canonRepoRoot, path))
 }
 
 // GC tears down every unleased, verified-safe slot so the next Ensure
@@ -822,7 +962,7 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) ([]GCR
 			// absent, which the next pass refuses (retained, bytes
 			// preserved); recovery of parked quarantine dirs is a
 			// root-owned action.
-			quarantine := filepath.Join(p.Root, fmt.Sprintf(".gc-quarantine-%s-%d", slot.Name, p.Now().UnixNano()))
+			quarantine := filepath.Join(p.canonRoot, fmt.Sprintf(".gc-quarantine-%s-%d", slot.Name, p.Now().UnixNano()))
 			if err := os.Rename(candidate.path, quarantine); err != nil {
 				reports[reportIndex].Reason = fmt.Sprintf("quarantine move failed: %v", err)
 				return fmt.Errorf("worktree pool: gc refused for slot %s: quarantine move failed: %w", slot.Name, err)
@@ -861,7 +1001,7 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) ([]GCR
 			// Adopt the moved registration: git re-points its own metadata
 			// at the quarantine path -- an exact, scoped operation on this
 			// one worktree, never repository-wide.
-			repair := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "repair", quarantine)
+			repair := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "repair", quarantine)
 			out, repairErr := boundedCombinedOutput(repair, maxGitOutputBytes)
 			if repairErr != nil {
 				if err := rollback(); err != nil {
@@ -869,7 +1009,7 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) ([]GCR
 				}
 				// The repair moved git's pointer; moving the directory back
 				// left it stale again -- re-point it at the original path.
-				back := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "repair", candidate.path)
+				back := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "repair", candidate.path)
 				if _, backErr := boundedCombinedOutput(back, maxGitOutputBytes); backErr != nil {
 					reports[reportIndex].ParkedAt = quarantine
 					reports[reportIndex].Reason = fmt.Sprintf("registration re-point failed: %v; %d bytes at %s", backErr, payloadBytes, quarantine)
@@ -881,7 +1021,7 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) ([]GCR
 			// git's own removal contract deletes the registered directory
 			// it just accepted -- the destructive step is git's, on the
 			// quarantine path this pass exclusively owns.
-			dispose := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "remove", quarantine)
+			dispose := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "remove", quarantine)
 			out, disposeErr := boundedCombinedOutput(dispose, maxGitOutputBytes)
 			if disposeErr != nil {
 				// Roll the registration back to the original path, restore
@@ -890,7 +1030,7 @@ func (p *Pool) GC(ctx context.Context, authority SlotRetirementAuthority) ([]GCR
 				if err := rollback(); err != nil {
 					return err
 				}
-				back := exec.CommandContext(ctx, "git", "-C", p.RepoRoot, "worktree", "repair", candidate.path)
+				back := exec.CommandContext(ctx, "git", "-C", p.canonRepoRoot, "worktree", "repair", candidate.path)
 				if _, backErr := boundedCombinedOutput(back, maxGitOutputBytes); backErr != nil {
 					reports[reportIndex].ParkedAt = quarantine
 					reports[reportIndex].Reason = fmt.Sprintf("disposal failed (%v) and registration re-point failed (%v); %d bytes at %s", disposeErr, backErr, payloadBytes, quarantine)
@@ -1040,10 +1180,10 @@ func (p *Pool) verifyGCCandidate(ctx context.Context, slot PoolSlot) (gcCandidat
 	if err != nil {
 		return gcCandidate{}, err
 	}
-	if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.RepoRoot, resolved); err != nil {
+	if err := RefuseRemovalWithoutLeaseHistoryCheck(ctx, p.canonRepoRoot, resolved); err != nil {
 		return gcCandidate{}, err
 	}
-	registered, err := registeredWorktrees(ctx, p.RepoRoot)
+	registered, err := registeredWorktrees(ctx, p.canonRepoRoot)
 	if err != nil {
 		return gcCandidate{}, fmt.Errorf("list registered worktrees: %w", err)
 	}
@@ -1065,7 +1205,7 @@ func (p *Pool) verifyGCCandidate(ctx context.Context, slot PoolSlot) (gcCandidat
 	if base == "" {
 		base = "origin/main"
 	}
-	if err := verifyReachableFromBase(ctx, p.RepoRoot, resolved, base); err != nil {
+	if err := verifyReachableFromBase(ctx, p.canonRepoRoot, resolved, base); err != nil {
 		return gcCandidate{}, err
 	}
 	info, err := os.Stat(resolved)
@@ -1100,6 +1240,9 @@ func (p *Pool) inspectSlotUse(ctx context.Context, path string) error {
 // one that escapes the pool root. It returns the normalized, non-symlink-
 // resolved absolute path, which is what git's own worktree registry keys on.
 func (p *Pool) containedRepoPath(path string) (string, error) {
+	if err := p.canonicalRoots(); err != nil {
+		return "", err
+	}
 	resolved := p.repoPath(path)
 	info, err := os.Lstat(resolved)
 	if err != nil {
@@ -1115,7 +1258,7 @@ func (p *Pool) containedRepoPath(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve slot path: %w", err)
 	}
-	realRoot, err := filepath.EvalSymlinks(p.Root)
+	realRoot, err := filepath.EvalSymlinks(p.canonRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolve pool root: %w", err)
 	}
