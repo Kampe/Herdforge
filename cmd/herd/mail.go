@@ -463,9 +463,25 @@ func runMailInbox(mode string, args []string) {
 	fs := flag.NewFlagSet("mail "+mode, flag.ContinueOnError)
 	recipient := fs.String("recipient", "", "inbox recipient")
 	mailPath := fs.String("mail", "", "mailbox path override")
+	// Additive paging. Passing either flag opts INTO the bounded object
+	// response; an unflagged call keeps the exact array it always returned.
+	afterCursor := fs.String("after-cursor", "", "resume after an opaque cursor from a previous page")
+	limit := fs.Int("limit", 0, "maximum records to retain in one page (enables bounded mode)")
+	maxBytes := fs.Int("max-bytes", 0, "maximum encoded bytes to retain in one page")
+	timeout := fs.Duration("timeout", 0, "finite deadline for one bounded page")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
+	// PRESENCE, not value. Deciding on value alone meant `--limit -1` was
+	// indistinguishable from an absent flag and silently fell through to the
+	// unbounded read this command exists to replace.
+	paging := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "after-cursor", "limit", "max-bytes", "timeout":
+			paging = true
+		}
+	})
 	if strings.TrimSpace(*recipient) == "" {
 		fmt.Fprintf(os.Stderr, "mail %s: --recipient is required\n", mode)
 		os.Exit(2)
@@ -474,6 +490,31 @@ func runMailInbox(mode string, args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, err)
 		os.Exit(1)
+	}
+	if paging {
+		req := boundedInboxRequest{
+			Active:   true,
+			Cursor:   strings.TrimSpace(*afterCursor),
+			Limit:    *limit,
+			MaxBytes: *maxBytes,
+			Timeout:  *timeout,
+		}
+		if verr := req.validate(); verr != nil {
+			fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, verr)
+			os.Exit(2)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), req.Timeout)
+		defer cancel()
+		resp, berr := readBoundedInbox(ctx, mail.NewMailbox(path), strings.TrimSpace(*recipient), req)
+		if berr != nil {
+			fmt.Fprintf(os.Stderr, "mail %s: %v\n", mode, berr)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+			fmt.Fprintf(os.Stderr, "mail %s: encode response: %v\n", mode, err)
+			os.Exit(1)
+		}
+		return
 	}
 	result, err := mail.NewMailbox(path).ReadInboxStatus(strings.TrimSpace(*recipient))
 	if err != nil {
