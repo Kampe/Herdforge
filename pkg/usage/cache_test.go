@@ -1,6 +1,8 @@
 package usage
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,8 +29,33 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 					return err
 				}
 			}
-			time.Sleep(time.Second)
-			return nil
+			release := os.Getenv("HERD_CACHE_HOLDER_RELEASE")
+			if release == "" {
+				// Legacy contract, unchanged for the callers that rely on the
+				// holder simply going away on its own.
+				time.Sleep(time.Second)
+				return nil
+			}
+			// Release handshake. The lock is held until the PARENT says it is
+			// done, so the hold covers the other process's whole attempt by
+			// construction rather than by outlasting it. A fixed interval
+			// could expire between the parent seeing the ready file and the
+			// other process reaching the lock, which is the scheduling
+			// assumption this replaces.
+			//
+			// The fail-safe is not the mechanism, only a leak bound: if the
+			// parent dies without releasing, this returns an error instead of
+			// holding the lock forever.
+			deadline := time.Now().Add(holderReleaseFailSafe)
+			for {
+				if _, err := os.Stat(release); err == nil {
+					return nil
+				}
+				if !time.Now().Before(deadline) {
+					return fmt.Errorf("holder was never released within %s", holderReleaseFailSafe)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +120,114 @@ const (
 	singleFlightServed        = "served"
 	singleFlightCached        = "cached"
 	singleFlightContended     = "contended"
+
+	// Every owned subprocess is bounded. These are LEAK bounds, not the
+	// mechanism any assertion depends on: the handshakes below decide the
+	// outcome, and a budget being reached is reported as a failure of this
+	// test rather than absorbed into the suite-wide timeout.
+	helperProcessBudget     = 60 * time.Second
+	helperResultBudget      = 45 * time.Second
+	helperReapBudget        = 10 * time.Second
+	holderReleaseFailSafe   = 90 * time.Second
+	holderReadyBudget       = 30 * time.Second
+	helperWaitDelayOnKill   = 5 * time.Second
+	helperReadyPollInterval = 5 * time.Millisecond
 )
+
+// ownedHelper is one subprocess this test owns end to end.
+//
+// It exists because the previous shape leaked in two ways that a whole-suite
+// timeout hid: CombinedOutput and the result channel were read without any
+// deadline, so a t.Cleanup that killed processes could never run while the
+// test was blocked on them, and Kill alone does not reap -- the temp directory
+// could be removed while a child still had it open.
+//
+// Start is synchronous so cmd.Process is set before anything else can observe
+// it, Wait is called exactly once by one goroutine, and every accessor waits on
+// that single completion instead of calling Wait again.
+// Completion is signalled by CLOSING finished, never by sending on it: a
+// channel that carries the result can be drained only once, so cleanup would
+// then block for its whole reap budget on every already-finished helper. waitErr
+// is written before the close and read only after it, which is what makes the
+// unsynchronised field safe.
+type ownedHelper struct {
+	name     string
+	cmd      *exec.Cmd
+	cancel   context.CancelFunc
+	output   *bytes.Buffer
+	finished chan struct{}
+	waitErr  error
+	stopped  sync.Once
+}
+
+// startOwnedHelper launches a helper under a finite context and registers a
+// cleanup that cancels it and WAITS for it to be reaped.
+func startOwnedHelper(t *testing.T, name string, env []string) *ownedHelper {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), helperProcessBudget)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
+	cmd.Env = env
+	// Bound the join as well as the process: without this, Wait can outlive
+	// the kill while an inherited pipe stays open.
+	cmd.WaitDelay = helperWaitDelayOnKill
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	h := &ownedHelper{name: name, cmd: cmd, cancel: cancel, output: &buf, finished: make(chan struct{})}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start %s helper: %v", name, err)
+	}
+	go func() {
+		h.waitErr = cmd.Wait()
+		close(h.finished)
+	}()
+	t.Cleanup(h.stop)
+	return h
+}
+
+// wait blocks for the helper's completion within a finite budget and returns
+// its combined output. Exceeding the budget is an ERROR naming the timeout, not
+// a result: a child that had to be killed proves nothing about the guard under
+// test.
+func (h *ownedHelper) wait(budget time.Duration) (string, error) {
+	select {
+	case <-h.finished:
+		// Safe to read the buffer and the error only after the single Wait
+		// has returned, which the close above establishes.
+		text := strings.TrimSpace(h.output.String())
+		if h.waitErr != nil {
+			return text, fmt.Errorf("%s helper failed: %w", h.name, h.waitErr)
+		}
+		return text, nil
+	case <-time.After(budget):
+		h.stop()
+		return "", fmt.Errorf("%s helper did not finish within %s; killed and reaped, result discarded", h.name, budget)
+	}
+}
+
+// exited reports whether the helper has already finished, without consuming its
+// completion, so a caller can distinguish "still holding" from "died early".
+func (h *ownedHelper) exited() bool {
+	select {
+	case <-h.finished:
+		return true
+	default:
+		return false
+	}
+}
+
+// stop cancels the process and waits for it to be reaped. Idempotent, and safe
+// to call from cleanup after wait has already consumed the completion.
+func (h *ownedHelper) stop() {
+	h.stopped.Do(func() {
+		h.cancel()
+		select {
+		case <-h.finished:
+		case <-time.After(helperReapBudget):
+		}
+	})
+}
 
 // singleFlightOutcome extracts the reported outcome from one helper's output.
 // An absent or unreadable line is a failure, never an assumed pass: a helper
@@ -425,56 +560,34 @@ func TestProviderCacheAcrossProcessesSingleFlight(t *testing.T) {
 		"CODEX_HOME="+home,
 		"HERD_QUOTA_CACHE_SECONDS=45",
 	)
-	cmds := make([]*exec.Cmd, 2)
-	for i := range cmds {
-		cmds[i] = exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
-		cmds[i].Env = baseEnv
-	}
-	// Cleanup on EVERY path, including a t.Fatal from the first result while
-	// the second helper is still running. Killing a process that already
-	// exited is harmless; leaving one behind is not.
-	t.Cleanup(func() {
-		for _, cmd := range cmds {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		}
-	})
-
-	type helperResult struct {
-		outcome string
-		err     error
-	}
-	results := make(chan helperResult, len(cmds))
-	for _, cmd := range cmds {
-		go func(cmd *exec.Cmd) {
-			output, err := cmd.CombinedOutput()
-			text := strings.TrimSpace(string(output))
-			if err != nil {
-				results <- helperResult{err: fmt.Errorf("helper failed: %w: %s", err, text)}
-				return
-			}
-			outcome, parseErr := singleFlightOutcome(text)
-			if parseErr != nil {
-				results <- helperResult{err: fmt.Errorf("%w: %s", parseErr, text)}
-				return
-			}
-			results <- helperResult{outcome: outcome}
-		}(cmd)
+	// Each helper is owned: started synchronously so its process handle exists
+	// before anything observes it, waited on exactly once, and cancelled and
+	// REAPED by cleanup before the temp directories are removed.
+	helpers := []*ownedHelper{
+		startOwnedHelper(t, "racer-a", baseEnv),
+		startOwnedHelper(t, "racer-b", baseEnv),
 	}
 
-	// Collect BOTH results before asserting. Returning early on the first
-	// failure would leave the second helper's outcome unread and its process
-	// competing with the next test for the same cache path.
-	outcomes := make([]string, 0, len(cmds))
+	// Collect BOTH results, each within its own finite budget, before
+	// asserting anything. Returning early on the first failure would leave the
+	// second helper's outcome unread and its process competing with the next
+	// test for the same cache path. A helper that exceeds its budget is killed
+	// and its result DISCARDED -- a child that had to be killed is not evidence
+	// about the guard under test.
+	outcomes := make([]string, 0, len(helpers))
 	var failures []error
-	for range cmds {
-		r := <-results
-		if r.err != nil {
-			failures = append(failures, r.err)
+	for _, h := range helpers {
+		text, err := h.wait(helperResultBudget)
+		if err != nil {
+			failures = append(failures, err)
 			continue
 		}
-		outcomes = append(outcomes, r.outcome)
+		outcome, parseErr := singleFlightOutcome(text)
+		if parseErr != nil {
+			failures = append(failures, fmt.Errorf("%s: %w: %s", h.name, parseErr, text))
+			continue
+		}
+		outcomes = append(outcomes, outcome)
 	}
 	if len(failures) > 0 {
 		t.Fatalf("helper(s) failed: %v", errors.Join(failures...))
@@ -1014,66 +1127,67 @@ func TestProviderCacheContendedLockIsBusyNotAPoll(t *testing.T) {
 		"CODEX_HOME="+home,
 		"HERD_QUOTA_CACHE_SECONDS=45",
 	)
-	holder := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
-	holder.Env = append(append([]string{}, baseEnv...),
+	release := filepath.Join(dir, "holder.release")
+	holder := startOwnedHelper(t, "holder", append(append([]string{}, baseEnv...),
 		"HERD_CACHE_HOLD_PROVIDER=codex",
 		"HERD_CACHE_HOLDER_READY="+ready,
-	)
-	contender := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
-	contender.Env = baseEnv
-
-	// Cleanup on every path, including a t.Fatal while the holder still sleeps.
-	t.Cleanup(func() {
-		for _, cmd := range []*exec.Cmd{holder, contender} {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		}
-	})
-
-	if err := holder.Start(); err != nil {
-		t.Fatalf("start holder: %v", err)
-	}
-	holderDone := make(chan error, 1)
-	go func() { holderDone <- holder.Wait() }()
+		"HERD_CACHE_HOLDER_RELEASE="+release,
+	))
+	// The release file is written on EVERY exit path, including a Fatal
+	// below, so the holder is never left waiting on its fail-safe. Cleanup
+	// registered after the helper runs BEFORE the helper's own cleanup, so the
+	// release lands before the reap wait rather than after it.
+	t.Cleanup(func() { _ = os.WriteFile(release, []byte("release\n"), 0o600) })
 
 	// Bounded wait for the announcement, polled rather than slept: the
 	// contender must not start before the lock is provably held, and a holder
 	// that never announces is a failure rather than a silent pass.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(holderReadyBudget)
 	held := false
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(ready); err == nil {
 			held = true
 			break
 		}
-		select {
-		case err := <-holderDone:
-			t.Fatalf("holder exited before announcing the lock: %v", err)
-		case <-time.After(10 * time.Millisecond):
+		if holder.exited() {
+			text, err := holder.wait(helperReapBudget)
+			t.Fatalf("holder exited before announcing the lock: %v: %s", err, text)
 		}
+		time.Sleep(helperReadyPollInterval)
 	}
 	if !held {
-		t.Fatal("holder never announced that it held the provider lock")
+		t.Fatalf("holder never announced that it held the provider lock within %s", holderReadyBudget)
 	}
 
-	output, err := contender.CombinedOutput()
-	text := strings.TrimSpace(string(output))
-	if err != nil {
-		t.Fatalf("contender failed instead of reporting a busy lock: %v: %s", err, text)
+	// The holder now stays locked until THIS test releases it, which happens
+	// only after the contender's result is in hand. The hold therefore spans
+	// the contender's entire attempt by construction. A fixed hold interval
+	// could not promise that: it can expire between the ready file appearing
+	// and the contender reaching the lock, and the contender would then
+	// legitimately succeed while this test called it a failure.
+	contender := startOwnedHelper(t, "contender", baseEnv)
+	text, waitErr := contender.wait(helperResultBudget)
+	if waitErr != nil {
+		t.Fatalf("contender failed instead of reporting a busy lock: %v: %s", waitErr, text)
 	}
 	outcome, parseErr := singleFlightOutcome(text)
 	if parseErr != nil {
 		t.Fatalf("%v: %s", parseErr, text)
 	}
 	if outcome != singleFlightContended {
-		t.Fatalf("contender reported %q while the lock was held for the whole wait, want %q",
+		t.Fatalf("contender reported %q while the lock was held for its whole attempt, want %q",
 			outcome, singleFlightContended)
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("a contender that could not take the lock still polled the provider %d time(s), want 0", got)
 	}
-	if err := <-holderDone; err != nil {
-		t.Fatalf("holder failed: %v", err)
+
+	// Release explicitly and confirm the holder exits cleanly. A holder that
+	// hit its fail-safe reports an error here rather than passing silently.
+	if err := os.WriteFile(release, []byte("release\n"), 0o600); err != nil {
+		t.Fatalf("release holder: %v", err)
+	}
+	if holderText, err := holder.wait(helperResultBudget); err != nil {
+		t.Fatalf("holder failed after release: %v: %s", err, holderText)
 	}
 }
