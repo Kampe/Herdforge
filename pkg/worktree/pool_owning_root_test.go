@@ -446,7 +446,7 @@ func TestRelativeConstructorAnchorsBeforeTheCallerMoves(t *testing.T) {
 
 	t.Chdir(f.foreign)
 	if err := rel.Release(ctx, lease.LeaseID); err != nil {
-		t.Fatalf("release after the caller moved: %v", err)
+		t.Fatalf("the relative constructor stopped resolving against the owning repository, so the required release could not be performed after the caller moved: %v", err)
 	}
 
 	if head := owningGit(t, f.slotPath, "rev-parse", "HEAD"); head != f.mainRef {
