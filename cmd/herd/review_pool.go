@@ -85,6 +85,17 @@ func runPoolReview(ref string) error {
 	// happened to work; everything between them did not. Resolving once here
 	// removes the class rather than the instance, and a root that cannot be
 	// resolved refuses instead of being guessed at.
+	//
+	// Resolving --pool-root below now settles that pool instance too, so it is
+	// worth saying what this still carries alone. Everything built from root
+	// that OUTLIVES this process, or leaves this directory, depends on it: the
+	// review packet records the surface for a LATER --no-launch dispatch that
+	// does not stand here; the retirement pending intent stores
+	// filepath.Rel(root, ...) spellings, which collapse silently to "" when
+	// root is relative and the lease path is not; and prepareCandidateSurface
+	// hands a root-joined path to `git -C root worktree add`, where a relative
+	// spelling is resolved a SECOND time against the repository. Different
+	// consumers, one absolute root.
 	root, err := filepath.Abs(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
 	if err != nil {
 		return fmt.Errorf("resolve repository root: %w", err)

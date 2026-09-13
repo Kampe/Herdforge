@@ -502,6 +502,27 @@ func TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot(t *testing.T) {
 	if err := runEntry(t, sha, base); err != nil {
 		t.Fatalf("a relative repository root was refused: %v", err)
 	}
+
+	// THE HANDOFF, which is the whole point of --no-launch: the packet names
+	// the surface a LATER, manual dispatch must work in. That reader does not
+	// stand where this caller stood, so a surface recorded as
+	// "repo/.herd/review-surfaces/..." names nothing it can reach -- it only
+	// looks right from the one directory that produced it.
+	//
+	// Accepting a relative root therefore means more than not refusing it, and
+	// the rest of this test cannot see the difference: the pool root is
+	// resolved separately, so the slot, the lease and the carrier count are all
+	// correct either way. Reaching the RECORDED surface from a DIFFERENT
+	// directory is what distinguishes a usable location from one that merely
+	// worked here, and it is the behaviour, not the spelling, that is asserted.
+	recorded := packetSurfacePath(t, root)
+	reach := exec.Command("git", "-C", recorded, "rev-parse", "HEAD")
+	reach.Dir = t.TempDir()
+	out, reachErr := reach.Output()
+	if reachErr != nil || strings.TrimSpace(string(out)) != sha {
+		t.Fatalf("the packet handed a later dispatch a surface it cannot reach from its own directory: %q (%v)", recorded, reachErr)
+	}
+
 	if got := entryCarriers(t, root); len(got) != 0 {
 		t.Fatalf("a relative root left an unowned carrier: %v", got)
 	}
@@ -513,6 +534,34 @@ func TestPoolNoLaunchEntryAcceptsARelativeRepositoryRoot(t *testing.T) {
 		t.Fatalf("a relative root left undeclared dirt:\n%s", dirt)
 	}
 	assertCompleteCensusObserved(t, herdrCalls())
+}
+
+// packetSurfacePath returns the surface location the entry RECORDED in the
+// review packet, which is the only thing a later --no-launch dispatch is
+// handed. The packet is found by reading the packet root rather than by
+// rebuilding its name, so the test cannot agree with the implementation by
+// construction.
+func packetSurfacePath(t *testing.T, root string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".herd", "review-packets")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("the entry wrote no review packet: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want exactly one review packet in %s, got %d", dir, len(entries))
+	}
+	body, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("review packet unreadable: %v", err)
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Surface: "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	t.Fatalf("the review packet names no surface:\n%s", body)
+	return ""
 }
 
 // AN EXPLICIT RELATIVE --pool-root, from a different directory.
