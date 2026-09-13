@@ -24,18 +24,67 @@ import (
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
+// IdentityRunner executes one git invocation and returns its stdout.
+//
+// FAC-831: RepositoryIdentity ran `exec.Command` directly, so a public Validate
+// reached git outside the caller's bounded runner and outside the one shared
+// validation budget. The caller now supplies the runner, which carries the
+// correct repository directory, the context, the command and output allowance
+// and the cancellation. This leaf starts no process of its own.
+type IdentityRunner func(args ...string) (string, error)
+
+// ErrNilIdentityRunner means no runner was supplied. There is deliberately no
+// fallback to starting a process here: that would escape the caller's budget,
+// which is the whole reason the runner is a parameter.
+var ErrNilIdentityRunner = errors.New("repository identity: a runner is required")
+
+// identityArgs is the SOLE argument contract for reading the configured origin.
+//
+// It omits -C on purpose: the runner already carries the repository directory,
+// so the directory is chosen in exactly one place rather than two that can
+// disagree.
+func identityArgs() []string {
+	return []string{"config", "--get", "remote.origin.url"}
+}
+
 // RepositoryIdentity derives a non-secret canonical origin binding from git's
 // configured remote. It is an identity binding, not cryptographic proof of
 // remote ownership; callers must not describe it as authentication.
+//
+// Signature and semantics are unchanged. It now delegates to
+// RepositoryIdentityWithRunner with a runner that preserves the previous
+// `git -C <root> ...` behaviour, so there is one identity rule and one
+// normalization, not two copies drifting apart.
 func RepositoryIdentity(root string) (string, error) {
+	return RepositoryIdentityWithRunner(root, func(args ...string) (string, error) {
+		full := append([]string{"-C", root}, args...)
+		out, err := exec.Command("git", full...).Output()
+		return string(out), err
+	})
+}
+
+// RepositoryIdentityWithRunner derives the same binding through a runner the
+// caller owns, so the read happens inside the caller's budget and deadline.
+//
+// A runner error is wrapped with %w and nothing else is added, so a caller's
+// budget or cancellation sentinel stays reachable through errors.Is instead of
+// being flattened into an identity failure.
+//
+// Credentials cannot leak through the result: the scheme branch returns only
+// the parsed host and path, so userinfo is dropped, and no branch echoes the
+// raw origin into an error or a log.
+func RepositoryIdentityWithRunner(root string, run IdentityRunner) (string, error) {
 	if strings.TrimSpace(root) == "" {
 		return "", ErrUnsafeTeardown
 	}
-	out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output()
+	if run == nil {
+		return "", ErrNilIdentityRunner
+	}
+	raw, err := run(identityArgs()...)
 	if err != nil {
 		return "", fmt.Errorf("authenticated repository origin: %w", err)
 	}
-	origin := strings.TrimSpace(string(out))
+	origin := strings.TrimSpace(raw)
 	if origin == "" {
 		return "", fmt.Errorf("authenticated repository origin is empty")
 	}
