@@ -389,3 +389,115 @@ func TestAncestorProvenChargesItsOwnCommand(t *testing.T) {
 		t.Fatalf("one ancestry probe charged %d commands, want 1; the search loop could then run unbounded", got)
 	}
 }
+
+// PUBLIC ENTRY: Gate.ProveLanded must spend ONE injected allowance across its
+// whole invocation, including the reconstruction stage that used to run on
+// context.Background().
+func TestGateProveLandedSpendsOneAllowanceAcrossTheInvocation(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 2)
+	g := &Gate{RepoDir: dir, ProofBudget: ProofBudget{MaxCommands: 1}}
+
+	if _, err := g.ProveLanded(Request{BaseSHA: base, CandidateSHA: candidate}, candidate); !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want ErrProofBudgetCommands from the public entry", err)
+	}
+}
+
+// PUBLIC ENTRY, merge mode: a cancelled or exhausted run must NEVER be reported
+// as "not an ancestor".
+//
+// Prove's merge mode called gitroot.RequireAncestor, which starts its own
+// process outside any allowance and whose boolean shape collapses every failure
+// into absence. A budget refusal then read as proof that the candidate had not
+// landed — a content verdict from a run that never looked.
+func TestPublicProveMergeModeDoesNotReportBudgetRefusalAsNonAncestry(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 2)
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{MaxCommands: 1})
+	defer cancel()
+
+	_, err := proveContext(ctx, dir, ProofRequest{
+		Mode: ModeMerge, BaseSHA: base, CandidateSHA: candidate, LandedSHA: candidate,
+	})
+	if err == nil {
+		t.Fatal("an exhausted allowance produced a merge-mode proof")
+	}
+	if !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want ErrProofBudgetCommands", err)
+	}
+	if strings.Contains(err.Error(), "is not an ancestor") {
+		t.Fatalf("a budget refusal was reported as absence: %v", err)
+	}
+}
+
+// The same public entry on the default allowance still proves an ordinary
+// merge-mode landing, so the refusals above are not an entry that refuses
+// everything.
+func TestPublicProveMergeModeSucceedsOnTheDefaultBudget(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 2)
+	proof, err := Prove(dir, ProofRequest{
+		Mode: ModeMerge, BaseSHA: base, CandidateSHA: candidate, LandedSHA: candidate,
+	})
+	if err != nil {
+		t.Fatalf("the default allowance refused an ordinary merge-mode landing: %v", err)
+	}
+	if proof == nil || proof.Method != "exact-ancestry" {
+		t.Fatalf("proof = %+v, want an exact-ancestry proof", proof)
+	}
+}
+
+// requireAncestorBounded must charge, and must keep absence and refusal apart.
+func TestRequireAncestorBoundedChargesAndSeparatesAbsenceFromRefusal(t *testing.T) {
+	dir, base, candidate := boundedProofRepo(t, 1)
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{})
+	defer cancel()
+	ledger := ledgerFrom(ctx)
+
+	before := ledger.spentCount()
+	if err := requireAncestorBounded(ctx, dir, base, candidate, "role"); err != nil {
+		t.Fatalf("a real ancestor was refused: %v", err)
+	}
+	if got := ledger.spentCount() - before; got != 1 {
+		t.Fatalf("one ancestry check charged %d commands, want 1", got)
+	}
+	// Genuine absence still reads as absence.
+	if err := requireAncestorBounded(ctx, dir, candidate, base, "role"); err == nil {
+		t.Fatal("a non-ancestor was accepted")
+	} else if !strings.Contains(err.Error(), "is not an ancestor") {
+		t.Fatalf("absence err = %v, want the absence message", err)
+	}
+	// An exhausted allowance does NOT.
+	spent, cancel2 := withProofBudget(context.Background(), ProofBudget{MaxCommands: 1})
+	defer cancel2()
+	_ = requireAncestorBounded(spent, dir, base, candidate, "role")
+	err := requireAncestorBounded(spent, dir, base, candidate, "role")
+	if !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want ErrProofBudgetCommands", err)
+	}
+	if strings.Contains(err.Error(), "is not an ancestor") {
+		t.Fatalf("a budget refusal was reported as absence: %v", err)
+	}
+}
+
+// The identity read is charged against the invocation's allowance, and a
+// refusal stays recognisable instead of becoming an identity failure.
+func TestRepositoryIdentityIsChargedAndRefusalStaysRecognisable(t *testing.T) {
+	dir := gitRepo(t)
+	g := &Gate{RepoDir: dir}
+
+	ctx, cancel := withProofBudget(context.Background(), ProofBudget{})
+	defer cancel()
+	ledger := ledgerFrom(ctx)
+	before := ledger.spentCount()
+	if _, err := g.repositoryIdentity(ctx); err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	if got := ledger.spentCount() - before; got != 1 {
+		t.Fatalf("the identity read charged %d commands, want 1; it would otherwise run outside the allowance", got)
+	}
+
+	spent, cancel2 := withProofBudget(context.Background(), ProofBudget{MaxCommands: 1})
+	defer cancel2()
+	_, _ = g.repositoryIdentity(spent)
+	if _, err := g.repositoryIdentity(spent); !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("err = %v, want ErrProofBudgetCommands", err)
+	}
+}

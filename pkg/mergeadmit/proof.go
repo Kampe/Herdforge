@@ -33,7 +33,6 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
@@ -176,9 +175,11 @@ func proveContext(ctx context.Context, repoDir string, req ProofRequest) (*Proof
 		// The candidate object survived, so ancestry is the whole question.
 		// This exit status IS the gate — capturing it and reporting success
 		// anyway is the FAC-178 bug.
-		if err := gitroot.RequireAncestor(repoDir, candidate, landed); err != nil {
-			return nil, fmt.Errorf("merge-mode proof failed: candidate %s is not an ancestor of landed %s",
-				short(candidate), short(landed))
+		if err := requireAncestorBounded(ctx, repoDir, candidate, landed, "merge-mode proof failed"); err != nil {
+			// A cancelled or exhausted run surfaces as itself. The old shape
+			// collapsed every failure into "is not an ancestor", so a budget
+			// refusal read as proof that the candidate had not landed.
+			return nil, err
 		}
 		p.MergeSHA = candidate
 		p.Method = "exact-ancestry"

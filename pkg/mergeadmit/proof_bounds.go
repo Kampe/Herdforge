@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // FAC-831 / review 6817b6221d2d: the producer proof path was not physically
@@ -241,4 +243,60 @@ func (l *proofLedger) spentCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.spent
+}
+
+// gateProofContext installs the ONE allowance a whole public gate invocation
+// spends, and returns it for every stage to share.
+//
+// Review 212: each public entry previously installed its own, and several
+// stages ran outside any — identity, follow-up resolution and merge-mode
+// ancestry all reached git unbounded after the proof had been budgeted. A
+// per-stage allowance is not a bound on the invocation: five bounded stages are
+// five times the work. There is exactly one per entry now, and nested stages
+// reuse it rather than resetting.
+func (g *Gate) gateProofContext() (context.Context, context.CancelFunc) {
+	budget := ProofBudget{}
+	if g != nil {
+		budget = g.ProofBudget
+	}
+	return withProofBudget(context.Background(), budget)
+}
+
+// boundedGit is the runner handed to leaf packages so their reads are charged
+// against THIS invocation's allowance. It carries the repository directory, so
+// a leaf never chooses it, and it adds no error text, so a budget or
+// cancellation sentinel stays reachable through errors.Is.
+func boundedGit(ctx context.Context, repoDir string) func(args ...string) (string, error) {
+	return func(args ...string) (string, error) {
+		return gitOut(ctx, repoDir, args...)
+	}
+}
+
+// repositoryIdentity reads the origin binding inside the shared allowance.
+//
+// It replaces toolchild.RepositoryIdentity, which ran its own unbounded
+// exec.Command after the proof had already been budgeted. The normalization
+// rule is NOT duplicated: the leaf still owns it, and this only supplies the
+// bounded runner.
+func (g *Gate) repositoryIdentity(ctx context.Context) (string, error) {
+	return toolchild.RepositoryIdentityWithRunner(g.RepoDir, boundedGit(ctx, g.RepoDir))
+}
+
+// requireAncestorBounded answers ancestry inside the shared allowance.
+//
+// gitroot.RequireAncestor starts its own process outside any budget, and its
+// boolean shape cannot distinguish "not an ancestor" from "the run was
+// cancelled". ancestorProven already separates those, so a cancelled or
+// exhausted run surfaces as itself and NEVER as an absence answer — which is
+// the difference between refusing a merge and silently deciding it did not
+// land.
+func requireAncestorBounded(ctx context.Context, repoDir, sha, ref, role string) error {
+	proven, err := ancestorProven(ctx, repoDir, sha, ref)
+	if err != nil {
+		return err
+	}
+	if !proven {
+		return fmt.Errorf("%s: %s is not an ancestor of %s", role, short(sha), short(ref))
+	}
+	return nil
 }

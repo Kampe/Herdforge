@@ -24,8 +24,25 @@ func (g *Gate) ProveLanded(req Request, landed string) (*Proof, error) {
 	// it ran with no deadline and no allowance. One finite, SHARED budget is
 	// installed here and reaches the whole proof: deadline, git command count,
 	// per-command output bytes and range size.
-	ctx, cancel := withProofBudget(context.Background(), g.ProofBudget)
+	ctx, cancel := g.gateProofContext()
 	defer cancel()
+	return g.proveLandedContext(ctx, req, landed)
+}
+
+// proveLandedContext is ProveLanded inside an allowance the CALLER already
+// installed, so a public entry that also seals a receipt spends ONE budget
+// across proof, identity and every follow-up read instead of resetting.
+func (g *Gate) proveLandedContext(ctx context.Context, req Request, landed string) (*Proof, error) {
+	if g == nil {
+		return nil, fmt.Errorf("landed proof requires a gate")
+	}
+	if req.Reconstruction != nil && g.Ledger == nil {
+		return nil, fmt.Errorf("reconstructed landing proof requires a ledger")
+	}
+	base, candidate, err := g.reconstructionContentContext(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 	return ProveEquivalentLandedContext(ctx, g.RepoDir, ProofRequest{BaseSHA: base, CandidateSHA: candidate, LandedSHA: landed})
 }
 

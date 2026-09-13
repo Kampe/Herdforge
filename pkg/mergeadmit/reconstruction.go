@@ -6,10 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 
-	"github.com/Kampe/Herdforge/pkg/harvest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 )
 
@@ -20,7 +18,18 @@ func ReconstructionDigest(row reviewledger.LedgerRow) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// reconstructionContent keeps its signature for existing callers and runs under
+// a fresh allowance of its own.
 func (g *Gate) reconstructionContent(req Request) (string, string, error) {
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+	return g.reconstructionContentContext(ctx, req)
+}
+
+// reconstructionContentContext runs inside the allowance the public entry
+// installed. Review 212: its git reads and its ancestry probe ran unbounded,
+// after the proof had already been budgeted.
+func (g *Gate) reconstructionContentContext(ctx context.Context, req Request) (string, string, error) {
 	r := req.Reconstruction
 	if r == nil {
 		return req.BaseSHA, req.CandidateSHA, nil
@@ -47,15 +56,14 @@ func (g *Gate) reconstructionContent(req Request) (string, string, error) {
 	if !matched {
 		return "", "", fmt.Errorf("missing or mismatched reconstruction attestation")
 	}
-	git := func(args ...string) (string, error) {
-		c := exec.Command("git", args...)
-		c.Dir = g.RepoDir
-		b, e := c.Output()
-		return string(b), e
-	}
+	// Charged against the invocation's allowance, and its errors are returned
+	// unchanged so a budget or cancellation sentinel stays reachable.
+	git := boundedGit(ctx, g.RepoDir)
 	for _, pair := range [][2]string{{req.BaseSHA, req.CandidateSHA}, {r.BaseSHA, r.SHA}} {
-		if !harvest.IsAncestor(context.Background(), g.RepoDir, pair[0], pair[1]) {
-			return "", "", fmt.Errorf("reconstruction base is not an ancestor")
+		// Bounded, and a cancelled or exhausted run is NOT reported as "not an
+		// ancestor": that would turn "I could not look" into a content verdict.
+		if err := requireAncestorBounded(ctx, g.RepoDir, pair[0], pair[1], "reconstruction base"); err != nil {
+			return "", "", err
 		}
 	}
 	paths := func(base, head string) (string, error) {
