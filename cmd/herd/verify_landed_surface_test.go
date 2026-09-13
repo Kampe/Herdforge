@@ -97,9 +97,11 @@ func TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin(t *testing.T
 	}
 }
 
-// A retired carrier WITH an explicit pinned candidate present in this
-// repository may use the invoking checkout.
-func TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo(t *testing.T) {
+// A retired carrier WITH an explicit pinned candidate may use the invoking
+// checkout. Selection does not check that the object is present here, and no
+// longer claims to: that is proved by the bounded gate proof. See
+// TestVerifyLandedGateRefusesAnAbsentPin.
+func TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidate(t *testing.T) {
 	dir := surfaceRepo(t)
 	candidate := surfaceCommit(t, dir, "a.txt", "one\n")
 
@@ -119,9 +121,13 @@ func TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo(t *testing.
 	}
 }
 
-// FOREIGN REPOSITORY: the pin names an object this repository does not hold, so
-// the invoking checkout is not the one the candidate was reviewed in.
-func TestResolveVerifyLandedSurfaceRefusesAForeignRepository(t *testing.T) {
+// FOREIGN REPOSITORY: selection no longer decides this. It returns the invoking
+// root without looking at the repository at all, and the bounded gate proof
+// refuses it, because that is the step that resolves the object it will
+// actually prove. The refusal itself is asserted in
+// TestVerifyLandedGateRefusesAnAbsentPin; this pins the SELECTION half of the
+// contract so the move cannot silently become an acceptance.
+func TestResolveVerifyLandedSurfaceSelectsWithoutProvingTheRepository(t *testing.T) {
 	reviewed := surfaceRepo(t)
 	candidate := surfaceCommit(t, reviewed, "a.txt", "one\n")
 
@@ -130,29 +136,14 @@ func TestResolveVerifyLandedSurfaceRefusesAForeignRepository(t *testing.T) {
 
 	surface, err := resolveVerifyLandedSurface("fix/x", verifyLandedBinding{Candidate: candidate},
 		func(string) string { return "" }, rootOf(foreign))
-	if err == nil {
-		t.Fatalf("proved a landing in a repository that does not hold the candidate: %q", surface.Dir)
+	if err != nil {
+		t.Fatalf("selection ran a check of its own: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not present in the invoking repository") {
-		t.Fatalf("refusal reason = %v", err)
+	if surface.Dir != foreign || !surface.CarrierRetired {
+		t.Fatalf("selection did not return the invoking root: %+v", surface)
 	}
-}
-
-// requireObjectPresent must demand a COMMIT. A tree or blob id resolves in git
-// but is not a candidate.
-func TestRequireObjectPresentDemandsACommit(t *testing.T) {
-	dir := surfaceRepo(t)
-	head := surfaceCommit(t, dir, "a.txt", "one\n")
-	tree := surfaceGit(t, dir, "rev-parse", head+"^{tree}")
-
-	if err := requireObjectPresent(dir, head); err != nil {
-		t.Fatalf("a real commit was refused: %v", err)
-	}
-	if err := requireObjectPresent(dir, tree); err == nil {
-		t.Fatal("a tree id was accepted as a candidate commit")
-	}
-	if err := requireObjectPresent(dir, strings.Repeat("0", 40)); err == nil {
-		t.Fatal("an absent object was accepted")
+	if surface.PinnedCandidate != candidate {
+		t.Fatal("selection lost the pin that the proof must be bound to")
 	}
 }
 
@@ -163,26 +154,5 @@ func TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead(t *testing.T) 
 	}
 	if got := pinnedCandidateFor(verifyLandedBinding{}); got != "" {
 		t.Fatalf("an unpinned binding produced %q; only --candidate or an admitted PASS may pin", got)
-	}
-}
-
-// An empty identity must be refused without spending a git subprocess, and
-// without producing a message that reads as a repository problem.
-//
-// CI 34742740503 m03 surfaced this: with the pin guard removed, an empty
-// candidate reached requireObjectPresent and came back as
-// "git cat-file -t : fatal: Not a valid object name", with a blank SHA.
-func TestRequireObjectPresentRefusesAnEmptyIdentityWithoutRunningGit(t *testing.T) {
-	// A directory that is NOT a repository: if a command were run, it would
-	// fail for that reason instead, and the message below would differ.
-	err := requireObjectPresent(t.TempDir(), "   ")
-	if err == nil {
-		t.Fatal("an empty identity was accepted")
-	}
-	if !strings.Contains(err.Error(), "no candidate identity to look up") {
-		t.Fatalf("err = %v, want the empty-identity refusal rather than a git failure", err)
-	}
-	if strings.Contains(err.Error(), "cat-file") {
-		t.Fatalf("err = %v; a git command was run for an empty identity", err)
 	}
 }

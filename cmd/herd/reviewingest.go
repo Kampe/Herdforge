@@ -1923,6 +1923,14 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 	if err != nil {
 		return err
 	}
+	// PR843/3d645a26: a pin authorises only the object it names. The surface
+	// check above no longer runs its own unbounded `git cat-file`; presence and
+	// commit-ness are proved by the bounded gate proof below, against
+	// req.CandidateSHA. This is what makes those the same object, so the
+	// fallback cannot be authorised by one identity and then spent on another.
+	if err := requirePinnedCandidateProved(surface, req.CandidateSHA); err != nil {
+		return err
+	}
 	gate, err := buildMergeGate(req.Ref, req.TaskID, 0)
 	if err != nil {
 		return fmt.Errorf("receipt reconcile: %w", err)
