@@ -133,6 +133,11 @@ func TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
+	// This fixture's reviewed candidate IS its carrier: one commit on the pull
+	// request line holds the reviewed content, which is the ordinary
+	// single-commit shape. prShapedLanding separates the two only because it
+	// models a harvested carrier distinct from the reviewed SHA.
+	candidate, carrier := sideCommit, sideCommit
 	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err == nil {
 		t.Fatalf("sealed %s although nothing integrates the reviewed base with the carrier", short(got))
@@ -298,6 +303,11 @@ func TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent(t *testin
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
+	// This fixture's reviewed candidate IS its carrier: one commit on the pull
+	// request line holds the reviewed content, which is the ordinary
+	// single-commit shape. prShapedLanding separates the two only because it
+	// models a harvested carrier distinct from the reviewed SHA.
+	candidate, carrier := sideCommit, sideCommit
 	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err == nil {
 		t.Fatalf("selected %s: an ours merge that discarded every reviewed hunk was sealed as the integration commit",
@@ -341,6 +351,11 @@ func TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent(t *testi
 	if err != nil {
 		t.Fatalf("range commits: %v", err)
 	}
+	// This fixture's reviewed candidate IS its carrier: one commit on the pull
+	// request line holds the reviewed content, which is the ordinary
+	// single-commit shape. prShapedLanding separates the two only because it
+	// models a harvested carrier distinct from the reviewed SHA.
+	candidate, carrier := sideCommit, sideCommit
 	got, err := integrationCommitFor(context.Background(), dir, base, candidate, carrier, landedCommits)
 	if err == nil {
 		t.Fatalf("selected %s: a merge whose tree holds different bytes than the reviewed result was sealed",

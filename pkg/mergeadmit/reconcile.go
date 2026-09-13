@@ -147,6 +147,7 @@ func (g *Gate) ReconcileLanded(req Request) (*hsync.CompletionReceipt, error) {
 		BaseSHA:            proof.BaseSHA,
 		CandidateSHA:       proof.CandidateSHA,
 		MergeSHA:           proof.MergeSHA,
+		ContentSHA:         proof.ContentSHA,
 		PatchID:            proof.PatchID,
 		AcceptanceDigest:   req.AcceptanceDigest,
 		VerificationDigest: result.VerificationDigest,
@@ -249,7 +250,7 @@ func (g *Gate) reconcileLandedReduced(req Request) (*hsync.CompletionReceipt, er
 	if err != nil {
 		return nil, fmt.Errorf("herd-merge-reconcile: resolve repository identity: %w", err)
 	}
-	receipt := &hsync.CompletionReceipt{RepoID: repoID, TaskRef: hsync.NormalizeRef(req.Ref), BaseSHA: proof.BaseSHA, CandidateSHA: proof.CandidateSHA, MergeSHA: proof.MergeSHA, PatchID: proof.PatchID, VerificationDigest: result.VerificationDigest, RiskTier: result.Tier, AuthorFamily: result.AuthorFamily, ReviewerFamily: result.ReviewerFamily, Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged, ProvenanceMode: hsync.ProvenanceReduced, PullRequest: rp.PullRequest}
+	receipt := &hsync.CompletionReceipt{RepoID: repoID, TaskRef: hsync.NormalizeRef(req.Ref), BaseSHA: proof.BaseSHA, CandidateSHA: proof.CandidateSHA, MergeSHA: proof.MergeSHA, ContentSHA: proof.ContentSHA, PatchID: proof.PatchID, VerificationDigest: result.VerificationDigest, RiskTier: result.Tier, AuthorFamily: result.AuthorFamily, ReviewerFamily: result.ReviewerFamily, Verdict: "PASS", IntegrationResult: hsync.IntegrationMerged, ProvenanceMode: hsync.ProvenanceReduced, PullRequest: rp.PullRequest}
 	if req.Reconstruction != nil {
 		receipt.CandidateSHA = req.CandidateSHA
 		receipt.BaseSHA = req.BaseSHA

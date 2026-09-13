@@ -123,7 +123,10 @@ for rel in "${sources[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Focused suites. These deliberately EXCLUDE the subprocess CLI fixtures: they
+# Focused suites. The pkg/sync row is the CONSUMER half: a receipt the producer
+# seals is only useful if the shipped consumer accepts it, and the FAC-831
+# carrier is meaningless unless the gate that reads it is proven too. These
+# deliberately EXCLUDE the subprocess CLI fixtures: they
 # build and run the whole binary, which this driver would then pay for on every
 # mutant. Their coverage belongs to the ordinary test job; this job exists to
 # prove the assertions below are not vacuous.
@@ -131,6 +134,7 @@ done
 suites=(
 "./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt"
 "./cmd/herd/${sep}^(TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged|TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin|TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo|TestResolveVerifyLandedSurfaceRefusesAForeignRepository|TestRequireObjectPresentDemandsACommit|TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead)\$${sep}TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo TestResolveVerifyLandedSurfaceRefusesAForeignRepository TestRequireObjectPresentDemandsACommit TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead"
+"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedDiscardedAndAlteredCarriers|TestSealedCarrierIsCoveredByTheDigest)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedDiscardedAndAlteredCarriers TestSealedCarrierIsCoveredByTheDigest"
 )
 
 # ---------------------------------------------------------------------------

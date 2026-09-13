@@ -87,6 +87,7 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 		BaseSHA:            proof.BaseSHA,
 		CandidateSHA:       proof.CandidateSHA,
 		MergeSHA:           proof.MergeSHA,
+		ContentSHA:         proof.ContentSHA,
 		PatchID:            proof.PatchID,
 		AcceptanceDigest:   req.AcceptanceDigest,
 		VerificationDigest: d.VerificationDigest,

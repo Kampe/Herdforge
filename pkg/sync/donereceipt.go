@@ -52,15 +52,27 @@ const ProvenanceReduced = "reduced"
 // DoneRecord.ProviderReadback, and a write whose readback does not say "done"
 // is a hard failure (see BoardDone).
 type CompletionReceipt struct {
-	Version               int    `json:"version"`
-	RepoID                string `json:"repo_id"`
-	TaskRef               string `json:"task_ref"`
-	TaskID                string `json:"task_id"`
-	ProviderRevision      string `json:"provider_revision"`
-	LeaseGeneration       int64  `json:"lease_generation"`
-	BaseSHA               string `json:"base_sha"`
-	CandidateSHA          string `json:"candidate_sha"`
-	MergeSHA              string `json:"merge_sha"`
+	Version          int    `json:"version"`
+	RepoID           string `json:"repo_id"`
+	TaskRef          string `json:"task_ref"`
+	TaskID           string `json:"task_id"`
+	ProviderRevision string `json:"provider_revision"`
+	LeaseGeneration  int64  `json:"lease_generation"`
+	BaseSHA          string `json:"base_sha"`
+	CandidateSHA     string `json:"candidate_sha"`
+	MergeSHA         string `json:"merge_sha"`
+	// ContentSHA is the commit whose patch PatchID identifies, when that is
+	// NOT the merge commit itself.
+	//
+	// A pull-request landing integrates reviewed work with a merge commit
+	// whose own diff is empty, so PatchID cannot be the merge's. Empty means
+	// the ordinary shape where the merge carries the patch, and the pre-image
+	// below omits it, so every receipt minted before this field existed keeps
+	// its digest byte for byte. Set, it is SEALED by the digest like every
+	// other field and is verified by Validate against the merge it claims to
+	// be carried by -- it is a narrowing of the content gate, never a way
+	// around it.
+	ContentSHA            string `json:"content_sha,omitempty"`
 	PatchID               string `json:"patch_id"`
 	AcceptanceDigest      string `json:"acceptance_digest"`
 	AcceptanceEvidence    string `json:"acceptance_evidence,omitempty"`
@@ -90,6 +102,7 @@ type receiptForDigest struct {
 	BaseSHA               string `json:"base_sha"`
 	CandidateSHA          string `json:"candidate_sha"`
 	MergeSHA              string `json:"merge_sha"`
+	ContentSHA            string `json:"content_sha,omitempty"`
 	PatchID               string `json:"patch_id"`
 	AcceptanceDigest      string `json:"acceptance_digest"`
 	AcceptanceEvidence    string `json:"acceptance_evidence,omitempty"`
@@ -113,7 +126,8 @@ func (r CompletionReceipt) ComputeDigest() string {
 		Version: r.Version, RepoID: r.RepoID, TaskRef: r.TaskRef, TaskID: r.TaskID,
 		ProviderRevision: r.ProviderRevision, LeaseGeneration: r.LeaseGeneration,
 		BaseSHA: r.BaseSHA, CandidateSHA: r.CandidateSHA, MergeSHA: r.MergeSHA,
-		PatchID: r.PatchID, AcceptanceDigest: r.AcceptanceDigest,
+		ContentSHA: r.ContentSHA,
+		PatchID:    r.PatchID, AcceptanceDigest: r.AcceptanceDigest,
 		AcceptanceEvidence: r.AcceptanceEvidence,
 		VerificationDigest: r.VerificationDigest, RiskTier: r.RiskTier,
 		AuthorFamily: r.AuthorFamily, ReviewerFamily: r.ReviewerFamily,
@@ -234,16 +248,8 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 		return fmt.Errorf("base sha %s is not an ancestor of merge sha %s", r.BaseSHA, r.MergeSHA)
 	}
 
-	// Content binding: the merged commit must carry the accepted candidate's
-	// patch. This is what makes "an empty commit naming the ticket" useless —
-	// an empty commit has no patch id at all.
-	landed, err := PatchID(repoDir, r.MergeSHA)
-	if err != nil {
-		return fmt.Errorf("merge sha %s: %w", r.MergeSHA, err)
-	}
-	if landed != r.PatchID {
-		return fmt.Errorf("merge sha %s carries patch %s, not the accepted candidate's patch %s",
-			r.MergeSHA, landed, r.PatchID)
+	if err := r.validateContentBinding(repoDir); err != nil {
+		return err
 	}
 	// Reduced receipts are deliberately minted only by post-merge PR
 	// reconciliation after the exact review-ledger verdict and patch-equivalent
@@ -492,3 +498,85 @@ func ReadDoneLog(repoDir string) ([]DoneRecord, error) {
 }
 
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// contentPreservedInMerge proves the merge actually KEPT what the carrier
+// changed, rather than merely descending from it.
+//
+// Two real landings satisfy ancestry and still land something else: an ours
+// merge that discards every reviewed hunk, and a merge amended to substitute
+// different bytes. Both leave the carrier an ancestor of the merge, so the
+// graph says yes while the tree says no. Comparing the carrier's own paths
+// between the two trees is what tells them apart.
+//
+// Scope is deliberately the carrier's paths, not the whole tree: later
+// unrelated commits legitimately change other files, and requiring the trees to
+// match outright would refuse every honest landing that was not the tip.
+func contentPreservedInMerge(repoDir, contentSHA, mergeSHA string) error {
+	changed, err := git(repoDir, "diff-tree", "--no-commit-id", "--name-only", "-r", contentSHA)
+	if err != nil {
+		return fmt.Errorf("content sha %s: cannot list the paths it changed: %w", contentSHA, err)
+	}
+	paths := make([]string, 0, 8)
+	for _, line := range strings.Split(changed, "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) == 0 {
+		// A carrier that changed nothing cannot be the content this receipt
+		// claims landed. PatchID refuses an empty commit too; refusing here as
+		// well keeps the reason specific instead of arriving as "no patch".
+		return fmt.Errorf("content sha %s changed no path; it cannot be the landed content", contentSHA)
+	}
+	args := append([]string{"diff", "--quiet", contentSHA, mergeSHA, "--"}, paths...)
+	if _, err := git(repoDir, args...); err != nil {
+		return fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: the paths it changed differ in the merged tree",
+			mergeSHA, contentSHA)
+	}
+	return nil
+}
+
+// validateContentBinding is the content half of Validate, extracted so the
+// contract can be driven directly by a test without fabricating every unrelated
+// field a full receipt carries. Validate calls it and nothing else does: this
+// is the shipped consumer path, not a copy of it.
+func (r CompletionReceipt) validateContentBinding(repoDir string) error {
+	// Content binding: the accepted candidate's patch must actually be in what
+	// landed. This is what makes "an empty commit naming the ticket" useless —
+	// an empty commit has no patch id at all.
+	//
+	// Ordinary landing: the merge commit carries the patch, and this is exactly
+	// the check it always was. Pull-request landing: the merge integrates the
+	// work and its OWN diff is empty, so the patch belongs to the carrier the
+	// receipt seals in ContentSHA. That does not relax the gate, it moves it
+	// onto the object that actually holds the content and adds two more
+	// requirements the ordinary shape never needed.
+	contentSHA := r.MergeSHA
+	if r.ContentSHA != "" {
+		contentSHA = r.ContentSHA
+		// Ancestry: the carrier must be IN the merge it claims to be carried
+		// by. Without this a receipt could name any commit in the repository
+		// whose patch happens to match and pass.
+		if _, err := git(repoDir, "merge-base", "--is-ancestor", r.ContentSHA, r.MergeSHA); err != nil {
+			return fmt.Errorf("content sha %s is not an ancestor of merge sha %s", r.ContentSHA, r.MergeSHA)
+		}
+		// Replay: every path the carrier changed must still hold the carrier's
+		// bytes in the merge's tree. Ancestry alone is satisfied by an ours
+		// merge that discarded every reviewed hunk, and by a merge amended to
+		// substitute different content: both keep the carrier as an ancestor
+		// while landing something else.
+		if err := contentPreservedInMerge(repoDir, r.ContentSHA, r.MergeSHA); err != nil {
+			return err
+		}
+	}
+	landed, err := PatchID(repoDir, contentSHA)
+	if err != nil {
+		return fmt.Errorf("content sha %s: %w", contentSHA, err)
+	}
+	if landed != r.PatchID {
+		return fmt.Errorf("content sha %s carries patch %s, not the accepted candidate's patch %s",
+			contentSHA, landed, r.PatchID)
+	}
+	return nil
+}
