@@ -1,0 +1,531 @@
+package mail
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Bounded incremental reads for the control mailbox.
+//
+// A full read materialises the whole JSONL file and returns a recipient's
+// entire history: the canonical bus is over 11 MB and one root inbox read
+// returned over 8 MB, every time. This path bounds what is RETAINED and
+// RETURNED. It does not bound the SCAN: JSONL carries no index, so a page
+// still walks the file from the start, and it walks it to the END even after
+// the page is full, because an integrity error past the boundary is still an
+// integrity error. Page N costs O(file) to scan and O(limit) to hold.
+
+const (
+	// MaxBoundedRecordBytes caps one encoded record so a single pathological
+	// line cannot defeat the budget it is counted against.
+	MaxBoundedRecordBytes = 1 << 20
+	// MaxBoundedLimit and MaxBoundedPageBytes cap operator input. A caller
+	// asking for a billion records is asking for the unbounded behaviour this
+	// command exists to replace.
+	MaxBoundedLimit     = 10000
+	MaxBoundedPageBytes = 32 << 20
+	// maxReportedQuarantineErrors bounds what a failing page carries back.
+	// Accumulating one error per malformed row would make a corrupt file
+	// allocate without limit, which is the bug this file is about.
+	maxReportedQuarantineErrors = 4
+)
+
+// ErrRecordExceedsBudget reports a record that cannot fit any page at the
+// requested budget. Returning it is what stops a caller looping forever on
+// empty, truncated pages whose cursor never advances.
+var ErrRecordExceedsBudget = errors.New("mail: record exceeds the requested page byte budget")
+
+// ErrStorageRewound reports a cursor ahead of the store. The control mailbox
+// is NOT purely append-only -- the receipt-backed repair path rewrites it in
+// place -- so a cursor can outlive the numbering it was issued against.
+// Resuming anyway would silently skip everything below the mark.
+var ErrStorageRewound = errors.New("mail: cursor is ahead of the store; it was replaced, truncated or renumbered")
+
+// ErrStorageUnordered reports records whose sequences do not ascend in file
+// order. A high-water mark is only sound over an ascending store; on any
+// other shape it skips the lower records that follow a higher one.
+var ErrStorageUnordered = errors.New("mail: store sequences do not ascend in file order; a high-water mark would skip records")
+
+// Cursor is a versioned position carrying, per source, a high-water mark AND
+// a prefix watermark over that store's consumed records. It is bound to the
+// recipient and to the resolved identity of the stores it was issued against.
+//
+// Two marks, not one, because the control bus and the feedback store number
+// records with SEPARATE counters -- feedback conversion sets Sequence from
+// its own per-file id -- so a single shared mark skips records in whichever
+// space ran ahead.
+//
+// The source fingerprint is a hash, never a path: cursors travel through logs
+// and artifacts, and a host path does not belong in either.
+type Cursor struct {
+	Recipient string
+	Source    string
+	Control   int64
+	// ControlAnchor and FeedbackAnchor are PREFIX WATERMARKS: a rolling
+	// digest over the stable identity and content of every record up to and
+	// including the mark, folded in order.
+	//
+	// An anchor on the FIRST record alone did not detect the class this
+	// claims to. A replacement can keep record one and rewrite everything
+	// after it, and the feedback anchor hashed only the counter, so different
+	// content at the same id produced an identical value. A prefix watermark
+	// covers every record the cursor has already consumed, so any change to
+	// any of them is visible on resume.
+	//
+	// Mutable acknowledgement state is deliberately EXCLUDED -- Envelope.Read
+	// on the control side, read_at on the feedback side -- so a supported
+	// ack rewrite leaves a cursor resumable while a content replacement does
+	// not. The full scan this costs is already the documented price of a page.
+	ControlAnchor  string
+	Feedback       int64
+	FeedbackAnchor string
+}
+
+const (
+	cursorVersion = "v2"
+	// EmptyAnchor is the anchor of a store with no records.
+	EmptyAnchor = "0"
+)
+
+// SourceFingerprint identifies the exact stores a cursor is valid against.
+//
+// Paths are RESOLVED first: two runs with the same relative --mail value from
+// different working directories address different files, and hashing the raw
+// strings made them accept each other's cursors. Symlinks are resolved too,
+// so one store reached by two names is one identity. A path that cannot be
+// resolved is fingerprinted from its absolute form, which still separates it
+// from an unrelated store; it is never silently treated as equal.
+func SourceFingerprint(controlPath, feedbackDir string) (string, error) {
+	control, err := canonicalStoragePath(controlPath)
+	if err != nil {
+		return "", fmt.Errorf("mail: resolve control store identity: %w", err)
+	}
+	feedback, err := canonicalStoragePath(feedbackDir)
+	if err != nil {
+		return "", fmt.Errorf("mail: resolve feedback store identity: %w", err)
+	}
+	sum := sha256.Sum256([]byte(control + "\x00" + feedback))
+	return hex.EncodeToString(sum[:8]), nil
+}
+
+// canonicalStoragePath resolves a store to the identity a fingerprint may be
+// computed from.
+//
+// Failure is PROPAGATED, not papered over. An earlier version returned the
+// raw input when filepath.Abs failed and the absolute form when EvalSymlinks
+// failed, then claimed the result identified the store exactly -- so a path
+// that could not be resolved was fingerprinted as if it had been.
+//
+// A store that does not exist yet is not a resolution failure: its PARENT is
+// resolved and the leaf appended, so a fresh mailbox and an existing one at
+// the same location fingerprint identically.
+func canonicalStoragePath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	// Walk up to the NEAREST EXISTING ancestor and re-append the missing
+	// suffix. Resolving only the immediate parent failed the moment a store
+	// lived under more than one not-yet-created directory, which turned the
+	// documented normal case -- a fleet member with no mailbox yet -- into a
+	// hard error. A genuine resolution failure is still propagated: only
+	// not-exist walks further up, and running out of ancestors is an error.
+	missing := []string{}
+	current := abs
+	for {
+		parent, leaf := filepath.Split(current)
+		parent = filepath.Clean(parent)
+		if leaf == "" || parent == current {
+			return "", fmt.Errorf("mail: no existing ancestor resolves %q", path)
+		}
+		missing = append([]string{leaf}, missing...)
+		resolved, resolveErr := filepath.EvalSymlinks(parent)
+		if resolveErr == nil {
+			return filepath.Join(append([]string{resolved}, missing...)...), nil
+		}
+		if !os.IsNotExist(resolveErr) {
+			return "", resolveErr
+		}
+		current = parent
+	}
+}
+
+// FoldWatermark folds one record's stable identity and content into a rolling
+// prefix digest. Fields are length-prefixed so no combination of values can
+// be re-partitioned into a different record and collide.
+func FoldWatermark(previous string, fields ...string) string {
+	h := sha256.New()
+	h.Write([]byte(previous))
+	for _, f := range fields {
+		h.Write([]byte(strconv.Itoa(len(f))))
+		h.Write([]byte{0})
+		h.Write([]byte(f))
+	}
+	return hex.EncodeToString(h.Sum(nil)[:12])
+}
+
+// ControlWatermarkFields is the stable projection of a control record.
+// Envelope.Read is omitted: it is acknowledgement state, and a supported ack
+// must not invalidate a cursor.
+func ControlWatermarkFields(env *Envelope) []string {
+	return []string{
+		env.ID,
+		strconv.FormatInt(env.Sequence, 10),
+		env.Sender,
+		env.Recipient,
+		env.Subject,
+		env.Body,
+		env.Timestamp.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+// String renders the cursor. The recipient is hex-encoded because it is
+// INJECTIVE: an earlier draft mapped '.' to '_', which made "a.b" and "a_b"
+// encode identically and accept each other's cursors.
+func (c Cursor) String() string {
+	return fmt.Sprintf("%s.%s.%s.c%d:%s.f%d:%s",
+		cursorVersion, hex.EncodeToString([]byte(c.Recipient)), c.Source,
+		c.Control, anchorOrEmpty(c.ControlAnchor), c.Feedback, anchorOrEmpty(c.FeedbackAnchor))
+}
+
+func anchorOrEmpty(a string) string {
+	if strings.TrimSpace(a) == "" {
+		return EmptyAnchor
+	}
+	return a
+}
+
+// ParseCursor parses and BINDS a cursor to the recipient and stores being
+// read. Any mismatch is a hard error: resuming from an unverifiable position
+// silently omits records, which is the failure this command exists to avoid.
+func ParseCursor(raw, recipient, source string) (Cursor, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return Cursor{Recipient: recipient, Source: source}, nil
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) != 5 {
+		return Cursor{}, fmt.Errorf("mail cursor is malformed: want %s.<recipient>.<source>.c<n>:<anchor>.f<n>:<anchor>", cursorVersion)
+	}
+	if parts[0] != cursorVersion {
+		return Cursor{}, fmt.Errorf("mail cursor version %q is not supported by this build (want %s)", parts[0], cursorVersion)
+	}
+	decoded, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return Cursor{}, fmt.Errorf("mail cursor recipient field is not valid encoding: %w", err)
+	}
+	if string(decoded) != recipient {
+		return Cursor{}, errors.New("mail cursor was issued for a different recipient; refusing to resume another mailbox's position")
+	}
+	if parts[2] != source {
+		return Cursor{}, errors.New("mail cursor was issued against different storage (mailbox path or feedback root changed); refusing to resume")
+	}
+	control, controlAnchor, err := parseCursorMark(parts[3], "c")
+	if err != nil {
+		return Cursor{}, err
+	}
+	feedback, feedbackAnchor, err := parseCursorMark(parts[4], "f")
+	if err != nil {
+		return Cursor{}, err
+	}
+	return Cursor{
+		Recipient: recipient, Source: source,
+		Control: control, ControlAnchor: controlAnchor,
+		Feedback: feedback, FeedbackAnchor: feedbackAnchor,
+	}, nil
+}
+
+func parseCursorMark(field, prefix string) (int64, string, error) {
+	if !strings.HasPrefix(field, prefix) {
+		return 0, "", fmt.Errorf("mail cursor field is missing its %q marker", prefix)
+	}
+	mark, anchor, ok := strings.Cut(strings.TrimPrefix(field, prefix), ":")
+	if !ok {
+		return 0, "", errors.New("mail cursor field is missing its store anchor")
+	}
+	value, err := strconv.ParseInt(mark, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("mail cursor field is not a number: %w", err)
+	}
+	if value < 0 {
+		return 0, "", errors.New("mail cursor field is negative")
+	}
+	if strings.TrimSpace(anchor) == "" {
+		return 0, "", errors.New("mail cursor field has an empty store anchor")
+	}
+	if value > 0 && anchor == EmptyAnchor {
+		return 0, "", errors.New("mail cursor claims a position in a store it records as empty")
+	}
+	return value, anchor, nil
+}
+
+// BoundedPage is one bounded read. Truncated is explicit rather than inferred
+// from len(Envelopes) == limit, which is ambiguous when the remainder ends
+// exactly on the boundary.
+type BoundedPage struct {
+	Envelopes []*Envelope
+	Next      string
+	Truncated bool
+	Bytes     int
+}
+
+// BoundedOptions configures one page. Both budgets are required; this package
+// does not invent a default.
+type BoundedOptions struct {
+	Limit    int
+	MaxBytes int
+	// FeedbackDir is the resolved feedback storage this read is paired with.
+	// The fingerprint is computed HERE, from m.MailFile and this directory,
+	// rather than taken from the caller: comparing a caller-supplied Source
+	// to a caller-supplied cursor let both stay constant while the mailbox
+	// path changed underneath, which is the binding this API promises.
+	FeedbackDir string
+}
+
+func (o BoundedOptions) validate() error {
+	if o.Limit <= 0 || o.MaxBytes <= 0 {
+		return errors.New("mail: bounded read requires a positive limit and byte budget")
+	}
+	if o.Limit > MaxBoundedLimit {
+		return fmt.Errorf("mail: limit %d exceeds the %d maximum", o.Limit, MaxBoundedLimit)
+	}
+	if o.MaxBytes > MaxBoundedPageBytes {
+		return fmt.Errorf("mail: byte budget %d exceeds the %d maximum", o.MaxBytes, MaxBoundedPageBytes)
+	}
+	return nil
+}
+
+// EnvelopeBytes is the accounted size of one record: the MARSHALLED envelope,
+// which is what the caller actually receives. The raw input line is not the
+// same thing -- escaping and field conversion change it -- and counting the
+// input would let a page overshoot its stated budget.
+//
+// The response wrapper itself (next_cursor, truncated, retained_bytes) is
+// deliberately NOT counted: it is a small fixed overhead, and documenting it
+// is more honest than folding an unrelated constant into the record budget.
+func EnvelopeBytes(env *Envelope) (int, error) {
+	data, err := json.Marshal(env)
+	if err != nil {
+		return 0, fmt.Errorf("mail: measure envelope: %w", err)
+	}
+	return len(data), nil
+}
+
+// ReadBoundedControl streams the control mailbox and returns records for
+// recipient whose Sequence is strictly greater than the cursor's control
+// mark, in ascending order.
+//
+// After the page fills it KEEPS SCANNING to the end of the file, retaining
+// nothing further, so that a malformed row, a failed quarantine, an unordered
+// store or a cancelled context past the boundary is still reported. A page
+// that looked complete while an integrity error went unmentioned would be
+// worse than no page at all. The cursor never advances over a record that was
+// not returned.
+//
+// Paging never acknowledges, rewrites, or deletes anything.
+func (m *Mailbox) ReadBoundedControl(ctx context.Context, recipient string, cur Cursor, opts BoundedOptions) (BoundedPage, error) {
+	page := BoundedPage{Envelopes: []*Envelope{}}
+	if m == nil {
+		return page, errors.New("mail: nil mailbox")
+	}
+	if ctx == nil {
+		return page, errors.New("mail: bounded read requires a context")
+	}
+	// Checked at ENTRY, so a cancelled read fails even when the store is
+	// missing or empty and the scan below never runs.
+	if err := ctx.Err(); err != nil {
+		return page, err
+	}
+	recipient = strings.TrimSpace(recipient)
+	if recipient == "" {
+		return page, errors.New("mail: recipient is required")
+	}
+	if err := opts.validate(); err != nil {
+		return page, err
+	}
+	if cur.Recipient != recipient {
+		return page, errors.New("mail: cursor recipient does not match the read recipient")
+	}
+	if cur.Control < 0 || cur.Feedback < 0 {
+		return page, errors.New("mail: cursor marks must not be negative")
+	}
+	// A Cursor handed in directly must have its SOURCE checked too. Accepting
+	// whatever the caller put there let a struct literal bypass the binding
+	// the parsed path enforces.
+	// The fingerprint is derived from the store THIS READ OPENS, not handed
+	// in. Comparing two caller-supplied strings let a caller keep both
+	// constant while switching m.MailFile, which is precisely the binding
+	// this API claims to enforce.
+	if strings.TrimSpace(opts.FeedbackDir) == "" {
+		return page, errors.New("mail: bounded read requires the paired feedback storage directory")
+	}
+	want, err := SourceFingerprint(m.MailFile, opts.FeedbackDir)
+	if err != nil {
+		return page, err
+	}
+	if cur.Control > 0 || cur.Feedback > 0 {
+		if cur.Source == "" {
+			return page, errors.New("mail: a cursor with a position must carry its storage fingerprint")
+		}
+		if cur.ControlAnchor == "" || cur.FeedbackAnchor == "" {
+			return page, errors.New("mail: a cursor with a position must carry both store watermarks")
+		}
+	}
+	if cur.Source != "" && cur.Source != want {
+		return page, errors.New("mail: cursor was issued against different storage than this read opens")
+	}
+	cur.Source = want
+	high := cur.Control
+
+	file, err := OpenRegularStore(m.MailFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if cur.Control > 0 {
+				return page, fmt.Errorf("%w: control mailbox is absent but the cursor is at %d", ErrStorageRewound, cur.Control)
+			}
+			page.Next = cur.withControl(0, EmptyAnchor).String()
+			return page, nil
+		}
+		return page, fmt.Errorf("mail: open mailbox: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), MaxBoundedRecordBytes)
+	var quarantineErrs []error
+	quarantineFailures := 0
+	var maxSeen int64
+	// watermark folds every record AT OR BELOW the emitted mark; resumeSeen
+	// is the same fold taken at exactly the incoming cursor, which is what
+	// the cursor's own watermark must equal.
+	watermark := EmptyAnchor
+	// emittedWatermark is the fold taken at exactly the sequence this page
+	// last emitted. The running fold keeps going to EOF for validation, so it
+	// covers records ABOVE the mark and must never be the one published.
+	emittedWatermark := cur.ControlAnchor
+	if cur.Control == 0 {
+		emittedWatermark = EmptyAnchor
+	}
+	resumeChecked := cur.Control == 0
+	sawAny := false
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return page, err
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var env Envelope
+		if decodeErr := json.Unmarshal([]byte(line), &env); decodeErr != nil {
+			if qErr := m.quarantineLineContext(ctx, line, decodeErr); qErr != nil {
+				quarantineFailures++
+				if len(quarantineErrs) < maxReportedQuarantineErrors {
+					quarantineErrs = append(quarantineErrs, qErr)
+				}
+			}
+			continue
+		}
+		// A record with no usable sequence is malformed, not old. Treating it
+		// as <= cursor silently discarded it on every page.
+		if env.Sequence <= 0 {
+			return page, fmt.Errorf("%w: record %q carries sequence %d", ErrStorageUnordered, env.ID, env.Sequence)
+		}
+		// STRICTLY increasing. `<` accepted DUPLICATES: two records at the
+		// same sequence, read one per page, made the second vanish because
+		// the cursor had already advanced to that number.
+		if sawAny && env.Sequence <= maxSeen {
+			return page, fmt.Errorf("%w: sequence %d does not exceed %d", ErrStorageUnordered, env.Sequence, maxSeen)
+		}
+		maxSeen = env.Sequence
+		sawAny = true
+		watermark = FoldWatermark(watermark, ControlWatermarkFields(&env)...)
+		if env.Sequence <= cur.Control {
+			if env.Sequence == cur.Control {
+				// Every record the cursor already consumed has now been
+				// folded. If the prefix differs, some record at or below the
+				// mark was rewritten or replaced and resuming would skip it.
+				if cur.ControlAnchor != watermark {
+					return page, fmt.Errorf("%w: control records at or below sequence %d changed since the cursor was issued", ErrStorageRewound, cur.Control)
+				}
+				resumeChecked = true
+			}
+		}
+
+		if env.Recipient != recipient && env.Recipient != "all" {
+			continue
+		}
+		if env.Sequence <= cur.Control {
+			continue
+		}
+		if page.Truncated {
+			continue
+		}
+		size, sizeErr := EnvelopeBytes(&env)
+		if sizeErr != nil {
+			return page, sizeErr
+		}
+		if size > opts.MaxBytes {
+			return page, fmt.Errorf("%w: sequence %d needs %d bytes, budget is %d",
+				ErrRecordExceedsBudget, env.Sequence, size, opts.MaxBytes)
+		}
+		if len(page.Envelopes) >= opts.Limit || page.Bytes+size > opts.MaxBytes {
+			page.Truncated = true
+			continue
+		}
+		copied := env
+		page.Envelopes = append(page.Envelopes, &copied)
+		page.Bytes += size
+		if env.Sequence > high {
+			high = env.Sequence
+			// Sequences ascend strictly, so the running fold at this instant
+			// covers exactly the records at or below this mark.
+			emittedWatermark = watermark
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return page, fmt.Errorf("mail: scan mailbox: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return page, err
+	}
+	if len(quarantineErrs) > 0 {
+		return page, fmt.Errorf("mail: %d quarantine write(s) failed: %w", quarantineFailures, errors.Join(quarantineErrs...))
+	}
+	// ONE refusal, because it strictly subsumes the alternatives. The cursor
+	// names a sequence; unless a record carrying exactly that sequence was
+	// seen and its prefix verified, the store cannot be resumed. That covers
+	// an emptied store, a removed one, a cursor beyond the highest sequence,
+	// and a cursor whose record was repaired away. Separate checks for those
+	// read as extra protection while being unreachable behind this one.
+	if !resumeChecked {
+		return page, fmt.Errorf("%w: control sequence %d is not present in this store (emptied, truncated, renumbered or repaired away)",
+			ErrStorageRewound, cur.Control)
+	}
+	_ = maxSeen
+	page.Next = cur.withControl(high, emittedWatermark).String()
+	return page, nil
+}
+
+// withControl returns the cursor advanced over the control store, preserving
+// the feedback position untouched.
+func (c Cursor) withControl(mark int64, anchor string) Cursor {
+	c.Control = mark
+	c.ControlAnchor = anchor
+	return c
+}
