@@ -29,7 +29,7 @@ func TestAdmissionPhaseIsWriteAheadOfCandidateAndRoute(t *testing.T) {
 		t.Fatal("cannot locate runPoolReview")
 	}
 	candidate := strings.Index(body, "capacityLease.update(admissionPhaseCandidate)")
-	resolveCandidate := strings.Index(body, "resolvePoolReviewCandidateAt(")
+	resolveCandidate := strings.Index(body, "resolvePoolReviewCandidateAtFor(")
 	if candidate < 0 || resolveCandidate < 0 || candidate > resolveCandidate {
 		t.Fatal("candidate phase is not write-ahead of candidate preparation")
 	}

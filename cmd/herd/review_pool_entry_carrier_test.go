@@ -104,6 +104,26 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	// Every test built on this fixture inherits the guard: reaching Herdr for
 	// anything the fixture does not model fails the test rather than escaping.
 	t.Cleanup(func() { assertOnlyCensusCommands(t, herdrCalls()) })
+
+	// The capacity census makes ONE MORE external call, and it does not use the
+	// override: herdrServerRunning (capacity.go:461) execs "herdr" from PATH
+	// directly. CI 34753903312 proved it — the entry refused with
+	// `herdr status server: exec: "herdr": executable file not found in $PATH`
+	// before candidate preparation, so the earlier fixture never reached the
+	// census at all. That PATH resolution is deliberate, and this package's
+	// convention for it is poolContractStatusStub: a fixture-owned `herdr` on
+	// PATH that answers the health probe and delegates everything else to the
+	// protocol fake, so the real probe really runs and really parses.
+	//
+	// The probe is therefore NOT in the call log (the stub answers it before
+	// delegating), and nothing asserts it directly. It needs no assertion: a
+	// failing probe refuses BEFORE candidate preparation, so the positive
+	// oracle reaching its assertions at all is proof the probe was served here.
+	stubDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stubDir, "herdr"), []byte(poolContractStatusStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	home := filepath.Join(root, "fixture-home")
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
