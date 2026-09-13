@@ -8,15 +8,51 @@ cd "$repo_root"
 (( $+commands[gosec] )) || { print -u2 'error: pinned gosec is required'; exit 1; }
 (( $+commands[jq] )) || { print -u2 'error: jq is required'; exit 1; }
 
-# Default to 300s (5m) to accommodate repository scale and multi-package AST
-# traversal on shared CI runners without masking hangs; preserve environment overrides.
-gosec_timeout=${GOSEC_TIMEOUT:-${SECURITY_GATE_TIMEOUT:-300}}
-gitleaks_timeout=${GITLEAKS_TIMEOUT:-${SECURITY_GATE_TIMEOUT:-300}}
-if ! [[ "$gosec_timeout" =~ ^[1-9][0-9]*$ ]]; then
-	gosec_timeout=300
+# FAC-251 budget semantics: an explicit GOSEC_TIMEOUT or
+# SECURITY_GATE_TIMEOUT always wins unchanged, and an INVALID override fails
+# closed here — a malformed budget must never degrade into a silent default.
+# With neither set, the gosec budget is DERIVED below from the measured scan
+# surface (see the derivation after the tracked-file copy): the repository
+# grows with every harvest wave, and a static default saturates — CI measured
+# the gosec phase at 181.7s (2026-09-10, ~108 packages) then 233.7s-282.3s
+# (2026-09-11, 138 packages, 78-94% of the old static 300s), and CI run
+# 34613250905 was killed at the 300s boundary before tests. The derivation
+# keeps the anti-hang property at every scale instead of re-sizing a magic
+# number per growth wave.
+# FAC-822: every budget is bounded by the same finite 900s maximum, explicit
+# overrides included — a hung scanner must die within the declared hang bound
+# no matter what a caller exports. A value outside positive-integer form, or
+# longer than 9 digits (zsh-arithmetic overflow shape), fails closed here; a
+# valid value above the maximum is capped with a diagnostic below. Precedence
+# (GOSEC_TIMEOUT > SECURITY_GATE_TIMEOUT > derivation, and the GITLEAKS
+# counterparts) is unchanged; an explicit override is still never floored,
+# so short diagnostic budgets keep working.
+gate_max_timeout=900
+if [[ -n "${GOSEC_TIMEOUT-}" ]]; then
+	[[ "$GOSEC_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: GOSEC_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
+	gosec_timeout=$GOSEC_TIMEOUT
+elif [[ -n "${SECURITY_GATE_TIMEOUT-}" ]]; then
+	[[ "$SECURITY_GATE_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
+	gosec_timeout=$SECURITY_GATE_TIMEOUT
+else
+	gosec_timeout=0
 fi
-if ! [[ "$gitleaks_timeout" =~ ^[1-9][0-9]*$ ]]; then
+if [[ -n "${GITLEAKS_TIMEOUT-}" ]]; then
+	[[ "$GITLEAKS_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: GITLEAKS_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
+	gitleaks_timeout=$GITLEAKS_TIMEOUT
+elif [[ -n "${SECURITY_GATE_TIMEOUT-}" ]]; then
+	[[ "$SECURITY_GATE_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]] || { print -u2 'error: SECURITY_GATE_TIMEOUT must be a positive integer number of seconds of at most 9 digits'; exit 1; }
+	gitleaks_timeout=$SECURITY_GATE_TIMEOUT
+else
 	gitleaks_timeout=300
+fi
+if (( gosec_timeout > gate_max_timeout )); then
+	print -u2 "==> gosec timeout ${gosec_timeout}s exceeds the finite ${gate_max_timeout}s maximum; using ${gate_max_timeout}s"
+	gosec_timeout=$gate_max_timeout
+fi
+if (( gitleaks_timeout > gate_max_timeout )); then
+	print -u2 "==> gitleaks timeout ${gitleaks_timeout}s exceeds the finite ${gate_max_timeout}s maximum; using ${gate_max_timeout}s"
+	gitleaks_timeout=$gate_max_timeout
 fi
 
 # Copy only paths Git currently tracks.  In particular, do not walk the
@@ -108,6 +144,31 @@ for file_path in "${tracked_files[@]}"; do
 	mkdir -p "$scan_root/${file_path:h}"
 	cp -p "$file_path" "$scan_root/$file_path"
 done
+
+# Derive the gosec budget from the surface gosec actually traverses: the
+# tracked directories holding shipped (non-test) Go sources — the same package
+# set gosec's per-module ./... walk analyzes (test files are already excluded
+# by gosec's default; a directory is one Go package in a well-formed module).
+# Calibration from CI (ubuntu-latest, warm setup-go build cache): worst
+# observed 2.04s/package. 3s/package plus a 90s per-module fixed-type-load
+# base is ~1.47x the worst observed rate; the 300s floor keeps today's
+# default exactly for repositories of 70 packages or fewer, and the 900s cap
+# keeps the timeout a strict hang bound at every scale. Explicit environment
+# overrides above bypass the derivation entirely.
+if (( gosec_timeout == 0 )); then
+	typeset -U go_src_dirs
+	go_src_dirs=( )
+	for file_path in "${tracked_files[@]}"; do
+		case "$file_path" in .worktrees/*|.herd/*) continue;; esac
+		[[ "$file_path" == *.go && "$file_path" != *_test.go ]] || continue
+		go_src_dirs+=( "${file_path:h}" )
+	done
+	gosec_packages=${#go_src_dirs}
+	(( gosec_timeout = 90 + 3 * gosec_packages ))
+	(( gosec_timeout < 300 )) && gosec_timeout=300
+	(( gosec_timeout > 900 )) && gosec_timeout=900
+	print -u2 "==> gosec budget ${gosec_timeout}s derived from ${gosec_packages} scanned Go packages"
+fi
 
 run_gosec() {
 	cd "$scan_root"

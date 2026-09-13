@@ -240,8 +240,16 @@ func TestProviderCacheAcrossProcessesShares429Backoff(t *testing.T) {
 	if !cached.Providers["codex"].BackoffUntil.After(time.Now()) {
 		t.Fatal("concurrent 429 did not persist a future cooldown")
 	}
-	if cached.Providers["codex"].BackoffUntil.After(time.Now().Add(15 * time.Second)) {
+	// FAC-818: the bound here is ONE backoff window, not the old flat 15s
+	// default (the floor is now the success TTL, and the helper's
+	// retry-after=15 no longer undercuts it). What this still proves is the
+	// single-flight property it was written for: the waiting caller must not
+	// write a second record and push the deadline out to a second window.
+	if cached.Providers["codex"].BackoffUntil.After(time.Now().Add(2 * defaultSnapshotTTL)) {
 		t.Fatal("cooldown deadline was extended by the waiting caller")
+	}
+	if got := cached.Providers["codex"].FailureStreak; got != 1 {
+		t.Fatalf("concurrent 429 callers recorded a failure streak of %d, want 1: the waiting caller escalated a failure it never observed", got)
 	}
 }
 
@@ -638,12 +646,20 @@ func TestProviderCacheKeepsFreshPositiveReadingDuring429Backoff(t *testing.T) {
 }
 
 func TestRateLimitBackoffHonorsLongAndHTTPDateRetryAfter(t *testing.T) {
-	if got := rateLimitBackoff(pollErrf("rate-limited", "HTTP 429 retry-after=601")); got != 601*time.Second {
+	if got := rateLimitBackoff(pollErrf("rate-limited", "HTTP 429 retry-after=601"), 1); got != 601*time.Second {
 		t.Fatalf("long Retry-After was truncated: got %v", got)
 	}
-	date := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
-	if got := rateLimitBackoff(pollErrf("rate-limited", "%s", "HTTP 429 retry-after="+date)); got < time.Second {
-		t.Fatalf("HTTP-date Retry-After was not honored: got %v", got)
+	// FAC-818: the backoff now floors at the success TTL, so a Retry-After
+	// SHORTER than the floor can no longer prove the header was read at all.
+	// Use a date beyond the floor, and assert it against the floor, so this
+	// stays a real test of Retry-After parsing rather than a tautology.
+	date := time.Now().Add(defaultSnapshotTTL + 90*time.Second).UTC().Format(http.TimeFormat)
+	got := rateLimitBackoff(pollErrf("rate-limited", "%s", "HTTP 429 retry-after="+date), 1)
+	if got <= defaultSnapshotTTL {
+		t.Fatalf("HTTP-date Retry-After was not honored: got %v, want more than the %v floor", got, defaultSnapshotTTL)
+	}
+	if got > defaultSnapshotTTL+91*time.Second {
+		t.Fatalf("HTTP-date Retry-After was inflated: got %v", got)
 	}
 }
 
