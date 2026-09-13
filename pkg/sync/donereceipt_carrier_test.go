@@ -6,6 +6,9 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
 
 // FAC-831: a pull-request landing integrates reviewed work with a merge commit
@@ -13,89 +16,156 @@ import (
 // binds content to the merge alone cannot be validated and BoardDone refuses
 // work that genuinely landed.
 //
-// These drive the shipped consumer path -- CompletionReceipt.validateContentBinding,
-// which Validate calls and nothing else does -- against a repo shaped like an
-// actual pull request: a reviewed base on main, a carrier on a
-// side line, and a two-parent merge whose tree holds the reviewed bytes.
+// The content gate for a sealed carrier is the producer's own predicate: replay
+// the sealed reviewed delta onto the integration commit's first parent and
+// require the result to equal its tree. These drive it through real git
+// topologies, and the ones that must be refused are here beside the ones that
+// must be accepted -- a gate is only as good as what it turns away.
 
-// prReceiptRepo builds that shape and returns the repo plus the three
-// identities a receipt binds. The merge is asserted to have two parents and an
-// empty diff of its own, so a test that passed because the merge happened to
-// carry the patch would fail here instead of quietly proving nothing.
-func prReceiptRepo(t *testing.T) (dir, baseSHA, carrierSHA, mergeSHA string) {
-	t.Helper()
-	dir = t.TempDir()
-	run := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "fixture@example.com")
-	run("config", "user.name", "fixture")
+const (
+	carrierRef      = "FAC-831"
+	carrierTaskID   = "task-fac-831"
+	carrierRevision = "provider-rev-831"
+	carrierLeaseGen = 4
+)
 
-	writeFileTest(t, dir, "a.txt", "root\n")
-	run("add", "a.txt")
-	run("commit", "-q", "-m", "root")
-
-	writeFileTest(t, dir, "base.txt", "reviewed base\n")
-	run("add", "base.txt")
-	run("commit", "-q", "-m", "reviewed base")
-	baseSHA = run("rev-parse", "HEAD")
-
-	// The carrier: the reviewed content, on its own line off the base.
-	run("checkout", "-q", "-b", "pr")
-	writeFileTest(t, dir, "reviewed.txt", "reviewed content\n")
-	run("add", "reviewed.txt")
-	run("commit", "-q", "-m", "reviewed candidate work")
-	carrierSHA = run("rev-parse", "HEAD")
-
-	// The integration: a real merge commit, never a fast-forward.
-	run("checkout", "-q", "main")
-	run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
-	mergeSHA = run("rev-parse", "HEAD")
-	run("update-ref", "refs/remotes/origin/main", mergeSHA)
-
-	if parents := run("rev-list", "--parents", "-n", "1", mergeSHA); len(strings.Fields(parents)) != 3 {
-		t.Fatalf("fixture invalid: %s is not a two-parent merge (%s)", mergeSHA[:12], parents)
-	}
-	if out := run("diff-tree", "-p", "--no-color", mergeSHA); strings.TrimSpace(out) != "" {
-		t.Fatalf("fixture invalid: the merge carries its own diff, so it would not exercise the carrier path")
-	}
-	if _, err := PatchID(dir, mergeSHA); err == nil {
-		t.Fatalf("fixture invalid: the merge has a patch id, so the old merge-bound gate would have passed")
-	}
-	return dir, baseSHA, carrierSHA, mergeSHA
+// fixture is a hermetic git repository. No network, no global git config, and
+// no assumption about the ambient default branch.
+type fixture struct {
+	t   *testing.T
+	dir string
 }
 
-// TestValidateAcceptsSealedCarrierForAPullRequestLanding is the end-to-end case
-// the review required: a PR-shaped landing must mint a receipt the ACTUAL
-// consumer accepts, not merely a proof object.
-func TestValidateAcceptsSealedCarrierForAPullRequestLanding(t *testing.T) {
-	dir, base, carrier, merge := prReceiptRepo(t)
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	f := &fixture{t: t, dir: t.TempDir()}
+	f.run("init", "-q", "-b", "main")
+	f.run("config", "user.email", "fixture@example.com")
+	f.run("config", "user.name", "fixture")
+	f.run("config", "commit.gpgsign", "false")
+	// RepositoryIdentity reads this config to bind a receipt to its repository.
+	// It is a CONFIG read only: nothing here fetches.
+	f.run("config", "remote.origin.url", "git@github.com:Kampe/Herdforge-fixture.git")
+	return f
+}
+
+func (f *fixture) run(args ...string) string {
+	f.t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = f.dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		f.t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (f *fixture) commit(name, body, msg string) string {
+	f.t.Helper()
+	writeFileTest(f.t, f.dir, name, body)
+	f.run("add", name)
+	f.run("commit", "-q", "-m", msg)
+	return f.run("rev-parse", "HEAD")
+}
+
+func (f *fixture) blob(commit, path string) string {
+	f.t.Helper()
+	return f.run("rev-parse", commit+":"+path)
+}
+
+// publishAsOriginMain is what makes the merge the integration commit the
+// consumer will accept as landed.
+func (f *fixture) publishAsOriginMain(merge string) {
+	f.t.Helper()
+	f.run("update-ref", "refs/remotes/origin/main", merge)
+}
+
+// carrierReceipt binds a sealed carrier for the CONTENT helper. Nothing here is
+// optional: the replay needs the sealed base and candidate, so a receipt that
+// omits them is not a shape the gate ever sees.
+func carrierReceipt(t *testing.T, dir, base, carrier, candidate, merge string) CompletionReceipt {
+	t.Helper()
 	patch, err := PatchID(dir, carrier)
 	if err != nil {
 		t.Fatalf("carrier must have a patch id: %v", err)
 	}
-	r := CompletionReceipt{
-		MergeSHA:   merge,
-		ContentSHA: carrier,
-		PatchID:    patch,
-		BaseSHA:    base,
-	}
-	if err := r.validateContentBinding(dir); err != nil {
-		t.Fatalf("a PR-shaped landing must validate against its sealed carrier: %v", err)
+	return CompletionReceipt{
+		BaseSHA: base, CandidateSHA: candidate, MergeSHA: merge,
+		ContentSHA: carrier, PatchID: patch,
 	}
 }
 
-// TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed is the legacy
-// path, unchanged: with no ContentSHA the gate is exactly the merge-bound check
-// it always was, and an empty merge still fails it.
+// publicReceipt builds a receipt complete enough for the PUBLIC gate, so a
+// topology is proven through CompletionReceipt.Validate -- the entry point
+// `herd approve` actually calls -- rather than through the content helper alone.
+// The lifecycle state it returns matches the receipt, so any refusal these tests
+// observe comes from the content gate and not from an unrelated binding.
+func publicReceipt(t *testing.T, dir, base, carrier, candidate, merge string) (CompletionReceipt, *lifecycle.TaskState) {
+	t.Helper()
+	repoID, err := toolchild.RepositoryIdentity(dir)
+	if err != nil {
+		t.Fatalf("repository identity: %v", err)
+	}
+	r := carrierReceipt(t, dir, base, carrier, candidate, merge)
+	r.RepoID = repoID
+	r.TaskRef = carrierRef
+	r.TaskID = carrierTaskID
+	r.ProviderRevision = carrierRevision
+	r.LeaseGeneration = carrierLeaseGen
+	r.AcceptanceDigest = "acceptance-digest-831"
+	r.VerificationDigest = "verification-digest-831"
+	r.RiskTier = "R3"
+	r.AuthorFamily = "anthropic"
+	r.ReviewerFamily = "openai"
+	r.Verdict = "PASS"
+	r.IntegrationResult = IntegrationMerged
+	r.Seal()
+	st := &lifecycle.TaskState{
+		TaskRef: carrierRef, State: lifecycle.StateIntegrated,
+		LeaseGeneration: carrierLeaseGen, CandidateSHA: candidate,
+	}
+	return r, st
+}
+
+// ---------------------------------------------------------------------------
+// Topology 1: the plain pull-request landing. The reviewed tip IS the carrier
+// and the merge carries no patch of its own.
+// ---------------------------------------------------------------------------
+
+func prReceiptRepo(t *testing.T) (dir, baseSHA, carrierSHA, mergeSHA string) {
+	t.Helper()
+	f := newFixture(t)
+	f.commit("a.txt", "root\n", "root")
+	baseSHA = f.commit("base.txt", "reviewed base\n", "reviewed base")
+
+	f.run("checkout", "-q", "-b", "pr")
+	carrierSHA = f.commit("reviewed.txt", "reviewed content\n", "reviewed candidate work")
+
+	f.run("checkout", "-q", "main")
+	f.run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
+	mergeSHA = f.run("rev-parse", "HEAD")
+	f.publishAsOriginMain(mergeSHA)
+
+	if parents := f.run("rev-list", "--parents", "-n", "1", mergeSHA); len(strings.Fields(parents)) != 3 {
+		t.Fatalf("fixture invalid: %s is not a two-parent merge (%s)", mergeSHA[:12], parents)
+	}
+	if _, err := PatchID(f.dir, mergeSHA); err == nil {
+		t.Fatal("fixture invalid: the merge has a patch id, so the old merge-bound gate would have passed")
+	}
+	return f.dir, baseSHA, carrierSHA, mergeSHA
+}
+
+func TestValidateAcceptsSealedCarrierForAPullRequestLanding(t *testing.T) {
+	dir, base, carrier, merge := prReceiptRepo(t)
+	r := carrierReceipt(t, dir, base, carrier, carrier, merge)
+	if err := r.validateContentBinding(dir); err != nil {
+		t.Fatalf("a pull-request landing must validate against its sealed carrier: %v", err)
+	}
+}
+
+// The legacy path, unchanged: with no ContentSHA the gate is exactly the
+// merge-bound check it always was, an empty merge still fails it, and no replay
+// runs at all.
 func TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed(t *testing.T) {
 	dir, base, _, merge := prReceiptRepo(t)
 	r := CompletionReceipt{MergeSHA: merge, PatchID: "whatever", BaseSHA: base}
@@ -108,37 +178,21 @@ func TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed(t *testing.T) 
 	}
 }
 
-// The negative regressions. Each is a receipt an attacker or a broken producer
-// could mint, and each must be refused for its OWN reason.
-func TestValidateRefusesForgedDiscardedAndAlteredCarriers(t *testing.T) {
+// The two refusals that do not depend on the replay at all: a carrier the merge
+// never took, and a carrier whose patch is not the sealed one.
+func TestValidateRefusesForgedAndPatchMismatchedCarriers(t *testing.T) {
 	t.Run("carrier that is not in the merge", func(t *testing.T) {
 		dir, base, carrier, merge := prReceiptRepo(t)
-		run := func(args ...string) string {
-			t.Helper()
-			cmd := exec.Command("git", args...)
-			cmd.Dir = dir
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("git %v: %v\n%s", args, err, out)
-			}
-			return strings.TrimSpace(string(out))
-		}
+		f := &fixture{t: t, dir: dir}
 		// A commit with the SAME patch, on a line the merge never took.
-		run("checkout", "-q", "-b", "forged", base)
-		writeFileTest(t, dir, "reviewed.txt", "reviewed content\n")
-		run("add", "reviewed.txt")
-		run("commit", "-q", "-m", "forged carrier")
-		forged := run("rev-parse", "HEAD")
-		run("checkout", "-q", "main")
+		f.run("checkout", "-q", "-b", "forged", base)
+		forged := f.commit("reviewed.txt", "reviewed content\n", "forged carrier")
+		f.run("checkout", "-q", "main")
 		if forged == carrier {
 			t.Fatal("fixture invalid: the forged carrier is the real one")
 		}
-		patch, err := PatchID(dir, forged)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r := CompletionReceipt{MergeSHA: merge, ContentSHA: forged, PatchID: patch, BaseSHA: base}
-		err = r.validateContentBinding(dir)
+		r := carrierReceipt(t, dir, base, forged, carrier, merge)
+		err := r.validateContentBinding(dir)
 		if err == nil {
 			t.Fatal("a carrier the merge does not contain was accepted; patch equality alone is not landing")
 		}
@@ -147,78 +201,10 @@ func TestValidateRefusesForgedDiscardedAndAlteredCarriers(t *testing.T) {
 		}
 	})
 
-	t.Run("merge that discarded the reviewed content", func(t *testing.T) {
-		dir, base, carrier, _ := prReceiptRepo(t)
-		run := func(args ...string) string {
-			t.Helper()
-			cmd := exec.Command("git", args...)
-			cmd.Dir = dir
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("git %v: %v\n%s", args, err, out)
-			}
-			return strings.TrimSpace(string(out))
-		}
-		// An ours merge: the carrier stays an ancestor, the content does not
-		// land. Ancestry says yes and the tree says no.
-		run("checkout", "-q", "-B", "ours", base)
-		run("merge", "-q", "--no-ff", "-s", "ours", "-m", "Merge pull request #831 (ours)", carrier)
-		discarded := run("rev-parse", "HEAD")
-		run("update-ref", "refs/remotes/origin/main", discarded)
-		if out := run("ls-tree", "--name-only", discarded); strings.Contains(out, "reviewed.txt") {
-			t.Fatal("fixture invalid: the ours merge kept the reviewed file")
-		}
-		patch, err := PatchID(dir, carrier)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r := CompletionReceipt{MergeSHA: discarded, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
-		err = r.validateContentBinding(dir)
-		if err == nil {
-			t.Fatal("a merge that discarded every reviewed hunk was accepted")
-		}
-		if !strings.Contains(err.Error(), "does not preserve the content of") {
-			t.Fatalf("refusal did not name the content rule: %v", err)
-		}
-	})
-
-	t.Run("merge that substituted different bytes", func(t *testing.T) {
-		dir, base, carrier, merge := prReceiptRepo(t)
-		run := func(args ...string) string {
-			t.Helper()
-			cmd := exec.Command("git", args...)
-			cmd.Dir = dir
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("git %v: %v\n%s", args, err, out)
-			}
-			return strings.TrimSpace(string(out))
-		}
-		writeFileTest(t, dir, "reviewed.txt", "SUBSTITUTED content\n")
-		run("add", "reviewed.txt")
-		run("commit", "-q", "--amend", "--no-edit")
-		altered := run("rev-parse", "HEAD")
-		run("update-ref", "refs/remotes/origin/main", altered)
-		if altered == merge {
-			t.Fatal("fixture invalid: the amend produced no new commit")
-		}
-		patch, err := PatchID(dir, carrier)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r := CompletionReceipt{MergeSHA: altered, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
-		err = r.validateContentBinding(dir)
-		if err == nil {
-			t.Fatal("a merge whose tree holds different bytes than the reviewed result was accepted")
-		}
-		if !strings.Contains(err.Error(), "does not preserve the content of") {
-			t.Fatalf("refusal did not name the content rule: %v", err)
-		}
-	})
-
 	t.Run("carrier whose patch does not match the sealed one", func(t *testing.T) {
 		dir, base, carrier, merge := prReceiptRepo(t)
-		r := CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: "0000000000000000000000000000000000000000", BaseSHA: base}
+		r := carrierReceipt(t, dir, base, carrier, carrier, merge)
+		r.PatchID = strings.Repeat("0", 40)
 		err := r.validateContentBinding(dir)
 		if err == nil {
 			t.Fatal("a receipt whose sealed patch id does not match the carrier was accepted")
@@ -255,220 +241,157 @@ func TestSealedCarrierIsCoveredByTheDigest(t *testing.T) {
 	}
 }
 
-// iteratedPRRepo builds the shape an iterated lane actually produces: the
-// carrier is an INTERMEDIATE commit on the pull request's line, and the same
-// path is revised again before the landing.
-//
-//	root ─── base ────────────────── merge          (main, and origin/main)
-//	          └── carrier ── tip ──────┘            (the pull request's line)
-//
-// discarded selects the adversarial twin of the same shape: main revises the
-// path too and the landing is an `ours` merge, so the reviewed hunks are gone
-// while the carrier is still an ancestor and the path was still revised later.
-// The allowance for a later revision must not admit that.
-func iteratedPRRepo(t *testing.T, discarded bool) (dir, baseSHA, carrierSHA, mergeSHA string) {
+// ---------------------------------------------------------------------------
+// Topology 2: the iterated lane. The carrier is an INTERMEDIATE commit whose own
+// path is revised again before the landing -- the shape this repository produces
+// constantly, and the one a byte-identity check refused.
+// ---------------------------------------------------------------------------
+
+func iteratedPRRepo(t *testing.T, discarded bool) (dir, base, carrier, candidate, merge string) {
 	t.Helper()
-	dir = t.TempDir()
-	run := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	commit := func(name, body, msg string) string {
-		t.Helper()
-		writeFileTest(t, dir, name, body)
-		run("add", name)
-		run("commit", "-q", "-m", msg)
-		return run("rev-parse", "HEAD")
-	}
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "fixture@example.com")
-	run("config", "user.name", "fixture")
+	f := newFixture(t)
+	f.commit("a.txt", "root\n", "root")
+	// The reviewed path already exists on main, so an `ours` merge can keep
+	// main's bytes at it rather than simply dropping a file.
+	base = f.commit("shared.txt", "base\n", "reviewed base")
 
-	commit("a.txt", "root\n", "root")
-	// The reviewed path already exists on main, so `ours` can keep main's
-	// bytes at it rather than simply dropping a file.
-	baseSHA = commit("shared.txt", "base\n", "reviewed base")
+	f.run("checkout", "-q", "-b", "pr")
+	carrier = f.commit("shared.txt", "reviewed v1\n", "reviewed candidate work")
+	candidate = f.commit("shared.txt", "reviewed v2\n", "revise the same path inside the pull request")
 
-	run("checkout", "-q", "-b", "pr")
-	carrierSHA = commit("shared.txt", "reviewed v1\n", "reviewed candidate work")
-	tip := commit("shared.txt", "reviewed v2\n", "revise the same path inside the pull request")
-
-	run("checkout", "-q", "main")
+	f.run("checkout", "-q", "main")
 	if discarded {
-		mainRevision := commit("shared.txt", "main revision\n", "main revises the same path")
-		run("merge", "-q", "--no-ff", "-s", "ours", "-m", "Merge pull request #831 (ours)", "pr")
-		mergeSHA = run("rev-parse", "HEAD")
-		if run("rev-parse", mergeSHA+"^{tree}") != run("rev-parse", mainRevision+"^{tree}") {
+		mainRevision := f.commit("shared.txt", "main revision\n", "main revises the same path")
+		f.run("merge", "-q", "--no-ff", "-s", "ours", "-m", "Merge pull request #831 (ours)", "pr")
+		merge = f.run("rev-parse", "HEAD")
+		if f.run("rev-parse", merge+"^{tree}") != f.run("rev-parse", mainRevision+"^{tree}") {
 			t.Fatal("fixture invalid: the ours merge did not keep main's tree")
 		}
 	} else {
-		run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
-		mergeSHA = run("rev-parse", "HEAD")
-		if run("rev-parse", mergeSHA+":shared.txt") != run("rev-parse", tip+":shared.txt") {
+		f.run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
+		merge = f.run("rev-parse", "HEAD")
+		if f.blob(merge, "shared.txt") != f.blob(candidate, "shared.txt") {
 			t.Fatal("fixture invalid: the merge does not hold the reviewed line's last revision")
 		}
 	}
-	run("update-ref", "refs/remotes/origin/main", mergeSHA)
+	f.publishAsOriginMain(merge)
 
-	// Both shapes must be NON-VACUOUS: the carrier's own bytes must differ from
-	// the merged tree, or the fast byte-identity path would answer and the case
-	// under test would never be reached.
-	if run("rev-parse", mergeSHA+":shared.txt") == run("rev-parse", carrierSHA+":shared.txt") {
-		t.Fatal("fixture invalid: the merge still holds the carrier's own bytes, so no later revision is under test")
+	// Non-vacuous either way: the carrier's OWN bytes are not what the merge
+	// holds, so a check that compared only those would be answering a different
+	// question than the one under test.
+	if f.blob(merge, "shared.txt") == f.blob(carrier, "shared.txt") {
+		t.Fatal("fixture invalid: the merge still holds the carrier's own bytes")
 	}
-	return dir, baseSHA, carrierSHA, mergeSHA
+	return f.dir, base, carrier, candidate, merge
 }
 
-// TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath is the FAC-831
-// follow-up regression: requiring the carrier's paths to be byte-identical in
-// the merge refused honest landings, because the producer seals the commit
-// matching the candidate's LAST patch and that is routinely an intermediate
-// commit whose files are revised again inside the same pull request. The
-// allowance is narrow, and the second case is what keeps it narrow.
+// An honest intermediate carrier: the reviewed line revised its own path before
+// the landing. This must be ACCEPTED, or every iterated lane is refused a
+// receipt for work that genuinely landed.
 func TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath(t *testing.T) {
-	t.Run("the reviewed line revised its own path before the merge", func(t *testing.T) {
-		dir, base, carrier, merge := iteratedPRRepo(t, false)
-		patch, err := PatchID(dir, carrier)
-		if err != nil {
-			t.Fatalf("carrier must have a patch id: %v", err)
-		}
-		r := CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
-		if err := r.validateContentBinding(dir); err != nil {
-			t.Fatalf("an honest landing whose carrier was revised again inside the pull request was refused: %v", err)
-		}
-	})
-
-	t.Run("an ours merge on a path the reviewed line also revised", func(t *testing.T) {
-		dir, base, carrier, merge := iteratedPRRepo(t, true)
-		patch, err := PatchID(dir, carrier)
-		if err != nil {
-			t.Fatalf("carrier must have a patch id: %v", err)
-		}
-		r := CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
-		err = r.validateContentBinding(dir)
-		if err == nil {
-			t.Fatal("an ours merge that discarded the reviewed hunks was accepted because the path was revised later")
-		}
-		if !strings.Contains(err.Error(), "does not preserve the content of") {
-			t.Fatalf("refusal did not name the content rule: %v", err)
-		}
-	})
+	dir, base, carrier, candidate, merge := iteratedPRRepo(t, false)
+	r := carrierReceipt(t, dir, base, carrier, candidate, merge)
+	if err := r.validateContentBinding(dir); err != nil {
+		t.Fatalf("an honest landing whose carrier was revised again inside the pull request was refused: %v", err)
+	}
 }
 
-// renamedPRRepo builds the shape the FAC-831 review found unguarded: the
-// carrier changes a path, and a REVIEWED DESCENDANT renames it away.
-//
-//	root ─── base ─────────────────────── merge      (main, and origin/main)
-//	          └── carrier ── renamed ───────┘        (the pull request's line)
-//
-// The old name is then absent in both the renaming commit and the merge. That
-// shared absence proves only that neither holds the OLD name, so accepting it
-// lets an altered destination validate: carrier ancestry holds, the old path
-// matches, and the carrier's patch id still matches.
-//
-// altered amends the merge so the destination holds different bytes; edited
-// makes the rename change the content in the same commit, which is the case no
-// content proof can follow and is therefore refused rather than assumed.
-func renamedPRRepo(t *testing.T, altered, edited bool) (dir, baseSHA, carrierSHA, mergeSHA string) {
+// The ours merge, through the PUBLIC gate: the carrier stays an ancestor and the
+// reviewed hunks are gone. Ancestry says yes and the tree says no.
+func TestValidateRefusesAMergeThatDiscardedTheReviewedContent(t *testing.T) {
+	dir, base, carrier, candidate, merge := iteratedPRRepo(t, true)
+	r, st := publicReceipt(t, dir, base, carrier, candidate, merge)
+	err := r.Validate(dir, carrierRef, st)
+	if err == nil {
+		t.Fatal("a merge that discarded every reviewed hunk was accepted")
+	}
+	if !strings.Contains(err.Error(), "does not preserve the content of") {
+		t.Fatalf("refusal did not name the content rule: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Topology 3: the reviewed line MOVES the carrier's file. The old name is then
+// absent in both the reviewed tip and the merge, and a path-by-path comparison
+// reads that shared absence as agreement -- which is how an altered destination
+// used to validate.
+// ---------------------------------------------------------------------------
+
+func renamedPRRepo(t *testing.T, altered, edited bool) (dir, base, carrier, candidate, merge string) {
 	t.Helper()
-	dir = t.TempDir()
-	run := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	commitFile := func(name, body, msg string) string {
-		t.Helper()
-		writeFileTest(t, dir, name, body)
-		run("add", name)
-		run("commit", "-q", "-m", msg)
-		return run("rev-parse", "HEAD")
-	}
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "fixture@example.com")
-	run("config", "user.name", "fixture")
+	f := newFixture(t)
+	f.commit("a.txt", "root\n", "root")
+	base = f.commit("reviewed.txt", "base\n", "reviewed base")
 
-	commitFile("a.txt", "root\n", "root")
-	baseSHA = commitFile("reviewed.txt", "base\n", "reviewed base")
+	f.run("checkout", "-q", "-b", "pr")
+	carrier = f.commit("reviewed.txt", "reviewed v1\n", "reviewed candidate work")
 
-	run("checkout", "-q", "-b", "pr")
-	carrierSHA = commitFile("reviewed.txt", "reviewed v1\n", "reviewed candidate work")
-
-	run("mv", "reviewed.txt", "renamed.txt")
+	f.run("mv", "reviewed.txt", "renamed.txt")
 	if edited {
-		writeFileTest(t, dir, "renamed.txt", "reviewed v2\n")
-		run("add", "renamed.txt")
+		writeFileTest(t, f.dir, "renamed.txt", "reviewed v2\n")
+		f.run("add", "renamed.txt")
 	}
-	run("commit", "-q", "-m", "move the reviewed file inside the pull request")
-	renamed := run("rev-parse", "HEAD")
+	f.run("commit", "-q", "-m", "move the reviewed file inside the pull request")
+	candidate = f.run("rev-parse", "HEAD")
 
-	run("checkout", "-q", "main")
-	run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
+	f.run("checkout", "-q", "main")
+	f.run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
 	if altered {
-		writeFileTest(t, dir, "renamed.txt", "SUBSTITUTED content\n")
-		run("add", "renamed.txt")
-		run("commit", "-q", "--amend", "--no-edit")
+		writeFileTest(t, f.dir, "renamed.txt", "SUBSTITUTED content\n")
+		f.run("add", "renamed.txt")
+		f.run("commit", "-q", "--amend", "--no-edit")
 	}
-	mergeSHA = run("rev-parse", "HEAD")
-	run("update-ref", "refs/remotes/origin/main", mergeSHA)
+	merge = f.run("rev-parse", "HEAD")
+	f.publishAsOriginMain(merge)
 
-	// Non-vacuity, all of it asserted rather than assumed:
-	if out := run("ls-tree", "--name-only", "-r", mergeSHA); strings.Contains(out, "reviewed.txt") {
+	// Non-vacuity, asserted rather than assumed.
+	if strings.Contains(f.run("ls-tree", "--name-only", "-r", merge), "reviewed.txt") {
 		t.Fatal("fixture invalid: the merge still holds the old name, so no rename is under test")
 	}
-	if !strings.Contains(run("ls-tree", "--name-only", "-r", mergeSHA), "renamed.txt") {
+	if !strings.Contains(f.run("ls-tree", "--name-only", "-r", merge), "renamed.txt") {
 		t.Fatal("fixture invalid: the merge does not hold the destination")
 	}
-	carrierBlob := run("rev-parse", carrierSHA+":reviewed.txt")
-	destBlob := run("rev-parse", renamed+":renamed.txt")
-	if edited && carrierBlob == destBlob {
+	if edited && f.blob(candidate, "renamed.txt") == f.blob(carrier, "reviewed.txt") {
 		t.Fatal("fixture invalid: the rename was supposed to edit the content too")
 	}
-	if !edited && carrierBlob != destBlob {
+	if !edited && f.blob(candidate, "renamed.txt") != f.blob(carrier, "reviewed.txt") {
 		t.Fatal("fixture invalid: the rename changed the content, so it is not a pure move")
 	}
-	return dir, baseSHA, carrierSHA, mergeSHA
-}
-
-// carrierReceipt is the receipt shape all three rename cases share.
-func carrierReceipt(t *testing.T, dir, base, carrier, merge string) CompletionReceipt {
-	t.Helper()
-	patch, err := PatchID(dir, carrier)
-	if err != nil {
-		t.Fatalf("carrier must have a patch id: %v", err)
+	if altered && f.blob(merge, "renamed.txt") == f.blob(candidate, "renamed.txt") {
+		t.Fatal("fixture invalid: the amend did not substitute the destination's bytes")
 	}
-	return CompletionReceipt{MergeSHA: merge, ContentSHA: carrier, PatchID: patch, BaseSHA: base}
+	return f.dir, base, carrier, candidate, merge
 }
 
-// The honest rename: the reviewed line moved its own file and the merge holds
-// it at the destination. This must be ACCEPTED, or every lane that reorganises
-// a file mid-review is refused a receipt for work that genuinely landed.
+// A pure move of the carrier's file, through the PUBLIC gate: ACCEPTED.
 func TestValidateFollowsAReviewedRenameToItsDestination(t *testing.T) {
-	dir, base, carrier, merge := renamedPRRepo(t, false, false)
-	r := carrierReceipt(t, dir, base, carrier, merge)
-	if err := r.validateContentBinding(dir); err != nil {
+	dir, base, carrier, candidate, merge := renamedPRRepo(t, false, false)
+	r, st := publicReceipt(t, dir, base, carrier, candidate, merge)
+	if err := r.Validate(dir, carrierRef, st); err != nil {
 		t.Fatalf("an honest reviewed rename was refused: %v", err)
 	}
 }
 
-// The defect itself: the destination is altered in the merge. The old path is
-// equally absent on both sides, so a proof that only compares the old path
-// accepts this. It must be REFUSED.
+// A move that EDITS the file in the same reviewed commit. No comparison of the
+// old path, by name or by blob, can establish where that content went -- the
+// bytes exist nowhere in the repository under the old name. Replaying the whole
+// reviewed delta reproduces the rename and the edit together, so this is
+// ACCEPTED rather than refused for being unfollowable.
+func TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit(t *testing.T) {
+	dir, base, carrier, candidate, merge := renamedPRRepo(t, false, true)
+	r, st := publicReceipt(t, dir, base, carrier, candidate, merge)
+	if err := r.Validate(dir, carrierRef, st); err != nil {
+		t.Fatalf("an honest rename that edited in the same reviewed commit was refused: %v", err)
+	}
+}
+
+// The attack the move enables: the destination holds different bytes in the
+// merge. The old name is equally absent on both sides, so only a whole-result
+// claim catches it. REFUSED.
 func TestValidateRefusesAnAlteredRenameDestination(t *testing.T) {
-	dir, base, carrier, merge := renamedPRRepo(t, true, false)
-	r := carrierReceipt(t, dir, base, carrier, merge)
-	err := r.validateContentBinding(dir)
+	dir, base, carrier, candidate, merge := renamedPRRepo(t, true, false)
+	r, st := publicReceipt(t, dir, base, carrier, candidate, merge)
+	err := r.Validate(dir, carrierRef, st)
 	if err == nil {
 		t.Fatal("an altered rename destination was accepted: a shared absence of the old path is not proof of what landed at the new one")
 	}
@@ -477,26 +400,97 @@ func TestValidateRefusesAnAlteredRenameDestination(t *testing.T) {
 	}
 }
 
-// The deliberate fail-closed edge, pinned so it is a decision rather than a
-// surprise: when the rename EDITS the bytes in the same commit, the carrier's
-// content is at no path in that commit and there is nothing to follow by
-// content. Git's rename detection could guess a destination, but a guess that
-// picks the wrong path would leave the real one unexamined, so this refuses.
-func TestValidateRefusesARenameItCannotFollowByContent(t *testing.T) {
-	dir, base, carrier, merge := renamedPRRepo(t, false, true)
-	r := carrierReceipt(t, dir, base, carrier, merge)
-	err := r.validateContentBinding(dir)
-	if err == nil {
-		t.Fatal("a removal whose destination cannot be proven by content was accepted")
+// ---------------------------------------------------------------------------
+// Topology 4: main and the reviewed line change DIFFERENT HUNKS of one file.
+// The merged file equals neither side's, which is ordinary and honest -- and
+// which every path-by-path or blob-by-blob comparison refuses.
+// ---------------------------------------------------------------------------
+
+const hunkedFile = "top\nmiddle 1\nmiddle 2\nmiddle 3\nmiddle 4\nmiddle 5\nbottom\n"
+
+func independentHunkRepo(t *testing.T) (dir, base, carrier, candidate, merge string) {
+	t.Helper()
+	f := newFixture(t)
+	f.commit("a.txt", "root\n", "root")
+	base = f.commit("file.txt", hunkedFile, "reviewed base")
+
+	f.run("checkout", "-q", "-b", "pr")
+	carrier = f.commit("file.txt", strings.Replace(hunkedFile, "top\n", "top reviewed\n", 1),
+		"reviewed candidate work: the top of the file")
+	candidate = f.commit("other.txt", "more reviewed work\n", "reviewed candidate work: a second file")
+
+	f.run("checkout", "-q", "main")
+	mainRevision := f.commit("file.txt", strings.Replace(hunkedFile, "bottom\n", "bottom main\n", 1),
+		"main revises the other end of the same file")
+	f.run("merge", "-q", "--no-ff", "-m", "Merge pull request #831", "pr")
+	merge = f.run("rev-parse", "HEAD")
+	f.publishAsOriginMain(merge)
+
+	// The point of the fixture: the merged file is NEITHER side's.
+	if f.blob(merge, "file.txt") == f.blob(carrier, "file.txt") {
+		t.Fatal("fixture invalid: the merged file is the carrier's, so main's hunk is not represented")
 	}
-	if !strings.Contains(err.Error(), "destination cannot be proven by content") {
-		t.Fatalf("refusal did not name the reason it could not follow the content: %v", err)
+	if f.blob(merge, "file.txt") == f.blob(mainRevision, "file.txt") {
+		t.Fatal("fixture invalid: the merged file is main's, so the reviewed hunk is not represented")
+	}
+	merged := f.run("show", merge+":file.txt")
+	if !strings.Contains(merged, "top reviewed") || !strings.Contains(merged, "bottom main") {
+		t.Fatalf("fixture invalid: the merged file does not carry both hunks:\n%s", merged)
+	}
+	return f.dir, base, carrier, candidate, merge
+}
+
+// Both sides edited one file, in different places, and both survived. This is an
+// honest landing and must be ACCEPTED: refusing it is the false refusal a
+// path-scoped comparison could not avoid.
+func TestValidateAcceptsIndependentMainAndReviewedHunks(t *testing.T) {
+	dir, base, carrier, candidate, merge := independentHunkRepo(t)
+	r, st := publicReceipt(t, dir, base, carrier, candidate, merge)
+	if err := r.Validate(dir, carrierRef, st); err != nil {
+		t.Fatalf("an honest landing where main and the reviewed line edited different hunks was refused: %v", err)
 	}
 }
 
-// stubContentProofCommand replaces the subprocess seam for one test. The budgets
-// are proven by an injected command, never by hoping the machine is slow or the
-// repository large: a timing assertion would be a flake, not a guard.
+// The sealed candidate is what gets replayed, so swapping it for another commit
+// on the same line -- here the carrier, dropping the rest of the reviewed work --
+// replays a different delta and lands a different tree. The lifecycle state is
+// built to MATCH the substitution, so the refusal can only come from the content
+// gate and not from an unrelated binding.
+func TestValidateRefusesASubstitutedSealedCandidate(t *testing.T) {
+	dir, base, carrier, candidate, merge := independentHunkRepo(t)
+	if carrier == candidate {
+		t.Fatal("fixture invalid: the substitution is not a different commit")
+	}
+	r, st := publicReceipt(t, dir, base, carrier, carrier, merge)
+	err := r.Validate(dir, carrierRef, st)
+	if err == nil {
+		t.Fatal("a receipt whose sealed candidate was swapped for another commit was accepted")
+	}
+	if !strings.Contains(err.Error(), "does not preserve the content of") {
+		t.Fatalf("refusal did not name the content rule: %v", err)
+	}
+}
+
+// The degenerate substitution: naming the integration commit as its own reviewed
+// candidate. Replaying a commit onto its own parent reproduces its tree, so the
+// claim would prove itself. REFUSED before any replay runs.
+func TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate(t *testing.T) {
+	dir, base, carrier, _, merge := independentHunkRepo(t)
+	r, st := publicReceipt(t, dir, base, carrier, merge, merge)
+	err := r.Validate(dir, carrierRef, st)
+	if err == nil {
+		t.Fatal("the integration commit was accepted as its own reviewed candidate")
+	}
+	if !strings.Contains(err.Error(), "no reviewed delta to replay") {
+		t.Fatalf("refusal did not name the self-proving rule: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The budget. Proven through an INJECTED command, so these assert the guard and
+// never the speed of the machine or the size of the repository that ran them.
+// ---------------------------------------------------------------------------
+
 func stubContentProofCommand(t *testing.T, fn func(context.Context, string, ...string) (string, error)) {
 	t.Helper()
 	prev := contentProofCommand
@@ -556,7 +550,7 @@ func TestContentProofRefusesOversizeCommandOutput(t *testing.T) {
 
 // The seam test above proves the LOGICAL cap. This proves the PHYSICAL one: the
 // writer exec hands to git refuses to grow, so an adversarial history is stopped
-// while it is still being written rather than measured after it is all in memory.
+// while it is still being written rather than measured once it is all in memory.
 func TestBoundedOutputRefusesToGrowPastItsCap(t *testing.T) {
 	w := &boundedOutput{max: 8}
 	if n, err := w.Write([]byte("12345678")); n != 8 || err != nil {

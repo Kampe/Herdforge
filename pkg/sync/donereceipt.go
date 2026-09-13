@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
@@ -508,14 +509,12 @@ func ReadDoneLog(repoDir string) ([]DoneRecord, error) {
 
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-// The content-binding proof answers one question -- did the merged tree keep
-// what the carrier changed -- and it has to answer inside a FIXED PHYSICAL
-// BUDGET. It runs in `herd approve` against a repository whose history an
-// author influences, so an unbounded walk is a denial of service with a receipt
+// The content-binding proof answers one question -- is the merged tree the
+// result of the REVIEWED DELTA -- and it has to answer inside a FIXED PHYSICAL
+// BUDGET. It runs in `herd approve` against a repository whose history an author
+// influences, so an unbounded walk is a denial of service with a receipt
 // attached. Per-command timeouts and argv batching bound neither the number of
-// commands nor the total work, so the budget below is shared by the whole proof
-// and covers every dimension it can spend: wall clock, subprocesses, output
-// bytes, paths, history entries, and rename hops.
+// commands nor the total work, so the budget below is shared by the whole proof.
 //
 // Every limit fails CLOSED through ErrContentProofBudget. A proof that was
 // STOPPED is never reported as a landing that was PRESERVED: the two are
@@ -523,13 +522,9 @@ func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 const (
 	contentProofTimeout        = 30 * time.Second
 	contentProofKillDelay      = 5 * time.Second
-	contentProofMaxCommands    = 512
+	contentProofMaxCommands    = 16
 	contentProofMaxOutputBytes = 1 << 20
 	contentProofMaxStderrBytes = 8 << 10
-	contentProofMaxPaths       = 256
-	contentProofMaxHistory     = 256
-	contentProofMaxHops        = 8
-	contentProofPathBatch      = 64
 )
 
 // ErrContentProofBudget is the one sentinel for every limit above.
@@ -589,8 +584,9 @@ func runBoundedGit(ctx context.Context, repoDir string, args ...string) (string,
 }
 
 // contentProof holds the budget for ONE validation. Every git call the proof
-// makes goes through run, so the counters cannot be bypassed by adding a code
-// path that calls git directly.
+// makes goes through run -- including the ones the shared replay primitive
+// makes, because the primitive takes this method as its runner and starts no
+// process of its own -- so the counters cannot be bypassed by adding a code path.
 type contentProof struct {
 	repoDir  string
 	ctx      context.Context
@@ -621,321 +617,94 @@ func (p *contentProof) run(args ...string) (string, error) {
 	return out, err
 }
 
-// predicate runs a git command whose EXIT STATUS is the answer: true for 0,
-// false for the documented "no" status 1, and an error for anything else.
+// reviewedDelta names the two commits whose difference IS the reviewed content.
 //
-// A missing object, a broken repository, or a killed process exits with neither
-// 0 nor 1, and reporting that as a clean "no" turns an infrastructure failure
-// into a content verdict -- `git diff --quiet` exiting 128 must never read as
-// "these paths differ".
-func (p *contentProof) predicate(args ...string) (bool, error) {
-	out, err := p.run(args...)
-	if err == nil {
-		return true, nil
+// Ordinarily that is the sealed base and candidate. A RECONSTRUCTED receipt
+// seals the original reviewed identities, which may no longer exist as objects,
+// alongside the reconstruction that does -- and the producer proved its landing
+// against the reconstruction, so the consumer must replay the same pair or it is
+// checking a different claim. Both come from the receipt and both are covered by
+// its digest: nothing here is chosen by the caller, and no descendant, branch
+// head or working tree is ever substituted for the sealed candidate.
+func (r CompletionReceipt) reviewedDelta() (base, candidate string) {
+	if r.ReconstructedSHA != "" && r.ReconstructionBaseSHA != "" {
+		return r.ReconstructionBaseSHA, r.ReconstructedSHA
 	}
-	if errors.Is(err, ErrContentProofBudget) {
-		return false, err
-	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == 1 {
-		return false, nil
-	}
-	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+	return r.BaseSHA, r.CandidateSHA
 }
 
-// identical reports whether two commits hold the same bytes at every path.
-func (p *contentProof) identical(from, to string, paths []string) (bool, error) {
-	args := append([]string{"diff", "--quiet", from, to, "--"}, paths...)
-	return p.predicate(args...)
-}
-
-// blobAt returns the blob a commit holds at path, and whether it holds one at
-// all. ls-tree answers both in one command and exits 0 either way, so an absent
-// path is never confused with a failed command.
-func (p *contentProof) blobAt(commit, path string) (string, bool, error) {
-	out, err := p.run("ls-tree", "-r", commit, "--", path)
-	if err != nil {
-		return "", false, fmt.Errorf("cannot read %s at %s: %w", path, commit, err)
-	}
-	for _, line := range strings.Split(out, "\n") {
-		meta, name, ok := strings.Cut(line, "\t")
-		if !ok || name != path {
-			continue
-		}
-		if f := strings.Fields(meta); len(f) >= 3 && f[1] == "blob" {
-			return f[2], true, nil
-		}
-	}
-	return "", false, nil
-}
-
-// destinationsWithBlob returns every path in commit holding exactly these bytes.
+// mergedTreeIsTheReviewedResult is the content gate for a sealed carrier.
 //
-// IDENTITY OF CONTENT, never similarity of names. Git's rename detection is a
-// heuristic, and a heuristic that picks the wrong destination would leave the
-// real one unexamined -- which is the whole defect this walk exists to close.
-// Bytes that are not found are a refusal, not an assumption.
-func (p *contentProof) destinationsWithBlob(commit, blob string) ([]string, error) {
-	out, err := p.run("ls-tree", "-r", commit)
-	if err != nil {
-		return nil, fmt.Errorf("cannot list the tree of %s: %w", commit, err)
-	}
-	var found []string
-	for _, line := range strings.Split(out, "\n") {
-		meta, name, ok := strings.Cut(line, "\t")
-		if !ok {
-			continue
-		}
-		f := strings.Fields(meta)
-		if len(f) >= 3 && f[1] == "blob" && f[2] == blob {
-			found = append(found, name)
-			if len(found) > contentProofMaxHops {
-				return nil, fmt.Errorf("%w: %s holds those bytes at more than %d paths",
-					ErrContentProofBudget, commit, contentProofMaxHops)
-			}
-		}
-	}
-	return found, nil
-}
-
-// contentClaim is one open obligation: the merged tree must hold `at`'s content
-// at `path`.
-type contentClaim struct{ path, at string }
-
-// lastReviewedRevision returns the newest commit that revised this path on the
-// REVIEWED line after `at`, or "" when nobody did.
+// It asks the producer's own question, with the producer's own command: replay
+// the reviewed delta onto the integration commit's FIRST PARENT and require the
+// result to equal the integration commit's tree. That is a WHOLE-RESULT claim,
+// which is why it answers the shapes a path-by-path comparison could not:
 //
-// --full-history so a revision on the pull request's side is never simplified
-// away when the merge is treesame to main; --topo-order so the reviewed line's
-// LAST word on the path is seen first; --max-count so the walk is finite. A
-// commit that does not descend from `at` is main's own work, which is not the
-// reviewed line revising itself and must never license a discarded hunk.
-func (p *contentProof) lastReviewedRevision(claim contentClaim, mergeSHA string) (string, error) {
-	out, err := p.run("rev-list", "--full-history", "--topo-order",
-		fmt.Sprintf("--max-count=%d", contentProofMaxHistory),
-		claim.at+".."+mergeSHA, "--", claim.path)
-	if err != nil {
-		return "", fmt.Errorf("merge sha %s: cannot list what revised %s after %s: %w",
-			mergeSHA, claim.path, claim.at, err)
-	}
-	for _, line := range strings.Split(out, "\n") {
-		rev := strings.TrimSpace(line)
-		if rev == "" {
-			continue
-		}
-		// The merge is not a revision OF the content. Bytes appearing for the
-		// first time in the merge commit are exactly the substitution this
-		// walk exists to refuse.
-		if strings.EqualFold(rev, mergeSHA) {
-			continue
-		}
-		descends, err := p.predicate("merge-base", "--is-ancestor", claim.at, rev)
-		if err != nil {
-			return "", err
-		}
-		if descends {
-			return rev, nil
-		}
-	}
-	return "", nil
-}
-
-// proveClaim follows ONE of the carrier's paths until the merged tree accounts
-// for it, or refuses.
+//   - a reviewed commit that renames a file AND edits it in the same commit: the
+//     replay reproduces both, where following the old path by name or by blob
+//     could not establish the destination at all;
+//   - a file where main and the reviewed line changed DIFFERENT hunks: the
+//     replay lands on main's tip, so the merged result is what it produces --
+//     no longer a false refusal;
+//   - later revisions inside the pull request: they are part of the delta.
 //
-// The path may move. A reviewed descendant can rename a to b, and then the old
-// name is absent in both the descendant and the merge -- a SHARED ABSENCE, which
-// proves only that neither holds the old name. Accepting it is how an altered b
-// validates: ancestry holds, the old path matches, and the carrier's patch id
-// still matches. So a removal is followed to its destination BY CONTENT and the
-// obligation moves with it, or the proof refuses. Deletions with no destination,
-// and renames whose bytes were edited in the same commit, are refusals rather
-// than assumptions -- fail-closed, and named as such in the error.
-func (p *contentProof) proveClaim(path, contentSHA, mergeSHA string) error {
-	start := contentClaim{path: path, at: contentSHA}
-	queue := []contentClaim{start}
-	seen := map[contentClaim]bool{start: true}
-	for hops := 0; len(queue) > 0; hops++ {
-		if hops >= contentProofMaxHops {
-			return fmt.Errorf("%w: following %s through more than %d reviewed-line moves",
-				ErrContentProofBudget, path, contentProofMaxHops)
-		}
-		claim := queue[0]
-		queue = queue[1:]
-
-		same, err := p.identical(claim.at, mergeSHA, []string{claim.path})
-		if err != nil {
-			return err
-		}
-		if same {
-			continue
-		}
-		rev, err := p.lastReviewedRevision(claim, mergeSHA)
-		if err != nil {
-			return err
-		}
-		if rev == "" {
-			return fmt.Errorf(
-				"merge sha %s does not preserve the content of %s: %s differs in the merged tree and no commit descending from %s revised it",
-				mergeSHA, contentSHA, claim.path, claim.at)
-		}
-		if _, present, err := p.blobAt(rev, claim.path); err != nil {
-			return err
-		} else if present {
-			same, err := p.identical(rev, mergeSHA, []string{claim.path})
-			if err != nil {
-				return err
-			}
-			if same {
-				continue
-			}
-			return fmt.Errorf(
-				"merge sha %s does not preserve the content of %s: %s was last revised on the reviewed line by %s, and the merged tree holds neither",
-				mergeSHA, contentSHA, claim.path, rev)
-		}
-		next, err := p.destinationClaims(claim, rev, contentSHA, mergeSHA)
-		if err != nil {
-			return err
-		}
-		for _, n := range next {
-			if seen[n] {
-				continue
-			}
-			seen[n] = true
-			queue = append(queue, n)
-		}
-	}
-	return nil
-}
-
-// destinationClaims handles the case the reviewed line REMOVED the path: it
-// establishes where those exact bytes went and returns the obligations that
-// replace this one. Returning no claims and no error would accept the shared
-// absence, which is precisely the acceptance hole, so every path out of here is
-// either a new obligation or a refusal.
-func (p *contentProof) destinationClaims(claim contentClaim, rev, contentSHA, mergeSHA string) ([]contentClaim, error) {
-	if _, inMerge, err := p.blobAt(mergeSHA, claim.path); err != nil {
-		return nil, err
-	} else if inMerge {
-		return nil, fmt.Errorf(
-			"merge sha %s does not preserve the content of %s: the reviewed line removed %s at %s, and the merged tree holds different bytes there",
-			mergeSHA, contentSHA, claim.path, rev)
-	}
-	blob, held, err := p.blobAt(claim.at, claim.path)
-	if err != nil {
-		return nil, err
-	}
-	if !held {
-		return nil, fmt.Errorf(
-			"merge sha %s does not preserve the content of %s: %s holds no content at %s, so there is nothing to follow",
-			mergeSHA, contentSHA, claim.at, claim.path)
-	}
-	dests, err := p.destinationsWithBlob(rev, blob)
-	if err != nil {
-		return nil, err
-	}
-	if len(dests) == 0 {
-		return nil, fmt.Errorf(
-			"merge sha %s does not preserve the content of %s: the reviewed line removed %s at %s and that commit holds those exact bytes at no path, so the destination cannot be proven by content",
-			mergeSHA, contentSHA, claim.path, rev)
-	}
-	next := make([]contentClaim, 0, len(dests))
-	for _, d := range dests {
-		next = append(next, contentClaim{path: d, at: rev})
-	}
-	return next, nil
-}
-
-// preserved proves the merged tree kept what the carrier changed.
-//
-// Two real landings satisfy ancestry and still land something else: an ours
-// merge that discards every reviewed hunk, and a merge amended to substitute
-// different bytes. Both leave the carrier an ancestor of the merge, so the graph
-// says yes while the tree says no. The carrier's own paths are what tell them
-// apart; the whole tree is the wrong scope, because later unrelated commits
-// legitimately change other files.
-//
-// Byte identity WITH THE CARRIER is the right test only while nothing revised
-// those paths afterwards, and that assumption does not hold. The producer seals
-// the landed commit matching the candidate's last patch, which is routinely an
-// INTERMEDIATE commit on an iterated pull-request line whose own files are
-// revised again before the merge -- this repository produces that shape
-// constantly. Demanding byte identity there refuses a landing that genuinely
-// happened. So a differing path is followed by proveClaim rather than refused on
-// sight, and what that still refuses is listed there.
-func (p *contentProof) preserved(contentSHA, mergeSHA string) error {
-	// The carrier must be an ordinary single-parent content commit. A merge has
-	// no patch of its own, and "the paths it changed" is not a question with one
-	// answer for it -- so this is a refusal, not a diff against an arbitrary
-	// parent. It also makes the path listing below exact.
-	parents, err := p.run("rev-list", "--parents", "-n", "1", contentSHA)
-	if err != nil {
-		return fmt.Errorf("content sha %s: cannot read its parents: %w", contentSHA, err)
-	}
-	if fields := strings.Fields(parents); len(fields) != 2 {
+// And it refuses the shapes that matter: an ours merge discards the reviewed
+// hunks so its tree is its first parent's, not the replay's; a merge amended to
+// substitute bytes holds neither; and a receipt whose sealed candidate was
+// swapped for another commit replays a different delta and lands a different
+// tree. A replay that cannot be computed at all -- a conflict -- is a refusal,
+// never an assumption.
+func (p *contentProof) mergedTreeIsTheReviewedResult(r CompletionReceipt) error {
+	base, candidate := r.reviewedDelta()
+	// An integration commit that IS the reviewed candidate has no independent
+	// reviewed delta to replay: the claim would prove itself. The producer never
+	// seals a carrier in that shape, and refusing it here is what stops a
+	// receipt from naming the merge as its own candidate.
+	if strings.EqualFold(candidate, r.MergeSHA) {
 		return fmt.Errorf(
-			"content sha %s is not an ordinary single-parent commit (%d parent(s)); a commit with no patch of its own cannot be the landed content",
-			contentSHA, len(fields)-1)
+			"merge sha %s does not preserve the content of %s: the reviewed candidate is the integration commit itself, so there is no reviewed delta to replay",
+			r.MergeSHA, r.ContentSHA)
 	}
-	changed, err := p.run("diff", "--name-only", contentSHA+"^", contentSHA)
+	parent, err := p.run("rev-parse", "--verify", "-q", r.MergeSHA+"^1")
 	if err != nil {
-		return fmt.Errorf("content sha %s: cannot list the paths it changed: %w", contentSHA, err)
-	}
-	paths := make([]string, 0, 8)
-	for _, line := range strings.Split(changed, "\n") {
-		if q := strings.TrimSpace(line); q != "" {
-			paths = append(paths, q)
-		}
-	}
-	if len(paths) == 0 {
-		// A carrier that changed nothing cannot be the content this receipt
-		// claims landed. PatchID refuses an empty commit too; refusing here as
-		// well keeps the reason specific instead of arriving as "no patch".
-		return fmt.Errorf("content sha %s changed no path; it cannot be the landed content", contentSHA)
-	}
-	if len(paths) > contentProofMaxPaths {
-		return fmt.Errorf("%w: content sha %s changed %d paths, more than the %d this proof will follow",
-			ErrContentProofBudget, contentSHA, len(paths), contentProofMaxPaths)
-	}
-	for start := 0; start < len(paths); start += contentProofPathBatch {
-		end := start + contentProofPathBatch
-		if end > len(paths) {
-			end = len(paths)
-		}
-		batch := paths[start:end]
-		// The batch check is the fast path for the ordinary landing, where the
-		// carrier's bytes are in the merge untouched. Batching bounds argv only;
-		// the aggregate bound is the command and time budget above.
-		same, err := p.identical(contentSHA, mergeSHA, batch)
-		if err != nil {
+		if errors.Is(err, ErrContentProofBudget) {
 			return err
 		}
-		if same {
-			continue
+		return fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: it has no first parent to replay onto: %w",
+			r.MergeSHA, r.ContentSHA, err)
+	}
+	replayed, err := gitroot.ReplayReviewedTree(base, parent, candidate, p.run)
+	if err != nil {
+		if errors.Is(err, ErrContentProofBudget) {
+			return err
 		}
-		for _, path := range batch {
-			same, err := p.identical(contentSHA, mergeSHA, []string{path})
-			if err != nil {
-				return err
-			}
-			if same {
-				continue
-			}
-			if err := p.proveClaim(path, contentSHA, mergeSHA); err != nil {
-				return err
-			}
+		return fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: replaying the reviewed delta %s..%s onto %s did not produce a tree: %w",
+			r.MergeSHA, r.ContentSHA, base, candidate, parent, err)
+	}
+	landedTree, err := p.run("rev-parse", "--verify", "-q", r.MergeSHA+"^{tree}")
+	if err != nil {
+		if errors.Is(err, ErrContentProofBudget) {
+			return err
 		}
+		return fmt.Errorf("merge sha %s: cannot read its own tree: %w", r.MergeSHA, err)
+	}
+	if !strings.EqualFold(replayed, landedTree) {
+		return fmt.Errorf(
+			"merge sha %s does not preserve the content of %s: replaying the reviewed delta %s..%s onto %s produces tree %s, and the merged tree is %s",
+			r.MergeSHA, r.ContentSHA, base, candidate, parent, replayed, landedTree)
 	}
 	return nil
 }
 
-// contentPreservedInMerge is the consumer entry point: one shared deadline for
+// replayProvesTheMergedTree is the consumer entry point: one shared deadline for
 // the whole proof, cancelled on every return.
-func contentPreservedInMerge(repoDir, contentSHA, mergeSHA string) error {
+func (r CompletionReceipt) replayProvesTheMergedTree(repoDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), contentProofTimeout)
 	defer cancel()
 	proof := &contentProof{repoDir: repoDir, ctx: ctx}
-	return proof.preserved(contentSHA, mergeSHA)
+	return proof.mergedTreeIsTheReviewedResult(r)
 }
 
 // validateContentBinding is the content half of Validate, extracted so the
@@ -962,14 +731,14 @@ func (r CompletionReceipt) validateContentBinding(repoDir string) error {
 		if _, err := git(repoDir, "merge-base", "--is-ancestor", r.ContentSHA, r.MergeSHA); err != nil {
 			return fmt.Errorf("content sha %s is not an ancestor of merge sha %s", r.ContentSHA, r.MergeSHA)
 		}
-		// Content: the merged tree has to account for every path the carrier
-		// changed -- holding the carrier's bytes, or the reviewed line's own
-		// later revision of them, or those bytes at the path the reviewed line
-		// moved them to. Ancestry alone is satisfied by an ours merge that
-		// discarded every reviewed hunk, and by a merge amended to substitute
-		// different content: both keep the carrier as an ancestor while landing
-		// something else. This runs inside one shared, finite budget.
-		if err := contentPreservedInMerge(repoDir, r.ContentSHA, r.MergeSHA); err != nil {
+		// Content: the merged tree must BE the reviewed result -- the sealed
+		// reviewed delta replayed onto the integration commit's first parent.
+		// Ancestry alone is satisfied by an ours merge that discarded every
+		// reviewed hunk, and by a merge amended to substitute different bytes:
+		// both keep the carrier an ancestor while landing something else. The
+		// carrier keeps its own independent bindings -- that ancestry, and the
+		// patch id below -- and the replay runs inside one shared, finite budget.
+		if err := r.replayProvesTheMergedTree(repoDir); err != nil {
 			return err
 		}
 	}

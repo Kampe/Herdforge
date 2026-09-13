@@ -136,7 +136,7 @@ done
 suites=(
 "./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt|TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt|TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt"
 "./cmd/herd/${sep}^(TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged|TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin|TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo|TestResolveVerifyLandedSurfaceRefusesAForeignRepository|TestRequireObjectPresentDemandsACommit|TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead)\$${sep}TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo TestResolveVerifyLandedSurfaceRefusesAForeignRepository TestRequireObjectPresentDemandsACommit TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead"
-"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedDiscardedAndAlteredCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath|TestValidateFollowsAReviewedRenameToItsDestination|TestValidateRefusesAnAlteredRenameDestination|TestValidateRefusesARenameItCannotFollowByContent|TestContentProofRefusesAfterItsDeadline|TestContentProofRefusesWhenTheCommandBudgetIsSpent|TestContentProofRefusesOversizeCommandOutput|TestBoundedOutputRefusesToGrowPastItsCap)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedDiscardedAndAlteredCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath TestValidateFollowsAReviewedRenameToItsDestination TestValidateRefusesAnAlteredRenameDestination TestValidateRefusesARenameItCannotFollowByContent TestContentProofRefusesAfterItsDeadline TestContentProofRefusesWhenTheCommandBudgetIsSpent TestContentProofRefusesOversizeCommandOutput TestBoundedOutputRefusesToGrowPastItsCap"
+"./pkg/sync/${sep}^(TestValidateAcceptsSealedCarrierForAPullRequestLanding|TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed|TestValidateRefusesForgedAndPatchMismatchedCarriers|TestSealedCarrierIsCoveredByTheDigest|TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath|TestValidateRefusesAMergeThatDiscardedTheReviewedContent|TestValidateFollowsAReviewedRenameToItsDestination|TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit|TestValidateRefusesAnAlteredRenameDestination|TestValidateAcceptsIndependentMainAndReviewedHunks|TestValidateRefusesASubstitutedSealedCandidate|TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate|TestContentProofRefusesAfterItsDeadline|TestContentProofRefusesWhenTheCommandBudgetIsSpent|TestContentProofRefusesOversizeCommandOutput|TestBoundedOutputRefusesToGrowPastItsCap)\$${sep}TestValidateAcceptsSealedCarrierForAPullRequestLanding TestValidateStillBindsContentToTheMergeWhenNoCarrierIsSealed TestValidateRefusesForgedAndPatchMismatchedCarriers TestSealedCarrierIsCoveredByTheDigest TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath TestValidateRefusesAMergeThatDiscardedTheReviewedContent TestValidateFollowsAReviewedRenameToItsDestination TestValidateAcceptsARenameThatEditsInTheSameReviewedCommit TestValidateRefusesAnAlteredRenameDestination TestValidateAcceptsIndependentMainAndReviewedHunks TestValidateRefusesASubstitutedSealedCandidate TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate TestContentProofRefusesAfterItsDeadline TestContentProofRefusesWhenTheCommandBudgetIsSpent TestContentProofRefusesOversizeCommandOutput TestBoundedOutputRefusesToGrowPastItsCap"
 )
 
 # ---------------------------------------------------------------------------
@@ -176,58 +176,41 @@ suites=(
 #                          It is its own copy site and the full-provenance
 #                          control cannot speak for it.
 #
-#   later-revision-must-be-the-one-that-landed
-#                          the consumer's allowance for a carrier whose paths
-#                          were revised again before the merge is narrow: the
-#                          merged tree must hold the REVIEWED LINE'S LAST
-#                          revision of that path. Without that the allowance
-#                          degrades into "somebody touched it later", and an
-#                          ours merge that discarded every reviewed hunk walks
-#                          straight through it.
-#
-#                          Anchored to the CHILD subtest that makes the
-#                          assertion, never to the parent. Go emits an
-#                          assertion's output event under the subtest that made
-#                          it, so a parent killer carries a fail action with no
-#                          assertion output of its own -- the exact shape that
-#                          read as WRONG-TEST-OR-ASSERTION for the observer
-#                          driver's mode-validation control in CI 34739189004.
-#                          test_emitted below also accepts a subtest of the
-#                          named test, so the child anchor satisfies both
-#                          readings instead of depending on which one is in
-#                          force. The parent stays in the pkg/sync suite row, so
-#                          its top-level PASS is still required at baseline and
-#                          after restore, and both subtests still run there.
-#
-#   destination-accounting-required
-#                          a path the reviewed line REMOVED is followed to where
-#                          its bytes went, by content, or refused. Without that
-#                          the old name is absent on both sides and the shared
-#                          absence is read as agreement, so a renamed-then-
-#                          altered destination validates while never being
-#                          looked at. That is the acceptance hole the FAC-831
-#                          review found, and it is an acceptance of altered
-#                          content, not a conservative refusal.
+#   sealed-carrier-requires-the-replay
+#                          a sealed carrier is not accepted on ancestry and a
+#                          matching patch id alone. Delete the replay and an ours
+#                          merge -- carrier still an ancestor, every reviewed hunk
+#                          gone -- validates.
+#   replayed-tree-must-equal-the-merged-tree
+#                          the replayed reviewed result must BE what landed.
+#                          Computing it and not comparing it accepts a merge
+#                          amended to substitute different bytes at a renamed
+#                          destination, which the old path-scoped comparison
+#                          could not see at all.
+#   candidate-may-not-be-the-integration-commit
+#                          a receipt may not name the merge as its own reviewed
+#                          candidate. Replaying a commit onto its own parent
+#                          reproduces its tree, so the claim would prove itself:
+#                          this is the refusal that stops the sealed candidate
+#                          from being replaced by the thing it is supposed to
+#                          justify.
 #   proof-command-budget-enforced
 #   proof-deadline-enforced
 #   proof-output-budget-enforced
 #                          the three physical limits of the consumer proof are
 #                          load bearing: total subprocesses, the one shared
 #                          deadline, and the bytes a single command may return.
-#                          A per-command timeout and an argv batch bound neither
-#                          the number of commands nor the total work, so each of
-#                          these is the only thing standing between `herd
-#                          approve` and an author-influenced history that can
-#                          monopolise the machine. Their killers drive an
-#                          INJECTED command, so they prove the guard rather than
-#                          the speed or size of whatever ran CI that day.
+#                          The shared replay primitive runs through this same
+#                          runner and starts no process of its own, so these
+#                          bound it too. Their killers drive an INJECTED command,
+#                          so they prove the guard rather than the speed or size
+#                          of whatever ran CI that day.
 #
-# Every control except later-revision-must-be-the-one-that-landed has its
-# assertion emitted by its killer test ITSELF: none of those nine declares a
-# subtest, and the shared helpers that assert for them (assertIntegrationContract,
-# assertSealedCarrierReceipt) run on the killer's own *testing.T, so their output
-# carries the killer's exact .Test name. No control in this file depends on
-# prefix matching to be attributable.
+# Every control's assertion is emitted by its killer test ITSELF: no killer in
+# this file declares a subtest, and the shared helpers that assert for them
+# (assertIntegrationContract, assertSealedCarrierReceipt) run on the killer's own
+# *testing.T, so their output carries the killer's exact .Test name. Nothing here
+# depends on prefix matching to be attributable.
 #
 # Gate.Complete's copy of the same field has NO control here, deliberately: its
 # producer is Prove, which never sets ContentSHA on any of its three modes, so
@@ -262,20 +245,16 @@ mutations=(
 		ContentSHA:         proof.ContentSHA,${sep}		MergeSHA:           proof.MergeSHA,
 		// MUTANT: the sealed carrier is dropped, so the receipt binds content to the merge alone${sep}TestReconcileLandedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}full-provenance producer did not seal the content carrier"
 "sealed-carrier-copied-into-the-reduced-receipt${sep}pkg/mergeadmit/reconcile.go${sep}./pkg/mergeadmit/${sep}MergeSHA: proof.MergeSHA, ContentSHA: proof.ContentSHA, PatchID: proof.PatchID,${sep}MergeSHA: proof.MergeSHA, /* MUTANT: the reduced receipt drops the sealed carrier */ PatchID: proof.PatchID,${sep}TestReconcileLandedReducedSealsThePullRequestCarrierAndPublicValidateAcceptsIt${sep}reduced-provenance producer did not seal the content carrier"
-"later-revision-must-be-the-one-that-landed${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}			if same {
-				continue
-			}
-			return fmt.Errorf(${sep}			if true || same { // MUTANT: a later revision alone licenses the path, so a discarded hunk passes
-				continue
-			}
-			return fmt.Errorf(${sep}TestValidateAcceptsALaterRevisionOfTheCarriersOwnPath/an_ours_merge_on_a_path_the_reviewed_line_also_revised${sep}was accepted because the path was revised later"
-"destination-accounting-required${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		next, err := p.destinationClaims(claim, rev, contentSHA, mergeSHA)
-		if err != nil {
-			return err
-		}${sep}		var next []contentClaim // MUTANT: a shared absence of the old path is accepted as proof of the destination${sep}TestValidateRefusesAnAlteredRenameDestination${sep}an altered rename destination was accepted"
 "proof-command-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if p.commands >= contentProofMaxCommands {${sep}	if false && p.commands >= contentProofMaxCommands { // MUTANT: the subprocess count is no longer bounded${sep}TestContentProofRefusesWhenTheCommandBudgetIsSpent${sep}the command budget did not stop the proof after"
 "proof-deadline-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if err := p.ctx.Err(); err != nil {${sep}	if err := error(nil); err != nil { // MUTANT: the shared deadline no longer stops the proof${sep}TestContentProofRefusesAfterItsDeadline${sep}an expired deadline must stop the proof before it starts a process"
 "proof-output-budget-enforced${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if len(out) > contentProofMaxOutputBytes {${sep}	if false && len(out) > contentProofMaxOutputBytes { // MUTANT: command output is no longer bounded${sep}TestContentProofRefusesOversizeCommandOutput${sep}output larger than the proof budget was accepted"
+"sealed-carrier-requires-the-replay${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}		if err := r.replayProvesTheMergedTree(repoDir); err != nil {
+			return err
+		}${sep}		if err := error(nil); err != nil { // MUTANT: a sealed carrier no longer has to replay to the merged tree
+			return err
+		}${sep}TestValidateRefusesAMergeThatDiscardedTheReviewedContent${sep}a merge that discarded every reviewed hunk was accepted"
+"replayed-tree-must-equal-the-merged-tree${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if !strings.EqualFold(replayed, landedTree) {${sep}	if false && !strings.EqualFold(replayed, landedTree) { // MUTANT: the replayed reviewed result no longer has to be what landed${sep}TestValidateRefusesAnAlteredRenameDestination${sep}an altered rename destination was accepted"
+"candidate-may-not-be-the-integration-commit${sep}pkg/sync/donereceipt.go${sep}./pkg/sync/${sep}	if strings.EqualFold(candidate, r.MergeSHA) {${sep}	if false && strings.EqualFold(candidate, r.MergeSHA) { // MUTANT: a receipt may name the merge as its own reviewed candidate${sep}TestValidateRefusesTheIntegrationCommitAsItsOwnCandidate${sep}the integration commit was accepted as its own reviewed candidate"
 )
 
 # compile_check proves the mutant builds. Its result is kept separately from
