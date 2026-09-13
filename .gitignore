@@ -134,3 +134,5 @@ TASK-PACKET.md
 
 # FAC-826: mutation-control logs from scripts/verify-resource-admission.zsh.
 .verify-admission-logs/
+# FAC-827: mutation-control logs from scripts/verify-manifest-budget.zsh.
+.verify-budget-logs/
