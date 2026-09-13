@@ -129,7 +129,7 @@ done
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
-"./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt"
+"./pkg/mergeadmit/${sep}^(TestIntegrationCommitForPromotesCarrierToTheMergeCommit|TestIntegrationCommitForLeavesAnOrdinaryLandingAlone|TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase|TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID|TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding|TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt|TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent|TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent|TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge|TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt)\$${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit TestIntegrationCommitForLeavesAnOrdinaryLandingAlone TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase TestEquivalentLandedProofSealsIntegrationCommitAndKeepsContentPatchID TestEquivalentLandedProofIsUnchangedForAnOrdinaryLanding TestEquivalentLandedProofRefusesRatherThanSealAnUnapprovableReceipt TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent TestIntegrationCommitForRefusesAMergeThatAlteredTheReviewedContent TestContentPreservedAtSeparatesAnHonestMergeFromAnOursMerge TestIntegrationCommitForSelectsTheMergeEvenWhenALaterCommitRevertsIt"
 "./cmd/herd/${sep}^(TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged|TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin|TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo|TestResolveVerifyLandedSurfaceRefusesAForeignRepository|TestRequireObjectPresentDemandsACommit|TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead)\$${sep}TestResolveVerifyLandedSurfaceUsesALiveCarrierUnchanged TestResolveVerifyLandedSurfaceRefusesRetiredCarrierWithoutAPin TestResolveVerifyLandedSurfaceAcceptsAPinnedCandidateInThisRepo TestResolveVerifyLandedSurfaceRefusesAForeignRepository TestRequireObjectPresentDemandsACommit TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead"
 )
 
@@ -182,11 +182,18 @@ mutations=(
 	}${sep}	if true || carrierHasBase { // MUTANT: promotion removed, the carrier is always sealed
 		return carrier, nil
 	}${sep}TestIntegrationCommitForPromotesCarrierToTheMergeCommit${sep}selected the patch carrier"
-"no-false-integration-proof${sep}pkg/mergeadmit/landed_integration.go${sep}./pkg/mergeadmit/${sep}		if containsBase {
+# REMOVED, deliberately: an earlier revision carried a "no-false-integration-proof"
+# control that mutated the base-ancestry test. With the content replay in place
+# it could not be shown to be independently load bearing -- every fixture that
+# would exercise it is already refused by the replay, so the mutant SURVIVED.
+# A control that cannot kill is worse than no control, because it reports
+# coverage that does not exist. Base ancestry remains enforced in source and is
+# asserted directly by the tests; it simply has no honest mutant here.
+"integration-content-replay-required${sep}pkg/mergeadmit/landed_integration.go${sep}./pkg/mergeadmit/${sep}		if preserved {
 			return sha, nil
-		}${sep}		if true || containsBase { // MUTANT: base ancestry no longer required of the selected commit
+		}${sep}		if true || preserved { // MUTANT: content replay no longer required, ancestry alone selects
 			return sha, nil
-		}${sep}TestIntegrationCommitForRefusesWhenNothingIntegratesTheBase${sep}although nothing integrates the reviewed base"
+		}${sep}TestIntegrationCommitForRefusesAnOursMergeThatDiscardedTheContent${sep}an ours merge that discarded every reviewed hunk was sealed"
 "retired-carrier-pin-required${sep}cmd/herd/verify_landed_surface.go${sep}./cmd/herd/${sep}	if pinned == \"\" {
 		return verifyLandedSurface{}, errRetiredCarrierUnpinned
 	}${sep}	if false && pinned == "" { // MUTANT: an unpinned retired carrier falls through to the invoker

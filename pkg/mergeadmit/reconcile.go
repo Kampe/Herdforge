@@ -407,7 +407,7 @@ func equivalentLandedProof(ctx context.Context, repoDir, base, candidate, landed
 	if err != nil {
 		return nil, fmt.Errorf("patch id for proved content commit %s: %w", short(contentSHA), err)
 	}
-	mergeSHA, err := integrationCommitFor(ctx, repoDir, base, contentSHA, landedCommits)
+	mergeSHA, err := integrationCommitFor(ctx, repoDir, base, candidate, contentSHA, landedCommits)
 	if err != nil {
 		return nil, err
 	}

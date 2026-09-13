@@ -119,3 +119,9 @@ func runOut(t *testing.T, dir, name string, args ...string) string {
 	}
 	return string(out)
 }
+
+// osWriteFile writes a file inside the fixture repository.
+func osWriteFile(t *testing.T, dir, name, body string) error {
+	t.Helper()
+	return os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644)
+}
