@@ -69,6 +69,37 @@ const (
 	ObserverExpiryTicks = 3
 )
 
+// maxObserverTickIndex is the highest schedule slot a legal run can reach: the
+// longest permitted lifetime divided by the shortest permitted interval.
+//
+// Elapsed time cannot produce an index beyond it, so one that appears came
+// from a clock that jumped. Bounding the index explicitly keeps every value
+// derived from it in range -- the schedule multiplication cannot overflow a
+// Duration, and the dropped-tick gap cannot exceed this ceiling -- so the
+// counts published from it are checked rather than assumed.
+const maxObserverTickIndex = int64(MaxObserverLifetime / MinObserverInterval)
+
+// droppedTicks is the number of scheduled ticks that were skipped between the
+// previous sample and this one.
+//
+// The subtraction is checked at BOTH ends before it becomes a count. The
+// schedule only ever advances, so a non-positive gap means the index moved
+// backwards, and a gap past the ceiling means it jumped; neither can be
+// published as a plausible number of dropped ticks, and converting either
+// unchecked would wrap into an enormous one. ok=false is a fault for the
+// caller to stop on, never a zero that reads as "nothing was dropped".
+func droppedTicks(tickIndex, lastIndex int64) (uint64, bool) {
+	if lastIndex <= 0 {
+		// No previous sample, so nothing was dropped before this one.
+		return 0, true
+	}
+	gap := tickIndex - lastIndex - 1
+	if gap < 0 || gap > maxObserverTickIndex {
+		return 0, false
+	}
+	return uint64(gap), true
+}
+
 // ErrObserverBusy is returned when another observer already holds the canonical
 // lock. It is a refusal, never a wait: two observers publishing into one status
 // path would interleave writes and neither could be trusted.
@@ -271,6 +302,13 @@ func runObserverLoop(ctx context.Context, cfg ObserverConfig, id ObserverIdentit
 	)
 
 	for {
+		// Bound the index BEFORE it is multiplied into a Duration. Beyond the
+		// ceiling the multiplication itself would be meaningless, so the run
+		// stops on the fault rather than scheduling from a wrapped instant.
+		if tickIndex < 1 || tickIndex > maxObserverTickIndex {
+			status.Terminated = "impossible schedule: tick index out of range"
+			return status, publishFinal(deps, &status)
+		}
 		scheduled := base.Add(time.Duration(tickIndex) * cfg.Interval)
 		if !scheduled.Before(deadline) {
 			status.Terminated = "lifetime reached"
@@ -315,10 +353,14 @@ func runObserverLoop(ctx context.Context, cfg ObserverConfig, id ObserverIdentit
 			status.Terminated = "impossible chronology: sample completed before it started"
 			return status, publishFinal(deps, &status)
 		}
-		skipped := uint64(0)
-		if lastIndex > 0 && tickIndex > lastIndex+1 {
-			// Ticks between the previous sample and this one were DROPPED.
-			skipped = uint64(tickIndex - lastIndex - 1)
+		// Ticks between the previous sample and this one were DROPPED, never
+		// queued. The count is derived through a checked subtraction so an
+		// impossible index can stop the run instead of publishing a wrapped
+		// total.
+		skipped, gapOK := droppedTicks(tickIndex, lastIndex)
+		if !gapOK {
+			status.Terminated = "impossible schedule: dropped-tick count out of range"
+			return status, publishFinal(deps, &status)
 		}
 		lastIndex = tickIndex
 

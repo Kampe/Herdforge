@@ -135,6 +135,20 @@ func TestObserverDropsOverrunTicksWithoutCatchUp(t *testing.T) {
 	if status.SkippedTicks == 0 {
 		t.Fatalf("an overrunning sample produced zero skipped ticks; drops are being hidden")
 	}
+	// A dropped-tick count is a real count, not a wrapped subtraction. Every
+	// published value must stay inside the schedule ceiling, and the per-sample
+	// figures must add up to the total.
+	var summed uint64
+	for i, h := range status.History {
+		if h.SkippedBefore > uint64(maxObserverTickIndex) {
+			t.Fatalf("sample %d published %d dropped ticks, past the %d ceiling: the count wrapped",
+				i, h.SkippedBefore, maxObserverTickIndex)
+		}
+		summed += h.SkippedBefore
+	}
+	if summed != status.SkippedTicks {
+		t.Fatalf("per-sample dropped ticks sum to %d but the total says %d", summed, status.SkippedTicks)
+	}
 	if status.TotalTicks != uint64(len(starts)) {
 		t.Fatalf("total ticks %d does not match samples actually taken %d", status.TotalTicks, len(starts))
 	}
@@ -631,5 +645,64 @@ func TestObserverRecordsSampleFailureWithoutAdmitting(t *testing.T) {
 	// assertion can stand in for the other.
 	if ok, _ := ObserverUsable(status, clock.Now()); ok {
 		t.Fatalf("a status whose latest sample failed was reported usable")
+	}
+}
+
+// TestDroppedTicksIsCheckedAtBothEnds pins the arithmetic behind the published
+// dropped-tick count.
+//
+// The subtraction that produces it converts to an unsigned count, so a
+// backwards or jumped index must be reported as a fault rather than converted:
+// unchecked, either would wrap into an enormous plausible-looking number of
+// dropped ticks.
+func TestDroppedTicksIsCheckedAtBothEnds(t *testing.T) {
+	cases := []struct {
+		name      string
+		tickIndex int64
+		lastIndex int64
+		want      uint64
+		wantOK    bool
+	}{
+		{"no previous sample", 1, 0, 0, true},
+		{"consecutive ticks drop nothing", 2, 1, 0, true},
+		{"one dropped tick", 3, 1, 1, true},
+		{"several dropped ticks", 9, 4, 4, true},
+		{"at the ceiling", maxObserverTickIndex + 1, 1, uint64(maxObserverTickIndex - 1), true},
+		{"index moved backwards", 1, 5, 0, false},
+		{"index equal to the previous", 4, 4, 0, false},
+		{"gap past the ceiling", maxObserverTickIndex + 3, 1, 0, false},
+		{"negative index", -1, 1, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := droppedTicks(tc.tickIndex, tc.lastIndex)
+			if ok != tc.wantOK {
+				t.Fatalf("%s: ok=%v, want %v", tc.name, ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Fatalf("%s: count=%d, want %d", tc.name, got, tc.want)
+			}
+			if !ok && got != 0 {
+				t.Fatalf("%s: a faulted gap still produced the count %d", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestMaxObserverTickIndexBoundsALegalRun keeps the ceiling meaningful: it must
+// be reachable by the longest legal run and no smaller, or it would either
+// reject a valid schedule or fail to bound anything.
+func TestMaxObserverTickIndexBoundsALegalRun(t *testing.T) {
+	if maxObserverTickIndex <= 0 {
+		t.Fatalf("the tick ceiling is %d; it bounds nothing", maxObserverTickIndex)
+	}
+	longest := int64(MaxObserverLifetime / MinObserverInterval)
+	if maxObserverTickIndex != longest {
+		t.Fatalf("the tick ceiling is %d but the longest legal run needs %d slots",
+			maxObserverTickIndex, longest)
+	}
+	// The bounded index can never overflow the Duration it is multiplied into.
+	if maxObserverTickIndex > int64(MaxObserverLifetime)/int64(MinObserverInterval) {
+		t.Fatalf("the ceiling exceeds what the schedule multiplication can represent")
 	}
 }
