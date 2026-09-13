@@ -265,18 +265,12 @@ func (r CompletionReceipt) Validate(repoDir, ref string, st *lifecycle.TaskState
 		return fmt.Errorf("no origin/main in %s", repoDir)
 	}
 	onMain, err := proof.answered("merge-base", "--is-ancestor", r.MergeSHA, "origin/main")
-	if err != nil {
-		return err
-	}
-	if !onMain {
-		return fmt.Errorf("merge sha %s is not an ancestor of origin/main", r.MergeSHA)
+	if refusal := ancestryRefusal(onMain, err, "merge sha %s is not an ancestor of origin/main", r.MergeSHA); refusal != nil {
+		return refusal
 	}
 	fromBase, err := proof.answered("merge-base", "--is-ancestor", r.BaseSHA, r.MergeSHA)
-	if err != nil {
-		return err
-	}
-	if !fromBase {
-		return fmt.Errorf("base sha %s is not an ancestor of merge sha %s", r.BaseSHA, r.MergeSHA)
+	if refusal := ancestryRefusal(fromBase, err, "base sha %s is not an ancestor of merge sha %s", r.BaseSHA, r.MergeSHA); refusal != nil {
+		return refusal
 	}
 
 	if err := r.validateContentBinding(proof); err != nil {
@@ -702,6 +696,32 @@ func (p *contentProof) answered(args ...string) (bool, error) {
 	return false, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
 }
 
+// ancestryRefusal turns one ancestry probe into the gate's answer.
+//
+// git exits 1 for its documented "no" and 128 for a revision this repository
+// does not have. Both are the SAME answer for a receipt gate -- a commit that is
+// not here did not land here -- so both produce the gate's own refusal, with the
+// probe's cause attached rather than swallowed. CI 34743907915 is what this is
+// for: a receipt naming cccc...cccc made the probe exit 128, and surfacing the
+// raw probe error told the operator about git's exit status instead of about the
+// receipt.
+//
+// The ONE distinction that must survive is the budget: a proof that was STOPPED
+// never answered the question at all, so it is returned as itself and is never
+// dressed up as an ancestry verdict.
+func ancestryRefusal(ok bool, err error, format string, args ...any) error {
+	if err != nil {
+		if errors.Is(err, ErrContentProofBudget) {
+			return err
+		}
+		return fmt.Errorf(format+": %w", append(args, err)...)
+	}
+	if !ok {
+		return fmt.Errorf(format, args...)
+	}
+	return nil
+}
+
 // repositoryIdentityWith is the runner-aware shared identity reader
 // (toolchild.RepositoryIdentityWithRunner). pkg/sync does not re-implement the
 // normalization: it supplies the bounded runner and pkg/toolchild keeps the one
@@ -851,11 +871,8 @@ func (r CompletionReceipt) validateContentBinding(p *contentProof) error {
 		// by. Without this a receipt could name any commit in the repository
 		// whose patch happens to match and pass.
 		carried, err := p.answered("merge-base", "--is-ancestor", r.ContentSHA, r.MergeSHA)
-		if err != nil {
-			return err
-		}
-		if !carried {
-			return fmt.Errorf("content sha %s is not an ancestor of merge sha %s", r.ContentSHA, r.MergeSHA)
+		if refusal := ancestryRefusal(carried, err, "content sha %s is not an ancestor of merge sha %s", r.ContentSHA, r.MergeSHA); refusal != nil {
+			return refusal
 		}
 		// Content: the merged tree must BE the reviewed result -- the sealed
 		// reviewed delta replayed onto the integration commit's first parent.

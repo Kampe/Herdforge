@@ -830,3 +830,26 @@ func TestBoundedGitIsBuiltForAnOwnedProcessGroup(t *testing.T) {
 			stdout.max, stderr.max, contentProofMaxOutputBytes, contentProofMaxStderrBytes)
 	}
 }
+
+// CI 34743907915. A receipt naming a commit this repository does not have makes
+// git exit 128 from `merge-base --is-ancestor`, not 1, and the gate surfaced the
+// probe's exit status instead of its own refusal. Both statuses are the SAME
+// answer here -- a commit that is not present did not land here -- while a
+// budget refusal remains no answer at all. This pins all three claims at once.
+func TestValidateRefusesACarrierThisRepositoryDoesNotHave(t *testing.T) {
+	dir, base, carrier, merge := prReceiptRepo(t)
+	r, st := publicReceipt(t, dir, base, carrier, carrier, merge)
+	r.ContentSHA = strings.Repeat("c", 40)
+	r.Seal()
+
+	err := r.Validate(dir, carrierRef, st)
+	if err == nil {
+		t.Fatal("a carrier this repository does not have was accepted")
+	}
+	if !strings.Contains(err.Error(), "is not an ancestor of merge sha") {
+		t.Fatalf("the gate reported the probe instead of its own refusal: %v", err)
+	}
+	if errors.Is(err, ErrContentProofBudget) {
+		t.Fatalf("an ordinary missing object was reported as a stopped proof: %v", err)
+	}
+}

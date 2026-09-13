@@ -1,5 +1,11 @@
 #!/usr/bin/env zsh
-# FAC-831: non-vacuity driver for the landed-receipt selection guards.
+# FAC-831: non-vacuity driver for the PRODUCER proof BOUNDS in pkg/mergeadmit.
+#
+# Its subject is the budget: every git command the producer entry points spend
+# has to be charged to one shared allowance, and each charge site has to be
+# shown to be load bearing on its own. The receipt selection guards are a
+# different driver (verify-landed-receipt-guards.zsh) owned by the other lane;
+# this one never reads or writes their files.
 #
 # A negative assertion proves nothing until something has been shown to break
 # it. This runs the focused suites, then mutates the REAL production source one
@@ -94,7 +100,7 @@ trap 'exit 129' HUP
 note() { print -r -- "$1" >> "$summary"; print -r -- "$1"; }
 
 pin=$(git -C "$repo_root" rev-parse HEAD)
-work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/verify-landed-receipt-XXXXXX")
+work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/verify-landed-proof-XXXXXX")
 # mktemp made the directory; `git worktree add` needs the path absent. rmdir
 # refuses a non-empty directory, which is the guard we want.
 rmdir -- "$work"
@@ -108,23 +114,50 @@ work_pin=$(git -C "$work" rev-parse HEAD)
 sep=$'\x1f'
 
 # ---------------------------------------------------------------------------
-# Sources under mutation. Each is hashed pristine up front so a restore can be
-# proven byte-for-byte rather than assumed.
+# Sources under mutation, DECLARED BEFORE ANYTHING READS THEM.
+#
+# This list and the pristine snapshot that follows are the first thing this
+# driver establishes, because every later guarantee rests on them: a mutation is
+# only reversible against a hash taken before it, and a restore that compares
+# against a hash which was never captured proves nothing. An earlier revision
+# declared this array AFTER the snapshot loop, so under `set -u` the loop hit
+# "sources: parameter not set" and the run aborted immediately after creating its
+# worktree -- no baseline, no mutant, no evidence. Order is the guarantee here,
+# not a formatting preference.
+#
+# Scoped to this lane's ownership: pkg/mergeadmit only. The seeded copy of this
+# file carried pkg/sync and cmd/herd entries from the receipt-guards driver;
+# those belong to the other author and are removed rather than left to let this
+# driver write into their files.
 # ---------------------------------------------------------------------------
+sources=(
+	pkg/mergeadmit/proof_bounds.go
+	pkg/mergeadmit/proof.go
+	pkg/mergeadmit/squash_landing.go
+)
+
+# An EMPTY source set is not "nothing to protect": it is a driver that would run
+# its mutation loop against files it never snapshotted. zsh iterates an empty
+# array zero times without complaint, so the refusal has to be explicit.
+(( ${#sources} > 0 )) || { print -u2 'error: no sources are declared; there is nothing to snapshot and nothing to restore'; exit 1; }
+
 typeset -A pristine
 for rel in "${sources[@]}"; do
+	[[ -n "${pristine[$rel]-}" ]] && { print -u2 "error: $rel is declared twice in sources"; exit 1; }
+	[[ -f "$work/$rel" ]] || { print -u2 "error: $rel does not exist in the mutation checkout"; exit 1; }
 	h=$(git -C "$work" hash-object -- "$rel") || { print -u2 "error: cannot hash $rel"; exit 1; }
 	[[ -n "$h" ]] || { print -u2 "error: empty hash for $rel"; exit 1; }
 	pristine[$rel]=$h
 done
+# Count, not just per-file success: a snapshot that silently covered fewer files
+# than were declared would leave some source mutable with no way back.
+(( ${#pristine} == ${#sources} )) || { print -u2 "error: snapshotted ${#pristine} of ${#sources} sources"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Focused suites. The pkg/sync row is the CONSUMER half: a receipt the producer
-# seals is only useful if the shipped consumer accepts it, and the FAC-831
-# carrier is meaningless unless the gate that reads it is proven too. These
-# deliberately EXCLUDE the subprocess CLI fixtures: they
-# build and run the whole binary, which this driver would then pay for on every
-# mutant. Their coverage belongs to the ordinary test job; this job exists to
+# Focused suites. ONE row, pkg/mergeadmit: this driver proves the producer budget
+# guards and nothing else. It deliberately EXCLUDES the subprocess CLI fixtures,
+# which build and run the whole binary and would be paid for again on every
+# mutant; their coverage belongs to the ordinary test job. This job exists to
 # prove the assertions below are not vacuous.
 # ---------------------------------------------------------------------------
 suites=(
@@ -132,87 +165,57 @@ suites=(
 )
 
 # ---------------------------------------------------------------------------
-# Controls. Each is the subject of a review finding, and each mutates REAL
-# production source.
+# Controls. Each mutates REAL production source and is killed by a test that
+# names the site, not by a generic refusal.
 #
-# What each one ACTUALLY proves, stated at its real strength:
+# THREE INDEPENDENT CHARGE SITES, THREE CONTROLS. An end-to-end "the proof
+# refuses" killer cannot attribute a charge: remove one site and the other two
+# still exhaust the allowance and produce the identical refusal. That is exactly
+# how the gitOutBytes mutant once survived while four patch-id commands paid for
+# it. Each control below is killed by an observer that COUNTS the charge at its
+# own site.
 #
-#   integration-commit-required
-#                          the producer promotes a patch carrier that sits off
-#                          the integrated line to the commit that INTEGRATED it.
-#                          Without the promotion the carrier is sealed as
-#                          MergeSHA and the consumer refuses a landing that
-#                          genuinely happened (PR836).
-#   integration-content-replay-required
-#                          selection is a CONTENT claim, not a graph claim: a
-#                          merge that kept the reviewed commit as an ancestor
-#                          while discarding every reviewed hunk must not be
-#                          selected. Ancestry alone accepts it; the replay is
-#                          what rejects it.
-#   retired-carrier-pin-required
-#                          a retired carrier with no pinned candidate is refused
-#                          rather than handed to the invoker as a proof surface.
-#   sealed-carrier-copied-into-the-receipt
-#                          the full-provenance producer COPIES the proved
-#                          content carrier into the receipt it seals. This is
-#                          the exact field-copy defect the FAC-831 review found:
-#                          Proof carried ContentSHA and CompletionReceipt did
-#                          not, so a pull-request landing sealed content against
-#                          a merge commit with no patch of its own and public
-#                          Validate refused it. The killer runs the real
-#                          ReconcileLanded and then the shipped consumer gate.
-#   sealed-carrier-copied-into-the-reduced-receipt
-#                          the same copy in the SEPARATE reduced-provenance
-#                          receipt literal, which is the path an actual
-#                          `--verify-landed` pull request reconciliation takes.
-#                          It is its own copy site and the full-provenance
-#                          control cannot speak for it.
+# What each one ACTUALLY proves, at its real strength:
 #
-#   later-revision-must-be-the-one-that-landed
-#                          the consumer's allowance for a carrier whose paths
-#                          were revised again before the merge is narrow: the
-#                          merged tree must hold the REVIEWED LINE'S LAST
-#                          revision of that path. Without that the allowance
-#                          degrades into "somebody touched it later", and an
-#                          ours merge that discarded every reviewed hunk walks
-#                          straight through it.
+#   gitoutbytes-not-charged
+#                          every git READ goes through the charging boundary.
+#                          Without it a read path spends no allowance and the
+#                          budget can be walked straight past.
+#   patchid-not-charged    the patch-id invocation is its own command, charged
+#                          separately from the diff-tree read that feeds it. Its
+#                          killer asserts the COUNT (2), so one charge standing
+#                          in for two cannot pass.
+#   ancestry-not-charged   each ancestry probe is charged, which is what bounds
+#                          the selection loop that calls it repeatedly.
+#   range-budget-not-enforced
+#                          a range is refused before it is materialised, rather
+#                          than after the memory has been spent.
+#   entry-path-unbounded-again
+#                          the PUBLIC entry installs the allowance. A mutant
+#                          that swaps the budgeted context for a bare
+#                          cancellable one reproduces the original defect: an
+#                          entry point that proves a landing while ignoring the
+#                          budget it was given.
+#   budget-error-flattened
+#                          a budget refusal stays recognisable through revision
+#                          resolution instead of being reported as a revision
+#                          that does not resolve. ONE control, not two: an
+#                          earlier revision split this into a passthrough mutant
+#                          and a %w mutant and NEITHER could kill, because each
+#                          half alone still lets errors.Is reach the sentinel
+#                          through the other. Only restoring the original
+#                          flattening -- the passthrough gone AND the cause
+#                          dropped -- reproduces the CI 34741746509 regression.
+#                          It is anchored to the CHILD subtest that makes the
+#                          assertion: Go emits an assertion's output event under
+#                          the subtest that made it, so a parent killer would
+#                          carry a fail action with no matching assertion output
+#                          of its own. The parent stays in the suite row, so its
+#                          top-level PASS is still required at baseline and
+#                          after restore.
 #
-#                          Anchored to the CHILD subtest that makes the
-#                          assertion, never to the parent. Go emits an
-#                          assertion's output event under the subtest that made
-#                          it, so a parent killer carries a fail action with no
-#                          assertion output of its own -- the exact shape that
-#                          read as WRONG-TEST-OR-ASSERTION for the observer
-#                          driver's mode-validation control in CI 34739189004.
-#                          test_emitted below also accepts a subtest of the
-#                          named test, so the child anchor satisfies both
-#                          readings instead of depending on which one is in
-#                          force. The parent stays in the pkg/sync suite row, so
-#                          its top-level PASS is still required at baseline and
-#                          after restore, and both subtests still run there.
-#
-# Every other control's assertion is emitted by its killer test ITSELF: none of
-# those five declares a subtest, and the shared helpers that assert for them
-# (assertIntegrationContract, assertSealedCarrierReceipt) run on the killer's
-# own *testing.T, so their output carries the killer's exact .Test name. No
-# control in this file depends on prefix matching to be attributable.
-#
-# Gate.Complete's copy of the same field has NO control here, deliberately: its
-# producer is Prove, which never sets ContentSHA on any of its three modes, so
-# no test can distinguish the copy from its absence. A control that cannot kill
-# reports coverage that does not exist.
 # id | source | test package | anchor | replacement | killer | required assertion
 # ---------------------------------------------------------------------------
-# Sources this driver may mutate. Scoped to my ownership: pkg/mergeadmit only.
-# The seeded copy of this file carried pkg/sync and cmd/herd entries from the
-# receipt-guards driver; those belong to C5 and are removed rather than left to
-# let this driver write into another author's files.
-sources=(
-	pkg/mergeadmit/proof_bounds.go
-	pkg/mergeadmit/proof.go
-	pkg/mergeadmit/squash_landing.go
-)
-
 mutations=(
 # Three INDEPENDENT charge sites, three controls. An end-to-end "the proof
 # refuses" killer cannot attribute a charge: remove one site and the other two
@@ -243,6 +246,28 @@ mutations=(
 	}
 	return fmt.Errorf(\"%s revision %q does not resolve to a commit in %s: %w\", role, rev, repoDir, err)${sep}	return fmt.Errorf(\"%s revision %q does not resolve to a commit in %s\", role, rev, repoDir) // MUTANT: the original flattening, cause and sentinel both lost${sep}TestProofBudgetSurvivesRevisionResolution/commands_exhausted_during_resolution${sep}a flattened budget error reads as an ordinary resolution failure"
 )
+
+# Every control row is validated BEFORE the run starts, against the snapshot
+# taken above. A row with the wrong shape, or naming a file this driver never
+# hashed, would be mutated with no pristine hash to restore from -- the same
+# class of defect as snapshotting after mutating, caught here rather than
+# discovered halfway through a run with a modified checkout.
+(( ${#mutations} > 0 )) || { print -u2 'error: no controls are declared; this driver would report success having proven nothing'; exit 1; }
+for record in "${mutations[@]}"; do
+	fields=("${(@ps:$sep:)record}")
+	if (( ${#fields} != 7 )); then
+		print -u2 "error: control row ${fields[1]:-<unnamed>} has ${#fields} fields, want 7"
+		exit 1
+	fi
+	rel=$fields[2]
+	if [[ -z "${pristine[$rel]-}" ]]; then
+		print -u2 "error: control ${fields[1]} mutates $rel, which is not in sources and has no pristine hash"
+		exit 1
+	fi
+	[[ -n "$fields[4]" ]] || { print -u2 "error: control ${fields[1]} has an empty anchor"; exit 1; }
+	[[ "$fields[4]" != "$fields[5]" ]] || { print -u2 "error: control ${fields[1]} replacement equals its anchor"; exit 1; }
+	[[ -n "$fields[6]" && -n "$fields[7]" ]] || { print -u2 "error: control ${fields[1]} has no killer or no required assertion"; exit 1; }
+done
 
 # compile_check proves the mutant builds. Its result is kept separately from
 # the assertion evidence, because "the build broke" and "the test saw the
@@ -490,7 +515,13 @@ for record in "${mutations[@]}"; do
 	killer=$fields[6]; want=$fields[7]
 	stem=$run_dir/$(printf 'm%02d-%s' "$index" "$id")
 
-	patch_source "$rel" "$anchor" "$replacement"
+	if ! patch_source "$rel" "$anchor" "$replacement"; then
+		# An anchor that no longer matches is source drift, not evidence about
+		# the guard. Say so in the artifact and stop: continuing would run the
+		# remaining controls against a checkout whose state is unknown.
+		note "mutant $id: ANCHOR DRIFT in $rel - the control could not be applied"
+		exit 1
+	fi
 	compile_exit=$(compile_check "$pkg" "$stem.compile.log")
 	if (( compile_exit != 0 )); then
 		restore_source "$rel"
