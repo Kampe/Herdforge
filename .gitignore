@@ -134,3 +134,6 @@ TASK-PACKET.md
 
 # FAC-827: mutation-control logs from scripts/verify-manifest-budget.zsh.
 .verify-budget-logs/
+
+# FAC-825: mutation-control logs from scripts/verify-census-window.zsh.
+.verify-census-logs/

@@ -114,6 +114,31 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # FAC-825: the registered census's bounded rotating window exists because
+      # one expensive lane could consume the whole registered phase before any
+      # lane qualified. Its tests pass, which says nothing about whether they
+      # would notice the window being removed, so this driver removes each guard
+      # from the real source and requires the named oracle to die on its named
+      # assertion. Serial: one package, one mutant at a time.
+      - name: FAC-825 census window non-vacuity controls
+        timeout-minutes: 25
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-census-window.zsh
+
+      # Hidden directory again: without these settings the run reports green
+      # while retaining none of the evidence it claims. Restricted to run-*, so
+      # only this driver's own logs are uploaded.
+      - name: Upload census window control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-census-window-logs
+          path: .verify-census-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
