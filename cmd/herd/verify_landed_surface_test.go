@@ -165,3 +165,24 @@ func TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead(t *testing.T) 
 		t.Fatalf("an unpinned binding produced %q; only --candidate or an admitted PASS may pin", got)
 	}
 }
+
+// An empty identity must be refused without spending a git subprocess, and
+// without producing a message that reads as a repository problem.
+//
+// CI 34742740503 m03 surfaced this: with the pin guard removed, an empty
+// candidate reached requireObjectPresent and came back as
+// "git cat-file -t : fatal: Not a valid object name", with a blank SHA.
+func TestRequireObjectPresentRefusesAnEmptyIdentityWithoutRunningGit(t *testing.T) {
+	// A directory that is NOT a repository: if a command were run, it would
+	// fail for that reason instead, and the message below would differ.
+	err := requireObjectPresent(t.TempDir(), "   ")
+	if err == nil {
+		t.Fatal("an empty identity was accepted")
+	}
+	if !strings.Contains(err.Error(), "no candidate identity to look up") {
+		t.Fatalf("err = %v, want the empty-identity refusal rather than a git failure", err)
+	}
+	if strings.Contains(err.Error(), "cat-file") {
+		t.Fatalf("err = %v; a git command was run for an empty identity", err)
+	}
+}
