@@ -146,6 +146,17 @@ func TestCandidateResolutionSpendsTheCallersAllowance(t *testing.T) {
 	if !errors.Is(err, mergeadmit.ErrProofBudgetCommands) {
 		t.Fatalf("err = %v, want ErrProofBudgetCommands through errors.Is", err)
 	}
+	// WHICH command the allowance refused is the whole claim. The sentinel alone
+	// cannot carry it: resolution charges the HEAD read, the containment guard
+	// charges its fetch, and the ancestry probe charges its own command, so a
+	// guard moved OFF this allowance leaves the other two able to exhaust it and
+	// produce an identical error. Hosted control run XI0WYE recorded exactly that
+	// -- m23 (containment-guard-must-be-bounded) survived because the refusal
+	// then came from the ancestry probe and read the same. The budget must be
+	// refused at the guard's OWN fetch, which the ledger names in its message.
+	if !strings.Contains(err.Error(), "fetch -q origin main") {
+		t.Fatalf("err = %v, want the allowance to be refused at the containment guard's own fetch", err)
+	}
 }
 
 // The HEAD read itself rides the caller's context, so a cancelled run stops

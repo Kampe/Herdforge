@@ -168,13 +168,62 @@ func TestVerifyLandedGateRefusesAnEmptyPinAsAMissingPin(t *testing.T) {
 	receiptUnsealed(t, repo)
 }
 
+// observationPrefixCost is the allowance every stage BEFORE the landing proof
+// needs: the worktree status read, and the integration-tip fetch and rev-parse.
+//
+// It is measured through the REAL observeVerifyLanded, with a request carrying a
+// reconstruction binding that this gate has no ledger to authorise.
+// proveLandedContext refuses that on its FIRST line -- before
+// reconstructionContentContext, and therefore before ProveEquivalentLandedContext
+// and the allowance line inside it. So the smallest allowance that reaches the
+// refusal is exactly what the prefix costs, and the number does not move when
+// the proof's own budget handling is changed. An oracle that moved with the
+// mutation it is meant to catch would certify nothing.
+func observationPrefixCost(t *testing.T, repo, base string) int {
+	t.Helper()
+	for n := 1; n < 64; n++ {
+		gate := &mergeadmit.Gate{
+			RepoDir:     repo,
+			ProofBudget: mergeadmit.ProofBudget{MaxCommands: n},
+			Live:        mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)},
+		}
+		req := mergeadmit.Request{
+			Ref: pinProofRef, BaseSHA: base, CandidateSHA: base,
+			Reconstruction: &mergeadmit.ReconstructionBinding{SHA: base, BaseSHA: base},
+		}
+		ctx, cancel := gate.ProofContext()
+		_, err := observeVerifyLanded(ctx, repo, gate, req)
+		cancel()
+		if err != nil && strings.Contains(err.Error(), "reconstructed landing proof requires a ledger") {
+			return n
+		}
+	}
+	t.Fatal("the observation prefix never completed within a sane allowance")
+	return 0
+}
+
 // The pin is proved inside the SAME finite allowance as the rest of the proof.
 // An exhausted allowance stops the route with its cause intact, and seals
 // nothing — it must never read as "the object is not there".
+//
+// THE ALLOWANCE MUST REACH THE PROOF. Hosted control run XI0WYE recorded this
+// test PASSING against a mutant that gives the proof a brand new budget
+// (m18, landed-proof-resets-the-injected-allowance). With MaxCommands: 1 the
+// run exhausted during the tip probe and never entered the proof at all, so the
+// mutated line was never executed and the refusal this asserts came from a stage
+// the control says nothing about. Exhausting early produces the right sentinel
+// for the wrong reason, which is a vacuous oracle.
+//
+// The allowance is therefore exactly the prefix: enough for the status read and
+// the tip probe, and nothing for the proof that follows. Pristine, the proof's
+// first command is refused. With the proof re-minting its own budget, it runs to
+// completion and proves the landing on an allowance that was already spent --
+// which is what the assertion below names.
 func TestVerifyLandedGateStopsOnAnExhaustedAllowance(t *testing.T) {
 	repo, base, candidate, _ := landedPinFixture(t)
 	// Positive MaxCommands is mandatory: zero means DEFAULT, not exhausted.
-	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: 1}, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
+	prefix := observationPrefixCost(t, repo, base)
+	gate := &mergeadmit.Gate{RepoDir: repo, ProofBudget: mergeadmit.ProofBudget{MaxCommands: prefix}, Live: mergeadmit.LiveState{OriginMainAt: originMainProbeContext(repo)}}
 	req := mergeadmit.Request{Ref: pinProofRef, BaseSHA: base, CandidateSHA: candidate}
 
 	_, err := observeVerifyLandedUnderGate(t, repo, gate, req)
