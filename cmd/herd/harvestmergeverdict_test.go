@@ -49,7 +49,7 @@ func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
 
 	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("an empty review ledger read as consent to merge")
-	} else if !strings.Contains(err.Error(), "no admissible independent PASS for exact candidate") {
+	} else if !strings.HasSuffix(err.Error(), "herd-review-ledger: refuse sha="+hmSHA+" reason=no record") {
 		t.Fatalf("empty ledger refused outside verdict admission: %v", err)
 	}
 
@@ -73,7 +73,7 @@ func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
 	}
 	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("a PASS for another sha read as consent for this candidate")
-	} else if !strings.Contains(err.Error(), "no admissible independent PASS for exact candidate") {
+	} else if !strings.HasSuffix(err.Error(), "herd-review-ledger: refuse sha="+hmSHA+" reason=no record") {
 		t.Fatalf("wrong-SHA PASS refused outside verdict admission: %v", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestHarvestMergeAcceptsLedgerPassForExactCandidate(t *testing.T) {
 	}
 	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("an unsuperseded FAIL for the exact candidate still yielded consent")
-	} else if !strings.Contains(err.Error(), "no admissible independent PASS for exact candidate") {
+	} else if !strings.HasSuffix(err.Error(), "herd-review-ledger: refuse sha="+hmSHA+" reason=review veto (FAIL or BLOCKED)") {
 		t.Fatalf("same-SHA veto refused outside verdict admission: %v", err)
 	}
 }
