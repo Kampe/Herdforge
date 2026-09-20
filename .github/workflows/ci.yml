@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  gate:
-    name: Build, Preflight & Test Suite
+  foundation:
+    name: Build, lint, unit tests & preflight
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -80,12 +80,99 @@ jobs:
             echo "CHAINSEER_PARITY_OPTIONAL=1" >> "$GITHUB_ENV"
           fi
 
+      # Run the small orchestration controls before the expensive foundation.
+      - name: Install CI fixture parser
+        run: sudo apt-get install -y --no-install-recommends ruby
+
+      - name: Verify CI dependency and collector controls
+        timeout-minutes: 3
+        run: ruby scripts/verify-ci-parallel.rb
+
+      - name: Upload CI dependency and collector control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-ci-parallel-logs
+          path: .verify-ci-parallel-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # make lint runs go vet, the hermeticity scan (FAC-215), the package
       # inventory drift check (FAC-301), and the security gates.
       - name: Build, lint, unit tests, preflight
         run: make lint test-unit test-race preflight
         env:
           CHAINSEER_BIN: chainseer/bin
+
+  # Two fixed control jobs bound concurrency while every driver stays serial.
+  controls_other:
+    name: Mutation controls (remaining suites)
+    runs-on: ubuntu-latest
+    needs: foundation
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Set up pinned gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+
+      # Use the upstream CLI directly. The v2 action performs a GitHub user
+      # lookup and turns transient API failures into a license failure before
+      # the repository's deterministic security gate can run.
+      - name: Set up pinned Gitleaks CLI
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$url" --output "$tmp_dir/$archive"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$tmp_dir/$archive" | sha256sum --check --status
+          tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+          test -x "$tmp_dir/gitleaks"
+          install -m 0755 "$tmp_dir/gitleaks" "$RUNNER_TEMP/gitleaks"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gitleaks" version
+
+      # Pinned to setup-trivy v0.3.1. This installs the scanner consumed by
+      # make lint's tracked-module HIGH/CRITICAL dependency gate.
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
+        with:
+          version: v0.74.0
+
+      - name: Checkout Chainseer parity source
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: Kampe/chainseer
+          path: chainseer
+          fetch-depth: 1
+
+      - name: Report Chainseer parity availability
+        run: |
+          if [ -d chainseer/bin ]; then
+            echo "Chainseer parity source available; FAC-309 parity gate will run."
+            echo "CHAINSEER_BIN=chainseer/bin" >> "$GITHUB_ENV"
+          else
+            echo "Chainseer parity source unavailable to this CI token; FAC-309 parity is explicitly skipped."
+            echo "CHAINSEER_PARITY_OPTIONAL=1" >> "$GITHUB_ENV"
+          fi
 
       # FAC-36: the `herd process` read path is defended almost entirely by
       # NEGATIVE assertions -- the sweep is bounded, a broken roster is not an
@@ -199,39 +286,6 @@ jobs:
         with:
           name: verify-resource-observer-logs
           path: .verify-observer-logs/run-*
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 7
-
-      # FAC-831: the landed-receipt producer is defended by NEGATIVE assertions
-      # -- it must not seal a patch carrier as MergeSHA, must not reach for a
-      # later commit that merely contains the base, and must not observe a
-      # landing against the invoking checkout without a pinned candidate. Each
-      # is removed from the REAL source here and its named test must fail on its
-      # named assertion; a mutant that does not build is BROKEN-RUN, not a kill.
-      #
-      # Serial by construction: one ephemeral checkout, one mutant at a time,
-      # each a compile plus one anchored package run, plus a baseline and a
-      # restored run. The mutant COUNT is deliberately not written here: two
-      # authors change this driver independently, and a number in a comment goes
-      # stale silently. The driver's own mutations array is the count.
-      - name: Verify landed receipt guard controls
-        timeout-minutes: 30
-        run: |
-          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
-          scripts/verify-landed-receipt-guards.zsh
-
-      # Bounded raw retention, same pattern as the other control steps. The log
-      # directory is HIDDEN, so include-hidden-files is required or the upload
-      # silently matches nothing; a missing log set is an error, not a warning,
-      # because evidence that did not survive must not read as green; and
-      # if: always() keeps the logs from the failing runs that need them most.
-      - name: Upload landed receipt control logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: verify-landed-receipt-logs
-          path: .verify-landed-receipt-logs/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
@@ -449,6 +503,139 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
+
+  controls_receipt:
+    name: Mutation controls (landed receipts)
+    runs-on: ubuntu-latest
+    needs: foundation
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Set up pinned gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+
+      # Use the upstream CLI directly. The v2 action performs a GitHub user
+      # lookup and turns transient API failures into a license failure before
+      # the repository's deterministic security gate can run.
+      - name: Set up pinned Gitleaks CLI
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$url" --output "$tmp_dir/$archive"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$tmp_dir/$archive" | sha256sum --check --status
+          tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+          test -x "$tmp_dir/gitleaks"
+          install -m 0755 "$tmp_dir/gitleaks" "$RUNNER_TEMP/gitleaks"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gitleaks" version
+
+      # Pinned to setup-trivy v0.3.1. This installs the scanner consumed by
+      # make lint's tracked-module HIGH/CRITICAL dependency gate.
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
+        with:
+          version: v0.74.0
+
+      - name: Checkout Chainseer parity source
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: Kampe/chainseer
+          path: chainseer
+          fetch-depth: 1
+
+      - name: Report Chainseer parity availability
+        run: |
+          if [ -d chainseer/bin ]; then
+            echo "Chainseer parity source available; FAC-309 parity gate will run."
+            echo "CHAINSEER_BIN=chainseer/bin" >> "$GITHUB_ENV"
+          else
+            echo "Chainseer parity source unavailable to this CI token; FAC-309 parity is explicitly skipped."
+            echo "CHAINSEER_PARITY_OPTIONAL=1" >> "$GITHUB_ENV"
+          fi
+
+      # FAC-831: the landed-receipt producer is defended by NEGATIVE assertions
+      # -- it must not seal a patch carrier as MergeSHA, must not reach for a
+      # later commit that merely contains the base, and must not observe a
+      # landing against the invoking checkout without a pinned candidate. Each
+      # is removed from the REAL source here and its named test must fail on its
+      # named assertion; a mutant that does not build is BROKEN-RUN, not a kill.
+      #
+      # Serial by construction: one ephemeral checkout, one mutant at a time,
+      # each a compile plus one anchored package run, plus a baseline and a
+      # restored run. The mutant COUNT is deliberately not written here: two
+      # authors change this driver independently, and a number in a comment goes
+      # stale silently. The driver's own mutations array is the count.
+      - name: Verify landed receipt guard controls
+        timeout-minutes: 30
+        run: |
+          command -v zsh >/dev/null || { echo "zsh is required for this step"; exit 1; }
+          scripts/verify-landed-receipt-guards.zsh
+
+      # Bounded raw retention, same pattern as the other control steps. The log
+      # directory is HIDDEN, so include-hidden-files is required or the upload
+      # silently matches nothing; a missing log set is an error, not a warning,
+      # because evidence that did not survive must not read as green; and
+      # if: always() keeps the logs from the failing runs that need them most.
+      - name: Upload landed receipt control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-landed-receipt-logs
+          path: .verify-landed-receipt-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  # Keep the merge policy's required check name. always() also schedules this
+  # collector when a failed foundation caused both control jobs to be skipped.
+  # Only three explicit success results can produce a successful required gate.
+  gate:
+    name: Build, Preflight & Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [foundation, controls_other, controls_receipt]
+    steps:
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Require foundation and both control lanes
+        shell: zsh {0}
+        env:
+          FOUNDATION_RESULT: ${{ needs.foundation.result }}
+          OTHER_CONTROLS_RESULT: ${{ needs.controls_other.result }}
+          RECEIPT_CONTROLS_RESULT: ${{ needs.controls_receipt.result }}
+        run: |
+          set -euo pipefail
+          for required_job in \
+            "foundation:${FOUNDATION_RESULT-}" \
+            "controls_other:${OTHER_CONTROLS_RESULT-}" \
+            "controls_receipt:${RECEIPT_CONTROLS_RESULT-}"
+          do
+            if [[ "${required_job#*:}" != success ]]; then
+              echo "Required CI job did not succeed: $required_job" >&2
+              exit 1 # FAC-833 refusal
+            fi
+          done
 
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
