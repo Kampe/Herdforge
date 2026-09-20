@@ -59,11 +59,11 @@ positive() {
 	(( rc == 0 )) && healthy_events "$run_dir/$phase.json" || return 1
 	jq -e -s '
 		[.[] | select(.Action == "pass") | .Test] as $passed |
-		["TestTaskSourceEnrollmentRetiresNamedTask", "TestTaskSourceEnrollmentProtectsLiveHome",
+		["TestTaskSourceEnrollmentRetiresNamedTask", "TestTaskSourceEnrollmentProtectsLiveHome", "TestTaskSourceEnrollmentProtectsRuntimeProfile",
 		 "TestTaskSourceEnrollmentRefusesUnprovenAuthority", "TestTaskSourceActRefusesDrift", "TestTaskSourceHardHomes"] |
 		all(.[]; . as $name | $passed | index($name) != null)
 	' "$run_dir/$phase.json" >/dev/null
-	note "$phase: PASS all five task-source suites"
+	note "$phase: PASS all six task-source suites"
 }
 
 # Exact source + oracle + assertion. Each mutant must compile and fail for
@@ -72,6 +72,7 @@ sep=$'\x1f'
 controls=(
 "resident-name-only${sep}cmd/herd/worktreereap.go${sep}case isResidentHome(e.Branch, e.Path) && r.taskSource == nil:${sep}case isResidentHome(e.Branch, e.Path):${sep}TestTaskSourceEnrollmentRetiresNamedTask${sep}enrolled named task was kept"
 "live-home-bypass${sep}cmd/herd/worktree_task_source.go${sep}if home == path || strings.HasPrefix(home, path+string(filepath.Separator)) {${sep}if false && (home == path || strings.HasPrefix(home, path+string(filepath.Separator))) {${sep}TestTaskSourceEnrollmentProtectsLiveHome${sep}live resident home was not refused by independent home guard"
+"runtime-profile-dropped${sep}cmd/herd/worktree_task_source.go${sep}for _, profile := range []string{canonicalPath, runtimePath} {${sep}for _, profile := range []string{canonicalPath, runtimePath}[:1] {${sep}TestTaskSourceEnrollmentProtectsRuntimeProfile${sep}runtime-profile resident home was not refused"
 )
 for control in "${controls[@]}"; do
 	fields=("${(@ps:$sep:)control}")
@@ -109,4 +110,4 @@ for control in "${controls[@]}"; do
 	positive "restored-$name"
 done
 cleanup
-note 'KILLED: 2 task-source controls; all pristine suites restored'
+note 'KILLED: 3 task-source controls; all pristine suites restored'

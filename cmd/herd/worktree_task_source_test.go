@@ -41,6 +41,11 @@ func newTaskSourceFixture(t *testing.T) taskSourceFixture {
 	if err := runHarvestVerifyLanded(pinProofBranch, binding); err != nil {
 		t.Fatal(err)
 	}
+	profile := filepath.Join(root, ".herd/herd.yaml")
+	if err := os.WriteFile(profile, []byte(taskSourceTestConfig), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONFIG_PATH", profile)
 	keyDir := t.TempDir()
 	t.Setenv(dispatch.KeyDirEnv, keyDir)
 	t.Setenv("HERD_ROLE", "coordinator")
@@ -83,6 +88,8 @@ func newTaskSourceFixture(t *testing.T) taskSourceFixture {
 	}
 	return f
 }
+
+const taskSourceTestConfig = "version: '1'\nproject:\n  name: task-source-fixture\ntask_provider:\n  type: memory\n"
 
 func (f taskSourceFixture) enroll(t *testing.T) taskSourceBinding {
 	t.Helper()
@@ -147,6 +154,27 @@ func TestTaskSourceEnrollmentProtectsLiveHome(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.root, taskSourceJournal)); !os.IsNotExist(err) {
 		t.Fatalf("refused enrollment published authority: %v", err)
+	}
+}
+
+func TestTaskSourceEnrollmentProtectsRuntimeProfile(t *testing.T) {
+	f := newTaskSourceFixture(t)
+	// Prove valid native enrollment first with the ordinary canonical profile.
+	if _, err := enrollTaskSource(f.root, f.relative, pinProofRef, f.receipt, false); err != nil {
+		t.Fatal(err)
+	}
+	profile := filepath.Join(t.TempDir(), "operator.yaml")
+	configText := taskSourceTestConfig + "lanes:\n  - name: dormant\n    agent_kind: codex\n    model: test\n    prompt: test\n    worktree: " + f.relative + "\n"
+	if err := os.WriteFile(profile, []byte(configText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_CONFIG_PATH", profile)
+	_, err := enrollTaskSource(f.root, f.relative, pinProofRef, f.receipt, true)
+	if err == nil || !strings.Contains(err.Error(), "configured or live resident home") {
+		t.Fatalf("runtime-profile resident home was not refused: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.root, taskSourceJournal)); !os.IsNotExist(err) {
+		t.Fatalf("runtime-profile refusal published authority: %v", err)
 	}
 }
 

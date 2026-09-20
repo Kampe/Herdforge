@@ -227,22 +227,36 @@ func taskSourceHomes(root string) ([]string, error) {
 		return nil, err
 	}
 	homes := []string{root, cwd}
-	cfg, err := config.LoadConfig(filepath.Join(root, ".herd", "herd.yaml"))
+	canonicalPath := filepath.Join(root, config.DefaultConfigPath)
+	runtimePath, err := filepath.Abs(config.RuntimeConfigPath())
 	if err != nil {
-		return nil, fmt.Errorf("task source: resident configuration unknown: %w", err)
+		return nil, fmt.Errorf("task source: runtime profile identity unknown: %w", err)
 	}
-	if cfg == nil {
-		return nil, fmt.Errorf("task source: resident configuration unavailable")
-	}
-	for _, lane := range cfg.Lanes {
-		if lane.Worktree == "" {
+	seen := map[string]bool{}
+	// A dormant home remains protected in both the canonical roster and the
+	// operator's active profile. An absent profile is unknown, never empty.
+	for _, profile := range []string{canonicalPath, runtimePath} {
+		if seen[profile] {
 			continue
 		}
-		path := lane.Worktree
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(root, path)
+		seen[profile] = true
+		cfg, err := config.LoadConfig(profile)
+		if err != nil {
+			return nil, fmt.Errorf("task source: resident configuration unknown: %w", err)
 		}
-		homes = append(homes, path)
+		if cfg == nil {
+			return nil, fmt.Errorf("task source: resident configuration unavailable")
+		}
+		for _, lane := range cfg.Lanes {
+			if lane.Worktree == "" {
+				continue
+			}
+			path := lane.Worktree
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(root, path)
+			}
+			homes = append(homes, path)
+		}
 	}
 	agents, err := taskSourceAgents()
 	if err != nil {
