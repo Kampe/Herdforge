@@ -202,7 +202,8 @@ func normalizeLegacyTimestamp(raw string) (time.Time, bool) {
 // RepairMalformedRow is the single narrow operator recovery for one exact
 // quarantined row: it normalizes a clearly parseable legacy timestamp, assigns
 // a proper monotonic sequence under the canonical mailbox lock, and preserves
-// the message id, payload and every other row unchanged.
+// the message id, payload, row position and every other row unchanged.
+// Use RepairMalformedRows to explicitly select a batch.
 //
 // It is REPORT-ONLY unless req.Act is set. It never repairs more than the one
 // row named by req.ID, never sweeps other malformed rows, and refuses rather
