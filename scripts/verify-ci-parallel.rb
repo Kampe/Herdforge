@@ -24,6 +24,8 @@ RETENTION_UPLOAD = 'Upload early landed suite retention logs'
 RETENTION_STEPS = [RETENTION_TOOLS, RETENTION_STEP, RETENTION_UPLOAD].freeze
 MODULE_STEP = 'Verify Gosec module invocation controls'
 MODULE_UPLOAD = 'Upload Gosec module invocation logs'
+TASK_SOURCE_STEP = 'FAC-839 task-source enrollment controls'
+TASK_SOURCE_UPLOAD = 'Upload task-source enrollment control logs'
 MODULE_RUN = <<~'ZSH'
   set -euo pipefail
   report_parent=.verify-ci-parallel-logs
@@ -131,6 +133,25 @@ def check_lane_controls(lane_steps)
   insist(artifacts.uniq == artifacts, 'each control artifact uploaded exactly once')
 end
 
+# Generic extra-pair validation cannot detect removal of BOTH new steps.
+# Pin this required pair independently, including failure evidence and lane.
+def check_task_source_controls(lane_steps, all_steps)
+  driver = { 'name' => TASK_SOURCE_STEP, 'timeout-minutes' => 35,
+             'run' => 'zsh scripts/verify-task-source-guards.zsh' }
+  upload = { 'name' => TASK_SOURCE_UPLOAD, 'if' => 'always()',
+             'uses' => 'actions/upload-artifact@v4',
+             'with' => { 'name' => 'verify-task-source-logs',
+                         'path' => '.verify-task-source-logs/run-*',
+                         'include-hidden-files' => true, 'if-no-files-found' => 'error',
+                         'retention-days' => 7 } }
+  insist(all_steps.select { |step| step['name'] == TASK_SOURCE_STEP } == [driver],
+         'task-source driver is required exactly once')
+  insist(all_steps.select { |step| step['name'] == TASK_SOURCE_UPLOAD } == [upload],
+         'task-source evidence survives failures')
+  insist(lane_steps['controls_other'].last(2) == [driver, upload],
+         'task-source pair stays in remaining controls')
+end
+
 def check_foundation(jobs, setup, make_step)
   foundation_steps = jobs['foundation']['steps']
   tools = foundation_steps.select { |step| step['name'] == RETENTION_TOOLS }
@@ -212,6 +233,7 @@ def check_structure(workflow, original)
     [job, jobs[job].fetch('steps').drop(setup.length)]
   end
   check_original_controls(old_steps.drop(make_index + 1), all_steps, lane_steps)
+  check_task_source_controls(lane_steps, all_steps)
   check_lane_controls(lane_steps)
   check_foundation(jobs, setup, old_steps[make_index])
   check_collector(jobs, setup)
@@ -294,6 +316,27 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
                      'module invocation evidence survives failures', summary) do |mutant|
       step = mutant['jobs']['foundation']['steps'].find { |entry| entry['name'] == MODULE_UPLOAD }
       step.delete('if')
+    end
+    structure_mutant(workflow, original, 'missing-task-source-pair',
+                     'task-source driver is required exactly once', summary) do |mutant|
+      mutant['jobs']['controls_other']['steps'].reject! do |step|
+        [TASK_SOURCE_STEP, TASK_SOURCE_UPLOAD].include?(step['name'])
+      end
+    end
+    structure_mutant(workflow, original, 'conditional-task-source-driver',
+                     'task-source driver is required exactly once', summary) do |mutant|
+      step = mutant['jobs']['controls_other']['steps'].find { |entry| entry['name'] == TASK_SOURCE_STEP }
+      step['if'] = 'false'
+    end
+    structure_mutant(workflow, original, 'lost-task-source-artifact',
+                     'task-source evidence survives failures', summary) do |mutant|
+      step = mutant['jobs']['controls_other']['steps'].find { |entry| entry['name'] == TASK_SOURCE_UPLOAD }
+      step.delete('if')
+    end
+    structure_mutant(workflow, original, 'reversed-task-source-pair',
+                     'task-source pair stays in remaining controls', summary) do |mutant|
+      steps = mutant['jobs']['controls_other']['steps']
+      steps[-2], steps[-1] = steps[-1], steps[-2]
     end
     old_driver = original['jobs']['gate']['steps'].find { |step| step['name'] == RECEIPT_STEP }
     structure_mutant(workflow, original, 'missing-driver',
