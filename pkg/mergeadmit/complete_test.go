@@ -1,15 +1,54 @@
 package mergeadmit
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
+
+func TestCompleteContextPreservesCancellationAndSpentAllowance(t *testing.T) {
+	f := newCompleteFixture(t, ModeMerge)
+	d := mustAdmit(t, f.gate, f.req)
+	f.merged()
+	for _, expired := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(context.Background())
+		want := context.Canceled
+		if expired {
+			cancel()
+			ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			want = context.DeadlineExceeded
+		} else {
+			cancel()
+		}
+		receipt, err := f.gate.CompleteContext(ctx, d, f.req)
+		cancel()
+		if receipt != nil || !errors.Is(err, want) {
+			t.Fatalf("CompleteContext escaped the stopped entry context: %+v, %v", receipt, err)
+		}
+	}
+	ctx, cancel := (&Gate{ProofBudget: ProofBudget{MaxCommands: 1}}).ProofContext()
+	defer cancel()
+	if _, err := BoundedGit(ctx, f.dir)("rev-parse", "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := f.gate.CompleteContext(ctx, d, f.req); receipt != nil || !errors.Is(err, ErrProofBudgetCommands) {
+		t.Fatalf("CompleteContext restarted the caller's spent allowance: %+v, %v", receipt, err)
+	}
+	if _, err := os.Stat(hsync.ReceiptPath(f.dir, f.req.Ref)); !os.IsNotExist(err) {
+		t.Fatalf("stopped completion wrote a receipt: %v", err)
+	}
+	if receipt, err := f.gate.CompleteContext(context.Background(), d, f.req); err != nil || receipt == nil {
+		t.Fatalf("fixture cannot complete with an available allowance: %+v, %v", receipt, err)
+	}
+}
 
 // completeFixture builds a REAL git repository with a real merge in it, plus a
 // ledger holding a valid independent PASS for the candidate. Everything is

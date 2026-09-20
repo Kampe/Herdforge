@@ -17,7 +17,6 @@ import (
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/remoteci"
-	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 	"github.com/Kampe/Herdforge/pkg/toolchild"
 )
@@ -210,13 +209,15 @@ func runMergeComplete() {
 
 	// The gate is rebuilt from live state; nothing is trusted from the record
 	// except the decision and the request it was made against.
-	gate, err := buildMergeGate(rec.Request.Ref, rec.Request.TaskID, 0)
+	ctx, cancel := cliMergeProofContext()
+	defer cancel()
+	gate, err := buildMergeGateContext(ctx, rec.Request.Ref, rec.Request.TaskID, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd merge-complete: %v\n", err)
 		os.Exit(1)
 	}
 
-	receipt, err := gate.Complete(&rec.Decision, rec.Request)
+	receipt, err := gate.CompleteContext(ctx, &rec.Decision, rec.Request)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "REFUSED  [%s]: %v\n", hsync.NormalizeRef(*ref), err)
 		os.Exit(1)
@@ -243,11 +244,17 @@ func runMergeComplete() {
 var cliProofBudget mergeadmit.ProofBudget
 
 func buildMergeGate(ref, taskID string, prNumber int) (*mergeadmit.Gate, error) {
+	ctx, cancel := cliMergeProofContext()
+	defer cancel()
+	return buildMergeGateContext(ctx, ref, taskID, prNumber)
+}
+
+func buildMergeGateContext(ctx context.Context, ref, taskID string, prNumber int) (*mergeadmit.Gate, error) {
 	policy, err := preflight.LoadMergePolicy(".")
 	if err != nil {
 		return nil, fmt.Errorf("merge policy: %w", err)
 	}
-	ledger, err := reviewledger.NewReviewLedger(".", reviewledger.DefaultPath(""))
+	ledger, err := openHarvestLedgerContext(ctx, ".")
 	if err != nil {
 		return nil, fmt.Errorf("open review ledger: %w", err)
 	}

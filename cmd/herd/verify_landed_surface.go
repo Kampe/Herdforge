@@ -49,9 +49,10 @@ var errRetiredCarrierUnpinned = fmt.Errorf(
 // resolveVerifyLandedSurface picks the directory the landing proof is observed
 // in, and refuses rather than guessing.
 //
-// This is SELECTION ONLY. It runs no git and proves nothing about the
-// repository it returns. A live carrier is used exactly as before — this
-// changes nothing for it, and its dirty/active protection is unchanged. Only
+// This is SELECTION ONLY and proves nothing about the repository it returns.
+// The public entry supplies the already-resolved ledger path; standalone
+// callers charge any ledger discovery to ctx. A live carrier is used exactly
+// as before — this changes nothing for it, and its dirty/active protection is unchanged. Only
 // when NO worktree carries the branch does the invoking checkout stand in, and
 // then only when the candidate is PINNED, by an explicit --candidate or by the
 // ref's current admitted PASS. The branch head is never consulted, because for
@@ -93,7 +94,10 @@ func resolveVerifyLandedSurface(ctx context.Context, branch string, binding veri
 		return verifyLandedSurface{Dir: dir}, nil
 	}
 
-	pinned := pinnedCandidateFor(binding)
+	pinned, err := pinnedCandidateFor(ctx, binding)
+	if err != nil {
+		return verifyLandedSurface{}, err
+	}
 	if pinned == "" {
 		return verifyLandedSurface{}, errRetiredCarrierUnpinned
 	}
@@ -134,19 +138,23 @@ func requirePinnedCandidateProved(surface verifyLandedSurface, candidate string)
 // pinnedCandidateFor returns the candidate identity that may authorise a
 // retired-carrier fallback: an explicit --candidate, else the ref's current
 // admitted PASS. It never falls back to a branch head.
-func pinnedCandidateFor(binding verifyLandedBinding) string {
+func pinnedCandidateFor(ctx context.Context, binding verifyLandedBinding) (string, error) {
 	if explicit := strings.TrimSpace(binding.Candidate); explicit != "" {
-		return explicit
+		return explicit, nil
 	}
 	ref := strings.TrimSpace(binding.Ref)
 	if ref == "" {
-		return ""
+		return "", nil
 	}
-	ev, err := newLedgerLegacyReview(drainLedgerPath()).AdmittedPass(ref)
+	ledgerPath, err := verifyLandedLedgerPath(ctx, binding)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return strings.TrimSpace(ev.CandidateSHA)
+	ev, err := newLedgerLegacyReview(ledgerPath).AdmittedPass(ref)
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(ev.CandidateSHA), nil
 }
 
 // invokingRepoRoot is the production proof surface when the carrier is gone.

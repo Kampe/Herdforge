@@ -40,7 +40,11 @@ func resolveVerifyLandedCandidate(ctx context.Context, wtDir, branch string, bin
 
 	ref := strings.TrimSpace(binding.Ref)
 	if ref != "" {
-		if ev, err := newLedgerLegacyReview(drainLedgerPath()).AdmittedPass(ref); err == nil {
+		ledgerPath, err := verifyLandedLedgerPath(ctx, binding)
+		if err != nil {
+			return "", err
+		}
+		if ev, err := newLedgerLegacyReview(ledgerPath).AdmittedPass(ref); err == nil {
 			if sha := strings.TrimSpace(ev.CandidateSHA); sha != "" {
 				return sha, nil
 			}

@@ -1302,7 +1302,7 @@ func runHarvestMerge() {
 		os.Exit(1)
 	}
 	if report.ReconstructedSHA != "" {
-		ledger, ledgerErr := reviewledger.NewReviewLedger(".", reviewledger.DefaultPath(""))
+		ledger, ledgerErr := openHarvestLedger(".")
 		if ledgerErr != nil {
 			fmt.Fprintf(os.Stderr, "herd harvest-merge: open review ledger for reconstruction: %v\n", ledgerErr)
 			os.Exit(1)
@@ -1559,7 +1559,7 @@ func resolveHarvestCandidateWithReconstructionAt(repoRoot, branch, requested, re
 		return harvestCandidateReport{}, fmt.Errorf("%s resolved to no commit", branch)
 	}
 
-	ledger, err := reviewledger.NewReviewLedger(repoRoot, reviewledger.DefaultPath(repoRoot))
+	ledger, err := openHarvestLedger(repoRoot)
 	if err != nil {
 		return harvestCandidateReport{}, fmt.Errorf("open review ledger: %w", err)
 	}
@@ -1841,7 +1841,7 @@ func harvestMergeVerdict(sha, operatorVeto string, allowUnrecorded bool) (harves
 			"Only FAIL/BLOCKED may be supplied here, and only to refuse", v)
 	}
 
-	ledger, err := reviewledger.NewReviewLedger(".", reviewledger.DefaultPath(""))
+	ledger, err := openHarvestLedger(".")
 	if err != nil {
 		return "", fmt.Errorf("open review ledger: %w", err)
 	}
@@ -1879,6 +1879,9 @@ func min(a, b int) int {
 // sealed completion receipt after LandedProof. Prefer a recorded merge-admission
 // for --ref; otherwise every field must be supplied explicitly.
 type verifyLandedBinding struct {
+	// Resolved once by the public entry, shared by the gate and both pin reads.
+	ledgerPath string
+
 	PriorReceiptDigest                                          string
 	ReconstructionSHA, ReconstructionBase, ReconstructionDigest string
 	Ref, TaskID, Candidate, BaseSHA                             string
@@ -1900,12 +1903,13 @@ func runHarvestVerifyLanded(branch string, binding verifyLandedBinding) error {
 	// built from the BINDING's ref and task id, which are what the operator
 	// supplied; the only gate field those choose is the task-revision probe,
 	// which this route never reads.
-	gate, err := buildMergeGate(binding.Ref, binding.TaskID, 0)
+	ctx, cancel := cliMergeProofContext()
+	defer cancel()
+	gate, err := buildMergeGateContext(ctx, binding.Ref, binding.TaskID, 0)
 	if err != nil {
 		return fmt.Errorf("receipt reconcile: %w", err)
 	}
-	ctx, cancel := gate.ProofContext()
-	defer cancel()
+	binding.ledgerPath = gate.Ledger.Path
 
 	// FAC-831: a retired carrier is not a missing precondition, it is the
 	// normal end state of merged work, and this path exists for exactly that
