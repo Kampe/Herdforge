@@ -673,6 +673,7 @@ func staleBackoffSnapshot(name string, record cachedProviderRecord) *UsageSnapsh
 	return &UsageSnapshot{
 		GeneratedAt: time.Now().UTC(),
 		Providers:   map[string]ProviderUsage{name: p},
+		Errors:      map[string]string{name: record.Error},
 	}
 }
 
