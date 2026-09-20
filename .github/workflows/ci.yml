@@ -436,6 +436,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: FAC-818 stale quota error control
+        timeout-minutes: 25
+        run: zsh scripts/verify-stale-quota-error.zsh
+
+      - name: Upload stale quota error control logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-stale-quota-error-logs
+          path: .verify-stale-quota-logs/run-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # FAC-198: the quarantined ownership suite only runs inside the hermetic
   # Docker profile. Compile is already part of test-unit; this job is the
   # reachable executor so those tests are not "compile-only forever."
