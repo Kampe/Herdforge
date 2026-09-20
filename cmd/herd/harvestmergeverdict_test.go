@@ -39,13 +39,18 @@ func TestHarvestMergeHonoursOperatorVeto(t *testing.T) {
 // With no operator opinion, consent must come from the ledger — and an empty
 // ledger is a refusal, not a default yes.
 func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
-	t.Chdir(t.TempDir())
+	// Default ledger discovery requires a repository even when evidence is absent.
+	t.Setenv("HERD_REVIEW_LEDGER", "")
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Chdir(surfaceRepo(t))
 	if err := os.MkdirAll(".herd", 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
 	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("an empty review ledger read as consent to merge")
+	} else if !strings.Contains(err.Error(), "no admissible independent PASS for exact candidate") {
+		t.Fatalf("empty ledger refused outside verdict admission: %v", err)
 	}
 
 	// A verdict for a DIFFERENT sha is not consent for this one.
@@ -68,6 +73,8 @@ func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
 	}
 	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("a PASS for another sha read as consent for this candidate")
+	} else if !strings.Contains(err.Error(), "no admissible independent PASS for exact candidate") {
+		t.Fatalf("wrong-SHA PASS refused outside verdict admission: %v", err)
 	}
 }
 
@@ -75,7 +82,9 @@ func TestHarvestMergeRefusesWithoutAnAdmissibleLedgerVerdict(t *testing.T) {
 // is the only thing that yields consent. Without this the test above could
 // pass simply because harvestMergeVerdict always refuses.
 func TestHarvestMergeAcceptsLedgerPassForExactCandidate(t *testing.T) {
-	t.Chdir(t.TempDir())
+	t.Setenv("HERD_REVIEW_LEDGER", "")
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Chdir(surfaceRepo(t))
 	if err := os.MkdirAll(".herd", 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -119,6 +128,8 @@ func TestHarvestMergeAcceptsLedgerPassForExactCandidate(t *testing.T) {
 	}
 	if _, err := harvestMergeVerdict(hmSHA, "", false); err == nil {
 		t.Fatal("an unsuperseded FAIL for the exact candidate still yielded consent")
+	} else if !strings.Contains(err.Error(), "no admissible independent PASS for exact candidate") {
+		t.Fatalf("same-SHA veto refused outside verdict admission: %v", err)
 	}
 }
 
