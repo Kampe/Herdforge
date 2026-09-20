@@ -3,15 +3,15 @@ package usage
 import (
 	"encoding/json"
 	"reflect"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// Exercise the public provider and aggregate limits projections through a
-// successful poll, a new 429, persisted backoff, and recovery. expireBackoff
-// advances the persisted clock fixture without sleeping or calling upstream.
+// Exercise provider error propagation through a successful poll, a new 429,
+// persisted backoff, and recovery. Aggregate assertions below retain coverage
+// of pre-existing behavior, independently of this fix. expireBackoff advances
+// the persisted clock fixture without sleeping or calling upstream.
 func TestStaleBackoffLimitsRetainsProviderError(t *testing.T) {
 	t.Setenv("HERD_QUOTA_CACHE_SECONDS", "0")
 	limited := false
@@ -34,7 +34,7 @@ func TestStaleBackoffLimitsRetainsProviderError(t *testing.T) {
 		t.Fatal("fixture has no account identity")
 	}
 	want.Stale = true
-	assertReport := func(snap *UsageSnapshot, age time.Duration, exact bool) {
+	assertReading := func(snap *UsageSnapshot, age time.Duration) LimitsReport {
 		t.Helper()
 		body, err := json.Marshal(snap.LimitsReport(age))
 		if err != nil {
@@ -44,15 +44,19 @@ func TestStaleBackoffLimitsRetainsProviderError(t *testing.T) {
 		if err := json.Unmarshal(body, &report); err != nil {
 			t.Fatal(err)
 		}
-		detail := report.Errors["codex"]
-		if len(report.Errors) != 1 || !strings.HasPrefix(detail, "rate-limited: ") || !strings.Contains(detail, wantError) || (exact && detail != wantError) {
-			t.Fatalf("stale limits lost exact-provider telemetry error: errors=%v", report.Errors)
-		}
 		if report.Schema != LimitsSchema || len(report.Providers) != 1 || !reflect.DeepEqual(report.Providers["codex"], want) {
 			t.Fatalf("stale limits changed the banked reading: got=%+v want=%+v", report, want)
 		}
 		if report.GeneratedAt.IsZero() || report.CacheAgeSeconds != age.Seconds() {
 			t.Fatalf("limits report metadata changed: %+v", report)
+		}
+		return report
+	}
+	assertProviderError := func(snap *UsageSnapshot) {
+		t.Helper()
+		report := assertReading(snap, 0)
+		if len(report.Errors) != 1 || report.Errors["codex"] != wantError {
+			t.Fatalf("stale limits lost exact-provider telemetry error: errors=%v", report.Errors)
 		}
 	}
 
@@ -61,7 +65,7 @@ func TestStaleBackoffLimitsRetainsProviderError(t *testing.T) {
 	if pollErrorCode(err) != "rate-limited" {
 		t.Fatalf("new 429 lost returned error: %v", err)
 	}
-	assertReport(snap, 0, true)
+	assertProviderError(snap)
 	backoff := persistedRecord(t, "codex")
 	if backoff.FailureStreak != 1 || backoff.Error != wantError || backoff.BackoffUntil.Sub(backoff.ObservedAt) < 600*time.Second {
 		t.Fatalf("new 429 did not retain classified error and server deadline: %+v", backoff)
@@ -71,12 +75,19 @@ func TestStaleBackoffLimitsRetainsProviderError(t *testing.T) {
 		if pollErrorCode(err) != "rate-limited" {
 			t.Fatalf("persisted backoff lost returned error: %v", err)
 		}
-		assertReport(snap, 0, true)
+		assertProviderError(snap)
 		all, age, err := FetchSnapshotCachedForce(force)
 		if err != nil {
 			t.Fatalf("aggregate with a banked reading failed: %v", err)
 		}
-		assertReport(all, age, false)
+		// Aggregate collection already derives Errors from the separately
+		// returned err, overwriting snapshot.Errors. Its persisted error is
+		// currently double-prefixed. This compatibility check passes before
+		// the fix; the provider assertion above is the mutation oracle.
+		report := assertReading(all, age)
+		if len(report.Errors) != 1 || report.Errors["codex"] != "rate-limited: "+wantError {
+			t.Fatalf("aggregate err-derived compatibility changed: %v", report.Errors)
+		}
 		if got := persistedRecord(t, "codex"); !reflect.DeepEqual(got, backoff) {
 			t.Fatalf("backoff read changed persisted deadline, identity or reading: got=%+v want=%+v", got, backoff)
 		}
@@ -100,5 +111,26 @@ func TestStaleBackoffLimitsRetainsProviderError(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(calls); got != 3 {
 		t.Fatalf("recovery polls=%d want=3", got)
+	}
+
+	// The reader accepts persisted backoff records without an Error. A
+	// concurrent successful refresh can also leave an errorless record for
+	// the final post-lock reread. Neither case is a classified empty error.
+	errorless := persistedRecord(t, "codex")
+	errorless.BackoffUntil = time.Now().Add(time.Minute)
+	if err := writeCachedRecords(map[string]cachedProviderRecord{"codex": errorless}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = FetchProviderForce("codex", true)
+	if pollErrorCode(err) != "rate-limited" || snap == nil {
+		t.Fatalf("errorless backoff lost existing return contract: snapshot=%+v error=%v", snap, err)
+	}
+	want = recovered.Providers["codex"]
+	want.Stale = true
+	if report := assertReading(snap, 0); len(report.Errors) != 0 {
+		t.Fatalf("errorless cache record fabricated an empty telemetry error: %v", report.Errors)
+	}
+	if got := atomic.LoadInt32(calls); got != 3 {
+		t.Fatalf("errorless backoff repolled upstream: calls=%d want=3", got)
 	}
 }

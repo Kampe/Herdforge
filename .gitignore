@@ -166,3 +166,6 @@ TASK-PACKET.md
 
 # FAC-832: mutation-control logs from scripts/verify-review-carrier.zsh.
 .verify-review-carrier-logs/
+
+# FAC-818: mutation-control logs from scripts/verify-stale-quota-error.zsh.
+.verify-stale-quota-logs/

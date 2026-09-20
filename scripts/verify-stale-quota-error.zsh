@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
-# FAC-818: run on hosted CI. Remove only stale-snapshot error propagation in
-# an owned checkout, require compilation, then require the named assertion.
+# FAC-818: run on hosted CI. Remove each stale-snapshot error guard in an owned
+# checkout, require compilation, then require its named assertion and restore.
 set -euo pipefail
 
 repo_root=$(git -C "${0:A:h}/.." rev-parse --show-toplevel)
@@ -10,12 +10,20 @@ done
 pin=$(git -C "$repo_root" rev-parse HEAD)
 src=pkg/usage/cache.go
 oracle=TestStaleBackoffLimitsRetainsProviderError
-assertion='stale limits lost exact-provider telemetry error'
-anchor=$'\t\tErrors:      map[string]string{name: record.Error},'
+sep=$'\x1f'
+controls=(
+"propagation${sep}"$'\t\tsnap.Errors = map[string]string{name: record.Error}'"${sep}// MUTANT: error propagation removed${sep}stale limits lost exact-provider telemetry error"
+"empty-error${sep}"$'\tif record.Error != "" {\n\t\tsnap.Errors'"${sep}"$'\tif true {\n\t\tsnap.Errors'"${sep}errorless cache record fabricated an empty telemetry error"
+)
 pristine=$(git -C "$repo_root" rev-parse "$pin:$src")
 content=$(git -C "$repo_root" show "$pin:$src")
-parts=("${(@ps:$anchor:)content}")
-(( ${#parts} == 2 )) || { print -u2 'error: mutation anchor must occur exactly once'; exit 1; }
+for control in "${controls[@]}"; do
+	fields=("${(@ps:$sep:)control}")
+	(( ${#fields} == 4 )) || { print -u2 'error: malformed mutation control'; exit 1; }
+	anchor=$fields[2]
+	parts=("${(@ps:$anchor:)content}")
+	(( ${#parts} == 2 )) || { print -u2 'error: mutation anchor must occur exactly once'; exit 1; }
+done
 
 report_parent=${VERIFY_STALE_QUOTA_REPORT_DIR:-$repo_root/.verify-stale-quota-logs}
 mkdir -p -- "$report_parent"
@@ -42,7 +50,7 @@ note() { print -r -- "$@" | tee -a "$run_dir/summary.txt"; }
 
 run_oracle() {
 	local rc=0
-	( cd "$work" && timeout -k 10s 600s go test -json -count=1 -p 1 -parallel 1 -timeout 300s -run "^${oracle}\$" ./pkg/usage/ ) > "$1" 2> "$2" || rc=$?
+	( cd "$work" && timeout -k 10s 180s go test -json -count=1 -p 1 -parallel 1 -timeout 60s -run "^${oracle}\$" ./pkg/usage/ ) > "$1" 2> "$2" || rc=$?
 	print -r -- "$rc"
 }
 crashed() {
@@ -67,35 +75,44 @@ if (( rc != 0 )) || ! oracle_passed "$baseline"; then
 fi
 note "baseline: PASS $oracle"
 
-print -r -- "${content//"$anchor"/}" > "$work/$src"
-[[ "$(git -C "$work" hash-object -- "$src")" != "$pristine" ]] || exit 1
-git -C "$work" diff -- "$src" > "$run_dir/mutant.diff"
-( cd "$work" && timeout -k 10s 300s go test -p 1 -c -o /dev/null ./pkg/usage/ ) > "$run_dir/mutant.compile" 2>&1 || {
-	note 'compile: FAILED'
-	print -u2 'BROKEN-MUTANT: compile failed; this is not assertion evidence'
-	exit 1
-}
-note 'compile: PASS mutant'
-events=$run_dir/mutant.json
-rc=$(run_oracle "$events" "$run_dir/mutant.console")
-git -C "$work" checkout -- "$src"
-[[ "$(git -C "$work" hash-object -- "$src")" == "$pristine" ]] || exit 1
-if (( rc != 1 )) || ! events_valid "$events" || crashed "$events" || ! jq -e -s --arg oracle "$oracle" --arg assertion "$assertion" '
-	any(.[]; .Action == "fail" and .Test == $oracle) and
-	any(.[]; .Action == "output" and .Test == $oracle and (.Output | contains($assertion)))
-' "$events" >/dev/null; then
-	note "kill: FAILED (exit $rc)"
-	print -u2 "BROKEN-RUN: mutant exit $rc did not prove the named assertion"
-	exit 1
-fi
-note "kill: PASS $oracle: $assertion"
-restored=$run_dir/restored.json
-rc=$(run_oracle "$restored" "$run_dir/restored.console")
-if (( rc != 0 )) || ! oracle_passed "$restored"; then
-	note "restored: FAILED (exit $rc)"
-	print -u2 'error: named oracle did not pass after restoring production source'
-	exit 1
-fi
-note "restored: PASS $oracle"
+for control in "${controls[@]}"; do
+	fields=("${(@ps:$sep:)control}")
+	name=$fields[1]
+	anchor=$fields[2]
+	replacement=$fields[3]
+	assertion=$fields[4]
+	control_dir=$run_dir/$name
+	mkdir -p -- "$control_dir"
+	print -r -- "${content//"$anchor"/"$replacement"}" > "$work/$src"
+	[[ "$(git -C "$work" hash-object -- "$src")" != "$pristine" ]] || exit 1
+	git -C "$work" diff -- "$src" > "$control_dir/mutant.diff"
+	( cd "$work" && timeout -k 10s 120s go test -p 1 -c -o /dev/null ./pkg/usage/ ) > "$control_dir/mutant.compile" 2>&1 || {
+		note "compile: FAILED $name"
+		print -u2 'BROKEN-MUTANT: compile failed; this is not assertion evidence'
+		exit 1
+	}
+	note "compile: PASS $name"
+	events=$control_dir/mutant.json
+	rc=$(run_oracle "$events" "$control_dir/mutant.console")
+	git -C "$work" checkout -- "$src"
+	[[ "$(git -C "$work" hash-object -- "$src")" == "$pristine" ]] || exit 1
+	if (( rc != 1 )) || ! events_valid "$events" || crashed "$events" || ! jq -e -s --arg oracle "$oracle" --arg assertion "$assertion" '
+		any(.[]; .Action == "fail" and .Test == $oracle) and
+		any(.[]; .Action == "output" and .Test == $oracle and (.Output | contains($assertion)))
+	' "$events" >/dev/null; then
+		note "kill: FAILED $name (exit $rc)"
+		print -u2 "BROKEN-RUN: mutant exit $rc did not prove the named assertion"
+		exit 1
+	fi
+	note "kill: PASS $name: $oracle: $assertion"
+	restored=$control_dir/restored.json
+	rc=$(run_oracle "$restored" "$control_dir/restored.console")
+	if (( rc != 0 )) || ! oracle_passed "$restored"; then
+		note "restored: FAILED $name (exit $rc)"
+		print -u2 'error: named oracle did not pass after restoring production source'
+		exit 1
+	fi
+	note "restored: PASS $name: $oracle"
+done
 cleanup || { print -u2 'error: owned checkout cleanup failed'; exit 1; }
-note "KILLED: $oracle: $assertion"
+note "KILLED: ${#controls} controls: $oracle"
