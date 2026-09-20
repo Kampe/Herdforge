@@ -534,7 +534,13 @@ func enrollTaskSource(root, target, ref, receiptPath string, write bool) (*taskS
 }
 
 func publishTaskSource(root, admin string, registration os.FileInfo, b taskSourceBinding) (*taskSourceBinding, error) {
-	signer, err := dispatch.LoadSignerForConfig("", root)
+	// The signer API takes the configured name; it does not load the profile.
+	// Always use canonical configuration for the repository's signing identity.
+	cfg, err := config.LoadConfig(filepath.Join(root, config.DefaultConfigPath))
+	if err != nil {
+		return nil, fmt.Errorf("task source: canonical signing configuration unavailable: %w", err)
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root)
 	if err != nil {
 		return nil, err
 	}

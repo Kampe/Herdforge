@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/launch"
@@ -50,7 +51,11 @@ func newTaskSourceFixture(t *testing.T) taskSourceFixture {
 	t.Setenv(dispatch.KeyDirEnv, keyDir)
 	t.Setenv("HERD_ROLE", "coordinator")
 	attestKeyDir(t, keyDir)
-	if _, err := dispatch.LoadSignerForConfig("", root); err != nil {
+	cfg, err := config.LoadConfig(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dispatch.LoadSignerForConfig(cfg.Project.Name, root); err != nil {
 		t.Fatal(err)
 	}
 	oldAgents := taskSourceAgents
@@ -60,7 +65,6 @@ func newTaskSourceFixture(t *testing.T) taskSourceFixture {
 	f.path = filepath.Join(root, f.relative)
 	taskSourceGit(t, root, "worktree", "add", f.path, pinProofBranch)
 	f.entry = worktreeEntry{Path: f.path, Branch: pinProofBranch, Head: candidate}
-	var err error
 	f.admin, err = herdr.HarvestRegistrationDir(f.path)
 	if err != nil {
 		t.Fatal(err)
