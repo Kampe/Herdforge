@@ -294,6 +294,12 @@ Commands:
 	"resource-governor": "Usage: herd resource-governor [--json] [--apply] [--max-reaps N] [--foreign owner:kind:path]\n" +
 		"  Inventory host-local registered worktrees and safely reap declared generated data.",
 	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main] [--target <path>]... [--by-pr]\n" +
+		"       herd worktree-reap --enroll-task <FAC-N> --target <path> --receipt <path> [--write]\n" +
+		"  Enrollment validates an existing completed task, canonical independent review,\n" +
+		"  original launch provenance and exact managed Git registration. Paths are\n" +
+		"  canonical-repository-relative. It is dry-run by default; --write signs the\n" +
+		"  registration binding without removing anything. This only clears a resident\n" +
+		"  name hint; true homes and every retirement safety gate remain protected.\n" +
 		"  Retire worktrees whose work has LANDED: no unique commits against base, so\n" +
 		"  removal is provably lossless. Never touches unmerged, dirty, locked or\n" +
 		"  detached worktrees -- unmerged work is not garbage. Everything declined is\n" +
