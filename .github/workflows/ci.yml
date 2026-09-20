@@ -265,8 +265,9 @@ jobs:
       # assertion. Serial by construction: one checkout, one mutant at a time.
       # Finite and explicit. The driver bounds each compile and each serial
       # package run itself; this is the outer ceiling so a wedged step cannot
-      # hold a runner indefinitely. Eight mutants, each one compile plus one
-      # anchored package run, plus a baseline and a restored run, all serial.
+      # hold a runner indefinitely. The driver's mutations array determines
+      # the count; each mutant has one compile and one anchored package run,
+      # plus a baseline and a restored run, all serial.
       - name: Verify mail repair guard controls
         timeout-minutes: 30
         run: |

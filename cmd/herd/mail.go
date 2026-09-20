@@ -52,7 +52,7 @@ func runMail() {
 	}
 }
 
-// runMailRepair is the bounded operator recovery for ONE quarantined row.
+// runMailRepair is bounded operator recovery for explicitly selected rows.
 // It is report-only unless --act is given, so the default cannot mutate a
 // mailbox. Exit codes: 0 report or applied, 1 refused or failed, 2 usage.
 func runMailRepair(args []string) {
@@ -71,9 +71,16 @@ func runMailRepair(args []string) {
 func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("mail repair", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	id := fs.String("id", "", "exact message id of the quarantined row")
+	var ids, fingerprints []string
+	fs.Func("id", "exact message id (repeat for an atomic batch, maximum 32)", func(value string) error {
+		ids = append(ids, strings.TrimSpace(value))
+		return nil
+	})
 	mailPath := fs.String("mail", "", "mailbox path override")
-	fingerprint := fs.String("fingerprint", "", "sha256 of the exact malformed line the operator reviewed (REQUIRED with --act)")
+	fs.Func("fingerprint", "sha256 of reviewed bytes; repeat in the same order as --id (REQUIRED for every id with --act)", func(value string) error {
+		fingerprints = append(fingerprints, strings.TrimSpace(value))
+		return nil
+	})
 	reason := fs.String("reason", "", "why this recovery is being performed")
 	actor := fs.String("actor", "", "operator performing the recovery")
 	act := fs.Bool("act", false, "perform the repair (default is report-only)")
@@ -86,39 +93,70 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "mail repair: unexpected argument %q; every input is a flag\n", fs.Arg(0))
 		return 2
 	}
-	if strings.TrimSpace(*id) == "" {
+	if len(ids) == 0 {
 		fmt.Fprintln(stderr, "mail repair: --id is required")
 		return 2
+	}
+	if len(ids) > mail.MaxRepairBatch {
+		fmt.Fprintf(stderr, "mail repair: at most %d --id flags are allowed\n", mail.MaxRepairBatch)
+		return 2
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			fmt.Fprintln(stderr, "mail repair: --id is required and must not be blank")
+			return 2
+		}
+		if seen[id] {
+			fmt.Fprintf(stderr, "mail repair: duplicate --id %q\n", id)
+			return 2
+		}
+		seen[id] = true
 	}
 	if *act && strings.TrimSpace(*actor) == "" {
 		fmt.Fprintln(stderr, "mail repair: --actor is required with --act")
 		return 2
 	}
-	if *act && strings.TrimSpace(*fingerprint) == "" {
+	if *act && len(fingerprints) == 0 {
 		fmt.Fprintln(stderr, "mail repair: --fingerprint is required with --act; run without --act first and use the original_sha256 it reports")
 		return 2
+	}
+	if len(fingerprints) != 0 && len(fingerprints) != len(ids) {
+		fmt.Fprintln(stderr, "mail repair: provide one --fingerprint per --id, in the same order")
+		return 2
+	}
+	for _, fingerprint := range fingerprints {
+		if fingerprint == "" {
+			fmt.Fprintln(stderr, "mail repair: --fingerprint is required to be nonblank when supplied")
+			return 2
+		}
 	}
 	path, err := controlMailPath(*mailPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "mail repair: %v\n", err)
 		return 1
 	}
-	plan, err := mail.NewMailbox(path).RepairMalformedRow(context.Background(), mail.RepairRequest{
-		ID:          strings.TrimSpace(*id),
-		Fingerprint: strings.TrimSpace(*fingerprint),
-		Act:         *act,
-		Actor:       strings.TrimSpace(*actor),
-		Reason:      strings.TrimSpace(*reason),
-	})
+	requests := make([]mail.RepairRequest, len(ids))
+	for i, id := range ids {
+		requests[i] = mail.RepairRequest{ID: id, Act: *act, Actor: strings.TrimSpace(*actor), Reason: strings.TrimSpace(*reason)}
+		if len(fingerprints) > 0 {
+			requests[i].Fingerprint = fingerprints[i]
+		}
+	}
+	plans, err := mail.NewMailbox(path).RepairMalformedRows(context.Background(), requests)
 	if err != nil {
 		fmt.Fprintf(stderr, "mail repair: %v\n", err)
 		return 1
 	}
-	if err := json.NewEncoder(stdout).Encode(plan); err != nil {
+	var output any = plans
+	if len(plans) == 1 {
+		output = plans[0] // Preserve the existing single-id JSON contract.
+	}
+	if err := json.NewEncoder(stdout).Encode(output); err != nil {
 		fmt.Fprintf(stderr, "mail repair: encode plan: %v\n", err)
 		return 1
 	}
-	if !plan.Applied {
+	if !*act {
 		fmt.Fprintln(stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor <name> to apply")
 	}
 	return 0

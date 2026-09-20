@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// Audit phases. A repair writes at most two durable records: a PREPARE record
-// before it touches the mailbox, and a RESULT record once the outcome is
+// Audit phases. A repair writes at most two durable records per selected row:
+// a PREPARE before it touches the mailbox, and a RESULT once the outcome is
 // actually known. Nothing claims success in advance.
 const (
 	RepairPhasePrepare = "prepare"
@@ -202,7 +202,8 @@ func normalizeLegacyTimestamp(raw string) (time.Time, bool) {
 // RepairMalformedRow is the single narrow operator recovery for one exact
 // quarantined row: it normalizes a clearly parseable legacy timestamp, assigns
 // a proper monotonic sequence under the canonical mailbox lock, and preserves
-// the message id, payload and every other row unchanged.
+// the message id, payload, row position and every other row unchanged.
+// Use RepairMalformedRows to explicitly select a batch.
 //
 // It is REPORT-ONLY unless req.Act is set. It never repairs more than the one
 // row named by req.ID, never sweeps other malformed rows, and refuses rather
@@ -214,306 +215,11 @@ func normalizeLegacyTimestamp(raw string) (time.Time, bool) {
 // malformed line and still skips nothing; this is the missing recovery path
 // for a row that quarantine already caught.
 func (m *Mailbox) RepairMalformedRow(ctx context.Context, req RepairRequest) (*RepairPlan, error) {
-	if m == nil {
-		return nil, errors.New("mail repair: nil mailbox")
-	}
-	if strings.TrimSpace(req.ID) == "" {
-		return nil, errors.New("mail repair: an exact message id is required")
-	}
-	if req.Act && strings.TrimSpace(req.Fingerprint) == "" {
-		return nil, ErrRepairFingerprintRequired
-	}
-	if req.Act && strings.TrimSpace(req.Actor) == "" {
-		return nil, ErrRepairActorRequired
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	var plan *RepairPlan
-	err := m.withFileLockContext(ctx, func() error {
-		data, err := os.ReadFile(m.MailFile)
-		if err != nil {
-			return fmt.Errorf("mail repair: read mailbox: %w", redactErr(err))
-		}
-		// Spans, not just split strings: the repair replaces one exact byte
-		// range and leaves every other byte of the file alone, so it needs the
-		// offsets rather than a re-joined approximation of them. lines is
-		// derived from the same spans, so every index below refers to both.
-		spans := lineSpans(data)
-		lines := make([]string, len(spans))
-		for i, sp := range spans {
-			lines[i] = string(data[sp.start:sp.end])
-		}
-
-		// The mailbox as a whole must be legible before one row of it is
-		// rewritten. A repair that succeeds beside a truncated row leaves every
-		// strict reader still blocked while reporting success, and that other
-		// row may itself carry a conflicting identity nobody can read. So any
-		// row that is neither blank, nor a well-formed envelope, nor the target
-		// refuses the whole operation — in report mode as well as act, and
-		// before any sequence is reserved, any record written or any byte
-		// changed.
-		targetIdx := -1
-		malformedHits := 0
-		var otherBad []string
-		noteBad := func(i int, why string) {
-			// Line number and class only. The other row's payload is not this
-			// operation's to disclose.
-			otherBad = append(otherBad, fmt.Sprintf("line %d: %s", i+1, why))
-		}
-
-		for i, line := range lines {
-			if len(line) == 0 {
-				continue
-			}
-			scan, isObject := scanJSONObject([]byte(line))
-
-			// Duplicate keys are checked BEFORE the Envelope decode, because
-			// that decode keeps only the last value: a row declaring id TARGET
-			// and then id OTHER would look like an unrelated well-formed row
-			// and be skipped, while still carrying TARGET. Identity here is the
-			// DECODED id values, so an escaped spelling matches and a mere
-			// mention of the id inside some other row's body does not.
-			// Structure first, and structure decided HERE rather than by an
-			// Envelope decode. json.Unmarshal succeeds on "null", on "{}" and
-			// on an object with no id at all, producing a zero Envelope — so
-			// asking the decoder whether a row is healthy lets exactly those
-			// through as ordinary neighbours, which is the opposite of the
-			// complete-object, legible-identity boundary this guard exists to
-			// enforce.
-			if !isObject {
-				noteBad(i, "not a complete JSON object")
-				continue
-			}
-			if dupKey, dup := duplicateKey(scan.Keys); dup {
-				if containsString(scan.IDs, req.ID) {
-					return fmt.Errorf("%w: a row carrying id %q repeats top-level key %q, so which value to keep is ambiguous",
-						ErrRepairDuplicateKeys, req.ID, dupKey)
-				}
-				// Last-key-wins means this row's identity is unreadable, so it
-				// could be hiding a conflicting one.
-				noteBad(i, fmt.Sprintf("repeated top-level key %q", dupKey))
-				continue
-			}
-			// Exactly one top-level id, present and not blank. A row nobody can
-			// name cannot be shown to be unrelated to the target.
-			if len(scan.IDs) != 1 || strings.TrimSpace(scan.IDs[0]) == "" {
-				noteBad(i, "no readable unique identity")
-				continue
-			}
-			id := scan.IDs[0]
-
-			var env Envelope
-			if json.Unmarshal([]byte(line), &env) == nil {
-				if id == req.ID {
-					// A well-formed row already owns this id. Repairing the
-					// malformed twin would create a duplicate delivery.
-					return fmt.Errorf("%w: a well-formed row already carries id %q", ErrRepairAmbiguous, req.ID)
-				}
-				// An ordinary unrelated row, including one whose body merely
-				// mentions the target id. Left exactly as it is.
-				continue
-			}
-			if id == req.ID {
-				malformedHits++
-				targetIdx = i
-				continue
-			}
-			noteBad(i, "not a well-formed envelope")
-		}
-		if malformedHits > 1 {
-			return fmt.Errorf("%w: %d malformed rows carry id %q", ErrRepairAmbiguous, malformedHits, req.ID)
-		}
-
-		// Target-specific refusals stay precise and take precedence; only then
-		// is the rest of the mailbox reported.
-		if targetIdx < 0 {
-			// A row too damaged to parse may BE the target with its identity
-			// unreadable. Substring is a heuristic and is used only to choose
-			// the clearer refusal, never to select a row to act on.
-			for _, line := range lines {
-				if len(line) == 0 || !strings.Contains(line, req.ID) {
-					continue
-				}
-				var env Envelope
-				if json.Unmarshal([]byte(line), &env) == nil {
-					continue
-				}
-				if rawObjectID(line) == "" {
-					return fmt.Errorf("%w: a row mentioning %q is present but does not parse as a JSON object, so only its bytes are recoverable", ErrRepairUnsupported, req.ID)
-				}
-			}
-			if len(otherBad) > 0 {
-				return unrelatedCorruptionError(otherBad)
-			}
-			return fmt.Errorf("%w: %q", ErrRepairNotFound, req.ID)
-		}
-		original := lines[targetIdx]
-		originalHash := sha256OfLine(original)
-		if fp := strings.TrimSpace(req.Fingerprint); fp != "" && !strings.EqualFold(fp, originalHash) {
-			return fmt.Errorf("%w: have %s", ErrRepairStale, originalHash)
-		}
-		if err := m.checkQuarantineIdentity(req.ID, originalHash); err != nil {
-			return err
-		}
-
-		repaired, rawTimestamp, ts, err := buildRepairedEnvelope(original)
-		if err != nil {
-			return err
-		}
-
-		// The rest of the mailbox is checked LAST among the refusals, so a
-		// problem with the target itself — stale fingerprint, privileged
-		// envelope, unsupported defect, ambiguous identity — is still reported
-		// as precisely as before rather than being replaced by a generic
-		// "something else is broken". It is still checked before anything is
-		// reserved, recorded or written, so nothing has moved on either side.
-		if len(otherBad) > 0 {
-			return unrelatedCorruptionError(otherBad)
-		}
-
-		nextSeq, err := m.peekNextSequence()
-		if err != nil {
-			return err
-		}
-		// A repair must never file BELOW rows that already exist. The .seq
-		// sidecar is the normal authority, but it can be absent or behind (a
-		// copied mailbox, a lost sidecar), and a repaired row that sorts under
-		// 3000 existing messages is not a recovery. Floor it on what the file
-		// actually holds, through the same checked increment: an existing row
-		// already at the int64 maximum leaves no successor to assign.
-		if maxSeq := maxSequenceInLines(lines); maxSeq >= nextSeq {
-			floored, err := nextSequenceValue(maxSeq)
-			if err != nil {
-				return fmt.Errorf("%w (highest existing row)", err)
-			}
-			nextSeq = floored
-		}
-		repaired.Sequence = nextSeq
-		encoded, err := json.Marshal(repaired)
-		if err != nil {
-			return fmt.Errorf("mail repair: encode repaired row: %w", err)
-		}
-		repairedLine := string(encoded)
-
-		plan = &RepairPlan{
-			ID:                req.ID,
-			OriginalLine:      original,
-			OriginalSHA256:    originalHash,
-			RepairedLine:      repairedLine,
-			RepairedSHA256:    sha256OfLine(repairedLine),
-			OriginalTimestamp: rawTimestamp,
-			RepairedTimestamp: ts,
-			AssignedSequence:  nextSeq,
-			Actor:             req.Actor,
-			Reason:            req.Reason,
-		}
-		if !req.Act {
-			return nil
-		}
-
-		// Settle the sequence BEFORE anything is recorded or written, so the
-		// prepare record describes the exact bytes that will land. Reserving
-		// early can only ever leave a gap in the counter, never a duplicate —
-		// that is nextSequenceLocked's existing contract.
-		reserved, err := m.nextSequenceLocked()
-		if err != nil {
-			return err
-		}
-		if reserved < nextSeq {
-			// Advance the durable counter to the floor in ONE atomic write, so
-			// the next ordinary send cannot collide with the repaired row.
-			// Reserving one at a time would fsync once per skipped number.
-			if err := m.setSequenceFloorLocked(nextSeq); err != nil {
-				return err
-			}
-			reserved = nextSeq
-		}
-		if reserved != nextSeq {
-			repaired.Sequence = reserved
-			encoded, err = json.Marshal(repaired)
-			if err != nil {
-				return fmt.Errorf("mail repair: encode repaired row: %w", err)
-			}
-			repairedLine = string(encoded)
-			plan.AssignedSequence = reserved
-			plan.RepairedLine = repairedLine
-			plan.RepairedSHA256 = sha256OfLine(repairedLine)
-		}
-
-		// PREPARE: the original bytes, and exactly what is about to replace
-		// them, are durable BEFORE the mailbox is touched. This record claims
-		// nothing about the outcome — Applied stays false until a readback has
-		// proven it.
-		plan.Phase = RepairPhasePrepare
-		plan.PreparedAt = time.Now().UTC()
-		if err := m.appendRepairRecord(plan); err != nil {
-			return fmt.Errorf("mail repair: durable prepare record: %w", err)
-		}
-
-		// From here on every exit writes a RESULT record, so a failed attempt
-		// is legible in the artifact rather than merely absent.
-		//
-		// Splice, do not rebuild. An earlier version re-joined the split lines
-		// and appended a newline, which silently dropped trailing blank rows
-		// and invented a terminal newline the file never had — a one-row repair
-		// editing bytes outside its row. Everything before the target span and
-		// everything after it is carried through untouched, including the
-		// original newline framing and any CR bytes on other rows.
-		target := spans[targetIdx]
-		expected := make([]byte, 0, len(data)-(target.end-target.start)+len(repairedLine))
-		expected = append(expected, data[:target.start]...)
-		expected = append(expected, repairedLine...)
-		expected = append(expected, data[target.end:]...)
-
-		if err := writeFileAtomic(m.MailFile, expected, 0644); err != nil {
-			return m.recordRepairFailure(plan, fmt.Errorf("mail repair: durable mailbox write: %w", err))
-		}
-		if err := m.verifyRepairedMailbox(expected, repaired); err != nil {
-			return m.recordRepairFailure(plan, err)
-		}
-
-		// RESULT: only now is the repair durable AND verified.
-		plan.Phase = RepairPhaseResult
-		plan.Outcome = RepairOutcomeApplied
-		plan.Applied = true
-		plan.CompletedAt = time.Now().UTC()
-		if err := m.appendRepairRecord(plan); err != nil {
-			// The row IS repaired and verified; what is unconfirmed is the
-			// record of it. Reporting success here would tell an operator
-			// "applied" while the evidence they would go looking for may not
-			// survive a crash.
-			//
-			// Deliberately NOT done here, and why:
-			//
-			//   - No rollback of the appended bytes. appendLine writes before
-			//     it fsyncs, so a sync failure usually leaves the result row on
-			//     the live filesystem. Truncating an append-only audit log to
-			//     "undo" it would destroy real evidence to make a failure look
-			//     tidy, and would itself need a durable write to be safe.
-			//
-			//   - No separate commit marker. It would not help: the marker is
-			//     another append with the same failure mode, and the degraded
-			//     state is already reconcilable without it. If the result row
-			//     is lost to a crash, what remains is the prepare record plus a
-			//     mailbox that demonstrably holds the repaired row — which is
-			//     exactly enough to see what happened.
-			//
-			// So the honest contract is: the caller is told, through this
-			// error, that the completion is not durably recorded. That fact
-			// lives in the returned error and nowhere in the artifact, because
-			// no sequence of bytes in an append-only file can express it.
-			plan.Applied = false
-			plan.Outcome = RepairOutcomeFailed
-			return fmt.Errorf("%w: %v", ErrRepairCompletionUnrecorded, err)
-		}
-		return nil
-	})
+	plans, err := m.RepairMalformedRows(ctx, []RepairRequest{req})
 	if err != nil {
 		return nil, err
 	}
-	return plan, nil
+	return plans[0], nil
 }
 
 // appendRepairRecord durably appends one audit record. It takes a copy, so a
@@ -866,15 +572,6 @@ func duplicateKey(keys []string) (string, bool) {
 	return "", false
 }
 
-func containsString(values []string, want string) bool {
-	for _, v := range values {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
-
 // maxSequenceInLines reports the highest sequence any well-formed row already
 // carries, so a repair can never be filed beneath the existing history.
 func maxSequenceInLines(lines []string) int64 {
@@ -892,4 +589,247 @@ func maxSequenceInLines(lines []string) int64 {
 		}
 	}
 	return max
+}
+
+// MaxRepairBatch bounds explicit operator selection. No repair discovers or
+// automatically includes additional malformed rows.
+const MaxRepairBatch = 32
+
+// RepairMalformedRows repairs an explicit set in one mailbox transaction.
+// Every request must use the same Act, Actor and Reason. Fingerprints bind each
+// selected original independently; any refusal leaves every mailbox byte alone.
+// A successful act durably retains every original before replacing the mailbox
+// once, under its canonical lock. Sequence gaps after an I/O failure are safe.
+// Plans are returned in request order, which also determines sequence order.
+func (m *Mailbox) RepairMalformedRows(ctx context.Context, requests []RepairRequest) ([]*RepairPlan, error) {
+	if m == nil {
+		return nil, errors.New("mail repair: nil mailbox")
+	}
+	if len(requests) == 0 || len(requests) > MaxRepairBatch {
+		return nil, fmt.Errorf("mail repair: select between 1 and %d exact ids", MaxRepairBatch)
+	}
+	selected := make(map[string]bool, len(requests))
+	for _, req := range requests {
+		if strings.TrimSpace(req.ID) == "" {
+			return nil, errors.New("mail repair: an exact message id is required")
+		}
+		if selected[req.ID] {
+			return nil, fmt.Errorf("%w: id %q selected more than once", ErrRepairAmbiguous, req.ID)
+		}
+		selected[req.ID] = true
+		if req.Act && strings.TrimSpace(req.Fingerprint) == "" {
+			return nil, ErrRepairFingerprintRequired
+		}
+		if req.Act && strings.TrimSpace(req.Actor) == "" {
+			return nil, ErrRepairActorRequired
+		}
+		if req.Act != requests[0].Act || req.Actor != requests[0].Actor || req.Reason != requests[0].Reason {
+			return nil, errors.New("mail repair: batch requests must share act, actor and reason")
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var plans []*RepairPlan
+	err := m.withFileLockContext(ctx, func() error {
+		data, err := os.ReadFile(m.MailFile)
+		if err != nil {
+			return fmt.Errorf("mail repair: read mailbox: %w", redactErr(err))
+		}
+		spans := lineSpans(data)
+		lines := make([]string, len(spans))
+		for i, span := range spans {
+			lines[i] = string(data[span.start:span.end])
+		}
+		indices, otherBad, err := selectRepairRows(lines, selected)
+		if err != nil {
+			return err
+		}
+		repaired := make([]*Envelope, len(requests))
+		for i, req := range requests {
+			idx, ok := indices[req.ID]
+			if !ok {
+				return missingRepairRow(lines, req.ID, otherBad)
+			}
+			original := lines[idx]
+			originalHash := sha256OfLine(original)
+			if fp := strings.TrimSpace(req.Fingerprint); fp != "" && !strings.EqualFold(fp, originalHash) {
+				return fmt.Errorf("%w: id %q has %s", ErrRepairStale, req.ID, originalHash)
+			}
+			if err := m.checkQuarantineIdentity(req.ID, originalHash); err != nil {
+				return err
+			}
+			env, rawTimestamp, ts, err := buildRepairedEnvelope(original)
+			if err != nil {
+				return err
+			}
+			repaired[i] = env
+			plans = append(plans, &RepairPlan{
+				ID: req.ID, OriginalLine: original, OriginalSHA256: originalHash,
+				OriginalTimestamp: rawTimestamp, RepairedTimestamp: ts,
+				Actor: req.Actor, Reason: req.Reason,
+			})
+		}
+		// All selected targets have passed their specific checks; unrelated
+		// corruption still refuses before sequence reservation or any audit.
+		if len(otherBad) > 0 {
+			return unrelatedCorruptionError(otherBad)
+		}
+		nextSeq, err := m.peekNextSequence()
+		if err != nil {
+			return err
+		}
+		if maxSeq := maxSequenceInLines(lines); maxSeq >= nextSeq {
+			nextSeq, err = nextSequenceValue(maxSeq)
+			if err != nil {
+				return fmt.Errorf("%w (highest existing row)", err)
+			}
+		}
+		// Check the entire range before reserving any of it. Overflow in a
+		// later selected row must not consume a sequence for an earlier row.
+		for i, plan := range plans {
+			if i > 0 {
+				nextSeq, err = nextSequenceValue(nextSeq)
+				if err != nil {
+					return err
+				}
+			}
+			repaired[i].Sequence = nextSeq
+			encoded, err := json.Marshal(repaired[i])
+			if err != nil {
+				return fmt.Errorf("mail repair: encode repaired row: %w", err)
+			}
+			plan.AssignedSequence = nextSeq
+			plan.RepairedLine = string(encoded)
+			plan.RepairedSHA256 = sha256OfLine(plan.RepairedLine)
+		}
+		if !requests[0].Act {
+			return nil
+		}
+		// Reserve the complete, checked range in one durable write. The lock
+		// covers both peeking and reservation; a crash can leave only a gap.
+		if err := m.setSequenceFloorLocked(nextSeq); err != nil {
+			return err
+		}
+		for _, plan := range plans {
+			plan.Phase = RepairPhasePrepare
+			plan.PreparedAt = time.Now().UTC()
+			if err := m.appendRepairRecord(plan); err != nil {
+				return fmt.Errorf("mail repair: durable prepare record: %w", err)
+			}
+		}
+		// Splice in physical file order, preserving all framing and every byte
+		// outside selected spans even when request order differs from row order.
+		replacements := make(map[int]string, len(plans))
+		for _, plan := range plans {
+			replacements[indices[plan.ID]] = plan.RepairedLine
+		}
+		expected := make([]byte, 0, len(data))
+		cursor := 0
+		for i, span := range spans {
+			if replacement, ok := replacements[i]; ok {
+				expected = append(expected, data[cursor:span.start]...)
+				expected = append(expected, replacement...)
+				cursor = span.end
+			}
+		}
+		expected = append(expected, data[cursor:]...)
+		if err := writeFileAtomic(m.MailFile, expected, 0644); err != nil {
+			return m.recordRepairBatchFailure(plans, fmt.Errorf("mail repair: durable mailbox write: %w", err))
+		}
+		for _, env := range repaired {
+			if err := m.verifyRepairedMailbox(expected, env); err != nil {
+				return m.recordRepairBatchFailure(plans, err)
+			}
+		}
+		// No result claims success until the entire replacement is durable and
+		// verified. A later audit failure never rolls back retained evidence.
+		for _, plan := range plans {
+			plan.Phase = RepairPhaseResult
+			plan.Outcome = RepairOutcomeApplied
+			plan.Applied = true
+			plan.CompletedAt = time.Now().UTC()
+			if err := m.appendRepairRecord(plan); err != nil {
+				return fmt.Errorf("%w: %v", ErrRepairCompletionUnrecorded, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return plans, nil
+}
+
+func selectRepairRows(lines []string, selected map[string]bool) (map[string]int, []string, error) {
+	indices := make(map[string]int, len(selected))
+	var otherBad []string
+	noteBad := func(i int, why string) {
+		otherBad = append(otherBad, fmt.Sprintf("line %d: %s", i+1, why))
+	}
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		scan, isObject := scanJSONObject([]byte(line))
+		if !isObject {
+			noteBad(i, "not a complete JSON object")
+			continue
+		}
+		if dupKey, dup := duplicateKey(scan.Keys); dup {
+			for _, id := range scan.IDs {
+				if selected[id] {
+					return nil, nil, fmt.Errorf("%w: a row carrying id %q repeats top-level key %q", ErrRepairDuplicateKeys, id, dupKey)
+				}
+			}
+			noteBad(i, fmt.Sprintf("repeated top-level key %q", dupKey))
+			continue
+		}
+		if len(scan.IDs) != 1 || strings.TrimSpace(scan.IDs[0]) == "" {
+			noteBad(i, "no readable unique identity")
+			continue
+		}
+		id := scan.IDs[0]
+		var env Envelope
+		if json.Unmarshal([]byte(line), &env) == nil {
+			if selected[id] {
+				return nil, nil, fmt.Errorf("%w: a well-formed row already carries id %q", ErrRepairAmbiguous, id)
+			}
+			continue
+		}
+		if selected[id] {
+			if _, exists := indices[id]; exists {
+				return nil, nil, fmt.Errorf("%w: multiple malformed rows carry id %q", ErrRepairAmbiguous, id)
+			}
+			indices[id] = i
+			continue
+		}
+		noteBad(i, "not a well-formed envelope")
+	}
+	return indices, otherBad, nil
+}
+
+func missingRepairRow(lines []string, id string, otherBad []string) error {
+	// This heuristic chooses only a refusal message, never a row to mutate.
+	for _, line := range lines {
+		if !strings.Contains(line, id) {
+			continue
+		}
+		var env Envelope
+		if json.Unmarshal([]byte(line), &env) != nil && rawObjectID(line) == "" {
+			return fmt.Errorf("%w: a row mentioning %q is present but does not parse as a JSON object, so only its bytes are recoverable", ErrRepairUnsupported, id)
+		}
+	}
+	if len(otherBad) > 0 {
+		return unrelatedCorruptionError(otherBad)
+	}
+	return fmt.Errorf("%w: %q", ErrRepairNotFound, id)
+}
+
+func (m *Mailbox) recordRepairBatchFailure(plans []*RepairPlan, cause error) error {
+	var failures []error
+	for _, plan := range plans {
+		failures = append(failures, m.recordRepairFailure(plan, cause))
+	}
+	return errors.Join(failures...)
 }

@@ -350,8 +350,8 @@ Commands:
   herd mail ack --recipient NAME --id ID [--mail path]
   herd mail inbox --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
   herd mail read --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
-  herd mail repair --id ID [--mail path] [--reason TEXT]
-  herd mail repair --id ID --fingerprint SHA256 --actor NAME --act [--mail path] [--reason TEXT]
+  herd mail repair --id ID [--id ID...] [--mail path] [--reason TEXT]
+  herd mail repair --id ID [--id ID...] --fingerprint SHA256 [--fingerprint SHA256...] --actor NAME --act [--mail path] [--reason TEXT]
   herd mail control <issue|drain> [flags]
 
 Bounded paging (inbox/read): passing --after-cursor, --limit or --max-bytes
@@ -362,26 +362,27 @@ error, never a silent resume. Paging bounds what is RETAINED and RETURNED, not
 the scan: JSONL has no index, so each page still walks the file. Paging never
 acknowledges, rewrites, or deletes anything.
 
-herd mail repair is a bounded operator recovery for ONE quarantined row whose
-only defect is a legacy non-RFC3339 timestamp: it normalizes that timestamp,
-assigns a monotonic sequence under the canonical mailbox lock, and preserves
-the id, payload and every other row. It is REPORT-ONLY unless --act is given.
-Acting REQUIRES --fingerprint and --actor: run report-only first and pass back
-the original_sha256 it reports, so a rewrite can only ever replace the exact
-bytes an operator reviewed, attributed to a named actor. It refuses ambiguous
-ids, a stale fingerprint, any other defect, and any privileged signed message.
+herd mail repair recovers 1 to 32 explicitly selected quarantined rows with
+legacy non-RFC3339 timestamps. It normalizes timestamps and assigns sequences
+above the existing rows and counter under the canonical mailbox lock. The ids,
+payloads, row positions and every unselected byte are preserved. It does not
+reorder history or resolve existing sequence-order failures in bounded paging.
+It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
+plan object; repeated --id flags return an array in the order supplied.
+Acting REQUIRES --actor and one --fingerprint per --id, paired in the same
+order. Run report-only first and pass back each plan's original_sha256, so the
+batch can replace only the exact bytes reviewed. All selected rows are checked
+before any mutation. Duplicate ids, stale fingerprints, unsupported defects,
+privileged signed messages and unselected malformed rows refuse the batch.
 Repeated identical quarantine copies of one row are normal reader behaviour and
 never block a repair; conflicting recorded originals do.
 
-<mail>.repair.jsonl records TWO entries per act: a prepare entry written before
-the mailbox is touched, carrying the original bytes and exactly what will
-replace them, and a result entry written only once the new row has been read
-back and verified. applied=true appears only on a verified result; a failed
-attempt is recorded as outcome=failed with its reason. If the mailbox is
-repaired but the result entry cannot be written, the command FAILS rather than
-reporting a success whose record an operator could never find — the prepare
-entry and the original bytes both remain recoverable, here and in the
-pre-existing <mail>.quarantine.jsonl. It changes no parsing rule.
+<mail>.repair.jsonl retains each row's original bytes and proposed replacement
+in a durable prepare entry before the mailbox is replaced once. After the
+entire replacement is read back and verified, each row gets an applied result.
+Write/readback failures produce failed results with their reason. If a result
+cannot be durably recorded after repair, the command fails while the repaired
+mailbox and prepare evidence remain. It changes no parsing rule.
 
 Ordinary durable messages use the local mailbox and are not authenticated control.
 herd mail ack is the explicit ordinary-report disposition; inbox/read remain read-only.
