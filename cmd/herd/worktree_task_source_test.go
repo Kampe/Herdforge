@@ -121,7 +121,7 @@ func TestTaskSourceEnrollmentRetiresNamedTask(t *testing.T) {
 	if len(landed) != 1 || len(kept) != 0 || landed[0].taskSource == nil {
 		t.Fatalf("enrolled named task was kept: landed=%v kept=%v", landed, kept)
 	}
-	if err := retireLandedOne(f.root, landed[0], runReapGit); err != nil {
+	if err := retireLandedOneWithInspector(f.root, landed[0], runReapGit, taskSourceOwner{}); err != nil {
 		t.Fatalf("enrolled task retirement refused: %v", err)
 	}
 	if _, err := os.Stat(f.path); !os.IsNotExist(err) {
@@ -283,17 +283,30 @@ func TestTaskSourceActRefusesDrift(t *testing.T) {
 
 func TestTaskSourceHardHomes(t *testing.T) {
 	root := t.TempDir()
+	var err error
+	root, err = canonicalWorktreePath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"orchestrator", "coordinator", "configured", "task"} {
+		if err := os.MkdirAll(filepath.Join(root, ".worktrees", name), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	v := &taskSourceView{root: root, homes: []string{root, filepath.Join(root, ".worktrees/configured")}}
-	for _, e := range []worktreeEntry{
-		{Path: filepath.Join(root, ".worktrees/orchestrator"), Branch: "task/x"},
-		{Path: filepath.Join(root, ".worktrees/coordinator"), Branch: "task/x"},
-		{Path: filepath.Join(root, ".worktrees/configured"), Branch: "task/x"},
-		{Path: filepath.Join(root, ".worktrees/task"), Branch: "standing/builder"},
-		{Path: filepath.Join(root, ".worktrees/task"), Branch: "main"},
-		{Path: root, Branch: "task/x"},
+	if err := v.hardHome(worktreeEntry{Path: filepath.Join(root, ".worktrees/task"), Branch: "task/x"}); err != nil {
+		t.Fatalf("ordinary existing task baseline was refused: %v", err)
+	}
+	for _, tc := range []struct{ path, branch, reason string }{
+		{filepath.Join(root, ".worktrees/orchestrator"), "task/x", "reserved resident home"},
+		{filepath.Join(root, ".worktrees/coordinator"), "task/x", "reserved resident home"},
+		{filepath.Join(root, ".worktrees/configured"), "task/x", "invoking, configured or live resident home"},
+		{filepath.Join(root, ".worktrees/task"), "standing/builder", "canonical, detached or standing checkout"},
+		{filepath.Join(root, ".worktrees/task"), "main", "canonical, detached or standing checkout"},
+		{root, "task/x", "invoking, configured or live resident home"},
 	} {
-		if err := v.hardHome(e); err == nil {
-			t.Fatalf("hard resident home accepted: %+v", e)
+		if err := v.hardHome(worktreeEntry{Path: tc.path, Branch: tc.branch}); err == nil || !strings.Contains(err.Error(), tc.reason) {
+			t.Fatalf("hard resident home missed intended guard %q for %s (%s): %v", tc.reason, tc.path, tc.branch, err)
 		}
 	}
 }
