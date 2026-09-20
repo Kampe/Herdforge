@@ -50,6 +50,8 @@ worktree_pkg=./pkg/worktree/
 pool_run='TestReleaseFromAForeignCaller|TestReclaimFromAForeignCaller|TestAReassignedSlotRefuses|TestReleaseRefuses|TestReleaseKeepsTheLease'
 pool_expect='TestReleaseFromAForeignCallerResetsTheOwningSlot TestReclaimFromAForeignCallerResetsTheOwningSlot TestAReassignedSlotRefusesTheRetiredLeaseIdentity TestReleaseRefusesAnUnknownLeaseAndLeavesTheOwnerHeld TestReleaseRefusesAStoredPathOutsideThePoolRootAndKeepsTheLease TestReleaseRefusesAnUnregisteredPathAndKeepsTheLease TestReleaseKeepsTheLeaseWhenTheSlotIsGone TestRelativeConstructorAnchorsBeforeTheCallerMoves TestFixedClockMintsAUniqueIncarnationForEveryAssignment TestARecreatedSlotDoesNotResurrectARetiredIdentity TestLegacyStateDoesNotReissueAReleasedGeneration TestLegacyHeldSlotDoesNotReissueItsOwnGenerationAfterReclaim TestStructLiteralPoolRefusesRelativeRootsOnItsFirstStateRead'
 
+pool_expect+=' TestLeaseFromForeignCallerReturnsOwningPath TestReclaimedLeaseFromForeignCallerReturnsOwningPath'
+
 go_timeout=${VERIFY_POOL_GO_TIMEOUT:-300}
 if [[ "$go_timeout" != <-> ]] || (( ${#go_timeout} > 4 )) || (( go_timeout < 60 || go_timeout > 1800 )); then
 	print -u2 "warning: ignoring unusable VERIFY_POOL_GO_TIMEOUT, using 300s"
@@ -241,6 +243,10 @@ restore_source() {
 sep=$'\x1f'
 typeset -a controls
 controls=(
+"free-lease-returns-owning-runtime-path${sep}${pool_src}${sep}${worktree_pkg}${sep}			// Keep the stored spelling portable; anchor only the returned copy.
+			copy.Path = p.repoPath(slot.Path)${sep}			// MUTANT: the free lease exposes its stored relative path.${sep}TestLeaseFromForeignCallerReturnsOwningPath${sep}returned lease path pinned the wrong worktree"
+"reclaimed-lease-returns-owning-runtime-path${sep}${pool_src}${sep}${worktree_pkg}${sep}			// A reclaimed lease has the same runtime path contract.
+			copy.Path = p.repoPath(slot.Path)${sep}			// MUTANT: the reclaimed lease exposes its stored relative path.${sep}TestReclaimedLeaseFromForeignCallerReturnsOwningPath${sep}returned lease path pinned the wrong worktree"
 "release-anchored-to-the-owning-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}			base := p.DefaultBase
 			if base == \"\" {
 				base = \"origin/main\"
@@ -402,6 +408,16 @@ print -r -- "$restored" >| "$run_dir/restored.hash"
 if [[ "$restored" != "${pristine[$pool_src]}" ]]; then
 	note "harness error: $pool_src did not end at its pristine content"
 	failures=$(( failures + 1 ))
+fi
+
+restored_events=$run_dir/restored.json
+restored_console=$run_dir/restored.console
+restored_rc=$(run_focused "^(${pool_expect// /|})\$" "$restored_events" "$restored_console")
+if (( restored_rc != 0 )) || ! baseline_ok "$restored_events"; then
+	note "RESTORED BASELINE FAILED (exit $restored_rc) — see $restored_events"
+	failures=$(( failures + 1 ))
+else
+	note "restored baseline: all ${#${=pool_expect}} oracle(s) pass"
 fi
 
 cleanup_worktree || {

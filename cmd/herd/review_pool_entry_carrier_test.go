@@ -591,6 +591,20 @@ func TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot(t *testing.T) {
 
 	// ONE location: the caller-relative spelling the caller actually wrote.
 	slot := filepath.Join(caller, "given", "pool", "pool-01")
+	// Check the location before invoking Git: a missing slot is the root
+	// regression, not evidence from an unrelated git exit status.
+	if info, err := os.Stat(slot); err != nil || !info.IsDir() {
+		t.Fatalf("explicit relative pool root did not create the caller-relative slot: path=%q error=%v", slot, err)
+	}
+	wantSlot, err := filepath.EvalSymlinks(slot)
+	if err != nil {
+		t.Fatalf("resolve caller-relative slot: %v", err)
+	}
+	recorded := packetSurfacePath(t, root)
+	packetSlot, err := filepath.EvalSymlinks(recorded)
+	if err != nil || packetSlot != wantSlot {
+		t.Fatalf("review packet does not point at the caller-relative slot: surface=%q resolved=%q want=%q error=%v", recorded, packetSlot, wantSlot, err)
+	}
 	if head := strings.TrimSpace(entryGitOutput(t, slot, "rev-parse", "HEAD")); head != sha {
 		t.Fatalf("leased slot HEAD = %s, want the exact candidate %s", head, sha)
 	}

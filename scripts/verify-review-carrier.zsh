@@ -264,7 +264,7 @@ controls=(
 	if err != nil {
 		return fmt.Errorf(\"resolve review pool root: %w\", err)
 	}
-	p := worktree.NewPool(root, poolPath, 2)${sep}TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot${sep}an explicit relative pool root was refused"
+	p := worktree.NewPool(root, poolPath, 2)${sep}TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot${sep}explicit relative pool root did not create the caller-relative slot"
 )
 
 # ---------------------------------------------------------------------------

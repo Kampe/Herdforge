@@ -323,6 +323,8 @@ func (p *Pool) Ensure(ctx context.Context) error {
 
 // Lease claims the first available clean slot. Dirty or uninspectable slots
 // are never handed out, because a review must execute against known contents.
+// The returned copy has an owner-rooted absolute Path for execution; persisted
+// slot paths and Slots() retain their original portable spelling.
 func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 	if strings.TrimSpace(purpose) == "" {
 		return nil, errors.New("worktree pool: purpose is required")
@@ -352,6 +354,8 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			slot.Purpose, slot.LeasedAt = purpose, at
 			slot.LeaseID = leaseIdentity(slot.Name, slot.LeasedAt)
 			copy := *slot
+			// Keep the stored spelling portable; anchor only the returned copy.
+			copy.Path = p.repoPath(slot.Path)
 			result = &copy
 			return p.writeState(state)
 		}
@@ -385,6 +389,8 @@ func (p *Pool) Lease(ctx context.Context, purpose string) (*PoolSlot, error) {
 			slot.Purpose, slot.LeasedAt = purpose, at
 			slot.LeaseID = leaseIdentity(slot.Name, slot.LeasedAt)
 			copy := *slot
+			// A reclaimed lease has the same runtime path contract.
+			copy.Path = p.repoPath(slot.Path)
 			result = &copy
 			return p.writeState(state)
 		}
