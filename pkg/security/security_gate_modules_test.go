@@ -25,6 +25,7 @@ func TestSecurityGateModulesExactlyOnce(t *testing.T) {
 	if err := securityModuleOrder(baseline); err != nil {
 		t.Fatal(err)
 	}
+	f.retain(t, "baseline", "oracle.txt", []byte("PASS root then nested exactly once\n"))
 
 	const unique = "\ttypeset -aU gosec_modules\n"
 	if bytes.Count(pristine, []byte(unique)) != 1 {
@@ -37,6 +38,10 @@ func TestSecurityGateModulesExactlyOnce(t *testing.T) {
 		got, err := os.ReadFile(filepath.Join(f.repo, "scripts/security-gate.zsh"))
 		if err != nil || !bytes.Equal(got, pristine) {
 			t.Errorf("cleanup did not restore pristine script bytes: %v", err)
+		}
+		f.retain(t, "cleanup", "script.zsh", got)
+		if !t.Failed() {
+			f.retain(t, "cleanup", "complete.txt", []byte("PASS all module controls and exact script restoration\n"))
 		}
 	})
 	f.checkSyntax(t)
@@ -51,6 +56,7 @@ func TestSecurityGateModulesExactlyOnce(t *testing.T) {
 		t.Fatalf("mutant lost nested module coverage: %q", mutantCalls)
 	}
 	t.Logf("CAUSAL-FAIL: %s; calls=%q; gate exit=0", causal, mutantCalls)
+	f.retain(t, "duplicate-enumeration", "oracle.txt", []byte("CAUSAL-FAIL: "+causal+"; nested present exactly once; gate exit=0\n"))
 
 	f.write(t, "scripts/security-gate.zsh", pristine, 0o755)
 	restored, err := os.ReadFile(filepath.Join(f.repo, "scripts/security-gate.zsh"))
@@ -60,6 +66,7 @@ func TestSecurityGateModulesExactlyOnce(t *testing.T) {
 	if err := securityModuleOrder(f.run(t, "restored", "", "")); err != nil {
 		t.Fatal(err)
 	}
+	f.retain(t, "restored", "oracle.txt", []byte("PASS root then nested exactly once; pristine bytes restored\n"))
 
 	// A deduplication repair must not become a root-only scan or erase the
 	// existing fail-closed scanner/report/baseline behavior. All modes run the
@@ -116,9 +123,9 @@ func securityModuleOrder(calls []string) error {
 }
 
 type securityModuleFixture struct {
-	repo, bin, trace string
-	script           []byte
-	env              []string
+	repo, bin, trace, evidence string
+	script                     []byte
+	env                        []string
 }
 
 func newSecurityModuleFixture(t *testing.T) *securityModuleFixture {
@@ -133,7 +140,7 @@ func newSecurityModuleFixture(t *testing.T) *securityModuleFixture {
 		t.Fatal(err)
 	}
 	parent := t.TempDir()
-	f := &securityModuleFixture{repo: filepath.Join(parent, "repo with spaces"), bin: filepath.Join(parent, "bin"), trace: filepath.Join(parent, "calls"), script: script}
+	f := &securityModuleFixture{repo: filepath.Join(parent, "repo with spaces"), bin: filepath.Join(parent, "bin"), trace: filepath.Join(parent, "calls"), script: script, evidence: os.Getenv("FAC838_EVIDENCE_DIR")}
 	for _, dir := range []string{f.repo, f.bin, filepath.Join(parent, "zsh-config")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -187,6 +194,28 @@ func (f *securityModuleFixture) write(t *testing.T, name string, body []byte, mo
 	}
 }
 
+// Only the focused hosted invocation sets evidence. Ordinary package tests keep
+// their disposable fixtures in TempDir. Exclusive files reject evidence reuse.
+func (f *securityModuleFixture) retain(t *testing.T, phase, name string, body []byte) {
+	t.Helper()
+	if f.evidence == "" {
+		return
+	}
+	dir := filepath.Join(f.evidence, strings.ReplaceAll(phase, " ", "-"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.Write(body)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("retain %s/%s: write=%v close=%v", phase, name, writeErr, closeErr)
+	}
+}
+
 func (f *securityModuleFixture) checkSyntax(t *testing.T) {
 	t.Helper()
 	zsh, err := exec.LookPath("zsh")
@@ -197,7 +226,9 @@ func (f *securityModuleFixture) checkSyntax(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, zsh, "-n", "scripts/security-gate.zsh")
 	cmd.Dir, cmd.Env = f.repo, f.env
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	f.retain(t, "duplicate-enumeration", "syntax.log", out)
+	if err != nil {
 		t.Fatalf("mutation must remain valid shell: %v\n%s", err, out)
 	}
 }
@@ -221,6 +252,24 @@ func (f *securityModuleFixture) run(t *testing.T, phase, mode, refusal string) [
 	}
 	cmd.WaitDelay = time.Second
 	out, runErr := cmd.CombinedOutput()
+	// Preserve raw output and the exact executed script before assertions, so
+	// setup, timeout and unexpected failures remain inspectable after TempDir.
+	f.retain(t, phase, "gate.log", out)
+	trace, err := os.ReadFile(f.trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.retain(t, phase, "scanner-calls.txt", trace)
+	script, err := os.ReadFile(filepath.Join(f.repo, "scripts/security-gate.zsh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.retain(t, phase, "script.zsh", script)
+	exitCode := -1
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	f.retain(t, phase, "result.txt", []byte(fmt.Sprintf("exit=%d\nouter-timeout=%t\nexpected-refusal=%s\n", exitCode, ctx.Err() != nil, refusal)))
 	if ctx.Err() != nil {
 		t.Fatalf("%s exceeded outer execution bound: %v\n%s", phase, ctx.Err(), out)
 	}
@@ -229,10 +278,6 @@ func (f *securityModuleFixture) run(t *testing.T, phase, mode, refusal string) [
 	}
 	if refusal != "" && (runErr == nil || !strings.Contains(string(out), refusal)) {
 		t.Fatalf("%s must refuse with %q: %v\n%s", phase, refusal, runErr, out)
-	}
-	trace, err := os.ReadFile(f.trace)
-	if err != nil {
-		t.Fatal(err)
 	}
 	calls := strings.Fields(string(trace))
 	t.Logf("%s calls=%q gate-error=%v\n%s", phase, calls, runErr, out)
