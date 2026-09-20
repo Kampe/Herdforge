@@ -670,10 +670,14 @@ func staleBackoffSnapshot(name string, record cachedProviderRecord) *UsageSnapsh
 	}
 	p := record.Provider
 	p.Stale = true
-	return &UsageSnapshot{
+	snap := &UsageSnapshot{
 		GeneratedAt: time.Now().UTC(),
 		Providers:   map[string]ProviderUsage{name: p},
 	}
+	if record.Error != "" {
+		snap.Errors = map[string]string{name: record.Error}
+	}
+	return snap
 }
 
 func providerOnlySnapshot(snap *UsageSnapshot, provider string) *UsageSnapshot {
