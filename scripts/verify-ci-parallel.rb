@@ -22,6 +22,23 @@ RETENTION_TOOLS = 'Install landed retention tools'
 RETENTION_STEP = 'Verify landed suite retention before foundation'
 RETENTION_UPLOAD = 'Upload early landed suite retention logs'
 RETENTION_STEPS = [RETENTION_TOOLS, RETENTION_STEP, RETENTION_UPLOAD].freeze
+MODULE_STEP = 'Verify Gosec module invocation controls'
+MODULE_UPLOAD = 'Upload Gosec module invocation logs'
+MODULE_RUN = <<~'ZSH'
+  set -euo pipefail
+  report_parent=.verify-ci-parallel-logs
+  mkdir -p -- "$report_parent"
+  run_dir=$(mktemp -d "$report_parent/gosec-XXXXXX")
+  FAC838_EVIDENCE_DIR="$PWD/$run_dir" go test -v -count=1 -timeout=120s ./pkg/security \
+    -run '^TestSecurityGateModulesExactlyOnce$' >"$run_dir/go-test.log" 2>&1
+  # A skipped or absent named test cannot satisfy this evidence gate.
+  for phase in baseline duplicate-enumeration restored; do
+    test -s "$run_dir/$phase/oracle.txt"
+    test -s "$run_dir/$phase/scanner-calls.txt"
+    test -s "$run_dir/$phase/result.txt"
+  done
+  test -s "$run_dir/cleanup/complete.txt"
+ZSH
 
 class ControlFailure < StandardError; end
 
@@ -145,10 +162,21 @@ def check_foundation(jobs, setup, make_step)
          'structural evidence survives failures')
   parser = { 'name' => 'Install CI fixture parser',
              'run' => 'sudo apt-get install -y --no-install-recommends ruby' }
+  modules = foundation_steps.select { |step| step['name'] == MODULE_STEP }
+  insist(modules == [{ 'name' => MODULE_STEP, 'shell' => 'zsh {0}', 'timeout-minutes' => 5,
+                      'run' => MODULE_RUN }], 'module invocation controls and completion evidence are required')
+  module_upload = foundation_steps.select { |step| step['name'] == MODULE_UPLOAD }
+  insist(module_upload == [{ 'name' => MODULE_UPLOAD, 'if' => 'always()',
+                            'uses' => 'actions/upload-artifact@v4',
+                            'with' => { 'name' => 'verify-gosec-modules-logs',
+                                        'path' => '.verify-ci-parallel-logs/gosec-*',
+                                        'include-hidden-files' => true, 'if-no-files-found' => 'error',
+                                        'retention-days' => 7 } }],
+         'module invocation evidence survives failures')
   early_index = setup.index { |step| step['name'] == 'Install zsh' }
   insist(!early_index.nil?, 'original shell setup anchor exists')
   foundation_setup = setup.dup.insert(early_index + 1, tools[0], retention[0], retention_upload[0])
-  insist(foundation_steps == foundation_setup + [parser, verifier[0], upload[0], make_step],
+  insist(foundation_steps == foundation_setup + [parser, verifier[0], upload[0], modules[0], module_upload[0], make_step],
          'foundation runs only setup, orchestration controls and original make')
 end
 
@@ -251,6 +279,20 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
     structure_mutant(workflow, original, 'lost-retention-artifact',
                      'early suite retention evidence survives failures', summary) do |mutant|
       step = mutant['jobs']['foundation']['steps'].find { |entry| entry['name'] == RETENTION_UPLOAD }
+      step.delete('if')
+    end
+    structure_mutant(workflow, original, 'missing-module-controls',
+                     'module invocation controls and completion evidence are required', summary) do |mutant|
+      mutant['jobs']['foundation']['steps'].reject! { |step| step['name'] == MODULE_STEP }
+    end
+    structure_mutant(workflow, original, 'missing-module-completion-evidence',
+                     'module invocation controls and completion evidence are required', summary) do |mutant|
+      step = mutant['jobs']['foundation']['steps'].find { |entry| entry['name'] == MODULE_STEP }
+      step['run'] = step['run'].sub('test -s "$run_dir/cleanup/complete.txt"', ':')
+    end
+    structure_mutant(workflow, original, 'lost-module-artifact',
+                     'module invocation evidence survives failures', summary) do |mutant|
+      step = mutant['jobs']['foundation']['steps'].find { |entry| entry['name'] == MODULE_UPLOAD }
       step.delete('if')
     end
     old_driver = original['jobs']['gate']['steps'].find { |step| step['name'] == RECEIPT_STEP }

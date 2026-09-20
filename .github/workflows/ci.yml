@@ -129,6 +129,34 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Verify Gosec module invocation controls
+        shell: zsh {0}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          report_parent=.verify-ci-parallel-logs
+          mkdir -p -- "$report_parent"
+          run_dir=$(mktemp -d "$report_parent/gosec-XXXXXX")
+          FAC838_EVIDENCE_DIR="$PWD/$run_dir" go test -v -count=1 -timeout=120s ./pkg/security \
+            -run '^TestSecurityGateModulesExactlyOnce$' >"$run_dir/go-test.log" 2>&1
+          # A skipped or absent named test cannot satisfy this evidence gate.
+          for phase in baseline duplicate-enumeration restored; do
+            test -s "$run_dir/$phase/oracle.txt"
+            test -s "$run_dir/$phase/scanner-calls.txt"
+            test -s "$run_dir/$phase/result.txt"
+          done
+          test -s "$run_dir/cleanup/complete.txt"
+
+      - name: Upload Gosec module invocation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-gosec-modules-logs
+          path: .verify-ci-parallel-logs/gosec-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       # make lint runs go vet, the hermeticity scan (FAC-215), the package
       # inventory drift check (FAC-301), and the security gates.
       - name: Build, lint, unit tests, preflight

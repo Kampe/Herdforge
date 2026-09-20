@@ -182,12 +182,17 @@ run_gosec() {
 	# run_with_timeout SIGKILL of this function (whose own traps cannot
 	# run), so no module report is ever leaked outside owned space.
 	mkdir -p "$scan_root/.gosec-reports"
-	for gomod in go.mod **/go.mod; do
+	# **/ includes the current directory. Keep root first, but never scan its
+	# go.mod twice; quoted unique-array entries also preserve module path spaces.
+	typeset -aU gosec_modules
+	gosec_modules=(go.mod **/go.mod)
+	for gomod in "${gosec_modules[@]}"; do
 		[[ -f "$gomod" ]] || continue
 		mdir="${gomod:h}"
 		subrep=$(mktemp "$scan_root/.gosec-reports/report.XXXXXX")
 		subreports+=( "$subrep" )
 		cd "$scan_root/$mdir"
+		print -u2 -- "==> gosec module $mdir"
 		# A module failure is recorded, not immediately fatal: remaining
 		# modules are still scanned. The recorded failure fails the gate
 		# below, so an operational gosec failure can never be evaluated
