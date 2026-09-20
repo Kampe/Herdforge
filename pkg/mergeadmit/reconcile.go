@@ -364,31 +364,56 @@ func ProveEquivalentLandedContext(ctx context.Context, repoDir string, req Proof
 			short(candidate), short(base))
 	}
 
-	// FAC-736: GitHub merge-commit landing (and empty worktree anchors) leave
-	// administrative commits with no patch content on the landed range. Patch
-	// identity is associated with the content-bearing counterpart, never the
-	// empty merge tip.
-	landedContent, err := nonEmptyCommits(ctx, repoDir, landedCommits)
-	if err != nil {
-		return nil, err
-	}
-	if len(landedContent) == 0 {
-		return nil, fmt.Errorf("landed %s adds no content over base %s", short(landed), short(base))
-	}
-
 	want, err := patchIDs(ctx, repoDir, candidateContent)
 	if err != nil {
 		return nil, err
 	}
-	got, err := patchIDs(ctx, repoDir, landedContent)
-	if err == nil {
-		mergeSHA, matchErr := matchOrderedPatchSubsequence(want, got, landedContent)
-		if matchErr == nil {
-			return equivalentLandedProof(ctx, repoDir, base, candidate, landed, mergeSHA,
+	// FAC-836: inspect only the prefix needed by the ordered predicate. Eager
+	// emptiness/patch scans spent the entire allowance on unrelated later main
+	// commits before matching an early landing. Reuse each diff for its patch
+	// ID, and stop only after the WHOLE reviewed sequence matches. Selection
+	// still receives the full bounded range for its ancestry and replay checks.
+	landedContent := make([]string, 0, len(landedCommits))
+	matched := 0
+	var orderedErr error
+	for _, sha := range landedCommits {
+		diff, diffErr := gitOutBytes(ctx, repoDir, "diff-tree", "-p", "--no-color", sha)
+		if diffErr != nil {
+			return nil, fmt.Errorf("inspect patch for %s: %w", short(sha), diffErr)
+		}
+		// FAC-736: administrative anchors are not content-bearing matches.
+		if len(bytes.TrimSpace(diff)) == 0 {
+			continue
+		}
+		landedContent = append(landedContent, sha)
+		if orderedErr != nil {
+			continue // Finish the complete content list for the fallback predicates.
+		}
+		pid, patchErr := stablePatchID(ctx, repoDir, diff)
+		if patchErr != nil {
+			if proofRunAborted(ctx, patchErr) {
+				return nil, patchErr
+			}
+			orderedErr = fmt.Errorf("patch id for %s: %w", short(sha), patchErr)
+			continue
+		}
+		if pid != want[matched] {
+			continue
+		}
+		matched++
+		if matched == len(want) {
+			return equivalentLandedProof(ctx, repoDir, base, candidate, landed, sha,
 				"ordered-patch-subsequence-on-landed", landedCommits)
 		}
-		err = matchErr
 	}
+	if len(landedContent) == 0 {
+		return nil, fmt.Errorf("landed %s adds no content over base %s", short(landed), short(base))
+	}
+	if orderedErr == nil {
+		orderedErr = fmt.Errorf("candidate commit %d (patch %s) has no patch-equivalent counterpart on the landed history",
+			matched+1, short(want[matched]))
+	}
+	err = orderedErr
 
 	// Keep the established single-content-commit predicate unchanged. The
 	// combined fallback exists only for a reviewed stack whose intermediate

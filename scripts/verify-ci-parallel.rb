@@ -18,6 +18,10 @@ RECEIPT_STEP = 'Verify landed receipt guard controls'
 CHECK_STEP = 'Verify CI dependency and collector controls'
 UPLOAD_STEP = 'Upload CI dependency and collector control logs'
 COLLECTOR_STEP = 'Require foundation and both control lanes'
+RETENTION_TOOLS = 'Install landed retention tools'
+RETENTION_STEP = 'Verify landed suite retention before foundation'
+RETENTION_UPLOAD = 'Upload early landed suite retention logs'
+RETENTION_STEPS = [RETENTION_TOOLS, RETENTION_STEP, RETENTION_UPLOAD].freeze
 
 class ControlFailure < StandardError; end
 
@@ -53,7 +57,11 @@ end
 
 def check_setup(jobs, old_steps, make_index, setup, all_steps)
   DEPENDENCIES.each do |job|
-    insist(jobs[job].fetch('steps').take(setup.length) == setup, "pinned setup preserved: #{job}")
+    steps = jobs[job].fetch('steps')
+    # Only foundation inserts this explicitly checked fast-failure group.
+    # The original setup objects and order remain mandatory in every lane.
+    steps = steps.reject { |step| RETENTION_STEPS.include?(step['name']) } if job == 'foundation'
+    insist(steps.take(setup.length) == setup, "pinned setup preserved: #{job}")
   end
   make_steps = all_steps.select { |step| step['run'] == 'make lint test-unit test-race preflight' }
   insist(make_steps == [old_steps[make_index]], 'foundation make command exactly once')
@@ -108,6 +116,23 @@ end
 
 def check_foundation(jobs, setup, make_step)
   foundation_steps = jobs['foundation']['steps']
+  tools = foundation_steps.select { |step| step['name'] == RETENTION_TOOLS }
+  insist(tools == [{ 'name' => RETENTION_TOOLS,
+                    'run' => 'sudo apt-get install -y --no-install-recommends jq coreutils' }],
+         'early suite retention tools are required')
+  retention = foundation_steps.select { |step| step['name'] == RETENTION_STEP }
+  invocation = "timeout -k 2s 20s zsh scripts/verify-landed-suite-retention.zsh \\\n    scripts/lib/landed-control-suites.zsh \"$run_dir/suite-retention\""
+  insist(retention.length == 1 && retention[0].keys.sort == %w[name run shell timeout-minutes] &&
+         retention[0]['shell'] == 'zsh {0}' && retention[0]['timeout-minutes'] == 1 &&
+         retention[0]['run'].include?(invocation), 'early suite retention fixture is required')
+  retention_upload = foundation_steps.select { |step| step['name'] == RETENTION_UPLOAD }
+  insist(retention_upload == [{ 'name' => RETENTION_UPLOAD, 'if' => 'always()',
+                               'uses' => 'actions/upload-artifact@v4',
+                               'with' => { 'name' => 'verify-landed-suite-retention-logs',
+                                           'path' => '.verify-landed-receipt-logs/foundation-*',
+                                           'include-hidden-files' => true, 'if-no-files-found' => 'error',
+                                           'retention-days' => 7 } }],
+         'early suite retention evidence survives failures')
   verifier = foundation_steps.select { |step| step['name'] == CHECK_STEP }
   insist(verifier.length == 1 && verifier[0]['run'] == 'ruby scripts/verify-ci-parallel.rb' &&
          verifier[0]['timeout-minutes'] == 3 && !verifier[0].key?('if') &&
@@ -120,7 +145,10 @@ def check_foundation(jobs, setup, make_step)
          'structural evidence survives failures')
   parser = { 'name' => 'Install CI fixture parser',
              'run' => 'sudo apt-get install -y --no-install-recommends ruby' }
-  insist(foundation_steps == setup + [parser, verifier[0], upload[0], make_step],
+  early_index = setup.index { |step| step['name'] == 'Install zsh' }
+  insist(!early_index.nil?, 'original shell setup anchor exists')
+  foundation_setup = setup.dup.insert(early_index + 1, tools[0], retention[0], retention_upload[0])
+  insist(foundation_steps == foundation_setup + [parser, verifier[0], upload[0], make_step],
          'foundation runs only setup, orchestration controls and original make')
 end
 
@@ -211,6 +239,19 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
     summary.puts('PASS original step inventory, setup, dependency graph, Docker and coverage')
     structure_mutant(workflow, original, 'missing-dependency', 'collector dependency edges', summary) do |mutant|
       mutant['jobs']['gate']['needs'].delete('controls_receipt')
+    end
+    structure_mutant(workflow, original, 'missing-retention-tools',
+                     'early suite retention tools are required', summary) do |mutant|
+      mutant['jobs']['foundation']['steps'].reject! { |step| step['name'] == RETENTION_TOOLS }
+    end
+    structure_mutant(workflow, original, 'missing-retention-preflight',
+                     'early suite retention fixture is required', summary) do |mutant|
+      mutant['jobs']['foundation']['steps'].reject! { |step| step['name'] == RETENTION_STEP }
+    end
+    structure_mutant(workflow, original, 'lost-retention-artifact',
+                     'early suite retention evidence survives failures', summary) do |mutant|
+      step = mutant['jobs']['foundation']['steps'].find { |entry| entry['name'] == RETENTION_UPLOAD }
+      step.delete('if')
     end
     old_driver = original['jobs']['gate']['steps'].find { |step| step['name'] == RECEIPT_STEP }
     structure_mutant(workflow, original, 'missing-driver',

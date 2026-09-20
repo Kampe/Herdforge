@@ -25,6 +25,37 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
 
+      - name: Install landed retention tools
+        run: sudo apt-get install -y --no-install-recommends jq coreutils
+
+      # Fail cheaply before Go setup, gosec installation or the unit suite.
+      # The same fixture remains required by both full landed-control drivers.
+      - name: Verify landed suite retention before foundation
+        shell: zsh {0}
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          report_parent=.verify-landed-receipt-logs
+          mkdir -p -- "$report_parent"
+          run_dir=$(mktemp -d "$report_parent/foundation-XXXXXX")
+          {
+            for tool in git jq timeout; do
+              command -v "$tool" >/dev/null || { print -u2 "error: $tool is required"; exit 1; }
+            done
+            timeout -k 2s 20s zsh scripts/verify-landed-suite-retention.zsh \
+              scripts/lib/landed-control-suites.zsh "$run_dir/suite-retention"
+          } >"$run_dir/suite-retention.log" 2>&1
+
+      - name: Upload early landed suite retention logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-landed-suite-retention-logs
+          path: .verify-landed-receipt-logs/foundation-*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
