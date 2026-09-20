@@ -455,6 +455,10 @@ func retireLandedOneWithSources(root string, l reapRow, run reapGitRunner, inspe
 	if reapInvokingHome(current.Path) {
 		return fmt.Errorf("retire %s: invoking checkout is protected", l.Path)
 	}
+	canonical, err := taskSourceRoot(root)
+	if err != nil || reapPulseSamePath(current.Path, canonical) {
+		return fmt.Errorf("retire %s: canonical checkout identity is protected or unknown", l.Path)
+	}
 	if l.taskSource != nil {
 		if err := validateTaskSourceAct(sources, current, *l.taskSource); err != nil {
 			return err
@@ -960,6 +964,8 @@ func classifyReapEntriesWithSources(root, base string, byPR bool, entries []work
 		switch {
 		case e.IsMain:
 			r.Class, r.Reason = "main", "the repository's own checkout"
+		case sources != nil && sources.root != "" && reapPulseSamePath(e.Path, sources.root):
+			r.Class, r.Reason = "main", "canonical repository checkout"
 		case reapInvokingHome(e.Path):
 			r.Class, r.Reason = "resident-home", "invoking checkout is protected"
 		case e.Detached:

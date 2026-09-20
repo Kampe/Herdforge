@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/gitroot"
@@ -105,7 +107,9 @@ func (v *taskSourceView) names(e worktreeEntry) bool {
 }
 
 func taskSourceRoot(root string) (string, error) {
-	common, err := gitroot.CommonDir(context.Background(), root)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	common, err := gitroot.CommonDir(ctx, root)
 	if err != nil {
 		return "", err
 	}
@@ -245,7 +249,7 @@ func taskSourceHomes(root string) ([]string, error) {
 		return nil, fmt.Errorf("task source: live homes unknown: %w", err)
 	}
 	for _, agent := range agents {
-		if agent.Cwd == "" {
+		if !filepath.IsAbs(agent.Cwd) || (agent.ForegroundCwd != "" && !filepath.IsAbs(agent.ForegroundCwd)) {
 			return nil, fmt.Errorf("task source: live home has no cwd")
 		}
 		homes = append(homes, agent.Cwd)
@@ -396,7 +400,7 @@ func taskSourceLaunchDigest(root string, e worktreeEntry) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	raw, err := taskSourceRead(launch.ReceiptPathFor(root), 8<<20)
+	raw, err := taskSourceRead(launch.PathFor(root), 8<<20)
 	if err != nil {
 		return "", err
 	}
@@ -589,6 +593,16 @@ func publishTaskSource(root, admin string, registration os.FileInfo, b taskSourc
 	if err != nil || !os.SameFile(registration, current) {
 		return nil, fmt.Errorf("task source: registration generation changed before marker write")
 	}
+	adminFD, err := unix.Open(admin, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	adminDir := os.NewFile(uintptr(adminFD), "task-source-registration")
+	defer adminDir.Close()
+	openedAdmin, err := adminDir.Stat()
+	if err != nil || !os.SameFile(registration, openedAdmin) {
+		return nil, fmt.Errorf("task source: registration changed while opening marker directory")
+	}
 	markerPath := filepath.Join(admin, taskSourceMarker)
 	if raw, err := taskSourceRead(markerPath, 16384); err == nil {
 		var prior taskSourceBinding
@@ -612,7 +626,7 @@ func publishTaskSource(root, admin string, registration os.FileInfo, b taskSourc
 			return nil, err
 		}
 		raw, _ := json.Marshal(b)
-		if err := writeTaskSourceExclusive(markerPath, raw); err != nil {
+		if err := writeTaskSourceExclusive(adminDir, raw); err != nil {
 			return nil, err
 		}
 	}
@@ -683,11 +697,14 @@ func taskSourceUnaliased(path string) error {
 	}
 }
 
-func writeTaskSourceExclusive(path string, raw []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+func writeTaskSourceExclusive(adminDir *os.File, raw []byte) error {
+	// Address the already-identified private directory, not a path that a
+	// concurrent remove/recreate could redirect to a new registration.
+	fd, err := unix.Openat(int(adminDir.Fd()), taskSourceMarker, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return err
 	}
+	f := os.NewFile(uintptr(fd), taskSourceMarker)
 	_, writeErr := f.Write(raw)
 	if writeErr == nil {
 		writeErr = f.Sync()
@@ -696,7 +713,7 @@ func writeTaskSourceExclusive(path string, raw []byte) error {
 	if err := errors.Join(writeErr, closeErr); err != nil {
 		return err
 	}
-	return syncTaskSourceDir(filepath.Dir(path))
+	return adminDir.Sync()
 }
 
 func syncTaskSourceDir(path string) error {
