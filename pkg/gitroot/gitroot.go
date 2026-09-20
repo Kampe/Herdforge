@@ -80,13 +80,19 @@ func CommonDir(ctx context.Context, startDir string) (string, error) {
 	if strings.TrimSpace(startDir) == "" {
 		startDir = "."
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", startDir,
-		"rev-parse", "--path-format=absolute", "--git-common-dir")
-	out, err := cmd.CombinedOutput()
+	return commonDirWithGit(startDir, func(args ...string) (string, error) {
+		cmd := exec.CommandContext(ctx, "git", append([]string{"-C", startDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	})
+}
+
+func commonDirWithGit(startDir string, git func(...string) (string, error)) (string, error) {
+	out, err := git("rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
-		return "", fmt.Errorf("git common dir from %q: %v (%s)", startDir, err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git common dir from %q: %w (%s)", startDir, err, strings.TrimSpace(out))
 	}
-	common := strings.TrimSpace(string(out))
+	common := strings.TrimSpace(out)
 	if common == "" {
 		return "", fmt.Errorf("git common dir from %q: empty result", startDir)
 	}
@@ -157,6 +163,18 @@ const EnvLaneRoot = "HERD_ROOT"
 // laneOverride reports a HERD_ROOT that disagrees with the resolved project
 // root, so the divergence can be surfaced rather than silently tolerated.
 func ProjectRoot(ctx context.Context, startDir string) (root string, laneOverride string, err error) {
+	return projectRoot(func() (string, error) { return CommonDir(ctx, startDir) })
+}
+
+// ProjectRootWithGit preserves ProjectRoot's precedence and path semantics
+// while charging discovery to a caller-owned Git runner (for example, a
+// landed proof's existing deadline, command allowance and output limit).
+// The runner must execute in startDir; no additional Git command runs here.
+func ProjectRootWithGit(startDir string, git func(...string) (string, error)) (root string, laneOverride string, err error) {
+	return projectRoot(func() (string, error) { return commonDirWithGit(startDir, git) })
+}
+
+func projectRoot(commonDir func() (string, error)) (root string, laneOverride string, err error) {
 	if explicit := strings.TrimSpace(os.Getenv(EnvProjectRoot)); explicit != "" {
 		abs, absErr := filepath.Abs(explicit)
 		if absErr != nil {
@@ -164,7 +182,7 @@ func ProjectRoot(ctx context.Context, startDir string) (root string, laneOverrid
 		}
 		return filepath.Clean(abs), divergentLane(abs), nil
 	}
-	common, err := CommonDir(ctx, startDir)
+	common, err := commonDir()
 	if err != nil {
 		return "", "", err
 	}

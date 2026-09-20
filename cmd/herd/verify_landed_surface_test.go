@@ -162,11 +162,11 @@ func TestResolveVerifyLandedSurfaceSelectsWithoutProvingTheRepository(t *testing
 
 // pinnedCandidateFor never reaches for a branch head.
 func TestPinnedCandidateForPrefersExplicitAndNeverUsesABranchHead(t *testing.T) {
-	if got := pinnedCandidateFor(verifyLandedBinding{Candidate: "  abc123  "}); got != "abc123" {
-		t.Fatalf("explicit candidate = %q", got)
+	if got, err := pinnedCandidateFor(context.Background(), verifyLandedBinding{Candidate: "  abc123  "}); err != nil || got != "abc123" {
+		t.Fatalf("explicit candidate = %q: %v", got, err)
 	}
-	if got := pinnedCandidateFor(verifyLandedBinding{}); got != "" {
-		t.Fatalf("an unpinned binding produced %q; only --candidate or an admitted PASS may pin", got)
+	if got, err := pinnedCandidateFor(context.Background(), verifyLandedBinding{}); err != nil || got != "" {
+		t.Fatalf("an unpinned binding produced %q (%v); only --candidate or an admitted PASS may pin", got, err)
 	}
 }
 

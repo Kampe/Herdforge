@@ -1,6 +1,7 @@
 package mergeadmit
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -30,6 +31,19 @@ var writeReceipt = hsync.WriteReceipt
 // the ledger consume re-reads the existing receipt and finishes the job rather
 // than minting a second one.
 func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, error) {
+	ctx, cancel := g.gateProofContext()
+	defer cancel()
+	return g.CompleteContext(ctx, d, req)
+}
+
+// CompleteContext shares the caller's allowance with preceding canonical
+// authority resolution, just as ReconcileLandedContext does for harvest.
+func (g *Gate) CompleteContext(ctx context.Context, d *Decision, req Request) (*hsync.CompletionReceipt, error) {
+	ctx, cancel := ensureProofBudget(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if g == nil {
 		return nil, fmt.Errorf("herd-merge-completion: no gate configured")
 	}
@@ -59,9 +73,7 @@ func (g *Gate) Complete(d *Decision, req Request) (*hsync.CompletionReceipt, err
 	// installed a second (review 212), and the tip read ran outside any at all
 	// (review 6c93cc2b) -- an unbounded fetch could hang ahead of every command
 	// this budget governs.
-	ctx, cancel := g.gateProofContext()
-	defer cancel()
-
+	//
 	// Re-read the integration tip AFTER the merge. This is the same live reading
 	// Admit used to assert the base had not moved; now its whole job is to
 	// report where the merge actually put things -- and which commit this receipt
