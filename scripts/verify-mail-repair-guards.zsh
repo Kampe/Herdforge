@@ -275,19 +275,24 @@ classify_run() {
 
 # id | anchor | replacement | killer test | required assertion text
 #
-# One mutant per guard the card names, and no more: stale/conflicting identity,
-# malformed unrelated rows, privileged records, concurrent mailbox change, and
-# the durable prepare / recovery / completion-error boundaries.
+# Controls cover stale/conflicting identity, malformed unrelated rows,
+# privileged records, durable recovery, and explicit batch selection bounds.
 sep=$'\x1f'
 mutations=(
-"fingerprint-cas-removed${sep}		if fp := strings.TrimSpace(req.Fingerprint); fp != \"\" && !strings.EqualFold(fp, originalHash) {${sep}		if fp := strings.TrimSpace(req.Fingerprint); false && fp != \"\" { // MUTANT: compare-and-swap removed${sep}TestRepairRefusesStaleFingerprint${sep}stale fingerprint must refuse"
-"quarantine-identity-removed${sep}		if err := m.checkQuarantineIdentity(req.ID, originalHash); err != nil {${sep}		if err := error(nil); err != nil { // MUTANT: concurrent-change check removed${sep}TestRepairRefusesConflictingQuarantinedOriginals${sep}conflicting quarantined originals must refuse"
-"unrelated-corruption-unrecorded${sep}			otherBad = append(otherBad, fmt.Sprintf(\"line %d: %s\", i+1, why))${sep}			_ = why // MUTANT: unrelated corruption never recorded${sep}TestRepairRefusesWhenAnotherRowIsMalformed${sep}an unrelated malformed row did not refuse the repair"
-"duplicate-identity-ignored${sep}				if containsString(scan.IDs, req.ID) {${sep}				if false && containsString(scan.IDs, req.ID) { // MUTANT: conflicting identity ignored${sep}TestRepairRefusesDuplicateKeyRowEvenWhenARepairableRowExists${sep}a duplicate-key row carrying the target id did not block the repair"
+"fingerprint-cas-removed${sep}			if fp := strings.TrimSpace(req.Fingerprint); fp != \"\" && !strings.EqualFold(fp, originalHash) {${sep}			if fp := strings.TrimSpace(req.Fingerprint); false && fp != \"\" { // MUTANT: compare-and-swap removed${sep}TestRepairRefusesStaleFingerprint${sep}stale fingerprint must refuse"
+"quarantine-identity-removed${sep}			if err := m.checkQuarantineIdentity(req.ID, originalHash); err != nil {${sep}			if err := error(nil); err != nil { // MUTANT: concurrent-change check removed${sep}TestRepairRefusesConflictingQuarantinedOriginals${sep}conflicting quarantined originals must refuse"
+"unrelated-corruption-unrecorded${sep}		otherBad = append(otherBad, fmt.Sprintf(\"line %d: %s\", i+1, why))${sep}		_ = why // MUTANT: unrelated corruption never recorded${sep}TestRepairRefusesWhenAnotherRowIsMalformed${sep}an unrelated malformed row did not refuse the repair"
+"duplicate-identity-ignored${sep}				if selected[id] {${sep}				if false && selected[id] { // MUTANT: conflicting identity ignored${sep}TestRepairRefusesDuplicateKeyRowEvenWhenARepairableRowExists${sep}a duplicate-key row carrying the target id did not block the repair"
 "privileged-refusal-removed${sep}			return nil, \"\", time.Time{}, fmt.Errorf(\"%w: row carries %q\", ErrRepairPrivileged, key)${sep}			_ = key // MUTANT: privileged refusal removed${sep}TestRepairRefusesPrivilegedSignedControlMessage${sep}a signed control message must never be silently rewritten"
-"prepare-phase-mislabelled${sep}		plan.Phase = RepairPhasePrepare${sep}		plan.Phase = RepairPhaseResult // MUTANT: pre-mutation record not labelled prepare${sep}TestRepairAuditRecordsPrepareBeforeResult${sep}first record is not a prepare record"
-"readback-verification-removed${sep}		if err := m.verifyRepairedMailbox(expected, repaired); err != nil {${sep}		if err := error(nil); err != nil { // MUTANT: durable readback removed${sep}TestRepairFailsClosedWhenReadbackMismatches${sep}a durable row that differs from the repaired row must fail closed"
-"completion-error-swallowed${sep}			return fmt.Errorf(\"%w: %v\", ErrRepairCompletionUnrecorded, err)${sep}			return nil // MUTANT: completion error swallowed, repair reports success${sep}TestRepairFailsWhenCompletionRecordCannotBeWritten${sep}an unrecorded completion must fail clearly"
+"prepare-phase-mislabelled${sep}			plan.Phase = RepairPhasePrepare${sep}			plan.Phase = RepairPhaseResult // MUTANT: pre-mutation record not labelled prepare${sep}TestRepairAuditRecordsPrepareBeforeResult${sep}first record is not a prepare record"
+"readback-verification-removed${sep}			if err := m.verifyRepairedMailbox(expected, env); err != nil {${sep}			if err := func() error { _ = env; return nil }(); err != nil { // MUTANT: durable readback removed${sep}TestRepairFailsClosedWhenReadbackMismatches${sep}a durable row that differs from the repaired row must fail closed"
+"completion-error-swallowed${sep}				return fmt.Errorf(\"%w: %v\", ErrRepairCompletionUnrecorded, err)${sep}				return nil // MUTANT: completion error swallowed, repair reports success${sep}TestRepairFailsWhenCompletionRecordCannotBeWritten${sep}an unrecorded completion must fail clearly"
+"batch-bound-removed${sep}len(requests) == 0 || len(requests) > MaxRepairBatch${sep}len(requests) == 0${sep}TestRepairBatchRefusesAnOversizedSelection${sep}oversized selection reached mailbox selection"
+"batch-duplicate-selection-accepted${sep}if selected[req.ID] {${sep}if false && selected[req.ID] {${sep}TestRepairBatchRefusesUnsafeSelectionWithoutMutation/duplicate-selection${sep}unsafe batch was not refused at its guard"
+"batch-fingerprint-optional${sep}if req.Act && strings.TrimSpace(req.Fingerprint) == \"\" {${sep}if false && req.Act && strings.TrimSpace(req.Fingerprint) == \"\" {${sep}TestRepairBatchRefusesUnsafeSelectionWithoutMutation/missing-fingerprint${sep}unsafe batch was not refused at its guard"
+"batch-mixed-mode-accepted${sep}if req.Act != requests[0].Act || req.Actor != requests[0].Actor || req.Reason != requests[0].Reason {${sep}if false {${sep}TestRepairBatchRefusesUnsafeSelectionWithoutMutation/mixed-act${sep}unsafe batch was not refused at its guard"
+"batch-range-check-removed${sep}nextSeq, err = nextSequenceValue(nextSeq)${sep}nextSeq, err = nextSeq + 1, nil${sep}TestRepairBatchRefusesUnsafeSelectionWithoutMutation/range-overflow${sep}unsafe batch was not refused at its guard"
+"batch-neighbour-accepted${sep}		if len(otherBad) > 0 {${sep}		if false && len(otherBad) > 0 {${sep}TestRepairBatchRefusesUnsafeSelectionWithoutMutation/third-malformed${sep}unsafe batch was not refused at its guard"
 )
 
 note "pin $pin"
@@ -323,6 +328,17 @@ required_tests=(
 	TestRepairAppliesWhenTheWriterIsFaithful
 	TestWellFormedUnrelatedRowsAndBodyMentionsStillRepair
 	TestAppendLineWriteSurvivesAFailedSync
+	TestRepairBatchAppliesTogetherAndPreservesFraming
+	TestRepairBatchRefusesAnOversizedSelection
+	TestRepairBatchRefusesUnsafeSelectionWithoutMutation
+	TestRepairBatchSecondPrepareFailureLeavesMailboxUntouched
+	TestRepairBatchReadbackRefusesAlteredSecondRow
+	TestRepairBatchCompletionFailurePreservesBothOriginals
+	TestRepairBatchRefusesUnsafeSelectionWithoutMutation/duplicate-selection
+	TestRepairBatchRefusesUnsafeSelectionWithoutMutation/missing-fingerprint
+	TestRepairBatchRefusesUnsafeSelectionWithoutMutation/mixed-act
+	TestRepairBatchRefusesUnsafeSelectionWithoutMutation/range-overflow
+	TestRepairBatchRefusesUnsafeSelectionWithoutMutation/third-malformed
 )
 
 # assert_required_identities proves, by name, that every required test reported

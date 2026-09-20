@@ -46,6 +46,84 @@ func runRepairCLI(args ...string) (code int, stdout, stderr string) {
 	return code, out.String(), errOut.String()
 }
 
+func TestMailRepairCLIBatchReportAndAct(t *testing.T) {
+	path := cliRepairMailbox(t)
+	secondID := "cli-second"
+	second := strings.Replace(cliLegacyRow, cliRepairID, secondID, 1)
+	before := cliLegacyRow + "\n" + second + "\n"
+	if err := os.WriteFile(path, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--mail", path, "--id", secondID, "--id", cliRepairID}
+	code, stdout, stderr := runRepairCLI(args...)
+	if code != 0 {
+		t.Fatalf("batch report failed: code=%d stderr=%s", code, stderr)
+	}
+	var plans []mail.RepairPlan
+	if err := json.Unmarshal([]byte(stdout), &plans); err != nil || len(plans) != 2 {
+		t.Fatalf("batch report lost its array contract: %s err=%v", stdout, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != before {
+		t.Fatalf("batch report mutated mailbox: %v", err)
+	}
+	args = append(args, "--act", "--actor", "op")
+	for i, plan := range plans {
+		wantID := secondID
+		if i == 1 {
+			wantID = cliRepairID
+		}
+		if plan.ID != wantID || plan.Applied {
+			t.Fatalf("batch report changed id order or claimed application: %+v", plan)
+		}
+		args = append(args, "--fingerprint", plan.OriginalSHA256)
+	}
+	code, stdout, stderr = runRepairCLI(args...)
+	if code != 0 {
+		t.Fatalf("batch act failed: code=%d stderr=%s", code, stderr)
+	}
+	if err := json.Unmarshal([]byte(stdout), &plans); err != nil || len(plans) != 2 || !plans[0].Applied || !plans[1].Applied {
+		t.Fatalf("batch act did not report both applied: %s err=%v", stdout, err)
+	}
+}
+
+func TestMailRepairCLIBatchRejectsAmbiguousSelection(t *testing.T) {
+	secondSum := sha256.Sum256([]byte(strings.Replace(cliLegacyRow, cliRepairID, "second", 1)))
+	for _, tc := range []struct {
+		name     string
+		flags    []string
+		wantCode int
+	}{
+		{"duplicate-id", []string{"--id", cliRepairID, "--id", cliRepairID}, 2},
+		{"missing-second-fingerprint", []string{"--id", cliRepairID, "--id", "second", "--fingerprint", cliLegacySHA()}, 2},
+		{"extra-fingerprint", []string{"--id", cliRepairID, "--fingerprint", cliLegacySHA(), "--fingerprint", "extra"}, 2},
+		{"blank-second-fingerprint", []string{"--id", cliRepairID, "--id", "second", "--fingerprint", cliLegacySHA(), "--fingerprint", " "}, 2},
+		{"reversed-fingerprints", []string{"--id", "second", "--id", cliRepairID, "--fingerprint", cliLegacySHA(), "--fingerprint", hex.EncodeToString(secondSum[:])}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := cliRepairMailbox(t)
+			before := cliLegacyRow + "\n" + strings.Replace(cliLegacyRow, cliRepairID, "second", 1) + "\n"
+			if err := os.WriteFile(path, []byte(before), 0600); err != nil {
+				t.Fatal(err)
+			}
+			args := append([]string{"--mail", path, "--act", "--actor", "op"}, tc.flags...)
+			code, stdout, stderr := runRepairCLI(args...)
+			if code != tc.wantCode || stdout != "" || stderr == "" {
+				t.Fatalf("ambiguous batch selection was accepted: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != before {
+				t.Fatalf("rejected CLI batch changed mailbox: %v", err)
+			}
+			for _, suffix := range []string{".seq", ".repair.jsonl"} {
+				if _, err := os.Stat(path + suffix); !os.IsNotExist(err) {
+					t.Fatalf("rejected CLI batch created %s: %v", suffix, err)
+				}
+			}
+		})
+	}
+}
+
 func TestMailRepairCLIUsageErrorsExitTwo(t *testing.T) {
 	path := cliRepairMailbox(t)
 	for _, tc := range []struct {
