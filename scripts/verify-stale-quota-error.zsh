@@ -4,7 +4,7 @@
 set -euo pipefail
 
 repo_root=$(git -C "${0:A:h}/.." rev-parse --show-toplevel)
-for tool in git go timeout jq mktemp rmdir; do
+for tool in git go timeout jq mktemp rmdir rm; do
 	(( $+commands[$tool] )) || { print -u2 "error: $tool is required"; exit 1; }
 done
 pin=$(git -C "$repo_root" rev-parse HEAD)
@@ -29,24 +29,46 @@ report_parent=${VERIFY_STALE_QUOTA_REPORT_DIR:-$repo_root/.verify-stale-quota-lo
 mkdir -p -- "$report_parent"
 run_dir=$(mktemp -d "$report_parent/run-XXXXXX")
 work_parent=$(mktemp -d)
+work_parent=$(cd "$work_parent" && pwd -P)
 work=$work_parent/checkout
 owned=0
 cleanup() {
 	if (( owned )); then
-		timeout -k 10s 60s git -C "$repo_root" worktree remove --force "$work" >/dev/null 2>&1 || return 1
+		local listing row registered=0
+		[[ ! -L "$work_parent" && "$work" == "$work_parent/checkout" ]] || return 1
+		listing=$(timeout -k 10s 10s git -C "$repo_root" worktree list --porcelain -z) || return 1
+		for row in "${(@0)listing}"; do
+			[[ "$row" != "worktree $work" ]] || registered=1
+		done
+		if (( registered )); then
+			timeout -k 10s 60s git -C "$repo_root" worktree remove --force "$work" >/dev/null 2>&1 || return 1
+		else
+			# Git may fail before registration, leaving partial checkout files.
+			# Only this invocation's reserved child may be removed directly.
+			timeout -k 10s 10s rm -rf -- "$work" || return 1
+		fi
 		owned=0
 	fi
 	if [[ -d "$work_parent" ]]; then
 		rmdir -- "$work_parent" || return 1
 	fi
 }
-trap 'cleanup || print -u2 "error: owned checkout cleanup failed"' EXIT
-trap 'trap - EXIT INT TERM HUP; cleanup || true; exit 143' INT TERM HUP
-timeout -k 10s 120s git -C "$repo_root" worktree add --detach "$work" "$pin" >/dev/null 2>&1
+on_exit() {
+	local rc=$?
+	trap - EXIT
+	cleanup || { print -u2 "error: owned checkout cleanup failed"; exit 1; }
+	exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 143' INT TERM HUP
+# Arm cleanup before Git can create or register the disposable checkout.
 owned=1
+timeout -k 10s 120s git -C "$repo_root" worktree add --detach "$work" "$pin" >/dev/null 2>&1
+# Worktree creation is complete; verification starts below.
 [[ "$(git -C "$work" hash-object -- "$src")" == "$pristine" ]] || exit 1
 print -r -- "pin: $pin" > "$run_dir/summary.txt"
 note() { print -r -- "$@" | tee -a "$run_dir/summary.txt"; }
+timeout -k 10s 120s zsh "$repo_root/scripts/verify-stale-quota-cleanup.zsh" "$run_dir/cleanup"
 
 run_oracle() {
 	local rc=0
