@@ -93,6 +93,16 @@ trap 'exit 129' HUP
 
 note() { print -r -- "$1" >> "$summary"; print -r -- "$1"; }
 
+# Cheap causal retention proof, before any Go build or mutation checkout.
+# Logs live under this invocation's existing always-uploaded report directory.
+if ! timeout -k 2s 20s zsh "$script_dir/verify-landed-suite-retention.zsh" \
+  "$script_dir/lib/landed-control-suites.zsh" "$run_dir/suite-retention" \
+  >"$run_dir/suite-retention.log" 2>&1; then
+  note 'suite retention control FAILED (see suite-retention.log)'
+  exit 1
+fi
+note 'suite retention control PASS'
+
 pin=$(git -C "$repo_root" rev-parse HEAD)
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/verify-landed-receipt-XXXXXX")
 # mktemp made the directory; `git worktree add` needs the path absent. rmdir
@@ -578,24 +588,8 @@ assert_required_identities() {
 	return 0
 }
 
-# run_all_suites executes every focused suite and proves its identities.
-run_all_suites() {
-	local label=$1 record fields pkg selector required suite_exit slug
-	for record in "${suites[@]}"; do
-		fields=("${(@ps:$sep:)record}")
-		pkg=$fields[1]; selector=$fields[2]; required=$fields[3]
-		slug=${${pkg//.\//}//\//-}
-		slug=${slug%-}
-		suite_exit=$(run_focused "$pkg" "$selector" "$run_dir/$label-$slug.json" "$run_dir/$label-$slug.err")
-		if (( suite_exit != 0 )); then
-			note "$label $pkg FAILED (exit $suite_exit) - the suite must pass before any mutant means anything"
-			[[ -s "$run_dir/$label-$slug.err" ]] && tail -n 20 -- "$run_dir/$label-$slug.err" >&2
-			return 1
-		fi
-		assert_required_identities "$run_dir/$label-$slug.json" "$label $pkg" ${=required} || return 1
-	done
-	return 0
-}
+# The same suite runner owns collision-free raw retention in both drivers.
+source "$script_dir/lib/landed-control-suites.zsh"
 
 note "pin $pin"
 for rel in "${sources[@]}"; do
