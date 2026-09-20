@@ -37,6 +37,7 @@ TASK-CONTEXT.json
 # Durable claim/lease store and evidence receipts (runtime, per-host).
 .herd/claim/
 .herd/receipts/
+/.herd/landed/
 .herd/verification-receipts/
 .herd/drain/
 .herd/ready-index.json
