@@ -19,15 +19,11 @@ cleanup() {
     wait "$holder" 2>/dev/null || true
     holder=""
   fi
-  if [[ -n "${LOG:-}" && -f "$LOG" && "$LOG" != "$WORKDIR"/* ]]; then
-    :
-  fi
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 unset HERD_ROOT HERD_REPO_ROOT HERD_PROJECT_ROOT HERD_CONFIG_PATH HERD_WORKSPACE HERD_LANE || true
-export HERD_PROJECT_ROOT="$WORKDIR"
 
 log() { print -r -- "$*" | tee -a "$LOG"; }
 
@@ -38,10 +34,14 @@ print -r -- 'ok' >"$WORKDIR/f"
 git -C "$WORKDIR" add f
 git -C "$WORKDIR" commit -qm init
 git -C "$WORKDIR" branch -M main
+git -C "$WORKDIR" update-ref refs/remotes/origin/main main
 
 integer i
 for i in {1..9}; do
   git -C "$WORKDIR" worktree add -q -b "leftover-$i" "$WORKDIR/wt-$i" main
+  print -r -- "unmerged-$i" >"$WORKDIR/wt-$i/extra-$i"
+  git -C "$WORKDIR/wt-$i" add "extra-$i"
+  git -C "$WORKDIR/wt-$i" commit -qm "unmerged leftover-$i"
 done
 git -C "$WORKDIR" checkout -q main
 
@@ -54,13 +54,12 @@ YAML
 
 LOCK="$WORKDIR/.herd/worktree-reap-pulse.lock"
 READY="$WORKDIR/lock.ready"
-mkdir -p "$WORKDIR/.herd"
 touch "$LOCK"
 (
   exec 9>"$LOCK"
   flock -n 9 || exit 1
   print -r -- ready >"$READY"
-  sleep 30
+  exec sleep 30
 ) &
 holder=$!
 integer n=0
@@ -76,8 +75,9 @@ out="$(cd "$WORKDIR/wt-1" && "$HERD" maintenance --act 2>&1)"
 rc=$?
 set -e
 log "$out"
+(( rc == 0 )) || { print -u2 "deferred maintenance rc=$rc want 0: $out"; exit 1; }
 print -r -- "$out" | grep -E -q 'deferred|tick lock' || {
-  print -u2 "missing deferred/tick lock while flock held (rc=$rc): $out"
+  print -u2 "missing deferred/tick lock while flock held: $out"
   exit 1
 }
 kill "$holder" 2>/dev/null || true
@@ -91,6 +91,10 @@ print -r -- "$out1" | grep -E -q 'inspected=[1-9]' || {
   print -u2 "wt-1 inspected not >0: $out1"
   exit 1
 }
+print -r -- "$out1" | grep -E -q 'retired=0' || {
+  print -u2 "unmerged fixtures must not be retired: $out1"
+  exit 1
+}
 [[ -f "$cursor" ]] || { print -u2 "missing shared cursor after wt-1"; exit 1; }
 [[ ! -e "$WORKDIR/wt-1/.herd/worktree-reap-pulse.cursor" ]] || { print -u2 "wt-1 grew its own cursor"; exit 1; }
 last1="$(cat "$cursor")"
@@ -101,9 +105,18 @@ print -r -- "$out2" | grep -E -q 'inspected=[1-9]' || {
   print -u2 "wt-2 inspected not >0: $out2"
   exit 1
 }
+print -r -- "$out2" | grep -E -q 'retired=0' || {
+  print -u2 "unmerged fixtures must not be retired: $out2"
+  exit 1
+}
 [[ -f "$cursor" ]] || { print -u2 "shared cursor vanished"; exit 1; }
 [[ ! -e "$WORKDIR/wt-2/.herd/worktree-reap-pulse.cursor" ]] || { print -u2 "wt-2 grew its own cursor"; exit 1; }
 last2="$(cat "$cursor")"
 [[ "$last1" != "$last2" ]] || { print -u2 "cursor last did not advance: $last1"; exit 1; }
+
+integer w
+for w in {1..9}; do
+  [[ -d "$WORKDIR/wt-$w" ]] || { print -u2 "fixture wt-$w removed"; exit 1; }
+done
 
 log "maintenance shared tick lab ok last1=$last1 last2=$last2"
