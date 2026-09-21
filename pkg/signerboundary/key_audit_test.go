@@ -63,7 +63,7 @@ func TestVerifyKeyAudit_RejectsAlteredSignedClaims(t *testing.T) {
 }
 
 func TestVerifyKeyAudit_RejectsWrongNonceIdentityPathUIDPID(t *testing.T) {
-	pub, _, req, st, sig := validAuditFixture(t)
+	pub, priv, req, st, sig := validAuditFixture(t)
 	cases := []struct {
 		name string
 		fn   func() error
@@ -72,7 +72,15 @@ func TestVerifyKeyAudit_RejectsWrongNonceIdentityPathUIDPID(t *testing.T) {
 		{"nonce", func() error {
 			r := req
 			r.Nonce = "ffffffffffffffffffffffffffffffff"
-			return verifyKeyAudit(pub, st.Path, st.Identity, 9, 42, r, st, sig)
+			raw, err := json.Marshal(st)
+			if err != nil {
+				return err
+			}
+			signReq := r
+			signReq.Payload = raw
+			signReq.PayloadHex = hex.EncodeToString(raw)
+			sig2 := ed25519.Sign(priv, signReq.Canonical())
+			return verifyKeyAudit(pub, st.Path, st.Identity, 9, 42, r, st, sig2)
 		}, "nonce"},
 		{"identity", func() error {
 			return verifyKeyAudit(pub, st.Path, "wrong-id", 9, 42, req, st, sig)
