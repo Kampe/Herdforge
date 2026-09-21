@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -437,20 +438,40 @@ func publicFromSeedFile(path string, wantUID int) (ed25519.PublicKey, error) {
 	return pub, nil
 }
 
+func primaryGIDForUID(uid int) (int, error) {
+	acct, err := user.LookupId(itoa(uid))
+	if err != nil {
+		return 0, fmt.Errorf("passwd lookup uid %d: %w", uid, err)
+	}
+	gid, err := strconv.Atoi(strings.TrimSpace(acct.Gid))
+	if err != nil || gid < 0 {
+		return 0, fmt.Errorf("passwd gid for uid %d invalid %q", uid, acct.Gid)
+	}
+	return gid, nil
+}
+
 func defaultRunAs(uid int, env []string, name string, args ...string) *exec.Cmd {
 	if uid == os.Getuid() {
 		cmd := exec.Command(name, args...)
 		cmd.Env = env
 		return cmd
 	}
+	gid, err := primaryGIDForUID(uid)
+	if err != nil {
+		cmd := exec.Command("sh", "-c", `printf '%s\n' "$1" >&2; exit 1`, "--", "signerboundary: refuse run-as without primary gid: "+err.Error())
+		cmd.Env = env
+		return cmd
+	}
 	// Prefer setpriv when available (containers), else sudo -n.
+	// --regid is required: --reuid + --init-groups alone retains the caller's
+	// primary GID (root 0 when launched via sudo).
 	if _, err := exec.LookPath("setpriv"); err == nil {
-		full := append([]string{"--reuid=" + itoa(uid), "--init-groups", "--", name}, args...)
+		full := append([]string{"--reuid=" + itoa(uid), "--regid=" + itoa(gid), "--init-groups", "--", name}, args...)
 		cmd := exec.Command("setpriv", full...)
 		cmd.Env = env
 		return cmd
 	}
-	full := append([]string{"-n", "-u", "#" + strconv.Itoa(uid), "--", name}, args...)
+	full := append([]string{"-n", "-u", "#" + strconv.Itoa(uid), "-g", "#" + strconv.Itoa(gid), "--", name}, args...)
 	cmd := exec.Command("sudo", full...)
 	cmd.Env = env
 	return cmd
