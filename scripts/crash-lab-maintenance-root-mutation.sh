@@ -75,12 +75,23 @@ if (( post_rc != 0 )); then
 fi
 log "POST-MUTANT linked-root PASS"
 
-log "DANGLING-LEAF MUTANT"
-DFROM='if info.Mode()&os.ModeSymlink != 0 {'
-DTO='if false {'
+log "DANGLING-LEAF BASELINE"
+set +e
+dbase="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestCleanupCoordinationRootDanglingLeaf$' 2>&1)"
+dbase_rc=$?
+set -e
+print -r -- "$dbase" | tee -a "$LOG"
+if (( dbase_rc != 0 )); then
+  print -u2 "baseline dangling-leaf failed; not mutating"
+  exit 1
+fi
+log "DANGLING-LEAF BASELINE PASS"
+
+DFROM='reconstructed, recErr := reconstructMissingExplicitRoot(root)'
+DTO='reconstructed, recErr := filepath.Clean(root), error(nil)'
 n="$(grep -F -c -- "$DFROM" "$FILE" || true)"
 if [[ "$n" != "1" ]]; then
-  print -u2 "dangling literal not unique count=$n"
+  print -u2 "reconstruct call not unique count=$n"
   exit 1
 fi
 FROM="$DFROM" TO="$DTO" perl -i -pe 'BEGIN { $from = $ENV{FROM}; $to = $ENV{TO} } s/\Q$from\E/$to/' "$FILE"
@@ -90,9 +101,13 @@ drc=$?
 set -e
 print -r -- "$dout" | tee -a "$LOG"
 if (( drc == 0 )); then
-  print -u2 "removing symlink-ancestor refusal did not fail dangling-leaf test"
+  print -u2 "accepting Clean(root) did not fail dangling-leaf test"
   exit 1
 fi
+print -r -- "$dout" | grep -F -q 'FAIL: TestCleanupCoordinationRootDanglingLeaf' || {
+  print -u2 "not named FAIL for dangling leaf"
+  exit 1
+}
 print -r -- "$dout" | grep -F -q 'dangling leaf must refuse' || {
   print -u2 "missing dangling leaf assertion"
   exit 1
@@ -103,12 +118,12 @@ if ! git diff --quiet -- "$FILE"; then
   exit 1
 fi
 set +e
-dpost="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestCleanupCoordinationRootDanglingLeaf$' 2>&1)"
+dpost="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestCleanupCoordinationRoot' 2>&1)"
 dpost_rc=$?
 set -e
 print -r -- "$dpost" | tee -a "$LOG"
 if (( dpost_rc != 0 )); then
-  print -u2 "dangling-leaf test failed after restore"
+  print -u2 "TestCleanupCoordinationRoot suite failed after restore"
   exit 1
 fi
 log "maintenance root mutation driver ok"

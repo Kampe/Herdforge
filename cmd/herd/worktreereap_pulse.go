@@ -428,19 +428,17 @@ func reconstructMissingExplicitRoot(root string) (string, error) {
 	for {
 		info, err := os.Lstat(cur)
 		if err == nil {
-			if info.Mode()&os.ModeSymlink != 0 {
-				target, e := filepath.EvalSymlinks(cur)
-				if e != nil {
-					return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s: %w", cur, e)
+			resolved, e := filepath.EvalSymlinks(cur)
+			if e != nil {
+				return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s: %w", cur, e)
+			}
+			cur = resolved
+			info, err = os.Stat(cur)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
 				}
-				cur = target
-				info, err = os.Lstat(cur)
-				if err != nil {
-					if !os.IsNotExist(err) {
-						return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
-					}
-					return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s", cur)
-				}
+				return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s", cur)
 			}
 			if !info.IsDir() {
 				return "", fmt.Errorf("cleanup coordination root: ancestor %s is not a directory", cur)

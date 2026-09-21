@@ -412,6 +412,28 @@ func TestCleanupCoordinationRootSymlinkAncestorAbsentSuffix(t *testing.T) {
 	}
 }
 
+func TestCleanupCoordinationRootNestedSymlinkThenExistingDir(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	existing := filepath.Join(real, "existing")
+	if err := os.MkdirAll(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", filepath.Join(link, "existing", "missing"))
+	got, err := cleanupCoordinationRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("nested symlink ancestor: %v", err)
+	}
+	want := filepath.Join(existing, "missing")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestMaintenanceLinkedWorktreeSharesProjectRoot(t *testing.T) {
 	root := maintenanceScratchRoot(t)
 	wt := filepath.Join(root, "wt")
