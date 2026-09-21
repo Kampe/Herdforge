@@ -23,26 +23,44 @@ HERD="${HERD:?HERD binary path required}"
 HERD="$(readlink -f "$HERD")"
 REPO="${REPO:?REPO path required}"
 EVIDENCE="${EVIDENCE:?EVIDENCE path required}"
-# /tmp is world-traversable; RUNNER_TEMP under /home/runner is not, so UID S
-# cannot lstat keys/private (EACCES) even when the key file itself is S-owned.
 WORKDIR="$(mktemp -d /tmp/herd-signer-lab.XXXXXX)"
 KEYDIR="$WORKDIR/keys"
-SOCK="$WORKDIR/signer.sock"
+SOCKDIR="$WORKDIR/sock"
+SOCK="$SOCKDIR/signer.sock"
 HERD_SIGNER_PID=""
 created_group=""
 created_users=()
 
 log() { print -r -- "$*" | tee -a "$EVIDENCE"; }
 
+diag_path() {
+  local p=$1
+  if [[ -e "$p" ]]; then
+    sudo -n stat -c 'mode=%a owner=%U:%G path=%n' "$p" 2>/dev/null | tee -a "$EVIDENCE" || true
+  else
+    log "diag missing $p"
+  fi
+}
+
+diag_ancestry() {
+  local p=$1
+  log "ancestry $p"
+  while true; do
+    diag_path "$p"
+    [[ "$p" == / ]] && break
+    p="$(dirname "$p")"
+  done
+}
+
 diag_dirs() {
   local p
-  for p in /tmp "$WORKDIR" "$KEYDIR" "$KEYDIR/private" "$KEYDIR/attest"; do
-    if [[ -e "$p" ]]; then
-      sudo -n stat -c 'mode=%a owner=%U:%G path=%n' "$p" 2>/dev/null | tee -a "$EVIDENCE" || true
-    else
-      log "diag missing $p"
-    fi
+  for p in /tmp "$WORKDIR" "$KEYDIR" "$KEYDIR/private" "$KEYDIR/attest" "$SOCKDIR"; do
+    diag_path "$p"
   done
+  if [[ -n "${RUNNER_TEMP:-}" ]]; then
+    log "hypothesis: RUNNER_TEMP ancestry (unchanged)"
+    diag_ancestry "$RUNNER_TEMP"
+  fi
 }
 
 fail() {
@@ -196,8 +214,17 @@ if [[ "$HERD_SIGNER_UID" == "$HERD_REQUESTER_UID" || "$HERD_SIGNER_UID" == "$HER
 fi
 
 sudo -n chmod 0755 "$WORKDIR"
-sudo -n mkdir -p "$KEYDIR"
+sudo -n mkdir -p "$KEYDIR" "$SOCKDIR"
 sudo -n chmod 0755 "$KEYDIR"
+sudo -n chown "$HERD_SIGNER_UID:$HERD_SIGNER_SOCK_GID" "$SOCKDIR"
+sudo -n chmod 0770 "$SOCKDIR"
+log "setpriv=$(command -v setpriv || print none)"
+sudo -n -u "#$HERD_SIGNER_UID" -- id | tee -a "$EVIDENCE" || true
+sudo -n -u "#$HERD_REQUESTER_UID" -- id | tee -a "$EVIDENCE" || true
+sudo -n -u "#$HERD_BUILDER_UID" -- id | tee -a "$EVIDENCE" || true
+if command -v setpriv >/dev/null 2>&1; then
+  sudo -n setpriv --reuid="$HERD_SIGNER_UID" --init-groups -- id | tee -a "$EVIDENCE" || true
+fi
 diag_dirs
 
 topo_env=(
@@ -209,10 +236,14 @@ topo_env=(
   HERD_SIGNER_SOCK="$SOCK"
 )
 
-launch_out="$(sudo -n env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary launch --key-dir "$KEYDIR" --socket "$SOCK" --repo "$REPO" --identity crash-lab 2> >(tee -a "$EVIDENCE" >&2))" || {
+set +e
+launch_out="$(sudo -n env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary launch --key-dir "$KEYDIR" --socket "$SOCK" --repo "$REPO" --identity crash-lab 2> >(tee -a "$EVIDENCE" >&2))"
+launch_rc=$?
+set -e
+if (( launch_rc != 0 )); then
   diag_dirs
-  fail $? "launch failed"
-}
+  fail "$launch_rc" "launch failed rc=$launch_rc"
+fi
 print -r -- "$launch_out" | grep -E '^(HERD_SIGNER_PID|HERD_SIGNER_SOCK|HERD_ADMISSION_LEDGER|HERD_KEY_DIR|HERD_SEALED_SESSION)=' | tee -a "$EVIDENCE"
 HERD_SIGNER_PID="$(print -r -- "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{print $2; exit}')"
 [[ -n "$HERD_SIGNER_PID" ]] || fail 1 "launch did not print HERD_SIGNER_PID"
