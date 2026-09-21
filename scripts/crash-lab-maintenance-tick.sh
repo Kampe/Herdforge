@@ -37,7 +37,7 @@ git -C "$WORKDIR" branch -M main
 git -C "$WORKDIR" update-ref refs/remotes/origin/main main
 
 integer i
-for i in {1..9}; do
+for i in {1..12}; do
   git -C "$WORKDIR" worktree add -q -b "leftover-$i" "$WORKDIR/wt-$i" main
   print -r -- "unmerged-$i" >"$WORKDIR/wt-$i/extra-$i"
   git -C "$WORKDIR/wt-$i" add "extra-$i"
@@ -87,8 +87,12 @@ holder=""
 cursor="$WORKDIR/.herd/worktree-reap-pulse.cursor"
 out1="$(cd "$WORKDIR/wt-1" && "$HERD" maintenance --act 2>&1)"
 log "$out1"
-print -r -- "$out1" | grep -E -q 'inspected=[1-9]' || {
-  print -u2 "wt-1 inspected not >0: $out1"
+print -r -- "$out1" | grep -E -q 'eligible=(9|[1-9][0-9]+)' || {
+  print -u2 "wt-1 eligible not >8: $out1"
+  exit 1
+}
+print -r -- "$out1" | grep -E -q 'inspected=8([^0-9]|$)' || {
+  print -u2 "wt-1 inspected not 8: $out1"
   exit 1
 }
 print -r -- "$out1" | grep -E -q 'retired=0' || {
@@ -101,8 +105,12 @@ last1="$(cat "$cursor")"
 
 out2="$(cd "$WORKDIR/wt-2" && "$HERD" maintenance --act 2>&1)"
 log "$out2"
-print -r -- "$out2" | grep -E -q 'inspected=[1-9]' || {
-  print -u2 "wt-2 inspected not >0: $out2"
+print -r -- "$out2" | grep -E -q 'eligible=(9|[1-9][0-9]+)' || {
+  print -u2 "wt-2 eligible not >8: $out2"
+  exit 1
+}
+print -r -- "$out2" | grep -E -q 'inspected=8([^0-9]|$)' || {
+  print -u2 "wt-2 inspected not 8: $out2"
   exit 1
 }
 print -r -- "$out2" | grep -E -q 'retired=0' || {
@@ -115,7 +123,7 @@ last2="$(cat "$cursor")"
 [[ "$last1" != "$last2" ]] || { print -u2 "cursor last did not advance: $last1"; exit 1; }
 
 integer w
-for w in {1..9}; do
+for w in {1..12}; do
   [[ -d "$WORKDIR/wt-$w" ]] || { print -u2 "fixture wt-$w removed"; exit 1; }
 done
 
