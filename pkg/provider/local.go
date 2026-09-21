@@ -169,17 +169,10 @@ func (p *LocalProvider) withStore(ctx context.Context, mutate bool, fn func(*loc
 		return fmt.Errorf("local task provider: lock: %w", err)
 	}
 	defer dl.Release()
-	created := false
-	if mutate {
-		var err error
-		created, err = p.ensureDir()
-		if err != nil {
-			return err
-		}
-	} else if err := refuseSymlinkPath(p.dir); err != nil && !os.IsNotExist(err) {
+	if err := refuseSymlinkPath(p.dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("local task provider: store dir: %w", err)
 	}
-	st, err := p.load(created)
+	st, err := p.load(false)
 	if err != nil {
 		return err
 	}
@@ -349,23 +342,20 @@ func localRelSeq(id string) (int, bool) {
 	return n, true
 }
 
+func (p *LocalProvider) abortFreshDir(created bool) {
+	if !created {
+		return
+	}
+	store := filepath.Join(p.dir, localStoreName)
+	if _, err := os.Lstat(store); err == nil {
+		return
+	}
+	_ = os.Remove(p.dir)
+}
+
 func (p *LocalProvider) save(st *localStore) error {
 	if err := validateLocalStore(st); err != nil {
 		return err
-	}
-	if err := refuseSymlinkPath(p.dir); err != nil {
-		return fmt.Errorf("local task provider: store dir: %w", err)
-	}
-	path := filepath.Join(p.dir, localStoreName)
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("local task provider: store is a symlink")
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("local task provider: store is not a regular file")
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("local task provider: lstat store: %w", err)
 	}
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -375,8 +365,31 @@ func (p *LocalProvider) save(st *localStore) error {
 	if len(encoded) > maxLocalStoreBytes {
 		return fmt.Errorf("local task provider: encoded store %d bytes exceeds %d; last good file preserved", len(encoded), maxLocalStoreBytes)
 	}
+	created, err := p.ensureDir()
+	if err != nil {
+		return err
+	}
+	if err := refuseSymlinkPath(p.dir); err != nil {
+		p.abortFreshDir(created)
+		return fmt.Errorf("local task provider: store dir: %w", err)
+	}
+	path := filepath.Join(p.dir, localStoreName)
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			p.abortFreshDir(created)
+			return fmt.Errorf("local task provider: store is a symlink")
+		}
+		if !info.Mode().IsRegular() {
+			p.abortFreshDir(created)
+			return fmt.Errorf("local task provider: store is not a regular file")
+		}
+	} else if !os.IsNotExist(err) {
+		p.abortFreshDir(created)
+		return fmt.Errorf("local task provider: lstat store: %w", err)
+	}
 	tmp, err := os.CreateTemp(p.dir, "tasks-*.json")
 	if err != nil {
+		p.abortFreshDir(created)
 		return fmt.Errorf("local task provider: temp store: %w", err)
 	}
 	tmpName := tmp.Name()
@@ -385,6 +398,7 @@ func (p *LocalProvider) save(st *localStore) error {
 		_ = tmp.Close()
 		if cleanup {
 			_ = os.Remove(tmpName)
+			p.abortFreshDir(created)
 		}
 	}()
 	if err := refuseSymlinkPath(tmpName); err != nil {
