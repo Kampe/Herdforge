@@ -355,7 +355,10 @@ func TestCleanupCoordinationRootRefusesCanceledContext(t *testing.T) {
 }
 
 func TestCleanupCoordinationRootMissingExplicitLeaf(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	missing := filepath.Join(dir, "absent")
 	t.Setenv("HERD_PROJECT_ROOT", missing)
 	got, err := cleanupCoordinationRoot(context.Background(), ".")
@@ -392,7 +395,10 @@ func TestCleanupCoordinationRootDanglingAncestor(t *testing.T) {
 }
 
 func TestCleanupCoordinationRootSymlinkAncestorAbsentSuffix(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	real := filepath.Join(dir, "real")
 	if err := os.Mkdir(real, 0o755); err != nil {
 		t.Fatal(err)
@@ -413,7 +419,10 @@ func TestCleanupCoordinationRootSymlinkAncestorAbsentSuffix(t *testing.T) {
 }
 
 func TestCleanupCoordinationRootNestedSymlinkThenExistingDir(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	real := filepath.Join(dir, "real")
 	existing := filepath.Join(real, "existing")
 	if err := os.MkdirAll(existing, 0o755); err != nil {
