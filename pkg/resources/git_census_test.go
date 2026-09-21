@@ -904,3 +904,34 @@ func TestDarwinLiveMetadataRefusalStaysFailClosed(t *testing.T) {
 		t.Fatalf("a classifier-resolved gone pid must complete the census, not fail it: %v", err)
 	}
 }
+
+func TestInUseManyWalkRecordsOnlyMatchingUniquePIDs(t *testing.T) {
+	const matchPath = "/wt-owned"
+	const otherPath = "/wt-other"
+	p := LSOFProcessInspector{
+		processReferencesManyFn: func(_ context.Context, pid int, paths []string, _ map[int]int) (map[string]bool, error) {
+			out := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				out[path] = pid == 7 && path == matchPath
+			}
+			return out, nil
+		},
+	}
+	usage := map[string]ProcessUsage{
+		matchPath: {},
+		otherPath: {},
+	}
+	got, err := p.inUseManyWalk(context.Background(), time.Second, usage, []string{matchPath, otherPath}, []int{7, 8, 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[matchPath].ReferencedPath {
+		t.Fatal("matching pid must set ReferencedPath")
+	}
+	if len(got[matchPath].PIDs) != 1 || got[matchPath].PIDs[0] != 7 {
+		t.Fatalf("matching unique pids = %v, want [7]", got[matchPath].PIDs)
+	}
+	if got[otherPath].ReferencedPath || len(got[otherPath].PIDs) != 0 {
+		t.Fatalf("nonmatching path recorded %v pids=%v", got[otherPath].ReferencedPath, got[otherPath].PIDs)
+	}
+}

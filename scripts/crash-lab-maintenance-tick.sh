@@ -171,16 +171,12 @@ print -r -- "$out1" | grep -E -q 'landed=[1-9]' || {
   exit 1
 }
 (( rc1 != 0 )) || { print -u2 "maintenance must exit nonzero when Failed>0; rc=$rc1 out=$out1"; exit 1; }
-print -r -- "$out1" | grep -E -q 'failed=[1-9]' || {
-  print -u2 "expected owner-census failed>=1 (rc=$rc1): $out1"
+print -r -- "$out1" | grep -E -q 'failed=1([^0-9]|$)' || {
+  print -u2 "expected failed=1 (rc=$rc1): $out1"
   exit 1
 }
-print -r -- "$out1" | grep -F -q "$OWNED" || {
-  print -u2 "refusal missing exact owned path $OWNED: $out1"
-  exit 1
-}
-print -r -- "$out1" | grep -E -q 'owner census found active use' || {
-  print -u2 "missing native owner-census refusal: $out1"
+print -r -- "$out1" | grep -E -q "${OWNED}: act-time owner census found active use" || {
+  print -u2 "refusal missing same-line owned path and census: $out1"
   exit 1
 }
 print -r -- "$out1" | grep -E -q 'retired=1([^0-9]|$)' || {
@@ -188,10 +184,15 @@ print -r -- "$out1" | grep -E -q 'retired=1([^0-9]|$)' || {
   exit 1
 }
 [[ ! -e "$MERGED" ]] || { print -u2 "merged fixture still on disk"; exit 1; }
-if git -C "$WORKDIR" worktree list --porcelain | grep -F -q "$MERGED"; then
+set +e
+reg="$(git -C "$WORKDIR" worktree list --porcelain)"
+reg_rc=$?
+set -e
+(( reg_rc == 0 )) || { print -u2 "git worktree list failed rc=$reg_rc"; exit 1; }
+print -r -- "$reg" | grep -E -q "^worktree[[:space:]]+$MERGED\$" && {
   print -u2 "merged fixture still registered"
   exit 1
-fi
+}
 [[ -d "$DIRTY" ]] || { print -u2 "dirty merged fixture was removed"; exit 1; }
 [[ -d "$OWNED" ]] || { print -u2 "owned merged fixture was removed"; exit 1; }
 kill -0 "$owned_pid" || { print -u2 "owned sleep died during retirement"; exit 1; }
@@ -217,12 +218,17 @@ print -r -- "$out2" | grep -E -q 'retired=0' || {
   exit 1
 }
 if (( rc2 != 0 )); then
-  print -r -- "$out2" | grep -F -q "$OWNED" || {
-    print -u2 "second beat unexpected failure without owned path: $out2"
+  print -r -- "$out2" | grep -E -q 'failed=1([^0-9]|$)' || {
+    print -u2 "second beat nonzero requires failed=1: $out2"
     exit 1
   }
-  print -r -- "$out2" | grep -E -q 'owner census found active use' || {
-    print -u2 "second beat unexpected failure without owner-census refusal: $out2"
+  print -r -- "$out2" | grep -E -q "${OWNED}: act-time owner census found active use" || {
+    print -u2 "second beat unexpected failure without same-line owned census: $out2"
+    exit 1
+  }
+else
+  print -r -- "$out2" | grep -E -q 'failed=0([^0-9]|$)' || {
+    print -u2 "second beat rc0 requires failed=0: $out2"
     exit 1
   }
 fi
