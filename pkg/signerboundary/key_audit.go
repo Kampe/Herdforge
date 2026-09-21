@@ -1,6 +1,7 @@
 package signerboundary
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -14,15 +15,48 @@ const keyAuditDomain = "herdforge-signer-audit-key-v1"
 // KeyAuditStatement is produced only by the signer after a fresh local audit
 // of its configured key. Clients must not supply these fields.
 type KeyAuditStatement struct {
-	Domain   string `json:"domain"`
-	Nonce    string `json:"nonce"`
-	Path     string `json:"path"`
-	Identity string `json:"identity"`
-	OwnerUID int    `json:"owner_uid"`
-	Mode     string `json:"mode"`
-	Nlink    uint64 `json:"nlink"`
-	ServerPID int   `json:"server_pid"`
-	ServerUID int   `json:"server_uid"`
+	Domain    string `json:"domain"`
+	Nonce     string `json:"nonce"`
+	Path      string `json:"path"`
+	Identity  string `json:"identity"`
+	OwnerUID  int    `json:"owner_uid"`
+	Mode      string `json:"mode"`
+	Nlink     uint64 `json:"nlink"`
+	ServerPID int    `json:"server_pid"`
+	ServerUID int    `json:"server_uid"`
+}
+
+func (s *Server) bindDiskKeyToLoadedPub() error {
+	f, err := openKeyVerified(s.keyPath, s.topo.SignerUID)
+	if err != nil {
+		return fmt.Errorf("%w: open key for audit bind: %v", ErrProvisioning, err)
+	}
+	data, err := ioReadAllClose(f)
+	if err != nil {
+		return fmt.Errorf("%w: read key for audit bind: %v", ErrProvisioning, err)
+	}
+	seed, err := hex.DecodeString(strings.TrimSpace(string(data)))
+	for i := range data {
+		data[i] = 0
+	}
+	if err != nil || len(seed) != ed25519.SeedSize {
+		for i := range seed {
+			seed[i] = 0
+		}
+		return fmt.Errorf("%w: corrupt key seed during audit bind", ErrProvisioning)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	for i := range seed {
+		seed[i] = 0
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	for i := range priv {
+		priv[i] = 0
+	}
+	if !bytes.Equal(pub, s.pub) {
+		return fmt.Errorf("%w: on-disk key does not match loaded signer public key", ErrProvisioning)
+	}
+	return nil
 }
 
 func (s *Server) handleKeyAudit(req SignRequest) (KeyAuditStatement, []byte, error) {
@@ -35,6 +69,9 @@ func (s *Server) handleKeyAudit(req SignRequest) (KeyAuditStatement, []byte, err
 	if err := auditKeyMaterialPath(s.keyPath, s.topo.SignerUID); err != nil {
 		return KeyAuditStatement{}, nil, err
 	}
+	if err := s.bindDiskKeyToLoadedPub(); err != nil {
+		return KeyAuditStatement{}, nil, err
+	}
 	fi, err := os.Lstat(s.keyPath)
 	if err != nil {
 		return KeyAuditStatement{}, nil, fmt.Errorf("%w: re-stat key: %v", ErrProvisioning, err)
@@ -43,7 +80,10 @@ func (s *Server) handleKeyAudit(req SignRequest) (KeyAuditStatement, []byte, err
 	if !ok {
 		return KeyAuditStatement{}, nil, fmt.Errorf("%w: key owner unreadable", ErrProvisioning)
 	}
-	nlink, _ := statNlink(fi)
+	nlink, ok := statNlink(fi)
+	if !ok || nlink != 1 {
+		return KeyAuditStatement{}, nil, fmt.Errorf("%w: key nlink missing or %d", ErrKeyExposed, nlink)
+	}
 	st := KeyAuditStatement{
 		Domain:    keyAuditDomain,
 		Nonce:     req.Nonce,
@@ -90,18 +130,12 @@ func AuditKeyAsRequester(opts Options, nonce string) error {
 		return err
 	}
 	req := SignRequest{Op: OpKeyAudit, SessionID: "audit-key-cli", Nonce: nonce}
-	st, sig, wirePID, wirePub, err := requestKeyAuditOverIPC(sock, sk, &req)
+	st, sig, kernelPID, err := requestKeyAuditOverIPC(sock, sk, topo.SignerUID, &req)
 	if err != nil {
 		return err
 	}
-	if len(pub) == 0 {
-		pub = wirePub
-	}
-	if err := verifyKeyAudit(pub, keyPath, opts.Identity, topo.SignerUID, 0, req, st, sig); err != nil {
+	if err := verifyKeyAudit(pub, keyPath, opts.Identity, topo.SignerUID, kernelPID, req, st, sig); err != nil {
 		return err
-	}
-	if wirePID != 0 && wirePID != st.ServerPID {
-		return fmt.Errorf("%w: audit wire pid mismatch", ErrProvisioning)
 	}
 	return nil
 }
@@ -122,14 +156,17 @@ func verifyKeyAudit(pub ed25519.PublicKey, expectedPath, expectedIdentity string
 	if st.OwnerUID != expectedUID || st.ServerUID != expectedUID {
 		return fmt.Errorf("%w: audit uid mismatch", ErrProvisioning)
 	}
+	if st.ServerPID <= 0 {
+		return fmt.Errorf("%w: audit missing server pid", ErrProvisioning)
+	}
 	if expectedPID > 0 && st.ServerPID != expectedPID {
 		return fmt.Errorf("%w: audit server pid mismatch", ErrProvisioning)
 	}
 	if st.Mode != "0600" && st.Mode != "0o600" {
 		return fmt.Errorf("%w: audit mode %s not 0600", ErrKeyExposed, st.Mode)
 	}
-	if st.Nlink != 0 && st.Nlink != 1 {
-		return fmt.Errorf("%w: audit nlink=%d", ErrKeyExposed, st.Nlink)
+	if st.Nlink != 1 {
+		return fmt.Errorf("%w: audit nlink=%d want 1", ErrKeyExposed, st.Nlink)
 	}
 	raw, err := json.Marshal(st)
 	if err != nil {

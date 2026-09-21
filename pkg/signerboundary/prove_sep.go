@@ -28,24 +28,20 @@ func proveSeparateUID(cfg proveSepConfig) (digest string, signerPID int, err err
 	asRequester := os.Getuid() == cfg.RequesterUID && os.Getuid() != cfg.SignerUID && os.Getuid() != 0
 
 	if asRequester {
+		if len(cfg.Pub) != ed25519.PublicKeySize {
+			return "", 0, fmt.Errorf("%w: pinned published public key required", ErrProvisioning)
+		}
 		req := SignRequest{Op: OpKeyAudit, SessionID: "audit-key-prove"}
-		st, sig, wirePID, wirePub, err := requestKeyAuditOverIPC(cfg.SocketPath, cfg.SessionKey, &req)
+		st, sig, kernelPID, err := requestKeyAuditOverIPC(cfg.SocketPath, cfg.SessionKey, cfg.SignerUID, &req)
 		if err != nil {
 			return "", 0, err
 		}
-		pub := cfg.Pub
-		if len(pub) == 0 {
-			pub = wirePub
-		}
-		if err := verifyKeyAudit(pub, cfg.KeyPath, cfg.Identity, cfg.SignerUID, cfg.SignerPID, req, st, sig); err != nil {
+		if err := verifyKeyAudit(cfg.Pub, cfg.KeyPath, cfg.Identity, cfg.SignerUID, kernelPID, req, st, sig); err != nil {
 			return "", 0, err
-		}
-		if wirePID != 0 && wirePID != st.ServerPID {
-			return "", 0, fmt.Errorf("%w: audit wire pid mismatch", ErrProvisioning)
 		}
 		receipts = append(receipts, ProbeReceipt{
 			Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
-			Detail: "authenticated signer key-audit verified against published key",
+			Detail:    "authenticated signer key-audit verified against published key",
 			SignerPID: st.ServerPID, SignerUID: st.ServerUID,
 		})
 	} else {

@@ -1,11 +1,12 @@
 package signerboundary
 
 import (
-	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -94,58 +95,74 @@ func signRequestOverIPCWithMAC(socketPath string, req SignRequest, mac string) (
 	return sig, nil
 }
 
-func requestKeyAuditOverIPC(socketPath string, key SessionKey, req *SignRequest) (KeyAuditStatement, []byte, int, ed25519.PublicKey, error) {
+func requestKeyAuditOverIPC(socketPath string, key SessionKey, expectedUID int, req *SignRequest) (KeyAuditStatement, []byte, int, error) {
 	var zero KeyAuditStatement
 	if req == nil {
-		return zero, nil, 0, nil, fmt.Errorf("nil SignRequest")
+		return zero, nil, 0, fmt.Errorf("nil SignRequest")
+	}
+	if expectedUID <= 0 {
+		return zero, nil, 0, fmt.Errorf("%w: expected signer uid required before session MAC", ErrProvisioning)
 	}
 	req.Op = OpKeyAudit
 	req.Payload = nil
 	req.PayloadHex = ""
 	if err := req.ValidateProduction(); err != nil {
-		return zero, nil, 0, nil, err
+		return zero, nil, 0, err
 	}
 	if err := req.EnsureNonce(); err != nil {
-		return zero, nil, 0, nil, err
+		return zero, nil, 0, err
 	}
 	mac := key.BindRequestMAC(*req)
 	conn, err := net.DialTimeout("unix", socketPath, 3*time.Second)
 	if err != nil {
-		return zero, nil, 0, nil, fmt.Errorf("dial signer: %w", err)
+		return zero, nil, 0, fmt.Errorf("dial signer: %w", err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := json.NewEncoder(conn).Encode(wireReq{SignRequest: *req, MAC: mac}); err != nil {
-		return zero, nil, 0, nil, err
+	peerUID, peerPID, _, err := peerCreds(conn)
+	if err != nil {
+		return zero, nil, 0, fmt.Errorf("%w: kernel peer creds before MAC: %v", ErrProvisioning, err)
 	}
+	if peerUID != expectedUID {
+		return zero, nil, peerPID, fmt.Errorf("%w: kernel peer uid %d want signer %d", ErrPeerUnauthorized, peerUID, expectedUID)
+	}
+	if runtime.GOOS == "linux" && peerPID <= 0 {
+		return zero, nil, peerPID, fmt.Errorf("%w: linux kernel peer pid required", ErrProvisioning)
+	}
+	if err := json.NewEncoder(conn).Encode(wireReq{SignRequest: *req, MAC: mac}); err != nil {
+		return zero, nil, peerPID, err
+	}
+	dec := json.NewDecoder(io.LimitReader(conn, MaxWireFrameBytes))
 	var resp wireResp
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return zero, nil, 0, nil, err
+	if err := dec.Decode(&resp); err != nil {
+		return zero, nil, peerPID, err
+	}
+	if resp.OK && (strings.TrimSpace(resp.Error) != "" || strings.TrimSpace(resp.ErrorCode) != "") {
+		return zero, nil, peerPID, fmt.Errorf("%w: ok response carried error fields", ErrProvisioning)
 	}
 	if !resp.OK {
-		return zero, nil, resp.PID, nil, fmt.Errorf("signer: %s", resp.Error)
+		return zero, nil, peerPID, fmt.Errorf("signer: %s", resp.Error)
 	}
 	if resp.EchoNonce != req.Nonce {
-		return zero, nil, resp.PID, nil, fmt.Errorf("signer: nonce binding failed")
+		return zero, nil, peerPID, fmt.Errorf("signer: nonce binding failed")
 	}
 	if strings.TrimSpace(resp.Audit) == "" {
-		return zero, nil, resp.PID, nil, fmt.Errorf("%w: empty audit statement", ErrProvisioning)
+		return zero, nil, peerPID, fmt.Errorf("%w: empty audit statement", ErrProvisioning)
 	}
 	var st KeyAuditStatement
-	if err := json.Unmarshal([]byte(resp.Audit), &st); err != nil {
-		return zero, nil, resp.PID, nil, fmt.Errorf("%w: malformed audit: %v", ErrProvisioning, err)
+	aud := json.NewDecoder(strings.NewReader(resp.Audit))
+	aud.DisallowUnknownFields()
+	if err := aud.Decode(&st); err != nil {
+		return zero, nil, peerPID, fmt.Errorf("%w: malformed or unknown audit fields: %v", ErrProvisioning, err)
 	}
 	sig, err := hex.DecodeString(resp.Signature)
 	if err != nil {
-		return zero, nil, resp.PID, nil, err
+		return zero, nil, peerPID, err
 	}
-	var pub ed25519.PublicKey
-	if resp.PubKey != "" {
-		raw, err := hex.DecodeString(resp.PubKey)
-		if err != nil {
-			return zero, nil, resp.PID, nil, err
+	if runtime.GOOS == "linux" {
+		if st.ServerPID <= 0 || st.ServerPID != peerPID {
+			return zero, nil, peerPID, fmt.Errorf("%w: signed pid %d != kernel peer pid %d", ErrProvisioning, st.ServerPID, peerPID)
 		}
-		pub = raw
 	}
-	return st, sig, resp.PID, pub, nil
+	return st, sig, peerPID, nil
 }

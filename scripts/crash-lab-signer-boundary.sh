@@ -255,29 +255,42 @@ print -r -- "$launch_out" | grep -E '^(HERD_SIGNER_PID|HERD_SIGNER_SOCK|HERD_ADM
 HERD_SIGNER_PID="$(print -r -- "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{print $2; exit}')"
 [[ -n "$HERD_SIGNER_PID" ]] || fail 1 "launch did not print HERD_SIGNER_PID"
 
-# Authentic establish as requester (writes attest/isolation.json). Do not
-# synthesize attestation or weaken RequireReady.
-sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary establish --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "establish failed as requester"
+pos_out="$WORKDIR/audit-pos.out"
+pos_err="$WORKDIR/audit-pos.err"
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab >"$pos_out" 2>"$pos_err" || fail $? "positive audit-key failed $(cat "$pos_err")"
+grep -q "audit-key ok" "$pos_out" || fail 1 "positive audit-key missing ok: $(cat "$pos_out" "$pos_err")"
+cat "$pos_out" "$pos_err" >>"$EVIDENCE"
+log "positive audit-key ok"
 
+wrong_err="$WORKDIR/audit-wrong.err"
 set +e
-sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity wrong-id >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2)
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity wrong-id >/dev/null 2>"$wrong_err"
 wrong_rc=$?
 set -e
+cat "$wrong_err" >>"$EVIDENCE"
 if (( wrong_rc == 0 )); then
   fail 1 "wrong identity audit-key should fail"
 fi
+grep -E -q "identity mismatch|audit identity" "$wrong_err" || fail 1 "wrong-id missing identity mismatch: $(cat "$wrong_err")"
 log "negative wrong-identity rc=$wrong_rc"
 
 replay_nonce="00112233445566778899aabbccddeeff"
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab --nonce "$replay_nonce" >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "first replay nonce should succeed"
+replay_err="$WORKDIR/audit-replay.err"
 set +e
-sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab --nonce "$replay_nonce" >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2)
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab --nonce "$replay_nonce" >/dev/null 2>"$replay_err"
 replay_rc=$?
 set -e
+cat "$replay_err" >>"$EVIDENCE"
 if (( replay_rc == 0 )); then
   fail 1 "replayed audit-key nonce should fail"
 fi
+grep -E -q "NONCE_REPLAY|nonce replay|replay" "$replay_err" || fail 1 "replay missing replay reason: $(cat "$replay_err")"
 log "negative replay rc=$replay_rc"
+
+# Authentic establish as requester (writes attest/isolation.json). Do not
+# synthesize attestation or weaken RequireReady.
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary establish --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "establish failed as requester"
 
 # status/prove as requester using ResolveKeyDir (HERD_KEY_DIR).
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary status >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "status failed as requester"
