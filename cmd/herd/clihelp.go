@@ -193,8 +193,11 @@ Outcomes:
 Authenticated urgent control (herd stop) still preempts. The same payload through herd send does not.
 Use herd mail send for durable mailbox delivery without a live pane.
 Prefer herdr-deliver for durable digests.`,
-	"integration-wake": `Usage: herd integration-wake --candidate <sha> --generation <n>
-  Acknowledge handling one delivered integration wake. This neither merges nor closes a card.`,
+	"integration-wake": `Usage: herd integration-wake --emit --candidate <sha> --pr <n> --task <ref> --owner <name> --target <pane> --session <id> --action <text> [--now RFC3339] [--max-age dur] [--json]
+       herd integration-wake --candidate <sha> --generation <n>
+  Enqueue one executable integration-ready wake, or acknowledge a delivered generation.
+  Empty actions are refused. Last-write-wins per candidate; unconsumed wakes escalate.
+  This neither merges nor closes a card.`,
 	"herdr-deliver": `Usage: herd herdr-deliver --key <op> --generation <n> --target <name> [--session <id>] [--file path] [--wait] [--timeout s] [--state path]
   Durably deliver exact prompt bytes from stdin or --file to one Herdr session.
   Positional free-form text is rejected (FAC-183 shell-literal incident class).`,

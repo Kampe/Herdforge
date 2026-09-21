@@ -127,7 +127,7 @@ func TestIntegrationWakeAckCommandUsesExactGeneration(t *testing.T) {
 	}
 	t.Chdir(root)
 	sha := strings.Repeat("c", 40)
-	action := beat.IntegrationAction{CandidateSHA: sha, PullRequest: 12, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "term1", Action: "Evaluate exact PR 12 admission"}
+	action := beat.IntegrationAction{CandidateSHA: sha, PullRequest: 12, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "term1", Action: "Evaluate exact candidate " + sha + " PR 12 admission"}
 	_, err := beat.ReconcileIntegrationWakes(context.Background(), integrationWakePath(root), []beat.IntegrationAction{action}, time.Now(), time.Minute, func(context.Context, beat.IntegrationWake) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,8 @@ func TestIntegrationWakeGenerationsUseDistinctDurableIntents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	wake := beat.IntegrationWake{IntegrationAction: beat.IntegrationAction{CandidateSHA: strings.Repeat("d", 40), PullRequest: 12, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "term1", Action: "Evaluate exact PR 12"}, Generation: 1, CreatedAt: time.Now().UTC()}
+	sha := strings.Repeat("d", 40)
+	wake := beat.IntegrationWake{IntegrationAction: beat.IntegrationAction{CandidateSHA: sha, PullRequest: 12, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "term1", Action: "Evaluate exact candidate " + sha + " PR 12"}, Generation: 1, CreatedAt: time.Now().UTC()}
 	calls := 0
 	executor := textdelivery.ExecutorFunc(func(_ context.Context, c textdelivery.Command) ([]byte, error) { calls++; return c.Payload, nil })
 	deliver := func(w beat.IntegrationWake) {
@@ -191,5 +192,97 @@ func TestIntegrationWakeGenerationsUseDistinctDurableIntents(t *testing.T) {
 	deliver(wake)
 	if calls != 3 {
 		t.Fatal("new owner incarnation lost", calls)
+	}
+}
+
+func TestIntegrationWakeNativeCLIDisposableEmit(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	sha := strings.Repeat("e", 40)
+	owner := "forge-orchestrator-39a9827d2b"
+	action := "merge SHA " + sha + " of PR 77"
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	run := func(args ...string) (string, int) {
+		t.Helper()
+		cmd := exec.Command(buildHerd(t), append([]string{"integration-wake"}, args...)...)
+		cmd.Dir = root
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return string(out), 0
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return string(out), exitErr.ExitCode()
+		}
+		t.Fatalf("herd integration-wake %v: %v\n%s", args, err, out)
+		return "", -1
+	}
+	emit := func(at time.Time, next string) (string, int) {
+		t.Helper()
+		return run("--emit", "--candidate", sha, "--pr", "77", "--task", "FAC-599", "--owner", owner, "--target", "wK:pZ6", "--session", "term-1", "--action", next, "--now", at.Format(time.RFC3339), "--max-age", "1m", "--json")
+	}
+	emptyOut, emptyCode := emit(now, "")
+	if emptyCode == 0 {
+		t.Fatalf("empty action was accepted:\n%s", emptyOut)
+	}
+	if _, err := os.Stat(integrationWakePath(root)); !os.IsNotExist(err) {
+		t.Fatal("empty action wrote wake state")
+	}
+	namelessOut, namelessCode := emit(now, "review something")
+	if namelessCode == 0 {
+		t.Fatalf("action without SHA/PR was accepted:\n%s", namelessOut)
+	}
+	out, code := emit(now, action)
+	if code != 0 {
+		t.Fatalf("emit failed: %s", out)
+	}
+	var report struct {
+		Wake   beat.IntegrationWake `json:"wake"`
+		Merged bool                 `json:"merged"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("emit json: %v\n%s", err, out)
+	}
+	if report.Merged || report.Wake.Owner != owner || report.Wake.Action != action || report.Wake.Generation != 1 || report.Wake.PullRequest != 77 {
+		t.Fatalf("wake is not executable for the exact owner: %+v", report)
+	}
+	if !strings.Contains(report.Wake.Action, sha) || !strings.Contains(report.Wake.Action, "77") {
+		t.Fatal("wake action omitted exact SHA or PR")
+	}
+	again, againCode := emit(now.Add(time.Second), action)
+	if againCode != 0 {
+		t.Fatalf("coalesce emit failed: %s", again)
+	}
+	if err := json.Unmarshal([]byte(again), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Wake.Generation != 1 || report.Merged {
+		t.Fatalf("stale identical wake was not coalesced: %+v", report)
+	}
+	escalated, escCode := emit(now.Add(time.Minute), action)
+	if escCode != 0 {
+		t.Fatalf("escalation emit failed: %s", escalated)
+	}
+	if err := json.Unmarshal([]byte(escalated), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.Wake.Escalated || report.Wake.Generation != 2 || report.Merged {
+		t.Fatalf("unconsumed wake did not escalate: %+v", report)
+	}
+	ackOut, ackCode := run("--candidate", sha, "--generation", "2")
+	if ackCode != 0 || !strings.Contains(ackOut, "no merge") {
+		t.Fatalf("ack failed: %d %s", ackCode, ackOut)
+	}
+	redeliver, redeliverCode := emit(now.Add(2*time.Minute), action)
+	if redeliverCode != 0 {
+		t.Fatalf("acked emit failed: %s", redeliver)
+	}
+	if err := json.Unmarshal([]byte(redeliver), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Wake.Generation != 2 || report.Merged {
+		t.Fatalf("acknowledged wake changed identity: %+v", report)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,9 @@ func (a IntegrationAction) validate() error {
 	}
 	if strings.TrimSpace(a.Target) == "" || strings.TrimSpace(a.Session) == "" || strings.TrimSpace(a.Owner) == "" || strings.TrimSpace(a.Task) == "" || strings.TrimSpace(a.Action) == "" {
 		return fmt.Errorf("integration wake requires task, owner and executable action")
+	}
+	if !strings.Contains(a.Action, a.CandidateSHA) || !strings.Contains(a.Action, strconv.Itoa(a.PullRequest)) {
+		return fmt.Errorf("integration wake action must name the exact SHA and PR")
 	}
 	return nil
 }
@@ -126,9 +130,31 @@ func saveIntegrationState(path string, state integrationState) error {
 // race an old intent into being sent after its replacement. No callback may
 // re-enter this queue. All delivered actions still require merge admission.
 func ReconcileIntegrationWakes(ctx context.Context, path string, ready []IntegrationAction, now time.Time, maxAge time.Duration, deliver func(context.Context, IntegrationWake) error) ([]IntegrationWake, error) {
-	if now.IsZero() || maxAge <= 0 || deliver == nil {
-		return nil, fmt.Errorf("integration wake requires clock, positive escalation age and delivery")
+	desired, err := validatedReady(ready)
+	if err != nil {
+		return nil, err
 	}
+	return applyIntegrationWakes(ctx, path, desired, ready, now, maxAge, deliver, true)
+}
+
+// EnqueueIntegrationWake records one candidate's executable intent. Other
+// candidates stay queued: this is last-write-wins for one SHA, not a complete
+// readiness snapshot. Delivery still records a prompt; it never merges.
+func EnqueueIntegrationWake(ctx context.Context, path string, action IntegrationAction, now time.Time, maxAge time.Duration, deliver func(context.Context, IntegrationWake) error) (IntegrationWake, error) {
+	if err := action.validate(); err != nil {
+		return IntegrationWake{}, err
+	}
+	wakes, err := applyIntegrationWakes(ctx, path, map[string]IntegrationAction{action.CandidateSHA: action}, []IntegrationAction{action}, now, maxAge, deliver, false)
+	if err != nil {
+		return IntegrationWake{}, err
+	}
+	if len(wakes) != 1 {
+		return IntegrationWake{}, fmt.Errorf("integration enqueue lost candidate %s", action.CandidateSHA)
+	}
+	return wakes[0], nil
+}
+
+func validatedReady(ready []IntegrationAction) (map[string]IntegrationAction, error) {
 	desired := map[string]IntegrationAction{}
 	for _, a := range ready {
 		if err := a.validate(); err != nil {
@@ -139,6 +165,13 @@ func ReconcileIntegrationWakes(ctx context.Context, path string, ready []Integra
 		}
 		desired[a.CandidateSHA] = a
 	}
+	return desired, nil
+}
+
+func applyIntegrationWakes(ctx context.Context, path string, desired map[string]IntegrationAction, order []IntegrationAction, now time.Time, maxAge time.Duration, deliver func(context.Context, IntegrationWake) error, withdrawAbsent bool) ([]IntegrationWake, error) {
+	if now.IsZero() || maxAge <= 0 || deliver == nil {
+		return nil, fmt.Errorf("integration wake requires clock, positive escalation age and delivery")
+	}
 	var result []IntegrationWake
 	err := envelope.WithSessionFileLock(path, func() error {
 		if err := ctx.Err(); err != nil {
@@ -148,10 +181,12 @@ func ReconcileIntegrationWakes(ctx context.Context, path string, ready []Integra
 		if err != nil {
 			return err
 		}
-		for sha, w := range state.Wakes {
-			if _, ok := desired[sha]; !ok {
-				w.Withdrawn = true
-				state.Wakes[sha] = w
+		if withdrawAbsent {
+			for sha, w := range state.Wakes {
+				if _, ok := desired[sha]; !ok {
+					w.Withdrawn = true
+					state.Wakes[sha] = w
+				}
 			}
 		}
 		for sha, a := range desired {
@@ -179,14 +214,20 @@ func ReconcileIntegrationWakes(ctx context.Context, path string, ready []Integra
 		}
 		// Preserve the caller's canonical priority/ref order; do not replace it
 		// with SHA order or duplicate the provider's priority policy here.
-		keys := make([]string, 0, len(ready))
-		for _, action := range ready {
+		keys := make([]string, 0, len(order))
+		for _, action := range order {
 			keys = append(keys, action.CandidateSHA)
 		}
 		var problems []error
 		for _, sha := range keys {
 			w := state.Wakes[sha]
-			if w.Withdrawn || !w.ConsumedAt.IsZero() {
+			if w.Withdrawn {
+				continue
+			}
+			if !w.ConsumedAt.IsZero() {
+				if !withdrawAbsent {
+					result = append(result, w)
+				}
 				continue
 			}
 			if w.DeliveredAt.IsZero() {

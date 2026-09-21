@@ -365,7 +365,7 @@ func main() {
 		runSend()
 
 	case "integration-wake":
-		if err := runIntegrationWakeAck(os.Args[2:]); err != nil {
+		if err := runIntegrationWake(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

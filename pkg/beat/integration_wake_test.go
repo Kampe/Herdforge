@@ -12,7 +12,8 @@ import (
 )
 
 func integrationFixture() IntegrationAction {
-	return IntegrationAction{CandidateSHA: strings.Repeat("a", 40), PullRequest: 123, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "terminal-1", Action: "Run normal integration admission for the exact candidate and PR 123"}
+	sha := strings.Repeat("a", 40)
+	return IntegrationAction{CandidateSHA: sha, PullRequest: 123, Task: "FAC-599", Owner: "coordinator", Target: "wK:p1", Session: "terminal-1", Action: "Run normal integration admission for exact candidate " + sha + " and PR 123"}
 }
 
 func TestIntegrationWakeReplacesPerCandidateAndRejectsDelayedAck(t *testing.T) {
@@ -22,6 +23,7 @@ func TestIntegrationWakeReplacesPerCandidateAndRejectsDelayedAck(t *testing.T) {
 	b := a
 	b.CandidateSHA = strings.Repeat("b", 40)
 	b.PullRequest = 124
+	b.Action = "Run normal integration admission for exact candidate " + b.CandidateSHA + " and PR 124"
 	var sent []IntegrationWake
 	send := func(_ context.Context, w IntegrationWake) error { sent = append(sent, w); return nil }
 	run := func(actions []IntegrationAction, at time.Time) []IntegrationWake {
@@ -41,6 +43,7 @@ func TestIntegrationWakeReplacesPerCandidateAndRejectsDelayedAck(t *testing.T) {
 		t.Fatal("unchanged observation resent successful delivery")
 	}
 	a.PullRequest = 125
+	a.Action = "Run normal integration admission for exact candidate " + a.CandidateSHA + " and PR 125"
 	run([]IntegrationAction{a, b}, now.Add(2*time.Second))
 	if len(sent) != 3 || sent[2].PullRequest != 125 || sent[2].Generation != 2 {
 		t.Fatalf("replacement not delivered: %+v", sent)
@@ -108,13 +111,14 @@ func TestIntegrationWakeInvalidSnapshotPreservesPriorState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	badAction, badOwner, badSHA, badTarget, badSession := a, a, a, a, a
+	badAction, badOwner, badSHA, badTarget, badSession, nameless := a, a, a, a, a, a
 	badAction.Action = ""
 	badOwner.Owner = ""
 	badSHA.CandidateSHA = "abc"
 	badTarget.Target = ""
 	badSession.Session = ""
-	for _, bad := range []IntegrationAction{badAction, badOwner, badSHA, badTarget, badSession} {
+	nameless.Action = "review something"
+	for _, bad := range []IntegrationAction{badAction, badOwner, badSHA, badTarget, badSession, nameless} {
 		if _, err := ReconcileIntegrationWakes(context.Background(), path, []IntegrationAction{bad}, now, time.Minute, send); err == nil {
 			t.Fatalf("accepted invalid action: %+v", bad)
 		}
@@ -195,11 +199,76 @@ func TestIntegrationWakePreservesCanonicalAdmissionOrder(t *testing.T) {
 	b := a
 	a.CandidateSHA = strings.Repeat("f", 40)
 	a.Task = "FAC-2"
+	a.Action = "Run normal integration admission for exact candidate " + a.CandidateSHA + " and PR 123"
 	b.CandidateSHA = strings.Repeat("a", 40)
 	b.Task = "FAC-10"
+	b.Action = "Run normal integration admission for exact candidate " + b.CandidateSHA + " and PR 123"
 	var sent []string
 	_, err := ReconcileIntegrationWakes(context.Background(), filepath.Join(t.TempDir(), "wakes.json"), []IntegrationAction{a, b}, time.Now(), time.Minute, func(_ context.Context, w IntegrationWake) error { sent = append(sent, w.Task); return nil })
 	if err != nil || len(sent) != 2 || sent[0] != "FAC-2" || sent[1] != "FAC-10" {
 		t.Fatalf("caller priority/ref order changed: %v %v", err, sent)
+	}
+}
+
+func TestEnqueueIntegrationWakeKeepsSiblingAndRefusesEmptyAction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wakes.json")
+	now := time.Now().UTC()
+	a := integrationFixture()
+	b := a
+	b.CandidateSHA = strings.Repeat("b", 40)
+	b.PullRequest = 124
+	b.Action = "Run normal integration admission for exact candidate " + b.CandidateSHA + " and PR 124"
+	send := func(context.Context, IntegrationWake) error { return nil }
+	if _, err := ReconcileIntegrationWakes(context.Background(), path, []IntegrationAction{a, b}, now, time.Minute, send); err != nil {
+		t.Fatal(err)
+	}
+	a.PullRequest = 125
+	a.Action = "merge SHA " + a.CandidateSHA + " of PR 125"
+	got, err := EnqueueIntegrationWake(context.Background(), path, a, now.Add(time.Second), time.Minute, send)
+	if err != nil || got.Generation != 2 || got.PullRequest != 125 || got.Owner != a.Owner {
+		t.Fatalf("enqueue did not replace one candidate: %v %+v", err, got)
+	}
+	pending, err := ReconcileIntegrationWakes(context.Background(), path, []IntegrationAction{a, b}, now.Add(2*time.Second), time.Minute, func(context.Context, IntegrationWake) error {
+		t.Fatal("unchanged sibling was redelivered")
+		return nil
+	})
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("enqueue withdrew the sibling: %v %+v", err, pending)
+	}
+	empty := a
+	empty.Action = ""
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnqueueIntegrationWake(context.Background(), path, empty, now, time.Minute, send); err == nil {
+		t.Fatal("empty action was recorded")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("empty action mutated durable state")
+	}
+}
+
+func TestEnqueueIntegrationWakeEscalatesUnconsumed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wakes.json")
+	now := time.Now().UTC()
+	a := integrationFixture()
+	var sent []IntegrationWake
+	send := func(_ context.Context, w IntegrationWake) error { sent = append(sent, w); return nil }
+	first, err := EnqueueIntegrationWake(context.Background(), path, a, now, time.Minute, send)
+	if err != nil || first.Generation != 1 || first.Escalated {
+		t.Fatalf("first enqueue: %v %+v", err, first)
+	}
+	same, err := EnqueueIntegrationWake(context.Background(), path, a, now.Add(time.Second), time.Minute, send)
+	if err != nil || same.Generation != 1 || len(sent) != 1 {
+		t.Fatalf("stale identical enqueue was not coalesced: %v %+v sent=%d", err, same, len(sent))
+	}
+	escalated, err := EnqueueIntegrationWake(context.Background(), path, a, now.Add(time.Minute), time.Minute, send)
+	if err != nil || !escalated.Escalated || escalated.Generation != 2 || len(sent) != 2 {
+		t.Fatalf("unconsumed wake did not escalate: %v %+v sent=%d", err, escalated, len(sent))
 	}
 }
