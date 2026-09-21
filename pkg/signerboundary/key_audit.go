@@ -57,7 +57,7 @@ func (s *Server) bindDiskKeyToLoadedPub() error {
 	data, err := readBoundedAuditSeed(f)
 	_ = f.Close()
 	if err != nil {
-		return fmt.Errorf("%w: read key for audit bind: %v", err)
+		return fmt.Errorf("%w: read key for audit bind: %v", ErrProvisioning, err)
 	}
 	seed, err := hex.DecodeString(strings.TrimSpace(string(data)))
 	for i := range data {

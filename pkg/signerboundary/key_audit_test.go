@@ -20,7 +20,7 @@ func validAuditFixture(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey, Sig
 	st := KeyAuditStatement{
 		Domain:    keyAuditDomain,
 		Nonce:     req.Nonce,
-		Path:      "/tmp/keys/private/id.ed25519",
+		Path:      "pkg/signerboundary/testdata/audit-key/private/id.ed25519",
 		Identity:  "id",
 		OwnerUID:  9,
 		Mode:      "0600",
@@ -53,8 +53,10 @@ func TestVerifyKeyAudit_RejectsBadSignature(t *testing.T) {
 func TestVerifyKeyAudit_RejectsAlteredSignedClaims(t *testing.T) {
 	pub, _, req, st, sig := validAuditFixture(t)
 	st.OwnerUID = 99
-	if err := verifyKeyAudit(pub, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
-		t.Fatal("altered signed claims must fail")
+	// Expected UID matches the mutated claim so static UID check passes;
+	// original signature must still fail (cryptographic binding).
+	if err := verifyKeyAudit(pub, st.Path, st.Identity, 99, 42, req, st, sig); err == nil {
+		t.Fatal("altered signed claims must fail signature")
 	}
 }
 
@@ -74,7 +76,7 @@ func TestVerifyKeyAudit_RejectsWrongNonceIdentityPathUIDPID(t *testing.T) {
 			return verifyKeyAudit(pub, st.Path, "wrong-id", 9, 42, req, st, sig)
 		}, "identity"},
 		{"path", func() error {
-			return verifyKeyAudit(pub, "/tmp/other", st.Identity, 9, 42, req, st, sig)
+			return verifyKeyAudit(pub, "pkg/signerboundary/testdata/audit-key/private/other.ed25519", st.Identity, 9, 42, req, st, sig)
 		}, "path"},
 		{"uid", func() error {
 			return verifyKeyAudit(pub, st.Path, st.Identity, 8, 42, req, st, sig)
@@ -101,6 +103,9 @@ func TestVerifyKeyAudit_RejectsMissingPinnedKey(t *testing.T) {
 	if err := verifyKeyAudit(nil, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
 		t.Fatal("nil published key must fail")
 	}
+	if err := verifyKeyAudit(ed25519.PublicKey{}, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
+		t.Fatal("empty published key must fail")
+	}
 }
 
 func TestReadBoundedAuditSeed_AcceptsHexPlusNewline(t *testing.T) {
@@ -120,13 +125,6 @@ func TestReadBoundedAuditSeed_RejectsOverflow(t *testing.T) {
 	_, err := readBoundedAuditSeed(bytes.NewReader(raw))
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("want overflow, got %v", err)
-	}
-}
-
-func TestMutation_KeyAudit_EmptyPubNeverOK(t *testing.T) {
-	_, _, req, st, sig := validAuditFixture(t)
-	if err := verifyKeyAudit(ed25519.PublicKey{}, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
-		t.Fatal("empty published key must fail closed")
 	}
 }
 
