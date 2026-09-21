@@ -182,6 +182,8 @@ print -r -- "$out1" | grep -E -q 'owner census found active use' || {
   exit 1
 }
 print -r -- "$out1" | grep -E -q 'retired=1([^0-9]|$)' || {
+  log "native ahead/status merged=$(git -C "$MERGED" rev-list --count origin/main..HEAD 2>&1) status=$(git -C "$MERGED" status --porcelain=v1 2>&1)"
+  log "native ahead/status owned=$(git -C "$OWNED" rev-list --count origin/main..HEAD 2>&1) status=$(git -C "$OWNED" status --porcelain=v1 2>&1)"
   print -u2 "expected retired=1 for merged fixture: $out1"
   exit 1
 }
