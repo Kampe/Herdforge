@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -707,15 +708,31 @@ func TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean(t *testing.T) {
 	}
 	run("add", "README")
 	run("commit", "-qm", "init")
-	missing := filepath.Join(dir, "missing-gitconfig")
-	t.Setenv("GIT_CONFIG_GLOBAL", missing)
-	t.Setenv("GIT_CONFIG_SYSTEM", missing)
+	excludes := filepath.Join(dir, "no-read-excludes")
+	if err := os.WriteFile(excludes, []byte("*\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(excludes, 0o644) })
+	run("config", "core.excludesFile", excludes)
+	direct := exec.Command("git", "-C", dir, "status", "--porcelain", "--untracked-files=all", "--ignored")
+	var stdout, stderr bytes.Buffer
+	direct.Stdout = &stdout
+	direct.Stderr = &stderr
+	if err := direct.Run(); err != nil {
+		t.Skipf("git status with unreadable excludesFile not rc0 on this Git: %v stderr=%q", err, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "" {
+		t.Fatalf("direct git stdout want empty, got %q", stdout.String())
+	}
+	if strings.TrimSpace(stderr.String()) == "" {
+		t.Fatal("direct git stderr must be nonempty warning evidence")
+	}
 	out, err := gitOutIn(dir, "status", "--porcelain", "--untracked-files=all", "--ignored")
 	if err != nil {
-		t.Fatalf("status with missing global config: %v", err)
+		t.Fatalf("gitOutIn status: %v", err)
 	}
 	if strings.TrimSpace(out) != "" {
-		t.Fatalf("clean stdout want empty, got %q", out)
+		t.Fatalf("gitOutIn stdout want empty, got %q", out)
 	}
 	entries := inspectWorktreeEntries([]worktreeEntry{{Path: dir}})
 	if entries[0].StatusError != "" {
@@ -730,5 +747,12 @@ func TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean(t *testing.T) {
 	entries = inspectWorktreeEntries([]worktreeEntry{{Path: dir}})
 	if !entries[0].Dirty {
 		t.Fatal("true untracked dirt must still classify dirty")
+	}
+	_, err = gitOutIn(filepath.Join(dir, "not-a-repo"), "status", "--porcelain")
+	if err == nil {
+		t.Fatal("nonzero git must refuse")
+	}
+	if !strings.Contains(err.Error(), "not a git repository") && !strings.Contains(err.Error(), "git -C") {
+		t.Fatalf("nonzero git error must retain diagnostics, got %v", err)
 	}
 }

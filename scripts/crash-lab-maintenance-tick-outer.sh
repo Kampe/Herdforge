@@ -77,17 +77,10 @@ sudo -n chmod 0755 "$STAGE"
 sudo -n chmod 0644 "$STAGE/maint-lab.log"
 
 set +e
-sudo -n -H -u "$labuser" -- env -i \
-  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-  HOME="$STAGE" \
-  USER="$labuser" \
-  LOGNAME="$labuser" \
-  HERD="$STAGE/herd" \
-  MAINT_LAB_LOG="$STAGE/maint-lab.log" \
-  GITHUB_ACTIONS=true \
-  RUNNER_OS=Linux \
-  LANG=C \
-  GIT_CONFIG_NOSYSTEM=1 \
+sudo -n -H -u "$labuser" -- env -u XDG_CONFIG_HOME -u XDG_CONFIG_DIRS -u XDG_DATA_HOME -u XDG_CACHE_HOME \
+  -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_NOSYSTEM \
+  -u HERD_ROOT -u HERD_REPO_ROOT -u HERD_PROJECT_ROOT -u HERD_CONFIG_PATH -u HERD_WORKSPACE \
+  HERD="$STAGE/herd" MAINT_LAB_LOG="$STAGE/maint-lab.log" GITHUB_ACTIONS=true RUNNER_OS=Linux LANG=C \
   zsh "$STAGE/inner.sh"
 inner_rc=$?
 set -e

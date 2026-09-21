@@ -30,6 +30,9 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
 
+      - name: Mutate gitOutIn CombinedOutput and require named FAIL
+        run: zsh scripts/crash-lab-gitoutin-mutation.sh
+
       - name: Mutate to per-worktree root and require named FAIL
         env:
           MUTATION_LOG: ${{ github.workspace }}/maintenance-root-mutation.log
