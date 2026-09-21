@@ -14,7 +14,7 @@ if ! git diff --quiet -- "$FILE" || ! git diff --cached --quiet -- "$FILE"; then
   exit 1
 fi
 trap restore EXIT
-n="$(grep -F -c -- $'if !referenced {\n\t\t\tcontinue' "$FILE" || true)"
+n="$(grep -F -c -- 'if !referenced {' "$FILE" || true)"
 if [[ "$n" != "1" ]]; then
   print -u2 "if !referenced not unique count=$n"
   exit 1
