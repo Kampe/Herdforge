@@ -41,6 +41,8 @@ func runSignerBoundary() {
 		runSignerBoundaryRotateKey(os.Args[3:])
 	case "revoke":
 		runSignerBoundaryRevoke(os.Args[3:])
+	case "audit-key":
+		runSignerBoundaryAuditKey(os.Args[3:])
 	case "sign", "sign-bytes":
 		fmt.Fprintln(os.Stderr, "signer-boundary: no general sign oracle. Use sign-verdict.")
 		os.Exit(1)
@@ -427,6 +429,39 @@ func runSignerBoundaryRotateKey(args []string) {
 	}
 	fmt.Printf("rotated key=%s pub=%s restarted=%v new_pid=%d\n",
 		res.KeyPath, res.PublicHex, res.Restarted, res.NewSignerPID)
+}
+
+func runSignerBoundaryAuditKey(args []string) {
+	fs := flag.NewFlagSet("audit-key", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	nonce := fs.String("nonce", "", "")
+	repo := fs.String("repo", ".", "")
+	keyDir := fs.String("key-dir", "", "")
+	identity := fs.String("identity", "", "")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	opts := signerboundary.Options{RepoRoot: *repo, RequireSeparateUID: true}
+	if *keyDir != "" {
+		opts.KeyDir = *keyDir
+	} else {
+		dir, err := signerboundary.ResolveKeyDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "audit-key: %v\n", err)
+			os.Exit(1)
+		}
+		opts.KeyDir = dir
+	}
+	if *identity != "" {
+		opts.Identity = *identity
+	} else {
+		opts.Identity = defaultSignerIdentity(opts.RepoRoot)
+	}
+	if err := signerboundary.AuditKeyAsRequester(opts, *nonce); err != nil {
+		fmt.Fprintf(os.Stderr, "audit-key: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("audit-key ok")
 }
 
 func runSignerBoundaryRevoke(args []string) {

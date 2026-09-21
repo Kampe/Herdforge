@@ -1,6 +1,7 @@
 package signerboundary
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"os"
 	"runtime"
@@ -9,12 +10,14 @@ import (
 
 type proveSepConfig struct {
 	KeyPath      string
+	Identity     string
 	SignerUID    int
 	RequesterUID int
 	BuilderUID   int
 	SocketPath   string
 	SessionKey   SessionKey
 	SignerPID    int
+	Pub          ed25519.PublicKey
 }
 
 // proveSeparateUID runs the mandatory live suite using structured ProbeReceipt
@@ -22,19 +25,44 @@ type proveSepConfig struct {
 // BLOCKED — never treated as denial success.
 func proveSeparateUID(cfg proveSepConfig) (digest string, signerPID int, err error) {
 	var receipts []ProbeReceipt
+	asRequester := os.Getuid() == cfg.RequesterUID && os.Getuid() != cfg.SignerUID && os.Getuid() != 0
 
-	// --- path-harden (must succeed as positive proof, not "error = deny") ---
-	if err := auditKeyMaterialPath(cfg.KeyPath, cfg.SignerUID); err != nil {
-		return "", 0, err
+	if asRequester {
+		req := SignRequest{Op: OpKeyAudit, SessionID: "audit-key-prove"}
+		st, sig, wirePID, wirePub, err := requestKeyAuditOverIPC(cfg.SocketPath, cfg.SessionKey, &req)
+		if err != nil {
+			return "", 0, err
+		}
+		pub := cfg.Pub
+		if len(pub) == 0 {
+			pub = wirePub
+		}
+		if err := verifyKeyAudit(pub, cfg.KeyPath, cfg.Identity, cfg.SignerUID, cfg.SignerPID, req, st, sig); err != nil {
+			return "", 0, err
+		}
+		if wirePID != 0 && wirePID != st.ServerPID {
+			return "", 0, fmt.Errorf("%w: audit wire pid mismatch", ErrProvisioning)
+		}
+		receipts = append(receipts, ProbeReceipt{
+			Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
+			Detail: "authenticated signer key-audit verified against published key",
+			SignerPID: st.ServerPID, SignerUID: st.ServerUID,
+		})
+	} else {
+		if err := auditKeyMaterialPath(cfg.KeyPath, cfg.SignerUID); err != nil {
+			return "", 0, err
+		}
+		receipts = append(receipts, ProbeReceipt{
+			Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
+			Detail: "symlink/hardlink/nlink/owner/mode audited; path exists",
+		})
 	}
-	receipts = append(receipts, ProbeReceipt{
-		Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
-		Detail: "symlink/hardlink/nlink/owner/mode audited; path exists",
-	})
 
 	// --- key-read: file MUST exist; only EACCES/EPERM counts as denial ---
-	if err := requirePathExists(cfg.KeyPath); err != nil {
-		return "", 0, err
+	if !asRequester {
+		if err := requirePathExists(cfg.KeyPath); err != nil {
+			return "", 0, err
+		}
 	}
 	_, rerr := os.ReadFile(cfg.KeyPath)
 	if rerr == nil {

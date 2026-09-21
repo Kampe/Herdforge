@@ -259,6 +259,26 @@ HERD_SIGNER_PID="$(print -r -- "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{prin
 # synthesize attestation or weaken RequireReady.
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary establish --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "establish failed as requester"
 
+set +e
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity wrong-id >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2)
+wrong_rc=$?
+set -e
+if (( wrong_rc == 0 )); then
+  fail 1 "wrong identity audit-key should fail"
+fi
+log "negative wrong-identity rc=$wrong_rc"
+
+replay_nonce="00112233445566778899aabbccddeeff"
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab --nonce "$replay_nonce" >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "first replay nonce should succeed"
+set +e
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab --nonce "$replay_nonce" >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2)
+replay_rc=$?
+set -e
+if (( replay_rc == 0 )); then
+  fail 1 "replayed audit-key nonce should fail"
+fi
+log "negative replay rc=$replay_rc"
+
 # status/prove as requester using ResolveKeyDir (HERD_KEY_DIR).
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary status >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "status failed as requester"
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 30s "$HERD" signer-boundary prove --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "prove failed as requester"

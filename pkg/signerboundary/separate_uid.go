@@ -15,31 +15,36 @@ func establishSeparateUID(opts Options) (*Boundary, error) {
 		return nil, err
 	}
 
-	if err := EnsureKeyLayout(opts.KeyDir, topo); err != nil {
-		return nil, err
-	}
+	asRequester := os.Getuid() == topo.RequesterUID && os.Getuid() != topo.SignerUID && os.Getuid() != 0
 	keyPath := PrivateKeyPath(opts.KeyDir, opts.Identity)
-	// Prefer private/ layout; fall back to legacy flat key path for migration.
-	if _, err := os.Lstat(keyPath); err != nil {
-		legacy := filepath.Join(opts.KeyDir, opts.Identity+KeyFileSuffix)
-		if _, e2 := os.Lstat(legacy); e2 == nil {
-			keyPath = legacy
+	if asRequester {
+		if data, err := os.ReadFile(keyPath); err == nil && len(data) > 0 {
+			return nil, fmt.Errorf("%w: private key readable by requester uid %d", ErrAdversarialSuccess, os.Getuid())
+		} else if err != nil && !isPermissionDenied(err) {
+			return nil, fmt.Errorf("%w: requester key-read harness failure (want EACCES/EPERM, got %v)", ErrProvisioning, err)
 		}
-	}
-	if err := auditKeyMaterialPath(keyPath, topo.SignerUID); err != nil {
-		return nil, fmt.Errorf("%w: key must be owned by signer uid %d at %s: %v",
-			ErrProvisioning, topo.SignerUID, keyPath, err)
-	}
-	if err := AuditKeyLayout(opts.KeyDir, opts.Identity, topo); err != nil {
-		// AuditKeyLayout requires private/ layout; legacy flat keys skip when private missing.
-		if _, e := os.Lstat(PrivateKeyPath(opts.KeyDir, opts.Identity)); e == nil {
+	} else {
+		if err := EnsureKeyLayout(opts.KeyDir, topo); err != nil {
 			return nil, err
 		}
-	}
-
-	// LIVE: requester uid must not read the private key (owned by signer).
-	if data, err := os.ReadFile(keyPath); err == nil && len(data) > 0 {
-		return nil, fmt.Errorf("%w: private key readable by requester uid %d", ErrAdversarialSuccess, os.Getuid())
+		if _, err := os.Lstat(keyPath); err != nil {
+			legacy := filepath.Join(opts.KeyDir, opts.Identity+KeyFileSuffix)
+			if _, e2 := os.Lstat(legacy); e2 == nil {
+				keyPath = legacy
+			}
+		}
+		if err := auditKeyMaterialPath(keyPath, topo.SignerUID); err != nil {
+			return nil, fmt.Errorf("%w: key must be owned by signer uid %d at %s: %v",
+				ErrProvisioning, topo.SignerUID, keyPath, err)
+		}
+		if err := AuditKeyLayout(opts.KeyDir, opts.Identity, topo); err != nil {
+			if _, e := os.Lstat(PrivateKeyPath(opts.KeyDir, opts.Identity)); e == nil {
+				return nil, err
+			}
+		}
+		if data, err := os.ReadFile(keyPath); err == nil && len(data) > 0 {
+			return nil, fmt.Errorf("%w: private key readable by requester uid %d", ErrAdversarialSuccess, os.Getuid())
+		}
 	}
 
 	pub, err := loadPublishedPublicKey(opts.RepoRoot)
@@ -71,12 +76,14 @@ func establishSeparateUID(opts Options) (*Boundary, error) {
 
 	digest, livePID, err := proveSeparateUID(proveSepConfig{
 		KeyPath:      keyPath,
+		Identity:     opts.Identity,
 		SignerUID:    topo.SignerUID,
 		RequesterUID: topo.RequesterUID,
 		BuilderUID:   topo.BuilderUID,
 		SocketPath:   sock,
 		SessionKey:   sessionKey,
 		SignerPID:    signerPID,
+		Pub:          pub,
 	})
 	if err != nil {
 		return nil, err

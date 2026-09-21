@@ -46,7 +46,7 @@ func currentAdmission() AdmissionFunc {
 // FAC-145 replaces/extends this with durable task-context admission.
 func DefaultAdmitReviewerVerdict(req SignRequest) error {
 	switch req.Op {
-	case OpPing, OpProbe:
+	case OpPing, OpProbe, OpKeyAudit:
 		return nil
 	case OpSignReceipt:
 		// Receipts require non-empty payload (ValidateProduction); deeper ledger
