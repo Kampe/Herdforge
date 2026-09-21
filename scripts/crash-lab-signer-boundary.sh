@@ -20,6 +20,7 @@ if [[ -z "${RUNNER_TEMP:-}" || ! -d "$RUNNER_TEMP" ]]; then
 fi
 
 HERD="${HERD:?HERD binary path required}"
+HERD="$(readlink -f "$HERD")"
 REPO="${REPO:?REPO path required}"
 EVIDENCE="${EVIDENCE:?EVIDENCE path required}"
 WORKDIR="$(mktemp -d "${RUNNER_TEMP}/herd-signer-lab.XXXXXX")"
@@ -28,56 +29,114 @@ SOCK="$WORKDIR/signer.sock"
 HERD_SIGNER_PID=""
 created_group=""
 created_users=()
-orig_exit=0
 
 log() { print -r -- "$*" | tee -a "$EVIDENCE"; }
 
 fail() {
-  orig_exit=$1
+  local code=$1
   shift
   print -u2 -r -- "$*"
   print -r -- "FAIL: $*" >>"$EVIDENCE"
-  exit "$orig_exit"
+  exit "$code"
+}
+
+numeric_pid() { [[ -n "${1:-}" && "$1" == <-> && "$1" -gt 1 ]]; }
+
+lab_owned_pid() {
+  local pid=$1
+  numeric_pid "$pid" || return 1
+  [[ -n "${HERD_SIGNER_UID:-}" ]] || return 1
+  local uid exe cmd
+  uid="$(ps -o uid= -p "$pid" 2>/dev/null | awk '{print $1}')"
+  [[ "$uid" == "$HERD_SIGNER_UID" ]] || return 1
+  exe="$(sudo -n readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  cmd="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+  [[ "$exe" == "$HERD" || "$exe" == "$HERD (deleted)" || "$cmd" == "$HERD "* || "$cmd" == *"/herd-linux-amd64 "* ]] || return 1
+  [[ "$cmd" == *signer-boundary* || "$exe" == "$HERD" || "$exe" == "$HERD (deleted)" ]] || return 1
+}
+
+stop_lab_pid() {
+  local pid=$1
+  if ! lab_owned_pid "$pid"; then
+    print -r -- "cleanup: skip pid=$pid (not numeric lab-owned herd signer)" >>"$EVIDENCE"
+    return 0
+  fi
+  if ! sudo -n kill -TERM "$pid" 2>>"$EVIDENCE"; then
+    print -r -- "cleanup: TERM pid=$pid failed" >>"$EVIDENCE"
+    return 1
+  fi
+  local waited=0
+  while (( waited < 30 )) && sudo -n kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if sudo -n kill -0 "$pid" 2>/dev/null; then
+    if ! sudo -n kill -KILL "$pid" 2>>"$EVIDENCE"; then
+      print -r -- "cleanup: KILL pid=$pid failed" >>"$EVIDENCE"
+      return 1
+    fi
+    waited=0
+    while (( waited < 20 )) && sudo -n kill -0 "$pid" 2>/dev/null; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+  fi
+  if sudo -n kill -0 "$pid" 2>/dev/null; then
+    print -r -- "cleanup: pid=$pid still present after KILL" >>"$EVIDENCE"
+    return 1
+  fi
+  return 0
+}
+
+collect_signer_pids() {
+  local pids=() p
+  if numeric_pid "${HERD_SIGNER_PID:-}"; then
+    pids+=("$HERD_SIGNER_PID")
+  fi
+  if [[ -n "${HERD_SIGNER_UID:-}" ]]; then
+    for p in $(ps -o pid= -u "$HERD_SIGNER_UID" 2>/dev/null); do
+      pids+=("$p")
+    done
+  fi
+  print -l -- "${pids[@]}" | awk 'NF && !seen[$0]++'
 }
 
 cleanup() {
   local rc=$?
+  local dirty=0
   set +e
   print -r -- "cleanup begin orig=$rc" >>"$EVIDENCE"
-  if [[ -n "$HERD_SIGNER_PID" ]]; then
-    if ! sudo -n kill -TERM "$HERD_SIGNER_PID" 2>>"$EVIDENCE"; then
-      print -r -- "cleanup: sudo kill -TERM pid=$HERD_SIGNER_PID failed" >>"$EVIDENCE"
+  local p
+  for p in $(collect_signer_pids); do
+    if ! stop_lab_pid "$p"; then
+      dirty=1
     fi
-    local waited=0
-    while (( waited < 30 )) && sudo -n kill -0 "$HERD_SIGNER_PID" 2>/dev/null; do
-      sleep 0.1
-      waited=$((waited + 1))
-    done
-    if sudo -n kill -0 "$HERD_SIGNER_PID" 2>/dev/null; then
-      if ! sudo -n kill -KILL "$HERD_SIGNER_PID" 2>>"$EVIDENCE"; then
-        print -r -- "cleanup: sudo kill -KILL pid=$HERD_SIGNER_PID failed (process still present)" >>"$EVIDENCE"
-        (( rc == 0 )) && rc=1
-      fi
-    fi
-  fi
+  done
   local u
   for u in "${created_users[@]}"; do
     if ! sudo -n userdel "$u" 2>>"$EVIDENCE"; then
       print -r -- "cleanup: userdel $u failed" >>"$EVIDENCE"
+      dirty=1
     fi
   done
   if [[ -n "$created_group" ]]; then
     if ! sudo -n groupdel "$created_group" 2>>"$EVIDENCE"; then
       print -r -- "cleanup: groupdel $created_group failed" >>"$EVIDENCE"
+      dirty=1
     fi
   fi
   if [[ -d "$WORKDIR" ]]; then
     if ! sudo -n rm -rf "$WORKDIR" 2>>"$EVIDENCE"; then
       print -r -- "cleanup: sudo rm workdir failed" >>"$EVIDENCE"
-      (( rc == 0 )) && rc=1
+      dirty=1
     fi
   fi
-  print -r -- "cleanup end rc=$rc" >>"$EVIDENCE"
+  if (( dirty )); then
+    if (( rc == 0 )); then
+      rc=1
+    fi
+  fi
+  print -r -- "cleanup end rc=$rc dirty=$dirty" >>"$EVIDENCE"
   exit $rc
 }
 trap cleanup EXIT
