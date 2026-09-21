@@ -10,6 +10,7 @@ fi
 HERD="${HERD:?HERD binary required}"
 INNER="${INNER:-$(cd "$(dirname "$0")" && pwd)/crash-lab-maintenance-tick.sh}"
 STAGE="$(mktemp -d /tmp/herd-maint-stage.XXXXXX)"
+chmod 0755 "$STAGE"
 labuser="herd-mlab-$$"
 created=0
 inner_rc=1
@@ -17,18 +18,44 @@ cleanup_ok=1
 
 finish() {
   local rc=$inner_rc
+  if [[ -f "$STAGE/maint-lab.log" ]]; then
+    if [[ -n "${MAINT_LAB_LOG:-}" ]]; then
+      cp "$STAGE/maint-lab.log" "$MAINT_LAB_LOG" 2>/dev/null || sudo -n cp "$STAGE/maint-lab.log" "$MAINT_LAB_LOG" || {
+        print -u2 "failed to retrieve inner log"
+        cleanup_ok=0
+      }
+    fi
+  else
+    print -u2 "missing inner log after run rc=$rc"
+    cleanup_ok=0
+  fi
   if [[ -n "${labuser:-}" && $created -eq 1 ]]; then
-    sudo -n pkill -u "$labuser" 2>/dev/null || true
-    sleep 0.2
+    leftover="$(pgrep -u "$labuser" || true)"
+    if [[ -n "$leftover" ]]; then
+      sudo -n pkill -u "$labuser" || true
+      sleep 0.5
+      leftover="$(pgrep -u "$labuser" || true)"
+      if [[ -n "$leftover" ]]; then
+        print -u2 "lab user still has processes: $leftover"
+        cleanup_ok=0
+      fi
+    fi
     if sudo -n userdel "$labuser"; then
-      :
+      if id "$labuser" >/dev/null 2>&1; then
+        print -u2 "user $labuser still present after userdel"
+        cleanup_ok=0
+      fi
     else
       print -u2 "userdel $labuser failed"
       cleanup_ok=0
     fi
   fi
-  if ! rm -rf "$STAGE"; then
+  if ! sudo -n rm -rf "$STAGE"; then
     print -u2 "staging rm failed"
+    cleanup_ok=0
+  fi
+  if [[ -e "$STAGE" ]]; then
+    print -u2 "staging path still exists"
     cleanup_ok=0
   fi
   if (( cleanup_ok == 0 )); then
@@ -44,7 +71,10 @@ cp "$HERD" "$STAGE/herd"
 cp "$INNER" "$STAGE/inner.sh"
 chmod 0755 "$STAGE/herd" "$STAGE/inner.sh"
 : >"$STAGE/maint-lab.log"
+chmod 0644 "$STAGE/maint-lab.log"
 sudo -n chown -R "$labuser:$labuser" "$STAGE"
+sudo -n chmod 0755 "$STAGE"
+sudo -n chmod 0644 "$STAGE/maint-lab.log"
 
 set +e
 sudo -n -u "$labuser" -- env -u HERD_ROOT -u HERD_REPO_ROOT -u HERD_PROJECT_ROOT -u HERD_CONFIG_PATH -u HERD_WORKSPACE \
@@ -52,7 +82,3 @@ sudo -n -u "$labuser" -- env -u HERD_ROOT -u HERD_REPO_ROOT -u HERD_PROJECT_ROOT
   zsh "$STAGE/inner.sh"
 inner_rc=$?
 set -e
-
-if [[ -n "${MAINT_LAB_LOG:-}" && -f "$STAGE/maint-lab.log" ]]; then
-  cp "$STAGE/maint-lab.log" "$MAINT_LAB_LOG" || cleanup_ok=0
-fi
