@@ -6,14 +6,17 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 )
 
 type proveSepConfig struct {
 	KeyPath      string
+	KeyDir       string
 	Identity     string
 	SignerUID    int
 	RequesterUID int
 	BuilderUID   int
+	SocketGID    int
 	SocketPath   string
 	SessionKey   SessionKey
 	SignerPID    int
@@ -89,23 +92,49 @@ func proveSeparateUID(cfg proveSepConfig) (digest string, signerPID int, err err
 		Detail: "server returned UNAUTHORIZED_MAC / INVALID_REQUEST error codes",
 	})
 
-	// --- ipc-auth (canonical admitted verdict — not an arbitrary payload oracle) ---
-	req := NewVerdictRequest(
-		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		"patch-probe", "APPROVED", "fac-169-live-probe", nil,
-	)
+	// --- ipc-auth: one-shot durable probe grant, then verify signature ---
+	if strings.TrimSpace(cfg.KeyDir) == "" {
+		return "", 0, fmt.Errorf("%w: KeyDir required to derive admission ledger", ErrProvisioning)
+	}
+	if len(cfg.Pub) != ed25519.PublicKeySize {
+		return "", 0, fmt.Errorf("%w: pinned published public key required for probe verify", ErrProvisioning)
+	}
+	ledPath := AdmissionLedgerPath(cfg.KeyDir)
+	led, err := OpenAdmissionLedgerTopo(ledPath, Topology{
+		SignerUID: cfg.SignerUID, RequesterUID: cfg.RequesterUID,
+		BuilderUID: cfg.BuilderUID, SocketGID: cfg.SocketGID,
+	})
+	if err != nil {
+		return "", 0, fmt.Errorf("%w: open admission ledger: %v", ErrProvisioning, err)
+	}
+	token := fmt.Sprintf("establish-probe-%d", time.Now().UnixNano())
+	rec := AdmissionRecord{
+		TokenID:      token,
+		CandidateSHA: "cccccccccccccccccccccccccccccccccccccccc",
+		BaseSHA:      "dddddddddddddddddddddddddddddddddddddddd",
+		PatchID:      "establish-prove-probe",
+		SessionID:    "session-establish-prove-" + token,
+		Verdict:      "APPROVED",
+		SingleUse:    true,
+	}
+	if err := led.AppendGrant(rec); err != nil {
+		return "", 0, fmt.Errorf("%w: append probe grant: %v", ErrProvisioning, err)
+	}
+	req := NewVerdictRequest(rec.CandidateSHA, rec.BaseSHA, rec.PatchID, rec.Verdict, rec.SessionID, nil)
+	if err := req.EnsureNonce(); err != nil {
+		return "", 0, err
+	}
 	sig, err := signRequestOverIPC(cfg.SocketPath, cfg.SessionKey, &req)
 	if err != nil {
 		return "", 0, fmt.Errorf("%w: authorized SignRequest failed (serve as uid %d?): %v",
 			ErrProvisioning, cfg.SignerUID, err)
 	}
-	if len(sig) == 0 {
-		return "", 0, fmt.Errorf("%w: empty signature", ErrProvisioning)
+	if !ed25519.Verify(cfg.Pub, req.Canonical(), sig) {
+		return "", 0, fmt.Errorf("%w: probe signature rejected against published key", ErrProvisioning)
 	}
 	receipts = append(receipts, ProbeReceipt{
 		Version: 1, Platform: runtime.GOOS, Operation: "ipc-auth", OK: true,
-		Detail: fmt.Sprintf("authorized SignRequest signature_len=%d", len(sig)),
+		Detail: "probe-only one-shot admitted SignRequest; not a review receipt token=" + token,
 	})
 
 	// --- attach: real ptrace/proc-mem; ESRCH/unsupported BLOCK ---

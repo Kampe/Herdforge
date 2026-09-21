@@ -76,10 +76,12 @@ func establishSeparateUID(opts Options) (*Boundary, error) {
 
 	digest, livePID, err := proveSeparateUID(proveSepConfig{
 		KeyPath:      keyPath,
+		KeyDir:       opts.KeyDir,
 		Identity:     opts.Identity,
 		SignerUID:    topo.SignerUID,
 		RequesterUID: topo.RequesterUID,
 		BuilderUID:   topo.BuilderUID,
+		SocketGID:    topo.SocketGID,
 		SocketPath:   sock,
 		SessionKey:   sessionKey,
 		SignerPID:    signerPID,
