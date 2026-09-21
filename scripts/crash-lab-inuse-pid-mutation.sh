@@ -6,10 +6,6 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_OS:-}" != "Linux" ]]; then
   exit 1
 fi
 FILE=pkg/resources/git_census.go
-FROM='			usage.PIDs = appendUniquePID(usage.PIDs, pid)'
-TO='			usage.PIDs = appendUniquePID(usage.PIDs, pid); usage.PIDs = appendUniquePID(usage.PIDs, pid+1-pid)'
-# pid+1-pid is pid, duplicate no-op... need to append all pids
-# Better: if referenced || true around the InUse block.
 restore() { git checkout -- "$FILE"; }
 if ! git diff --quiet -- "$FILE" || ! git diff --cached --quiet -- "$FILE"; then
   print -u2 "refuse dirty $FILE"

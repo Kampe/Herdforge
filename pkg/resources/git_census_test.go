@@ -348,7 +348,10 @@ func TestLSOFProcessInspectorInUseCancellationBetweenIterationsMarksMetadataUnav
 
 func TestLSOFProcessInspectorInUseManyCancellationBetweenIterationsMarkMetadataUnavailable(t *testing.T) {
 	lsof := writeSilentLsofAndSelfPS(t)
-	root := filepath.Clean(t.TempDir())
+	root, err := filepath.EvalSymlinks(filepath.Clean(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Minute}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
