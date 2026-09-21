@@ -145,7 +145,7 @@ type reapPulseReport struct {
 // genuine failure returns false, because silently swallowing a real cleanup
 // failure would violate this repo's fail-closed invariant.
 func reapLandedWorktreesOnPulse(ctx context.Context, errOut *os.File) bool {
-	root, err := cleanupCoordinationRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	root, err := cleanupCoordinationRoot(ctx, firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
 	if err != nil {
 		fmt.Fprintf(errOut, "pulse: worktree reap: %v\n", err)
 		return false
@@ -384,21 +384,28 @@ func reapPulseStatePath(root, name string) string {
 // maintenance/reap-pulse tick lock and cursor. It uses gitroot.ProjectRoot
 // (git common-dir parent, never HERD_ROOT) so linked checkouts share one
 // flock and one relative cursor base. Unresolved roots fail closed.
-func cleanupCoordinationRoot(start string) (string, error) {
+func cleanupCoordinationRoot(ctx context.Context, start string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("cleanup coordination root: %w", err)
+	}
 	if strings.TrimSpace(start) == "" {
 		start = "."
 	}
-	root, _, err := gitroot.ProjectRoot(context.Background(), start)
+	root, _, err := gitroot.ProjectRoot(ctx, start)
 	if err != nil {
 		return "", fmt.Errorf("cleanup coordination root: %w", err)
 	}
 	if strings.TrimSpace(root) == "" {
 		return "", fmt.Errorf("cleanup coordination root: empty")
 	}
-	if resolved, err := filepath.EvalSymlinks(root); err == nil {
-		root = resolved
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return filepath.Clean(root), nil
+		}
+		return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
 	}
-	return filepath.Clean(root), nil
+	return filepath.Clean(resolved), nil
 }
 
 // reapPulseLockIdentity is the advisory record written into the lock file
