@@ -39,7 +39,8 @@ type reapRow struct {
 	// receipt registry to be this repository's own harvest-merge staging
 	// registration. It is deliberately unexported: it is act-routing state,
 	// not reported classification output.
-	harvest *herdr.HarvestRetirementReceipt
+	harvest    *herdr.HarvestRetirementReceipt
+	taskSource *taskSourceBinding
 }
 
 // runWorktreeReap retires worktrees whose work has demonstrably LANDED.
@@ -69,6 +70,9 @@ func runWorktreeReap(args []string) error {
 	apply := fs.Bool("apply", false, "remove the landed worktrees; without it, report only")
 	asJSON := fs.Bool("json", false, "emit the classification as JSON")
 	base := fs.String("base", "origin/main", "ref that defines 'landed'")
+	enroll := fs.String("enroll-task", "", "validate completed-task enrollment for exactly one --target")
+	receipt := fs.String("receipt", "", "existing completion receipt, relative to the canonical repository")
+	write := fs.Bool("write", false, "publish the validated enrollment; never removes a worktree")
 	var targets reapTargets
 	fs.Var(&targets, "target", "exact repository-relative worktree path to inspect (repeatable; bounds the operation)")
 	// FAC-673: retire by the PR's own closure, not only by branch state.
@@ -85,6 +89,22 @@ func runWorktreeReap(args []string) error {
 		return err
 	}
 	root := firstEnv("HERD_ROOT", "HERD_REPO_ROOT", ".")
+	if fs.NArg() != 0 {
+		return fmt.Errorf("worktree-reap: unexpected positional arguments")
+	}
+	if *enroll != "" {
+		if len(targets) != 1 || *receipt == "" || *apply || *byPR || *base != "origin/main" {
+			return fmt.Errorf("worktree-reap: --enroll-task requires one --target and --receipt; cannot combine with --apply, --by-pr or another base")
+		}
+		binding, err := enrollTaskSource(root, targets[0], *enroll, *receipt, *write)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"enrollment": binding, "written": *write, "applied": false})
+	}
+	if *write || *receipt != "" {
+		return fmt.Errorf("worktree-reap: --write and --receipt require --enroll-task")
+	}
 
 	var entries []worktreeEntry
 	var err error
@@ -218,6 +238,13 @@ func retireLanded(root string, landed []reapRow) (retired, failed []map[string]s
 const batchCensusBudget = 30 * time.Second
 
 func retireLandedWithInspector(root string, landed []reapRow, inspector resources.ProcessInspector) (retired, failed []map[string]string) {
+	var sources *taskSourceView
+	for _, row := range landed {
+		if row.taskSource != nil {
+			sources = loadTaskSources(root)
+			break
+		}
+	}
 	// FAC-809: the act-time owner census runs ONCE for the whole set through
 	// the batched inspector. The per-PID reference walk shares one process
 	// population and one owner snapshot across every target; the serial
@@ -277,7 +304,7 @@ func retireLandedWithInspector(root string, landed []reapRow, inspector resource
 			}
 			usage = &u
 		}
-		err := retireLandedOneWithInspectorCensus(root, l, runReapGit, inspector, usage)
+		err := retireLandedOneWithSources(root, l, runReapGit, inspector, usage, sources)
 		if err != nil {
 			failed = append(failed, map[string]string{
 				"path":   l.Path,
@@ -373,6 +400,14 @@ func retireLandedOneWithInspector(root string, l reapRow, run reapGitRunner, ins
 }
 
 func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector, census *resources.ProcessUsage) error {
+	var sources *taskSourceView
+	if l.taskSource != nil {
+		sources = loadTaskSources(root)
+	}
+	return retireLandedOneWithSources(root, l, run, inspector, census, sources)
+}
+
+func retireLandedOneWithSources(root string, l reapRow, run reapGitRunner, inspector resources.ProcessInspector, census *resources.ProcessUsage, sources *taskSourceView) error {
 	// A receipt-qualified detached harvest surface has no branch ref to
 	// compare-and-delete and the generic fence below refuses detached
 	// surfaces by design. Its own act-time fence is every bit as strict and
@@ -417,7 +452,21 @@ func retireLandedOneWithInspectorCensus(root string, l reapRow, run reapGitRunne
 	if current.Dirty {
 		return fmt.Errorf("retire %s: act-time worktree has uncommitted, untracked, or ignored content", l.Path)
 	}
-	if isResidentHome(current.Branch, current.Path) {
+	if reapInvokingHome(current.Path) {
+		return fmt.Errorf("retire %s: invoking checkout is protected", l.Path)
+	}
+	canonical, err := taskSourceRoot(root)
+	if err != nil || reapPulseSamePath(current.Path, canonical) {
+		return fmt.Errorf("retire %s: canonical checkout identity is protected or unknown", l.Path)
+	}
+	if l.taskSource != nil {
+		if err := validateTaskSourceAct(sources, current, *l.taskSource); err != nil {
+			return err
+		}
+		if err := reapHarvestDurableHold(root, current.Path); err != nil {
+			return err
+		}
+	} else if isResidentHome(current.Branch, current.Path) {
 		return fmt.Errorf("retire %s: act-time worktree is a protected resident home", l.Path)
 	}
 	// FAC-805: classification and act are separate processes, so the landing
@@ -903,11 +952,22 @@ func gitOutIn(dir string, args ...string) (string, error) {
 // provably on the base, and every uncertain, dirty, locked, detached, or
 // unanswerable surface is kept with its exact identity.
 func classifyReapEntries(root, base string, byPR bool, entries []worktreeEntry) (landed, kept []reapRow) {
+	return classifyReapEntriesWithSources(root, base, byPR, entries, loadTaskSources(root))
+}
+
+func classifyReapEntriesWithSources(root, base string, byPR bool, entries []worktreeEntry, sources *taskSourceView) (landed, kept []reapRow) {
 	for _, e := range entries {
 		r := reapRow{Path: e.Path, Branch: e.Branch, Head: e.Head, Base: base}
+		if isResidentHome(e.Branch, e.Path) && !e.IsMain && !e.Detached && !e.Locked && !e.Dirty && e.StatusError == "" {
+			r.taskSource, _ = sources.authorize(e)
+		}
 		switch {
 		case e.IsMain:
 			r.Class, r.Reason = "main", "the repository's own checkout"
+		case sources != nil && sources.root != "" && reapPulseSamePath(e.Path, sources.root):
+			r.Class, r.Reason = "main", "canonical repository checkout"
+		case reapInvokingHome(e.Path):
+			r.Class, r.Reason = "resident-home", "invoking checkout is protected"
 		case e.Detached:
 			// A pool slot or review surface. Its identity is a lease, not a
 			// branch, and reclaiming it belongs to the pool, not here.
@@ -960,7 +1020,9 @@ func classifyReapEntries(root, base string, byPR bool, entries []worktreeEntry) 
 			r.Class, r.Reason = "unknown", "status inspection failed: "+e.StatusError
 		case e.Dirty:
 			r.Class, r.Reason = "dirty", "uncommitted changes would be destroyed"
-		case isResidentHome(e.Branch, e.Path):
+		case r.taskSource != nil && reapHarvestDurableHold(root, e.Path) != nil:
+			r.Class, r.Reason = "held", "completed task source has durable ownership"
+		case isResidentHome(e.Branch, e.Path) && r.taskSource == nil:
 			// FAC-672: a standing lane's RESIDENT HOME tracks main and therefore
 			// has no unique commits, which makes it look landed. It is not a task
 			// worktree: removing it evicts a live lane from the directory it

@@ -37,6 +37,8 @@ TASK-CONTEXT.json
 # Durable claim/lease store and evidence receipts (runtime, per-host).
 .herd/claim/
 .herd/receipts/
+/.herd/source/task-worktrees.jsonl
+/.herd/source/task-worktrees.jsonl.lock
 /.herd/landed/
 .herd/verification-receipts/
 .herd/drain/
@@ -170,6 +172,7 @@ TASK-PACKET.md
 
 # FAC-818: mutation-control logs from scripts/verify-stale-quota-error.zsh.
 .verify-stale-quota-logs/
+/.verify-task-source-logs/
 
 # FAC-833: hosted CI dependency and collector control evidence.
 /.verify-ci-parallel-logs/

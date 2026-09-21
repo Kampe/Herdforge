@@ -191,7 +191,8 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 	}
 	report.Registered = len(registrations)
 
-	eligible := reapPulseEligible(root, registrations, reapPulseMainWorktreePath(ctx, root), reapHarvestCandidatesForBeat(root, registrations, ctx))
+	sources := loadTaskSources(root)
+	eligible := reapPulseEligibleWithSources(root, registrations, reapPulseMainWorktreePath(ctx, root), reapHarvestCandidatesForBeat(root, registrations, ctx), sources)
 	report.Eligible = len(eligible)
 	if len(eligible) == 0 {
 		return report, nil
@@ -220,7 +221,7 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 
 	// The native classifier decides. byPR is false: a scheduled beat must not
 	// depend on network reachability of a PR host to answer "did this land".
-	landed, _ := classifyReapEntries(root, base, false, inspected)
+	landed, _ := classifyReapEntriesWithSources(root, base, false, inspected, sources)
 	report.Landed = len(landed)
 	if len(landed) > reapPulseRetireBudget {
 		landed = landed[:reapPulseRetireBudget]
@@ -278,9 +279,13 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 // that was started from inside a linked worktree; an empty mainPath excludes
 // nothing.
 func reapPulseEligible(root string, entries []worktreeEntry, mainPath string, candidates *herdr.HarvestRetirementCandidates) []worktreeEntry {
+	return reapPulseEligibleWithSources(root, entries, mainPath, candidates, nil)
+}
+
+func reapPulseEligibleWithSources(root string, entries []worktreeEntry, mainPath string, candidates *herdr.HarvestRetirementCandidates, sources *taskSourceView) []worktreeEntry {
 	out := make([]worktreeEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsMain || entry.Locked {
+		if entry.IsMain || entry.Locked || reapInvokingHome(entry.Path) {
 			continue
 		}
 		if entry.Detached {
@@ -296,7 +301,7 @@ func reapPulseEligible(root string, entries []worktreeEntry, mainPath string, ca
 		if mainPath != "" && reapPulseSamePath(entry.Path, mainPath) {
 			continue
 		}
-		if isResidentHome(entry.Branch, entry.Path) {
+		if isResidentHome(entry.Branch, entry.Path) && !sources.names(entry) {
 			continue
 		}
 		out = append(out, entry)
