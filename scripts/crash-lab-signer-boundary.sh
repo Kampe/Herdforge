@@ -23,7 +23,9 @@ HERD="${HERD:?HERD binary path required}"
 HERD="$(readlink -f "$HERD")"
 REPO="${REPO:?REPO path required}"
 EVIDENCE="${EVIDENCE:?EVIDENCE path required}"
-WORKDIR="$(mktemp -d "${RUNNER_TEMP}/herd-signer-lab.XXXXXX")"
+# /tmp is world-traversable; RUNNER_TEMP under /home/runner is not, so UID S
+# cannot lstat keys/private (EACCES) even when the key file itself is S-owned.
+WORKDIR="$(mktemp -d /tmp/herd-signer-lab.XXXXXX)"
 KEYDIR="$WORKDIR/keys"
 SOCK="$WORKDIR/signer.sock"
 HERD_SIGNER_PID=""
@@ -31,6 +33,17 @@ created_group=""
 created_users=()
 
 log() { print -r -- "$*" | tee -a "$EVIDENCE"; }
+
+diag_dirs() {
+  local p
+  for p in /tmp "$WORKDIR" "$KEYDIR" "$KEYDIR/private" "$KEYDIR/attest"; do
+    if [[ -e "$p" ]]; then
+      sudo -n stat -c 'mode=%a owner=%U:%G path=%n' "$p" 2>/dev/null | tee -a "$EVIDENCE" || true
+    else
+      log "diag missing $p"
+    fi
+  done
+}
 
 fail() {
   local code=$1
@@ -182,9 +195,10 @@ if [[ "$HERD_SIGNER_UID" == "$HERD_REQUESTER_UID" || "$HERD_SIGNER_UID" == "$HER
   fail 1 "UIDs are not distinct"
 fi
 
+sudo -n chmod 0755 "$WORKDIR"
 sudo -n mkdir -p "$KEYDIR"
-sudo -n chown "$HERD_REQUESTER_UID:$HERD_SIGNER_SOCK_GID" "$WORKDIR"
-sudo -n chmod 0770 "$WORKDIR"
+sudo -n chmod 0755 "$KEYDIR"
+diag_dirs
 
 topo_env=(
   HERD_SIGNER_UID="$HERD_SIGNER_UID"
@@ -195,7 +209,10 @@ topo_env=(
   HERD_SIGNER_SOCK="$SOCK"
 )
 
-launch_out="$(sudo -n env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary launch --key-dir "$KEYDIR" --socket "$SOCK" --repo "$REPO" --identity crash-lab 2> >(tee -a "$EVIDENCE" >&2))" || fail $? "launch failed"
+launch_out="$(sudo -n env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary launch --key-dir "$KEYDIR" --socket "$SOCK" --repo "$REPO" --identity crash-lab 2> >(tee -a "$EVIDENCE" >&2))" || {
+  diag_dirs
+  fail $? "launch failed"
+}
 print -r -- "$launch_out" | grep -E '^(HERD_SIGNER_PID|HERD_SIGNER_SOCK|HERD_ADMISSION_LEDGER|HERD_KEY_DIR|HERD_SEALED_SESSION)=' | tee -a "$EVIDENCE"
 HERD_SIGNER_PID="$(print -r -- "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{print $2; exit}')"
 [[ -n "$HERD_SIGNER_PID" ]] || fail 1 "launch did not print HERD_SIGNER_PID"
