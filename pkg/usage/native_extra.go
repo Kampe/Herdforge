@@ -307,9 +307,14 @@ type antigravitySummary struct {
 	} `json:"groups"`
 }
 
+// antigravityBuckets keeps the Cloud Code / language-server bucketId as the
+// resource key herdr-route looks up (gemini-weekly, 3p-weekly). CamelCase
+// aliases (geminiWeekly, nonGeminiWeekly) are not in that lookup table.
 var antigravityBuckets = map[string]string{
-	"gemini-5h": "geminiSession", "gemini-weekly": "geminiWeekly",
-	"3p-5h": "nonGeminiSession", "3p-weekly": "nonGeminiWeekly",
+	"gemini-5h":     "gemini-5h",
+	"gemini-weekly": "gemini-weekly",
+	"3p-5h":         "3p-5h",
+	"3p-weekly":     "3p-weekly",
 }
 
 var (
@@ -487,7 +492,7 @@ func antigravityResources(summary antigravitySummary) (map[string]ResourceUsage,
 			remaining := frac * 100
 			resources[name] = ResourceUsage{
 				Kind: "consumption", State: "active",
-				Pool: strings.TrimSuffix(name, "Session"), Unit: "percent",
+				Pool: antigravityPoolForBucket(bucket.BucketID), Unit: "percent",
 				Used: 100 - remaining, Remaining: remaining, Limit: 100,
 				Utilization: 1 - frac, ResetsAt: bucket.ResetTime,
 				WindowSeconds: antigravityWindowSeconds(bucket.Window),
@@ -509,6 +514,17 @@ func antigravityWindowSeconds(window string) int {
 	default:
 		return 0
 	}
+}
+
+func antigravityPoolForBucket(bucketID string) string {
+	lower := strings.ToLower(strings.TrimSpace(bucketID))
+	if strings.HasPrefix(lower, "3p-") || strings.HasPrefix(lower, "nongemini") {
+		return "nonGemini"
+	}
+	if strings.HasPrefix(lower, "gemini") {
+		return "gemini"
+	}
+	return ""
 }
 
 func antigravityTokenFromFile() (string, error) {

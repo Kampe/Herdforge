@@ -202,7 +202,7 @@ func TestAntigravityMapsOnlyExactFractionBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Resources) != 2 || p.Resources["geminiWeekly"].Remaining != 25 || p.Resources["nonGeminiSession"].Used != 50 {
+	if len(p.Resources) != 2 || p.Resources["gemini-weekly"].Remaining != 25 || p.Resources["3p-5h"].Used != 50 {
 		t.Fatalf("exact buckets/fractions not preserved: %+v", p.Resources)
 	}
 }
@@ -234,7 +234,7 @@ func TestRegisteredAntigravityPollUsesInjectedDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Resources["geminiSession"].Remaining != 75 {
+	if p.Resources["gemini-5h"].Remaining != 75 {
 		t.Fatalf("registered poller did not use discovered service: %+v", p.Resources)
 	}
 }
@@ -248,7 +248,7 @@ func TestAntigravitySkipsMissingRemainingFraction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Resources) != 1 || p.Resources["nonGeminiWeekly"].Remaining != 40 {
+	if len(p.Resources) != 1 || p.Resources["3p-weekly"].Remaining != 40 {
 		t.Fatalf("omitted/null remainingFraction must not become zero quota: %+v", p.Resources)
 	}
 }
@@ -274,13 +274,13 @@ func TestAntigravityCloudPollMapsExactBucketsAndWindows(t *testing.T) {
 	if len(p.Resources) != 4 {
 		t.Fatalf("exact buckets not preserved: %+v", p.Resources)
 	}
-	if p.Resources["geminiSession"].Remaining != 60 || p.Resources["geminiSession"].WindowSeconds != Window5h {
-		t.Fatalf("gemini-5h mapping wrong: %+v", p.Resources["geminiSession"])
+	if p.Resources["gemini-5h"].Remaining != 60 || p.Resources["gemini-5h"].WindowSeconds != Window5h || p.Resources["gemini-5h"].Pool != "gemini" {
+		t.Fatalf("gemini-5h mapping wrong: %+v", p.Resources["gemini-5h"])
 	}
-	if p.Resources["geminiWeekly"].Remaining != 25 || p.Resources["geminiWeekly"].WindowSeconds != WindowWeekly {
-		t.Fatalf("gemini-weekly mapping wrong: %+v", p.Resources["geminiWeekly"])
+	if p.Resources["gemini-weekly"].Remaining != 25 || p.Resources["gemini-weekly"].WindowSeconds != WindowWeekly || p.Resources["gemini-weekly"].Pool != "gemini" {
+		t.Fatalf("gemini-weekly mapping wrong: %+v", p.Resources["gemini-weekly"])
 	}
-	if p.Resources["nonGeminiSession"].Used != 50 || p.Resources["nonGeminiWeekly"].Remaining != 10 {
+	if p.Resources["3p-5h"].Used != 50 || p.Resources["3p-weekly"].Remaining != 10 || p.Resources["3p-5h"].Pool != "nonGemini" || p.Resources["3p-weekly"].Pool != "nonGemini" {
 		t.Fatalf("non-gemini mapping wrong: %+v", p.Resources)
 	}
 }
@@ -308,7 +308,7 @@ func TestRegisteredAntigravityPollUsesCLICloudIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Resources["geminiWeekly"].Remaining != 80 {
+	if p.Resources["gemini-weekly"].Remaining != 80 {
 		t.Fatalf("registered poller did not use AGY cloud identity: %+v", p.Resources)
 	}
 }
@@ -377,7 +377,7 @@ func TestAntigravityEmptyCSRFDoesNotBlockCloudSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Resources["nonGeminiWeekly"].Remaining != 90 {
+	if p.Resources["3p-weekly"].Remaining != 90 {
 		t.Fatalf("CLI cloud identity must win without CSRF: %+v", p.Resources)
 	}
 }

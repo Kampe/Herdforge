@@ -161,7 +161,7 @@ var providerSource = map[string]string{
 	"codex":        "native:chatgpt.com/backend-api/wham/usage",
 	"gemini":       "native:cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
 	"grok":         "native:cli-chat-proxy.grok.com/v1/billing?format=credits",
-	"antigravity":  "native:same-host-language-server/RetrieveUserQuotaSummary",
+	"antigravity":  "native:daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 	"litellm":      "native:authenticated-key-info",
 	"opencode":     "native:opencode.ai/zen/go/v1/usage",
 	"ollama":       "native:ollama.com/api/usage:signed-ed25519",
