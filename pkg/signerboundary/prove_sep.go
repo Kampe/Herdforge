@@ -22,26 +22,20 @@ type proveSepConfig struct {
 // BLOCKED — never treated as denial success.
 func proveSeparateUID(cfg proveSepConfig) (digest string, signerPID int, err error) {
 	var receipts []ProbeReceipt
-	asRequester := os.Getuid() == cfg.RequesterUID && os.Getuid() != cfg.SignerUID && os.Getuid() != 0
 
-	if asRequester {
-		receipts = append(receipts, ProbeReceipt{
-			Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
-			Detail: "requester cannot audit S-owned private/; signer audited at serve; live IPC is the trusted result",
-		})
-	} else {
-		if err := auditKeyMaterialPath(cfg.KeyPath, cfg.SignerUID); err != nil {
-			return "", 0, err
-		}
-		receipts = append(receipts, ProbeReceipt{
-			Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
-			Detail: "symlink/hardlink/nlink/owner/mode audited; path exists",
-		})
-		if err := requirePathExists(cfg.KeyPath); err != nil {
-			return "", 0, err
-		}
+	// --- path-harden (must succeed as positive proof, not "error = deny") ---
+	if err := auditKeyMaterialPath(cfg.KeyPath, cfg.SignerUID); err != nil {
+		return "", 0, err
 	}
+	receipts = append(receipts, ProbeReceipt{
+		Version: 1, Platform: runtime.GOOS, Operation: "path-harden", OK: true,
+		Detail: "symlink/hardlink/nlink/owner/mode audited; path exists",
+	})
 
+	// --- key-read: file MUST exist; only EACCES/EPERM counts as denial ---
+	if err := requirePathExists(cfg.KeyPath); err != nil {
+		return "", 0, err
+	}
 	_, rerr := os.ReadFile(cfg.KeyPath)
 	if rerr == nil {
 		return "", 0, fmt.Errorf("%w: key still readable by uid %d", ErrAdversarialSuccess, os.Getuid())
