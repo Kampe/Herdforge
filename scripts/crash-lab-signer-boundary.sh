@@ -214,12 +214,11 @@ if [[ "$HERD_SIGNER_UID" == "$HERD_REQUESTER_UID" || "$HERD_SIGNER_UID" == "$HER
 fi
 
 sudo -n chmod 0755 "$WORKDIR"
-sudo -n mkdir -p "$KEYDIR" "$SOCKDIR" "$WORKDIR/bin" "$WORKDIR/repo/.herd"
+sudo -n mkdir -p "$KEYDIR" "$SOCKDIR" "$WORKDIR/bin" "$WORKDIR/repo"
 sudo -n chmod 0755 "$KEYDIR" "$WORKDIR/bin"
 sudo -n cp "$HERD" "$WORKDIR/bin/herd-linux-amd64"
 sudo -n chmod 0755 "$WORKDIR/bin/herd-linux-amd64"
 HERD="$WORKDIR/bin/herd-linux-amd64"
-print -r -- "project:\n  name: crash-lab\n" | sudo -n tee "$WORKDIR/repo/.herd/herd.yaml" >/dev/null
 sudo -n git -C "$WORKDIR/repo" init -q
 sudo -n chown -R "$HERD_REQUESTER_UID:$HERD_SIGNER_SOCK_GID" "$WORKDIR/repo"
 sudo -n chmod -R u+rwX,g+rwX "$WORKDIR/repo"
@@ -256,7 +255,11 @@ print -r -- "$launch_out" | grep -E '^(HERD_SIGNER_PID|HERD_SIGNER_SOCK|HERD_ADM
 HERD_SIGNER_PID="$(print -r -- "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{print $2; exit}')"
 [[ -n "$HERD_SIGNER_PID" ]] || fail 1 "launch did not print HERD_SIGNER_PID"
 
-# status/prove as requester using ResolveKeyDir (HERD_KEY_DIR), not guessed extra flags.
+# Authentic establish as requester (writes attest/isolation.json). Do not
+# synthesize attestation or weaken RequireReady.
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary establish --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "establish failed as requester"
+
+# status/prove as requester using ResolveKeyDir (HERD_KEY_DIR).
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary status >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "status failed as requester"
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 30s "$HERD" signer-boundary prove --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "prove failed as requester"
 
