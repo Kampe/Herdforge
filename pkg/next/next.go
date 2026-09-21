@@ -163,7 +163,7 @@ func (p *NextPicker) evalAll(ctx context.Context) ([]*NextAction, error) {
 	if err != nil {
 		return nil, err
 	}
-	claimCommand := "herd pulse --spawn"
+	claimCommand := "herd pulse --act --spawn"
 	if preview.Claimable == 0 && preview.ProvenanceBlocked > 0 {
 		claimCommand = "herd deps migrate"
 	}
