@@ -15,16 +15,20 @@ LOG="${MAINT_LAB_LOG:-$WORKDIR/maint-lab.log}"
 : >"$LOG"
 holder=""
 owned_pid=""
+labuser=""
 cleanup() {
   if [[ -n "${owned_pid:-}" ]]; then
-    kill "$owned_pid" 2>/dev/null || true
-    wait "$owned_pid" 2>/dev/null || true
+    sudo -n kill "$owned_pid" 2>/dev/null || true
+    sudo -n kill -0 "$owned_pid" 2>/dev/null && sudo -n kill -KILL "$owned_pid" 2>/dev/null || true
     owned_pid=""
   fi
   if [[ -n "${holder:-}" ]]; then
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
+    sudo -n kill "$holder" 2>/dev/null || true
     holder=""
+  fi
+  if [[ -n "${labuser:-}" ]]; then
+    sudo -n userdel "$labuser" 2>/dev/null || true
+    labuser=""
   fi
   rm -rf "$WORKDIR"
 }
@@ -59,12 +63,25 @@ git -C "$WORKDIR" worktree add -q -b merged-ok "$MERGED" origin/main
 git -C "$WORKDIR" worktree add -q -b dirty-ok "$DIRTY" origin/main
 print -r -- 'dirt' >"$DIRTY/dirt"
 git -C "$WORKDIR" worktree add -q -b owned-ok "$OWNED" origin/main
-(
-  cd "$OWNED" || exit 1
-  print -r -- ready >"$WORKDIR/owned.ready"
-  exec sleep 120
-) &
-owned_pid=$!
+
+labuser="herd-mlab-$$"
+sudo -n useradd --system --no-create-home --home-dir "$WORKDIR" --shell /usr/sbin/nologin "$labuser"
+mkdir -p "$WORKDIR/bin"
+cp "$HERD" "$WORKDIR/bin/herd"
+chmod 0755 "$WORKDIR/bin/herd"
+LABHERD="$WORKDIR/bin/herd"
+sudo -n chown -R "$labuser:$labuser" "$WORKDIR"
+lab_uid="$(id -u "$labuser")"
+
+run_lab() {
+  local dir=$1
+  shift
+  sudo -n -u "$labuser" -- env -u HERD_ROOT -u HERD_REPO_ROOT -u HERD_PROJECT_ROOT -u HERD_CONFIG_PATH -u HERD_WORKSPACE \
+    sh -c 'cd "$1" && shift && exec "$@"' sh "$dir" "$LABHERD" "$@"
+}
+
+sudo -n -u "$labuser" -- env OWNED="$OWNED" READY="$WORKDIR/owned.ready" CHILD="$WORKDIR/owned.child" \
+  sh -c 'cd "$OWNED" && printf %s $$ > "$CHILD" && printf ready > "$READY" && exec sleep 120' &
 integer on=0
 while (( on < 50 )); do
   [[ -f "$WORKDIR/owned.ready" ]] && break
@@ -72,9 +89,13 @@ while (( on < 50 )); do
   on=$((on + 1))
 done
 [[ -f "$WORKDIR/owned.ready" ]] || { print -u2 "owned sleep never ready"; exit 1; }
-kill -0 "$owned_pid" || { print -u2 "owned sleep pid $owned_pid not live"; exit 1; }
-cwd="$(readlink "/proc/$owned_pid/cwd" 2>/dev/null || true)"
+owned_pid="$(cat "$WORKDIR/owned.child")"
+[[ -n "$owned_pid" ]] || { print -u2 "owned child pid missing"; exit 1; }
+sudo -n kill -0 "$owned_pid" || { print -u2 "owned sleep pid $owned_pid not live"; exit 1; }
+cwd="$(sudo -n readlink "/proc/$owned_pid/cwd" 2>/dev/null || true)"
 [[ "$cwd" == "$OWNED" ]] || { print -u2 "owned cwd $cwd want $OWNED"; exit 1; }
+ouid="$(ps -o uid= -p "$owned_pid" | awk '{print $1}')"
+[[ "$ouid" == "$lab_uid" ]] || { print -u2 "owned uid $ouid want $lab_uid"; exit 1; }
 
 INVOKING="$WORKDIR/wt-1"
 window="$(
@@ -109,14 +130,9 @@ YAML
 
 LOCK="$WORKDIR/.herd/worktree-reap-pulse.lock"
 READY="$WORKDIR/lock.ready"
-touch "$LOCK"
-(
-  exec 9>"$LOCK"
-  flock -n 9 || exit 1
-  print -r -- ready >"$READY"
-  exec sleep 30
-) &
-holder=$!
+sudo -n -u "$labuser" -- env LOCK="$LOCK" READY="$READY" CHILD="$WORKDIR/holder.child" \
+  sh -c 'exec 9>"$LOCK"; flock -n 9 || exit 1; printf %s $$ > "$CHILD"; printf ready > "$READY"; exec sleep 30' &
+holder=""
 integer n=0
 while (( n < 50 )); do
   [[ -f "$READY" ]] && break
@@ -124,9 +140,10 @@ while (( n < 50 )); do
   n=$((n + 1))
 done
 [[ -f "$READY" ]] || { print -u2 "flock holder never became ready"; exit 1; }
+holder="$(cat "$WORKDIR/holder.child")"
 
 set +e
-out="$(cd "$WORKDIR/wt-1" && "$HERD" maintenance --act 2>&1)"
+out="$(run_lab "$WORKDIR/wt-1" maintenance --act 2>&1)"
 rc=$?
 set -e
 log "$out"
@@ -135,13 +152,12 @@ print -r -- "$out" | grep -E -q 'deferred|tick lock' || {
   print -u2 "missing deferred/tick lock while flock held: $out"
   exit 1
 }
-kill "$holder" 2>/dev/null || true
-wait "$holder" 2>/dev/null || true
+sudo -n kill "$holder" 2>/dev/null || true
 holder=""
 
 cursor="$WORKDIR/.herd/worktree-reap-pulse.cursor"
 set +e
-out1="$(cd "$WORKDIR/wt-1" && "$HERD" maintenance --act 2>&1)"
+out1="$(run_lab "$WORKDIR/wt-1" maintenance --act 2>&1)"
 rc1=$?
 set -e
 log "$out1"
@@ -178,12 +194,12 @@ print -r -- "$out1" | grep -E -q 'retired=1([^0-9]|$)' || {
 git -C "$WORKDIR" worktree list --porcelain | grep -F -q "$MERGED" && { print -u2 "merged fixture still registered"; exit 1; }
 [[ -d "$DIRTY" ]] || { print -u2 "dirty merged fixture was removed"; exit 1; }
 [[ -d "$OWNED" ]] || { print -u2 "owned merged fixture was removed"; exit 1; }
-kill -0 "$owned_pid" || { print -u2 "owned sleep died during retirement"; exit 1; }
+sudo -n kill -0 "$owned_pid" || { print -u2 "owned sleep died during retirement"; exit 1; }
 [[ -f "$cursor" ]] || { print -u2 "missing shared cursor after wt-1"; exit 1; }
 [[ ! -e "$WORKDIR/wt-1/.herd/worktree-reap-pulse.cursor" ]] || { print -u2 "wt-1 grew its own cursor"; exit 1; }
 last1="$(cat "$cursor")"
 
-out2="$(cd "$WORKDIR/wt-2" && "$HERD" maintenance --act 2>&1)"
+out2="$(run_lab "$WORKDIR/wt-2" maintenance --act 2>&1)"
 log "$out2"
 print -r -- "$out2" | grep -E -q 'eligible=(9|[1-9][0-9]+)' || {
   print -u2 "wt-2 eligible not >8: $out2"
@@ -212,7 +228,7 @@ done
 dangle="$WORKDIR/dangle"
 ln -s "$WORKDIR/nowhere-target" "$dangle"
 set +e
-dangle_out="$(cd "$WORKDIR/wt-1" && HERD_PROJECT_ROOT="$dangle" "$HERD" maintenance --act 2>&1)"
+dangle_out="$(sudo -n -u "$labuser" -- env HERD_PROJECT_ROOT="$dangle" -u HERD_ROOT -u HERD_REPO_ROOT -u HERD_CONFIG_PATH -u HERD_WORKSPACE sh -c 'cd "$1" && exec "$2" maintenance --act' sh "$WORKDIR/wt-1" "$LABHERD" 2>&1)"
 dangle_rc=$?
 set -e
 log "$dangle_out"
