@@ -685,3 +685,50 @@ func TestRetireLandedReportsAFailureRatherThanClaimingSuccess(t *testing.T) {
 		t.Error("the failure must carry git's own message so it is actionable")
 	}
 }
+
+func TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "lab@example.com")
+	run("config", "user.name", "lab")
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README")
+	run("commit", "-qm", "init")
+	missing := filepath.Join(dir, "missing-gitconfig")
+	t.Setenv("GIT_CONFIG_GLOBAL", missing)
+	t.Setenv("GIT_CONFIG_SYSTEM", missing)
+	out, err := gitOutIn(dir, "status", "--porcelain", "--untracked-files=all", "--ignored")
+	if err != nil {
+		t.Fatalf("status with missing global config: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("clean stdout want empty, got %q", out)
+	}
+	entries := inspectWorktreeEntries([]worktreeEntry{{Path: dir}})
+	if entries[0].StatusError != "" {
+		t.Fatalf("status error %q", entries[0].StatusError)
+	}
+	if entries[0].Dirty {
+		t.Fatal("rc0 stderr warnings must not classify a clean tree dirty")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dirt"), []byte("y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries = inspectWorktreeEntries([]worktreeEntry{{Path: dir}})
+	if !entries[0].Dirty {
+		t.Fatal("true untracked dirt must still classify dirty")
+	}
+}
