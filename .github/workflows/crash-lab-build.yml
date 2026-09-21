@@ -1,0 +1,48 @@
+name: Crash lab binary
+
+on:
+  push:
+    branches: [ "lab/**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crash-lab-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  herd-binaries:
+    name: Bounded herd binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build linux/amd64 and darwin/arm64
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          mkdir -p dist
+          printf '%s\n' "$sha" > dist/GITSHA
+          GOOS=linux GOARCH=amd64 go build -p 1 -o dist/herd-linux-amd64 ./cmd/herd
+          GOOS=darwin GOARCH=arm64 go build -p 1 -o dist/herd-darwin-arm64 ./cmd/herd
+          sha256sum dist/herd-linux-amd64 dist/herd-darwin-arm64 dist/GITSHA > dist/SHA256SUMS
+
+      - name: Upload binaries and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: herd-crash-lab-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
