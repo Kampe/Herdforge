@@ -1,32 +1,36 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/lock"
 )
 
 const (
-	localBoardDirName = "local-board"
-	localStoreName    = "tasks.json"
-	localLockWait     = 5 * time.Second
+	localBoardDirName   = "local-board"
+	localBoardLockName  = "local-board.lock.d"
+	localStoreName      = "tasks.json"
+	localLockWait       = 5 * time.Second
+	maxLocalStoreBytes  = 1 << 20
 )
 
 // LocalProvider is a persistent, repository-local development board.
 // It does not share MemoryProvider's in-process map or its ID scheme.
 // It does not implement Kaneo position, StatusReceipt footers, or CAS.
 type LocalProvider struct {
-	root string
-	dir  string
+	root    string
+	dir     string
+	lockDir string
 }
 
 type localStore struct {
@@ -51,7 +55,11 @@ func NewLocalProvider(repoRoot string) (*LocalProvider, error) {
 	}
 	herdDir := filepath.Join(absRoot, ".herd")
 	dir := filepath.Join(herdDir, localBoardDirName)
+	lockDir := filepath.Join(herdDir, localBoardLockName)
 	if err := refuseEscaping(absRoot, dir); err != nil {
+		return nil, err
+	}
+	if err := refuseEscaping(absRoot, lockDir); err != nil {
 		return nil, err
 	}
 	if err := refuseSymlinkPath(herdDir); err != nil && !os.IsNotExist(err) {
@@ -60,7 +68,10 @@ func NewLocalProvider(repoRoot string) (*LocalProvider, error) {
 	if err := refuseSymlinkPath(dir); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("local task provider: store dir: %w", err)
 	}
-	return &LocalProvider{root: absRoot, dir: dir}, nil
+	if err := refuseSymlinkPath(lockDir); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("local task provider: lock dir: %w", err)
+	}
+	return &LocalProvider{root: absRoot, dir: dir, lockDir: lockDir}, nil
 }
 
 func refuseEscaping(root, candidate string) error {
@@ -134,6 +145,18 @@ func (p *LocalProvider) withStore(ctx context.Context, mutate bool, fn func(*loc
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	herdDir := filepath.Join(p.root, ".herd")
+	if err := refuseSymlinkPath(herdDir); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("local task provider: .herd is missing")
+		}
+		return fmt.Errorf("local task provider: .herd: %w", err)
+	}
+	dl := lock.NewDirLock(p.lockDir)
+	if err := dl.Acquire(ctx, localLockWait, "local-board"); err != nil {
+		return fmt.Errorf("local task provider: lock: %w", err)
+	}
+	defer dl.Release()
 	created := false
 	if mutate {
 		var err error
@@ -143,13 +166,6 @@ func (p *LocalProvider) withStore(ctx context.Context, mutate bool, fn func(*loc
 		}
 	} else if err := refuseSymlinkPath(p.dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("local task provider: store dir: %w", err)
-	}
-	if mutate || dirExists(p.dir) {
-		dl := lock.NewDirLock(p.dir)
-		if err := dl.Acquire(ctx, localLockWait, "local-board"); err != nil {
-			return fmt.Errorf("local task provider: lock: %w", err)
-		}
-		defer dl.Release()
 	}
 	st, err := p.load(created)
 	if err != nil {
@@ -187,22 +203,29 @@ func (p *LocalProvider) load(allowInit bool) (*localStore, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("local task provider: store is not a regular file")
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("local task provider: open store: %w", err)
 	}
 	defer f.Close()
-	fi, err := f.Stat()
+	limited := io.LimitReader(f, maxLocalStoreBytes+1)
+	raw, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("local task provider: stat store fd: %w", err)
+		return nil, fmt.Errorf("local task provider: read store: %w", err)
 	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("local task provider: store fd is not a regular file")
+	if len(raw) > maxLocalStoreBytes {
+		return nil, fmt.Errorf("local task provider: store exceeds %d bytes", maxLocalStoreBytes)
 	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	var st localStore
-	dec := json.NewDecoder(f)
 	if err := dec.Decode(&st); err != nil {
 		return nil, fmt.Errorf("local task provider: parse store: %w", err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("local task provider: trailing JSON after store object")
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("local task provider: trailing JSON after store object")
 	}
 	if err := validateLocalStore(&st); err != nil {
 		return nil, err
