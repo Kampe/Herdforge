@@ -160,8 +160,8 @@ func (m *MemoryProvider) AddTask(t *Task) {
 }
 
 func (m *MemoryProvider) CreateTask(_ context.Context, task *Task) (*Task, error) {
-	if task == nil || task.Title == "" || task.ProjectID == "" {
-		return nil, fmt.Errorf("create task: title and project are required")
+	if err := ValidateCreateTask(task); err != nil {
+		return nil, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

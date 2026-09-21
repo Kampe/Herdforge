@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	localBoardDirName   = "local-board"
-	localBoardLockName  = "local-board.lock.d"
-	localStoreName      = "tasks.json"
-	localLockWait       = 5 * time.Second
-	maxLocalStoreBytes  = 1 << 20
+	localBoardDirName  = "local-board"
+	localBoardLockName = "local-board.lock.d"
+	localStoreName     = "tasks.json"
+	localLockWait      = 5 * time.Second
+	maxLocalStoreBytes = 1 << 20
 )
 
 // LocalProvider is a persistent, repository-local development board.
@@ -479,8 +479,8 @@ func (p *LocalProvider) mintID(st *localStore) string {
 }
 
 func (p *LocalProvider) CreateTask(ctx context.Context, task *Task) (*Task, error) {
-	if task == nil || task.Title == "" || task.ProjectID == "" {
-		return nil, fmt.Errorf("create task: title and project are required")
+	if err := ValidateCreateTask(task); err != nil {
+		return nil, err
 	}
 	var out *Task
 	err := p.withStore(ctx, true, func(st *localStore) error {

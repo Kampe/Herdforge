@@ -28,7 +28,7 @@ func runBoardCard() {
 		fmt.Println(boardCardUsage)
 		return
 	}
-	cfg, err := config.LoadConfig(".herd/herd.yaml")
+	cfg, err := config.LoadConfig(config.PathFor(""))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd board-card: %v\n", err)
 		os.Exit(1)
