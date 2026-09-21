@@ -288,6 +288,65 @@ fi
 grep -E -q "NONCE_REPLAY|nonce replay|replay" "$replay_err" || fail 1 "replay missing replay reason: $(cat "$replay_err")"
 log "negative replay rc=$replay_rc"
 
+KEYFILE="$KEYDIR/private/crash-lab.ed25519"
+KEYBAK="$WORKDIR/crash-lab.ed25519.orig"
+sudo -n cp -a "$KEYFILE" "$KEYBAK"
+sudo -n chmod 0600 "$KEYBAK"
+
+restore_key() {
+  sudo -n cp -a "$KEYBAK" "$KEYFILE"
+  sudo -n chown "$HERD_SIGNER_UID:$HERD_SIGNER_SOCK_GID" "$KEYFILE"
+  sudo -n chmod 0600 "$KEYFILE"
+}
+
+audit_ok() {
+  local out="$WORKDIR/audit-ok.out" errf="$WORKDIR/audit-ok.err"
+  sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab >"$out" 2>"$errf" || fail $? "positive audit-key failed $(cat "$errf")"
+  grep -q "audit-key ok" "$out" || fail 1 "positive audit-key missing ok $(cat "$out" "$errf")"
+  cat "$out" "$errf" >>"$EVIDENCE"
+  log "positive audit-key ok"
+}
+
+expect_audit_fail() {
+  local tag=$1
+  local pat=$2
+  local errf="$WORKDIR/audit-$tag.err"
+  set +e
+  sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab >/dev/null 2>"$errf"
+  local rc=$?
+  set -e
+  cat "$errf" >>"$EVIDENCE"
+  if (( rc == 0 )); then
+    fail 1 "$tag audit-key should fail"
+  fi
+  grep -E -q "$pat" "$errf" || fail 1 "$tag missing expected reason /$pat/: $(cat "$errf")"
+  log "negative $tag rc=$rc"
+}
+
+sudo -n mv "$KEYFILE" "$WORKDIR/key.hidden"
+expect_audit_fail missing "not a regular file|open key|key path|no such file|audit seed|server key"
+restore_key
+audit_ok
+
+sudo -n chmod 0644 "$KEYFILE"
+expect_audit_fail exposed "mode|group/world|KeyExposed|fstat mode"
+restore_key
+audit_ok
+
+printf '%s\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" | sudo -n tee "$KEYFILE" >/dev/null
+sudo -n chown "$HERD_SIGNER_UID:$HERD_SIGNER_SOCK_GID" "$KEYFILE"
+sudo -n chmod 0600 "$KEYFILE"
+expect_audit_fail replaced "does not match loaded signer public key|on-disk key"
+restore_key
+audit_ok
+
+printf '%s\n' "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" | sudo -n tee "$KEYFILE" >/dev/null
+sudo -n chown "$HERD_SIGNER_UID:$HERD_SIGNER_SOCK_GID" "$KEYFILE"
+sudo -n chmod 0600 "$KEYFILE"
+expect_audit_fail oversized "exceeds|audit seed"
+restore_key
+audit_ok
+
 # Authentic establish as requester (writes attest/isolation.json). Do not
 # synthesize attestation or weaken RequireReady.
 sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary establish --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "establish failed as requester"
@@ -298,5 +357,25 @@ sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 30s "$HERD" signe
 
 # revoke requires --key-dir per CLI contract.
 sudo -n env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary revoke --key-dir "$KEYDIR" --identity crash-lab --socket "$SOCK" >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "revoke failed"
+
+if sudo -n kill -0 "$HERD_SIGNER_PID" 2>/dev/null; then
+  fail 1 "signer pid $HERD_SIGNER_PID still present after revoke"
+fi
+leftover="$(ps -o pid= -u "$HERD_SIGNER_UID" 2>/dev/null | awk 'NF' || true)"
+if [[ -n "$leftover" ]]; then
+  fail 1 "signer uid still has processes after revoke: $leftover"
+fi
+post_err="$WORKDIR/post-revoke.err"
+set +e
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary audit-key --repo "$REPO" --identity crash-lab >/dev/null 2>"$post_err"
+post_rc=$?
+set -e
+cat "$post_err" >>"$EVIDENCE"
+if (( post_rc == 0 )); then
+  fail 1 "audit-key after revoke should fail"
+fi
+grep -E -q "dial|not established|revoked|no such|connection refused|unix" "$post_err" || fail 1 "post-revoke missing refusal reason: $(cat "$post_err")"
+log "post-revoke signer absent and audit-key refused rc=$post_rc"
+HERD_SIGNER_PID=""
 
 log "ok"

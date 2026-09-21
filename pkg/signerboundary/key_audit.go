@@ -6,8 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+)
+
+const (
+	// 32-byte ed25519 seed as hex, plus documented whitespace (newline/trim).
+	auditSeedHexBytes        = ed25519.SeedSize * 2
+	auditSeedWhitespaceAllow = 8
+	maxAuditSeedRead         = auditSeedHexBytes + auditSeedWhitespaceAllow
 )
 
 const keyAuditDomain = "herdforge-signer-audit-key-v1"
@@ -31,9 +39,17 @@ func (s *Server) bindDiskKeyToLoadedPub() error {
 	if err != nil {
 		return fmt.Errorf("%w: open key for audit bind: %v", ErrProvisioning, err)
 	}
-	data, err := ioReadAllClose(f)
+	limited := io.LimitReader(f, int64(maxAuditSeedRead)+1)
+	data, err := io.ReadAll(limited)
+	_ = f.Close()
 	if err != nil {
 		return fmt.Errorf("%w: read key for audit bind: %v", ErrProvisioning, err)
+	}
+	if len(data) > maxAuditSeedRead {
+		for i := range data {
+			data[i] = 0
+		}
+		return fmt.Errorf("%w: audit seed exceeds %d-byte hex+whitespace bound", ErrProvisioning, maxAuditSeedRead)
 	}
 	seed, err := hex.DecodeString(strings.TrimSpace(string(data)))
 	for i := range data {
