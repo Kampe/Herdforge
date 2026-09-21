@@ -737,7 +737,7 @@ func printUsage() {
 	fmt.Println("                  --observer-status reads its snapshot and exits 3 once it expires")
 	fmt.Println("  lock           Advisory shared-checkout lock: with, acquire, release, status")
 	fmt.Println("  reset-safe     Reset a feature worktree after preserving unique commits")
-	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | sign (FAC-169)")
+	fmt.Println("  signer-boundary  OS signing boundary: serve | establish | status | prove | audit-key | sign (FAC-169)")
 	fmt.Println("  command         Run a root-authorized command under a durable attempt budget")
 	fmt.Println("  hostcreds       HostCreds oracle: diagnose|session|selftest (FAC-170; native auth diagnose, no OpenCode broker)")
 	fmt.Println("  control        Issue/drain authenticated control envelopes (FAC-133)")

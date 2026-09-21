@@ -150,7 +150,7 @@ var subcommandUsage = map[string]string{
 	"role-inject":     "Usage: herd role-inject [flags]\n  Bind a session to its worker contract at session start.",
 	"scope":           "Usage: herd scope [flags]\n  Publish the trusted task scope resolved by dispatch.",
 	"seed-lane-state": "Usage: herd seed-lane-state [flags]\n  Restore or seed lane state artifacts without overwriting existing state.",
-	"signer-boundary": "Usage: herd signer-boundary <serve|establish|status|prove|sign> [flags]\n  Operate the OS signing boundary.",
+	"signer-boundary": "Usage: herd signer-boundary <serve|establish|status|prove|audit-key|sign> [flags]\n  Operate the OS signing boundary.",
 	"spin":            "Usage: herd spin [flags]\n  Detect stalled or spinning agent panes.",
 	"stash":           "Usage: herd stash push [-m <msg>] [-- <paths>...] | pop | apply | list\n  Use a worktree-scoped private stash namespace.",
 	"stop":            "Usage: herd stop [flags]\n  Stop the herd without deleting worktrees; dry-run by default.",

@@ -147,11 +147,11 @@ func verifyKeyAudit(pub ed25519.PublicKey, expectedPath, expectedIdentity string
 	if st.Nonce != req.Nonce || strings.TrimSpace(st.Nonce) == "" {
 		return fmt.Errorf("%w: audit nonce mismatch", ErrProvisioning)
 	}
-	if st.Path != expectedPath {
-		return fmt.Errorf("%w: audit path mismatch", ErrProvisioning)
-	}
 	if st.Identity != expectedIdentity {
 		return fmt.Errorf("%w: audit identity mismatch", ErrProvisioning)
+	}
+	if st.Path != expectedPath {
+		return fmt.Errorf("%w: audit path mismatch", ErrProvisioning)
 	}
 	if st.OwnerUID != expectedUID || st.ServerUID != expectedUID {
 		return fmt.Errorf("%w: audit uid mismatch", ErrProvisioning)

@@ -62,7 +62,7 @@ func printSignerBoundaryUsage() {
   herd signer-boundary launch --key-dir DIR --socket PATH --repo PATH --identity NAME
   herd signer-boundary serve --key PATH --socket PATH --admission-ledger PATH \
       (--session-key-fd N | --session-key-stdin)
-  herd signer-boundary establish|status|prove
+  herd signer-boundary establish|status|prove|audit-key
   herd signer-boundary admit --candidate --base --patch --verdict --session [--key-dir]
   herd signer-boundary sign-verdict --candidate --base --patch --verdict --session --payload-hex
   herd signer-boundary rotate-key --key-dir DIR --identity NAME --socket PATH [--repo] [--restart]
