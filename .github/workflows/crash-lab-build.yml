@@ -46,3 +46,39 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 7
+
+  signer-boundary-linux:
+    name: Linux signer-boundary lab
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: herd-binaries
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download linux herd
+        uses: actions/download-artifact@v4
+        with:
+          name: herd-crash-lab-${{ github.sha }}
+          path: dist
+
+      - name: Operate authentic signer-boundary on disposable UIDs
+        env:
+          HERD: ${{ github.workspace }}/dist/herd-linux-amd64
+          REPO: ${{ github.workspace }}
+          WORKDIR: ${{ runner.temp }}/herd-signer-lab
+          EVIDENCE: ${{ github.workspace }}/signer-lab-evidence.txt
+        run: |
+          set -euo pipefail
+          chmod +x "$HERD"
+          chmod +x scripts/crash-lab-signer-boundary.sh
+          scripts/crash-lab-signer-boundary.sh
+
+      - name: Upload sanitized evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signer-boundary-lab-evidence-${{ github.sha }}
+          path: signer-lab-evidence.txt
+          if-no-files-found: warn
+          retention-days: 7
