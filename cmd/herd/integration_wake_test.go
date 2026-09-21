@@ -4,18 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/attention"
 	"github.com/Kampe/Herdforge/pkg/beat"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/coordinator"
 	"github.com/Kampe/Herdforge/pkg/herdr"
 	"github.com/Kampe/Herdforge/pkg/outbox"
+	"github.com/Kampe/Herdforge/pkg/provider"
+	"github.com/Kampe/Herdforge/pkg/reviewledger"
 	"github.com/Kampe/Herdforge/pkg/textdelivery"
 )
 
@@ -116,6 +121,13 @@ func TestIntegrationWakeProductionForgeComposition(t *testing.T) {
 	}
 	if !strings.Contains(source, "IntegrationWakes:") || !strings.Contains(source, "return runForgeIntegrationWakes(ctx, cfg, tp)") {
 		t.Fatal("production forge does not drive integration wakes")
+	}
+	wakeSrc, err := os.ReadFile("integration_wake.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wakeSrc), "return reconcileReadyIntegrationWakes(ctx, root, cfg, tp, attentionCommandAt(root), time.Now().UTC(), integrationWakeAge, deliverIntegrationWake)") {
+		t.Fatal("forge tick does not drive the ready-but-open wake path")
 	}
 }
 
@@ -284,5 +296,153 @@ func TestIntegrationWakeNativeCLIDisposableEmit(t *testing.T) {
 	}
 	if report.Wake.Generation != 2 || report.Merged {
 		t.Fatalf("acknowledged wake changed identity: %+v", report)
+	}
+}
+
+type readyWakeTaskReader struct {
+	provider.TaskProvider
+	task *provider.Task
+}
+
+func (p *readyWakeTaskReader) GetTask(ctx context.Context, ref string) (*provider.Task, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("task read has no deadline")
+	}
+	if p.task == nil || ref != p.task.Ref {
+		return nil, errors.New("wrong task ref")
+	}
+	return p.task, nil
+}
+
+type readyWakeProcess struct {
+	args []string
+	out  []byte
+}
+
+func (p *readyWakeProcess) SetStdin(io.Reader) {}
+func (p *readyWakeProcess) Output() ([]byte, error) {
+	return p.out, nil
+}
+
+type readyWakeStarter struct {
+	last  *readyWakeProcess
+	calls atomic.Int32
+}
+
+func (s *readyWakeStarter) Start(_ context.Context, _ string, args ...string) textdelivery.Process {
+	s.calls.Add(1)
+	p := &readyWakeProcess{args: append([]string(nil), args...), out: []byte("ok")}
+	s.last = p
+	return p
+}
+
+func TestProductionReadyTransitionDeliversCoalescesAndEscalates(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	root := t.TempDir()
+	ledgerPath := filepath.Join(root, ".herd", "review-ledger.jsonl")
+	t.Setenv("HERD_REVIEW_LEDGER", ledgerPath)
+	t.Setenv("HERD_MAIL_FILE", filepath.Join(root, ".herd", "mail.jsonl"))
+	t.Setenv(herdr.NoLiveEnv, "1")
+	ledger, err := reviewledger.NewReviewLedger(root, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"event":"record","sha":"` + sha + `","task":"FAC-599","branch":"herd/fac-599","reviewer":"reviewer","builder_family":"openai","reviewer_family":"anthropic","gate":"independent"}` + "\n" +
+		`{"event":"verdict","sha":"` + sha + `","reviewer":"reviewer","builder_family":"openai","reviewer_family":"anthropic","verdict":"PASS"}` + "\n"
+	if err := os.WriteFile(ledgerPath, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ledger.QueuePath, []byte(`{"event":"enqueue","sha":"`+sha+`","branch":"herd/fac-599"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Register(root, "coordinator", "wK"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.BindTab(root, "wK", "wK:t1", "wK:p1", "term1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.TaskProvider.ProjectID = "project"
+	tp := &readyWakeTaskReader{task: &provider.Task{Ref: "FAC-599", ProjectID: "project", Status: "in-review"}}
+	ready := true
+	roster, err := json.Marshal(map[string]any{"result": map[string]any{"agents": []herdr.AgentEntry{{
+		Kind: "codex", Status: "idle", Workspace: "wK", TabID: "wK:t1", PaneID: "wK:p1", TerminalID: "term1", InteractiveReady: &ready,
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prJSON := `[{"number":42,"headRefOid":"` + sha + `","state":"OPEN","url":"https://example.test/pr/42","mergeable":"MERGEABLE","statusCheckRollup":[{"name":"Build, Preflight & Test Suite","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://example.test/check/1"}]}]`
+	pendingJSON := `[{"number":42,"headRefOid":"` + sha + `","state":"OPEN","url":"https://example.test/pr/42","mergeable":"MERGEABLE","statusCheckRollup":[{"name":"Build, Preflight & Test Suite","status":"PENDING","conclusion":"","detailsUrl":"https://example.test/check/1"}]}]`
+	prBody := pendingJSON
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "git":
+			return []byte(sha), nil
+		case "gh":
+			return []byte(prBody), nil
+		case "herdr":
+			if strings.Join(args, " ") != "agent list" {
+				t.Fatalf("production path issued %s %v", name, args)
+			}
+			return roster, nil
+		default:
+			t.Fatalf("production path issued %s %v", name, args)
+			return nil, nil
+		}
+	}
+	var n int32
+	restore := herdr.InstallOperatorStatusProbe(func(target string) (string, error) {
+		if target != "wK:p1" {
+			t.Fatalf("delivery target=%q", target)
+		}
+		if atomic.AddInt32(&n, 1)%2 == 1 {
+			return "idle", nil
+		}
+		return "working", nil
+	})
+	t.Cleanup(restore)
+	starter := &readyWakeStarter{}
+	deliver := func(ctx context.Context, labRoot string, w beat.IntegrationWake) error {
+		return deliverReadyIntegrationWake(ctx, labRoot, w, run, func(ctx context.Context, d herdr.OperatorDelivery) (herdr.DeliveryProof, error) {
+			return herdr.DeliverOperatorWithExecutor(ctx, d, textdelivery.NewDirectExecutor(starter.Start))
+		})
+	}
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	tick := func(at time.Time) {
+		t.Helper()
+		if err := reconcileReadyIntegrationWakes(context.Background(), root, cfg, tp, run, at, time.Minute, deliver); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tick(now)
+	if starter.calls.Load() != 0 {
+		t.Fatalf("ci-pending candidate produced a wake: calls=%d", starter.calls.Load())
+	}
+
+	prBody = prJSON
+	tick(now)
+	if starter.calls.Load() != 1 || starter.last == nil {
+		t.Fatalf("ready-but-open did not deliver: calls=%d", starter.calls.Load())
+	}
+	payload := starter.last.args[3]
+	if !strings.Contains(payload, sha) || !strings.Contains(payload, "#42") || !strings.Contains(payload, `"owner":"coordinator"`) || !strings.Contains(payload, "integration-ready") {
+		t.Fatalf("wake payload missing exact action/owner: %s", payload)
+	}
+	if strings.Contains(payload, "board-done") || strings.Contains(strings.ToLower(payload), "auto-merge") {
+		t.Fatal("wake granted merge or board authority")
+	}
+
+	tick(now.Add(time.Second))
+	if starter.calls.Load() != 1 {
+		t.Fatalf("unchanged ready observation redelivered: calls=%d", starter.calls.Load())
+	}
+
+	tick(now.Add(time.Minute))
+	if starter.calls.Load() != 2 {
+		t.Fatalf("unconsumed wake did not escalate: calls=%d", starter.calls.Load())
+	}
+	if !strings.Contains(starter.last.args[3], `"escalated":true`) || !strings.Contains(starter.last.args[3], `"generation":2`) {
+		t.Fatalf("escalation payload missing identity: %s", starter.last.args[3])
 	}
 }

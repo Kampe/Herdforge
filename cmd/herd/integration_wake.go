@@ -90,7 +90,11 @@ func integrationActions(items []attention.CandidateItem, owner *coordinator.Regi
 }
 
 func deliverIntegrationWake(ctx context.Context, root string, w beat.IntegrationWake) error {
-	owner, err := liveIntegrationOwner(ctx, root, attentionCommandAt(root), true)
+	return deliverReadyIntegrationWake(ctx, root, w, attentionCommandAt(root), herdr.DeliverOperator)
+}
+
+func deliverReadyIntegrationWake(ctx context.Context, root string, w beat.IntegrationWake, run attentionCommand, send func(context.Context, herdr.OperatorDelivery) (herdr.DeliveryProof, error)) error {
+	owner, err := liveIntegrationOwner(ctx, root, run, true)
 	if err != nil {
 		return err
 	}
@@ -101,7 +105,7 @@ func deliverIntegrationWake(ctx context.Context, root string, w beat.Integration
 	if err != nil {
 		return err
 	}
-	proof, err := herdr.DeliverOperator(ctx, request)
+	proof, err := send(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -120,7 +124,14 @@ func runForgeIntegrationWakes(ctx context.Context, cfg *config.Config, tp provid
 	if err != nil {
 		return err
 	}
-	run := attentionCommandAt(root)
+	return reconcileReadyIntegrationWakes(ctx, root, cfg, tp, attentionCommandAt(root), time.Now().UTC(), integrationWakeAge, deliverIntegrationWake)
+}
+
+// reconcileReadyIntegrationWakes is the production ready-transition: FAC-598
+// ready-but-open evidence becomes one executable owner wake. Callers inject
+// clock, command, and delivery only for a disposable lab; production uses
+// live herdr, time.Now, and DeliverOperator.
+func reconcileReadyIntegrationWakes(ctx context.Context, root string, cfg *config.Config, tp provider.TaskProvider, run attentionCommand, now time.Time, maxAge time.Duration, deliver func(context.Context, string, beat.IntegrationWake) error) error {
 	items, err := collectAttentionCandidates(ctx, root, cfg, tp, run)
 	if err != nil {
 		return fmt.Errorf("integration readiness snapshot: %w", err)
@@ -139,7 +150,9 @@ func runForgeIntegrationWakes(ctx context.Context, cfg *config.Config, tp provid
 	if err != nil {
 		return err
 	}
-	_, err = beat.ReconcileIntegrationWakes(ctx, integrationWakePath(root), actions, time.Now().UTC(), integrationWakeAge, func(ctx context.Context, w beat.IntegrationWake) error { return deliverIntegrationWake(ctx, root, w) })
+	_, err = beat.ReconcileIntegrationWakes(ctx, integrationWakePath(root), actions, now, maxAge, func(ctx context.Context, w beat.IntegrationWake) error {
+		return deliver(ctx, root, w)
+	})
 	return err
 }
 

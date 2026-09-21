@@ -73,6 +73,18 @@ type operatorReadback struct {
 // statusProbe is injectable for hermetic tests. Production uses liveStatus.
 var statusProbe = liveStatus
 
+// InstallOperatorStatusProbe replaces the live pane-status reader used by
+// operator delivery proofs. Restore with the returned function.
+func InstallOperatorStatusProbe(probe func(string) (string, error)) func() {
+	prev := statusProbe
+	if probe == nil {
+		statusProbe = liveStatus
+	} else {
+		statusProbe = probe
+	}
+	return func() { statusProbe = prev }
+}
+
 func canonicalHerdrIdentity(target, session string) []byte {
 	return []byte(fmt.Sprintf("target:%d:%s;session:%d:%s", len(target), target, len(session), session))
 }
