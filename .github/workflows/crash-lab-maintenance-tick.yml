@@ -73,7 +73,7 @@ jobs:
         env:
           HERD: ${{ github.workspace }}/dist/herd-linux-amd64
           MAINT_LAB_LOG: ${{ github.workspace }}/maint-lab.log
-        run: zsh scripts/crash-lab-maintenance-tick.sh
+        run: zsh scripts/crash-lab-maintenance-tick-outer.sh
 
       - name: Upload sanitized lab log
         if: always()
