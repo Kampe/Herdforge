@@ -61,7 +61,6 @@ print -r -- 'dirt' >"$DIRTY/dirt"
 git -C "$WORKDIR" worktree add -q -b owned-ok "$OWNED" origin/main
 (
   cd "$OWNED" || exit 1
-  print -r -- $$ >"$WORKDIR/owned.pid"
   print -r -- ready >"$WORKDIR/owned.ready"
   exec sleep 120
 ) &
@@ -158,11 +157,16 @@ print -r -- "$out1" | grep -E -q 'landed=[1-9]' || {
   print -u2 "expected landed>=1: $out1"
   exit 1
 }
+(( rc1 != 0 )) || { print -u2 "maintenance must exit nonzero when Failed>0; rc=$rc1 out=$out1"; exit 1; }
 print -r -- "$out1" | grep -E -q 'failed=[1-9]' || {
   print -u2 "expected owner-census failed>=1 (rc=$rc1): $out1"
   exit 1
 }
-print -r -- "$out1" | grep -E -q 'owner census found active use|active use' || {
+print -r -- "$out1" | grep -F -q "$OWNED" || {
+  print -u2 "refusal missing exact owned path $OWNED: $out1"
+  exit 1
+}
+print -r -- "$out1" | grep -E -q 'owner census found active use' || {
   print -u2 "missing native owner-census refusal: $out1"
   exit 1
 }

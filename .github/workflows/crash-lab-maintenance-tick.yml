@@ -67,7 +67,7 @@ jobs:
           GOOS=linux GOARCH=amd64 go build -p 1 -o dist/herd-linux-amd64 ./cmd/herd
 
       - name: Install zsh
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh lsof
 
       - name: Prove shared tick lock and cursor
         env:
