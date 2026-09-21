@@ -38,7 +38,7 @@ finish() {
 }
 trap finish EXIT
 
-sudo -n useradd --system --no-create-home --home-dir "$STAGE" --shell /bin/zsh "$labuser"
+sudo -n useradd --system --no-create-home --home-dir "$STAGE" --shell "$(command -v zsh)" "$labuser"
 created=1
 cp "$HERD" "$STAGE/herd"
 cp "$INNER" "$STAGE/inner.sh"
