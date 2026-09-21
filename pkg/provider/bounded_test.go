@@ -27,7 +27,13 @@ func TestTimeoutReportsEverythingAnOperatorAskedFor(t *testing.T) {
 	if diag.Outcome != ReadTimedOut {
 		t.Fatalf("outcome = %q, want timed-out", diag.Outcome)
 	}
-	for _, want := range []string{"kaneo", "paginating board census", "40ms", "rev-8811e89"} {
+	for _, want := range []string{
+		`"provider":"kaneo"`,
+		`"phase":"paginating board census"`,
+		`"applied_deadline":"40ms"`,
+		`"last_successful_cache_revision":"rev-8811e89"`,
+		`"outcome":"timed-out"`,
+	} {
 		if !strings.Contains(diag.String(), want) {
 			t.Fatalf("diagnostics omit %q, so an operator cannot act on them:\n%s", want, diag.String())
 		}
@@ -80,7 +86,7 @@ func TestDiagnosticsAreNeverSilent(t *testing.T) {
 		if strings.TrimSpace(diag.String()) == "" {
 			t.Fatalf("%s produced an empty diagnostic line", name)
 		}
-		if !strings.Contains(diag.String(), "provider=kaneo") {
+		if !strings.Contains(diag.String(), `"provider":"kaneo"`) {
 			t.Fatalf("%s diagnostics do not name the provider: %s", name, diag.String())
 		}
 	}
@@ -134,5 +140,23 @@ func TestAProviderIgnoringItsContextStillReportsOnTime(t *testing.T) {
 	}
 	if diag.Outcome != ReadTimedOut {
 		t.Fatalf("outcome = %q, want timed-out", diag.Outcome)
+	}
+}
+
+func TestAContextRespectingHangIsTimedOutNotFailed(t *testing.T) {
+	_, diag, err := BoundedRead(context.Background(), "kaneo", 40*time.Millisecond, "",
+		func(ctx context.Context, p *Phases) (int, error) {
+			p.Enter("GetTask FAC-607")
+			<-ctx.Done()
+			return 0, ctx.Err()
+		})
+	if err == nil {
+		t.Fatal("a budget-respecting hang returned success")
+	}
+	if diag.Outcome != ReadTimedOut {
+		t.Fatalf("outcome = %q, want timed-out when the callback returns the budget error", diag.Outcome)
+	}
+	if !diag.Unknown() {
+		t.Fatal("a budget hang classified as known")
 	}
 }
