@@ -34,9 +34,21 @@ type LocalProvider struct {
 }
 
 type localStore struct {
-	NextID   int                 `json:"next_id"`
-	Tasks    map[string]*Task    `json:"tasks"`
-	Comments map[string][]string `json:"comments"`
+	NextID    int                 `json:"next_id"`
+	NextRel   int                 `json:"next_rel"`
+	Tasks     map[string]*Task    `json:"tasks"`
+	Comments  map[string][]string `json:"comments"`
+	Relations map[string]Relation `json:"relations"`
+}
+
+func emptyLocalStore() *localStore {
+	return &localStore{
+		NextID:    1,
+		NextRel:   1,
+		Tasks:     map[string]*Task{},
+		Comments:  map[string][]string{},
+		Relations: map[string]Relation{},
+	}
 }
 
 // NewLocalProvider stores cards under <repoRoot>/.herd/local-board/.
@@ -193,7 +205,7 @@ func (p *LocalProvider) load(allowInit bool) (*localStore, error) {
 			if dirExists(p.dir) && !allowInit {
 				return nil, fmt.Errorf("local task provider: store missing after directory init; refusing to reinitialize")
 			}
-			return &localStore{NextID: 1, Tasks: map[string]*Task{}, Comments: map[string][]string{}}, nil
+			return emptyLocalStore(), nil
 		}
 		return nil, fmt.Errorf("local task provider: lstat store: %w", err)
 	}
@@ -226,6 +238,12 @@ func (p *LocalProvider) load(allowInit bool) (*localStore, error) {
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return nil, fmt.Errorf("local task provider: trailing JSON after store object")
+	}
+	if st.Relations == nil {
+		st.Relations = map[string]Relation{}
+	}
+	if st.NextRel < 1 {
+		st.NextRel = 1
 	}
 	if err := validateLocalStore(&st); err != nil {
 		return nil, err
@@ -265,11 +283,62 @@ func validateLocalStore(st *localStore) error {
 	if st.NextID <= maxLocal {
 		return fmt.Errorf("local task provider: malformed store: next_id %d collides with existing local-%d", st.NextID, maxLocal)
 	}
+	if st.Relations == nil {
+		return fmt.Errorf("local task provider: malformed store: relations is null")
+	}
+	maxRel := 0
+	seenEdge := map[string]string{}
+	for key, r := range st.Relations {
+		if r.ID != key {
+			return fmt.Errorf("local task provider: malformed store: relation key %q != id %q", key, r.ID)
+		}
+		if r.SourceTaskID == "" || r.TargetTaskID == "" {
+			return fmt.Errorf("local task provider: malformed store: relation %q missing endpoints", key)
+		}
+		if r.SourceTaskID == r.TargetTaskID {
+			return fmt.Errorf("local task provider: malformed store: relation %q is a self-edge", key)
+		}
+		if !ValidRelationType(r.Type) {
+			return fmt.Errorf("local task provider: malformed store: relation %q unknown type %q", key, r.Type)
+		}
+		if _, ok := st.Tasks[r.SourceTaskID]; !ok {
+			return fmt.Errorf("local task provider: malformed store: relation %q source %q missing", key, r.SourceTaskID)
+		}
+		if _, ok := st.Tasks[r.TargetTaskID]; !ok {
+			return fmt.Errorf("local task provider: malformed store: relation %q target %q missing", key, r.TargetTaskID)
+		}
+		edge := r.SourceTaskID + "\x00" + r.TargetTaskID + "\x00" + string(r.Type)
+		if other, ok := seenEdge[edge]; ok {
+			return fmt.Errorf("local task provider: malformed store: duplicate relation %s and %s", other, r.ID)
+		}
+		seenEdge[edge] = r.ID
+		if n, ok := localRelSeq(r.ID); ok && n > maxRel {
+			maxRel = n
+		}
+	}
+	if st.NextRel < 1 {
+		return fmt.Errorf("local task provider: malformed store: next_rel %d", st.NextRel)
+	}
+	if maxRel > 0 && st.NextRel <= maxRel {
+		return fmt.Errorf("local task provider: malformed store: next_rel %d collides with existing local-rel-%d", st.NextRel, maxRel)
+	}
 	return nil
 }
 
 func localSeq(id string) (int, bool) {
 	const pfx = "local-"
+	if !strings.HasPrefix(id, pfx) || strings.HasPrefix(id, "local-rel-") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(id[len(pfx):])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
+func localRelSeq(id string) (int, bool) {
+	const pfx = "local-rel-"
 	if !strings.HasPrefix(id, pfx) {
 		return 0, false
 	}
@@ -302,6 +371,10 @@ func (p *LocalProvider) save(st *localStore) error {
 	if err != nil {
 		return fmt.Errorf("local task provider: encode store: %w", err)
 	}
+	encoded := append(raw, '\n')
+	if len(encoded) > maxLocalStoreBytes {
+		return fmt.Errorf("local task provider: encoded store %d bytes exceeds %d; last good file preserved", len(encoded), maxLocalStoreBytes)
+	}
 	tmp, err := os.CreateTemp(p.dir, "tasks-*.json")
 	if err != nil {
 		return fmt.Errorf("local task provider: temp store: %w", err)
@@ -317,7 +390,7 @@ func (p *LocalProvider) save(st *localStore) error {
 	if err := refuseSymlinkPath(tmpName); err != nil {
 		return fmt.Errorf("local task provider: temp store: %w", err)
 	}
-	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+	if _, err := tmp.Write(encoded); err != nil {
 		return fmt.Errorf("local task provider: write temp store: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
@@ -541,4 +614,151 @@ func ticketNumber(ref string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+func (p *LocalProvider) RelationTraversalConcurrency() int { return 1 }
+
+func (p *LocalProvider) relOnTask(st *localStore, taskID, relationID string) bool {
+	for _, r := range st.Relations {
+		if r.ID == relationID && (r.SourceTaskID == taskID || r.TargetTaskID == taskID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *LocalProvider) ListRelations(ctx context.Context, taskID string) ([]Relation, error) {
+	var out []Relation
+	err := p.withStore(ctx, false, func(st *localStore) error {
+		cur, err := p.lookup(st, taskID)
+		if err != nil {
+			return err
+		}
+		for _, r := range st.Relations {
+			if r.SourceTaskID == cur.ID || r.TargetTaskID == cur.ID {
+				out = append(out, r)
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return nil
+	})
+	return out, err
+}
+
+func (p *LocalProvider) ListProjectRelations(ctx context.Context, projectID string) ([]Relation, error) {
+	var out []Relation
+	err := p.withStore(ctx, false, func(st *localStore) error {
+		for _, r := range st.Relations {
+			if projectID != "" {
+				src := st.Tasks[r.SourceTaskID]
+				tgt := st.Tasks[r.TargetTaskID]
+				if src != nil && src.ProjectID != "" && src.ProjectID != projectID {
+					continue
+				}
+				if tgt != nil && tgt.ProjectID != "" && tgt.ProjectID != projectID {
+					continue
+				}
+			}
+			out = append(out, r)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return nil
+	})
+	return out, err
+}
+
+func (p *LocalProvider) CreateRelation(ctx context.Context, sourceID, targetID string, typ RelationType) (*Relation, error) {
+	var out *Relation
+	err := p.withStore(ctx, true, func(st *localStore) error {
+		src, err := p.lookup(st, sourceID)
+		if err != nil {
+			return err
+		}
+		tgt, err := p.lookup(st, targetID)
+		if err != nil {
+			return err
+		}
+		if src.ID == tgt.ID {
+			return fmt.Errorf("local CreateRelation: self-edge rejected")
+		}
+		if typ == "" {
+			return fmt.Errorf("local CreateRelation: type required")
+		}
+		if !ValidRelationType(typ) {
+			return fmt.Errorf("local CreateRelation: unknown type %q", typ)
+		}
+		for _, r := range st.Relations {
+			if r.SourceTaskID == src.ID && r.TargetTaskID == tgt.ID && r.Type == typ {
+				cp := r
+				out = &cp
+				return nil
+			}
+		}
+		id := ""
+		for {
+			cand := fmt.Sprintf("local-rel-%d", st.NextRel)
+			st.NextRel++
+			if _, exists := st.Relations[cand]; !exists {
+				id = cand
+				break
+			}
+		}
+		r := Relation{
+			ID:           id,
+			SourceTaskID: src.ID,
+			TargetTaskID: tgt.ID,
+			Type:         typ,
+			CreatedAt:    time.Now().UTC(),
+		}
+		st.Relations[r.ID] = r
+		if !p.relOnTask(st, src.ID, r.ID) || !p.relOnTask(st, tgt.ID, r.ID) {
+			return fmt.Errorf("local CreateRelation dual readback failed")
+		}
+		cp := r
+		out = &cp
+		return nil
+	})
+	return out, err
+}
+
+func (p *LocalProvider) DeleteRelation(ctx context.Context, relationID, sourceID, targetID string) error {
+	return p.withStore(ctx, true, func(st *localStore) error {
+		r, ok := st.Relations[relationID]
+		if !ok {
+			if sourceID != "" {
+				if src, err := p.lookup(st, sourceID); err == nil && p.relOnTask(st, src.ID, relationID) {
+					return fmt.Errorf("local DeleteRelation: missing map but present on source")
+				}
+			}
+			if targetID != "" {
+				if tgt, err := p.lookup(st, targetID); err == nil && p.relOnTask(st, tgt.ID, relationID) {
+					return fmt.Errorf("local DeleteRelation: missing map but present on target")
+				}
+			}
+			return nil
+		}
+		if sourceID != "" {
+			src, err := p.lookup(st, sourceID)
+			if err != nil {
+				return err
+			}
+			if src.ID != r.SourceTaskID {
+				return fmt.Errorf("local DeleteRelation: source endpoint mismatch")
+			}
+		}
+		if targetID != "" {
+			tgt, err := p.lookup(st, targetID)
+			if err != nil {
+				return err
+			}
+			if tgt.ID != r.TargetTaskID {
+				return fmt.Errorf("local DeleteRelation: target endpoint mismatch")
+			}
+		}
+		delete(st.Relations, relationID)
+		if p.relOnTask(st, r.SourceTaskID, relationID) || p.relOnTask(st, r.TargetTaskID, relationID) {
+			return fmt.Errorf("local DeleteRelation: still present after delete")
+		}
+		return nil
+	})
 }
