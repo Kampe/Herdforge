@@ -31,7 +31,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
 
       - name: Mutate to per-worktree root and require named FAIL
+        env:
+          MUTATION_LOG: ${{ github.workspace }}/maintenance-root-mutation.log
         run: zsh scripts/crash-lab-maintenance-root-mutation.sh
+
+      - name: Upload mutation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintenance-root-mutation-${{ github.sha }}
+          path: maintenance-root-mutation.log
+          if-no-files-found: warn
+          retention-days: 7
 
   shared-tick:
     name: Two linked worktrees share tick lock

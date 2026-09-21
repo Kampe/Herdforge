@@ -8,7 +8,7 @@ fi
 
 FILE=cmd/herd/worktreereap_pulse.go
 FROM='root, _, err := gitroot.ProjectRoot(ctx, start)'
-TO='return canonicalRepoRoot(start), nil'
+TO='root, err := canonicalRepoRoot(start), error(nil)'
 restore() { git checkout -- "$FILE"; }
 
 if ! git diff --quiet -- "$FILE" || ! git diff --cached --quiet -- "$FILE"; then
@@ -23,8 +23,20 @@ if [[ "$n" != "1" ]]; then
   exit 1
 fi
 
-print -r -- "BASELINE linked-root PASS"
-go test -count=1 -timeout=60s ./cmd/herd -run '^TestMaintenanceLinkedWorktreeSharesProjectRoot$'
+LOG="${MUTATION_LOG:-maintenance-root-mutation.log}"
+: >"$LOG"
+log() { print -r -- "$*" | tee -a "$LOG"; }
+log "BASELINE linked-root"
+set +e
+base="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestMaintenanceLinkedWorktreeSharesProjectRoot$' 2>&1)"
+base_rc=$?
+set -e
+print -r -- "$base" | tee -a "$LOG"
+if (( base_rc != 0 )); then
+  print -u2 "baseline linked-root failed; not mutating"
+  exit 1
+fi
+log "BASELINE linked-root PASS"
 
 FROM="$FROM" TO="$TO" perl -i -pe 'BEGIN { $from = $ENV{FROM}; $to = $ENV{TO} } s/\Q$from\E/$to/' "$FILE"
 
@@ -32,7 +44,7 @@ set +e
 out="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestMaintenanceLinkedWorktreeSharesProjectRoot$' 2>&1)"
 rc=$?
 set -e
-print -r -- "$out"
+print -r -- "$out" | tee -a "$LOG"
 if (( rc == 0 )); then
   print -u2 "per-worktree regression did not fail linked-root test"
   exit 1
@@ -51,6 +63,15 @@ if ! git diff --quiet -- "$FILE"; then
   print -u2 "restore left dirty $FILE"
   exit 1
 fi
-print -r -- "POST-MUTANT linked-root PASS"
-go test -count=1 -timeout=60s ./cmd/herd -run '^TestMaintenanceLinkedWorktreeSharesProjectRoot$|^TestCleanupCoordinationRootRefusesCanceledContext$'
-print -r -- "maintenance root mutation driver ok"
+log "POST-MUTANT"
+set +e
+post="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestMaintenanceLinkedWorktreeSharesProjectRoot$|^TestCleanupCoordinationRootRefusesCanceledContext$' 2>&1)"
+post_rc=$?
+set -e
+print -r -- "$post" | tee -a "$LOG"
+if (( post_rc != 0 )); then
+  print -u2 "post-mutant restore tests failed"
+  exit 1
+fi
+log "POST-MUTANT linked-root PASS"
+log "maintenance root mutation driver ok"
