@@ -1,0 +1,44 @@
+name: Crash lab maintenance tick
+
+on:
+  push:
+    branches: [ "lab/**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crash-lab-maintenance-tick-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shared-tick:
+    name: Two linked worktrees share tick lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build linux herd
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -p 1 -o dist/herd-linux-amd64 ./cmd/herd
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Prove shared tick lock and cursor
+        env:
+          HERD: ${{ github.workspace }}/dist/herd-linux-amd64
+        run: zsh scripts/crash-lab-maintenance-tick.sh

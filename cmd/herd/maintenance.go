@@ -77,7 +77,11 @@ func runMaintenanceCommandContext(ctx context.Context, args []string, out, errOu
 	// repository, so a carrier started from a linked worktree shares state with
 	// the pulse beat instead of opening a second one beside it. The base comes
 	// from the repository's configured default branch, not a hardcoded ref.
-	root := canonicalRepoRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	root, err := cleanupCoordinationRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	if err != nil {
+		fmt.Fprintf(errOut, "maintenance: %v\n", err)
+		return 1
+	}
 	base := reapPulseBaseRef(root)
 
 	// Zero interval is one cycle and exit: the supervisor's own timer is the
