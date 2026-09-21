@@ -84,6 +84,14 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 			}
 		}
 	}
+	localRoot := ""
+	if providerType == "local" {
+		wd, wdErr := os.Getwd()
+		if wdErr != nil {
+			return nil, fmt.Errorf("local task provider: working directory: %w", wdErr)
+		}
+		localRoot = wd
+	}
 	return NewProductionProvider(TaskConfig{
 		Type:                providerType,
 		APIURL:              apiURL,
@@ -94,6 +102,7 @@ func NewFromHerdConfig(cfg *config.Config) (TaskProvider, error) {
 		UserEmail:           strings.TrimSpace(cfg.TaskProvider.UserEmail),
 		APIKeyTrustedOrigin: trustedOrigin,
 		Enabled:             cfg.TaskProvider.Enabled,
+		LocalRoot:           localRoot,
 		Get:                 g,
 		List:                l,
 		Mutate:              m,

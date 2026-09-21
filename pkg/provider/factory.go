@@ -30,6 +30,9 @@ type TaskConfig struct {
 	// task_provider.type without also moving the operator policy fails closed
 	// instead of silently pointing the fleet at a different board.
 	Enabled []string
+	// LocalRoot is the repository root for type=local. Store lives under
+	// <LocalRoot>/.herd/local-board and is refused if it would escape .herd.
+	LocalRoot string
 }
 
 // checkEnabled enforces the activation policy for a normalized provider type.
@@ -117,6 +120,12 @@ func NewProductionProvider(tc TaskConfig) (TaskProvider, error) {
 	case "memory":
 		// Explicit test/dev type — still bound so timeouts classify uniformly.
 		return NewBoundClient(NewMemoryProvider(), dls), nil
+	case "local":
+		lp, err := NewLocalProvider(tc.LocalRoot)
+		if err != nil {
+			return nil, err
+		}
+		return NewBoundClient(lp, dls), nil
 	default:
 		return nil, fmt.Errorf("task_provider.type %q is not activated in this build", providerType)
 	}

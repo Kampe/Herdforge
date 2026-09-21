@@ -58,6 +58,7 @@ func markOperational(command string) {
 // source, scoped to this literal, instead of a self-invalidating baseline entry.
 var subcommandUsage = map[string]string{
 	"control-surface":  "Usage: herd control-surface [--json]\n  Machine-readable discovery of public-agent operations only.",
+	"board-card":       "Usage: herd board-card <create|get|list|status> [flags]\n  Coordinator-owned CRUD for task_provider.type=local persistent board.",
 	"board-freeze":     "Usage: herd board-freeze [status|on|off]\n  Durable provider-mutation freeze; on requires --actor and --reason.",
 	"board-frozen":     "Usage: herd board-frozen\n  Exit 0 with the durable board-freeze trigger when mutations are frozen.",
 	"broker":           "Usage: herd broker [ensure]\n  Serve or ensure the local broker runtime.",

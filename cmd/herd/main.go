@@ -342,6 +342,9 @@ func main() {
 	case "board-done":
 		runBoardDone()
 
+	case "board-card":
+		runBoardCard()
+
 	case "board-audit":
 		runBoardAudit()
 
@@ -689,6 +692,7 @@ func printUsage() {
 	fmt.Println("  approve    Move in-review cards to done, gated on merge evidence")
 	fmt.Println("  drain      Report coordinator review pile (optional bounded --act)")
 	fmt.Println("  board-done Move one card to done ONLY from a task-bound completion receipt")
+	fmt.Println("  board-card Local persistent board create/get/list/status (type=local only)")
 	fmt.Println("  receipt    Issue, recover, or release signed task receipts")
 	fmt.Println("  board-audit Report Done cards that no completion receipt closed (read-only)")
 	fmt.Println("  board-sync Reconcile board against git + live lanes; --fix advances lagging cards")
