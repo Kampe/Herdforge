@@ -127,4 +127,20 @@ for w in {1..12}; do
   [[ -d "$WORKDIR/wt-$w" ]] || { print -u2 "fixture wt-$w removed"; exit 1; }
 done
 
+dangle="$WORKDIR/dangle"
+ln -s "$WORKDIR/nowhere-target" "$dangle"
+set +e
+dangle_out="$(cd "$WORKDIR/wt-1" && HERD_PROJECT_ROOT="$dangle" "$HERD" maintenance --act 2>&1)"
+dangle_rc=$?
+set -e
+log "$dangle_out"
+if (( dangle_rc == 0 )); then
+  print -u2 "dangling HERD_PROJECT_ROOT must refuse: $dangle_out"
+  exit 1
+fi
+print -r -- "$dangle_out" | grep -E -q 'dangling symlink|unresolvable identity' || {
+  print -u2 "dangling refusal missing expected text: $dangle_out"
+  exit 1
+}
+
 log "maintenance shared tick lab ok last1=$last1 last2=$last2"

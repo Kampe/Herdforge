@@ -401,21 +401,66 @@ func cleanupCoordinationRoot(ctx context.Context, start string) (string, error) 
 	explicit := strings.TrimSpace(os.Getenv(gitroot.EnvProjectRoot)) != ""
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		if explicit && os.IsNotExist(err) {
-			if _, lerr := os.Lstat(root); lerr == nil {
-				return "", fmt.Errorf("cleanup coordination root: dangling symlink %s", root)
-			}
-			if err := ctx.Err(); err != nil {
-				return "", fmt.Errorf("cleanup coordination root: %w", err)
-			}
-			return filepath.Clean(root), nil
+		if !explicit {
+			return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
 		}
-		return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+		reconstructed, recErr := reconstructMissingExplicitRoot(root)
+		if recErr != nil {
+			return "", recErr
+		}
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("cleanup coordination root: %w", err)
+		}
+		return reconstructed, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("cleanup coordination root: %w", err)
 	}
 	return filepath.Clean(resolved), nil
+}
+
+// reconstructMissingExplicitRoot walks to the nearest existing ancestor,
+// refuses dangling/unreadable symlink ancestors, and joins only the
+// genuinely absent suffix.
+func reconstructMissingExplicitRoot(root string) (string, error) {
+	cur := filepath.Clean(root)
+	var suffix []string
+	for {
+		info, err := os.Lstat(cur)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				target, e := filepath.EvalSymlinks(cur)
+				if e != nil {
+					return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s: %w", cur, e)
+				}
+				cur = target
+				info, err = os.Lstat(cur)
+				if err != nil {
+					if !os.IsNotExist(err) {
+						return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+					}
+					return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s", cur)
+				}
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("cleanup coordination root: ancestor %s is not a directory", cur)
+			}
+			out := cur
+			for i := len(suffix) - 1; i >= 0; i-- {
+				out = filepath.Join(out, suffix[i])
+			}
+			return filepath.Clean(out), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", fmt.Errorf("cleanup coordination root: no existing ancestor")
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 // reapPulseLockIdentity is the advisory record written into the lock file

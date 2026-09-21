@@ -354,6 +354,64 @@ func TestCleanupCoordinationRootRefusesCanceledContext(t *testing.T) {
 	}
 }
 
+func TestCleanupCoordinationRootMissingExplicitLeaf(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent")
+	t.Setenv("HERD_PROJECT_ROOT", missing)
+	got, err := cleanupCoordinationRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("missing explicit leaf: %v", err)
+	}
+	if got != missing {
+		t.Fatalf("missing explicit leaf root = %q, want %q", got, missing)
+	}
+}
+
+func TestCleanupCoordinationRootDanglingLeaf(t *testing.T) {
+	dir := t.TempDir()
+	dangle := filepath.Join(dir, "dangle")
+	if err := os.Symlink(filepath.Join(dir, "nowhere"), dangle); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", dangle)
+	if _, err := cleanupCoordinationRoot(context.Background(), "."); err == nil {
+		t.Fatal("dangling leaf must refuse")
+	}
+}
+
+func TestCleanupCoordinationRootDanglingAncestor(t *testing.T) {
+	dir := t.TempDir()
+	dangle := filepath.Join(dir, "dangle")
+	if err := os.Symlink(filepath.Join(dir, "nowhere"), dangle); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", filepath.Join(dangle, "child"))
+	if _, err := cleanupCoordinationRoot(context.Background(), "."); err == nil {
+		t.Fatal("dangling ancestor must refuse")
+	}
+}
+
+func TestCleanupCoordinationRootSymlinkAncestorAbsentSuffix(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", filepath.Join(link, "new"))
+	got, err := cleanupCoordinationRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("symlink ancestor absent suffix: %v", err)
+	}
+	want := filepath.Join(real, "new")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestMaintenanceLinkedWorktreeSharesProjectRoot(t *testing.T) {
 	root := maintenanceScratchRoot(t)
 	wt := filepath.Join(root, "wt")
