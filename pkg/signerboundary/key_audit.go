@@ -34,22 +34,30 @@ type KeyAuditStatement struct {
 	ServerUID int    `json:"server_uid"`
 }
 
-func (s *Server) bindDiskKeyToLoadedPub() error {
-	f, err := openKeyVerified(s.keyPath, s.topo.SignerUID)
-	if err != nil {
-		return fmt.Errorf("%w: open key for audit bind: %v", ErrProvisioning, err)
-	}
-	limited := io.LimitReader(f, int64(maxAuditSeedRead)+1)
+func readBoundedAuditSeed(r io.Reader) ([]byte, error) {
+	limited := io.LimitReader(r, int64(maxAuditSeedRead)+1)
 	data, err := io.ReadAll(limited)
-	_ = f.Close()
 	if err != nil {
-		return fmt.Errorf("%w: read key for audit bind: %v", ErrProvisioning, err)
+		return nil, err
 	}
 	if len(data) > maxAuditSeedRead {
 		for i := range data {
 			data[i] = 0
 		}
-		return fmt.Errorf("%w: audit seed exceeds %d-byte hex+whitespace bound", ErrProvisioning, maxAuditSeedRead)
+		return nil, fmt.Errorf("%w: audit seed exceeds %d-byte hex+whitespace bound", ErrProvisioning, maxAuditSeedRead)
+	}
+	return data, nil
+}
+
+func (s *Server) bindDiskKeyToLoadedPub() error {
+	f, err := openKeyVerified(s.keyPath, s.topo.SignerUID)
+	if err != nil {
+		return fmt.Errorf("%w: open key for audit bind: %v", ErrProvisioning, err)
+	}
+	data, err := readBoundedAuditSeed(f)
+	_ = f.Close()
+	if err != nil {
+		return fmt.Errorf("%w: read key for audit bind: %v", err)
 	}
 	seed, err := hex.DecodeString(strings.TrimSpace(string(data)))
 	for i := range data {
