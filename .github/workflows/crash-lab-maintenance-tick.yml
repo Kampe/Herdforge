@@ -36,6 +36,9 @@ jobs:
       - name: Mutate census nonmatching PIDs and require named FAIL
         run: zsh scripts/crash-lab-census-pid-mutation.sh
 
+      - name: Mutate single InUse PID filter and require named FAIL
+        run: zsh scripts/crash-lab-inuse-pid-mutation.sh
+
       - name: Mutate to per-worktree root and require named FAIL
         env:
           MUTATION_LOG: ${{ github.workspace }}/maintenance-root-mutation.log

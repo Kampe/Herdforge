@@ -905,6 +905,37 @@ func TestDarwinLiveMetadataRefusalStaysFailClosed(t *testing.T) {
 	}
 }
 
+func TestInUseRecordsMatchingNonmatchingAndLsofDuplicate(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := os.Getpid()
+	fake := filepath.Join(dir, "fake-lsof")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'p%d\\nfcwd\\nn%s\\n'\nexit 0\n", self, dir)
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := LSOFProcessInspector{
+		Executable:     fake,
+		Timeout:        2 * time.Second,
+		MaxOutputBytes: 1 << 20,
+		processReferencesFn: func(_ context.Context, pid int, _ string) (bool, error) {
+			return pid == self, nil
+		},
+	}
+	usage, err := p.InUse(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usage.ReferencedPath {
+		t.Fatal("matching pid must set ReferencedPath")
+	}
+	if len(usage.PIDs) != 1 || usage.PIDs[0] != self {
+		t.Fatalf("single InUse pids = %v, want [%d] (lsof duplicate + nonmatching filtered)", usage.PIDs, self)
+	}
+}
+
 func TestAppendUniquePIDMatchingNonmatchingAndDuplicate(t *testing.T) {
 	if got := appendUniquePID(nil, 7); len(got) != 1 || got[0] != 7 {
 		t.Fatalf("matching append = %v, want [7]", got)
