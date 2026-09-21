@@ -41,4 +41,14 @@ jobs:
       - name: Prove shared tick lock and cursor
         env:
           HERD: ${{ github.workspace }}/dist/herd-linux-amd64
+          MAINT_LAB_LOG: ${{ github.workspace }}/maint-lab.log
         run: zsh scripts/crash-lab-maintenance-tick.sh
+
+      - name: Upload sanitized lab log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maint-tick-lab-${{ github.sha }}
+          path: maint-lab.log
+          if-no-files-found: warn
+          retention-days: 7
