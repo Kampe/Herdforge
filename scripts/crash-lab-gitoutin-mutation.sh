@@ -29,11 +29,11 @@ if (( brc != 0 )); then
   print -u2 "baseline failed; not mutating"
   exit 1
 fi
-print -r -- "$base" | grep -E -q '--- SKIP:[[:space:]]*TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean' && {
+print -r -- "$base" | grep -E -q -- '--- SKIP:[[:space:]]*TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean' && {
   print -u2 "baseline skipped; hosted mutation requires named PASS"
   exit 1
 }
-print -r -- "$base" | grep -E -q '--- PASS:[[:space:]]*TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean' || {
+print -r -- "$base" | grep -E -q -- '--- PASS:[[:space:]]*TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean' || {
   print -u2 "baseline missing named PASS"
   exit 1
 }
