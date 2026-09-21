@@ -188,7 +188,10 @@ print -r -- "$out1" | grep -E -q 'retired=1([^0-9]|$)' || {
   exit 1
 }
 [[ ! -e "$MERGED" ]] || { print -u2 "merged fixture still on disk"; exit 1; }
-git -C "$WORKDIR" worktree list --porcelain | grep -F -q "$MERGED" && { print -u2 "merged fixture still registered"; exit 1; }
+if git -C "$WORKDIR" worktree list --porcelain | grep -F -q "$MERGED"; then
+  print -u2 "merged fixture still registered"
+  exit 1
+fi
 [[ -d "$DIRTY" ]] || { print -u2 "dirty merged fixture was removed"; exit 1; }
 [[ -d "$OWNED" ]] || { print -u2 "owned merged fixture was removed"; exit 1; }
 kill -0 "$owned_pid" || { print -u2 "owned sleep died during retirement"; exit 1; }
@@ -196,7 +199,10 @@ kill -0 "$owned_pid" || { print -u2 "owned sleep died during retirement"; exit 1
 [[ ! -e "$WORKDIR/wt-1/.herd/worktree-reap-pulse.cursor" ]] || { print -u2 "wt-1 grew its own cursor"; exit 1; }
 last1="$(cat "$cursor")"
 
+set +e
 out2="$(cd "$WORKDIR/wt-2" && "$HERD" maintenance --act 2>&1)"
+rc2=$?
+set -e
 log "$out2"
 print -r -- "$out2" | grep -E -q 'eligible=(9|[1-9][0-9]+)' || {
   print -u2 "wt-2 eligible not >8: $out2"
@@ -210,6 +216,16 @@ print -r -- "$out2" | grep -E -q 'retired=0' || {
   print -u2 "second beat must not retire remaining unmerged/dirty/owned: $out2"
   exit 1
 }
+if (( rc2 != 0 )); then
+  print -r -- "$out2" | grep -F -q "$OWNED" || {
+    print -u2 "second beat unexpected failure without owned path: $out2"
+    exit 1
+  }
+  print -r -- "$out2" | grep -E -q 'owner census found active use' || {
+    print -u2 "second beat unexpected failure without owner-census refusal: $out2"
+    exit 1
+  }
+fi
 [[ -d "$DIRTY" ]] || { print -u2 "dirty fixture missing after second beat"; exit 1; }
 [[ -d "$OWNED" ]] || { print -u2 "owned fixture missing after second beat"; exit 1; }
 [[ -f "$cursor" ]] || { print -u2 "shared cursor vanished"; exit 1; }

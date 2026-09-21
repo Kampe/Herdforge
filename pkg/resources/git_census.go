@@ -1009,15 +1009,24 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 			usage.MetadataUnavailable = true
 			break
 		}
-		if _, alreadySeen := seen[pid]; !alreadySeen {
-			usage.PIDs = append(usage.PIDs, pid)
-		}
 		referenced, referenceErr := p.referenceProbe()(processCtx, pid, resolved)
 		if referenceErr != nil {
 			usage.MetadataUnavailable = true
 			continue
 		}
-		usage.ReferencedPath = usage.ReferencedPath || referenced
+		if referenced {
+			usage.ReferencedPath = true
+			already := false
+			for _, existing := range usage.PIDs {
+				if existing == pid {
+					already = true
+					break
+				}
+			}
+			if !already {
+				usage.PIDs = append(usage.PIDs, pid)
+			}
+		}
 	}
 	sortInts(usage.PIDs)
 	return usage, nil
@@ -1299,9 +1308,21 @@ func (p LSOFProcessInspector) inUseManyWalk(ctx context.Context, timeout time.Du
 			continue
 		}
 		for path, referenced := range references {
+			if !referenced {
+				continue
+			}
 			entry := usage[path]
-			entry.ReferencedPath = entry.ReferencedPath || referenced
-			entry.PIDs = append(entry.PIDs, pid)
+			entry.ReferencedPath = true
+			already := false
+			for _, existing := range entry.PIDs {
+				if existing == pid {
+					already = true
+					break
+				}
+			}
+			if !already {
+				entry.PIDs = append(entry.PIDs, pid)
+			}
 			usage[path] = entry
 		}
 	}
