@@ -219,6 +219,11 @@ func TestRegisteredAntigravityPollUsesInjectedDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldToken := antigravityToken
+	antigravityToken = func() (string, error) {
+		return "", pollErrf("auth-missing", "antigravity credentials are unavailable; run agy to sign in")
+	}
+	t.Cleanup(func() { antigravityToken = oldToken })
 	old := discoverAntigravity
 	discoverAntigravity = func() (antigravityDiscovery, error) {
 		return antigravityDiscovery{Ports: []int{port}, CSRF: "fixture-csrf"}, nil
@@ -231,6 +236,149 @@ func TestRegisteredAntigravityPollUsesInjectedDiscovery(t *testing.T) {
 	}
 	if p.Resources["geminiSession"].Remaining != 75 {
 		t.Fatalf("registered poller did not use discovered service: %+v", p.Resources)
+	}
+}
+
+func TestAntigravitySkipsMissingRemainingFraction(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-5h"},{"bucketId":"gemini-weekly","remainingFraction":null},{"bucketId":"3p-weekly","remainingFraction":0.4}]}]}`))
+	}))
+	defer s.Close()
+	p, err := antigravityPollWithURL(s.URL, "csrf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Resources) != 1 || p.Resources["nonGeminiWeekly"].Remaining != 40 {
+		t.Fatalf("omitted/null remainingFraction must not become zero quota: %+v", p.Resources)
+	}
+}
+
+func TestAntigravityCloudPollMapsExactBucketsAndWindows(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer agy-tok" {
+			t.Errorf("missing AGY bearer")
+		}
+		if r.Header.Get("User-Agent") != antigravityUserAgent {
+			t.Errorf("User-Agent = %q, want %q", r.Header.Get("User-Agent"), antigravityUserAgent)
+		}
+		if r.Header.Get("x-codeium-csrf-token") != "" {
+			t.Errorf("cloud poller must not send language-server CSRF")
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":0.6,"window":"5h","resetTime":"2099-01-01T00:00:00Z"},{"bucketId":"gemini-weekly","remainingFraction":0.25,"window":"weekly"},{"bucketId":"3p-5h","remainingFraction":0.5,"window":"5h"},{"bucketId":"3p-weekly","remainingFraction":0.1,"window":"weekly"},{"bucketId":"unknown","remainingFraction":1}]}]}`))
+	}))
+	defer s.Close()
+	p, err := antigravityCloudPollWithURL(s.URL, "agy-tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Resources) != 4 {
+		t.Fatalf("exact buckets not preserved: %+v", p.Resources)
+	}
+	if p.Resources["geminiSession"].Remaining != 60 || p.Resources["geminiSession"].WindowSeconds != Window5h {
+		t.Fatalf("gemini-5h mapping wrong: %+v", p.Resources["geminiSession"])
+	}
+	if p.Resources["geminiWeekly"].Remaining != 25 || p.Resources["geminiWeekly"].WindowSeconds != WindowWeekly {
+		t.Fatalf("gemini-weekly mapping wrong: %+v", p.Resources["geminiWeekly"])
+	}
+	if p.Resources["nonGeminiSession"].Used != 50 || p.Resources["nonGeminiWeekly"].Remaining != 10 {
+		t.Fatalf("non-gemini mapping wrong: %+v", p.Resources)
+	}
+}
+
+func TestRegisteredAntigravityPollUsesCLICloudIdentity(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != antigravityUserAgent {
+			t.Fatalf("User-Agent = %q", r.Header.Get("User-Agent"))
+		}
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.8,"window":"weekly"}]}]}`))
+	}))
+	defer s.Close()
+	oldURL := antigravityCloudURL
+	antigravityCloudURL = s.URL
+	t.Cleanup(func() { antigravityCloudURL = oldURL })
+	oldToken := antigravityToken
+	antigravityToken = func() (string, error) { return "agy-tok", nil }
+	t.Cleanup(func() { antigravityToken = oldToken })
+	oldDisc := discoverAntigravity
+	discoverAntigravity = func() (antigravityDiscovery, error) {
+		return antigravityDiscovery{}, pollErrf("unsupported", "antigravity language server is not running")
+	}
+	t.Cleanup(func() { discoverAntigravity = oldDisc })
+	p, err := nativePollers["antigravity"]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["geminiWeekly"].Remaining != 80 {
+		t.Fatalf("registered poller did not use AGY cloud identity: %+v", p.Resources)
+	}
+}
+
+func TestAntigravityPollDoesNotUseGeminiCLICredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", "")
+	geminiDir := filepath.Join(home, ".gemini")
+	if err := os.MkdirAll(geminiDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Gemini CLI creds in the same tree must not become Antigravity quota.
+	if err := os.WriteFile(filepath.Join(geminiDir, "oauth_creds.json"), []byte(`{"access_token":"gemini-tok","expiry_date":9999999999999}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDisc := discoverAntigravity
+	discoverAntigravity = func() (antigravityDiscovery, error) {
+		return antigravityDiscovery{}, pollErrf("unsupported", "antigravity language server is not running")
+	}
+	t.Cleanup(func() { discoverAntigravity = oldDisc })
+	oldToken := antigravityToken
+	antigravityToken = antigravityTokenFromFile
+	t.Cleanup(func() { antigravityToken = oldToken })
+	_, err := nativePollers["antigravity"]()
+	if err == nil || pollErrorCode(err) != "auth-missing" {
+		t.Fatalf("gemini CLI creds must not satisfy AGY quota, got %v", err)
+	}
+}
+
+func TestAntigravityExpiredTokenIsAuthExpired(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", "")
+	dir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	expired := `{"token":{"access_token":"stale","expiry":"2020-01-01T00:00:00Z"},"auth_method":"consumer"}`
+	if err := os.WriteFile(filepath.Join(dir, antigravityOAuthFile), []byte(expired), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := antigravityTokenFromFile()
+	if err == nil || pollErrorCode(err) != "auth-expired" {
+		t.Fatalf("expired AGY token must be auth-expired, got %v", err)
+	}
+}
+
+func TestAntigravityEmptyCSRFDoesNotBlockCloudSuccess(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"bucketId":"3p-weekly","remainingFraction":0.9,"window":"weekly"}]}]}`))
+	}))
+	defer s.Close()
+	oldURL := antigravityCloudURL
+	antigravityCloudURL = s.URL
+	t.Cleanup(func() { antigravityCloudURL = oldURL })
+	oldToken := antigravityToken
+	antigravityToken = func() (string, error) { return "agy-tok", nil }
+	t.Cleanup(func() { antigravityToken = oldToken })
+	oldDisc := discoverAntigravity
+	discoverAntigravity = func() (antigravityDiscovery, error) {
+		return antigravityDiscovery{Ports: []int{1}, CSRF: ""}, nil
+	}
+	t.Cleanup(func() { discoverAntigravity = oldDisc })
+	p, err := antigravityPoll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Resources["nonGeminiWeekly"].Remaining != 90 {
+		t.Fatalf("CLI cloud identity must win without CSRF: %+v", p.Resources)
 	}
 }
 
@@ -1208,5 +1356,3 @@ func TestLiteLLMMissingConfigFailsClosed(t *testing.T) {
 		t.Fatalf("missing config error = %v, want config-missing", err)
 	}
 }
-
-

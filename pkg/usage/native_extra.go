@@ -284,16 +284,25 @@ func zeroOllamaKey(k *ollamaSigningKey) {
 	k.public = nil
 }
 
-// Antigravity quota is a same-host language-server authority. The collector
-// never starts AGY and never substitutes Gemini CLI data for these buckets.
+// Antigravity quota is the standalone AGY CLI identity. The collector never
+// starts AGY, never shells OpenUsage, and never substitutes Gemini CLI
+// oauth_creds.json for these buckets. The supported Cloud Code summary
+// endpoint is what the live CLI uses; an IDE language-server CSRF is an
+// optional extra when it is actually present on argv.
+const (
+	antigravityQuotaURL  = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+	antigravityUserAgent = "Google Antigravity"
+	antigravityOAuthFile = "antigravity-oauth-token"
+)
+
 type antigravitySummary struct {
 	Groups []struct {
 		Buckets []struct {
-			BucketID          string  `json:"bucketId"`
-			DisplayName       string  `json:"displayName"`
-			Window            string  `json:"window"`
-			RemainingFraction float64 `json:"remainingFraction"`
-			ResetTime         string  `json:"resetTime"`
+			BucketID          string   `json:"bucketId"`
+			DisplayName       string   `json:"displayName"`
+			Window            string   `json:"window"`
+			RemainingFraction *float64 `json:"remainingFraction"`
+			ResetTime         string   `json:"resetTime"`
 		} `json:"buckets"`
 	} `json:"groups"`
 }
@@ -303,10 +312,36 @@ var antigravityBuckets = map[string]string{
 	"3p-5h": "nonGeminiSession", "3p-weekly": "nonGeminiWeekly",
 }
 
+var (
+	antigravityToken    = antigravityTokenFromFile
+	antigravityCloudURL = antigravityQuotaURL
+)
+
 func antigravityPoll() (ProviderUsage, error) {
+	tok, tokErr := antigravityToken()
+	if tokErr == nil {
+		p, pollErr := antigravityCloudPollWithURL(antigravityCloudURL, tok)
+		if pollErr == nil {
+			return p, nil
+		}
+		if p, lsErr := antigravityPollLanguageServer(); lsErr == nil {
+			return p, nil
+		}
+		return ProviderUsage{}, pollErr
+	}
+	if p, lsErr := antigravityPollLanguageServer(); lsErr == nil {
+		return p, nil
+	}
+	return ProviderUsage{}, tokErr
+}
+
+func antigravityPollLanguageServer() (ProviderUsage, error) {
 	d, err := discoverAntigravity()
 	if err != nil {
 		return ProviderUsage{}, err
+	}
+	if strings.TrimSpace(d.CSRF) == "" {
+		return ProviderUsage{}, pollErrf("unsupported", "antigravity language server has no usable CSRF token")
 	}
 	for _, port := range d.Ports {
 		for _, scheme := range []string{"https", "http"} {
@@ -403,36 +438,135 @@ func antigravityPollWithURL(url, csrf string) (ProviderUsage, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-codeium-csrf-token", csrf)
+	return antigravityDoSummary(req, "antigravity quota")
+}
+
+func antigravityCloudPollWithURL(url, token string) (ProviderUsage, error) {
+	req, err := http.NewRequest("POST", url, strings.NewReader("{}"))
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", antigravityUserAgent)
+	return antigravityDoSummary(req, "antigravity quota")
+}
+
+func antigravityDoSummary(req *http.Request, surface string) (ProviderUsage, error) {
 	resp, err := pollClient().Do(req)
 	if err != nil {
 		return ProviderUsage{}, netPollError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return ProviderUsage{}, httpRateLimitPollError("antigravity quota", resp)
+		return ProviderUsage{}, httpRateLimitPollError(surface, resp)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return ProviderUsage{}, httpStatusPollError("antigravity quota", resp.StatusCode)
+		return ProviderUsage{}, httpStatusPollError(surface, resp.StatusCode)
 	}
 	var summary antigravitySummary
 	if err := json.NewDecoder(resp.Body).Decode(&summary); err != nil {
 		return ProviderUsage{}, pollErrf("decode-failed", "antigravity quota decode: %v", err)
 	}
+	resources, err := antigravityResources(summary)
+	if err != nil {
+		return ProviderUsage{}, err
+	}
+	return ProviderUsage{DisplayName: "Antigravity", Resources: resources}, nil
+}
+
+func antigravityResources(summary antigravitySummary) (map[string]ResourceUsage, error) {
 	resources := map[string]ResourceUsage{}
 	for _, group := range summary.Groups {
 		for _, bucket := range group.Buckets {
 			name, ok := antigravityBuckets[bucket.BucketID]
-			if !ok || bucket.RemainingFraction < 0 || bucket.RemainingFraction > 1 {
+			if !ok || bucket.RemainingFraction == nil || *bucket.RemainingFraction < 0 || *bucket.RemainingFraction > 1 {
 				continue
 			}
-			remaining := bucket.RemainingFraction * 100
-			resources[name] = ResourceUsage{Kind: "consumption", State: "active", Pool: strings.TrimSuffix(name, "Session"), Unit: "percent", Used: 100 - remaining, Remaining: remaining, Limit: 100, Utilization: 1 - bucket.RemainingFraction, ResetsAt: bucket.ResetTime}
+			frac := *bucket.RemainingFraction
+			remaining := frac * 100
+			resources[name] = ResourceUsage{
+				Kind: "consumption", State: "active",
+				Pool: strings.TrimSuffix(name, "Session"), Unit: "percent",
+				Used: 100 - remaining, Remaining: remaining, Limit: 100,
+				Utilization: 1 - frac, ResetsAt: bucket.ResetTime,
+				WindowSeconds: antigravityWindowSeconds(bucket.Window),
+			}
 		}
 	}
 	if len(resources) == 0 {
-		return ProviderUsage{}, pollErrf("no-windows", "antigravity quota: no recognized usable buckets")
+		return nil, pollErrf("no-windows", "antigravity quota: no recognized usable buckets")
 	}
-	return ProviderUsage{DisplayName: "Antigravity", Resources: resources}, nil
+	return resources, nil
+}
+
+func antigravityWindowSeconds(window string) int {
+	switch strings.ToLower(strings.TrimSpace(window)) {
+	case "5h", "five_hour", "five-hour", "five hour":
+		return Window5h
+	case "weekly":
+		return WindowWeekly
+	default:
+		return 0
+	}
+}
+
+func antigravityTokenFromFile() (string, error) {
+	var lastErr error
+	for _, path := range antigravityCredentialFiles() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var creds struct {
+			Token struct {
+				AccessToken string `json:"access_token"`
+				Expiry      string `json:"expiry"`
+			} `json:"token"`
+		}
+		if err := json.Unmarshal(raw, &creds); err != nil {
+			lastErr = pollErrf("decode-failed", "antigravity creds decode: %v", err)
+			continue
+		}
+		if strings.TrimSpace(creds.Token.AccessToken) == "" {
+			lastErr = pollErrf("auth-missing", "antigravity creds at %s: no access token", path)
+			continue
+		}
+		if expiry := strings.TrimSpace(creds.Token.Expiry); expiry != "" {
+			ts, err := time.Parse(time.RFC3339Nano, expiry)
+			if err != nil {
+				ts, err = time.Parse(time.RFC3339, expiry)
+			}
+			if err != nil {
+				return "", pollErrf("auth-invalid", "antigravity credentials expiry is unusable")
+			}
+			if time.Now().After(ts) {
+				return "", pollErrf("auth-expired",
+					"antigravity credentials expired at %s; run agy to refresh",
+					ts.Format(time.RFC3339))
+			}
+		}
+		return creds.Token.AccessToken, nil
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", pollErrf("auth-missing",
+		"antigravity credentials are unavailable; run agy to sign in")
+}
+
+func antigravityCredentialFiles() []string {
+	var out []string
+	add := func(dir string) {
+		if strings.TrimSpace(dir) != "" {
+			out = append(out, filepath.Join(dir, antigravityOAuthFile))
+		}
+	}
+	add(os.Getenv("ANTIGRAVITY_APP_DATA_DIR"))
+	if home, err := os.UserHomeDir(); err == nil {
+		add(filepath.Join(home, ".gemini", "antigravity-cli"))
+	}
+	return out
 }
 
 // LiteLLM's key-info endpoint is an authority only when it returns an
