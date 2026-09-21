@@ -222,8 +222,14 @@ func (p *LocalProvider) load(allowInit bool) (*localStore, error) {
 		return nil, fmt.Errorf("local task provider: store exceeds %d bytes", maxLocalStoreBytes)
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	var st localStore
-	if err := dec.Decode(&st); err != nil {
+	var wire struct {
+		NextID    int                 `json:"next_id"`
+		NextRel   json.RawMessage     `json:"next_rel"`
+		Tasks     map[string]*Task    `json:"tasks"`
+		Comments  map[string][]string `json:"comments"`
+		Relations json.RawMessage     `json:"relations"`
+	}
+	if err := dec.Decode(&wire); err != nil {
 		return nil, fmt.Errorf("local task provider: parse store: %w", err)
 	}
 	if dec.More() {
@@ -232,11 +238,27 @@ func (p *LocalProvider) load(allowInit bool) (*localStore, error) {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return nil, fmt.Errorf("local task provider: trailing JSON after store object")
 	}
-	if st.Relations == nil {
+	st := localStore{NextID: wire.NextID, Tasks: wire.Tasks, Comments: wire.Comments}
+	legacyRels := len(bytes.TrimSpace(wire.Relations)) == 0 && len(bytes.TrimSpace(wire.NextRel)) == 0
+	if legacyRels {
 		st.Relations = map[string]Relation{}
-	}
-	if st.NextRel < 1 {
 		st.NextRel = 1
+	} else {
+		if len(bytes.TrimSpace(wire.Relations)) == 0 || bytes.Equal(bytes.TrimSpace(wire.Relations), []byte("null")) {
+			return nil, fmt.Errorf("local task provider: malformed store: relations is explicitly null or missing while next_rel is present")
+		}
+		if len(bytes.TrimSpace(wire.NextRel)) == 0 || bytes.Equal(bytes.TrimSpace(wire.NextRel), []byte("null")) {
+			return nil, fmt.Errorf("local task provider: malformed store: next_rel is explicitly null or missing while relations is present")
+		}
+		if err := json.Unmarshal(wire.Relations, &st.Relations); err != nil {
+			return nil, fmt.Errorf("local task provider: parse relations: %w", err)
+		}
+		if st.Relations == nil {
+			return nil, fmt.Errorf("local task provider: malformed store: relations is null")
+		}
+		if err := json.Unmarshal(wire.NextRel, &st.NextRel); err != nil {
+			return nil, fmt.Errorf("local task provider: parse next_rel: %w", err)
+		}
 	}
 	if err := validateLocalStore(&st); err != nil {
 		return nil, err
@@ -628,6 +650,38 @@ func ticketNumber(ref string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+func (p *LocalProvider) GetDescription(ctx context.Context, taskID string) (string, error) {
+	t, err := p.GetTask(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	return t.Description, nil
+}
+
+func (p *LocalProvider) SetDescription(ctx context.Context, taskID, description string) error {
+	err := p.withStore(ctx, true, func(st *localStore) error {
+		cur, err := p.lookup(st, taskID)
+		if err != nil {
+			return err
+		}
+		t := st.Tasks[cur.ID]
+		t.Description = description
+		t.UpdatedAt = time.Now().UTC()
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	got, err := p.GetDescription(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("local description readback: %w", err)
+	}
+	if got != description {
+		return fmt.Errorf("local description readback mismatch")
+	}
+	return nil
 }
 
 func (p *LocalProvider) RelationTraversalConcurrency() int { return 1 }

@@ -997,6 +997,26 @@ func (w MemoryDescriptionWriter) GetDescription(ctx context.Context, taskID stri
 	return t.Description, nil
 }
 
+// LocalDescriptionWriter adapts the persistent local board for coordinator
+// description fences. It does not fall back to Kaneo or Memory.
+type LocalDescriptionWriter struct {
+	LP *provider.LocalProvider
+}
+
+func (w LocalDescriptionWriter) SetDescription(ctx context.Context, taskID, description string) error {
+	if w.LP == nil {
+		return fmt.Errorf("nil local provider")
+	}
+	return w.LP.SetDescription(ctx, taskID, description)
+}
+
+func (w LocalDescriptionWriter) GetDescription(ctx context.Context, taskID string) (string, error) {
+	if w.LP == nil {
+		return "", fmt.Errorf("nil local provider")
+	}
+	return w.LP.GetDescription(ctx, taskID)
+}
+
 // DescriptionWriterFor selects the coordinator description writer for a live
 // provider. Kaneo uses the scoped HTTP description PUT/GET, never CLI
 // presentation enrichment. BoundClient wrappers are unwrapped.
@@ -1008,6 +1028,8 @@ func DescriptionWriterFor(tp provider.TaskProvider, projectID string) (Descripti
 	switch p := inner.(type) {
 	case *provider.MemoryProvider:
 		return MemoryDescriptionWriter{MP: p}, nil
+	case *provider.LocalProvider:
+		return LocalDescriptionWriter{LP: p}, nil
 	case *provider.KaneoProvider:
 		if strings.TrimSpace(p.APIURL) == "" {
 			return nil, fmt.Errorf("kaneo description writer requires HTTP API URL")
