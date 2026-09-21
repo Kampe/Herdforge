@@ -151,6 +151,8 @@ wait "$holder" 2>/dev/null || true
 holder=""
 
 cursor="$WORKDIR/.herd/worktree-reap-pulse.cursor"
+log "pre-act ahead/status merged=$(git -C "$MERGED" rev-list --count origin/main..HEAD 2>&1) status=$(git -C "$MERGED" status --porcelain=v1 2>&1)"
+log "pre-act ahead/status owned=$(git -C "$OWNED" rev-list --count origin/main..HEAD 2>&1) status=$(git -C "$OWNED" status --porcelain=v1 2>&1)"
 set +e
 out1="$(cd "$WORKDIR/wt-1" && "$HERD" maintenance --act 2>&1)"
 rc1=$?
@@ -164,8 +166,6 @@ print -r -- "$out1" | grep -E -q 'inspected=8([^0-9]|$)' || {
   print -u2 "wt-1 inspected not 8: $out1"
   exit 1
 }
-log "native ahead/status merged=$(git -C "$MERGED" rev-list --count origin/main..HEAD 2>&1) status=$(git -C "$MERGED" status --porcelain=v1 2>&1)"
-log "native ahead/status owned=$(git -C "$OWNED" rev-list --count origin/main..HEAD 2>&1) status=$(git -C "$OWNED" status --porcelain=v1 2>&1)"
 print -r -- "$out1" | grep -E -q 'landed=[1-9]' || {
   print -u2 "expected landed>=1: $out1"
   exit 1

@@ -21,7 +21,7 @@ if [[ "$n" != "1" ]]; then
 fi
 print -r -- "BASELINE"
 set +e
-base="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean$' 2>&1)"
+base="$(go test -count=1 -timeout=60s -v ./cmd/herd -run '^TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean$' 2>&1)"
 brc=$?
 set -e
 print -r -- "$base"
@@ -29,6 +29,14 @@ if (( brc != 0 )); then
   print -u2 "baseline failed; not mutating"
   exit 1
 fi
+print -r -- "$base" | grep -E -q '--- SKIP:[[:space:]]*TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean' && {
+  print -u2 "baseline skipped; hosted mutation requires named PASS"
+  exit 1
+}
+print -r -- "$base" | grep -E -q '--- PASS:[[:space:]]*TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean' || {
+  print -u2 "baseline missing named PASS"
+  exit 1
+}
 FROM="$FROM" TO="$TO" perl -i -pe 'BEGIN { $from = $ENV{FROM}; $to = $ENV{TO} } s/\Q$from\E/$to/' "$FILE"
 set +e
 out="$(go test -count=1 -timeout=60s ./cmd/herd -run '^TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean$' 2>&1)"
@@ -43,8 +51,8 @@ print -r -- "$out" | grep -F -q 'FAIL: TestGitOutInStatusIgnoresStderrWarningsWh
   print -u2 "not named FAIL"
   exit 1
 }
-print -r -- "$out" | grep -F -q 'rc0 stderr warnings must not classify a clean tree dirty' || {
-  print -u2 "missing dirty-from-warning assertion"
+print -r -- "$out" | grep -F -q 'gitOutIn stdout want empty' || {
+  print -u2 "missing first gitOutIn stdout assertion"
   exit 1
 }
 restore
