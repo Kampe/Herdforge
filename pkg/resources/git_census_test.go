@@ -905,6 +905,18 @@ func TestDarwinLiveMetadataRefusalStaysFailClosed(t *testing.T) {
 	}
 }
 
+func TestAppendUniquePIDMatchingNonmatchingAndDuplicate(t *testing.T) {
+	if got := appendUniquePID(nil, 7); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("matching append = %v, want [7]", got)
+	}
+	if got := appendUniquePID([]int{7}, 8); len(got) != 2 || got[0] != 7 || got[1] != 8 {
+		t.Fatalf("nonmatching append = %v, want [7 8]", got)
+	}
+	if got := appendUniquePID([]int{7}, 7); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("already-recorded pid = %v, want [7]", got)
+	}
+}
+
 func TestInUseManyWalkRecordsOnlyMatchingUniquePIDs(t *testing.T) {
 	const matchPath = "/wt-owned"
 	const otherPath = "/wt-other"

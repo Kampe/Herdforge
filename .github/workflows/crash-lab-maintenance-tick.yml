@@ -33,6 +33,9 @@ jobs:
       - name: Mutate gitOutIn CombinedOutput and require named FAIL
         run: zsh scripts/crash-lab-gitoutin-mutation.sh
 
+      - name: Mutate census nonmatching PIDs and require named FAIL
+        run: zsh scripts/crash-lab-census-pid-mutation.sh
+
       - name: Mutate to per-worktree root and require named FAIL
         env:
           MUTATION_LOG: ${{ github.workspace }}/maintenance-root-mutation.log

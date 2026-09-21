@@ -175,7 +175,7 @@ print -r -- "$out1" | grep -E -q 'failed=1([^0-9]|$)' || {
   print -u2 "expected failed=1 (rc=$rc1): $out1"
   exit 1
 }
-print -r -- "$out1" | grep -E -q "${OWNED}: act-time owner census found active use" || {
+print -r -- "$out1" | grep -F -q -- "${OWNED}: act-time owner census found active use" || {
   print -u2 "refusal missing same-line owned path and census: $out1"
   exit 1
 }
@@ -189,7 +189,7 @@ reg="$(git -C "$WORKDIR" worktree list --porcelain)"
 reg_rc=$?
 set -e
 (( reg_rc == 0 )) || { print -u2 "git worktree list failed rc=$reg_rc"; exit 1; }
-print -r -- "$reg" | grep -E -q "^worktree[[:space:]]+$MERGED\$" && {
+print -r -- "$reg" | grep -F -x -- "worktree $MERGED" && {
   print -u2 "merged fixture still registered"
   exit 1
 }
@@ -222,7 +222,7 @@ if (( rc2 != 0 )); then
     print -u2 "second beat nonzero requires failed=1: $out2"
     exit 1
   }
-  print -r -- "$out2" | grep -E -q "${OWNED}: act-time owner census found active use" || {
+  print -r -- "$out2" | grep -F -- "${OWNED}: act-time owner census found active use" >/dev/null || {
     print -u2 "second beat unexpected failure without same-line owned census: $out2"
     exit 1
   }
