@@ -65,7 +65,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
 
       - name: Mutate production guards and require named FAIL
+        env:
+          MUTATION_LOG: ${{ github.workspace }}/audit-key-mutation.log
         run: zsh scripts/crash-lab-audit-key-mutation.sh
+
+      - name: Upload mutation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-key-mutation-${{ github.sha }}
+          path: audit-key-mutation.log
+          if-no-files-found: warn
+          retention-days: 7
 
   signer-boundary-linux:
     name: Linux signer-boundary lab

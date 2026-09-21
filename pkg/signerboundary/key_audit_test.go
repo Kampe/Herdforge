@@ -53,10 +53,12 @@ func TestVerifyKeyAudit_RejectsBadSignature(t *testing.T) {
 func TestVerifyKeyAudit_RejectsAlteredSignedClaims(t *testing.T) {
 	pub, _, req, st, sig := validAuditFixture(t)
 	st.OwnerUID = 99
-	// Expected UID matches the mutated claim so static UID check passes;
-	// original signature must still fail (cryptographic binding).
+	st.ServerUID = 99
 	if err := verifyKeyAudit(pub, st.Path, st.Identity, 99, 42, req, st, sig); err == nil {
 		t.Fatal("altered signed claims must fail signature")
+	}
+	if err := verifyKeyAudit(pub, st.Path, st.Identity, 99, 42, req, st, sig); err != nil && !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("want signature rejection after static UID match, got %v", err)
 	}
 }
 
@@ -100,12 +102,16 @@ func TestVerifyKeyAudit_RejectsWrongNonceIdentityPathUIDPID(t *testing.T) {
 
 func TestVerifyKeyAudit_RejectsMissingPinnedKey(t *testing.T) {
 	_, _, req, st, sig := validAuditFixture(t)
-	if err := verifyKeyAudit(nil, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
-		t.Fatal("nil published key must fail")
-	}
-	if err := verifyKeyAudit(ed25519.PublicKey{}, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
-		t.Fatal("empty published key must fail")
-	}
+	t.Run("nil", func(t *testing.T) {
+		if err := verifyKeyAudit(nil, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
+			t.Fatal("nil published key must fail")
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		if err := verifyKeyAudit(ed25519.PublicKey{}, st.Path, st.Identity, 9, 42, req, st, sig); err == nil {
+			t.Fatal("empty published key must fail")
+		}
+	})
 }
 
 func TestReadBoundedAuditSeed_AcceptsHexPlusNewline(t *testing.T) {
