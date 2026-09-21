@@ -214,16 +214,24 @@ if [[ "$HERD_SIGNER_UID" == "$HERD_REQUESTER_UID" || "$HERD_SIGNER_UID" == "$HER
 fi
 
 sudo -n chmod 0755 "$WORKDIR"
-sudo -n mkdir -p "$KEYDIR" "$SOCKDIR"
-sudo -n chmod 0755 "$KEYDIR"
+sudo -n mkdir -p "$KEYDIR" "$SOCKDIR" "$WORKDIR/bin" "$WORKDIR/repo/.herd"
+sudo -n chmod 0755 "$KEYDIR" "$WORKDIR/bin"
+sudo -n cp "$HERD" "$WORKDIR/bin/herd-linux-amd64"
+sudo -n chmod 0755 "$WORKDIR/bin/herd-linux-amd64"
+HERD="$WORKDIR/bin/herd-linux-amd64"
+print -r -- "project:\n  name: crash-lab\n" | sudo -n tee "$WORKDIR/repo/.herd/herd.yaml" >/dev/null
+sudo -n git -C "$WORKDIR/repo" init -q
+sudo -n chown -R "$HERD_REQUESTER_UID:$HERD_SIGNER_SOCK_GID" "$WORKDIR/repo"
+sudo -n chmod -R u+rwX,g+rwX "$WORKDIR/repo"
 sudo -n chown "$HERD_SIGNER_UID:$HERD_SIGNER_SOCK_GID" "$SOCKDIR"
 sudo -n chmod 0770 "$SOCKDIR"
+REPO="$WORKDIR/repo"
 log "setpriv=$(command -v setpriv || print none)"
 sudo -n -u "#$HERD_SIGNER_UID" -- id | tee -a "$EVIDENCE" || true
 sudo -n -u "#$HERD_REQUESTER_UID" -- id | tee -a "$EVIDENCE" || true
 sudo -n -u "#$HERD_BUILDER_UID" -- id | tee -a "$EVIDENCE" || true
 if command -v setpriv >/dev/null 2>&1; then
-  sudo -n setpriv --reuid="$HERD_SIGNER_UID" --init-groups -- id | tee -a "$EVIDENCE" || true
+  sudo -n setpriv --reuid="$HERD_SIGNER_UID" --regid="$HERD_SIGNER_SOCK_GID" --init-groups -- id | tee -a "$EVIDENCE" || true
 fi
 diag_dirs
 
