@@ -1,107 +1,151 @@
-#!/usr/bin/env bash
-# Ephemeral Ubuntu runner only. Never run on the Mac.
+#!/usr/bin/env zsh
+# Ephemeral GitHub-hosted Linux runner only. Never run on the Mac.
 set -euo pipefail
 
-HERD="${HERD:-}"
-REPO="${REPO:-.}"
-WORKDIR="${WORKDIR:-${RUNNER_TEMP:-/tmp}/herd-signer-lab}"
+if [[ "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  print -u2 "refusing: GITHUB_ACTIONS is not true"
+  exit 1
+fi
+if [[ "${RUNNER_OS:-}" != "Linux" ]]; then
+  print -u2 "refusing: RUNNER_OS=${RUNNER_OS:-unset} is not Linux"
+  exit 1
+fi
+if [[ "$(uname -s)" != "Linux" ]]; then
+  print -u2 "refusing: kernel is not Linux"
+  exit 1
+fi
+if [[ -z "${RUNNER_TEMP:-}" || ! -d "$RUNNER_TEMP" ]]; then
+  print -u2 "refusing: RUNNER_TEMP missing"
+  exit 1
+fi
+
+HERD="${HERD:?HERD binary path required}"
+REPO="${REPO:?REPO path required}"
+EVIDENCE="${EVIDENCE:?EVIDENCE path required}"
+WORKDIR="$(mktemp -d "${RUNNER_TEMP}/herd-signer-lab.XXXXXX")"
 KEYDIR="$WORKDIR/keys"
 SOCK="$WORKDIR/signer.sock"
-EVIDENCE="${EVIDENCE:-$WORKDIR/evidence.txt}"
-GROUP="herd-lab-sock"
-USER_S="herd-lab-s"
-USER_R="herd-lab-r"
-USER_B="herd-lab-b"
 HERD_SIGNER_PID=""
+created_group=""
+created_users=()
+orig_exit=0
 
-log() { printf '%s\n' "$*" | tee -a "$EVIDENCE" >/dev/null; printf '%s\n' "$*"; }
+log() { print -r -- "$*" | tee -a "$EVIDENCE"; }
+
+fail() {
+  orig_exit=$1
+  shift
+  print -u2 -r -- "$*"
+  print -r -- "FAIL: $*" >>"$EVIDENCE"
+  exit "$orig_exit"
+}
 
 cleanup() {
+  local rc=$?
   set +e
-  if [[ -n "${HERD_SIGNER_PID:-}" ]]; then
-    kill -TERM "$HERD_SIGNER_PID" 2>/dev/null || true
-    timeout 3s bash -c "while kill -0 $HERD_SIGNER_PID 2>/dev/null; do sleep 0.1; done" || kill -KILL "$HERD_SIGNER_PID" 2>/dev/null || true
-  fi
-  if [[ -n "${HERD_SIGNER_UID:-}" ]]; then
-    pgrep -u "$HERD_SIGNER_UID" -a 2>/dev/null | while read -r line; do
-      case "$line" in
-        *signer-boundary*) kill -TERM "${line%% *}" 2>/dev/null || true ;;
-      esac
+  print -r -- "cleanup begin orig=$rc" >>"$EVIDENCE"
+  if [[ -n "$HERD_SIGNER_PID" ]]; then
+    if ! sudo -n kill -TERM "$HERD_SIGNER_PID" 2>>"$EVIDENCE"; then
+      print -r -- "cleanup: sudo kill -TERM pid=$HERD_SIGNER_PID failed" >>"$EVIDENCE"
+    fi
+    local waited=0
+    while (( waited < 30 )) && sudo -n kill -0 "$HERD_SIGNER_PID" 2>/dev/null; do
+      sleep 0.1
+      waited=$((waited + 1))
     done
+    if sudo -n kill -0 "$HERD_SIGNER_PID" 2>/dev/null; then
+      if ! sudo -n kill -KILL "$HERD_SIGNER_PID" 2>>"$EVIDENCE"; then
+        print -r -- "cleanup: sudo kill -KILL pid=$HERD_SIGNER_PID failed (process still present)" >>"$EVIDENCE"
+        (( rc == 0 )) && rc=1
+      fi
+    fi
   fi
-  sudo -n userdel "$USER_S" 2>/dev/null || true
-  sudo -n userdel "$USER_R" 2>/dev/null || true
-  sudo -n userdel "$USER_B" 2>/dev/null || true
-  sudo -n groupdel "$GROUP" 2>/dev/null || true
-  rm -rf "$WORKDIR"
+  local u
+  for u in "${created_users[@]}"; do
+    if ! sudo -n userdel "$u" 2>>"$EVIDENCE"; then
+      print -r -- "cleanup: userdel $u failed" >>"$EVIDENCE"
+    fi
+  done
+  if [[ -n "$created_group" ]]; then
+    if ! sudo -n groupdel "$created_group" 2>>"$EVIDENCE"; then
+      print -r -- "cleanup: groupdel $created_group failed" >>"$EVIDENCE"
+    fi
+  fi
+  if [[ -d "$WORKDIR" ]]; then
+    if ! sudo -n rm -rf "$WORKDIR" 2>>"$EVIDENCE"; then
+      print -r -- "cleanup: sudo rm workdir failed" >>"$EVIDENCE"
+      (( rc == 0 )) && rc=1
+    fi
+  fi
+  print -r -- "cleanup end rc=$rc" >>"$EVIDENCE"
+  exit $rc
 }
 trap cleanup EXIT
 
-if [[ -z "$HERD" || ! -x "$HERD" ]]; then
-  echo "HERD binary missing or not executable: ${HERD:-unset}" >&2
-  exit 1
-fi
-mkdir -p "$WORKDIR" "$KEYDIR"
 : >"$EVIDENCE"
+if [[ ! -x "$HERD" ]]; then
+  fail 1 "HERD is not executable"
+fi
 
-sudo -n groupadd -f "$GROUP"
-sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin -g "$GROUP" "$USER_S"
-sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin -g "$GROUP" "$USER_R"
-sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin -g "$GROUP" "$USER_B"
+sudo -n true || fail 1 "passwordless sudo required on ephemeral Linux runner"
 
-export HERD_SIGNER_UID
-export HERD_REQUESTER_UID
-export HERD_BUILDER_UID
-export HERD_SIGNER_SOCK_GID
-HERD_SIGNER_UID="$(id -u "$USER_S")"
-HERD_REQUESTER_UID="$(id -u "$USER_R")"
-HERD_BUILDER_UID="$(id -u "$USER_B")"
-HERD_SIGNER_SOCK_GID="$(getent group "$GROUP" | cut -d: -f3)"
+group="herd-lab-sock-$$"
+if ! sudo -n groupadd "$group"; then
+  fail 1 "groupadd $group failed"
+fi
+created_group=$group
+
+user_s="herd-lab-s-$$"
+user_r="herd-lab-r-$$"
+user_b="herd-lab-b-$$"
+if ! sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin -g "$group" "$user_s"; then
+  fail 1 "useradd $user_s failed"
+fi
+created_users+=("$user_s")
+if ! sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin -g "$group" "$user_r"; then
+  fail 1 "useradd $user_r failed"
+fi
+created_users+=("$user_r")
+if ! sudo -n useradd --system --no-create-home --shell /usr/sbin/nologin -g "$group" "$user_b"; then
+  fail 1 "useradd $user_b failed"
+fi
+created_users+=("$user_b")
+
+export HERD_SIGNER_UID="$(id -u "$user_s")"
+export HERD_REQUESTER_UID="$(id -u "$user_r")"
+export HERD_BUILDER_UID="$(id -u "$user_b")"
+export HERD_SIGNER_SOCK_GID="$(getent group "$group" | cut -d: -f3)"
+export HERD_KEY_DIR="$KEYDIR"
+export HERD_SIGNER_SOCK="$SOCK"
 log "topology S=$HERD_SIGNER_UID R=$HERD_REQUESTER_UID B=$HERD_BUILDER_UID G=$HERD_SIGNER_SOCK_GID"
 
 if [[ "$HERD_SIGNER_UID" == "$HERD_REQUESTER_UID" || "$HERD_SIGNER_UID" == "$HERD_BUILDER_UID" || "$HERD_REQUESTER_UID" == "$HERD_BUILDER_UID" ]]; then
-  echo "UIDs are not distinct" >&2
-  exit 1
+  fail 1 "UIDs are not distinct"
 fi
 
-launch_out="$(timeout 45s env \
-  HERD_SIGNER_UID="$HERD_SIGNER_UID" \
-  HERD_REQUESTER_UID="$HERD_REQUESTER_UID" \
-  HERD_BUILDER_UID="$HERD_BUILDER_UID" \
-  HERD_SIGNER_SOCK_GID="$HERD_SIGNER_SOCK_GID" \
-  "$HERD" signer-boundary launch --key-dir "$KEYDIR" --socket "$SOCK" --repo "$REPO" --identity crash-lab)"
-printf '%s\n' "$launch_out" | tee -a "$EVIDENCE"
-HERD_SIGNER_PID="$(printf '%s\n' "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{print $2; exit}')"
-if [[ -z "$HERD_SIGNER_PID" ]]; then
-  echo "launch did not print HERD_SIGNER_PID" >&2
-  exit 1
-fi
-log "launch_pid=$HERD_SIGNER_PID"
+sudo -n mkdir -p "$KEYDIR"
+sudo -n chown "$HERD_REQUESTER_UID:$HERD_SIGNER_SOCK_GID" "$WORKDIR"
+sudo -n chmod 0770 "$WORKDIR"
 
-timeout 20s env \
-  HERD_SIGNER_UID="$HERD_SIGNER_UID" \
-  HERD_REQUESTER_UID="$HERD_REQUESTER_UID" \
-  HERD_BUILDER_UID="$HERD_BUILDER_UID" \
-  HERD_SIGNER_SOCK_GID="$HERD_SIGNER_SOCK_GID" \
-  "$HERD" signer-boundary status --key-dir "$KEYDIR" | tee -a "$EVIDENCE"
+topo_env=(
+  HERD_SIGNER_UID="$HERD_SIGNER_UID"
+  HERD_REQUESTER_UID="$HERD_REQUESTER_UID"
+  HERD_BUILDER_UID="$HERD_BUILDER_UID"
+  HERD_SIGNER_SOCK_GID="$HERD_SIGNER_SOCK_GID"
+  HERD_KEY_DIR="$KEYDIR"
+  HERD_SIGNER_SOCK="$SOCK"
+)
 
-timeout 30s env \
-  HERD_SIGNER_UID="$HERD_SIGNER_UID" \
-  HERD_REQUESTER_UID="$HERD_REQUESTER_UID" \
-  HERD_BUILDER_UID="$HERD_BUILDER_UID" \
-  HERD_SIGNER_SOCK_GID="$HERD_SIGNER_SOCK_GID" \
-  "$HERD" signer-boundary prove --key-dir "$KEYDIR" --repo "$REPO" --identity crash-lab | tee -a "$EVIDENCE"
+launch_out="$(sudo -n env "${topo_env[@]}" timeout 45s "$HERD" signer-boundary launch --key-dir "$KEYDIR" --socket "$SOCK" --repo "$REPO" --identity crash-lab 2> >(tee -a "$EVIDENCE" >&2))" || fail $? "launch failed"
+print -r -- "$launch_out" | grep -E '^(HERD_SIGNER_PID|HERD_SIGNER_SOCK|HERD_ADMISSION_LEDGER|HERD_KEY_DIR|HERD_SEALED_SESSION)=' | tee -a "$EVIDENCE"
+HERD_SIGNER_PID="$(print -r -- "$launch_out" | awk -F= '/^HERD_SIGNER_PID=/{print $2; exit}')"
+[[ -n "$HERD_SIGNER_PID" ]] || fail 1 "launch did not print HERD_SIGNER_PID"
 
-timeout 20s env \
-  HERD_SIGNER_UID="$HERD_SIGNER_UID" \
-  HERD_REQUESTER_UID="$HERD_REQUESTER_UID" \
-  HERD_BUILDER_UID="$HERD_BUILDER_UID" \
-  HERD_SIGNER_SOCK_GID="$HERD_SIGNER_SOCK_GID" \
-  HERD_SIGNER_SOCK="$SOCK" \
-  "$HERD" signer-boundary revoke --key-dir "$KEYDIR" --identity crash-lab --socket "$SOCK" | tee -a "$EVIDENCE"
+# status/prove as requester using ResolveKeyDir (HERD_KEY_DIR), not guessed extra flags.
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary status >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "status failed as requester"
+sudo -n -u "#$HERD_REQUESTER_UID" env "${topo_env[@]}" timeout 30s "$HERD" signer-boundary prove --repo "$REPO" --identity crash-lab >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "prove failed as requester"
 
-# Never copy key/sealed session into evidence or dist.
-if grep -R --include='*' -l . "$KEYDIR" >/dev/null 2>&1; then
-  log "key_dir_present_not_uploaded=1"
-fi
+# revoke requires --key-dir per CLI contract.
+sudo -n env "${topo_env[@]}" timeout 20s "$HERD" signer-boundary revoke --key-dir "$KEYDIR" --identity crash-lab --socket "$SOCK" >>"$EVIDENCE" 2> >(tee -a "$EVIDENCE" >&2) || fail $? "revoke failed"
+
 log "ok"
