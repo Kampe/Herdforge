@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -36,16 +37,35 @@ func stubMaintenanceTick(t *testing.T, fn func(ctx context.Context, root, base s
 	return calls
 }
 
-// maintenanceScratchRoot points root resolution at a scratch checkout so no
-// test ever touches a real repository's cursor or lock.
+// maintenanceScratchRoot is a real Git scratch repository. HERD_PROJECT_ROOT
+// and lane root overrides are cleared so cleanupCoordinationRoot must discover
+// the project via gitroot.ProjectRoot from cwd.
 func maintenanceScratchRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	if resolved, err := filepath.EvalSymlinks(root); err == nil {
 		root = resolved
 	}
-	t.Setenv("HERD_ROOT", root)
-	t.Setenv("HERD_REPO_ROOT", root)
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Setenv("HERD_ROOT", "")
+	t.Setenv("HERD_REPO_ROOT", "")
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "lab@example.com")
+	run("config", "user.name", "lab")
+	if err := os.WriteFile(filepath.Join(root, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README")
+	run("commit", "-qm", "init")
+	t.Chdir(root)
 	return root
 }
 
@@ -323,6 +343,39 @@ func TestMaintenanceResolvesCanonicalRootAndConfiguredBase(t *testing.T) {
 	}
 	if got.Root != root {
 		t.Errorf("root = %q, want the canonical %q", got.Root, root)
+	}
+}
+
+func TestCleanupCoordinationRootRefusesCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := cleanupCoordinationRoot(ctx, "."); err == nil {
+		t.Fatal("canceled context must fail closed before discovery")
+	}
+}
+
+func TestMaintenanceLinkedWorktreeSharesProjectRoot(t *testing.T) {
+	root := maintenanceScratchRoot(t)
+	wt := filepath.Join(root, "wt")
+	cmd := exec.Command("git", "worktree", "add", "-q", "-b", "leftover", wt, "HEAD")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v (%s)", err, out)
+	}
+	t.Chdir(wt)
+	calls := stubMaintenanceTick(t, func(context.Context, string, string, bool) (reapPulseReport, error) {
+		return reapPulseReport{}, nil
+	})
+	var out, errOut bytes.Buffer
+	if code := runMaintenanceCommandContext(context.Background(), []string{"--act"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("cycles = %d, want 1", len(*calls))
+	}
+	got := (*calls)[0].Root
+	if got != root {
+		t.Fatalf("linked worktree root = %q, want shared project root %q", got, root)
 	}
 }
 

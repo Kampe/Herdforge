@@ -13,6 +13,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linked-root-mutation:
+    name: Linked-root mutation control
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Mutate to per-worktree root and require named FAIL
+        run: zsh scripts/crash-lab-maintenance-root-mutation.sh
+
   shared-tick:
     name: Two linked worktrees share tick lock
     runs-on: ubuntu-latest
