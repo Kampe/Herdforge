@@ -99,6 +99,28 @@ func TestMaintenanceRunsWhileFleetAdmissionRefuses(t *testing.T) {
 	}
 }
 
+func TestMaintenancePrintsFailureReasonsAndExitsOne(t *testing.T) {
+	maintenanceScratchRoot(t)
+	owned := filepath.Join(t.TempDir(), "wt-02-owned")
+	reason := owned + ": act-time owner census found active use (cwd=true open=false referenced=false pids=[9])"
+	stubMaintenanceTick(t, func(context.Context, string, string, bool) (reapPulseReport, error) {
+		return reapPulseReport{
+			Registered: 4, Eligible: 3, Inspected: 8, Landed: 2, Retired: 1, Failed: 1, Acted: true,
+			Failures: []string{reason},
+		}, nil
+	})
+	var out, errOut bytes.Buffer
+	if code := runMaintenanceCommandContext(context.Background(), []string{"--act"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), owned) {
+		t.Fatalf("stderr missing exact owned path; stderr=%q", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "owner census found active use") {
+		t.Fatalf("stderr missing census reason; stderr=%q", errOut.String())
+	}
+}
+
 // TestMaintenanceDefersToAHeldTickLock is the concurrent-exclusion proof, and
 // it runs against the REAL lock rather than a stub: the carrier must share the
 // pulse beat's kernel tick lock, not open a second one beside it. A carrier

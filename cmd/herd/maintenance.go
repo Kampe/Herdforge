@@ -125,6 +125,9 @@ func runMaintenanceCommandContext(ctx context.Context, args []string, out, errOu
 			report.Landed, report.Retired, report.Failed, report.Acted)
 		if report.Failed > 0 {
 			faults++
+			for _, f := range report.Failures {
+				fmt.Fprintf(errOut, "maintenance: cycle %d: %s\n", cycles, f)
+			}
 		}
 		return nil
 	})
