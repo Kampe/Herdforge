@@ -398,12 +398,22 @@ func cleanupCoordinationRoot(ctx context.Context, start string) (string, error) 
 	if strings.TrimSpace(root) == "" {
 		return "", fmt.Errorf("cleanup coordination root: empty")
 	}
+	explicit := strings.TrimSpace(os.Getenv(gitroot.EnvProjectRoot)) != ""
 	resolved, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if explicit && os.IsNotExist(err) {
+			if _, lerr := os.Lstat(root); lerr == nil {
+				return "", fmt.Errorf("cleanup coordination root: dangling symlink %s", root)
+			}
+			if err := ctx.Err(); err != nil {
+				return "", fmt.Errorf("cleanup coordination root: %w", err)
+			}
 			return filepath.Clean(root), nil
 		}
 		return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("cleanup coordination root: %w", err)
 	}
 	return filepath.Clean(resolved), nil
 }
