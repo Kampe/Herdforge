@@ -646,7 +646,8 @@ func runPoolReview(ref string) error {
 			return fmt.Errorf("agy pinned-model readiness: %w", homeErr)
 		}
 		ev, modelErr := herdr.AwaitAgyPinnedModelReady(herdr.AgyPinnedModelReadyRequest{
-			Home: home, Cwd: surfaceAbs, PinnedModel: reviewer.Model, StartedAt: startedAt, Budget: 30 * time.Second,
+			Home: home, Cwd: surfaceAbs, PinnedModel: reviewer.Model, StartedAt: startedAt,
+			PaneID: tab.Pane.ID, Budget: 30 * time.Second,
 		})
 		if modelErr != nil {
 			launchFailureReason = modelErr.Error()

@@ -81,6 +81,51 @@ func TestAwaitAgyPinnedModelReadyBindsLaunchLogAndUUID(t *testing.T) {
 	}
 }
 
+func TestAwaitAgyPinnedModelReadyInterleavedTimestampsBindOwnProcess(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	logDir := filepath.Join(home, ".gemini", "antigravity-cli", "log")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 9, 22, 14, 10, 0, 0, time.Local)
+	other := filepath.Join(logDir, "cli-"+start.Add(time.Second).Format("20060102_150405")+".log")
+	ours := filepath.Join(logDir, "cli-"+start.Add(2*time.Second).Format("20060102_150405")+".log")
+	if err := os.WriteFile(other, []byte("Starting language server process with pid 1111\nResolving model gemini-3.1-pro-high\nPropagating selected model override to backend: label=\"Gemini 3.1 Pro (High)\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ours, []byte("Starting language server process with pid 2222\nResolving model gemini-3.1-pro-high\nfailed to apply model override: model gemini-3.1-pro-high is not recognized\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := AgyPinnedModelReadyRequest{
+		Home: home, Cwd: cwd, PinnedModel: "gemini-3.1-pro-high",
+		StartedAt: start, Budget: time.Millisecond, LogDir: logDir,
+	}
+	if _, err := inspectAgyPinnedModelReady(req); err == nil {
+		t.Fatal("timestamp-only inspect must fail closed")
+	}
+	picked := pickAgyLaunchLog([]agyLogCand{
+		{path: other, stamp: start.Add(time.Second)},
+		{path: ours, stamp: start.Add(2 * time.Second)},
+	}, start)
+	if picked != other {
+		t.Fatalf("disproof: first-at-or-after-start selected %q, want the concurrent other launch", picked)
+	}
+	req.PID = 2222
+	ev, err := inspectAgyPinnedModelReady(req)
+	if err == nil {
+		t.Fatalf("own process still failed override; must not inherit peer ready log %+v", ev)
+	}
+	req.PID = 1111
+	ev, err = inspectAgyPinnedModelReady(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.LogFile != other {
+		t.Fatalf("pid 1111 must bind the other launch log, got %s", ev.LogFile)
+	}
+}
+
 func TestAwaitAgyPinnedModelReadyRejectsConcurrentOtherLaunch(t *testing.T) {
 	home := t.TempDir()
 	cwdA := t.TempDir()
@@ -145,8 +190,11 @@ func TestAwaitAgyPinnedModelReadyRejectsConcurrentOtherLaunch(t *testing.T) {
 	}
 	reqBPID.PID = 1111
 	ev, err = inspectAgyPinnedModelReady(reqBPID)
-	if err == nil {
-		t.Fatalf("launch B with A's pid must not report ready from A's log: %+v", ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.LogFile != logA {
+		t.Fatalf("pid 1111 must bind process A's log, got %s", ev.LogFile)
 	}
 
 	reqA := AgyPinnedModelReadyRequest{
@@ -204,7 +252,7 @@ func TestAwaitAgyPinnedModelReadyLiveTUI(t *testing.T) {
 	})
 	ev, err := AwaitAgyPinnedModelReady(AgyPinnedModelReadyRequest{
 		Home: home, Cwd: cwd, PinnedModel: "gemini-3.1-pro-high",
-		StartedAt: started, Budget: 30 * time.Second,
+		StartedAt: started, PID: cmd.Process.Pid, Budget: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("pinned model never settled for this launch: %v", err)

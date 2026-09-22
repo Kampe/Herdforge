@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -33,6 +34,7 @@ type AgyPinnedModelReadyRequest struct {
 	PinnedModel   string
 	StartedAt     time.Time
 	PID           int
+	PaneID        string
 	Budget        time.Duration
 	LogDir        string
 	IndexPath     string
@@ -82,6 +84,16 @@ func AwaitAgyPinnedModelReady(req AgyPinnedModelReadyRequest) (AgyPinnedModelRea
 
 func inspectAgyPinnedModelReady(req AgyPinnedModelReadyRequest) (AgyPinnedModelReadyEvidence, error) {
 	var zero AgyPinnedModelReadyEvidence
+	if req.PID <= 0 && strings.TrimSpace(req.PaneID) != "" {
+		pid, err := AgyPaneLaunchPID(req.PaneID)
+		if err != nil {
+			return zero, err
+		}
+		req.PID = pid
+	}
+	if req.PID <= 0 {
+		return zero, fmt.Errorf("agy pinned-model readiness requires this launch's process pid")
+	}
 	logFile, err := launchAgyLogFile(req)
 	if err != nil {
 		return zero, err
@@ -90,7 +102,7 @@ func inspectAgyPinnedModelReady(req AgyPinnedModelReadyRequest) (AgyPinnedModelR
 	if err != nil {
 		return zero, fmt.Errorf("agy launch log: %w", err)
 	}
-	if req.PID > 0 && !agyLogBoundToPID(string(body), req.PID) {
+	if !agyLogBoundToLaunch(string(body), req.PID) {
 		return zero, fmt.Errorf("agy launch log %s is not bound to pid %d", filepath.Base(logFile), req.PID)
 	}
 	if !agyLogPinnedModelReady(string(body), req.PinnedModel) {
@@ -150,22 +162,98 @@ func launchAgyLogFile(req AgyPinnedModelReadyRequest) (string, error) {
 			continue
 		}
 		path := filepath.Join(dir, ent.Name())
-		if req.PID > 0 {
-			body, readErr := os.ReadFile(path)
-			if readErr != nil || !agyLogBoundToPID(string(body), req.PID) {
-				continue
-			}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil || !agyLogBoundToLaunch(string(body), req.PID) {
+			continue
 		}
 		matched = append(matched, agyLogCand{path: path, stamp: stamp})
 	}
-	if req.PID > 0 && len(matched) == 0 {
+	if len(matched) == 0 {
 		return "", fmt.Errorf("no agy launch log bound to pid %d after %s", req.PID, req.StartedAt.Format(time.RFC3339Nano))
+	}
+	if len(matched) == 1 {
+		return matched[0].path, nil
 	}
 	picked := pickAgyLaunchLog(matched, req.StartedAt)
 	if picked == "" {
-		return "", fmt.Errorf("no agy launch log bound to start %s", req.StartedAt.Format(time.RFC3339Nano))
+		return "", fmt.Errorf("ambiguous agy logs bound to pid %d after %s", req.PID, req.StartedAt.Format(time.RFC3339Nano))
 	}
 	return picked, nil
+}
+
+func agyLogBoundToLaunch(body string, pid int) bool {
+	if agyLogBoundToPID(body, pid) {
+		return true
+	}
+	for _, child := range listAgyChildPIDs(pid) {
+		if agyLogBoundToPID(body, child) {
+			return true
+		}
+	}
+	return false
+}
+
+func AgyPaneLaunchPID(paneID string) (int, error) {
+	paneID = strings.TrimSpace(paneID)
+	if paneID == "" {
+		return 0, fmt.Errorf("agy pane launch pid requires a pane id")
+	}
+	procs, _ := PaneProcessArgv(paneID)
+	var ids []int
+	for _, p := range procs {
+		if p.PID <= 0 || !agyPaneProcess(p) {
+			continue
+		}
+		ids = append(ids, p.PID)
+	}
+	if len(ids) != 1 {
+		return 0, fmt.Errorf("agy pane %s does not have exactly one agy process", paneID)
+	}
+	return ids[0], nil
+}
+
+func agyPaneProcess(p PaneProcess) bool {
+	name := filepath.Base(strings.ToLower(strings.TrimSpace(p.Name)))
+	if name == "agy" || name == "antigravity" {
+		return true
+	}
+	if len(p.Argv) == 0 {
+		return false
+	}
+	base := filepath.Base(strings.ToLower(p.Argv[0]))
+	return base == "agy" || base == "antigravity"
+}
+
+var listAgyChildPIDs = func(pid int) []int {
+	kids := pgrepChildren(pid)
+	out := append([]int(nil), kids...)
+	for _, k := range kids {
+		out = append(out, pgrepChildren(k)...)
+	}
+	return out
+}
+
+func pgrepChildren(pid int) []int {
+	if pid <= 0 {
+		return nil
+	}
+	raw, err := exec.Command("pgrep", "-P", strconv.Itoa(pid)).Output()
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var ids []int
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		n, err := strconv.Atoi(line)
+		if err != nil || n <= 0 {
+			continue
+		}
+		ids = append(ids, n)
+	}
+	return ids
 }
 
 func agyLogBoundToPID(body string, pid int) bool {
