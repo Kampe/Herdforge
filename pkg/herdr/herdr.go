@@ -1011,6 +1011,25 @@ func Tab(workspaceID, label string, noFocus bool) (*TabInfo, error) {
 // When Cwd is set it is passed as --cwd so the pane process starts there
 // (prompt "cd" is not isolation). Empty Workspace fails closed.
 // Labels lacking the "Herdforge · " prefix are auto-prefixed (FAC-141).
+func resolveRequiredTabCwd(cwd string) (string, error) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return "", fmt.Errorf("herdr tab create: cwd is required for task agents")
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", fmt.Errorf("herdr tab create: resolve cwd %q: %w", cwd, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("herdr tab create: cwd %q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
+	}
+	return abs, nil
+}
+
 func TabCreate(opts TabCreateOptions) (*TabInfo, error) {
 	if strings.TrimSpace(opts.Workspace) == "" {
 		return nil, fmt.Errorf("herdr tab create: workspace is required (no hardcoded fallback)")
@@ -1190,20 +1209,9 @@ func TabForAgent(workspaceID, label string, noFocus bool) (*TabInfo, error) {
 //
 // FAC-145: every task pane also carries the agent role marker.
 func TabCreateForTask(workspaceID, label, cwd string, noFocus bool, env ...string) (*TabInfo, error) {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
-	}
-	abs, err := filepath.Abs(cwd)
+	abs, err := resolveRequiredTabCwd(cwd)
 	if err != nil {
-		return nil, fmt.Errorf("herdr tab create: resolve cwd %q: %w", cwd, err)
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, fmt.Errorf("herdr tab create: cwd %q: %w", abs, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
+		return nil, err
 	}
 	opts := TabCreateOptions{
 		Workspace: workspaceID,
@@ -2119,20 +2127,9 @@ func runHerdrContextReal(ctx context.Context, args ...string) (string, error) {
 // tab-level hosted_uid or AgentStart/AssertHostedPaneUID fails closed against
 // a non-hosted shell.
 func TabCreateForTaskEnv(workspaceID, label, cwd string, env []string, noFocus bool) (*TabInfo, error) {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		return nil, fmt.Errorf("herdr tab create: cwd is required for task agents")
-	}
-	abs, err := filepath.Abs(cwd)
+	abs, err := resolveRequiredTabCwd(cwd)
 	if err != nil {
-		return nil, fmt.Errorf("herdr tab create: resolve cwd %q: %w", cwd, err)
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, fmt.Errorf("herdr tab create: cwd %q: %w", abs, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
+		return nil, err
 	}
 	opts := TabCreateOptions{
 		Workspace: workspaceID,

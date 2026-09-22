@@ -1,9 +1,7 @@
 package herdr
 
 import (
-	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -86,33 +84,29 @@ func withReviewVerificationBudget(env []string) []string {
 	return out
 }
 
-// ReviewTabCreate starts a native review tab with the verification budget
-// inherited through herdr tab create --env. Callers still pass an absolute
-// candidate cwd; empty workspace or cwd fail closed.
-func ReviewTabCreate(workspace, label, cwd string) (*TabInfo, error) {
-	if strings.TrimSpace(workspace) == "" {
-		return nil, fmt.Errorf("herdr tab create: workspace is required (no hardcoded fallback)")
-	}
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		return nil, fmt.Errorf("herdr tab create: cwd is required for review agents")
-	}
-	abs, err := filepath.Abs(cwd)
+// ReviewTabCreateOptions is the native-review TabCreate payload: verification
+// budget env on an existing candidate cwd. Workspace and cwd gates live in
+// TabCreate / resolveRequiredTabCwd.
+func ReviewTabCreateOptions(workspace, label, cwd string) (TabCreateOptions, error) {
+	abs, err := resolveRequiredTabCwd(cwd)
 	if err != nil {
-		return nil, fmt.Errorf("herdr tab create: resolve cwd %q: %w", cwd, err)
+		return TabCreateOptions{}, err
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, fmt.Errorf("herdr tab create: cwd %q: %w", abs, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("herdr tab create: cwd %q is not a directory", abs)
-	}
-	return TabCreate(TabCreateOptions{
+	return TabCreateOptions{
 		Workspace: workspace,
 		Label:     label,
 		Cwd:       abs,
 		NoFocus:   true,
 		Env:       bindChildWorkspaceEnv(abs, workspace, ReviewLaunchEnv()),
-	})
+	}, nil
+}
+
+// ReviewTabCreate starts a native review tab with the verification budget
+// inherited through herdr tab create --env.
+func ReviewTabCreate(workspace, label, cwd string) (*TabInfo, error) {
+	opts, err := ReviewTabCreateOptions(workspace, label, cwd)
+	if err != nil {
+		return nil, err
+	}
+	return TabCreate(opts)
 }

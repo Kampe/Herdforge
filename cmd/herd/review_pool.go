@@ -554,7 +554,11 @@ func runPoolReview(ref string) error {
 	if st, statErr := os.Stat(surfaceAbs); statErr != nil || !st.IsDir() {
 		return fmt.Errorf("reviewer cwd %q does not resolve to a directory: %v", surfaceAbs, statErr)
 	}
-	tab, err := herdr.ReviewTabCreate(ws, tabLabel, surfaceAbs)
+	tabOpts, err := herdr.ReviewTabCreateOptions(ws, tabLabel, surfaceAbs)
+	if err != nil {
+		return fmt.Errorf("create reviewer tab: %w", err)
+	}
+	tab, err := herdr.TabCreate(tabOpts)
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}

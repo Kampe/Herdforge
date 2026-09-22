@@ -400,8 +400,11 @@ func TestReviewPoolLaunchUsesReviewTabCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(src)
-	if !strings.Contains(body, "herdr.ReviewTabCreate(ws, tabLabel, surfaceAbs)") {
-		t.Fatal("native review tab must inherit ReviewTabCreate budget env")
+	if !strings.Contains(body, "herdr.ReviewTabCreateOptions(ws, tabLabel, surfaceAbs)") {
+		t.Fatal("native review tab must inherit ReviewTabCreateOptions budget env")
+	}
+	if !strings.Contains(body, "herdr.TabCreate(tabOpts)") {
+		t.Fatal("native review tab must still call shared TabCreate")
 	}
 	if strings.Contains(body, "Env: []string{herdr.AgentRoleEnv}") {
 		t.Fatal("review tab must not launch with AgentRoleEnv alone")
