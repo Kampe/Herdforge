@@ -241,6 +241,65 @@ func TestArchiveDuplicateCarrierDedupReclaims(t *testing.T) {
 	}
 }
 
+func TestArchiveSameBatchHardlinksDoNotOverclaim(t *testing.T) {
+	root, wt := archiveFixture(t)
+	src := filepath.Join(wt, "bin", "herd")
+	alias := filepath.Join(wt, "bin", "herdforge")
+	payload := []byte("hardlink-payload-bytes")
+	if err := os.WriteFile(src, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Link(src, alias); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aliases int
+	for _, e := range rep.Entries {
+		if e.Disposition == "hardlink-alias" {
+			aliases++
+		}
+	}
+	if aliases == 0 {
+		t.Fatalf("expected a hardlink-alias in %+v", rep.Entries)
+	}
+	if rep.SourceAllocatedBytes >= rep.SourceBytes {
+		t.Fatalf("allocated %d should be below logical %d for hardlinks", rep.SourceAllocatedBytes, rep.SourceBytes)
+	}
+	if rep.NetReclaim != 0 {
+		t.Fatalf("same-batch hardlinks overclaimed net_reclaim=%d report=%+v", rep.NetReclaim, rep)
+	}
+}
+
+func TestArchiveSameBatchCopiesDedupOnce(t *testing.T) {
+	root, wt := archiveFixture(t)
+	payload := []byte("copy-payload-bytes")
+	if err := os.WriteFile(filepath.Join(wt, "bin", "herd"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "bin", "herdforge"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copies int64
+	for _, e := range rep.Entries {
+		if e.Path == "bin/herd" || e.Path == "bin/herdforge" {
+			copies += e.Size
+		}
+	}
+	if copies == 0 || rep.DedupSavings == 0 || rep.NetReclaim != int64(len(payload)) {
+		t.Fatalf("two copies should reclaim one payload, report=%+v", rep)
+	}
+}
+
 func TestClassifyArtifactPathReceipts(t *testing.T) {
 	if ClassifyArtifactPath(".herd/receipts/FAC-843.json") != ArtifactReceipt {
 		t.Fatal("receipt")

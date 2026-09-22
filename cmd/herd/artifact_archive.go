@@ -49,8 +49,8 @@ func runArtifactArchiveArgs(args []string) error {
 	if opts.act {
 		mode = "ACT"
 	}
-	fmt.Printf("herd artifact-archive: %s target=%s archived=%d removed=%d source_bytes=%d archive_new_bytes=%d dedup_savings=%d relocated_bytes=%d net_reclaim=%d\n",
-		mode, rep.Target, rep.Archived, rep.Removed, rep.SourceBytes, rep.ArchiveNewBytes, rep.DedupSavings, rep.RelocatedBytes, rep.NetReclaim)
+	fmt.Printf("herd artifact-archive: %s target=%s archived=%d removed=%d source_bytes=%d source_allocated_bytes=%d archive_new_bytes=%d dedup_savings=%d relocated_bytes=%d net_reclaim=%d\n",
+		mode, rep.Target, rep.Archived, rep.Removed, rep.SourceBytes, rep.SourceAllocatedBytes, rep.ArchiveNewBytes, rep.DedupSavings, rep.RelocatedBytes, rep.NetReclaim)
 	for _, e := range rep.Entries {
 		fmt.Printf("  %-8s %-11s %-10s %s %s\n", e.Kind, e.Retention, e.Disposition, e.Digest[:12], e.Path)
 	}

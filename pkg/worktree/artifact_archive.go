@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -94,19 +95,20 @@ type ArchiveRequest struct {
 // NetReclaim is only source bytes whose digest already existed in the
 // archive. RelocatedBytes is a copy, not reclaim.
 type ArchiveReport struct {
-	Target          string          `json:"target"`
-	Archive         string          `json:"archive"`
-	Manifest        string          `json:"manifest,omitempty"`
-	Act             bool            `json:"act"`
-	Entries         []ArtifactEntry `json:"entries"`
-	Archived        int             `json:"archived"`
-	Removed         int             `json:"removed"`
-	SourceBytes     int64           `json:"source_bytes"`
-	ArchiveNewBytes int64           `json:"archive_new_bytes"`
-	DedupSavings    int64           `json:"dedup_savings"`
-	RelocatedBytes  int64           `json:"relocated_bytes"`
-	NetReclaim      int64           `json:"net_reclaim"`
-	Reason          string          `json:"reason,omitempty"`
+	Target               string          `json:"target"`
+	Archive              string          `json:"archive"`
+	Manifest             string          `json:"manifest,omitempty"`
+	Act                  bool            `json:"act"`
+	Entries              []ArtifactEntry `json:"entries"`
+	Archived             int             `json:"archived"`
+	Removed              int             `json:"removed"`
+	SourceBytes          int64           `json:"source_bytes"`
+	SourceAllocatedBytes int64           `json:"source_allocated_bytes"`
+	ArchiveNewBytes      int64           `json:"archive_new_bytes"`
+	DedupSavings         int64           `json:"dedup_savings"`
+	RelocatedBytes       int64           `json:"relocated_bytes"`
+	NetReclaim           int64           `json:"net_reclaim"`
+	Reason               string          `json:"reason,omitempty"`
 }
 
 // ClassifyArtifactPath marks receipt evidence versus rebuildable derived files.
@@ -195,6 +197,8 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 	}
 
 	var entries []ArtifactEntry
+	seenIno := map[uint64]struct{}{}
+	seenDigest := map[string]struct{}{}
 	for _, rel := range files {
 		src := filepath.Join(target, filepath.FromSlash(rel))
 		if err := refuseCanonicalReceipt(root, target, src); err != nil {
@@ -207,11 +211,23 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		if err != nil {
 			return nil, fmt.Errorf("artifact-archive: hash %s: %w", rel, err)
 		}
+		ino, _, err := fileAlloc(src)
+		if err != nil {
+			return nil, fmt.Errorf("artifact-archive: inode %s: %w", rel, err)
+		}
 		kind := ClassifyArtifactPath(rel)
 		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: kind, Retention: retentionOf(kind)}
 		rep.SourceBytes += size
+		_, seenName := seenIno[ino]
+		if !seenName {
+			seenIno[ino] = struct{}{}
+			rep.SourceAllocatedBytes += size
+		}
 		existed := objectExists(archive, sum)
-		if req.Act {
+		if _, ok := seenDigest[sum]; ok {
+			existed = true
+		}
+		if req.Act && !seenName {
 			created, err := writeObject(archive, src, sum)
 			if err != nil {
 				return nil, fmt.Errorf("artifact-archive: store %s: %w", rel, err)
@@ -225,14 +241,18 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 				return nil, fmt.Errorf("artifact-archive: drift on %s before removal (archived %s, now %s)", rel, sum, again)
 			}
 		}
-		if existed {
+		switch {
+		case seenName:
+			ent.Disposition = "hardlink-alias"
+		case existed:
 			ent.Disposition = "deduped"
 			rep.DedupSavings += size
-		} else {
+		default:
 			ent.Disposition = "relocated"
 			rep.RelocatedBytes += size
 			rep.ArchiveNewBytes += size
 		}
+		seenDigest[sum] = struct{}{}
 		entries = append(entries, ent)
 	}
 	rep.Entries = entries
@@ -295,6 +315,14 @@ func retentionOf(kind ArtifactKind) string {
 func objectExists(archive, digest string) bool {
 	got, _, err := hashFile(objectPath(archive, digest))
 	return err == nil && got == digest
+}
+
+func fileAlloc(path string) (ino uint64, nlink uint64, err error) {
+	var st syscall.Stat_t
+	if err := syscall.Lstat(path, &st); err != nil {
+		return 0, 0, err
+	}
+	return st.Ino, uint64(st.Nlink), nil
 }
 
 func listIgnoredFiles(target string) ([]string, error) {
