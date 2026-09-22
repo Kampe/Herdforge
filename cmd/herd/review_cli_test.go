@@ -1731,6 +1731,70 @@ func TestReceiptIssueCLI_VerifierBaseIsCandidateAncestorWhenMainAdvanced(t *test
 	}
 }
 
+func TestReceiptIssueCLI_BaseFlagRejectedForNonVerifierRole(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	base := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "recovery", "--base", base, "FAC-1", target).CombinedOutput()
+	if err == nil {
+		t.Fatalf("non-verifier --base must be refused:\n%s", out)
+	}
+	if !strings.Contains(string(out), "--base is only valid for --role verifier") {
+		t.Fatalf("want verifier-only --base refusal, got:\n%s", out)
+	}
+}
+
+func TestReceiptIssueCLI_VerifierBaseRefusesExplicitConflictWithAuthenticated(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	fork := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-848")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-848", target, fork)
+	gitIn(t, target, "commit", "--allow-empty", "-m", "builder-base")
+	auth := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	gitIn(t, target, "commit", "--allow-empty", "-m", "candidate")
+	candidate := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	if auth == fork {
+		t.Fatal("authenticated base must differ from merge-base")
+	}
+
+	signer := fixtureSigner(t, keyDir, dir)
+	prior, err := signer.Issue(dispatch.TaskContext{
+		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
+		Role: dispatch.RoleWorker, TaskRef: "FAC-1", TaskID: "t1", Branch: "herd/fac-848",
+		BaseSHA: auth, CandidateSHA: candidate, LeaseID: "worker-prior", LeaseGeneration: 1,
+		LeaseTaskRef: "FAC-1", SessionID: "worker-prior-session", AllowedOps: dispatch.OpsForRole(dispatch.RoleWorker),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(target, prior); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "--base", fork, "FAC-1", target).CombinedOutput()
+	if err == nil {
+		t.Fatalf("conflicting --base must be refused:\n%s", out)
+	}
+	if !strings.Contains(string(out), "conflicts with authenticated builder base") {
+		t.Fatalf("want conflict diagnostic, got:\n%s", out)
+	}
+	after, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Signature != prior.Signature || after.BaseSHA != auth {
+		t.Fatal("refused verifier issue mutated the authenticated builder context")
+	}
+}
+
 // FAC-145 (blocker 1 regression): a REVIEWER receipt whose lease was
 // acquired under the scoped key (FAC-X:review) must work through the
 // broker. Binding the lease key into the signed receipt is what makes this

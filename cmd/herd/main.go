@@ -10939,7 +10939,11 @@ func runReceiptIssue() {
 		// substitute a later origin/main for the builder's signed base.
 		base = priorRecovery.BaseSHA
 	} else if *role == dispatch.RoleVerifier {
-		authBase := authenticatedBuilderBase(root, targetDir, candidate)
+		authBase, authErr := authenticatedBuilderBase(root, targetDir, candidate)
+		if authErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", authErr)
+			os.Exit(1)
+		}
 		base, err = verifierIssuanceBase(targetDir, originMain, candidate, authBase, *explicitBase)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
