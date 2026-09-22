@@ -31,14 +31,35 @@ func runArtifactArchiveArgs(args []string) error {
 	if err != nil {
 		return err
 	}
-	rep, err := worktree.ArchiveIgnored(worktree.ArchiveRequest{
+	req := worktree.ArchiveRequest{
 		Root:    root,
 		Target:  opts.target,
 		Archive: opts.archive,
 		Act:     opts.act,
-	})
+	}
+	if opts.plan != "" && opts.act {
+		raw, err := os.ReadFile(opts.plan)
+		if err != nil {
+			return fmt.Errorf("artifact-archive: read plan: %w", err)
+		}
+		var plan worktree.ArchivePlan
+		if err := json.Unmarshal(raw, &plan); err != nil {
+			return fmt.Errorf("artifact-archive: parse plan: %w", err)
+		}
+		req.Plan = &plan
+	}
+	rep, err := worktree.ArchiveIgnored(req)
 	if err != nil {
 		return err
+	}
+	if opts.plan != "" && !opts.act && rep.Plan != nil {
+		body, err := json.MarshalIndent(rep.Plan, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(opts.plan, body, 0o600); err != nil {
+			return fmt.Errorf("artifact-archive: write plan: %w", err)
+		}
 	}
 	if opts.jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -65,6 +86,7 @@ func runArtifactArchiveArgs(args []string) error {
 type artifactArchiveOpts struct {
 	target  string
 	archive string
+	plan    string
 	act     bool
 	jsonOut bool
 }
@@ -100,14 +122,20 @@ func parseArtifactArchiveArgs(args []string) (artifactArchiveOpts, error) {
 			}
 			i++
 			opts.archive = args[i]
+		case "--plan":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("artifact-archive: --plan requires a path")
+			}
+			i++
+			opts.plan = args[i]
 		case "--help", "-h":
-			return opts, fmt.Errorf("usage: herd artifact-archive --target <worktree> [--archive DIR] [--dry-run|--act] [--json]")
+			return opts, fmt.Errorf("usage: herd artifact-archive --target <worktree> [--archive DIR] [--plan FILE] [--dry-run|--act] [--json]")
 		default:
 			return opts, fmt.Errorf("artifact-archive: unknown flag %s", arg)
 		}
 	}
 	if strings.TrimSpace(opts.target) == "" {
-		return opts, fmt.Errorf("usage: herd artifact-archive --target <worktree> [--archive DIR] [--dry-run|--act] [--json]")
+		return opts, fmt.Errorf("usage: herd artifact-archive --target <worktree> [--archive DIR] [--plan FILE] [--dry-run|--act] [--json]")
 	}
 	return opts, nil
 }

@@ -81,14 +81,31 @@ type ArtifactManifest struct {
 	Entries []ArtifactEntry `json:"entries"`
 }
 
+// PlannedFile is one ignored path captured by a dry-run plan.
+type PlannedFile struct {
+	Path   string `json:"path"`
+	Digest string `json:"digest"`
+	Size   int64  `json:"size"`
+	Ino    uint64 `json:"ino"`
+	Nlink  uint64 `json:"nlink"`
+}
+
+// ArchivePlan binds apply to the exact sources observed at plan time.
+type ArchivePlan struct {
+	Target string        `json:"target"`
+	Files  []PlannedFile `json:"files"`
+}
+
 // ArchiveRequest is a bounded archive-then-remove of ignored files in one
-// registered worktree. Dry-run is the default.
+// registered worktree. Dry-run is the default. When Plan is set on Act,
+// apply refuses digest, inode, or nlink drift and keeps sources.
 type ArchiveRequest struct {
 	Root    string
 	Target  string
 	Archive string
 	Act     bool
 	Now     time.Time
+	Plan    *ArchivePlan
 }
 
 // ArchiveReport is the operator-visible outcome. Dry-run never sets Removed.
@@ -113,6 +130,7 @@ type ArchiveReport struct {
 	PhysicalReclaimUncertainBytes int64           `json:"physical_reclaim_uncertain_bytes"`
 	NetReclaim                    int64           `json:"net_reclaim"`
 	Reason                        string          `json:"reason,omitempty"`
+	Plan                          *ArchivePlan    `json:"plan,omitempty"`
 }
 
 // ClassifyArtifactPath marks receipt evidence versus rebuildable derived files.
@@ -207,8 +225,10 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		newObj bool
 	}
 	var entries []ArtifactEntry
+	var planned []PlannedFile
 	seenIno := map[uint64]*inodeAcc{}
 	seenDigest := map[string]struct{}{}
+	seenPath := map[string]struct{}{}
 	for _, rel := range files {
 		src := filepath.Join(target, filepath.FromSlash(rel))
 		if err := refuseCanonicalReceipt(root, target, src); err != nil {
@@ -226,6 +246,11 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 			return nil, fmt.Errorf("artifact-archive: inode %s: %w", rel, err)
 		}
 		kind := ClassifyArtifactPath(rel)
+		if err := matchPlannedFile(req.Plan, rel, sum, size, ino, nlink); err != nil {
+			return nil, err
+		}
+		seenPath[rel] = struct{}{}
+		planned = append(planned, PlannedFile{Path: rel, Digest: sum, Size: size, Ino: ino, Nlink: nlink})
 		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: kind, Retention: retentionOf(kind)}
 		rep.SourceBytes += size
 		acc, seenName := seenIno[ino]
@@ -272,6 +297,10 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 	}
 	rep.Entries = entries
 	rep.Archived = len(entries)
+	rep.Plan = &ArchivePlan{Target: relTarget, Files: planned}
+	if err := matchPlannedSet(req.Plan, seenPath); err != nil {
+		return nil, err
+	}
 
 	if !req.Act {
 		rep.NetReclaim = 0
@@ -340,6 +369,43 @@ func retentionOf(kind ArtifactKind) string {
 		return "evidence"
 	}
 	return "regenerable"
+}
+
+func matchPlannedFile(plan *ArchivePlan, rel, sum string, size int64, ino, nlink uint64) error {
+	if plan == nil {
+		return nil
+	}
+	for _, pf := range plan.Files {
+		if pf.Path != rel {
+			continue
+		}
+		if pf.Digest != sum {
+			return fmt.Errorf("artifact-archive: source %s replaced after plan (planned %s, now %s); source kept", rel, pf.Digest, sum)
+		}
+		if pf.Ino != ino {
+			return fmt.Errorf("artifact-archive: source %s inode changed after plan; source kept", rel)
+		}
+		if nlink > pf.Nlink {
+			return fmt.Errorf("artifact-archive: source %s gained external alias after plan (nlink %d -> %d); source kept", rel, pf.Nlink, nlink)
+		}
+		if pf.Size != size {
+			return fmt.Errorf("artifact-archive: source %s size drifted after plan; source kept", rel)
+		}
+		return nil
+	}
+	return fmt.Errorf("artifact-archive: source %s was not in the plan; source kept", rel)
+}
+
+func matchPlannedSet(plan *ArchivePlan, seen map[string]struct{}) error {
+	if plan == nil {
+		return nil
+	}
+	for _, pf := range plan.Files {
+		if _, ok := seen[pf.Path]; !ok {
+			return fmt.Errorf("artifact-archive: planned source %s missing at apply; sources kept", pf.Path)
+		}
+	}
+	return nil
 }
 
 func objectExists(archive, digest string) bool {
