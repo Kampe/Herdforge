@@ -21,6 +21,8 @@ type Server struct {
 	sessionKey SessionKey
 	topo       Topology
 	socketPath string
+	keyPath    string
+	identity   string
 	nonces     *DurableNonceLedger
 	ln         net.Listener
 	admit      AdmissionFunc
@@ -148,12 +150,15 @@ func StartServer(opts ServeOptions) (*Server, error) {
 		admit = currentAdmission()
 	}
 
+	ident := strings.TrimSuffix(filepath.Base(opts.KeyPath), KeyFileSuffix)
 	return &Server{
 		priv:        priv,
 		pub:         pub,
 		sessionKey:  append(SessionKey(nil), opts.SessionKey...),
 		topo:        opts.Topology,
 		socketPath:  sock,
+		keyPath:     opts.KeyPath,
+		identity:    ident,
 		nonces:      ledger,
 		ln:          ln,
 		admit:       admit,
@@ -274,6 +279,19 @@ func (s *Server) handle(conn net.Conn) {
 	case OpPing, OpProbe:
 		_ = json.NewEncoder(conn).Encode(wireResp{
 			OK: true, EchoNonce: req.Nonce, PID: s.PID(), PubKey: hex.EncodeToString(s.pub),
+		})
+	case OpKeyAudit:
+		st, sig, err := s.handleKeyAudit(req)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(wireResp{
+				OK: false, ErrorCode: ErrCodeInvalidRequest, Error: err.Error(), EchoNonce: req.Nonce, PID: s.PID(),
+			})
+			return
+		}
+		raw, _ := json.Marshal(st)
+		_ = json.NewEncoder(conn).Encode(wireResp{
+			OK: true, Signature: hex.EncodeToString(sig), EchoNonce: req.Nonce,
+			PubKey: hex.EncodeToString(s.pub), PID: s.PID(), Audit: string(raw),
 		})
 	case OpExportKey:
 		_ = json.NewEncoder(conn).Encode(wireResp{

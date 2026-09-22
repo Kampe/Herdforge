@@ -1,0 +1,120 @@
+name: Crash lab binary
+
+on:
+  push:
+    branches: [ "lab/**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crash-lab-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  herd-binaries:
+    name: Bounded herd binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build linux/amd64 and darwin/arm64
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          mkdir -p dist
+          printf '%s\n' "$sha" > dist/GITSHA
+          GOOS=linux GOARCH=amd64 go build -p 1 -o dist/herd-linux-amd64 ./cmd/herd
+          GOOS=darwin GOARCH=arm64 go build -p 1 -o dist/herd-darwin-arm64 ./cmd/herd
+          sha256sum dist/herd-linux-amd64 dist/herd-darwin-arm64 dist/GITSHA > dist/SHA256SUMS
+
+      - name: Upload binaries and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: herd-crash-lab-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  audit-key-mutation:
+    name: Audit-key mutation driver
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Mutate production guards and require named FAIL
+        env:
+          MUTATION_LOG: ${{ github.workspace }}/audit-key-mutation.log
+        run: zsh scripts/crash-lab-audit-key-mutation.sh
+
+      - name: Upload mutation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-key-mutation-${{ github.sha }}
+          path: audit-key-mutation.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  signer-boundary-linux:
+    name: Linux signer-boundary lab
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: herd-binaries
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download linux herd
+        uses: actions/download-artifact@v4
+        with:
+          name: herd-crash-lab-${{ github.sha }}
+          path: dist
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Verify linux artifact then operate signer-boundary
+        env:
+          HERD: ${{ github.workspace }}/dist/herd-linux-amd64
+          REPO: ${{ github.workspace }}
+          EVIDENCE: ${{ github.workspace }}/signer-lab-evidence.txt
+        run: |
+          set -euo pipefail
+          test -s dist/GITSHA
+          test "$(cat dist/GITSHA)" = "${{ github.sha }}"
+          grep -F "dist/herd-linux-amd64" dist/SHA256SUMS
+          sha256sum -c dist/SHA256SUMS --ignore-missing
+          chmod +x "$HERD"
+          zsh scripts/crash-lab-signer-boundary.sh
+
+      - name: Upload sanitized evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signer-boundary-lab-evidence-${{ github.sha }}
+          path: signer-lab-evidence.txt
+          if-no-files-found: warn
+          retention-days: 7
