@@ -554,12 +554,11 @@ func ArgvFor(provider, model, effort string) []string {
 	pe := PeerEffort(effort)
 	switch provider {
 	case "claude":
-		var base []string
-		if model == "claude-fable-5" || model == "claude-opus-5" {
-			base = []string{"claude", "--model", model, "--effort", effort, "--fallback-model", "claude-sonnet-5"}
-		} else {
-			base = []string{"claude", "--model", model, "--effort", effort}
-		}
+		// Exact pin: do not inject --fallback-model. Silent sonnet fallback
+		// made an Opus-5 reviewer pin launch a different model. Opt-in
+		// fallbacks are applied by ArgvForWithFallbacks when the contract
+		// lists them.
+		base := []string{"claude", "--model", model, "--effort", effort}
 		// FAC-576: an autonomous lane must not sit at a permission prompt.
 		//
 		// Nothing set a permission mode, so a fleet claude pane asked to trust
@@ -604,6 +603,75 @@ func ArgvFor(provider, model, effort string) []string {
 		return []string{"opencode", "--model", model, "--auto"}
 	}
 	return nil
+}
+
+// ArgvForWithFallbacks compiles exact-model argv, then attaches Claude
+// --fallback-model only when the launch contract lists an explicit same-family
+// Claude alternative. Router-level PreferredFallbackModels that are other
+// providers are routing substitutes, not Claude CLI fallbacks.
+func ArgvForWithFallbacks(provider, model, effort string, fallbacks []string) []string {
+	return applyExplicitClaudeFallback(ArgvFor(provider, model, effort), model, fallbacks)
+}
+
+func applyExplicitClaudeFallback(argv []string, primary string, fallbacks []string) []string {
+	if len(argv) == 0 || argv[0] != "claude" {
+		return argv
+	}
+	if argvHasFlag(argv, "--fallback-model") {
+		return argv
+	}
+	fb := firstClaudeCLIFallback(primary, fallbacks)
+	if fb == "" {
+		return argv
+	}
+	out := append([]string(nil), argv...)
+	inserted := false
+	for i := range out {
+		if out[i] == "--permission-mode" {
+			head := append([]string{}, out[:i]...)
+			head = append(head, "--fallback-model", fb)
+			out = append(head, out[i:]...)
+			inserted = true
+			break
+		}
+	}
+	if !inserted {
+		out = append(out, "--fallback-model", fb)
+	}
+	return out
+}
+
+func firstClaudeCLIFallback(primary string, fallbacks []string) string {
+	primary = strings.TrimSpace(primary)
+	for _, fb := range fallbacks {
+		fb = strings.TrimSpace(fb)
+		if fb == "" || fb == primary {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(fb), "claude") {
+			continue
+		}
+		return fb
+	}
+	return ""
+}
+
+func argvHasFlag(argv []string, flag string) bool {
+	_, ok := argvFlagValue(argv, flag)
+	return ok
+}
+
+func argvFlagValue(argv []string, flag string) (string, bool) {
+	for i := range argv {
+		if argv[i] != flag {
+			continue
+		}
+		if i+1 < len(argv) {
+			return argv[i+1], true
+		}
+		return "", true
+	}
+	return "", false
 }
 
 // HeadlessArgvFor is the argv for a ONE-SHOT, non-interactive run.
