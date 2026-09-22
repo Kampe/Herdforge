@@ -358,8 +358,8 @@ Commands:
   herd mail read --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
   herd mail repair --id ID [--id ID...] [--mail path] [--reason TEXT]
   herd mail repair --id ID [--id ID...] --fingerprint SHA256 [--fingerprint SHA256...] --actor NAME --act [--mail path] [--reason TEXT]
-  herd mail repair --sequence-order [--mail path] [--reason TEXT] [--after-cursor C --recipient NAME]
-  herd mail repair --sequence-order --act --actor NAME --fingerprint SHA256 [--fingerprint SHA256...] [--mail path] [--reason TEXT]
+  herd mail repair --sequence-order [--mail path] [--reason TEXT] [--plan-out PATH] [--max-rows N] [--max-bytes N] [--after-cursor C --recipient NAME]
+  herd mail repair --sequence-order --act --actor NAME --plan-file PATH --plan-digest SHA256 [--mail path] [--reason TEXT]
   herd mail control <issue|drain> [flags]
 
 Bounded paging (inbox/read): passing --after-cursor, --limit or --max-bytes
@@ -377,9 +377,11 @@ payloads, row positions and every unselected byte are preserved. Timestamp
 repair does not reorder history. Sequence-order recovery (--sequence-order)
 restores file-order monotonic sequences by assigning seq values above the
 running max to inverting rows only; ids, payloads, row positions and signed
-controls are preserved. Duplicate ids, stale fingerprints, stale paging
-cursors, privileged signed rows that would be rewritten, and plans over 32
-changed rows refuse with the mailbox untouched. It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
+controls are preserved. The compact --plan-out artifact plus --plan-digest is
+the CAS for --act (whole-store digest, not argv fingerprints). Duplicate ids,
+stale plan/store digests, stale paging cursors, privileged signed rows that
+would be rewritten, and stores over the configured row/byte ceiling refuse
+with the mailbox untouched. It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
 plan object; repeated --id flags return an array in the order supplied.
 Acting REQUIRES --actor and one --fingerprint per --id, paired in the same
 order. Run report-only first and pass back each plan's original_sha256, so the

@@ -62,22 +62,26 @@ func TestSequenceOrderReportOnlyThenActOnDisposableInversion(t *testing.T) {
 	if string(afterReport) != string(before) {
 		t.Fatal("report-only must not mutate the mailbox")
 	}
-	if report.Changed != 1 || report.Kept != 4 || report.TotalRows != 5 || report.Truncated {
+	if report.Changed != 1 || report.Kept != 4 || report.TotalRows != 5 {
 		t.Fatalf("report shape: %+v", report)
 	}
-	if report.Plans[0].ID != "a5" || report.Plans[0].AssignedSequence != 5 || report.Plans[0].Applied {
-		t.Fatalf("plan: %+v", report.Plans[0])
+	if report.Edits[0].ID != "a5" || report.Edits[0].AssignedSequence != 5 {
+		t.Fatalf("plan: %+v", report.Edits[0])
 	}
 
+	raw, err := report.MarshalPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
 	act, err := mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{
 		Act: true, Actor: "op", Reason: "fixture",
-		Fingerprints: []string{report.Plans[0].OriginalSHA256},
+		Plan: raw, PlanDigest: SequenceOrderPlanDigest(raw),
 	})
 	if err != nil {
 		t.Fatalf("act: %v", err)
 	}
-	if !act.Plans[0].Applied || act.Plans[0].AssignedSequence != 5 {
-		t.Fatalf("applied plan: %+v", act.Plans[0])
+	if act.Edits[0].AssignedSequence != 5 {
+		t.Fatalf("applied plan: %+v", act.Edits[0])
 	}
 
 	cur, opts = sequenceOrderPage(t, mb, "alice")
@@ -126,17 +130,21 @@ func TestSequenceOrderPreservesSignedControls(t *testing.T) {
 	}
 }
 
-func TestSequenceOrderRejectsStaleFingerprint(t *testing.T) {
+func TestSequenceOrderRejectsStalePlanDigest(t *testing.T) {
 	mb, _ := mailboxWith(t, seqRow(t, "a1", "alice", 1), seqRow(t, "a2", "alice", 1))
 	report, err := mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	raw, err := report.MarshalPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{
-		Act: true, Actor: "op", Fingerprints: []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		Act: true, Actor: "op", Plan: raw, PlanDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	})
-	if err == nil || !errors.Is(err, ErrRepairStale) {
-		t.Fatalf("stale fingerprint must refuse, got %v", err)
+	if err == nil || !errors.Is(err, ErrSequenceOrderPlanDigest) {
+		t.Fatalf("stale plan digest must refuse, got %v", err)
 	}
 	if report.Changed != 1 {
 		t.Fatalf("changed = %d", report.Changed)
@@ -158,28 +166,63 @@ func TestSequenceOrderRejectsStaleCursor(t *testing.T) {
 	}
 }
 
-func TestSequenceOrderBoundsLargePlans(t *testing.T) {
-	rows := make([]string, 0, MaxSequenceOrderRepairs+2)
-	rows = append(rows, seqRow(t, "head", "alice", 10))
-	for i := 0; i < MaxSequenceOrderRepairs+1; i++ {
+func TestSequenceOrderBoundsConfiguredRowCeiling(t *testing.T) {
+	rows := []string{seqRow(t, "head", "alice", 10)}
+	for i := 0; i < 5; i++ {
 		rows = append(rows, seqRow(t, fmt.Sprintf("inv-%d", i), "alice", 1))
 	}
 	mb, path := mailboxWith(t, rows...)
 	before, _ := os.ReadFile(path)
-	report, err := mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{})
-	if err != nil {
-		t.Fatalf("report-only over bound: %v", err)
-	}
-	if !report.Truncated || report.Changed != MaxSequenceOrderRepairs+1 || len(report.Plans) != MaxSequenceOrderRepairs {
-		t.Fatalf("truncated report: changed=%d plans=%d truncated=%v", report.Changed, len(report.Plans), report.Truncated)
-	}
-	_, err = mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{Act: true, Actor: "op"})
+	_, err := mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{MaxRows: 4})
 	if err == nil || !errors.Is(err, ErrSequenceOrderBound) {
-		t.Fatalf("act over bound must refuse, got %v", err)
+		t.Fatalf("row ceiling must refuse, got %v", err)
 	}
 	after, _ := os.ReadFile(path)
 	if string(after) != string(before) {
 		t.Fatal("bounded refuse must not mutate")
+	}
+}
+
+func TestSequenceOrderRecovers517Inversions(t *testing.T) {
+	rows := []string{
+		seqRow(t, "h1", "alice", 1),
+		seqRow(t, "h2", "alice", 2),
+		seqRow(t, "h3", "alice", 3),
+		seqRow(t, "h4", "alice", 4),
+	}
+	for i := 0; i < 517; i++ {
+		rows = append(rows, seqRow(t, fmt.Sprintf("inv-%d", i), "alice", 1))
+	}
+	mb, _ := mailboxWith(t, rows...)
+	cur, opts := sequenceOrderPage(t, mb, "alice")
+	if _, err := mb.ReadBoundedControl(context.Background(), "alice", cur, opts); err == nil || !errors.Is(err, ErrStorageUnordered) {
+		t.Fatalf("517-inversion fixture must refuse paging, got %v", err)
+	}
+	report, err := mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Changed != 517 || report.TotalRows != 521 {
+		t.Fatalf("changed=%d total=%d", report.Changed, report.TotalRows)
+	}
+	raw, err := report.MarshalPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mb.RepairSequenceOrder(context.Background(), SequenceOrderRequest{
+		Act: true, Actor: "op", Plan: raw, PlanDigest: SequenceOrderPlanDigest(raw),
+	}); err != nil {
+		t.Fatalf("act 517: %v", err)
+	}
+	cur, opts = sequenceOrderPage(t, mb, "alice")
+	opts.Limit = 1000
+	opts.MaxBytes = MaxBoundedPageBytes
+	page, err := mb.ReadBoundedControl(context.Background(), "alice", cur, opts)
+	if err != nil {
+		t.Fatalf("bounded after 517 repair: %v", err)
+	}
+	if len(page.Envelopes) != 521 {
+		t.Fatalf("skipped messages: got %d want 521", len(page.Envelopes))
 	}
 }
 

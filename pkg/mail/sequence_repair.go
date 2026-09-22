@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,63 +16,101 @@ import (
 // would skip later lower-numbered rows. This walk keeps every row in place,
 // rewrites only inverting seq values, and never touches signed controls.
 //
-// It is REPORT-ONLY unless Act is set. Changed rows are bounded: a store
-// that would rewrite more than MaxSequenceOrderRepairs cannot be applied in
-// one transaction, so a large live mailbox cannot be mutated by accident.
+// Operator review uses a compact plan file (ids, line indexes, per-row
+// original digests, assigned sequences) plus a whole-store digest. Acting
+// is compare-and-swap on those digests. Full original bodies are not copied
+// into the plan, so a 517-inversion store stays within bounded memory.
 
-// MaxSequenceOrderRepairs is the maximum number of rows one sequence-order
-// act may rewrite. It matches MaxRepairBatch so operator selection stays
-// reviewable. Report-only still reports the full changed count.
-const MaxSequenceOrderRepairs = MaxRepairBatch
+const (
+	SequenceOrderPlanSchema = "mail.sequence-order.v1"
+	// MaxSequenceOrderRows / MaxSequenceOrderBytes are finite configured
+	// ceilings. They are large enough for the observed 4447-row / 517-inversion
+	// control mailbox and refuse anything bigger instead of scanning forever.
+	MaxSequenceOrderRows  = MaxBoundedLimit
+	MaxSequenceOrderBytes = MaxBoundedPageBytes
+)
 
 var (
-	// ErrSequenceOrderBound fires when applying would rewrite more rows than
-	// the operator bound. Report-only still returns the truncated plan.
-	ErrSequenceOrderBound = errors.New("mail repair: sequence-order plan exceeds the 32-row bound")
-	// ErrSequenceOrderStaleCursor fires when the operator-supplied paging
-	// cursor does not bind to this store's current prefix. Acting anyway
-	// would rewrite underneath a position the operator thinks is live.
+	ErrSequenceOrderBound       = errors.New("mail repair: sequence-order store exceeds configured row or byte bound")
 	ErrSequenceOrderStaleCursor = errors.New("mail repair: paging cursor is stale for this store")
+	ErrSequenceOrderStaleStore  = errors.New("mail repair: store digest does not match the reviewed plan")
+	ErrSequenceOrderPlanDigest  = errors.New("mail repair: plan-file digest does not match the reviewed bytes")
 )
 
 // SequenceOrderRequest is one whole-store sequence-order recovery.
 type SequenceOrderRequest struct {
-	Act          bool
-	Actor        string
-	Reason       string
-	Fingerprints []string
-	// Cursor, Recipient and FeedbackDir bind an optional paging cursor.
-	// Empty cursor is ignored. A non-empty cursor must parse for Recipient
-	// against this mailbox and still match the current recipient prefix.
+	Act         bool
+	Actor       string
+	Reason      string
+	Plan        []byte
+	PlanDigest  string
+	MaxRows     int
+	MaxBytes    int
 	Cursor      string
 	Recipient   string
 	FeedbackDir string
 }
 
-// SequenceOrderReport is the operator evidence for a sequence-order walk.
-type SequenceOrderReport struct {
-	Defect      string        `json:"defect"`
-	TotalRows   int           `json:"total_rows"`
-	Changed     int           `json:"changed"`
-	Kept        int           `json:"kept"`
-	Bound       int           `json:"bound"`
-	Truncated   bool          `json:"truncated"`
-	StoreSHA256 string        `json:"store_sha256"`
-	Plans       []*RepairPlan `json:"plans"`
+// SequenceOrderEdit is one inverting row in the compact plan. It never carries
+// original_line: the live row plus original_sha256 is the CAS.
+type SequenceOrderEdit struct {
+	Index            int    `json:"index"`
+	ID               string `json:"id"`
+	OriginalSHA256   string `json:"original_sha256"`
+	AssignedSequence int64  `json:"assigned_sequence"`
+}
+
+// SequenceOrderPlan is the durable reviewed artifact. json.Marshal of this
+// struct is what --plan-digest hashes.
+type SequenceOrderPlan struct {
+	Schema      string              `json:"schema"`
+	StoreSHA256 string              `json:"store_sha256"`
+	TotalRows   int                 `json:"total_rows"`
+	Changed     int                 `json:"changed"`
+	Kept        int                 `json:"kept"`
+	MaxRows     int                 `json:"max_rows"`
+	MaxBytes    int                 `json:"max_bytes"`
+	Edits       []SequenceOrderEdit `json:"edits"`
+}
+
+func (p SequenceOrderPlan) MarshalPlan() ([]byte, error) {
+	if p.Edits == nil {
+		p.Edits = []SequenceOrderEdit{}
+	}
+	return json.Marshal(p)
+}
+
+func DecodeSequenceOrderPlan(raw []byte) (SequenceOrderPlan, error) {
+	var plan SequenceOrderPlan
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return SequenceOrderPlan{}, fmt.Errorf("mail repair: plan file is not JSON: %w", err)
+	}
+	if plan.Schema != SequenceOrderPlanSchema {
+		return SequenceOrderPlan{}, fmt.Errorf("mail repair: plan schema %q is not %s", plan.Schema, SequenceOrderPlanSchema)
+	}
+	if strings.TrimSpace(plan.StoreSHA256) == "" {
+		return SequenceOrderPlan{}, errors.New("mail repair: plan is missing store_sha256")
+	}
+	return plan, nil
+}
+
+func SequenceOrderPlanDigest(raw []byte) string {
+	return sha256OfLine(string(raw))
 }
 
 type sequenceEdit struct {
-	index int
-	id    string
-	env   *Envelope
-	plan  *RepairPlan
+	index          int
+	id             string
+	assigned       int64
+	originalSHA256 string
 }
 
 // RepairSequenceOrder restores file-order monotonic sequences without
 // reordering or dropping rows. Duplicate ids, privileged signed rows that
-// would be rewritten, stale fingerprints, stale paging cursors, and plans
-// over MaxSequenceOrderRepairs all refuse with the mailbox untouched.
-func (m *Mailbox) RepairSequenceOrder(ctx context.Context, req SequenceOrderRequest) (*SequenceOrderReport, error) {
+// would be rewritten, stale plan/store digests, stale paging cursors, and
+// stores over the configured row/byte bound all refuse with the mailbox
+// untouched.
+func (m *Mailbox) RepairSequenceOrder(ctx context.Context, req SequenceOrderRequest) (*SequenceOrderPlan, error) {
 	if m == nil {
 		return nil, errors.New("mail repair: nil mailbox")
 	}
@@ -81,20 +120,24 @@ func (m *Mailbox) RepairSequenceOrder(ctx context.Context, req SequenceOrderRequ
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	report := &SequenceOrderReport{
-		Defect: "sequence-order",
-		Bound:  MaxSequenceOrderRepairs,
-		Plans:  []*RepairPlan{},
+	maxRows := req.MaxRows
+	if maxRows <= 0 {
+		maxRows = MaxSequenceOrderRows
 	}
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = MaxSequenceOrderBytes
+	}
+	var out *SequenceOrderPlan
 	err := m.withFileLockContext(ctx, func() error {
 		data, err := os.ReadFile(m.MailFile)
 		if err != nil {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("mail repair: read mailbox: %w", err)
-			}
 			return fmt.Errorf("mail repair: read mailbox: %w", redactErr(err))
 		}
-		report.StoreSHA256 = sha256OfLine(string(data))
+		if len(data) > maxBytes {
+			return fmt.Errorf("%w: store is %d bytes (max %d)", ErrSequenceOrderBound, len(data), maxBytes)
+		}
+		storeSHA := sha256OfLine(string(data))
 		spans := lineSpans(data)
 		lines := make([]string, len(spans))
 		for i, span := range spans {
@@ -103,131 +146,161 @@ func (m *Mailbox) RepairSequenceOrder(ctx context.Context, req SequenceOrderRequ
 		if err := m.checkSequenceOrderCursor(req, lines); err != nil {
 			return err
 		}
-		edits, kept, total, err := planSequenceOrderEdits(lines, req.Actor, req.Reason)
+		edits, kept, total, err := planSequenceOrderEdits(lines, maxRows)
 		if err != nil {
 			return err
 		}
-		report.TotalRows = total
-		report.Kept = kept
-		report.Changed = len(edits)
-		if len(edits) > MaxSequenceOrderRepairs {
-			report.Truncated = true
-			report.Plans = make([]*RepairPlan, MaxSequenceOrderRepairs)
-			for i := 0; i < MaxSequenceOrderRepairs; i++ {
-				report.Plans[i] = edits[i].plan
-			}
-			if req.Act {
-				return fmt.Errorf("%w: %d rows would change", ErrSequenceOrderBound, len(edits))
-			}
-			return nil
+		plan := SequenceOrderPlan{
+			Schema: SequenceOrderPlanSchema, StoreSHA256: storeSHA,
+			TotalRows: total, Changed: len(edits), Kept: kept,
+			MaxRows: maxRows, MaxBytes: maxBytes, Edits: compactSequenceEdits(edits),
 		}
-		if err := bindSequenceOrderFingerprints(edits, req.Fingerprints, req.Act); err != nil {
-			return err
-		}
-		report.Plans = make([]*RepairPlan, len(edits))
-		for i := range edits {
-			report.Plans[i] = edits[i].plan
-		}
+		out = &plan
 		if !req.Act || len(edits) == 0 {
 			return nil
 		}
-		var floor int64
-		for _, line := range lines {
-			if line == "" {
-				continue
-			}
-			var env Envelope
-			if json.Unmarshal([]byte(line), &env) == nil && env.Sequence > floor {
-				floor = env.Sequence
-			}
+		if len(req.Plan) == 0 || strings.TrimSpace(req.PlanDigest) == "" {
+			return ErrSequenceOrderPlanDigest
 		}
-		for _, edit := range edits {
-			if edit.env.Sequence > floor {
-				floor = edit.env.Sequence
-			}
+		if !strings.EqualFold(strings.TrimSpace(req.PlanDigest), SequenceOrderPlanDigest(req.Plan)) {
+			return fmt.Errorf("%w: computed %s", ErrSequenceOrderPlanDigest, SequenceOrderPlanDigest(req.Plan))
 		}
-		if err := m.setSequenceFloorLocked(floor); err != nil {
+		reviewed, err := DecodeSequenceOrderPlan(req.Plan)
+		if err != nil {
 			return err
 		}
-		for _, edit := range edits {
-			edit.plan.Phase = RepairPhasePrepare
-			edit.plan.PreparedAt = time.Now().UTC()
-			if err := m.appendRepairRecord(edit.plan); err != nil {
-				return fmt.Errorf("mail repair: durable prepare record: %w", err)
-			}
+		if !strings.EqualFold(reviewed.StoreSHA256, storeSHA) {
+			return fmt.Errorf("%w: live %s", ErrSequenceOrderStaleStore, storeSHA)
 		}
-		expected := make([]byte, 0, len(data))
-		cursor := 0
-		replacements := make(map[int]string, len(edits))
-		want := make([]*Envelope, 0, len(edits))
-		for _, edit := range edits {
-			replacements[edit.index] = edit.plan.RepairedLine
-			want = append(want, edit.env)
+		if err := bindSequenceOrderPlan(edits, reviewed); err != nil {
+			return err
 		}
-		for i, span := range spans {
-			if replacement, ok := replacements[i]; ok {
-				expected = append(expected, data[cursor:span.start]...)
-				expected = append(expected, replacement...)
-				cursor = span.end
-			}
-		}
-		expected = append(expected, data[cursor:]...)
-		if err := writeFileAtomic(m.MailFile, expected, 0644); err != nil {
-			plans := make([]*RepairPlan, len(edits))
-			for i, edit := range edits {
-				plans[i] = edit.plan
-			}
-			return m.recordRepairBatchFailure(plans, fmt.Errorf("mail repair: durable mailbox write: %w", err))
-		}
-		for _, env := range want {
-			if err := m.verifyRepairedMailbox(expected, env); err != nil {
-				plans := make([]*RepairPlan, len(edits))
-				for i, edit := range edits {
-					plans[i] = edit.plan
-				}
-				return m.recordRepairBatchFailure(plans, err)
-			}
-		}
-		for _, edit := range edits {
-			edit.plan.Phase = RepairPhaseResult
-			edit.plan.Outcome = RepairOutcomeApplied
-			edit.plan.Applied = true
-			edit.plan.CompletedAt = time.Now().UTC()
-			if err := m.appendRepairRecord(edit.plan); err != nil {
-				return fmt.Errorf("%w: %v", ErrRepairCompletionUnrecorded, err)
-			}
-		}
-		return nil
+		return m.applySequenceOrderLocked(data, spans, lines, edits, req)
 	})
 	if err != nil {
-		return report, err
+		return out, err
 	}
-	return report, nil
+	return out, nil
 }
 
-func bindSequenceOrderFingerprints(edits []sequenceEdit, fingerprints []string, act bool) error {
-	if act && len(edits) > 0 && len(fingerprints) == 0 {
-		return ErrRepairFingerprintRequired
+func compactSequenceEdits(edits []sequenceEdit) []SequenceOrderEdit {
+	out := make([]SequenceOrderEdit, len(edits))
+	for i, e := range edits {
+		out[i] = SequenceOrderEdit{Index: e.index, ID: e.id, OriginalSHA256: e.originalSHA256, AssignedSequence: e.assigned}
 	}
-	if len(fingerprints) == 0 {
-		return nil
+	return out
+}
+
+func bindSequenceOrderPlan(live []sequenceEdit, reviewed SequenceOrderPlan) error {
+	if reviewed.Changed != len(live) || len(reviewed.Edits) != len(live) {
+		return fmt.Errorf("%w: plan changed=%d edits=%d live=%d", ErrSequenceOrderStaleStore, reviewed.Changed, len(reviewed.Edits), len(live))
 	}
-	if len(fingerprints) != len(edits) {
-		return errors.New("mail repair: provide one --fingerprint per changed row, in file order")
-	}
-	for i, edit := range edits {
-		fp := strings.TrimSpace(fingerprints[i])
-		if fp == "" {
-			return errors.New("mail repair: --fingerprint is required to be nonblank when supplied")
-		}
-		if !strings.EqualFold(fp, edit.plan.OriginalSHA256) {
-			return fmt.Errorf("%w: id %q has %s", ErrRepairStale, edit.id, edit.plan.OriginalSHA256)
+	for i, edit := range live {
+		want := reviewed.Edits[i]
+		if want.Index != edit.index || want.ID != edit.id || !strings.EqualFold(want.OriginalSHA256, edit.originalSHA256) || want.AssignedSequence != edit.assigned {
+			return fmt.Errorf("%w: edit %d id %q does not match the reviewed plan", ErrSequenceOrderStaleStore, i, edit.id)
 		}
 	}
 	return nil
 }
 
-func planSequenceOrderEdits(lines []string, actor, reason string) ([]sequenceEdit, int, int, error) {
+func (m *Mailbox) applySequenceOrderLocked(data []byte, spans []lineSpan, lines []string, edits []sequenceEdit, req SequenceOrderRequest) error {
+	if len(edits) == 0 {
+		return nil
+	}
+	audit := map[string]any{
+		"schema": SequenceOrderPlanSchema, "phase": RepairPhasePrepare,
+		"actor": req.Actor, "reason": req.Reason,
+		"store_sha256": sha256OfLine(string(data)), "changed": len(edits),
+		"prepared_at": time.Now().UTC(),
+	}
+	if err := m.appendRepairJSON(audit); err != nil {
+		return fmt.Errorf("mail repair: durable prepare record: %w", err)
+	}
+	replacements := make(map[int]string, len(edits))
+	want := make([]*Envelope, 0, len(edits))
+	var floor int64
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var env Envelope
+		if json.Unmarshal([]byte(line), &env) == nil && env.Sequence > floor {
+			floor = env.Sequence
+		}
+	}
+	for _, edit := range edits {
+		repaired, err := rewriteSequenceLine(lines[edit.index], edit.assigned)
+		if err != nil {
+			return err
+		}
+		var env Envelope
+		if err := json.Unmarshal([]byte(repaired), &env); err != nil {
+			return fmt.Errorf("mail repair: repaired row %q does not parse: %w", edit.id, err)
+		}
+		replacements[edit.index] = repaired
+		want = append(want, &env)
+		if edit.assigned > floor {
+			floor = edit.assigned
+		}
+	}
+	if err := m.setSequenceFloorLocked(floor); err != nil {
+		return err
+	}
+	expected := make([]byte, 0, len(data))
+	cursor := 0
+	for i, span := range spans {
+		if replacement, ok := replacements[i]; ok {
+			expected = append(expected, data[cursor:span.start]...)
+			expected = append(expected, replacement...)
+			cursor = span.end
+		}
+	}
+	expected = append(expected, data[cursor:]...)
+	if err := writeFileAtomic(m.MailFile, expected, 0644); err != nil {
+		return fmt.Errorf("mail repair: durable mailbox write: %w", redactErr(err))
+	}
+	got, err := os.ReadFile(m.MailFile)
+	if err != nil {
+		return fmt.Errorf("%w: reread: %v", ErrRepairReadbackFailed, redactErr(err))
+	}
+	if !bytes.Equal(got, expected) {
+		return fmt.Errorf("%w: durable mailbox is not the exact bytes this repair wrote", ErrRepairReadbackFailed)
+	}
+	for _, env := range want {
+		line, ok := findLineByID(expected, env.ID)
+		if !ok {
+			return fmt.Errorf("%w: repaired row %q is not present", ErrRepairReadbackFailed, env.ID)
+		}
+		var durable Envelope
+		if err := json.Unmarshal(line, &durable); err != nil {
+			return fmt.Errorf("%w: repaired row does not parse: %v", ErrRepairReadbackFailed, err)
+		}
+		if !sameEnvelope(&durable, env) {
+			return fmt.Errorf("%w: durable row differs from the repaired row", ErrRepairReadbackFailed)
+		}
+	}
+	result := map[string]any{
+		"schema": SequenceOrderPlanSchema, "phase": RepairPhaseResult,
+		"outcome": RepairOutcomeApplied, "applied": true,
+		"actor": req.Actor, "changed": len(edits),
+		"completed_at": time.Now().UTC(),
+	}
+	if err := m.appendRepairJSON(result); err != nil {
+		return fmt.Errorf("%w: %v", ErrRepairCompletionUnrecorded, err)
+	}
+	return nil
+}
+
+func (m *Mailbox) appendRepairJSON(v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("encode audit record: %w", err)
+	}
+	return appendLine(m.RepairAuditPath(), data)
+}
+
+func planSequenceOrderEdits(lines []string, maxRows int) ([]sequenceEdit, int, int, error) {
 	seenID := map[string]int{}
 	var edits []sequenceEdit
 	var maxSeen int64
@@ -239,6 +312,9 @@ func planSequenceOrderEdits(lines []string, actor, reason string) ([]sequenceEdi
 			continue
 		}
 		total++
+		if total > maxRows {
+			return nil, 0, 0, fmt.Errorf("%w: store has more than %d rows", ErrSequenceOrderBound, maxRows)
+		}
 		scan, isObject := scanJSONObject([]byte(line))
 		if !isObject {
 			return nil, 0, 0, fmt.Errorf("%w: line %d is not a complete JSON object", ErrRepairUnsupported, i+1)
@@ -288,28 +364,10 @@ func planSequenceOrderEdits(lines []string, actor, reason string) ([]sequenceEdi
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		repaired, err := rewriteSequenceLine(line, next)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		copied := env
-		copied.Sequence = next
 		maxSeen = next
 		saw = true
 		edits = append(edits, sequenceEdit{
-			index: i,
-			id:    id,
-			env:   &copied,
-			plan: &RepairPlan{
-				ID:               id,
-				OriginalLine:     line,
-				OriginalSHA256:   sha256OfLine(line),
-				RepairedLine:     repaired,
-				RepairedSHA256:   sha256OfLine(repaired),
-				AssignedSequence: next,
-				Actor:            actor,
-				Reason:           reason,
-			},
+			index: i, id: id, assigned: next, originalSHA256: sha256OfLine(line),
 		})
 	}
 	return edits, kept, total, nil

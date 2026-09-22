@@ -34,25 +34,30 @@ func TestMailRepairCLISequenceOrderReportAndAct(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := runRepairCLI("--sequence-order", "--mail", path)
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	code, stdout, stderr := runRepairCLI("--sequence-order", "--mail", path, "--plan-out", planPath)
 	if code != 0 {
 		t.Fatalf("report-only exit %d stderr %s", code, stderr)
 	}
 	if !strings.Contains(stderr, "REPORT ONLY") {
 		t.Fatalf("report-only must say so, stderr=%s", stderr)
 	}
-	var report mail.SequenceOrderReport
-	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
-		t.Fatalf("decode report: %v %s", err, stdout)
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(stdout), &summary); err != nil {
+		t.Fatalf("decode summary: %v %s", err, stdout)
 	}
-	if report.Changed != 1 || len(report.Plans) != 1 {
-		t.Fatalf("report %+v", report)
+	if summary["changed"] != float64(1) {
+		t.Fatalf("summary %+v", summary)
+	}
+	digest, _ := summary["plan_sha256"].(string)
+	if digest == "" {
+		t.Fatal("missing plan_sha256")
 	}
 
 	code, _, stderr = runRepairCLI(
 		"--sequence-order", "--mail", path,
 		"--act", "--actor", "op",
-		"--fingerprint", report.Plans[0].OriginalSHA256,
+		"--plan-file", planPath, "--plan-digest", digest,
 	)
 	if code != 0 {
 		t.Fatalf("act exit %d stderr %s", code, stderr)
