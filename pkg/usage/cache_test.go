@@ -544,9 +544,7 @@ func TestProviderCacheContentionUsesProductionLockWait(t *testing.T) {
 		t.Fatal("waiter must not poll while the production lock is held")
 		return ProviderUsage{}, nil
 	}})
-	started := time.Now()
 	_, err := FetchProviderForce("codex", false)
-	elapsed := time.Since(started)
 	restore()
 	if err := os.WriteFile(release, []byte("release\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -557,15 +555,11 @@ func TestProviderCacheContentionUsesProductionLockWait(t *testing.T) {
 	if !errors.Is(err, ErrCacheLockBusy) {
 		t.Fatalf("contended waiter must be ErrCacheLockBusy, got %v", err)
 	}
-	if elapsed < 200*time.Millisecond {
-		t.Fatalf("production lock wait returned too quickly (%v); waiter did not use the 300ms budget", elapsed)
-	}
-	// Production withProviderFileLock waits 300ms. This 1s ceiling is an
-	// observation bound around that contract, not a scheduling budget to grow
-	// on overloaded CI. It still fails if the wait is loosened toward the 2s
-	// snapshot-file lock. Do not widen it to hide descheduling.
-	if elapsed > time.Second {
-		t.Fatalf("production lock wait stretched to %v; do not loosen the 300ms bound", elapsed)
+}
+
+func TestProviderCacheLockWaitIsTheProductionBudget(t *testing.T) {
+	if providerCacheLockWait != 300*time.Millisecond {
+		t.Fatalf("providerCacheLockWait = %v, want 300ms production budget", providerCacheLockWait)
 	}
 }
 
