@@ -3096,6 +3096,7 @@ REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbo
 	cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
 2. %s   (targeted tests for the changed packages, not the whole repo)
+`+reviewVerificationBudgetSection(testCmd)+`
 File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"

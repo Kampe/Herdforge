@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -368,5 +369,41 @@ func TestReviewPacketExplainsSurfaceAliasAndPoolToplevel(t *testing.T) {
 	// and produced the false non-isolated report. Keep the shared-checkout stop.
 	if !strings.Contains(body, "shared checkout root") {
 		t.Error("packet must still fail closed when toplevel is the shared checkout")
+	}
+}
+
+func TestReviewPacketSerializesVerificationBudget(t *testing.T) {
+	body := packetBody("FAC-607", strings.Repeat("a", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "xai", "wK")
+	for _, want := range []string{
+		"VERIFICATION BUDGET",
+		"serialize, do not fan out",
+		"GOMAXPROCS=2",
+		"GOFLAGS=-p=1",
+		"one process at a time",
+		"Never start make test-unit, go test ./cmd/herd, and go test ./... together",
+		"honest reuse",
+		"Build, Preflight & Test Suite",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("packet missing verification budget %q", want)
+		}
+	}
+	if strings.Contains(body, "run make test-unit in parallel") {
+		t.Error("packet must not instruct parallel full-suite execution")
+	}
+}
+
+func TestReviewPoolLaunchUsesReviewTabCreate(t *testing.T) {
+	src, err := os.ReadFile("review_pool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	if !strings.Contains(body, "herdr.ReviewTabCreate(ws, tabLabel, surfaceAbs)") {
+		t.Fatal("native review tab must inherit ReviewTabCreate budget env")
+	}
+	if strings.Contains(body, "Env: []string{herdr.AgentRoleEnv}") {
+		t.Fatal("review tab must not launch with AgentRoleEnv alone")
 	}
 }
