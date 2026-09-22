@@ -95,20 +95,23 @@ type ArchiveRequest struct {
 // NetReclaim is only source bytes whose digest already existed in the
 // archive. RelocatedBytes is a copy, not reclaim.
 type ArchiveReport struct {
-	Target               string          `json:"target"`
-	Archive              string          `json:"archive"`
-	Manifest             string          `json:"manifest,omitempty"`
-	Act                  bool            `json:"act"`
-	Entries              []ArtifactEntry `json:"entries"`
-	Archived             int             `json:"archived"`
-	Removed              int             `json:"removed"`
-	SourceBytes          int64           `json:"source_bytes"`
-	SourceAllocatedBytes int64           `json:"source_allocated_bytes"`
-	ArchiveNewBytes      int64           `json:"archive_new_bytes"`
-	DedupSavings         int64           `json:"dedup_savings"`
-	RelocatedBytes       int64           `json:"relocated_bytes"`
-	NetReclaim           int64           `json:"net_reclaim"`
-	Reason               string          `json:"reason,omitempty"`
+	Target                        string          `json:"target"`
+	Archive                       string          `json:"archive"`
+	Manifest                      string          `json:"manifest,omitempty"`
+	Act                           bool            `json:"act"`
+	Entries                       []ArtifactEntry `json:"entries"`
+	Archived                      int             `json:"archived"`
+	Removed                       int             `json:"removed"`
+	SourceBytes                   int64           `json:"source_bytes"`
+	SourceAllocatedBytes          int64           `json:"source_allocated_bytes"`
+	ArchiveNewBytes               int64           `json:"archive_new_bytes"`
+	DedupSavings                  int64           `json:"dedup_savings"`
+	RelocatedBytes                int64           `json:"relocated_bytes"`
+	LogicalUnlinkedBytes          int64           `json:"logical_unlinked_bytes"`
+	PhysicalReclaimCertainBytes   int64           `json:"physical_reclaim_certain_bytes"`
+	PhysicalReclaimUncertainBytes int64           `json:"physical_reclaim_uncertain_bytes"`
+	NetReclaim                    int64           `json:"net_reclaim"`
+	Reason                        string          `json:"reason,omitempty"`
 }
 
 // ClassifyArtifactPath marks receipt evidence versus rebuildable derived files.
@@ -196,8 +199,14 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		return rep, nil
 	}
 
+	type inodeAcc struct {
+		size   int64
+		nlink  uint64
+		names  int
+		newObj bool
+	}
 	var entries []ArtifactEntry
-	seenIno := map[uint64]struct{}{}
+	seenIno := map[uint64]*inodeAcc{}
 	seenDigest := map[string]struct{}{}
 	for _, rel := range files {
 		src := filepath.Join(target, filepath.FromSlash(rel))
@@ -211,18 +220,20 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		if err != nil {
 			return nil, fmt.Errorf("artifact-archive: hash %s: %w", rel, err)
 		}
-		ino, _, err := fileAlloc(src)
+		ino, nlink, err := fileAlloc(src)
 		if err != nil {
 			return nil, fmt.Errorf("artifact-archive: inode %s: %w", rel, err)
 		}
 		kind := ClassifyArtifactPath(rel)
 		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: kind, Retention: retentionOf(kind)}
 		rep.SourceBytes += size
-		_, seenName := seenIno[ino]
+		acc, seenName := seenIno[ino]
 		if !seenName {
-			seenIno[ino] = struct{}{}
+			acc = &inodeAcc{size: size, nlink: nlink}
+			seenIno[ino] = acc
 			rep.SourceAllocatedBytes += size
 		}
+		acc.names++
 		existed := objectExists(archive, sum)
 		if _, ok := seenDigest[sum]; ok {
 			existed = true
@@ -233,6 +244,9 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 				return nil, fmt.Errorf("artifact-archive: store %s: %w", rel, err)
 			}
 			existed = !created
+			if created {
+				acc.newObj = true
+			}
 			if afterArchiveHook != nil {
 				afterArchiveHook(src)
 			}
@@ -300,8 +314,23 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 			return nil, fmt.Errorf("artifact-archive: remove %s: %w", ent.Path, err)
 		}
 		rep.Removed++
+		rep.LogicalUnlinkedBytes += ent.Size
 	}
-	rep.NetReclaim = rep.DedupSavings
+	for _, acc := range seenIno {
+		leftover := int64(acc.nlink) - int64(acc.names)
+		if leftover > 0 {
+			continue
+		}
+		if acc.newObj {
+			continue
+		}
+		if acc.nlink == 1 {
+			rep.PhysicalReclaimUncertainBytes += acc.size
+			continue
+		}
+		rep.PhysicalReclaimCertainBytes += acc.size
+	}
+	rep.NetReclaim = rep.PhysicalReclaimCertainBytes
 	return rep, nil
 }
 

@@ -236,8 +236,14 @@ func TestArchiveDuplicateCarrierDedupReclaims(t *testing.T) {
 	if derived == 0 || second.ArchiveNewBytes != 0 {
 		t.Fatalf("second carrier must not grow the archive: %+v", second)
 	}
-	if second.NetReclaim != derived || second.DedupSavings != derived {
-		t.Fatalf("dedup reclaim=%d savings=%d want %d", second.NetReclaim, second.DedupSavings, derived)
+	if second.DedupSavings != derived {
+		t.Fatalf("logical dedup savings=%d want %d", second.DedupSavings, derived)
+	}
+	if second.PhysicalReclaimUncertainBytes != derived {
+		t.Fatalf("nlink=1 extra copy is reflink-uncertain, uncertain=%d want %d", second.PhysicalReclaimUncertainBytes, derived)
+	}
+	if second.NetReclaim != 0 {
+		t.Fatalf("nlink=1 extra copy is not certain physical reclaim, net_reclaim=%d", second.NetReclaim)
 	}
 }
 
@@ -295,8 +301,49 @@ func TestArchiveSameBatchCopiesDedupOnce(t *testing.T) {
 			copies += e.Size
 		}
 	}
-	if copies == 0 || rep.DedupSavings == 0 || rep.NetReclaim != int64(len(payload)) {
-		t.Fatalf("two copies should reclaim one payload, report=%+v", rep)
+	if copies == 0 || rep.DedupSavings == 0 {
+		t.Fatalf("two copies should record logical dedup, report=%+v", rep)
+	}
+	if rep.PhysicalReclaimUncertainBytes != int64(len(payload)) {
+		t.Fatalf("nlink=1 extra copy is reflink-uncertain, uncertain=%d want %d report=%+v", rep.PhysicalReclaimUncertainBytes, len(payload), rep)
+	}
+	if rep.NetReclaim != 0 {
+		t.Fatalf("nlink=1 extra copy must not be certain physical reclaim, net_reclaim=%d", rep.NetReclaim)
+	}
+}
+
+func TestArchiveExternalHardlinkIsNotPhysicalReclaim(t *testing.T) {
+	root, wt := archiveFixture(t)
+	payload := []byte("external-alias-payload")
+	outside := filepath.Join(root, "outside-alias")
+	inside := filepath.Join(wt, "bin", "herd")
+	if err := os.WriteFile(inside, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(inside, outside); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(root, filepath.FromSlash(ArtifactArchiveDir))
+	sum, _, err := hashFile(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeObject(archive, inside, sum); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Archive: archive, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("external alias must survive: %v", err)
+	}
+	if rep.NetReclaim != 0 || rep.PhysicalReclaimCertainBytes != 0 {
+		t.Fatalf("external hardlink counted as physical reclaim: %+v", rep)
+	}
+	if int64(len(payload)) > 0 && rep.LogicalUnlinkedBytes == 0 {
+		t.Fatal("logical unlink of the in-target name must still be reported")
 	}
 }
 
