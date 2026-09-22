@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/Kampe/Herdforge/pkg/daemon"
 	"io"
@@ -106,6 +107,12 @@ func writeSignedReceipt(t *testing.T, keyDir, repoDir, wt string, mutate func(*d
 	// Receipts are backed by a REAL live lease in the durable claim store —
 	// exact-lease validation requires it (FAC-145).
 	leaseID, leaseGen := acquireFixtureLease(t, repoDir, "FAC-1")
+	baseSHA := "abc"
+	if out, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output(); err == nil {
+		if sha := strings.TrimSpace(string(out)); len(sha) >= 12 {
+			baseSHA = sha
+		}
+	}
 	tc := dispatch.TaskContext{
 		ProviderType:    "kaneo",
 		ProjectID:       "proj-x",
@@ -114,7 +121,7 @@ func writeSignedReceipt(t *testing.T, keyDir, repoDir, wt string, mutate func(*d
 		TaskRef:         "FAC-1",
 		TaskID:          "t1",
 		Branch:          "herd/fac-1",
-		BaseSHA:         "abc",
+		BaseSHA:         baseSHA,
 		LeaseID:         leaseID,
 		LeaseGeneration: leaseGen,
 		LeaseTaskRef:    "FAC-1",
@@ -1605,6 +1612,14 @@ func TestReceiptIssueCLI_AdmitsEveryIsolatedAgentClass(t *testing.T) {
 		if tc.LeaseTaskRef != "FAC-1:"+role {
 			t.Fatalf("role lease scope = %q", tc.LeaseTaskRef)
 		}
+		if role == dispatch.RoleVerifier {
+			if tc.BaseSHA == "abc" {
+				t.Fatal("isolated-class verifier minted placeholder abc as BaseSHA")
+			}
+			if !gitIsAncestor(dir, tc.BaseSHA, tc.CandidateSHA) {
+				t.Fatalf("isolated-class verifier base %s is not an ancestor of %s", tc.BaseSHA, tc.CandidateSHA)
+			}
+		}
 		for _, op := range tc.AllowedOps {
 			if op == "mutate" {
 				t.Fatalf("%s receipt must not carry mutate", role)
@@ -1689,6 +1704,183 @@ func TestReceiptIssueCLI_ExplicitCandidateSupersessionRecoveryIsScopedAndBasePre
 	}
 	if issued.BaseSHA != base || issued.CandidateSHA != candidate || issued.TaskID != prior.TaskID || issued.ProjectID != prior.ProjectID {
 		t.Fatalf("explicit recovery changed immutable identity: %+v", issued)
+	}
+}
+
+func TestReceiptIssueCLI_VerifierBaseIsCandidateAncestorWhenMainAdvanced(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	fork := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-650-old")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-650", target, fork)
+	gitIn(t, target, "commit", "--allow-empty", "-m", "candidate")
+	candidate := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	gitIn(t, dir, "commit", "--allow-empty", "-m", "later origin/main")
+	gitIn(t, dir, "push", "-q", "origin", "HEAD:main")
+	originMain := strings.TrimSpace(runGitOut(t, target, "rev-parse", "origin/main"))
+	if gitIsAncestor(target, originMain, candidate) {
+		t.Fatal("fixture did not advance origin/main past the candidate")
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("verifier issue: %v\n%s", err, out)
+	}
+	issued, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued.BaseSHA == originMain {
+		t.Fatalf("verifier minted advanced origin/main %s as base", originMain)
+	}
+	if issued.BaseSHA != fork || issued.CandidateSHA != candidate {
+		t.Fatalf("verifier identity base=%s candidate=%s want base=%s candidate=%s", issued.BaseSHA, issued.CandidateSHA, fork, candidate)
+	}
+	if !gitIsAncestor(target, issued.BaseSHA, issued.CandidateSHA) {
+		t.Fatal("issued verifier base is not an ancestor of the candidate")
+	}
+}
+
+func TestReceiptIssueCLI_BaseFlagRejectedForNonVerifierRole(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	base := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "recovery", "--base", base, "FAC-1", target).CombinedOutput()
+	if err == nil {
+		t.Fatalf("non-verifier --base must be refused:\n%s", out)
+	}
+	if !strings.Contains(string(out), "--base is only valid for --role verifier") {
+		t.Fatalf("want verifier-only --base refusal, got:\n%s", out)
+	}
+}
+
+func TestReceiptIssueCLI_VerifierBaseRefusesExplicitConflictWithAuthenticated(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	fork := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-848")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-848", target, fork)
+	gitIn(t, target, "commit", "--allow-empty", "-m", "builder-base")
+	auth := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	gitIn(t, target, "commit", "--allow-empty", "-m", "candidate")
+	candidate := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	if auth == fork {
+		t.Fatal("authenticated base must differ from merge-base")
+	}
+
+	signer := fixtureSigner(t, keyDir, dir)
+	prior, err := signer.Issue(dispatch.TaskContext{
+		ProviderType: "kaneo", ProjectID: "proj-x", Repository: dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
+		Role: dispatch.RoleWorker, TaskRef: "FAC-1", TaskID: "t1", Branch: "herd/fac-848",
+		BaseSHA: auth, CandidateSHA: candidate, LeaseID: "worker-prior", LeaseGeneration: 1,
+		LeaseTaskRef: "FAC-1", SessionID: "worker-prior-session", AllowedOps: dispatch.OpsForRole(dispatch.RoleWorker),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.WriteTaskContext(target, prior); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "--base", fork, "FAC-1", target).CombinedOutput()
+	if err == nil {
+		t.Fatalf("conflicting --base must be refused:\n%s", out)
+	}
+	if !strings.Contains(string(out), "conflicts with authenticated builder base") {
+		t.Fatalf("want conflict diagnostic, got:\n%s", out)
+	}
+	after, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Signature != prior.Signature || after.BaseSHA != auth {
+		t.Fatal("refused verifier issue mutated the authenticated builder context")
+	}
+}
+
+// Native replacement after a verifier receipt already exists: release the
+// old verifier claim, then reissue. No manual TASK-CONTEXT edits.
+func TestReceiptIssueCLI_VerifierReleaseThenReissue(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	fork := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-848-reissue")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-848-reissue", target, fork)
+	gitIn(t, target, "commit", "--allow-empty", "-m", "candidate")
+	candidate := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	gitIn(t, dir, "commit", "--allow-empty", "-m", "later origin/main")
+	gitIn(t, dir, "push", "-q", "origin", "HEAD:main")
+	originMain := strings.TrimSpace(runGitOut(t, target, "rev-parse", "origin/main"))
+	if gitIsAncestor(target, originMain, candidate) {
+		t.Fatal("fixture did not advance origin/main past the candidate")
+	}
+
+	firstOut, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("first verifier issue: %v\n%s", err, firstOut)
+	}
+	first, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Role != dispatch.RoleVerifier || first.BaseSHA == originMain || !gitIsAncestor(target, first.BaseSHA, first.CandidateSHA) {
+		t.Fatalf("first verifier identity %+v origin/main %s", first, originMain)
+	}
+
+	replaceOut, replaceErr := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "FAC-1", target).CombinedOutput()
+	if replaceErr == nil {
+		t.Fatalf("reissue over an existing verifier context succeeded without native release:\n%s", replaceOut)
+	}
+
+	relOut, err := herdCmd(binary, dir, keyDir, "receipt", "release", "--role", "verifier", "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("native verifier release: %v\n%s", err, relOut)
+	}
+	if _, err := dispatch.ReadTaskContext(target); err == nil {
+		t.Fatal("release left TASK-CONTEXT in place")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("after release, want absent context, got %v", err)
+	}
+
+	secondOut, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("reissue after native release: %v\n%s", err, secondOut)
+	}
+	second, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Role != dispatch.RoleVerifier {
+		t.Fatalf("reissued role %q", second.Role)
+	}
+	if second.BaseSHA == originMain {
+		t.Fatalf("reissue minted advanced origin/main %s as base", originMain)
+	}
+	if second.BaseSHA != fork || second.CandidateSHA != candidate {
+		t.Fatalf("reissue identity base=%s candidate=%s want base=%s candidate=%s", second.BaseSHA, second.CandidateSHA, fork, candidate)
+	}
+	if !gitIsAncestor(target, second.BaseSHA, second.CandidateSHA) {
+		t.Fatal("reissued verifier base is not an ancestor of the candidate")
+	}
+	if second.Signature == first.Signature || second.LeaseID == first.LeaseID {
+		t.Fatal("reissue reused the released verifier receipt identity")
 	}
 }
 
