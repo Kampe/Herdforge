@@ -858,6 +858,20 @@ func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeo
 				return a, nil
 			}
 			last = "agent session remains unavailable after delivery"
+			// AGY 1.2.x TUI does not fire PreInvocation hooks, so herdr never
+			// receives conversationId. After a real consumed turn, bind the
+			// conversation UUID AGY stored for this cwd through the official
+			// pane.report_agent_session API. Never use pane/terminal/timestamp.
+			if strings.EqualFold(strings.TrimSpace(a.Kind), "agy") {
+				bound, bindErr := herdr.BindAgyWorkspaceSession(*a)
+				if bindErr == nil {
+					if bound.TabID != tab.ID || bound.PaneID != tab.Pane.ID || bound.TerminalID != tab.Pane.TerminalID || bound.Workspace != workspace {
+						return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", bound.Name, bound.TabID, bound.PaneID, bound.TerminalID, bound.Workspace)
+					}
+					return bound, nil
+				}
+				last = bindErr.Error()
+			}
 		} else if !errors.Is(err, herdr.ErrAgentNotFound) {
 			last = err.Error()
 		}
