@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeAgyConversationIndex(t *testing.T, home, cwd, id string, withDB bool) {
@@ -99,7 +100,7 @@ func TestBindAgyWorkspaceSessionReportsOfficialConversation(t *testing.T) {
 	t.Setenv("FAC650_HERDR_LOG", logPath)
 	t.Setenv("FAC650_AGY_CWD", cwd)
 	agent := AgentEntry{Name: "review-agy", Kind: "agy", Status: "done", Workspace: "wK", TabID: "t1", PaneID: "p1", TerminalID: "term1", Cwd: cwd}
-	got, err := BindAgyWorkspaceSession(agent)
+	got, err := BindAgyWorkspaceSession(agent, "", time.Time{})
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
@@ -129,7 +130,41 @@ func TestBindAgyWorkspaceSessionDoesNotInventFromPaneIdentity(t *testing.T) {
 	t.Setenv(BinaryEnv, bin)
 	t.Setenv(NoLiveEnv, "1")
 	agent := AgentEntry{Name: "review-agy", Kind: "agy", PaneID: "wK:p1E7", TabID: "wK:t1E7", TerminalID: "term_x", Cwd: t.TempDir()}
-	if _, err := BindAgyWorkspaceSession(agent); err == nil {
+	if _, err := BindAgyWorkspaceSession(agent, "", time.Time{}); err == nil {
 		t.Fatal("empty workspace conversation invented a session")
+	}
+}
+
+func TestSelectAgyLaunchConversationRefusesReusedSlotMapping(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	oldID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	newID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	writeAgyConversationIndex(t, home, cwd, oldID, true)
+	stale := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(agyConversationDB(home, oldID), stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SelectAgyLaunchConversation(home, cwd, oldID, time.Now().Add(-time.Minute)); err == nil {
+		t.Fatal("reused-slot mapping was bound as the current launch")
+	}
+	writeAgyConversationIndex(t, home, cwd, newID, true)
+	got, err := SelectAgyLaunchConversation(home, cwd, oldID, time.Now().Add(-time.Minute))
+	if err != nil || got != newID {
+		t.Fatalf("fresh launch conversation: got %q err=%v", got, err)
+	}
+}
+
+func TestSelectAgyLaunchConversationRefusesOlderThanLaunch(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	id := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	writeAgyConversationIndex(t, home, cwd, id, true)
+	stale := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(agyConversationDB(home, id), stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SelectAgyLaunchConversation(home, cwd, "", time.Now()); err == nil {
+		t.Fatal("pre-launch conversation db was treated as current")
 	}
 }

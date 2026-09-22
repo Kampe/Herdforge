@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
@@ -42,9 +43,48 @@ func AgyWorkspaceConversationID(home, cwd string) (string, error) {
 	if !RealModelSessionID(id) {
 		return "", fmt.Errorf("agy workspace conversation is not a real model session")
 	}
-	db := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", id+".db")
-	if _, err := os.Stat(db); err != nil {
+	if _, err := os.Stat(agyConversationDB(home, id)); err != nil {
 		return "", fmt.Errorf("agy conversation db for %s: %w", id, err)
+	}
+	return id, nil
+}
+
+func agyConversationDB(home, id string) string {
+	return filepath.Join(home, ".gemini", "antigravity-cli", "conversations", id+".db")
+}
+
+func agyConversationFreshness(home, id string, notBefore time.Time) error {
+	if notBefore.IsZero() {
+		return nil
+	}
+	db := agyConversationDB(home, id)
+	info, err := os.Stat(db)
+	if err != nil {
+		return fmt.Errorf("agy conversation db for %s: %w", id, err)
+	}
+	mtime := info.ModTime()
+	if wal, err := os.Stat(db + "-wal"); err == nil && wal.ModTime().After(mtime) {
+		mtime = wal.ModTime()
+	}
+	if mtime.Before(notBefore) {
+		return fmt.Errorf("agy workspace conversation is older than this launch")
+	}
+	return nil
+}
+
+// SelectAgyLaunchConversation returns the workspace conversation created by
+// this launch. A reused pool slot that still maps to the previous conversation
+// is stale, even if the db still exists.
+func SelectAgyLaunchConversation(home, cwd, priorID string, notBefore time.Time) (string, error) {
+	id, err := AgyWorkspaceConversationID(home, cwd)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(priorID) != "" && id == strings.TrimSpace(priorID) {
+		return "", fmt.Errorf("agy workspace conversation is the previous launch mapping")
+	}
+	if err := agyConversationFreshness(home, id, notBefore); err != nil {
+		return "", err
 	}
 	return id, nil
 }
@@ -72,9 +112,11 @@ func ReportPaneAgentSession(paneID, source, agent, sessionID string) error {
 }
 
 // BindAgyWorkspaceSession reports AGY's own workspace conversation through
-// herdr's session API, then re-reads the live agent. It never uses pane,
+// herdr's session API, then re-reads the live agent. priorID is the mapping
+// present before this launch; notBefore is the launch clock. A reused slot
+// that still names the previous conversation is stale. It never uses pane,
 // terminal, timestamp, or revision as a session id.
-func BindAgyWorkspaceSession(agent AgentEntry) (*AgentEntry, error) {
+func BindAgyWorkspaceSession(agent AgentEntry, priorID string, notBefore time.Time) (*AgentEntry, error) {
 	if RealModelSessionID(agent.Session.Value) {
 		return &agent, nil
 	}
@@ -89,7 +131,7 @@ func BindAgyWorkspaceSession(agent AgentEntry) (*AgentEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agy workspace conversation home: %w", err)
 	}
-	id, err := AgyWorkspaceConversationID(home, cwd)
+	id, err := SelectAgyLaunchConversation(home, cwd, priorID, notBefore)
 	if err != nil {
 		return nil, fmt.Errorf("agent session remains unavailable after delivery: %w", err)
 	}

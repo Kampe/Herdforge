@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,7 +37,7 @@ fi
 	t.Setenv(herdr.NoLiveEnv, "1")
 	t.Setenv("FAC708_SESSION_CALLS", state)
 	tab := herdr.TabInfo{ID: "t1", Pane: herdr.PaneInfo{ID: "p1", TerminalID: "term1"}}
-	agent, err := awaitNativeReviewerSession("reviewer", "w1", tab, time.Second)
+	agent, err := awaitNativeReviewerSession("reviewer", "w1", tab, time.Second, "", time.Time{})
 	if err != nil {
 		t.Fatalf("cold session capture: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestAwaitNativeReviewerSessionBindsAgyWorkspaceConversation(t *testing.T) {
 	t.Setenv("FAC650_REPORTED", reported)
 	t.Setenv("FAC650_CWD", cwd)
 	tab := herdr.TabInfo{ID: "t1", Pane: herdr.PaneInfo{ID: "p1", TerminalID: "term1"}}
-	agent, err := awaitNativeReviewerSession("reviewer", "w1", tab, time.Second)
+	agent, err := awaitNativeReviewerSession("reviewer", "w1", tab, time.Second, "", time.Now().Add(-time.Minute))
 	if err != nil {
 		t.Fatalf("agy session bind: %v", err)
 	}
@@ -124,6 +125,44 @@ func TestAwaitNativeReviewerSessionBindsAgyWorkspaceConversation(t *testing.T) {
 	}
 	if !strings.Contains(string(got), id) || !strings.Contains(string(got), "herdr:antigravity_cli") {
 		t.Fatalf("did not report authentic conversation: %s", got)
+	}
+}
+
+func TestAwaitNativeReviewerSessionRefusesReusedSlotConversation(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	oldID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	cache := filepath.Join(home, ".gemini", "antigravity-cli", "cache")
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]string{cwd: oldID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "last_conversations.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conv := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	if err := os.MkdirAll(conv, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(conv, oldID+".db"), []byte("agy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"result\":{\"agents\":[{\"name\":\"reviewer\",\"agent\":\"agy\",\"agent_status\":\"done\",\"workspace_id\":\"w1\",\"tab_id\":\"t1\",\"pane_id\":\"p1\",\"terminal_id\":\"term1\",\"cwd\":%q}]}}'\n", cwd)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(herdr.BinaryEnv, bin)
+	t.Setenv(herdr.NoLiveEnv, "1")
+	tab := herdr.TabInfo{ID: "t1", Pane: herdr.PaneInfo{ID: "p1", TerminalID: "term1"}}
+	_, err = awaitNativeReviewerSession("reviewer", "w1", tab, 400*time.Millisecond, oldID, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "previous launch mapping") {
+		t.Fatalf("reused slot bound stale conversation: %v", err)
 	}
 }
 
