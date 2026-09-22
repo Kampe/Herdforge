@@ -6859,14 +6859,82 @@ func prepareStandingWorktreeWith(lane *config.LaneDef, add func(path, branch str
 		return nil
 	}
 	wtPath := filepath.Join(".", lane.Worktree)
-	if _, err := os.Stat(wtPath); os.IsNotExist(err) {
+	info, err := os.Stat(wtPath)
+	if os.IsNotExist(err) {
 		fmt.Printf("Creating worktree %s for lane %s...\n", lane.Worktree, lane.Name)
 		branch := fmt.Sprintf("wt/%s", lane.Name)
 		if err := add(lane.Worktree, branch); err != nil {
 			return fmt.Errorf("create standing worktree %s: %w", lane.Name, err)
 		}
+		return admitExistingStandingWorktree(wtPath, lane.Name)
 	}
+	if err != nil {
+		return fmt.Errorf("stat standing worktree %s: %w", lane.Name, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("standing worktree %s is not a directory", lane.Name)
+	}
+	return admitExistingStandingWorktree(wtPath, lane.Name)
+}
+
+// admitExistingStandingWorktree re-admits a standing lane against fresh
+// origin/main at raise time (FAC-621). Dirty trees and unmerged commits ahead
+// refuse; a clean behind tree fast-forwards. A 0/0 tree raises unchanged.
+func admitExistingStandingWorktree(wtPath, laneName string) error {
+	if err := standingGitAt(wtPath, "fetch", "-q", "origin"); err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: fetch origin failed: %w", laneName, err)
+	}
+	base, err := standingGitOutput(wtPath, "rev-parse", "origin/main")
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: origin/main is missing after fetch: %w", laneName, err)
+	}
+	counts, err := standingGitOutput(wtPath, "rev-list", preflight.GitRevListLeftRight, "--count", "HEAD...origin/main")
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: measure origin/main distance: %w", laneName, err)
+	}
+	parts := strings.Fields(counts)
+	if len(parts) != 2 {
+		return fmt.Errorf("refuse standing raise for lane %s: expected two distance counts, got %q", laneName, counts)
+	}
+	ahead, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: parse ahead count %q: %w", laneName, parts[0], err)
+	}
+	behind, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: parse behind count %q: %w", laneName, parts[1], err)
+	}
+	dirty, err := standingGitOutput(wtPath, "status", "--porcelain")
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: status: %w", laneName, err)
+	}
+	if strings.TrimSpace(dirty) != "" {
+		return fmt.Errorf("refuse standing raise for lane %s: worktree is dirty; origin/main is %d commit(s) ahead and the lane is %d commit(s) ahead", laneName, behind, ahead)
+	}
+	if ahead > 0 {
+		return fmt.Errorf("refuse standing raise for lane %s: unmerged commits ahead of origin/main: origin/main is %d commit(s) ahead and the lane is %d commit(s) ahead", laneName, behind, ahead)
+	}
+	if behind > 0 {
+		if err := standingGitAt(wtPath, "merge", "--ff-only", "origin/main"); err != nil {
+			return fmt.Errorf("refuse standing raise for lane %s: fast-forward onto origin/main failed (%d behind / %d ahead): %w", laneName, behind, ahead, err)
+		}
+	}
+	fmt.Printf("standing worktree %s admitted at %s (%d behind / %d ahead vs origin/main)\n", laneName, base, behind, ahead)
 	return nil
+}
+
+func standingGitAt(dir string, args ...string) error {
+	_, err := standingGitOutput(dir, args...)
+	return err
+}
+
+func standingGitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func routedLaneDecision(ctx context.Context, task *provider.Task) func(*config.LaneDef) (*router.LaunchDecision, error) {
