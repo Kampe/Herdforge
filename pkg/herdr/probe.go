@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -138,10 +139,10 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 	return ProbeResult{Model: model, Available: true}
 }
 
-// agyPrintEnvelope is the documented --output-format json payload
-// (also nested under stream-json event=result). Slash-command print
-// answers use empty conversation_id and num_turns=0; a model probe must
-// be a real assistant turn.
+// agyPrintEnvelope is the documented --output-format json payload.
+// Slash-command print answers use empty conversation_id; a model probe
+// must be a real assistant turn. Stream-json NDJSON is not accepted:
+// the probe requests json and requires exactly one complete document.
 type agyPrintEnvelope struct {
 	ConversationID string `json:"conversation_id"`
 	Status         string `json:"status"`
@@ -171,30 +172,19 @@ func agyStructuredProbeReason(stdout, requestedModel string) string {
 
 func decodeAgyPrintEnvelope(stdout string) (agyPrintEnvelope, error) {
 	s := strings.TrimSpace(stdout)
+	dec := json.NewDecoder(strings.NewReader(s))
 	var env agyPrintEnvelope
-	if err := json.Unmarshal([]byte(s), &env); err == nil && (env.Status != "" || env.Response != "" || env.ConversationID != "") {
-		return env, nil
+	if err := dec.Decode(&env); err != nil {
+		return agyPrintEnvelope{}, err
 	}
-	var last json.RawMessage
-	for _, line := range strings.Split(s, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var ev struct {
-			Event  string          `json:"event"`
-			Result json.RawMessage `json:"result"`
-		}
-		if json.Unmarshal([]byte(line), &ev) == nil && ev.Event == "result" && len(ev.Result) > 0 {
-			last = ev.Result
-		}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return agyPrintEnvelope{}, fmt.Errorf("trailing content after agy json envelope")
 	}
-	if len(last) > 0 {
-		if err := json.Unmarshal(last, &env); err == nil {
-			return env, nil
-		}
+	if env.Status == "" && env.Response == "" && env.ConversationID == "" {
+		return agyPrintEnvelope{}, fmt.Errorf("agy print envelope not found")
 	}
-	return agyPrintEnvelope{}, fmt.Errorf("agy print envelope not found")
+	return env, nil
 }
 
 // boundProbeDetail retains useful multiline provider diagnostics while keeping

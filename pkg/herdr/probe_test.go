@@ -277,7 +277,11 @@ func TestProbeProviderModel_AgyRequiresStructuredFinalAssistant(t *testing.T) {
 		{name: "json-response-extra", script: `printf '%s\n' '{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK\nextra"}'`, reason: "agy probe response is not the exact token"},
 		{name: "json-wrong-model", script: `printf '%s\n' '{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK","model":"gemini-2.5-flash"}'`, reason: "agy probe model does not match requested model"},
 		{name: "json-not-success", script: `printf '%s\n' '{"conversation_id":"sess-1","status":"ERROR","response":"PROBE_OK"}'`, reason: "agy probe status is not SUCCESS"},
-		{name: "stream-json-result", script: `printf '%s\n' '{"event":"tool","name":"view_file"}' '{"event":"result","result":{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK","model":"gemini-3.1-pro-high"}}'`, ok: true},
+		{name: "stream-json-competing-result", script: `printf '%s\n' '{"event":"tool","name":"view_file"}' '{"event":"result","result":{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK","model":"gemini-3.1-pro-high"}}'`, reason: "no structured agy probe result"},
+		{name: "trailing-garbage", script: `printf '%s\nERROR boom\n' '` + healthy + `'`, reason: "no structured agy probe result"},
+		{name: "trailing-error-json", script: `printf '%s\n%s\n' '` + healthy + `' '{"error":"cascade failed"}'`, reason: "no structured agy probe result"},
+		{name: "competing-second-result", script: `printf '%s\n%s\n' '` + healthy + `' '{"conversation_id":"sess-2","status":"SUCCESS","response":"PROBE_OK","model":"gemini-3.1-pro-high"}'`, reason: "no structured agy probe result"},
+		{name: "malformed-after-valid", script: `printf '%s\n{"status":\n' '` + healthy + `'`, reason: "no structured agy probe result"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -327,6 +331,16 @@ printf '%s\n' '{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_
 	}
 	if i := jsonAt + 1; i >= len(got) || got[i] != "json" {
 		t.Fatalf("missing json format value: %#v", got)
+	}
+	slashAt := -1
+	for i, a := range got {
+		if a == "--disable-slash-commands" {
+			slashAt = i
+			break
+		}
+	}
+	if slashAt < 0 || slashAt > printAt {
+		t.Fatalf("--disable-slash-commands must precede --print: %#v", got)
 	}
 }
 
