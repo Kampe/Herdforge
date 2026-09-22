@@ -309,19 +309,42 @@ func loadQuotaSupervisorSnapshot() (*usage.UsageSnapshot, error) {
 }
 
 // quotaObservationTime is when that quota provider generated the reading, not
-// when this supervisor process assembled the snapshot.
+// when this supervisor process assembled the snapshot. Missing providers and
+// zero ObservedAt stay unknown (zero time) so Grade fail-closes instead of
+// treating assembly time as a fresh observation.
 func quotaObservationTime(snap *usage.UsageSnapshot, quotaProvider string) time.Time {
-	if snap == nil {
+	p, ok := snapshotProviderUsage(snap, quotaProvider)
+	if !ok || p.ObservedAt.IsZero() {
 		return time.Time{}
 	}
+	return p.ObservedAt.UTC()
+}
+
+func snapshotProviderUsage(snap *usage.UsageSnapshot, quotaProvider string) (usage.ProviderUsage, bool) {
+	if snap == nil {
+		return usage.ProviderUsage{}, false
+	}
 	name := strings.ToLower(strings.TrimSpace(quotaProvider))
-	if p, ok := snap.Providers[name]; ok && !p.ObservedAt.IsZero() {
-		return p.ObservedAt.UTC()
+	if name == "" {
+		return usage.ProviderUsage{}, false
 	}
-	if !snap.GeneratedAt.IsZero() {
-		return snap.GeneratedAt.UTC()
+	keys := []string{name}
+	switch name {
+	case "agy":
+		keys = append(keys, "antigravity")
+	case "antigravity":
+		keys = append(keys, "agy")
+	case "lazer":
+		keys = append(keys, "litellm")
+	case "litellm":
+		keys = append(keys, "lazer")
 	}
-	return time.Time{}
+	for _, k := range keys {
+		if p, ok := snap.Providers[k]; ok {
+			return p, true
+		}
+	}
+	return usage.ProviderUsage{}, false
 }
 
 func oldestProviderObservation(snap *usage.UsageSnapshot) time.Time {
@@ -336,9 +359,6 @@ func oldestProviderObservation(snap *usage.UsageSnapshot) time.Time {
 		if oldest.IsZero() || p.ObservedAt.Before(oldest) {
 			oldest = p.ObservedAt
 		}
-	}
-	if oldest.IsZero() {
-		return snap.GeneratedAt
 	}
 	return oldest
 }
