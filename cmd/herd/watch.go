@@ -90,11 +90,17 @@ func runWatch() {
 		}
 
 		events := state.Poll(obs)
-		for _, e := range events {
-			fmt.Println(watch.SettleLine(e, attention))
+		// --wake is a recipient-scoped mail drain. Unrelated panes settling
+		// must not print HARVEST ALL or end the wait: live fleet always has
+		// idle peers, and that made queued mail sit undelivered while the
+		// exact recipient was still working.
+		if !*wake {
+			for _, e := range events {
+				fmt.Println(watch.SettleLine(e, attention))
+			}
 		}
 
-		if !*stream {
+		if !*stream && !*wake {
 			if *all && len(named) > 0 {
 				if state.AllSettled(named) {
 					return
