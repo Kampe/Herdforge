@@ -34,6 +34,7 @@ func TestDecodeHerdrAgentRosterRequiresExplicitAgentsArray(t *testing.T) {
 		`{"result":{"error":"nested","agents":[]}}`,
 		`{"result":{"agents":[{"cwd":"/tmp/x","error":"nested"}]}}`,
 		`{"result":{"agents":[{"terminal_id":"term_x"}]}}`,
+		`{"result":{"agents":[{"cwd":"","foreground_cwd":"","terminal_id":"term_safe","pane_id":"w:p0"}]}}`,
 	}
 	for _, raw := range refusals {
 		_, err := decodeHerdrAgentRoster([]byte(raw))
@@ -46,9 +47,15 @@ func TestDecodeHerdrAgentRosterRequiresExplicitAgentsArray(t *testing.T) {
 	if err != nil || len(owned) != 1 || owned[0].Cwd != "/tmp/lab" {
 		t.Fatalf("real cwd entry must parse: %#v %v", owned, err)
 	}
-	safe, err := decodeHerdrAgentRoster([]byte(`{"id":"cli:agent:list","result":{"agents":[{"cwd":"","foreground_cwd":"","terminal_id":"term_safe","pane_id":"w:p0"}]}}`))
-	if err != nil || len(safe) != 0 {
-		t.Fatalf("explicit empty cwd on a terminal is known-safe, not an owner: %#v %v", safe, err)
+}
+
+func TestDecodeHerdrAgentRosterEmptyCwdNamedTerminalRefuses(t *testing.T) {
+	// terminal_id/pane_id identify a pane; empty cwd is failed observation, not
+	// proof the pane owns nothing.
+	raw := `{"id":"cli:agent:list","result":{"agents":[{"cwd":"","foreground_cwd":"","terminal_id":"term_safe","pane_id":"w:p0"}]}}`
+	_, err := decodeHerdrAgentRoster([]byte(raw))
+	if err == nil || !strings.Contains(err.Error(), "missing usable cwd") {
+		t.Fatalf("empty cwd named terminal must refuse unknown ownership: %v", err)
 	}
 }
 

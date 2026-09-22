@@ -394,52 +394,43 @@ func decodeHerdrAgentRoster(out []byte) ([]herdrListedAgent, error) {
 	}
 	agents := make([]herdrListedAgent, 0, len(elems))
 	for _, el := range elems {
-		a, skip, err := decodeHerdrListedAgent(el)
+		a, err := decodeHerdrListedAgent(el)
 		if err != nil {
 			return nil, err
-		}
-		if skip {
-			continue
 		}
 		agents = append(agents, a)
 	}
 	return agents, nil
 }
 
-func decodeHerdrListedAgent(el json.RawMessage) (herdrListedAgent, bool, error) {
+func decodeHerdrListedAgent(el json.RawMessage) (herdrListedAgent, error) {
 	if !jsonIsObject(el) {
-		return herdrListedAgent{}, false, fmt.Errorf("herdr agent list has a null or non-object agent")
+		return herdrListedAgent{}, fmt.Errorf("herdr agent list has a null or non-object agent")
 	}
 	var raw struct {
 		Error         json.RawMessage `json:"error"`
 		Cwd           *string         `json:"cwd"`
 		ForegroundCwd *string         `json:"foreground_cwd"`
-		TerminalID    string          `json:"terminal_id"`
-		PaneID        string          `json:"pane_id"`
 	}
 	if err := json.Unmarshal(el, &raw); err != nil {
-		return herdrListedAgent{}, false, fmt.Errorf("herdr agent list agent is not an object: %w", err)
+		return herdrListedAgent{}, fmt.Errorf("herdr agent list agent is not an object: %w", err)
 	}
 	if jsonTokenPresent(raw.Error) {
-		return herdrListedAgent{}, false, fmt.Errorf("herdr agent list nested error response")
+		return herdrListedAgent{}, fmt.Errorf("herdr agent list nested error response")
 	}
-	cwd, cwdSet := derefAgentCwd(raw.Cwd)
-	fg, fgSet := derefAgentCwd(raw.ForegroundCwd)
-	if cwd != "" || fg != "" {
-		return herdrListedAgent{Cwd: cwd, ForegroundCwd: fg}, false, nil
+	cwd := derefAgentCwd(raw.Cwd)
+	fg := derefAgentCwd(raw.ForegroundCwd)
+	if cwd == "" && fg == "" {
+		return herdrListedAgent{}, fmt.Errorf("herdr agent list entry missing usable cwd")
 	}
-	// Known-safe: herdr explicitly reported empty cwd fields on a named terminal.
-	if (cwdSet || fgSet) && (strings.TrimSpace(raw.TerminalID) != "" || strings.TrimSpace(raw.PaneID) != "") {
-		return herdrListedAgent{}, true, nil
-	}
-	return herdrListedAgent{}, false, fmt.Errorf("herdr agent list entry missing usable cwd")
+	return herdrListedAgent{Cwd: cwd, ForegroundCwd: fg}, nil
 }
 
-func derefAgentCwd(p *string) (string, bool) {
+func derefAgentCwd(p *string) string {
 	if p == nil {
-		return "", false
+		return ""
 	}
-	return strings.TrimSpace(*p), true
+	return strings.TrimSpace(*p)
 }
 
 func jsonTokenPresent(raw json.RawMessage) bool {
