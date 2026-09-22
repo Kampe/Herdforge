@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 )
 
 // AgyPrintEnvelope is the documented `agy --output-format json` payload.
@@ -28,13 +30,13 @@ func InsertAgyStructuredPrintFlags(argv []string) []string {
 	inserted := false
 	for _, a := range argv {
 		if !inserted && (a == "--print" || a == "-p" || a == "--prompt") {
-			out = append(out, "--output-format", "json", "--disable-slash-commands")
+			out = append(out, OutputFormatFlag, "json", agentpolicy.DisableSlashCommandsFlag)
 			inserted = true
 		}
 		out = append(out, a)
 	}
 	if !inserted {
-		out = append(out, "--output-format", "json", "--disable-slash-commands")
+		out = append(out, OutputFormatFlag, "json", agentpolicy.DisableSlashCommandsFlag)
 	}
 	return out
 }

@@ -3,6 +3,8 @@ package router
 import (
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 )
 
 func TestInsertAgyStructuredPrintFlagsBeforePrint(t *testing.T) {
@@ -14,11 +16,11 @@ func TestInsertAgyStructuredPrintFlagsBeforePrint(t *testing.T) {
 			if printAt < 0 {
 				printAt = i
 			}
-		case "--output-format":
+		case OutputFormatFlag:
 			formatAt = i
 		case "json":
 			jsonAt = i
-		case "--disable-slash-commands":
+		case agentpolicy.DisableSlashCommandsFlag:
 			disableAt = i
 		}
 	}
@@ -40,13 +42,13 @@ func TestInsertAgyStructuredPrintFlagsWhenPrintAbsent(t *testing.T) {
 	got := InsertAgyStructuredPrintFlags([]string{"--model", "gemini-3.1-pro-high"})
 	foundFormat, foundJSON, foundDisable := false, false, false
 	for i, a := range got {
-		if a == "--output-format" {
+		if a == OutputFormatFlag {
 			foundFormat = true
 			if i+1 < len(got) && got[i+1] == "json" {
 				foundJSON = true
 			}
 		}
-		if a == "--disable-slash-commands" {
+		if a == agentpolicy.DisableSlashCommandsFlag {
 			foundDisable = true
 		}
 	}

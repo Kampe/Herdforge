@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/agentpolicy"
 )
 
 // Disposable fake child: timeout must kill the owned process group, including
@@ -78,11 +80,11 @@ func TestAgyAdmissionArgvPlacesJSONFlagsBeforePrint(t *testing.T) {
 			if printAt < 0 {
 				printAt = i
 			}
-		case "--output-format":
+		case OutputFormatFlag:
 			formatAt = i
 		case "json":
 			foundJSON = true
-		case "--disable-slash-commands":
+		case agentpolicy.DisableSlashCommandsFlag:
 			foundDisable = true
 		}
 	}
