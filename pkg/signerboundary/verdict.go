@@ -12,6 +12,7 @@ import (
 const (
 	OpPing        = "ping"
 	OpProbe       = "probe"
+	OpKeyAudit    = "audit-key"
 	OpSignVerdict = "sign-verdict"
 	OpSignReceipt = "sign-receipt"
 	OpExportKey   = "export-key" // always refused
@@ -42,6 +43,14 @@ func (r SignRequest) ValidateProduction() error {
 	}
 	switch r.Op {
 	case OpPing, OpProbe:
+		return nil
+	case OpKeyAudit:
+		if strings.TrimSpace(r.SessionID) == "" || len(strings.TrimSpace(r.SessionID)) < 8 {
+			return fmt.Errorf("%w: SessionID required for audit-key", ErrPeerUnauthorized)
+		}
+		if len(r.payloadBytes()) != 0 {
+			return fmt.Errorf("%w: audit-key request must not carry client audit facts", ErrPeerUnauthorized)
+		}
 		return nil
 	case OpSignVerdict:
 		if !shaHex.MatchString(strings.TrimSpace(r.CandidateSHA)) {
