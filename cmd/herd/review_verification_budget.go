@@ -19,7 +19,7 @@ func reviewVerificationBudgetSection(scopedTestCmd string) string {
 		scoped = "go test -count=1 ./<changed-packages>/"
 	}
 	return fmt.Sprintf(`VERIFICATION BUDGET — serialize, do not fan out
-Launch env is GOMAXPROCS=%s GOFLAGS=%s. Keep those values. Do not raise GOMAXPROCS or go -p.
+Launch env is GOMAXPROCS=%s and GOFLAGS includes %s (other GOFLAGS are kept). Do not raise GOMAXPROCS or go -p.
 
 Mandatory checks, one process at a time, in this order:
 1. Inspect only git diff origin/main..HEAD (or the packet base..HEAD).

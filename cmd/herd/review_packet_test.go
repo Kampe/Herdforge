@@ -379,7 +379,7 @@ func TestReviewPacketSerializesVerificationBudget(t *testing.T) {
 		"VERIFICATION BUDGET",
 		"serialize, do not fan out",
 		"GOMAXPROCS=2",
-		"GOFLAGS=-p=1",
+		"GOFLAGS includes -p=1",
 		"one process at a time",
 		"Never start make test-unit, go test ./cmd/herd, and go test ./... together",
 		"honest reuse",
