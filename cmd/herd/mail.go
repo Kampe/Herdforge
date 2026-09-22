@@ -203,7 +203,7 @@ func mailSequenceOrderMain(args mailRepairSeqArgs, stdout, stderr io.Writer) int
 		return 2
 	}
 	if args.cursor != "" && args.recipient == "" {
-		fmt.Fprintln(stderr, "mail repair: --after-cursor requires --recipient")
+		fmt.Fprintln(stderr, mail.ErrRepairCursorNeedsRecipient.Error())
 		return 2
 	}
 	if args.act && (args.planFile == "" || args.planDigest == "") {

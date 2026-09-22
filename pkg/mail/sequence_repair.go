@@ -277,7 +277,7 @@ func (m *Mailbox) applySequenceOrderLocked(data []byte, spans []lineSpan, lines 
 			return fmt.Errorf("%w: repaired row does not parse: %v", ErrRepairReadbackFailed, err)
 		}
 		if !sameEnvelope(&durable, env) {
-			return fmt.Errorf("%w: durable row differs from the repaired row", ErrRepairReadbackFailed)
+			return repairReadbackRowMismatch()
 		}
 	}
 	result := map[string]any{
@@ -397,7 +397,7 @@ func (m *Mailbox) checkSequenceOrderCursor(req SequenceOrderRequest, lines []str
 	}
 	recipient := strings.TrimSpace(req.Recipient)
 	if recipient == "" {
-		return errors.New("mail repair: --after-cursor requires --recipient")
+		return ErrRepairCursorNeedsRecipient
 	}
 	source, err := SourceFingerprint(m.MailFile, req.FeedbackDir)
 	if err != nil {
