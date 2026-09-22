@@ -2,12 +2,22 @@ package herdr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
+
+// ErrAgentSessionUnavailableAfterDelivery is the single native-reviewer
+// session-miss identity. cmd/herd and this package must share it.
+var ErrAgentSessionUnavailableAfterDelivery = errors.New("agent session remains unavailable after delivery")
+
+// ReviewerIdentityChangedError is the single pane-incarnation mismatch.
+func ReviewerIdentityChangedError(name, tab, pane, terminal, workspace string) error {
+	return fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", name, tab, pane, terminal, workspace)
+}
 
 const (
 	agySessionSource = "herdr:antigravity_cli"
@@ -132,7 +142,7 @@ func BindAgyWorkspaceSession(agent AgentEntry, priorID string, notBefore time.Ti
 		return &agent, nil
 	}
 	if !strings.EqualFold(strings.TrimSpace(agent.Kind), agySessionAgent) {
-		return nil, fmt.Errorf("agent session remains unavailable after delivery")
+		return nil, ErrAgentSessionUnavailableAfterDelivery
 	}
 	cwd := strings.TrimSpace(agent.ForegroundCwd)
 	if cwd == "" {
@@ -144,7 +154,7 @@ func BindAgyWorkspaceSession(agent AgentEntry, priorID string, notBefore time.Ti
 	}
 	id, err := SelectAgyLaunchConversation(home, cwd, priorID, notBefore)
 	if err != nil {
-		return nil, fmt.Errorf("agent session remains unavailable after delivery: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrAgentSessionUnavailableAfterDelivery, err)
 	}
 	live, err := LookupAgent(agent.Name)
 	if err != nil {
@@ -164,14 +174,14 @@ func BindAgyWorkspaceSession(agent AgentEntry, priorID string, notBefore time.Ti
 		return nil, err
 	}
 	if live.Session.Value != id || !RealModelSessionID(live.Session.Value) {
-		return nil, fmt.Errorf("agent session remains unavailable after delivery")
+		return nil, ErrAgentSessionUnavailableAfterDelivery
 	}
 	return live, nil
 }
 
 func sameReviewerIncarnation(live, want AgentEntry) error {
 	if live.PaneID != want.PaneID || live.TabID != want.TabID || live.TerminalID != want.TerminalID || live.Workspace != want.Workspace {
-		return fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", live.Name, live.TabID, live.PaneID, live.TerminalID, live.Workspace)
+		return ReviewerIdentityChangedError(live.Name, live.TabID, live.PaneID, live.TerminalID, live.Workspace)
 	}
 	return nil
 }

@@ -858,12 +858,12 @@ func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeo
 		a, err := herdr.LookupAgent(name)
 		if err == nil {
 			if a.TabID != tab.ID || a.PaneID != tab.Pane.ID || a.TerminalID != tab.Pane.TerminalID || a.Workspace != workspace {
-				return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
+				return nil, herdr.ReviewerIdentityChangedError(a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
 			}
 			if herdr.RealModelSessionID(a.Session.Value) {
 				return a, nil
 			}
-			last = "agent session remains unavailable after delivery"
+			last = herdr.ErrAgentSessionUnavailableAfterDelivery.Error()
 			// AGY 1.2.x TUI does not fire PreInvocation hooks, so herdr never
 			// receives conversationId. After a real consumed turn, bind the
 			// conversation UUID AGY stored for this cwd through the official
@@ -872,7 +872,7 @@ func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeo
 				bound, bindErr := herdr.BindAgyWorkspaceSession(*a, priorAgyConversation, launchedAt)
 				if bindErr == nil {
 					if bound.TabID != tab.ID || bound.PaneID != tab.Pane.ID || bound.TerminalID != tab.Pane.TerminalID || bound.Workspace != workspace {
-						return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", bound.Name, bound.TabID, bound.PaneID, bound.TerminalID, bound.Workspace)
+						return nil, herdr.ReviewerIdentityChangedError(bound.Name, bound.TabID, bound.PaneID, bound.TerminalID, bound.Workspace)
 					}
 					return bound, nil
 				}

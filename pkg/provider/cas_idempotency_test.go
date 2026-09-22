@@ -236,18 +236,26 @@ func TestSQLite_PerTaskLock_DoesNotBlockOtherTasks(t *testing.T) {
 	cas, _ := NewFencedCAS(store, mp)
 
 	release := make(chan struct{})
+	heldA := make(chan struct{})
 	doneA := make(chan struct{})
 	doneB := make(chan error, 1)
 	go func() {
 		defer close(doneA)
 		rev, _ := cas.ReadRevision(ctx, "ta")
 		_, _ = cas.CompareAndSwap(ctx, "ta", rev, 1, "op-a", func(ctx context.Context) error {
+			close(heldA)
 			<-release
 			return mp.UpdateStatus(ctx, "ta", StatusInProgress)
 		})
 	}()
-	// Let A enter exclusive, then start B.
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-heldA:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-doneA
+		_ = store.Close()
+		t.Fatal("task A never entered exclusive")
+	}
 	go func() {
 		rev, _ := cas.ReadRevision(ctx, "tb")
 		_, err := cas.CompareAndSwap(ctx, "tb", rev, 1, "op-b", func(ctx context.Context) error {
@@ -263,7 +271,7 @@ func TestSQLite_PerTaskLock_DoesNotBlockOtherTasks(t *testing.T) {
 			_ = store.Close()
 			t.Fatalf("task B blocked/failed: %v", err)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(store.BusyTimeout()):
 		close(release)
 		<-doneA
 		_ = store.Close()
