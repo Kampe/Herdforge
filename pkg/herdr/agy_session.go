@@ -33,15 +33,26 @@ func AgyWorkspaceConversationID(home, cwd string) (string, error) {
 		return "", fmt.Errorf("agy workspace conversation index is invalid")
 	}
 	want := canonicalPath(cwd)
-	id := ""
+	ids := map[string]struct{}{}
 	for recorded, value := range index {
-		if canonicalPath(recorded) == want {
-			id = strings.TrimSpace(value)
-			break
+		if canonicalPath(recorded) != want {
+			continue
 		}
+		id := strings.TrimSpace(value)
+		if !RealModelSessionID(id) {
+			return "", fmt.Errorf("agy workspace conversation is not a real model session")
+		}
+		ids[id] = struct{}{}
 	}
-	if !RealModelSessionID(id) {
+	if len(ids) == 0 {
 		return "", fmt.Errorf("agy workspace conversation is not a real model session")
+	}
+	if len(ids) > 1 {
+		return "", fmt.Errorf("agy workspace conversation mapping is ambiguous for equivalent cwd keys")
+	}
+	var id string
+	for got := range ids {
+		id = got
 	}
 	if _, err := os.Stat(agyConversationDB(home, id)); err != nil {
 		return "", fmt.Errorf("agy conversation db for %s: %w", id, err)
@@ -135,18 +146,32 @@ func BindAgyWorkspaceSession(agent AgentEntry, priorID string, notBefore time.Ti
 	if err != nil {
 		return nil, fmt.Errorf("agent session remains unavailable after delivery: %w", err)
 	}
-	if err := ReportPaneAgentSession(agent.PaneID, agySessionSource, agySessionAgent, id); err != nil {
-		return nil, fmt.Errorf("report agy workspace conversation: %w", err)
-	}
 	live, err := LookupAgent(agent.Name)
 	if err != nil {
 		return nil, err
 	}
-	if live.PaneID != agent.PaneID || live.TabID != agent.TabID || live.TerminalID != agent.TerminalID || live.Workspace != agent.Workspace {
-		return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", live.Name, live.TabID, live.PaneID, live.TerminalID, live.Workspace)
+	if err := sameReviewerIncarnation(*live, agent); err != nil {
+		return nil, err
+	}
+	if err := ReportPaneAgentSession(agent.PaneID, agySessionSource, agySessionAgent, id); err != nil {
+		return nil, fmt.Errorf("report agy workspace conversation: %w", err)
+	}
+	live, err = LookupAgent(agent.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := sameReviewerIncarnation(*live, agent); err != nil {
+		return nil, err
 	}
 	if live.Session.Value != id || !RealModelSessionID(live.Session.Value) {
 		return nil, fmt.Errorf("agent session remains unavailable after delivery")
 	}
 	return live, nil
+}
+
+func sameReviewerIncarnation(live, want AgentEntry) error {
+	if live.PaneID != want.PaneID || live.TabID != want.TabID || live.TerminalID != want.TerminalID || live.Workspace != want.Workspace {
+		return fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", live.Name, live.TabID, live.PaneID, live.TerminalID, live.Workspace)
+	}
+	return nil
 }

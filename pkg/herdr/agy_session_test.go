@@ -12,11 +12,15 @@ import (
 
 func writeAgyConversationIndex(t *testing.T, home, cwd, id string, withDB bool) {
 	t.Helper()
+	writeAgyConversationIndexMap(t, home, map[string]string{cwd: id}, withDB)
+}
+
+func writeAgyConversationIndexMap(t *testing.T, home string, index map[string]string, withDB bool) {
+	t.Helper()
 	cache := filepath.Join(home, ".gemini", "antigravity-cli", "cache")
 	if err := os.MkdirAll(cache, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	index := map[string]string{cwd: id}
 	body, err := json.Marshal(index)
 	if err != nil {
 		t.Fatal(err)
@@ -31,8 +35,15 @@ func writeAgyConversationIndex(t *testing.T, home, cwd, id string, withDB bool) 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, id+".db"), []byte("agy"), 0o600); err != nil {
-		t.Fatal(err)
+	seen := map[string]struct{}{}
+	for _, id := range index {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if err := os.WriteFile(filepath.Join(dir, id+".db"), []byte("agy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -152,6 +163,73 @@ func TestSelectAgyLaunchConversationRefusesReusedSlotMapping(t *testing.T) {
 	got, err := SelectAgyLaunchConversation(home, cwd, oldID, time.Now().Add(-time.Minute))
 	if err != nil || got != newID {
 		t.Fatalf("fresh launch conversation: got %q err=%v", got, err)
+	}
+}
+
+func TestAgyWorkspaceConversationIDRefusesAmbiguousEquivalentKeys(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(cwd, alias); err != nil {
+		t.Fatal(err)
+	}
+	idA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	idB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	writeAgyConversationIndexMap(t, home, map[string]string{cwd: idA, alias: idB}, true)
+	_, err := AgyWorkspaceConversationID(home, cwd)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("disagreeing equivalent cwd keys: %v", err)
+	}
+	writeAgyConversationIndexMap(t, home, map[string]string{cwd: idA, alias: idA}, true)
+	got, err := AgyWorkspaceConversationID(home, cwd)
+	if err != nil || got != idA {
+		t.Fatalf("agreeing equivalent keys: got %q err=%v", got, err)
+	}
+}
+
+func TestBindAgyWorkspaceSessionRefusesMutationWhenPaneChanged(t *testing.T) {
+	home := t.TempDir()
+	cwd := t.TempDir()
+	id := "dddddddd-dddd-dddd-dddd-dddddddddddd"
+	writeAgyConversationIndex(t, home, cwd, id, true)
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	logPath := filepath.Join(dir, "calls")
+	listed, err := json.Marshal(map[string]any{
+		"result": map[string]any{
+			"agents": []map[string]any{{
+				"name":         "review-agy",
+				"agent":        "agy",
+				"agent_status": "done",
+				"workspace_id": "wK",
+				"tab_id":       "t1",
+				"pane_id":      "p-other",
+				"terminal_id":  "term1",
+				"cwd":          cwd,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> \"$FAC650_HERDR_LOG\"\nprintf '%%s\\n' '%s'\n", string(listed))
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(BinaryEnv, bin)
+	t.Setenv(NoLiveEnv, "1")
+	t.Setenv("FAC650_HERDR_LOG", logPath)
+	agent := AgentEntry{Name: "review-agy", Kind: "agy", Status: "done", Workspace: "wK", TabID: "t1", PaneID: "p1", TerminalID: "term1", Cwd: cwd}
+	if _, err := BindAgyWorkspaceSession(agent, "", time.Time{}); err == nil {
+		t.Fatal("changed pane still received a session report")
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logged), "report-agent-session") {
+		t.Fatalf("session report ran before pane revalidation: %s", logged)
 	}
 }
 
