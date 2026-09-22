@@ -19,6 +19,11 @@ var (
 	agyConversation = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
+type agyLogCand struct {
+	path  string
+	stamp time.Time
+}
+
 // AgyPinnedModelReadyRequest binds one AGY TUI launch. Callers must pass the
 // launch's own cwd, start time, and pinned model. Global log greps without
 // that binding are refused.
@@ -85,10 +90,8 @@ func inspectAgyPinnedModelReady(req AgyPinnedModelReadyRequest) (AgyPinnedModelR
 	if err != nil {
 		return zero, fmt.Errorf("agy launch log: %w", err)
 	}
-	if req.PID > 0 {
-		if !strings.Contains(string(body), "pid "+strconv.Itoa(req.PID)) && !strings.Contains(string(body), " "+strconv.Itoa(req.PID)+" ") {
-			return zero, fmt.Errorf("agy launch log %s is not bound to pid %d", filepath.Base(logFile), req.PID)
-		}
+	if req.PID > 0 && !agyLogBoundToPID(string(body), req.PID) {
+		return zero, fmt.Errorf("agy launch log %s is not bound to pid %d", filepath.Base(logFile), req.PID)
 	}
 	if !agyLogPinnedModelReady(string(body), req.PinnedModel) {
 		return zero, fmt.Errorf("agy launch log %s has not applied pinned model %s after auth", filepath.Base(logFile), req.PinnedModel)
@@ -130,8 +133,7 @@ func launchAgyLogFile(req AgyPinnedModelReadyRequest) (string, error) {
 		return "", fmt.Errorf("agy launch log dir: %w", err)
 	}
 	floor := req.StartedAt.Add(-2 * time.Second)
-	var picked string
-	var pickedAt time.Time
+	var matched []agyLogCand
 	for _, ent := range entries {
 		if ent.IsDir() {
 			continue
@@ -150,19 +152,60 @@ func launchAgyLogFile(req AgyPinnedModelReadyRequest) (string, error) {
 		path := filepath.Join(dir, ent.Name())
 		if req.PID > 0 {
 			body, readErr := os.ReadFile(path)
-			if readErr != nil || !strings.Contains(string(body), strconv.Itoa(req.PID)) {
+			if readErr != nil || !agyLogBoundToPID(string(body), req.PID) {
 				continue
 			}
 		}
-		if picked == "" || stamp.Before(pickedAt) {
-			picked = path
-			pickedAt = stamp
-		}
+		matched = append(matched, agyLogCand{path: path, stamp: stamp})
 	}
+	if req.PID > 0 && len(matched) == 0 {
+		return "", fmt.Errorf("no agy launch log bound to pid %d after %s", req.PID, req.StartedAt.Format(time.RFC3339Nano))
+	}
+	picked := pickAgyLaunchLog(matched, req.StartedAt)
 	if picked == "" {
 		return "", fmt.Errorf("no agy launch log bound to start %s", req.StartedAt.Format(time.RFC3339Nano))
 	}
 	return picked, nil
+}
+
+func agyLogBoundToPID(body string, pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	re := regexp.MustCompile(`(?m)(?:^|[^\d])pid ` + regexp.QuoteMeta(strconv.Itoa(pid)) + `(?:[^\d]|$)`)
+	return re.MatchString(body)
+}
+
+func pickAgyLaunchLog(cands []agyLogCand, started time.Time) string {
+	if len(cands) == 0 {
+		return ""
+	}
+	var after []agyLogCand
+	for _, c := range cands {
+		if !c.stamp.Before(started.Truncate(time.Second)) {
+			after = append(after, c)
+		}
+	}
+	pool := after
+	if len(pool) == 0 {
+		return ""
+	}
+	best := pool[0]
+	same := 1
+	for _, c := range pool[1:] {
+		if c.stamp.Before(best.stamp) {
+			best = c
+			same = 1
+			continue
+		}
+		if c.stamp.Equal(best.stamp) && c.path != best.path {
+			same++
+		}
+	}
+	if same > 1 {
+		return ""
+	}
+	return best.path
 }
 
 func agyLaunchConversationID(req AgyPinnedModelReadyRequest) (string, error) {
@@ -212,7 +255,7 @@ func agyLaunchConversationID(req AgyPinnedModelReadyRequest) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("agy conversation db for %s: %w", id, err)
 	}
-	if info.ModTime().Before(req.StartedAt.Add(-2 * time.Second)) {
+	if info.ModTime().Before(req.StartedAt) {
 		return "", fmt.Errorf("agy conversation %s predates this launch", id)
 	}
 	return id, nil

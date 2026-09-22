@@ -81,6 +81,99 @@ func TestAwaitAgyPinnedModelReadyBindsLaunchLogAndUUID(t *testing.T) {
 	}
 }
 
+func TestAwaitAgyPinnedModelReadyRejectsConcurrentOtherLaunch(t *testing.T) {
+	home := t.TempDir()
+	cwdA := t.TempDir()
+	cwdB := t.TempDir()
+	logDir := filepath.Join(home, ".gemini", "antigravity-cli", "log")
+	cache := filepath.Join(home, ".gemini", "antigravity-cli", "cache")
+	conv := filepath.Join(home, ".gemini", "antigravity-cli", "conversations")
+	for _, d := range []string{logDir, cache, conv} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startA := time.Date(2026, 9, 22, 14, 0, 0, 0, time.Local)
+	startB := startA.Add(time.Second)
+	logA := filepath.Join(logDir, "cli-"+startA.Format("20060102_150405")+".log")
+	logB := filepath.Join(logDir, "cli-"+startB.Format("20060102_150405")+".log")
+	if err := os.WriteFile(logA, []byte("Starting language server process with pid 1111\nResolving model gemini-3.1-pro-high\nPropagating selected model override to backend: label=\"Gemini 3.1 Pro (High)\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logB, []byte("Starting language server process with pid 2222\nResolving model gemini-3.1-pro-high\nfailed to apply model override: model gemini-3.1-pro-high is not recognized\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idA := "aaaaaaaa-bbbb-cccc-dddd-111111111111"
+	idBstale := "aaaaaaaa-bbbb-cccc-dddd-000000000000"
+	idx, err := json.Marshal(map[string]string{cwdA: idA, cwdB: idBstale})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "last_conversations.json"), idx, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(conv, idA+".db"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(conv, idA+".db"), startA.Add(time.Second), startA.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(conv, idBstale+".db"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(conv, idBstale+".db"), startB.Add(-time.Second), startB.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	reqB := AgyPinnedModelReadyRequest{
+		Home: home, Cwd: cwdB, PinnedModel: "gemini-3.1-pro-high",
+		StartedAt: startB, Budget: time.Millisecond,
+		LogDir: logDir, IndexPath: filepath.Join(cache, "last_conversations.json"), Conversations: conv,
+	}
+	ev, err := inspectAgyPinnedModelReady(reqB)
+	if err == nil {
+		t.Fatalf("launch B must not inherit launch A's ready log, got %+v", ev)
+	}
+	if ev.LogFile == logA {
+		t.Fatal("launch B bound launch A's log")
+	}
+
+	reqBPID := reqB
+	reqBPID.PID = 2222
+	if _, err := inspectAgyPinnedModelReady(reqBPID); err == nil {
+		t.Fatal("pid 2222 still failed override; must not be ready")
+	}
+	reqBPID.PID = 1111
+	ev, err = inspectAgyPinnedModelReady(reqBPID)
+	if err == nil {
+		t.Fatalf("launch B with A's pid must not report ready from A's log: %+v", ev)
+	}
+
+	reqA := AgyPinnedModelReadyRequest{
+		Home: home, Cwd: cwdA, PinnedModel: "gemini-3.1-pro-high",
+		StartedAt: startA, PID: 1111, Budget: time.Millisecond,
+		LogDir: logDir, IndexPath: filepath.Join(cache, "last_conversations.json"), Conversations: conv,
+	}
+	ev, err = inspectAgyPinnedModelReady(reqA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.LogFile != logA || ev.ConversationID != idA {
+		t.Fatalf("launch A evidence %+v", ev)
+	}
+
+	id, err := agyLaunchConversationID(reqB)
+	if err == nil {
+		t.Fatalf("stale cwd UUID %s must not bind to launch B", id)
+	}
+
+	reqLoose := reqB
+	reqLoose.PID = 111
+	if _, err := inspectAgyPinnedModelReady(reqLoose); err == nil {
+		t.Fatal("pid 111 must not match log pid 1111")
+	}
+}
+
 func TestAwaitAgyPinnedModelReadyLiveTUI(t *testing.T) {
 	if os.Getenv("HERD_AGY_LIVE_TUI") != "1" {
 		t.Skip("set HERD_AGY_LIVE_TUI=1 to run the disposable AGY TUI readiness fixture")
