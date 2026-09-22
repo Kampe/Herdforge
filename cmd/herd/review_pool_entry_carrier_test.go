@@ -585,16 +585,19 @@ func TestPoolNoLaunchEntryHonoursAnExplicitRelativePoolRoot(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(caller) })
 	t.Chdir(caller)
 
-	if err := runEntryWith(t, sha, base, "--pool-root", "given/pool"); err != nil {
-		t.Fatalf("an explicit relative pool root was refused: %v", err)
-	}
+	entryErr := runEntryWith(t, sha, base, "--pool-root", "given/pool")
 
 	// ONE location: the caller-relative spelling the caller actually wrote.
 	slot := filepath.Join(caller, "given", "pool", "pool-01")
-	// Check the location before invoking Git: a missing slot is the root
-	// regression, not evidence from an unrelated git exit status.
+	// Check the location before treating any later entry error as the oracle.
+	// A missing slot is the root regression. A missing surface contract on a
+	// shadow pool under the repository must not mask it, and an unrelated git
+	// exit status is not the proof either.
 	if info, err := os.Stat(slot); err != nil || !info.IsDir() {
 		t.Fatalf("explicit relative pool root did not create the caller-relative slot: path=%q error=%v", slot, err)
+	}
+	if entryErr != nil {
+		t.Fatalf("an explicit relative pool root was refused: %v", entryErr)
 	}
 	wantSlot, err := filepath.EvalSymlinks(slot)
 	if err != nil {
