@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -683,5 +684,83 @@ func TestRetireLandedReportsAFailureRatherThanClaimingSuccess(t *testing.T) {
 	}
 	if failed[0]["error"] == "" {
 		t.Error("the failure must carry git's own message so it is actionable")
+	}
+}
+
+func TestGitOutInStatusIgnoresStderrWarningsWhenStdoutClean(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "lab@example.com")
+	run("config", "user.name", "lab")
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README")
+	run("commit", "-qm", "init")
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	excludes := filepath.Join(outside, "no-read-excludes")
+	if err := os.WriteFile(excludes, []byte("*\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(excludes, 0o644) })
+	if f, err := os.Open(excludes); err == nil {
+		_ = f.Close()
+		t.Skip("unreadable excludesFile is readable under this privilege; hosted mutation requires PASS not SKIP")
+	}
+	run("config", "core.excludesFile", excludes)
+	direct := exec.Command("git", "-C", dir, "status", "--porcelain", "--untracked-files=all", "--ignored")
+	var stdout, stderr bytes.Buffer
+	direct.Stdout = &stdout
+	direct.Stderr = &stderr
+	if err := direct.Run(); err != nil {
+		t.Skipf("git status with unreadable excludesFile not rc0 on this Git: %v stderr=%q", err, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "" {
+		t.Fatalf("direct git stdout want empty, got %q", stdout.String())
+	}
+	if strings.TrimSpace(stderr.String()) == "" {
+		t.Fatal("direct git stderr must be nonempty warning evidence")
+	}
+	out, err := gitOutIn(dir, "status", "--porcelain", "--untracked-files=all", "--ignored")
+	if err != nil {
+		t.Fatalf("gitOutIn status: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("gitOutIn stdout want empty, got %q", out)
+	}
+	entries := inspectWorktreeEntries([]worktreeEntry{{Path: dir}})
+	if entries[0].StatusError != "" {
+		t.Fatalf("status error %q", entries[0].StatusError)
+	}
+	if entries[0].Dirty {
+		t.Fatal("rc0 stderr warnings must not classify a clean tree dirty")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dirt"), []byte("y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries = inspectWorktreeEntries([]worktreeEntry{{Path: dir}})
+	if !entries[0].Dirty {
+		t.Fatal("true untracked dirt must still classify dirty")
+	}
+	_, err = gitOutIn(filepath.Join(dir, "not-a-repo"), "status", "--porcelain")
+	if err == nil {
+		t.Fatal("nonzero git must refuse")
+	}
+	if !strings.Contains(err.Error(), "fatal") {
+		t.Fatalf("nonzero git error must retain captured Git diagnostic, got %v", err)
 	}
 }

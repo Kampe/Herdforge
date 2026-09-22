@@ -988,7 +988,7 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 	if maxOutput <= 0 {
 		maxOutput = 1 << 20
 	}
-	openUsage, seen, err := p.lsofPath(ctx, executable, timeout, maxOutput, resolved)
+	openUsage, _, err := p.lsofPath(ctx, executable, timeout, maxOutput, resolved)
 	if err != nil {
 		return ProcessUsage{}, err
 	}
@@ -1009,15 +1009,15 @@ func (p LSOFProcessInspector) InUse(ctx context.Context, path string) (ProcessUs
 			usage.MetadataUnavailable = true
 			break
 		}
-		if _, alreadySeen := seen[pid]; !alreadySeen {
-			usage.PIDs = append(usage.PIDs, pid)
-		}
 		referenced, referenceErr := p.referenceProbe()(processCtx, pid, resolved)
 		if referenceErr != nil {
 			usage.MetadataUnavailable = true
 			continue
 		}
-		usage.ReferencedPath = usage.ReferencedPath || referenced
+		if referenced {
+			usage.ReferencedPath = true
+			usage.PIDs = appendUniquePID(usage.PIDs, pid)
+		}
 	}
 	sortInts(usage.PIDs)
 	return usage, nil
@@ -1299,9 +1299,12 @@ func (p LSOFProcessInspector) inUseManyWalk(ctx context.Context, timeout time.Du
 			continue
 		}
 		for path, referenced := range references {
+			if !referenced {
+				continue
+			}
 			entry := usage[path]
-			entry.ReferencedPath = entry.ReferencedPath || referenced
-			entry.PIDs = append(entry.PIDs, pid)
+			entry.ReferencedPath = true
+			entry.PIDs = appendUniquePID(entry.PIDs, pid)
 			usage[path] = entry
 		}
 	}
@@ -2021,6 +2024,15 @@ func (w *limitedOutput) Write(p []byte) (int, error) {
 }
 
 func (w *limitedOutput) Bytes() []byte { return w.buf.Bytes() }
+
+func appendUniquePID(pids []int, pid int) []int {
+	for _, existing := range pids {
+		if existing == pid {
+			return pids
+		}
+	}
+	return append(pids, pid)
+}
 
 func sortInts(values []int) {
 	for i := 1; i < len(values); i++ {

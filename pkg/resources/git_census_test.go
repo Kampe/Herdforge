@@ -348,7 +348,10 @@ func TestLSOFProcessInspectorInUseCancellationBetweenIterationsMarksMetadataUnav
 
 func TestLSOFProcessInspectorInUseManyCancellationBetweenIterationsMarkMetadataUnavailable(t *testing.T) {
 	lsof := writeSilentLsofAndSelfPS(t)
-	root := filepath.Clean(t.TempDir())
+	root, err := filepath.EvalSymlinks(filepath.Clean(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	inspector := LSOFProcessInspector{Executable: lsof, Timeout: time.Minute}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -902,5 +905,79 @@ func TestDarwinLiveMetadataRefusalStaysFailClosed(t *testing.T) {
 	readDarwinProcessArgsFn = func(int) ([]byte, error) { return nil, os.ErrProcessDone }
 	if _, err := processReferencesManyWithOwners(context.Background(), pid, []string{target}, map[int]int{pid: os.Getuid()}); err != nil {
 		t.Fatalf("a classifier-resolved gone pid must complete the census, not fail it: %v", err)
+	}
+}
+
+func TestInUseRecordsMatchingNonmatchingAndLsofDuplicate(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := os.Getpid()
+	fake := filepath.Join(dir, "fake-lsof")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'p%d\\nfcwd\\nn%s\\n'\nexit 0\n", self, dir)
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := LSOFProcessInspector{
+		Executable:     fake,
+		Timeout:        2 * time.Second,
+		MaxOutputBytes: 1 << 20,
+		processReferencesFn: func(_ context.Context, pid int, _ string) (bool, error) {
+			return pid == self, nil
+		},
+	}
+	usage, err := p.InUse(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usage.ReferencedPath {
+		t.Fatal("matching pid must set ReferencedPath")
+	}
+	if len(usage.PIDs) != 1 || usage.PIDs[0] != self {
+		t.Fatalf("single InUse pids = %v, want [%d] (lsof duplicate + nonmatching filtered)", usage.PIDs, self)
+	}
+}
+
+func TestAppendUniquePIDMatchingNonmatchingAndDuplicate(t *testing.T) {
+	if got := appendUniquePID(nil, 7); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("matching append = %v, want [7]", got)
+	}
+	if got := appendUniquePID([]int{7}, 8); len(got) != 2 || got[0] != 7 || got[1] != 8 {
+		t.Fatalf("nonmatching append = %v, want [7 8]", got)
+	}
+	if got := appendUniquePID([]int{7}, 7); len(got) != 1 || got[0] != 7 {
+		t.Fatalf("already-recorded pid = %v, want [7]", got)
+	}
+}
+
+func TestInUseManyWalkRecordsOnlyMatchingUniquePIDs(t *testing.T) {
+	const matchPath = "/wt-owned"
+	const otherPath = "/wt-other"
+	p := LSOFProcessInspector{
+		processReferencesManyFn: func(_ context.Context, pid int, paths []string, _ map[int]int) (map[string]bool, error) {
+			out := make(map[string]bool, len(paths))
+			for _, path := range paths {
+				out[path] = pid == 7 && path == matchPath
+			}
+			return out, nil
+		},
+	}
+	usage := map[string]ProcessUsage{
+		matchPath: {},
+		otherPath: {},
+	}
+	got, err := p.inUseManyWalk(context.Background(), time.Second, usage, []string{matchPath, otherPath}, []int{7, 8, 7}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[matchPath].ReferencedPath {
+		t.Fatal("matching pid must set ReferencedPath")
+	}
+	if len(got[matchPath].PIDs) != 1 || got[matchPath].PIDs[0] != 7 {
+		t.Fatalf("matching unique pids = %v, want [7]", got[matchPath].PIDs)
+	}
+	if got[otherPath].ReferencedPath || len(got[otherPath].PIDs) != 0 {
+		t.Fatalf("nonmatching path recorded %v pids=%v", got[otherPath].ReferencedPath, got[otherPath].PIDs)
 	}
 }

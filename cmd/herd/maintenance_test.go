@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -36,16 +37,35 @@ func stubMaintenanceTick(t *testing.T, fn func(ctx context.Context, root, base s
 	return calls
 }
 
-// maintenanceScratchRoot points root resolution at a scratch checkout so no
-// test ever touches a real repository's cursor or lock.
+// maintenanceScratchRoot is a real Git scratch repository. HERD_PROJECT_ROOT
+// and lane root overrides are cleared so cleanupCoordinationRoot must discover
+// the project via gitroot.ProjectRoot from cwd.
 func maintenanceScratchRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	if resolved, err := filepath.EvalSymlinks(root); err == nil {
 		root = resolved
 	}
-	t.Setenv("HERD_ROOT", root)
-	t.Setenv("HERD_REPO_ROOT", root)
+	t.Setenv("HERD_PROJECT_ROOT", "")
+	t.Setenv("HERD_ROOT", "")
+	t.Setenv("HERD_REPO_ROOT", "")
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v (%s)", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "lab@example.com")
+	run("config", "user.name", "lab")
+	if err := os.WriteFile(filepath.Join(root, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README")
+	run("commit", "-qm", "init")
+	t.Chdir(root)
 	return root
 }
 
@@ -76,6 +96,28 @@ func TestMaintenanceRunsWhileFleetAdmissionRefuses(t *testing.T) {
 	}
 	if len(*calls) != 1 {
 		t.Fatalf("cycles = %d, want 1 while admission refuses", len(*calls))
+	}
+}
+
+func TestMaintenancePrintsFailureReasonsAndExitsOne(t *testing.T) {
+	maintenanceScratchRoot(t)
+	owned := filepath.Join(t.TempDir(), "wt-02-owned")
+	reason := owned + ": act-time owner census found active use (cwd=true open=false referenced=false pids=[9])"
+	stubMaintenanceTick(t, func(context.Context, string, string, bool) (reapPulseReport, error) {
+		return reapPulseReport{
+			Registered: 4, Eligible: 3, Inspected: 8, Landed: 2, Retired: 1, Failed: 1, Acted: true,
+			Failures: []string{reason},
+		}, nil
+	})
+	var out, errOut bytes.Buffer
+	if code := runMaintenanceCommandContext(context.Background(), []string{"--act"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit = %d, want 1; stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), owned) {
+		t.Fatalf("stderr missing exact owned path; stderr=%q", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "owner census found active use") {
+		t.Fatalf("stderr missing census reason; stderr=%q", errOut.String())
 	}
 }
 
@@ -323,6 +365,128 @@ func TestMaintenanceResolvesCanonicalRootAndConfiguredBase(t *testing.T) {
 	}
 	if got.Root != root {
 		t.Errorf("root = %q, want the canonical %q", got.Root, root)
+	}
+}
+
+func TestCleanupCoordinationRootRefusesCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := cleanupCoordinationRoot(ctx, "."); err == nil {
+		t.Fatal("canceled context must fail closed before discovery")
+	}
+}
+
+func TestCleanupCoordinationRootMissingExplicitLeaf(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "absent")
+	t.Setenv("HERD_PROJECT_ROOT", missing)
+	got, err := cleanupCoordinationRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("missing explicit leaf: %v", err)
+	}
+	if got != missing {
+		t.Fatalf("missing explicit leaf root = %q, want %q", got, missing)
+	}
+}
+
+func TestCleanupCoordinationRootDanglingLeaf(t *testing.T) {
+	dir := t.TempDir()
+	dangle := filepath.Join(dir, "dangle")
+	if err := os.Symlink(filepath.Join(dir, "nowhere"), dangle); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", dangle)
+	if _, err := cleanupCoordinationRoot(context.Background(), "."); err == nil {
+		t.Fatal("dangling leaf must refuse")
+	}
+}
+
+func TestCleanupCoordinationRootDanglingAncestor(t *testing.T) {
+	dir := t.TempDir()
+	dangle := filepath.Join(dir, "dangle")
+	if err := os.Symlink(filepath.Join(dir, "nowhere"), dangle); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", filepath.Join(dangle, "child"))
+	if _, err := cleanupCoordinationRoot(context.Background(), "."); err == nil {
+		t.Fatal("dangling ancestor must refuse")
+	}
+}
+
+func TestCleanupCoordinationRootSymlinkAncestorAbsentSuffix(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", filepath.Join(link, "new"))
+	got, err := cleanupCoordinationRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("symlink ancestor absent suffix: %v", err)
+	}
+	want := filepath.Join(real, "new")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestCleanupCoordinationRootNestedSymlinkThenExistingDir(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(dir, "real")
+	existing := filepath.Join(real, "existing")
+	if err := os.MkdirAll(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERD_PROJECT_ROOT", filepath.Join(link, "existing", "missing"))
+	got, err := cleanupCoordinationRoot(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("nested symlink ancestor: %v", err)
+	}
+	want := filepath.Join(existing, "missing")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestMaintenanceLinkedWorktreeSharesProjectRoot(t *testing.T) {
+	root := maintenanceScratchRoot(t)
+	wt := filepath.Join(root, "wt")
+	cmd := exec.Command("git", "worktree", "add", "-q", "-b", "leftover", wt, "HEAD")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v (%s)", err, out)
+	}
+	t.Chdir(wt)
+	calls := stubMaintenanceTick(t, func(context.Context, string, string, bool) (reapPulseReport, error) {
+		return reapPulseReport{}, nil
+	})
+	var out, errOut bytes.Buffer
+	if code := runMaintenanceCommandContext(context.Background(), []string{"--act"}, &out, &errOut); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("cycles = %d, want 1", len(*calls))
+	}
+	got := (*calls)[0].Root
+	if got != root {
+		t.Fatalf("linked worktree root = %q, want shared project root %q", got, root)
 	}
 }
 

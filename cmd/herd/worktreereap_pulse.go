@@ -145,7 +145,11 @@ type reapPulseReport struct {
 // genuine failure returns false, because silently swallowing a real cleanup
 // failure would violate this repo's fail-closed invariant.
 func reapLandedWorktreesOnPulse(ctx context.Context, errOut *os.File) bool {
-	root := canonicalRepoRoot(firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	root, err := cleanupCoordinationRoot(ctx, firstEnv("HERD_ROOT", "HERD_REPO_ROOT", "."))
+	if err != nil {
+		fmt.Fprintf(errOut, "pulse: worktree reap: %v\n", err)
+		return false
+	}
 	report, err := runReapPulseTick(ctx, root, reapPulseBaseRef(root), true)
 	if err != nil {
 		if errors.Is(err, errReapPulseTickBusy) {
@@ -374,6 +378,87 @@ func reapPulseFairOrder(entries []worktreeEntry, cursor string) []worktreeEntry 
 
 func reapPulseStatePath(root, name string) string {
 	return filepath.Join(root, ".herd", name)
+}
+
+// cleanupCoordinationRoot is the worktree-invariant control root for the
+// maintenance/reap-pulse tick lock and cursor. It uses gitroot.ProjectRoot
+// (git common-dir parent, never HERD_ROOT) so linked checkouts share one
+// flock and one relative cursor base. Unresolved roots fail closed.
+func cleanupCoordinationRoot(ctx context.Context, start string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("cleanup coordination root: %w", err)
+	}
+	if strings.TrimSpace(start) == "" {
+		start = "."
+	}
+	root, _, err := gitroot.ProjectRoot(ctx, start)
+	if err != nil {
+		return "", fmt.Errorf("cleanup coordination root: %w", err)
+	}
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("cleanup coordination root: empty")
+	}
+	explicit := strings.TrimSpace(os.Getenv(gitroot.EnvProjectRoot)) != ""
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		if !explicit {
+			return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+		}
+		reconstructed, recErr := reconstructMissingExplicitRoot(root)
+		if recErr != nil {
+			return "", recErr
+		}
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("cleanup coordination root: %w", err)
+		}
+		return reconstructed, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("cleanup coordination root: %w", err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+// reconstructMissingExplicitRoot walks to the nearest existing ancestor,
+// refuses dangling/unreadable symlink ancestors, and joins only the
+// genuinely absent suffix.
+func reconstructMissingExplicitRoot(root string) (string, error) {
+	cur := filepath.Clean(root)
+	var suffix []string
+	for {
+		info, err := os.Lstat(cur)
+		if err == nil {
+			resolved, e := filepath.EvalSymlinks(cur)
+			if e != nil {
+				return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s: %w", cur, e)
+			}
+			cur = resolved
+			info, err = os.Stat(cur)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+				}
+				return "", fmt.Errorf("cleanup coordination root: dangling symlink ancestor %s", cur)
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("cleanup coordination root: ancestor %s is not a directory", cur)
+			}
+			out := cur
+			for i := len(suffix) - 1; i >= 0; i-- {
+				out = filepath.Join(out, suffix[i])
+			}
+			return filepath.Clean(out), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("cleanup coordination root: unresolvable identity: %w", err)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", fmt.Errorf("cleanup coordination root: no existing ancestor")
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 // reapPulseLockIdentity is the advisory record written into the lock file
