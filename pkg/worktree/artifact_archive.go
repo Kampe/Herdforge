@@ -321,7 +321,10 @@ func refuseLiveCwdOwner(target string) error {
 	if err != nil {
 		return fmt.Errorf("artifact-archive: herdr unavailable; refusing unknown live owners: %w", err)
 	}
-	cmd := exec.Command(path, "agent", "list", "--json")
+	// herdr 0.9.0 already emits JSON from `agent list`. Passing --json is
+	// usage/exit 2, which this probe used to treat as unknown owners and
+	// refuse every native archive.
+	cmd := exec.Command(path, "agent", "list")
 	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("artifact-archive: herdr agent list failed; refusing unknown live owners: %w", err)
@@ -330,10 +333,44 @@ func refuseLiveCwdOwner(target string) error {
 	if want == "" {
 		want = target
 	}
-	if strings.Contains(string(out), want) {
-		return fmt.Errorf("artifact-archive: herdr process cwd owns %s; refusing", target)
+	var payload struct {
+		Result struct {
+			Agents []struct {
+				Cwd           string `json:"cwd"`
+				ForegroundCwd string `json:"foreground_cwd"`
+			} `json:"agents"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return fmt.Errorf("artifact-archive: herdr agent list is not JSON; refusing unknown live owners: %w", err)
+	}
+	for _, a := range payload.Result.Agents {
+		for _, raw := range []string{a.Cwd, a.ForegroundCwd} {
+			if cwdOwnsArchiveTarget(raw, want) {
+				return fmt.Errorf("artifact-archive: herdr process cwd owns %s; refusing", target)
+			}
+		}
 	}
 	return nil
+}
+
+func cwdOwnsArchiveTarget(cwd, want string) bool {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" || strings.TrimSpace(want) == "" {
+		return false
+	}
+	got, err := filepath.EvalSymlinks(cwd)
+	if err != nil || got == "" {
+		got = filepath.Clean(cwd)
+	} else {
+		got = filepath.Clean(got)
+	}
+	want = filepath.Clean(want)
+	if sameArchivePath(got, want) {
+		return true
+	}
+	sep := string(os.PathSeparator)
+	return strings.HasPrefix(got, want+sep)
 }
 
 func refuseProcessHolders(paths []string) error {
