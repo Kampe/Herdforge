@@ -84,6 +84,9 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 	reason := fs.String("reason", "", "why this recovery is being performed")
 	actor := fs.String("actor", "", "operator performing the recovery")
 	act := fs.Bool("act", false, "perform the repair (default is report-only)")
+	sequenceOrder := fs.Bool("sequence-order", false, "restore file-order monotonic sequences without reordering or dropping rows")
+	afterCursor := fs.String("after-cursor", "", "refuse if this paging cursor is stale for the store")
+	recipient := fs.String("recipient", "", "recipient the --after-cursor was issued for")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -92,6 +95,13 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() > 0 {
 		fmt.Fprintf(stderr, "mail repair: unexpected argument %q; every input is a flag\n", fs.Arg(0))
 		return 2
+	}
+	if *sequenceOrder {
+		return mailSequenceOrderMain(mailRepairSeqArgs{
+			mailPath: *mailPath, reason: strings.TrimSpace(*reason), actor: strings.TrimSpace(*actor),
+			act: *act, fingerprints: fingerprints, ids: ids,
+			cursor: strings.TrimSpace(*afterCursor), recipient: strings.TrimSpace(*recipient),
+		}, stdout, stderr)
 	}
 	if len(ids) == 0 {
 		fmt.Fprintln(stderr, "mail repair: --id is required")
@@ -157,6 +167,50 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if !*act {
+		fmt.Fprintln(stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor <name> to apply")
+	}
+	return 0
+}
+
+type mailRepairSeqArgs struct {
+	mailPath, reason, actor string
+	act                     bool
+	fingerprints, ids       []string
+	cursor, recipient       string
+}
+
+func mailSequenceOrderMain(args mailRepairSeqArgs, stdout, stderr io.Writer) int {
+	if len(args.ids) > 0 {
+		fmt.Fprintln(stderr, "mail repair: --sequence-order cannot be combined with --id")
+		return 2
+	}
+	if args.act && strings.TrimSpace(args.actor) == "" {
+		fmt.Fprintln(stderr, "mail repair: --actor is required with --act")
+		return 2
+	}
+	if args.cursor != "" && args.recipient == "" {
+		fmt.Fprintln(stderr, "mail repair: --after-cursor requires --recipient")
+		return 2
+	}
+	path, err := controlMailPath(args.mailPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: %v\n", err)
+		return 1
+	}
+	report, err := mail.NewMailbox(path).RepairSequenceOrder(context.Background(), mail.SequenceOrderRequest{
+		Act: args.act, Actor: args.actor, Reason: args.reason,
+		Fingerprints: args.fingerprints, Cursor: args.cursor, Recipient: args.recipient,
+		FeedbackDir: feedbackMailDir(),
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: %v\n", err)
+		return 1
+	}
+	if err := json.NewEncoder(stdout).Encode(report); err != nil {
+		fmt.Fprintf(stderr, "mail repair: encode plan: %v\n", err)
+		return 1
+	}
+	if !args.act {
 		fmt.Fprintln(stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor <name> to apply")
 	}
 	return 0

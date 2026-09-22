@@ -358,6 +358,8 @@ Commands:
   herd mail read --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
   herd mail repair --id ID [--id ID...] [--mail path] [--reason TEXT]
   herd mail repair --id ID [--id ID...] --fingerprint SHA256 [--fingerprint SHA256...] --actor NAME --act [--mail path] [--reason TEXT]
+  herd mail repair --sequence-order [--mail path] [--reason TEXT] [--after-cursor C --recipient NAME]
+  herd mail repair --sequence-order --act --actor NAME --fingerprint SHA256 [--fingerprint SHA256...] [--mail path] [--reason TEXT]
   herd mail control <issue|drain> [flags]
 
 Bounded paging (inbox/read): passing --after-cursor, --limit or --max-bytes
@@ -371,9 +373,13 @@ acknowledges, rewrites, or deletes anything.
 herd mail repair recovers 1 to 32 explicitly selected quarantined rows with
 legacy non-RFC3339 timestamps. It normalizes timestamps and assigns sequences
 above the existing rows and counter under the canonical mailbox lock. The ids,
-payloads, row positions and every unselected byte are preserved. It does not
-reorder history or resolve existing sequence-order failures in bounded paging.
-It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
+payloads, row positions and every unselected byte are preserved. Timestamp
+repair does not reorder history. Sequence-order recovery (--sequence-order)
+restores file-order monotonic sequences by assigning seq values above the
+running max to inverting rows only; ids, payloads, row positions and signed
+controls are preserved. Duplicate ids, stale fingerprints, stale paging
+cursors, privileged signed rows that would be rewritten, and plans over 32
+changed rows refuse with the mailbox untouched. It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
 plan object; repeated --id flags return an array in the order supplied.
 Acting REQUIRES --actor and one --fingerprint per --id, paired in the same
 order. Run report-only first and pass back each plan's original_sha256, so the
