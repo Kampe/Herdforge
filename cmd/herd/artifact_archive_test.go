@@ -44,6 +44,7 @@ func TestArtifactArchiveCLIDisposableProof(t *testing.T) {
 	}
 
 	t.Chdir(root)
+	t.Cleanup(worktree.InstallTestSafetyProbes(nil, nil))
 	if err := runArtifactArchiveArgs([]string{"--target", wt, "--json"}); err != nil {
 		t.Fatalf("dry-run: %v", err)
 	}

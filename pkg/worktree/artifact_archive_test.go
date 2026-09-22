@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,8 +11,19 @@ import (
 	"time"
 )
 
+func silenceLiveProbes(t *testing.T) {
+	t.Helper()
+	prevOwner, prevProc := liveOwnerProbe, processHolderProbe
+	liveOwnerProbe = func(string) error { return nil }
+	processHolderProbe = func([]string) error { return nil }
+	t.Cleanup(func() {
+		liveOwnerProbe, processHolderProbe = prevOwner, prevProc
+	})
+}
+
 func archiveFixture(t *testing.T) (root, wt string) {
 	t.Helper()
+	silenceLiveProbes(t)
 	root = t.TempDir()
 	git := func(args ...string) {
 		t.Helper()
@@ -163,5 +175,92 @@ func TestClassifyArtifactPathReceipts(t *testing.T) {
 	}
 	if ClassifyArtifactPath("bin/herd") != ArtifactDerived {
 		t.Fatal("derived")
+	}
+}
+
+func TestArchiveMustSitOutsideTarget(t *testing.T) {
+	root, wt := archiveFixture(t)
+	_, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Archive: filepath.Join(wt, "inside"), Act: true})
+	if err == nil || !strings.Contains(err.Error(), "must be outside target") {
+		t.Fatalf("want archive-outside-target refusal, got %v", err)
+	}
+	if _, stat := os.Stat(filepath.Join(wt, ".herd", "receipts", "FAC-843.json")); stat != nil {
+		t.Fatal("source kept")
+	}
+}
+
+func TestArchiveObjectCollisionRejectsDifferentBytes(t *testing.T) {
+	root, wt := archiveFixture(t)
+	src := filepath.Join(wt, ".herd", "receipts", "FAC-843.json")
+	sum, _, err := hashFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(root, filepath.FromSlash(ArtifactArchiveDir))
+	dst := objectPath(archive, sum)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("not-the-receipt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err == nil || !strings.Contains(err.Error(), "different digest") {
+		t.Fatalf("want object collision refusal, got %v", err)
+	}
+	if _, stat := os.Stat(src); stat != nil {
+		t.Fatal("collision must keep the source")
+	}
+}
+
+func TestArchiveInterruptionKeepsSources(t *testing.T) {
+	root, wt := archiveFixture(t)
+	src := filepath.Join(wt, ".herd", "receipts", "FAC-843.json")
+	t.Cleanup(func() { beforeRemoveHook = nil })
+	beforeRemoveHook = func() error { return errors.New("injected interrupt") }
+	_, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err == nil || !strings.Contains(err.Error(), "sources kept") {
+		t.Fatalf("want interruption refusal, got %v", err)
+	}
+	if _, stat := os.Stat(src); stat != nil {
+		t.Fatal("interrupted act must keep the source receipt")
+	}
+}
+
+func TestArchiveUnknownProcessFailsClosed(t *testing.T) {
+	root, wt := archiveFixture(t)
+	processHolderProbe = func([]string) error { return errors.New("holders unknown") }
+	_, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err == nil || !strings.Contains(err.Error(), "holders unknown") {
+		t.Fatalf("want process fail-closed, got %v", err)
+	}
+	if _, stat := os.Stat(filepath.Join(wt, ".herd", "receipts", "FAC-843.json")); stat != nil {
+		t.Fatal("unknown process must keep the source")
+	}
+}
+
+func TestArchiveHerdrCwdFailsClosed(t *testing.T) {
+	root, wt := archiveFixture(t)
+	liveOwnerProbe = func(string) error { return errors.New("herdr cwd owns target") }
+	_, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err == nil || !strings.Contains(err.Error(), "herdr cwd") {
+		t.Fatalf("want herdr cwd refusal, got %v", err)
+	}
+}
+
+func TestArchivePreservesCanonicalReceiptReferences(t *testing.T) {
+	root, wt := archiveFixture(t)
+	canon := filepath.Join(root, ".herd", "receipts", "FAC-843.json")
+	if err := os.MkdirAll(filepath.Dir(canon), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(canon, []byte(`{"canonical":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := refuseCanonicalReceipt(root, wt, canon); err == nil {
+		t.Fatal("canonical receipt path must be refused")
+	}
+	if err := refuseCanonicalReceipt(root, wt, filepath.Join(wt, ".herd", "receipts", "FAC-843.json")); err != nil {
+		t.Fatalf("worktree-local receipt is archivable: %v", err)
 	}
 }

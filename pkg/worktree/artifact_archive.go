@@ -19,6 +19,32 @@ import (
 // before the source is re-hashed for drift.
 var afterArchiveHook func(path string)
 
+// beforeRemoveHook is test-only: it fires after the manifest is durable and
+// before any source unlink (interruption).
+var beforeRemoveHook func() error
+
+// liveOwnerProbe, when set, replaces Herdr cwd ownership checks.
+var liveOwnerProbe func(target string) error
+
+// processHolderProbe, when set, replaces lsof fail-closed process checks.
+var processHolderProbe func(paths []string) error
+
+// InstallTestSafetyProbes replaces live Herdr/lsof probes. Tests must restore
+// via the returned function. Empty probes treat the fixture as unowned.
+func InstallTestSafetyProbes(owner func(string) error, holders func([]string) error) func() {
+	prevOwner, prevProc := liveOwnerProbe, processHolderProbe
+	liveOwnerProbe, processHolderProbe = owner, holders
+	if liveOwnerProbe == nil {
+		liveOwnerProbe = func(string) error { return nil }
+	}
+	if processHolderProbe == nil {
+		processHolderProbe = func([]string) error { return nil }
+	}
+	return func() {
+		liveOwnerProbe, processHolderProbe = prevOwner, prevProc
+	}
+}
+
 const (
 	// ArtifactArchiveDir is the canonical, repository-relative archive root.
 	ArtifactArchiveDir     = ".herd/artifact-archive"
@@ -123,6 +149,9 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 	if err := refuseActiveOwner(target, req.Now); err != nil {
 		return nil, err
 	}
+	if err := refuseLiveCwdOwner(target); err != nil {
+		return nil, err
+	}
 
 	archive := strings.TrimSpace(req.Archive)
 	if archive == "" {
@@ -133,6 +162,9 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 	archive, err = filepath.Abs(archive)
 	if err != nil {
 		return nil, fmt.Errorf("artifact-archive: archive: %w", err)
+	}
+	if err := refuseArchiveInsideTarget(target, archive); err != nil {
+		return nil, err
 	}
 
 	files, err := listIgnoredFiles(target)
@@ -156,6 +188,9 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 	var entries []ArtifactEntry
 	for _, rel := range files {
 		src := filepath.Join(target, filepath.FromSlash(rel))
+		if err := refuseCanonicalReceipt(root, target, src); err != nil {
+			return nil, err
+		}
 		if err := refuseUnsafeSource(target, src); err != nil {
 			return nil, err
 		}
@@ -191,6 +226,18 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		return nil, err
 	}
 	rep.Manifest = filepath.ToSlash(relPathOrAbs(root, manPath))
+	if beforeRemoveHook != nil {
+		if err := beforeRemoveHook(); err != nil {
+			return nil, fmt.Errorf("artifact-archive: interrupted before removal; sources kept: %w", err)
+		}
+	}
+	var held []string
+	for _, ent := range entries {
+		held = append(held, filepath.Join(target, filepath.FromSlash(ent.Path)))
+	}
+	if err := refuseProcessHolders(held); err != nil {
+		return nil, err
+	}
 
 	for _, ent := range entries {
 		src := filepath.Join(target, filepath.FromSlash(ent.Path))
@@ -233,6 +280,81 @@ func listIgnoredFiles(target string) ([]string, error) {
 		files = append(files, filepath.ToSlash(p))
 	}
 	return files, nil
+}
+
+func refuseArchiveInsideTarget(target, archive string) error {
+	ta := filepath.Clean(target)
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		ta = resolved
+	}
+	aa := filepath.Clean(archive)
+	if resolved, err := filepath.EvalSymlinks(filepath.Dir(aa)); err == nil {
+		aa = filepath.Join(resolved, filepath.Base(aa))
+	}
+	sep := string(os.PathSeparator)
+	if aa == ta || strings.HasPrefix(aa, ta+sep) {
+		return fmt.Errorf("artifact-archive: archive %s must be outside target %s", archive, target)
+	}
+	return nil
+}
+
+func refuseCanonicalReceipt(root, target, src string) error {
+	canon := filepath.Join(root, ".herd", "receipts")
+	rel, err := filepath.Rel(canon, src)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return nil
+	}
+	trel, terr := filepath.Rel(target, src)
+	if terr == nil && !strings.HasPrefix(trel, "..") {
+		return nil
+	}
+	return fmt.Errorf("artifact-archive: refusing canonical receipt reference %s", src)
+}
+
+func refuseLiveCwdOwner(target string) error {
+	if liveOwnerProbe != nil {
+		return liveOwnerProbe(target)
+	}
+	path, err := exec.LookPath("herdr")
+	if err != nil {
+		return fmt.Errorf("artifact-archive: herdr unavailable; refusing unknown live owners: %w", err)
+	}
+	cmd := exec.Command(path, "agent", "list", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("artifact-archive: herdr agent list failed; refusing unknown live owners: %w", err)
+	}
+	want, _ := filepath.EvalSymlinks(target)
+	if want == "" {
+		want = target
+	}
+	if strings.Contains(string(out), want) {
+		return fmt.Errorf("artifact-archive: herdr process cwd owns %s; refusing", target)
+	}
+	return nil
+}
+
+func refuseProcessHolders(paths []string) error {
+	if processHolderProbe != nil {
+		return processHolderProbe(paths)
+	}
+	if _, err := exec.LookPath("lsof"); err != nil {
+		return fmt.Errorf("artifact-archive: lsof unavailable; refusing unknown process holders: %w", err)
+	}
+	for _, p := range paths {
+		cmd := exec.Command("lsof", "-t", p)
+		out, err := cmd.Output()
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 && len(out) == 0 {
+				continue
+			}
+			return fmt.Errorf("artifact-archive: process probe failed for %s; refusing: %w", p, err)
+		}
+		if strings.TrimSpace(string(out)) != "" {
+			return fmt.Errorf("artifact-archive: process holds %s; refusing", p)
+		}
+	}
+	return nil
 }
 
 func refuseActiveOwner(target string, now time.Time) error {
@@ -387,14 +509,28 @@ func writeManifest(archive, target string, entries []ArtifactEntry) (string, err
 	sum := sha256.Sum256(body)
 	name := hex.EncodeToString(sum[:]) + ".json"
 	path := filepath.Join(manDir, name)
+	if existing, err := os.ReadFile(path); err == nil {
+		if string(existing) != string(body) {
+			return "", fmt.Errorf("artifact-archive: immutable manifest collision at %s", name)
+		}
+		return path, nil
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o600); err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := os.Link(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		if errors.Is(err, os.ErrExist) {
+			existing, rerr := os.ReadFile(path)
+			if rerr == nil && string(existing) == string(body) {
+				return path, nil
+			}
+			return "", fmt.Errorf("artifact-archive: immutable manifest collision at %s", name)
+		}
 		return "", err
 	}
+	_ = os.Remove(tmp)
 	return path, nil
 }
 
