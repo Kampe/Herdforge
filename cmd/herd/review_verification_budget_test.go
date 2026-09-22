@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,6 +82,7 @@ import "testing"
 
 func TestAlpha(t *testing.T) {}
 func TestBeta(t *testing.T) {}
+func TestSentinelFail(t *testing.T) { t.Fatal("sentinel must be excluded by -run") }
 `
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(mod), 0o644); err != nil {
 		t.Fatal(err)
@@ -88,7 +90,7 @@ func TestBeta(t *testing.T) {}
 	if err := os.WriteFile(filepath.Join(dir, "quote_test.go"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	quoted := "go test -count=1 -p=1 -timeout=" + nativeReviewTargetTimeout + " " + nativeReviewRunFlag([]string{"TestAlpha", "TestBeta"}) + " ."
+	quoted := "go test -count=1 -p=1 -timeout=" + nativeReviewTargetTimeout + " -json " + nativeReviewRunFlag([]string{"TestAlpha", "TestBeta"}) + " ."
 	unquoted := "go test -count=1 -p=1 -timeout=" + nativeReviewTargetTimeout + " -run TestAlpha|TestBeta ."
 
 	unquotedRun := exec.Command("sh", "-c", unquoted)
@@ -108,9 +110,31 @@ func TestBeta(t *testing.T) {}
 	if quotedErr != nil {
 		t.Fatalf("quoted anchored -run must run both tests: %v\ncmd=%s\n%s", quotedErr, quoted, quotedOut)
 	}
-	text := string(quotedOut)
-	if !strings.Contains(text, "ok") {
-		t.Fatalf("quoted command produced no ok: %s", text)
+	ran, passed := map[string]bool{}, map[string]bool{}
+	for _, line := range strings.Split(string(quotedOut), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Action string `json:"Action"`
+			Test   string `json:"Test"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Test == "" {
+			continue
+		}
+		switch ev.Action {
+		case "run":
+			ran[ev.Test] = true
+		case "pass":
+			passed[ev.Test] = true
+		}
+	}
+	if !ran["TestAlpha"] || !ran["TestBeta"] || !passed["TestAlpha"] || !passed["TestBeta"] {
+		t.Fatalf("both named tests must RUN and PASS, ran=%v passed=%v\n%s", ran, passed, quotedOut)
+	}
+	if ran["TestSentinelFail"] || passed["TestSentinelFail"] {
+		t.Fatalf("failing sentinel must be excluded by -run, ran=%v\n%s", ran, quotedOut)
 	}
 }
 
