@@ -381,7 +381,8 @@ func TestReviewPacketExplainsSurfaceAliasAndPoolToplevel(t *testing.T) {
 
 // Native AGY reviews pin a model independently of the harness. A packet that
 // says "agy writes google" made a claude-opus-4-6-thinking reviewer emit
-// reviewer-family google, which FAC-848 then admitted as an incorrect-family PASS.
+// reviewer-family google. Coordinator refused that google artifact; only the
+// reviewer-corrected anthropic artifact was ingested.
 var harnessFamilyHardcodes = []string{
 	"agy writes google",
 	"codex writes openai",
