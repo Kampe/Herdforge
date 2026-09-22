@@ -1045,13 +1045,23 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 // create one: it answers "" so the caller proceeds from the identities it was
 // given rather than from a directory nobody reads.
 func resolvePoolReviewCandidateAtFor(root, ref, sha string, mayPrepare bool) (string, error) {
+	// FAC-653: a SHA too short to verify is a bad ARGUMENT, not a missing
+	// worktree and not a Git-discovery failure. Check it before any
+	// `git worktree list` so a non-repo fixture still names the argument.
+	sha = strings.TrimSpace(sha)
+	if sha != "" && len(sha) < 12 {
+		return "", fmt.Errorf("candidate sha %q is too short to verify (need at least 12 hex characters); "+
+			"an abbreviation could match more than one commit, so it is refused rather than guessed. "+
+			"Pass the full 40-character sha", sha)
+	}
+
 	// FAC-844: a FAC-number selector used to miss the exclusive author
 	// worktree (different branch name, attached HEAD) and prepare a blank
 	// detached carrier. TASK-CONTEXT.json is gitignored, so the new surface
 	// had no authenticated SHA/base/lease identity and operators reissued
 	// receipts by hand. Prefer a verified existing home before any path
 	// probe or speculative prepare, and never copy or Issue a replacement.
-	if strings.TrimSpace(sha) != "" {
+	if sha != "" {
 		home, err := authenticatedCandidateHome(root, ref, sha)
 		if err != nil {
 			return "", err
@@ -1329,7 +1339,11 @@ func authenticatedCandidateHome(root, ref, sha string) (string, error) {
 func findAuthenticatedCandidateHomes(root, ref, sha string) (homes []string, unverified bool, err error) {
 	out, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
 	if listErr != nil {
-		return nil, false, fmt.Errorf("list Git worktrees for authenticated candidate home: %w", listErr)
+		// Not a git repo (or worktree list is unavailable) means there is no
+		// authenticated home to discover. That is a miss, not an auth failure:
+		// callers still emit FAC-653 short-SHA and genuine-worktree-miss
+		// diagnostics instead of "git worktree list: exit status 128".
+		return nil, false, nil
 	}
 	absRoot, _ := filepath.Abs(root)
 	var verifier *dispatch.Verifier
