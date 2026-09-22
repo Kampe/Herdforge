@@ -92,8 +92,9 @@ type ArchiveRequest struct {
 }
 
 // ArchiveReport is the operator-visible outcome. Dry-run never sets Removed.
-// NetReclaim is only source bytes whose digest already existed in the
-// archive. RelocatedBytes is a copy, not reclaim.
+// NetReclaim is physical_reclaim_certain_bytes only. Last-name unlinks are
+// logical deletion; without exclusive-extent proof they are uncertain, even
+// when nlink>1. RelocatedBytes is a copy, not reclaim.
 type ArchiveReport struct {
 	Target                        string          `json:"target"`
 	Archive                       string          `json:"archive"`
@@ -324,11 +325,11 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		if acc.newObj {
 			continue
 		}
-		if acc.nlink == 1 {
-			rep.PhysicalReclaimUncertainBytes += acc.size
-			continue
-		}
-		rep.PhysicalReclaimCertainBytes += acc.size
+		// Last names of this inode are gone. nlink>1 only proves other names
+		// of this inode, not exclusive extents: a reflink clone can carry its
+		// own hardlink set and keep the blocks. Without filesystem proof of
+		// exclusive allocation, last-name reclaim is uncertain.
+		rep.PhysicalReclaimUncertainBytes += acc.size
 	}
 	rep.NetReclaim = rep.PhysicalReclaimCertainBytes
 	return rep, nil
