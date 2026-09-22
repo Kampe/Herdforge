@@ -57,6 +57,7 @@ func TestReviewPoolLaunchOrdersManifestAfterColdSession(t *testing.T) {
 		"appendReviewRetirementPending(root, pending)",
 		"verifyReviewLaunchFence(ws, surfaceAbs, *tab, lease, sha)",
 		"herdr.StartReviewAgent(tab.ID",
+		"herdr.AwaitAgyPinnedModelReady(",
 		"herdr.Send(agentName,",
 		"awaitNativeReviewerSession(agentName, ws, *tab",
 		"recordReviewRetirementManifest(root, cfg",

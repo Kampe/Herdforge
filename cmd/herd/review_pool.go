@@ -639,6 +639,21 @@ func runPoolReview(ref string) error {
 	if _, readyErr := herdr.AwaitInteractiveReady(agentName, 30*time.Second); readyErr != nil {
 		fmt.Fprintf(os.Stderr, "review --pool: %s not interactive yet (%v); delivering anyway\n", agentName, readyErr)
 	}
+	if strings.EqualFold(reviewer.Kind, "agy") && strings.TrimSpace(reviewer.Model) != "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			launchFailureReason = homeErr.Error()
+			return fmt.Errorf("agy pinned-model readiness: %w", homeErr)
+		}
+		ev, modelErr := herdr.AwaitAgyPinnedModelReady(herdr.AgyPinnedModelReadyRequest{
+			Home: home, Cwd: surfaceAbs, PinnedModel: reviewer.Model, StartedAt: startedAt, Budget: 30 * time.Second,
+		})
+		if modelErr != nil {
+			launchFailureReason = modelErr.Error()
+			return fmt.Errorf("agy pinned model %s not ready for this launch: %w", reviewer.Model, modelErr)
+		}
+		fmt.Fprintf(os.Stderr, "review --pool: agy pinned model ready model=%s conversation=%s log=%s\n", ev.PinnedModel, ev.ConversationID, filepath.Base(ev.LogFile))
+	}
 	// FAC-592: the delivered path must be ABSOLUTE. --packet-root defaults to the
 	// relative ".herd/review-packets", and the reviewer resolves it against its
 	// own cwd — which is the pool slot, not the repo root, so the packet is not
