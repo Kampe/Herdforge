@@ -128,7 +128,8 @@ func runPoolReview(ref string) error {
 	if err != nil {
 		return fmt.Errorf("review task identity: load provider: %w", err)
 	}
-	providerTask, err := resolveReviewTaskRef(context.Background(), tasks, cfg.TaskProvider.ProjectID, ref)
+	sha := strings.TrimSpace(*shaFlag)
+	providerTask, err := resolveReviewTaskRef(context.Background(), tasks, cfg.TaskProvider.ProjectID, ref, root, sha)
 	if err != nil {
 		return err
 	}
@@ -138,12 +139,11 @@ func runPoolReview(ref string) error {
 	}
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.
-	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
-		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))
+	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, sha,
+		needsCandidateDirectory(sha, strings.TrimSpace(*opts.Base)))
 	if err != nil {
 		return err
 	}
-	sha := strings.TrimSpace(*shaFlag)
 	if sha == "" {
 		out, err := exec.Command("git", "-C", candidateDir, "rev-parse", "HEAD").Output()
 		if err != nil {
