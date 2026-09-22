@@ -14,6 +14,9 @@ const (
 	ClaudeToolAgent          = "Agent"
 	ClaudeToolTask           = "Task"
 	ClaudeToolSearch         = "ToolSearch"
+	// DisableSlashCommandsFlag is the shared vendor flag that turns off slash
+	// command handling. AGY probes and Claude policy compile both need it.
+	DisableSlashCommandsFlag = "--disable-slash-commands"
 )
 
 // CompileCodexArgs injects the fleet nested-agent denials. Existing
@@ -120,7 +123,7 @@ func CompileClaudeArgs(argv []string) ([]string, error) {
 			}
 			i--
 			continue
-		case "--strict-mcp-config", "--disable-slash-commands":
+		case "--strict-mcp-config", DisableSlashCommandsFlag:
 			continue
 		}
 		if strings.HasPrefix(arg, "--mcp-config=") || strings.HasPrefix(arg, "--disallowed-tools=") || strings.HasPrefix(arg, "--disallowedTools=") {
@@ -137,7 +140,7 @@ func CompileClaudeArgs(argv []string) ([]string, error) {
 		// nested-tool boundary without killing the pane at startup.
 		"--mcp-config", `{"mcpServers":{}}`,
 		"--strict-mcp-config",
-		"--disable-slash-commands",
+		DisableSlashCommandsFlag,
 		"--disallowed-tools", ClaudeToolAgent, ClaudeToolTask, ClaudeToolSearch,
 	)
 	out = append(out, stripped[1:]...)
