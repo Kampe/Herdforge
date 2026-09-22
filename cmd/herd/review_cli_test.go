@@ -1692,6 +1692,45 @@ func TestReceiptIssueCLI_ExplicitCandidateSupersessionRecoveryIsScopedAndBasePre
 	}
 }
 
+func TestReceiptIssueCLI_VerifierBaseIsCandidateAncestorWhenMainAdvanced(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	fork := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-650-old")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-650", target, fork)
+	gitIn(t, target, "commit", "--allow-empty", "-m", "candidate")
+	candidate := strings.TrimSpace(runGitOut(t, target, "rev-parse", "HEAD"))
+	gitIn(t, dir, "commit", "--allow-empty", "-m", "later origin/main")
+	gitIn(t, dir, "push", "-q", "origin", "HEAD:main")
+	originMain := strings.TrimSpace(runGitOut(t, target, "rev-parse", "origin/main"))
+	if gitIsAncestor(target, originMain, candidate) {
+		t.Fatal("fixture did not advance origin/main past the candidate")
+	}
+
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("verifier issue: %v\n%s", err, out)
+	}
+	issued, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued.BaseSHA == originMain {
+		t.Fatalf("verifier minted advanced origin/main %s as base", originMain)
+	}
+	if issued.BaseSHA != fork || issued.CandidateSHA != candidate {
+		t.Fatalf("verifier identity base=%s candidate=%s want base=%s candidate=%s", issued.BaseSHA, issued.CandidateSHA, fork, candidate)
+	}
+	if !gitIsAncestor(target, issued.BaseSHA, issued.CandidateSHA) {
+		t.Fatal("issued verifier base is not an ancestor of the candidate")
+	}
+}
+
 // FAC-145 (blocker 1 regression): a REVIEWER receipt whose lease was
 // acquired under the scoped key (FAC-X:review) must work through the
 // broker. Binding the lease key into the signed receipt is what makes this
