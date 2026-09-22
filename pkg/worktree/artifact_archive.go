@@ -65,10 +65,12 @@ const (
 
 // ArtifactEntry is one archived ignored file.
 type ArtifactEntry struct {
-	Path   string       `json:"path"`
-	Digest string       `json:"digest"`
-	Size   int64        `json:"size"`
-	Kind   ArtifactKind `json:"kind"`
+	Path        string       `json:"path"`
+	Digest      string       `json:"digest"`
+	Size        int64        `json:"size"`
+	Kind        ArtifactKind `json:"kind"`
+	Retention   string       `json:"retention"`
+	Disposition string       `json:"disposition,omitempty"`
 }
 
 // ArtifactManifest records every archived path for one target worktree.
@@ -89,15 +91,22 @@ type ArchiveRequest struct {
 }
 
 // ArchiveReport is the operator-visible outcome. Dry-run never sets Removed.
+// NetReclaim is only source bytes whose digest already existed in the
+// archive. RelocatedBytes is a copy, not reclaim.
 type ArchiveReport struct {
-	Target   string          `json:"target"`
-	Archive  string          `json:"archive"`
-	Manifest string          `json:"manifest,omitempty"`
-	Act      bool            `json:"act"`
-	Entries  []ArtifactEntry `json:"entries"`
-	Archived int             `json:"archived"`
-	Removed  int             `json:"removed"`
-	Reason   string          `json:"reason,omitempty"`
+	Target          string          `json:"target"`
+	Archive         string          `json:"archive"`
+	Manifest        string          `json:"manifest,omitempty"`
+	Act             bool            `json:"act"`
+	Entries         []ArtifactEntry `json:"entries"`
+	Archived        int             `json:"archived"`
+	Removed         int             `json:"removed"`
+	SourceBytes     int64           `json:"source_bytes"`
+	ArchiveNewBytes int64           `json:"archive_new_bytes"`
+	DedupSavings    int64           `json:"dedup_savings"`
+	RelocatedBytes  int64           `json:"relocated_bytes"`
+	NetReclaim      int64           `json:"net_reclaim"`
+	Reason          string          `json:"reason,omitempty"`
 }
 
 // ClassifyArtifactPath marks receipt evidence versus rebuildable derived files.
@@ -198,11 +207,16 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		if err != nil {
 			return nil, fmt.Errorf("artifact-archive: hash %s: %w", rel, err)
 		}
-		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: ClassifyArtifactPath(rel)}
+		kind := ClassifyArtifactPath(rel)
+		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: kind, Retention: retentionOf(kind)}
+		rep.SourceBytes += size
+		existed := objectExists(archive, sum)
 		if req.Act {
-			if err := writeObject(archive, src, sum); err != nil {
+			created, err := writeObject(archive, src, sum)
+			if err != nil {
 				return nil, fmt.Errorf("artifact-archive: store %s: %w", rel, err)
 			}
+			existed = !created
 			if afterArchiveHook != nil {
 				afterArchiveHook(src)
 			}
@@ -211,13 +225,22 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 				return nil, fmt.Errorf("artifact-archive: drift on %s before removal (archived %s, now %s)", rel, sum, again)
 			}
 		}
+		if existed {
+			ent.Disposition = "deduped"
+			rep.DedupSavings += size
+		} else {
+			ent.Disposition = "relocated"
+			rep.RelocatedBytes += size
+			rep.ArchiveNewBytes += size
+		}
 		entries = append(entries, ent)
 	}
 	rep.Entries = entries
 	rep.Archived = len(entries)
 
 	if !req.Act {
-		rep.Reason = "dry-run: archived nothing, removed nothing"
+		rep.NetReclaim = 0
+		rep.Reason = "dry-run: relocation is not reclaim; net_reclaim stays 0 until sources are removed against an existing digest"
 		return rep, nil
 	}
 
@@ -258,7 +281,20 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		}
 		rep.Removed++
 	}
+	rep.NetReclaim = rep.DedupSavings
 	return rep, nil
+}
+
+func retentionOf(kind ArtifactKind) string {
+	if kind == ArtifactReceipt {
+		return "evidence"
+	}
+	return "regenerable"
+}
+
+func objectExists(archive, digest string) bool {
+	got, _, err := hashFile(objectPath(archive, digest))
+	return err == nil && got == digest
 }
 
 func listIgnoredFiles(target string) ([]string, error) {
@@ -450,51 +486,51 @@ func objectPath(archive, digest string) string {
 	return filepath.Join(archive, "objects", "sha256", digest[:2], digest)
 }
 
-func writeObject(archive, src, digest string) error {
+func writeObject(archive, src, digest string) (created bool, err error) {
 	dst := objectPath(archive, digest)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := os.Lstat(dst); err == nil {
 		got, _, err := hashFile(dst)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if got != digest {
-			return fmt.Errorf("object %s already exists with a different digest", digest)
+			return false, fmt.Errorf("object %s already exists with a different digest", digest)
 		}
-		return nil
+		return false, nil
 	}
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		_ = os.Remove(dst)
-		return err
+		return false, err
 	}
 	if err := out.Sync(); err != nil {
 		out.Close()
-		return err
+		return false, err
 	}
 	if err := out.Close(); err != nil {
-		return err
+		return false, err
 	}
 	got, _, err := hashFile(dst)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if got != digest {
 		_ = os.Remove(dst)
-		return fmt.Errorf("object readback digest %s != %s", got, digest)
+		return false, fmt.Errorf("object readback digest %s != %s", got, digest)
 	}
-	return nil
+	return true, nil
 }
 
 func writeManifest(archive, target string, entries []ArtifactEntry) (string, error) {

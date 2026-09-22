@@ -169,6 +169,78 @@ func TestArchiveIgnoredActiveOwnerRefuses(t *testing.T) {
 	}
 }
 
+func TestArchiveAccountingRelocationIsNotReclaim(t *testing.T) {
+	root, wt := archiveFixture(t)
+	src := filepath.Join(wt, ".herd", "receipts", "FAC-843.json")
+	size := int64(len(`{"ref":"FAC-843"}`))
+	info, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size = info.Size()
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.SourceBytes == 0 {
+		t.Fatal("source_bytes")
+	}
+	if rep.RelocatedBytes == 0 || rep.ArchiveNewBytes == 0 {
+		t.Fatalf("unique files must be relocation, report=%+v", rep)
+	}
+	if rep.NetReclaim != 0 {
+		t.Fatalf("relocation claimed as reclaim: net_reclaim=%d", rep.NetReclaim)
+	}
+	_ = size
+}
+
+func TestArchiveDuplicateCarrierDedupReclaims(t *testing.T) {
+	root, wtA := archiveFixture(t)
+	payload := []byte("shared-bin-herd-bytes")
+	if err := os.WriteFile(filepath.Join(wtA, "bin", "herd"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wtA, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.NetReclaim != 0 {
+		t.Fatalf("first carrier relocation must not reclaim, got %d", first.NetReclaim)
+	}
+
+	wtB := filepath.Join(root, ".herd", "worktrees", "fac-843-b")
+	cmd := exec.Command("git", "-C", root, "worktree", "add", "-q", wtB, "HEAD")
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t", "GIT_CONFIG_GLOBAL=/dev/null")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("second carrier: %v\n%s", err, out)
+	}
+	if err := os.MkdirAll(filepath.Join(wtB, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtB, "bin", "herd"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wtB, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var derived int64
+	for _, e := range second.Entries {
+		if e.Path == "bin/herd" {
+			if e.Disposition != "deduped" || e.Retention != "regenerable" {
+				t.Fatalf("second derived file %+v", e)
+			}
+			derived = e.Size
+		}
+	}
+	if derived == 0 || second.ArchiveNewBytes != 0 {
+		t.Fatalf("second carrier must not grow the archive: %+v", second)
+	}
+	if second.NetReclaim != derived || second.DedupSavings != derived {
+		t.Fatalf("dedup reclaim=%d savings=%d want %d", second.NetReclaim, second.DedupSavings, derived)
+	}
+}
+
 func TestClassifyArtifactPathReceipts(t *testing.T) {
 	if ClassifyArtifactPath(".herd/receipts/FAC-843.json") != ArtifactReceipt {
 		t.Fatal("receipt")
