@@ -1,13 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
@@ -27,9 +27,9 @@ func runArtifactArchiveArgs(args []string) error {
 	if err != nil {
 		return fmt.Errorf("artifact-archive: cwd: %w", err)
 	}
-	root, err := execGitRoot(cwd)
+	root, err := gitroot.Toplevel(context.Background(), cwd)
 	if err != nil {
-		return err
+		return fmt.Errorf("artifact-archive: canonical git root: %w", err)
 	}
 	req := worktree.ArchiveRequest{
 		Root:    root,
@@ -138,20 +138,4 @@ func parseArtifactArchiveArgs(args []string) (artifactArchiveOpts, error) {
 		return opts, fmt.Errorf("usage: herd artifact-archive --target <worktree> [--archive DIR] [--plan FILE] [--dry-run|--act] [--json]")
 	}
 	return opts, nil
-}
-
-func execGitRoot(cwd string) (string, error) {
-	cmd := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("artifact-archive: canonical git root: %w", err)
-	}
-	root := strings.TrimSpace(string(out))
-	if root == "" {
-		return "", fmt.Errorf("artifact-archive: canonical git root is empty")
-	}
-	if abs, err := filepath.Abs(root); err == nil {
-		return abs, nil
-	}
-	return root, nil
 }

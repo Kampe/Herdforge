@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
 // afterArchiveHook is test-only: it fires after an object is stored and
@@ -518,7 +520,7 @@ func refuseProcessHolders(paths []string) error {
 }
 
 func refuseActiveOwner(target string, now time.Time) error {
-	raw, err := os.ReadFile(filepath.Join(target, "TASK-CONTEXT.json"))
+	raw, err := os.ReadFile(filepath.Join(target, gitroot.TaskContextFile))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
