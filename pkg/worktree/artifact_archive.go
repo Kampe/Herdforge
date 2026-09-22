@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -329,22 +330,15 @@ func refuseLiveCwdOwner(target string) error {
 	if err != nil {
 		return fmt.Errorf("artifact-archive: herdr agent list failed; refusing unknown live owners: %w", err)
 	}
+	agents, err := decodeHerdrAgentRoster(out)
+	if err != nil {
+		return fmt.Errorf("artifact-archive: %w; refusing unknown live owners", err)
+	}
 	want, _ := filepath.EvalSymlinks(target)
 	if want == "" {
 		want = target
 	}
-	var payload struct {
-		Result struct {
-			Agents []struct {
-				Cwd           string `json:"cwd"`
-				ForegroundCwd string `json:"foreground_cwd"`
-			} `json:"agents"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(out, &payload); err != nil {
-		return fmt.Errorf("artifact-archive: herdr agent list is not JSON; refusing unknown live owners: %w", err)
-	}
-	for _, a := range payload.Result.Agents {
+	for _, a := range agents {
 		for _, raw := range []string{a.Cwd, a.ForegroundCwd} {
 			if cwdOwnsArchiveTarget(raw, want) {
 				return fmt.Errorf("artifact-archive: herdr process cwd owns %s; refusing", target)
@@ -352,6 +346,64 @@ func refuseLiveCwdOwner(target string) error {
 		}
 	}
 	return nil
+}
+
+type herdrListedAgent struct {
+	Cwd           string `json:"cwd"`
+	ForegroundCwd string `json:"foreground_cwd"`
+}
+
+// decodeHerdrAgentRoster requires one successful herdr agent-list document:
+// a result object with a non-null agents array. {} / null / error envelopes
+// must not be treated as an empty safe roster (coordinator 4745).
+func decodeHerdrAgentRoster(out []byte) ([]herdrListedAgent, error) {
+	dec := json.NewDecoder(bytes.NewReader(bytes.TrimSpace(out)))
+	var env struct {
+		Error  json.RawMessage `json:"error"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := dec.Decode(&env); err != nil {
+		return nil, fmt.Errorf("herdr agent list is not JSON: %w", err)
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("herdr agent list has trailing JSON")
+	}
+	if jsonTokenPresent(env.Error) {
+		return nil, fmt.Errorf("herdr agent list error envelope")
+	}
+	if !jsonIsObject(env.Result) {
+		return nil, fmt.Errorf("herdr agent list missing result object")
+	}
+	var result struct {
+		Agents json.RawMessage `json:"agents"`
+	}
+	if err := json.Unmarshal(env.Result, &result); err != nil {
+		return nil, fmt.Errorf("herdr agent list result is not an object: %w", err)
+	}
+	if !jsonIsArray(result.Agents) {
+		return nil, fmt.Errorf("herdr agent list missing agents array")
+	}
+	agents := []herdrListedAgent{}
+	if err := json.Unmarshal(result.Agents, &agents); err != nil {
+		return nil, fmt.Errorf("herdr agent list agents are not objects: %w", err)
+	}
+	return agents, nil
+}
+
+func jsonTokenPresent(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s != "" && s != "null"
+}
+
+func jsonIsObject(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+func jsonIsArray(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return len(s) >= 2 && s[0] == '[' && s[len(s)-1] == ']'
 }
 
 func cwdOwnsArchiveTarget(cwd, want string) bool {

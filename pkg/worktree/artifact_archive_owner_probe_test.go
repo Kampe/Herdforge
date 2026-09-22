@@ -2,10 +2,55 @@ package worktree
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestDecodeHerdrAgentRosterRequiresExplicitAgentsArray(t *testing.T) {
+	// Coordinator 4745: unmarshalling into a zero struct treated {},
+	// result.agents:null, and error envelopes as an empty safe roster.
+	ok, err := decodeHerdrAgentRoster([]byte(`{"id":"cli:agent:list","result":{"agents":[]}}`))
+	if err != nil {
+		t.Fatalf("real empty array must succeed: %v", err)
+	}
+	if ok == nil || len(ok) != 0 {
+		t.Fatalf("empty array roster = %#v", ok)
+	}
+
+	refusals := []string{
+		`{}`,
+		`null`,
+		`{"result":null}`,
+		`{"result":{}}`,
+		`{"result":{"agents":null}}`,
+		`{"error":"boom"}`,
+		`{"error":{"message":"boom"},"result":{"agents":[]}}`,
+		`{"result":{"agents":{}}}`,
+		`{"result":{"agents":[]}}{"extra":true}`,
+	}
+	for _, raw := range refusals {
+		_, err := decodeHerdrAgentRoster([]byte(raw))
+		if err == nil {
+			t.Fatalf("payload %s must refuse unknown owners", raw)
+		}
+	}
+}
+
+func TestDecodeHerdrAgentRosterAcceptsLiveHerdrList(t *testing.T) {
+	path, err := exec.LookPath("herdr")
+	if err != nil {
+		t.Skip("herdr not on PATH")
+	}
+	out, err := exec.Command(path, "agent", "list").Output()
+	if err != nil {
+		t.Fatalf("live herdr agent list: %v", err)
+	}
+	if _, err := decodeHerdrAgentRoster(out); err != nil {
+		t.Fatalf("live herdr roster rejected: %v\n%s", err, out)
+	}
+}
 
 func TestRefuseLiveCwdOwnerDoesNotPassJSONFlag(t *testing.T) {
 	dir := t.TempDir()
