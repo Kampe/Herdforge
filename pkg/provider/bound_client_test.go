@@ -59,6 +59,12 @@ func TestBoundClient_ListTimeout_NeverEmptySuccess(t *testing.T) {
 			t.Fatalf("structured diagnostics omit %q: %v", want, err)
 		}
 	}
+	if strings.Contains(err.Error(), `"elapsed":"0s"`) {
+		t.Fatalf("a 40ms list deadline reported elapsed 0s: %v", err)
+	}
+	if !strings.Contains(err.Error(), `"elapsed":"`) {
+		t.Fatalf("structured diagnostics omit elapsed: %v", err)
+	}
 	if ClassifyOpError(err) != OpTimeout {
 		t.Fatalf("class=%q", ClassifyOpError(err))
 	}

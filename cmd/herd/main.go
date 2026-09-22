@@ -4512,6 +4512,9 @@ func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID, providerName string,
 			phases.Enter("ReconcileBoard provider census")
 			return syncer.ReconcileBoard(ctx, projectID, ".")
 		})
+	// deps check exits 3 on diag.Unknown() (timeout or failed read). board-sync
+	// keeps exit 3 for ReadTimedOut only so a fast provider error stays exit 1
+	// (hard error) rather than collapsing into the UNKNOWN timeout code.
 	if diag.Outcome == provider.ReadTimedOut {
 		fmt.Fprintf(os.Stderr, "board-sync: UNKNOWN: %s\n", diag.String())
 		return 3

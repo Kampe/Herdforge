@@ -181,6 +181,8 @@ func runBoardAudit() {
 			phases.Enter("AuditDone provider census")
 			return hsync.AuditDone(ctx, tp, ".", cfg.TaskProvider.ProjectID)
 		})
+	// deps check exits 3 on diag.Unknown(); board-audit uses exit 3 only for
+	// ReadTimedOut so a fast provider error stays operational exit 1.
 	if diag.Outcome == provider.ReadTimedOut {
 		fmt.Fprintf(os.Stderr, "herd board-audit: UNKNOWN: %s\n", diag.String())
 		os.Exit(3)

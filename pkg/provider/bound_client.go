@@ -55,6 +55,10 @@ func (b *BoundClient) deadlines() Deadlines {
 }
 
 func (b *BoundClient) wrap(op string, kind OpKind, err error) error {
+	return b.wrapSince(op, kind, err, time.Time{})
+}
+
+func (b *BoundClient) wrapSince(op string, kind OpKind, err error, started time.Time) error {
 	if err == nil {
 		return nil
 	}
@@ -83,10 +87,15 @@ func (b *BoundClient) wrap(op string, kind OpKind, err error) error {
 		if IsTimeout(original) || IsAmbiguous(original) {
 			outcome = ReadTimedOut
 		}
+		elapsed := time.Duration(0)
+		if !started.IsZero() {
+			elapsed = time.Since(started)
+		}
 		diag := ReadDiagnostics{
 			Provider: b.providerName(),
 			Phase:    op,
 			Budget:   b.deadlines().For(kind),
+			Elapsed:  elapsed,
 			Outcome:  outcome,
 			Err:      original.Error(),
 		}
@@ -121,21 +130,23 @@ func (b *BoundClient) GetTask(ctx context.Context, id string) (*Task, error) {
 	if b == nil || b.Inner == nil {
 		return nil, fmt.Errorf("GetTask: nil provider")
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpGet)
 	defer cancel()
 	t, err := b.Inner.GetTask(opCtx, id)
-	return t, b.wrap("GetTask", OpGet, err)
+	return t, b.wrapSince("GetTask", OpGet, err, started)
 }
 
 func (b *BoundClient) ListTasks(ctx context.Context, projectID, status string) ([]*Task, error) {
 	if b == nil || b.Inner == nil {
 		return nil, fmt.Errorf("ListTasks: nil provider")
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
 	defer cancel()
 	tasks, err := b.Inner.ListTasks(opCtx, projectID, status)
 	if err != nil {
-		return nil, b.wrap("ListTasks", OpList, err)
+		return nil, b.wrapSince("ListTasks", OpList, err, started)
 	}
 	// Never treat timeout as empty success: nil err + nil/empty is fine;
 	// a wrapped timeout already returned above.
@@ -214,10 +225,11 @@ func (b *BoundClient) ListTaskLabels(ctx context.Context, taskID string) ([]Task
 	if err != nil {
 		return nil, err
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
 	defer cancel()
 	rows, e := p.ListTaskLabels(opCtx, taskID)
-	return rows, b.wrap("ListTaskLabels", OpList, e)
+	return rows, b.wrapSince("ListTaskLabels", OpList, e, started)
 }
 
 func (b *BoundClient) ListTaskLabelsBulk(ctx context.Context, taskIDs []string) (BulkTaskLabels, error) {
@@ -228,11 +240,12 @@ func (b *BoundClient) ListTaskLabelsBulk(ctx context.Context, taskIDs []string) 
 	if !ok {
 		return BulkTaskLabels{}, fmt.Errorf("ListTaskLabelsBulk: provider unsupported")
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
 	defer cancel()
 	result, err := p.ListTaskLabelsBulk(opCtx, taskIDs)
 	if err != nil {
-		return BulkTaskLabels{}, b.wrap("ListTaskLabelsBulk", OpList, err)
+		return BulkTaskLabels{}, b.wrapSince("ListTaskLabelsBulk", OpList, err, started)
 	}
 	return result, nil
 }
@@ -332,10 +345,11 @@ func (b *BoundClient) ListRelations(ctx context.Context, taskID string) ([]Relat
 	if err != nil {
 		return nil, err
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
 	defer cancel()
 	rels, e := rp.ListRelations(opCtx, taskID)
-	return rels, b.wrap("ListRelations", OpList, e)
+	return rels, b.wrapSince("ListRelations", OpList, e, started)
 }
 
 func (b *BoundClient) CreateRelation(ctx context.Context, sourceID, targetID string, typ RelationType) (*Relation, error) {
@@ -377,10 +391,11 @@ func (b *BoundClient) ListProjectRelations(ctx context.Context, projectID string
 		}
 		return nil, fmt.Errorf("%w: inner does not implement BulkRelationProvider", errCapability)
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpList)
 	defer cancel()
 	rels, e := bp.ListProjectRelations(opCtx, projectID)
-	return rels, b.wrap("ListProjectRelations", OpList, e)
+	return rels, b.wrapSince("ListProjectRelations", OpList, e, started)
 }
 
 func (b *BoundClient) relationProvider() (RelationProvider, error) {
@@ -418,8 +433,9 @@ func (b *BoundClient) ListComments(ctx context.Context, taskID string) ([]string
 	if !ok {
 		return nil, fmt.Errorf("provider does not support comment readback")
 	}
+	started := time.Now()
 	opCtx, cancel := BoundOp(ctx, b.deadlines(), OpGet)
 	defer cancel()
 	out, err := reader.ListComments(opCtx, taskID)
-	return out, b.wrap("ListComments", OpGet, err)
+	return out, b.wrapSince("ListComments", OpGet, err, started)
 }
