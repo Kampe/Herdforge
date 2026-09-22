@@ -1,13 +1,16 @@
 package main
 
 import (
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/config"
+	"github.com/Kampe/Herdforge/pkg/mergeadmit"
 )
 
 func standingGit(t *testing.T, dir string, args ...string) string {
@@ -88,6 +91,40 @@ func TestPrepareStandingWorktreeRefusesUnmergedAhead(t *testing.T) {
 	err := prepareStandingWorktree(lane)
 	if err == nil || !strings.Contains(err.Error(), "unmerged") || !strings.Contains(err.Error(), "ahead") {
 		t.Fatalf("ahead standing raise must refuse with distance, got %v", err)
+	}
+}
+
+func TestAdmitStandingWorktreeFetchHonorsProofDeadline(t *testing.T) {
+	_, _, laneDir, _ := standingLaneRepo(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		c, accErr := ln.Accept()
+		if accErr != nil {
+			return
+		}
+		defer c.Close()
+		time.Sleep(30 * time.Second)
+	}()
+	standingGit(t, laneDir, "remote", "set-url", "origin", "git://"+ln.Addr().String()+"/")
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	prev := cliProofBudget
+	cliProofBudget = mergeadmit.ProofBudget{Deadline: 400 * time.Millisecond}
+	t.Cleanup(func() { cliProofBudget = prev })
+	start := time.Now()
+	err = prepareStandingWorktree(&config.LaneDef{Name: "scout", Worktree: "wt/scout"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("stalled fetch must refuse")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("fetch hung %s beyond proof deadline", elapsed)
+	}
+	if !strings.Contains(err.Error(), "timed out") && !strings.Contains(err.Error(), "deadline") && !strings.Contains(err.Error(), "context") {
+		t.Fatalf("want bounded fetch timeout, got %v after %s", err, elapsed)
 	}
 }
 

@@ -6880,15 +6880,23 @@ func prepareStandingWorktreeWith(lane *config.LaneDef, add func(path, branch str
 // admitExistingStandingWorktree re-admits a standing lane against fresh
 // origin/main at raise time (FAC-621). Dirty trees and unmerged commits ahead
 // refuse; a clean behind tree fast-forwards. A 0/0 tree raises unchanged.
+// Network fetch uses mergeadmit.BoundedGit under ProofContext so a stalled
+// remote is killed by the existing proof deadline instead of hanging raise.
 func admitExistingStandingWorktree(wtPath, laneName string) error {
-	if err := standingGitAt(wtPath, "fetch", "-q", "origin"); err != nil {
+	ctx, cancel := (&mergeadmit.Gate{ProofBudget: cliProofBudget}).ProofContext()
+	defer cancel()
+	git := mergeadmit.BoundedGit(ctx, wtPath)
+	if _, err := git("fetch", "-q", "origin"); err != nil {
+		if mergeadmit.ProofRunAborted(ctx, err) {
+			return fmt.Errorf("refuse standing raise for lane %s: fetch origin timed out: %w", laneName, err)
+		}
 		return fmt.Errorf("refuse standing raise for lane %s: fetch origin failed: %w", laneName, err)
 	}
-	base, err := standingGitOutput(wtPath, "rev-parse", "origin/main")
+	base, err := git("rev-parse", "origin/main")
 	if err != nil {
 		return fmt.Errorf("refuse standing raise for lane %s: origin/main is missing after fetch: %w", laneName, err)
 	}
-	counts, err := standingGitOutput(wtPath, "rev-list", preflight.GitRevListLeftRight, "--count", "HEAD...origin/main")
+	counts, err := git("rev-list", preflight.GitRevListLeftRight, "--count", "HEAD...origin/main")
 	if err != nil {
 		return fmt.Errorf("refuse standing raise for lane %s: measure origin/main distance: %w", laneName, err)
 	}
@@ -6904,7 +6912,7 @@ func admitExistingStandingWorktree(wtPath, laneName string) error {
 	if err != nil {
 		return fmt.Errorf("refuse standing raise for lane %s: parse behind count %q: %w", laneName, parts[1], err)
 	}
-	dirty, err := standingGitOutput(wtPath, "status", "--porcelain")
+	dirty, err := git("status", "--porcelain")
 	if err != nil {
 		return fmt.Errorf("refuse standing raise for lane %s: status: %w", laneName, err)
 	}
@@ -6915,26 +6923,12 @@ func admitExistingStandingWorktree(wtPath, laneName string) error {
 		return fmt.Errorf("refuse standing raise for lane %s: unmerged commits ahead of origin/main: origin/main is %d commit(s) ahead and the lane is %d commit(s) ahead", laneName, behind, ahead)
 	}
 	if behind > 0 {
-		if err := standingGitAt(wtPath, "merge", "--ff-only", "origin/main"); err != nil {
+		if _, err := git("merge", "--ff-only", "origin/main"); err != nil {
 			return fmt.Errorf("refuse standing raise for lane %s: fast-forward onto origin/main failed (%d behind / %d ahead): %w", laneName, behind, ahead, err)
 		}
 	}
 	fmt.Printf("standing worktree %s admitted at %s (%d behind / %d ahead vs origin/main)\n", laneName, base, behind, ahead)
 	return nil
-}
-
-func standingGitAt(dir string, args ...string) error {
-	_, err := standingGitOutput(dir, args...)
-	return err
-}
-
-func standingGitOutput(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 func routedLaneDecision(ctx context.Context, task *provider.Task) func(*config.LaneDef) (*router.LaunchDecision, error) {
