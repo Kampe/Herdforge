@@ -4498,7 +4498,7 @@ func runBoardSync() {
 
 	if *intervalSec > 0 {
 		for {
-			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, providerLabel(cfg), *asJSON)
 			if code != 0 {
 				os.Exit(code)
 			}
@@ -4506,13 +4506,27 @@ func runBoardSync() {
 		}
 	}
 
-	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, providerLabel(cfg), *asJSON)
 	os.Exit(code)
 }
 
-func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID string, asJSON bool) int {
-	drift, err := syncer.ReconcileBoard(context.Background(), projectID, ".")
+func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID, providerName string, asJSON bool) int {
+	drift, diag, err := provider.BoundedRead(context.Background(), providerName, providerReadBudget(), "",
+		func(ctx context.Context, phases *provider.Phases) (*hsync.BoardDrift, error) {
+			phases.Enter("ReconcileBoard provider census")
+			return syncer.ReconcileBoard(ctx, projectID, ".")
+		})
+	// deps check exits 3 on diag.Unknown() (timeout or failed read). board-sync
+	// keeps exit 3 for ReadTimedOut only so a fast provider error stays exit 1
+	// (hard error) rather than collapsing into the UNKNOWN timeout code.
+	if diag.Outcome == provider.ReadTimedOut {
+		fmt.Fprintf(os.Stderr, "board-sync: UNKNOWN: %s\n", diag.String())
+		return 3
+	}
 	if err != nil {
+		if cause := errors.Unwrap(err); cause != nil {
+			err = cause
+		}
 		fmt.Fprintf(os.Stderr, "board-sync: %v\n", err)
 		return 1
 	}

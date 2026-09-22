@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -57,19 +58,41 @@ func (d ReadDiagnostics) Unknown() bool {
 	return d.Outcome == ReadTimedOut || d.Outcome == ReadFailed
 }
 
-// String is the one line an operator sees instead of silence.
+// String is the one line an operator sees instead of silence. The payload is
+// JSON so a consumer can distinguish timeout from empty-result without parsing
+// prose: provider, phase, applied deadline, and last successful cache revision
+// are named fields. "none" is an observed absence of a successful revision,
+// never an omitted key that could look like "we did not check".
 func (d ReadDiagnostics) String() string {
+	lastRevision := strings.TrimSpace(d.LastRevision)
+	if lastRevision == "" {
+		lastRevision = "none"
+	}
+	structured, err := json.Marshal(struct {
+		Provider                    string      `json:"provider"`
+		Phase                       string      `json:"phase"`
+		AppliedDeadline             string      `json:"applied_deadline"`
+		Elapsed                     string      `json:"elapsed"`
+		LastSuccessfulCacheRevision string      `json:"last_successful_cache_revision"`
+		Outcome                     ReadOutcome `json:"outcome"`
+		Error                       string      `json:"error,omitempty"`
+	}{
+		Provider:                    d.Provider,
+		Phase:                       d.Phase,
+		AppliedDeadline:             d.Budget.String(),
+		Elapsed:                     d.Elapsed.Round(time.Millisecond).String(),
+		LastSuccessfulCacheRevision: lastRevision,
+		Outcome:                     d.Outcome,
+		Error:                       d.Err,
+	})
+	if err != nil {
+		// The view contains only strings and a string-backed enum, so this is a
+		// defensive fallback rather than an expected path. It must still speak.
+		structured = []byte(`{"provider":"unknown","phase":"diagnostic-encoding","applied_deadline":"unknown","last_successful_cache_revision":"none","outcome":"failed"}`)
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "provider read %s: provider=%s phase=%q budget=%s elapsed=%s",
-		d.Outcome, d.Provider, d.Phase, d.Budget, d.Elapsed.Round(time.Millisecond))
-	if d.LastRevision != "" {
-		fmt.Fprintf(&b, " last-successful-cache-revision=%s", d.LastRevision)
-	} else {
-		b.WriteString(" last-successful-cache-revision=none")
-	}
-	if d.Err != "" {
-		fmt.Fprintf(&b, " error=%q", d.Err)
-	}
+	fmt.Fprintf(&b, "provider read %s: %s", d.Outcome, structured)
 	if d.Unknown() {
 		b.WriteString("; this is UNKNOWN, not an empty or clean result -- do not infer clean state from it")
 	}
@@ -141,12 +164,20 @@ func BoundedRead[T any](ctx context.Context, providerName string, budget time.Du
 		diag.Elapsed = time.Since(started)
 		diag.Phase = phases.Current()
 		if r.err != nil {
-			diag.Outcome = ReadFailed
+			// A provider that respects the budget returns ctx.Err() on the
+			// done path. That is a timeout, not a semantic refusal: collapsing
+			// it into ReadFailed made a well-behaved client look like a
+			// distinct failure class from a hung one.
+			if IsTimeout(r.err) || IsAmbiguous(r.err) {
+				diag.Outcome = ReadTimedOut
+			} else {
+				diag.Outcome = ReadFailed
+			}
 			diag.Err = r.err.Error()
 			// Preserve both the callback's populated result and typed cause. A
 			// caller may have completed every provider read before reaching a
 			// semantic decision (for example, an open dependency blocker). The
-			// diagnostics remain failed/UNKNOWN until that caller proves the
+			// diagnostics remain UNKNOWN until that caller proves the
 			// returned value and error are a recognized semantic outcome.
 			return r.v, diag, fmt.Errorf("%s: %w", diag.String(), r.err)
 		}
