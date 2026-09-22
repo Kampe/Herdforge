@@ -623,7 +623,7 @@ REPORT_TARGET: %s (mandatory; never coordinator)
 REPORT_CONTRACT: deliver the signed verdict artifact to the review supervisor. The supervisor owns retries, author feedback, exact-SHA ledger ingest, and reviewer-tab cleanup. The coordinator receives only an exact PASS plus merge-ready handoff.
 cd %s
 1. git diff origin/main..%s --stat  (review ONLY these changed files)
-2. %s   (targeted tests for the changed packages, not the whole repo)
+2. %s   (named tests from the diff with -run; full heavy packages are hosted CI)
 `+reviewVerificationBudgetSection(scoped)+`
 Your FINAL line MUST be exactly one of:
 REVIEW VERDICT %s: APPROVED
