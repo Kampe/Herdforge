@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 )
@@ -263,4 +264,10 @@ func TestAwaitAgyPinnedModelReadyLiveTUI(t *testing.T) {
 	if ev.ConversationID != "" && !agyConversation.MatchString(ev.ConversationID) {
 		t.Fatalf("conversation id %q is not a genuine UUID", ev.ConversationID)
 	}
+	body, err := os.ReadFile(ev.LogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := regexp.MustCompile(`pid (\d+)`).FindAllStringSubmatch(string(body), -1)
+	t.Logf("launch pid=%d log=%s pin=%s conv=%s pid_tokens=%v children=%v", cmd.Process.Pid, filepath.Base(ev.LogFile), ev.PinnedModel, ev.ConversationID, tokens, listAgyChildPIDs(cmd.Process.Pid))
 }
