@@ -107,6 +107,12 @@ func writeSignedReceipt(t *testing.T, keyDir, repoDir, wt string, mutate func(*d
 	// Receipts are backed by a REAL live lease in the durable claim store —
 	// exact-lease validation requires it (FAC-145).
 	leaseID, leaseGen := acquireFixtureLease(t, repoDir, "FAC-1")
+	baseSHA := "abc"
+	if out, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").Output(); err == nil {
+		if sha := strings.TrimSpace(string(out)); len(sha) >= 12 {
+			baseSHA = sha
+		}
+	}
 	tc := dispatch.TaskContext{
 		ProviderType:    "kaneo",
 		ProjectID:       "proj-x",
@@ -115,7 +121,7 @@ func writeSignedReceipt(t *testing.T, keyDir, repoDir, wt string, mutate func(*d
 		TaskRef:         "FAC-1",
 		TaskID:          "t1",
 		Branch:          "herd/fac-1",
-		BaseSHA:         "abc",
+		BaseSHA:         baseSHA,
 		LeaseID:         leaseID,
 		LeaseGeneration: leaseGen,
 		LeaseTaskRef:    "FAC-1",
@@ -1605,6 +1611,14 @@ func TestReceiptIssueCLI_AdmitsEveryIsolatedAgentClass(t *testing.T) {
 		}
 		if tc.LeaseTaskRef != "FAC-1:"+role {
 			t.Fatalf("role lease scope = %q", tc.LeaseTaskRef)
+		}
+		if role == dispatch.RoleVerifier {
+			if tc.BaseSHA == "abc" {
+				t.Fatal("isolated-class verifier minted placeholder abc as BaseSHA")
+			}
+			if !gitIsAncestor(dir, tc.BaseSHA, tc.CandidateSHA) {
+				t.Fatalf("isolated-class verifier base %s is not an ancestor of %s", tc.BaseSHA, tc.CandidateSHA)
+			}
 		}
 		for _, op := range tc.AllowedOps {
 			if op == "mutate" {

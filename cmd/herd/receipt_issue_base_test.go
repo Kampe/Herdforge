@@ -71,6 +71,14 @@ func TestVerifierIssuanceBaseUsesMergeBaseWhenMainAdvanced(t *testing.T) {
 	}
 }
 
+func TestVerifierIssuanceBaseRefusesPlaceholderABC(t *testing.T) {
+	dir := gitInitIssuanceRepo(t)
+	cand := gitSHA(t, dir, "HEAD")
+	if _, err := verifierIssuanceBase(dir, cand, cand, "abc", ""); err == nil {
+		t.Fatal("placeholder abc was accepted as verifier base")
+	}
+}
+
 func TestVerifierIssuanceBaseRefusesExplicitNonAncestor(t *testing.T) {
 	dir := gitInitIssuanceRepo(t)
 	base := gitSHA(t, dir, "HEAD")
