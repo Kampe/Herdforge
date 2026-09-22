@@ -3,6 +3,7 @@ package herdr
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -125,10 +126,75 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 		}
 		return ProbeResult{Model: model, Reason: "probe failed: " + boundProbeFailureDetail(detail, status)}
 	}
+	if strings.EqualFold(provider, "agy") {
+		if reason := agyStructuredProbeReason(sanitizedOut, model); reason != "" {
+			return ProbeResult{Model: model, Reason: reason}
+		}
+		return ProbeResult{Model: model, Available: true}
+	}
 	if strings.TrimSpace(sanitizedOut) != probeToken {
 		return ProbeResult{Model: model, Reason: "no exact probe output"}
 	}
 	return ProbeResult{Model: model, Available: true}
+}
+
+// agyPrintEnvelope is the documented --output-format json payload
+// (also nested under stream-json event=result). Slash-command print
+// answers use empty conversation_id and num_turns=0; a model probe must
+// be a real assistant turn.
+type agyPrintEnvelope struct {
+	ConversationID string `json:"conversation_id"`
+	Status         string `json:"status"`
+	Response       string `json:"response"`
+	Model          string `json:"model"`
+}
+
+func agyStructuredProbeReason(stdout, requestedModel string) string {
+	env, err := decodeAgyPrintEnvelope(stdout)
+	if err != nil {
+		return "no structured agy probe result"
+	}
+	if !strings.EqualFold(strings.TrimSpace(env.Status), "SUCCESS") {
+		return "agy probe status is not SUCCESS"
+	}
+	if strings.TrimSpace(env.ConversationID) == "" {
+		return "agy probe missing conversation session"
+	}
+	if strings.TrimSpace(env.Response) != probeToken {
+		return "agy probe response is not the exact token"
+	}
+	if got := strings.TrimSpace(env.Model); got != "" && got != strings.TrimSpace(requestedModel) {
+		return "agy probe model does not match requested model"
+	}
+	return ""
+}
+
+func decodeAgyPrintEnvelope(stdout string) (agyPrintEnvelope, error) {
+	s := strings.TrimSpace(stdout)
+	var env agyPrintEnvelope
+	if err := json.Unmarshal([]byte(s), &env); err == nil && (env.Status != "" || env.Response != "" || env.ConversationID != "") {
+		return env, nil
+	}
+	var last json.RawMessage
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Event  string          `json:"event"`
+			Result json.RawMessage `json:"result"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Event == "result" && len(ev.Result) > 0 {
+			last = ev.Result
+		}
+	}
+	if len(last) > 0 {
+		if err := json.Unmarshal(last, &env); err == nil {
+			return env, nil
+		}
+	}
+	return agyPrintEnvelope{}, fmt.Errorf("agy print envelope not found")
 }
 
 // boundProbeDetail retains useful multiline provider diagnostics while keeping
@@ -187,7 +253,29 @@ func providerProbeCommand(provider, model, effort string) (string, []string, pro
 	if len(argv) == 0 {
 		return "", nil, probeDelivery{}, fmt.Errorf("no headless contract for provider %q (cannot probe what cannot be launched)", provider)
 	}
+	if provider == "agy" {
+		argv = insertAgyStructuredPrintFlags(argv)
+	}
 	return argv[0], argv[1:], probeDelivery{Mode: probeDeliveryFor(provider, delivery)}, nil
+}
+
+// insertAgyStructuredPrintFlags puts --output-format json before --print.
+// --print consumes the next argv as the prompt, so flags after it become the
+// prompt and never reach print-mode JSON.
+func insertAgyStructuredPrintFlags(argv []string) []string {
+	out := make([]string, 0, len(argv)+4)
+	inserted := false
+	for _, a := range argv {
+		if !inserted && (a == "--print" || a == "-p" || a == "--prompt") {
+			out = append(out, "--output-format", "json", "--disable-slash-commands")
+			inserted = true
+		}
+		out = append(out, a)
+	}
+	if !inserted {
+		out = append(out, "--output-format", "json", "--disable-slash-commands")
+	}
+	return out
 }
 
 // probeDeliveryFor returns how the probe hands its prompt to a surface.
