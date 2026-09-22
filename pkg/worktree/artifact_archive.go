@@ -376,19 +376,70 @@ func decodeHerdrAgentRoster(out []byte) ([]herdrListedAgent, error) {
 		return nil, fmt.Errorf("herdr agent list missing result object")
 	}
 	var result struct {
+		Error  json.RawMessage `json:"error"`
 		Agents json.RawMessage `json:"agents"`
 	}
 	if err := json.Unmarshal(env.Result, &result); err != nil {
 		return nil, fmt.Errorf("herdr agent list result is not an object: %w", err)
 	}
+	if jsonTokenPresent(result.Error) {
+		return nil, fmt.Errorf("herdr agent list nested error response")
+	}
 	if !jsonIsArray(result.Agents) {
 		return nil, fmt.Errorf("herdr agent list missing agents array")
 	}
-	agents := []herdrListedAgent{}
-	if err := json.Unmarshal(result.Agents, &agents); err != nil {
-		return nil, fmt.Errorf("herdr agent list agents are not objects: %w", err)
+	var elems []json.RawMessage
+	if err := json.Unmarshal(result.Agents, &elems); err != nil {
+		return nil, fmt.Errorf("herdr agent list agents are not an array: %w", err)
+	}
+	agents := make([]herdrListedAgent, 0, len(elems))
+	for _, el := range elems {
+		a, skip, err := decodeHerdrListedAgent(el)
+		if err != nil {
+			return nil, err
+		}
+		if skip {
+			continue
+		}
+		agents = append(agents, a)
 	}
 	return agents, nil
+}
+
+func decodeHerdrListedAgent(el json.RawMessage) (herdrListedAgent, bool, error) {
+	if !jsonIsObject(el) {
+		return herdrListedAgent{}, false, fmt.Errorf("herdr agent list has a null or non-object agent")
+	}
+	var raw struct {
+		Error         json.RawMessage `json:"error"`
+		Cwd           *string         `json:"cwd"`
+		ForegroundCwd *string         `json:"foreground_cwd"`
+		TerminalID    string          `json:"terminal_id"`
+		PaneID        string          `json:"pane_id"`
+	}
+	if err := json.Unmarshal(el, &raw); err != nil {
+		return herdrListedAgent{}, false, fmt.Errorf("herdr agent list agent is not an object: %w", err)
+	}
+	if jsonTokenPresent(raw.Error) {
+		return herdrListedAgent{}, false, fmt.Errorf("herdr agent list nested error response")
+	}
+	cwd, cwdSet := derefAgentCwd(raw.Cwd)
+	fg, fgSet := derefAgentCwd(raw.ForegroundCwd)
+	if cwd != "" || fg != "" {
+		return herdrListedAgent{Cwd: cwd, ForegroundCwd: fg}, false, nil
+	}
+	// Known-safe: herdr explicitly reported empty cwd fields on a named terminal.
+	if (cwdSet || fgSet) && (strings.TrimSpace(raw.TerminalID) != "" || strings.TrimSpace(raw.PaneID) != "") {
+		return herdrListedAgent{}, true, nil
+	}
+	return herdrListedAgent{}, false, fmt.Errorf("herdr agent list entry missing usable cwd")
+}
+
+func derefAgentCwd(p *string) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	return strings.TrimSpace(*p), true
 }
 
 func jsonTokenPresent(raw json.RawMessage) bool {

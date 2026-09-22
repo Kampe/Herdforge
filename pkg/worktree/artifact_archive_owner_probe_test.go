@@ -29,12 +29,26 @@ func TestDecodeHerdrAgentRosterRequiresExplicitAgentsArray(t *testing.T) {
 		`{"error":{"message":"boom"},"result":{"agents":[]}}`,
 		`{"result":{"agents":{}}}`,
 		`{"result":{"agents":[]}}{"extra":true}`,
+		`{"result":{"agents":[null]}}`,
+		`{"result":{"agents":[{}]}}`,
+		`{"result":{"error":"nested","agents":[]}}`,
+		`{"result":{"agents":[{"cwd":"/tmp/x","error":"nested"}]}}`,
+		`{"result":{"agents":[{"terminal_id":"term_x"}]}}`,
 	}
 	for _, raw := range refusals {
 		_, err := decodeHerdrAgentRoster([]byte(raw))
 		if err == nil {
 			t.Fatalf("payload %s must refuse unknown owners", raw)
 		}
+	}
+
+	owned, err := decodeHerdrAgentRoster([]byte(`{"id":"cli:agent:list","result":{"type":"agent_list","agents":[{"cwd":"/tmp/lab","foreground_cwd":"/tmp/lab","terminal_id":"term_1","pane_id":"w:p1"}]}}`))
+	if err != nil || len(owned) != 1 || owned[0].Cwd != "/tmp/lab" {
+		t.Fatalf("real cwd entry must parse: %#v %v", owned, err)
+	}
+	safe, err := decodeHerdrAgentRoster([]byte(`{"id":"cli:agent:list","result":{"agents":[{"cwd":"","foreground_cwd":"","terminal_id":"term_safe","pane_id":"w:p0"}]}}`))
+	if err != nil || len(safe) != 0 {
+		t.Fatalf("explicit empty cwd on a terminal is known-safe, not an owner: %#v %v", safe, err)
 	}
 }
 
