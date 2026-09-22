@@ -27,6 +27,7 @@ type RecordOpts struct {
 	Tier            string
 	Task            string
 	Lease           string
+	SessionID       string
 	// PatchURL is the candidate's independent patch identity. Admit binds it,
 	// and it is stable across a clean rebase, which is what lets a rebased
 	// candidate keep its verdict instead of being re-reviewed (FAC-656).
@@ -107,6 +108,7 @@ func (l *Ledger) record(opts RecordOpts) error {
 		Tier:            opts.Tier,
 		Task:            opts.Task,
 		Lease:           opts.Lease,
+		SessionID:       opts.SessionID,
 		PatchURL:        opts.PatchURL,
 	})
 }

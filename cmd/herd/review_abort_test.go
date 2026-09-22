@@ -45,6 +45,21 @@ func abortCLIEnv(ledgerPath string) []string {
 	return append(env, "HERD_REVIEW_LEDGER="+ledgerPath)
 }
 
+func seedAbortCLILaunch(t *testing.T, dir, ledgerPath string, m herdr.ReviewRetirementManifest) {
+	t.Helper()
+	l, err := reviewledger.NewReviewLedger(dir, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce,
+		Pane: m.PaneID, Task: m.TaskRef, SessionID: m.SessionID,
+		BuilderFamily: "google",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReviewAbortCLI_SessionMismatch(t *testing.T) {
 	binary := buildHerd(t)
 	dir := t.TempDir()
@@ -59,11 +74,16 @@ func TestReviewAbortCLI_SessionMismatch(t *testing.T) {
 	}
 }
 
-func TestReviewAbortCLI_DryRunDoesNotWriteLedger(t *testing.T) {
+func TestReviewAbortCLI_DryRunDoesNotWriteAbort(t *testing.T) {
 	binary := buildHerd(t)
 	dir := t.TempDir()
 	path, m := writeAbortManifest(t, dir)
 	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	seedAbortCLILaunch(t, dir, ledgerPath, m)
+	before, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(binary, "review-abort", "--manifest", path, "--session", m.SessionID, "--reason", "quota-exhausted", "--dry-run")
 	cmd.Dir = dir
 	cmd.Env = abortCLIEnv(ledgerPath)
@@ -71,8 +91,12 @@ func TestReviewAbortCLI_DryRunDoesNotWriteLedger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry-run: %v\n%s", err, out)
 	}
-	if _, err := os.Stat(ledgerPath); !os.IsNotExist(err) {
-		t.Fatal("dry-run must not create a ledger")
+	after, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), `"event":"coordinator-abort"`) || string(after) != string(before) {
+		t.Fatalf("dry-run must not append abort, before=%s after=%s", before, after)
 	}
 }
 
@@ -81,6 +105,7 @@ func TestReviewAbortCLI_ActWritesAbortNotVerdict(t *testing.T) {
 	dir := t.TempDir()
 	path, m := writeAbortManifest(t, dir)
 	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	seedAbortCLILaunch(t, dir, ledgerPath, m)
 	cmd := exec.Command(binary, "review-abort", "--manifest", path, "--session", m.SessionID, "--reason", "quota-exhausted", "--act")
 	cmd.Dir = dir
 	cmd.Env = abortCLIEnv(ledgerPath)
@@ -106,6 +131,7 @@ func TestReviewAbortCLI_ActRefusesPASS(t *testing.T) {
 	dir := t.TempDir()
 	path, m := writeAbortManifest(t, dir)
 	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	seedAbortCLILaunch(t, dir, ledgerPath, m)
 	l, err := reviewledger.NewReviewLedger(dir, ledgerPath)
 	if err != nil {
 		t.Fatal(err)
@@ -123,5 +149,69 @@ func TestReviewAbortCLI_ActRefusesPASS(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "existing PASS") {
 		t.Fatalf("want PASS refuse, got err=%v\n%s", err, out)
+	}
+}
+
+func TestReviewAbortCLI_RefusesNonexistentLaunch(t *testing.T) {
+	binary := buildHerd(t)
+	dir := t.TempDir()
+	path, m := writeAbortManifest(t, dir)
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	cmd := exec.Command(binary, "review-abort", "--manifest", path, "--session", m.SessionID, "--reason", "quota-exhausted", "--act")
+	cmd.Dir = dir
+	cmd.Env = abortCLIEnv(ledgerPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "canonical launch record") {
+		t.Fatalf("want nonexistent launch refuse, got err=%v\n%s", err, out)
+	}
+}
+
+func TestReviewAbortCLI_RefusesWrongLease(t *testing.T) {
+	binary := buildHerd(t)
+	dir := t.TempDir()
+	path, m := writeAbortManifest(t, dir)
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	l, err := reviewledger.NewReviewLedger(dir, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: "other-lease",
+		Pane: m.PaneID, Task: m.TaskRef, SessionID: m.SessionID,
+		BuilderFamily: "google",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "review-abort", "--manifest", path, "--session", m.SessionID, "--reason", "quota-exhausted", "--act")
+	cmd.Dir = dir
+	cmd.Env = abortCLIEnv(ledgerPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "lease does not bind") {
+		t.Fatalf("want wrong lease refuse, got err=%v\n%s", err, out)
+	}
+}
+
+func TestReviewAbortCLI_RefusesWrongSession(t *testing.T) {
+	binary := buildHerd(t)
+	dir := t.TempDir()
+	path, m := writeAbortManifest(t, dir)
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	l, err := reviewledger.NewReviewLedger(dir, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce,
+		Pane: m.PaneID, Task: m.TaskRef, SessionID: "other-session",
+		BuilderFamily: "google",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "review-abort", "--manifest", path, "--session", m.SessionID, "--reason", "quota-exhausted", "--act")
+	cmd.Dir = dir
+	cmd.Env = abortCLIEnv(ledgerPath)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "session does not bind") {
+		t.Fatalf("want wrong session refuse, got err=%v\n%s", err, out)
 	}
 }

@@ -26,6 +26,9 @@ func validateCoordinatorAbort(rows []LedgerRow, opts AbortOpts) error {
 		strings.TrimSpace(opts.Reason) == "" {
 		return fmt.Errorf("coordinator abort requires sha, reviewer, lease, session, and reason")
 	}
+	if _, err := canonicalLaunchForAbort(rows, opts); err != nil {
+		return err
+	}
 	for _, row := range rows {
 		if row.Event != string(EventVerdict) || row.SHA != opts.SHA || row.Reviewer != opts.Reviewer {
 			continue
@@ -35,6 +38,38 @@ func validateCoordinatorAbort(rows []LedgerRow, opts AbortOpts) error {
 		}
 	}
 	return nil
+}
+
+// canonicalLaunchForAbort returns the last EventRecord that binds this abort
+// to an exact candidate, reviewer, lease, and (when recorded) session/pane/task.
+func canonicalLaunchForAbort(rows []LedgerRow, opts AbortOpts) (LedgerRow, error) {
+	var sameReviewerSHA, leaseMatches []LedgerRow
+	for _, row := range rows {
+		if row.Event != string(EventRecord) || row.SHA != opts.SHA || row.Reviewer != opts.Reviewer {
+			continue
+		}
+		sameReviewerSHA = append(sameReviewerSHA, row)
+		if row.Lease == opts.Lease {
+			leaseMatches = append(leaseMatches, row)
+		}
+	}
+	if len(sameReviewerSHA) == 0 {
+		return LedgerRow{}, fmt.Errorf("coordinator abort requires a canonical launch record for reviewer %s", opts.Reviewer)
+	}
+	if len(leaseMatches) == 0 {
+		return LedgerRow{}, fmt.Errorf("coordinator abort lease does not bind the canonical launch")
+	}
+	launch := leaseMatches[len(leaseMatches)-1]
+	if sid := strings.TrimSpace(launch.SessionID); sid != "" && sid != opts.SessionID {
+		return LedgerRow{}, fmt.Errorf("coordinator abort session does not bind the canonical launch")
+	}
+	if pane := strings.TrimSpace(opts.Pane); pane != "" && strings.TrimSpace(launch.Pane) != pane {
+		return LedgerRow{}, fmt.Errorf("coordinator abort pane does not bind the canonical launch")
+	}
+	if task := strings.TrimSpace(opts.Task); task != "" && strings.TrimSpace(launch.Task) != task {
+		return LedgerRow{}, fmt.Errorf("coordinator abort task does not bind the canonical launch")
+	}
+	return launch, nil
 }
 
 // CheckCoordinatorAbort reports whether an abort would be admitted without writing.

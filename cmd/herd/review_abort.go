@@ -51,19 +51,8 @@ func runReviewAbort() error {
 		if listErr != nil {
 			return fmt.Errorf("live reviewer identity: %w", listErr)
 		}
-		for _, a := range agents {
-			if a.Name != m.Reviewer || a.PaneID != m.PaneID || a.TabID != m.TabID {
-				continue
-			}
-			if a.Status == "working" {
-				return fmt.Errorf("review abort refuses live useful work: reviewer %s is working", m.Reviewer)
-			}
-			if a.Focused != nil && *a.Focused {
-				return fmt.Errorf("review abort refuses a focused reviewer tab")
-			}
-			if a.Session.Value != "" && a.Session.Value != sess {
-				return fmt.Errorf("live session mismatch: pane %s vs --session %s", a.Session.Value, sess)
-			}
+		if err := herdr.ReviewAbortLiveConflict(agents, m.Reviewer, m.PaneID, m.TabID, sess); err != nil {
+			return err
 		}
 	}
 	root, err := filepath.Abs(".")
