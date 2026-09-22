@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -10,8 +13,12 @@ func TestFormatNativeReviewTargetedCommandRequiresRunForHeavyPackages(t *testing
 	if nativeReviewCommandIsFullHeavyPackage(cmd) {
 		t.Fatalf("targeted command must not be a full heavy package suite: %s", cmd)
 	}
-	if !strings.Contains(cmd, "-run") || !strings.Contains(cmd, "TestReviewLaunchEnvPinsBudget") {
-		t.Fatalf("targeted command must name tests with -run: %s", cmd)
+	want := nativeReviewRunFlag([]string{"TestReviewLaunchEnvPinsBudget", "TestMergeBoundedGOFLAGS"})
+	if !strings.Contains(cmd, want) {
+		t.Fatalf("targeted command must quote anchored -run regex %s, got %s", want, cmd)
+	}
+	if strings.Contains(cmd, "-run TestReviewLaunchEnvPinsBudget|TestMergeBoundedGOFLAGS") {
+		t.Fatalf("unquoted pipe -run is a shell pipeline: %s", cmd)
 	}
 	if !strings.Contains(cmd, "-timeout="+nativeReviewTargetTimeout) {
 		t.Fatalf("targeted command must bound timeout: %s", cmd)
@@ -59,6 +66,51 @@ func TestNativeReviewTestFuncNames(t *testing.T) {
 	got := nativeReviewTestFuncNames(src)
 	if len(got) != 2 || got[0] != "TestMergeBoundedGOFLAGS" || got[1] != "TestReviewLaunchEnvPinsBudget" {
 		t.Fatalf("names=%v", got)
+	}
+}
+
+func TestQuotedRunRegexSurvivesDisposableShellWithTwoRealTests(t *testing.T) {
+	dir := t.TempDir()
+	mod := `module herd.example/runquote
+
+go 1.22
+`
+	src := `package runquote
+
+import "testing"
+
+func TestAlpha(t *testing.T) {}
+func TestBeta(t *testing.T) {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(mod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "quote_test.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	quoted := "go test -count=1 -p=1 -timeout=" + nativeReviewTargetTimeout + " " + nativeReviewRunFlag([]string{"TestAlpha", "TestBeta"}) + " ."
+	unquoted := "go test -count=1 -p=1 -timeout=" + nativeReviewTargetTimeout + " -run TestAlpha|TestBeta ."
+
+	unquotedRun := exec.Command("sh", "-c", unquoted)
+	unquotedRun.Dir = dir
+	unquotedOut, unquotedErr := unquotedRun.CombinedOutput()
+	if unquotedErr == nil {
+		t.Fatalf("unquoted pipe must be a shell pipeline, got success:\n%s", unquotedOut)
+	}
+	if !strings.Contains(string(unquotedOut), "TestBeta") {
+		t.Fatalf("unquoted pipeline must try to execute the second Test name, got %v\n%s", unquotedErr, unquotedOut)
+	}
+
+	quotedRun := exec.Command("sh", "-c", quoted)
+	quotedRun.Dir = dir
+	quotedRun.Env = append(os.Environ(), "GOMAXPROCS=2")
+	quotedOut, quotedErr := quotedRun.CombinedOutput()
+	if quotedErr != nil {
+		t.Fatalf("quoted anchored -run must run both tests: %v\ncmd=%s\n%s", quotedErr, quoted, quotedOut)
+	}
+	text := string(quotedOut)
+	if !strings.Contains(text, "ok") {
+		t.Fatalf("quoted command produced no ok: %s", text)
 	}
 }
 

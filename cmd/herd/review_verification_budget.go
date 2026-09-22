@@ -93,17 +93,34 @@ func formatNativeReviewTargetedCommand(pkgs, testNames []string) string {
 	}
 	var parts []string
 	if len(heavy) > 0 {
-		if len(testNames) > 0 {
-			parts = append(parts, fmt.Sprintf("GOMAXPROCS=2 go test -count=1 -p=1 -timeout=%s -run %s %s",
-				nativeReviewTargetTimeout, strings.Join(testNames, "|"), strings.Join(heavy, " ")))
+		if run := nativeReviewRunFlag(testNames); run != "" {
+			parts = append(parts, fmt.Sprintf("GOMAXPROCS=2 go test -count=1 -p=1 -timeout=%s %s %s",
+				nativeReviewTargetTimeout, run, strings.Join(heavy, " ")))
 		} else {
-			parts = append(parts, "Select Test names from the diff, then GOMAXPROCS=2 go test -count=1 -p=1 -timeout="+nativeReviewTargetTimeout+" -run TestName "+strings.Join(heavy, " ")+". Full-package go test of those trees without -run is hosted CI, not targeted-first.")
+			parts = append(parts, "Select Test names from the diff, then GOMAXPROCS=2 go test -count=1 -p=1 -timeout="+nativeReviewTargetTimeout+" -run 'TestName' "+strings.Join(heavy, " ")+". Full-package go test of those trees without -run is hosted CI, not targeted-first.")
 		}
 	}
 	if len(light) > 0 {
 		parts = append(parts, "go test -count=1 -timeout="+nativeReviewTargetTimeout+" "+strings.Join(light, " "))
 	}
 	return strings.Join(parts, " ; ")
+}
+
+// nativeReviewRunFlag returns a shell-quoted, anchored -run regex. Unquoted
+// Name|Name is a pipeline: the second name is executed as a command.
+func nativeReviewRunFlag(names []string) string {
+	var parts []string
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || !strings.HasPrefix(n, "Test") || strings.ContainsAny(n, "'\\ \t|$;&<>") {
+			continue
+		}
+		parts = append(parts, "^"+n+"$")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "-run '" + strings.Join(parts, "|") + "'"
 }
 
 func nativeReviewCommandIsFullHeavyPackage(cmd string) bool {
