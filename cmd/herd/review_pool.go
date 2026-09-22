@@ -1045,6 +1045,32 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 // create one: it answers "" so the caller proceeds from the identities it was
 // given rather than from a directory nobody reads.
 func resolvePoolReviewCandidateAtFor(root, ref, sha string, mayPrepare bool) (string, error) {
+	// FAC-653: a SHA too short to verify is a bad ARGUMENT, not a missing
+	// worktree and not a Git-discovery failure. Check it before any
+	// `git worktree list` so a non-repo fixture still names the argument.
+	sha = strings.TrimSpace(sha)
+	if sha != "" && len(sha) < 12 {
+		return "", fmt.Errorf("candidate sha %q is too short to verify (need at least 12 hex characters); "+
+			"an abbreviation could match more than one commit, so it is refused rather than guessed. "+
+			"Pass the full 40-character sha", sha)
+	}
+
+	// FAC-844: a FAC-number selector used to miss the exclusive author
+	// worktree (different branch name, attached HEAD) and prepare a blank
+	// detached carrier. TASK-CONTEXT.json is gitignored, so the new surface
+	// had no authenticated SHA/base/lease identity and operators reissued
+	// receipts by hand. Prefer a verified existing home before any path
+	// probe or speculative prepare, and never copy or Issue a replacement.
+	if sha != "" {
+		home, err := authenticatedCandidateHome(root, ref, sha)
+		if err != nil {
+			return "", err
+		}
+		if home != "" {
+			return home, nil
+		}
+	}
+
 	// Probe both spellings: the raw-ref path for historical ticket-style refs and
 	// the launcher's sanitized path, so one sanitizer cannot hide the other's dir.
 	for _, dir := range candidateSurfaceDirs(root, ref) {
@@ -1284,6 +1310,132 @@ func headMatchesSHA(dir, sha string) bool {
 		return false
 	}
 	return strings.EqualFold(head, sha) || strings.HasPrefix(strings.ToLower(head), strings.ToLower(sha))
+}
+
+// authenticatedCandidateHome returns the unique registered worktree whose
+// verified TASK-CONTEXT matches the closeable ref and exact candidate SHA.
+// Attached author worktrees qualify; the shared root never does. A matching
+// file that fails verification refuses rather than preparing a replacement
+// surface. Zero matches is not an error: callers may still prepare a blank
+// carrier when no authenticated home exists (FAC-678).
+func authenticatedCandidateHome(root, ref, sha string) (string, error) {
+	homes, unverified, err := findAuthenticatedCandidateHomes(root, ref, sha)
+	if err != nil {
+		return "", err
+	}
+	if unverified {
+		return "", fmt.Errorf("review candidate %q at %s has a TASK-CONTEXT that failed authentication; refusing to prepare a replacement surface or reissue authority", ref, shortSHA(sha))
+	}
+	switch len(homes) {
+	case 0:
+		return "", nil
+	case 1:
+		return homes[0], nil
+	default:
+		return "", fmt.Errorf("review candidate %q at %s has %d authenticated TASK-CONTEXT homes %v; refuse rather than pick one", ref, shortSHA(sha), len(homes), homes)
+	}
+}
+
+func findAuthenticatedCandidateHomes(root, ref, sha string) (homes []string, unverified bool, err error) {
+	out, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	if listErr != nil {
+		// Not a git repo (or worktree list is unavailable) means there is no
+		// authenticated home to discover. That is a miss, not an auth failure:
+		// callers still emit FAC-653 short-SHA and genuine-worktree-miss
+		// diagnostics instead of "git worktree list: exit status 128".
+		return nil, false, nil
+	}
+	absRoot, _ := filepath.Abs(root)
+	var verifier *dispatch.Verifier
+	loadVerifier := func() error {
+		if verifier != nil {
+			return nil
+		}
+		v, vErr := dispatch.LoadVerifier(root)
+		if vErr != nil {
+			return vErr
+		}
+		verifier = v
+		return nil
+	}
+
+	var path string
+	flush := func() error {
+		if path == "" {
+			return nil
+		}
+		abs, absErr := filepath.Abs(path)
+		if absErr == nil && abs == absRoot {
+			return nil
+		}
+		if !worktreeExists(path) || !headMatchesSHA(path, sha) {
+			return nil
+		}
+		tc, readErr := dispatch.ReadTaskContext(path)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				return nil
+			}
+			unverified = true
+			return nil
+		}
+		if !sameCloseableCardRef(tc.TaskRef, ref) {
+			return nil
+		}
+		if cand := strings.TrimSpace(tc.CandidateSHA); cand != "" && !receiptSHAMatches(cand, sha) {
+			unverified = true
+			return nil
+		}
+		if vErr := loadVerifier(); vErr != nil {
+			unverified = true
+			return nil
+		}
+		if vErr := verifier.Verify(tc); vErr != nil {
+			unverified = true
+			return nil
+		}
+		homes = append(homes, path)
+		return nil
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			if err := flush(); err != nil {
+				return nil, unverified, err
+			}
+			path = strings.TrimPrefix(line, "worktree ")
+		case line == "":
+			if err := flush(); err != nil {
+				return nil, unverified, err
+			}
+			path = ""
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, unverified, fmt.Errorf("read Git worktrees for authenticated candidate home: %w", err)
+	}
+	if err := flush(); err != nil {
+		return nil, unverified, err
+	}
+	return homes, unverified, nil
+}
+
+func receiptSHAMatches(got, want string) bool {
+	got, want = strings.TrimSpace(got), strings.TrimSpace(want)
+	if got == "" || want == "" {
+		return false
+	}
+	if strings.EqualFold(got, want) {
+		return true
+	}
+	if len(got) < 12 || len(want) < 12 {
+		return false
+	}
+	gl, wl := strings.ToLower(got), strings.ToLower(want)
+	return strings.HasPrefix(gl, wl) || strings.HasPrefix(wl, gl)
 }
 
 // detachedSurfaceAtSHA finds any registered worktree whose HEAD is the exact
