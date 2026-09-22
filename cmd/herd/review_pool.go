@@ -619,6 +619,12 @@ func runPoolReview(ref string) error {
 	// interactive, which measured ~20s here. Silent, it is the third stretch a
 	// bounded caller cannot tell apart from a hang.
 	startedAt := time.Now()
+	priorAgyConversation := ""
+	if strings.EqualFold(reviewer.Kind, "agy") {
+		if home, homeErr := os.UserHomeDir(); homeErr == nil {
+			priorAgyConversation, _ = herdr.AgyWorkspaceConversationID(home, surfaceAbs)
+		}
+	}
 	fmt.Printf("starting %s agent %s in pane %s\n", reviewer.Kind, agentName, tab.Pane.ID)
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
 		launchFailureReason = err.Error()
@@ -671,7 +677,7 @@ func runPoolReview(ref string) error {
 	// Cold Codex/OpenCode assigns agent_session only after the first accepted
 	// model turn. Capture it authoritatively after the single delivery boundary;
 	// never fabricate a session from pane, terminal, timestamp, or revision.
-	launchedAgent, err := awaitNativeReviewerSession(agentName, ws, *tab, 30*time.Second)
+	launchedAgent, err := awaitNativeReviewerSession(agentName, ws, *tab, 30*time.Second, priorAgyConversation, startedAt)
 	if err != nil {
 		cleanupPending("cleanup-pending", err.Error())
 		return fmt.Errorf("capture authoritative reviewer session after delivery: %w", err)
@@ -842,7 +848,7 @@ func verifyReviewLaunchFence(workspace, cwd string, tab herdr.TabInfo, lease *wo
 // awaitNativeReviewerSession waits only for the model-owned session identity
 // that cold Codex/OpenCode emits after its first accepted turn. It never uses
 // a pane, terminal, revision, timestamp, or provisional value as a session.
-func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeout time.Duration) (*herdr.AgentEntry, error) {
+func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeout time.Duration, priorAgyConversation string, launchedAt time.Time) (*herdr.AgentEntry, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -852,12 +858,26 @@ func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeo
 		a, err := herdr.LookupAgent(name)
 		if err == nil {
 			if a.TabID != tab.ID || a.PaneID != tab.Pane.ID || a.TerminalID != tab.Pane.TerminalID || a.Workspace != workspace {
-				return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
+				return nil, herdr.ReviewerIdentityChangedError(a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
 			}
 			if herdr.RealModelSessionID(a.Session.Value) {
 				return a, nil
 			}
-			last = "agent session remains unavailable after delivery"
+			last = herdr.ErrAgentSessionUnavailableAfterDelivery.Error()
+			// AGY 1.2.x TUI does not fire PreInvocation hooks, so herdr never
+			// receives conversationId. After a real consumed turn, bind the
+			// conversation UUID AGY stored for this cwd through the official
+			// pane.report_agent_session API. Never use pane/terminal/timestamp.
+			if strings.EqualFold(strings.TrimSpace(a.Kind), "agy") {
+				bound, bindErr := herdr.BindAgyWorkspaceSession(*a, priorAgyConversation, launchedAt)
+				if bindErr == nil {
+					if bound.TabID != tab.ID || bound.PaneID != tab.Pane.ID || bound.TerminalID != tab.Pane.TerminalID || bound.Workspace != workspace {
+						return nil, herdr.ReviewerIdentityChangedError(bound.Name, bound.TabID, bound.PaneID, bound.TerminalID, bound.Workspace)
+					}
+					return bound, nil
+				}
+				last = bindErr.Error()
+			}
 		} else if !errors.Is(err, herdr.ErrAgentNotFound) {
 			last = err.Error()
 		}
