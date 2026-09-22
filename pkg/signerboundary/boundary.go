@@ -294,12 +294,16 @@ func (b *Boundary) AdversarialProbe() error {
 	}
 	_, _, err = proveSeparateUID(proveSepConfig{
 		KeyPath:      PrivateKeyPath(b.keyDir, b.identity),
+		KeyDir:       b.keyDir,
+		Identity:     b.identity,
 		SignerUID:    topo.SignerUID,
 		RequesterUID: topo.RequesterUID,
 		BuilderUID:   topo.BuilderUID,
+		SocketGID:    topo.SocketGID,
 		SocketPath:   b.socketPath,
 		SessionKey:   b.sessionKey,
 		SignerPID:    b.attest.SignerPID,
+		Pub:          b.pub,
 	})
 	return err
 }
