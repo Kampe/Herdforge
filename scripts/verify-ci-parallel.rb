@@ -9,15 +9,17 @@ require 'yaml'
 
 # Immutable pre-split inventory, available through the preserved full checkout.
 # Intentional future setup/gate changes must revise this oracle in the same PR;
-# additional control/upload pairs can extend controls_other without losing it.
+# FAC-837 changes placement only; FAC-839's required pair is pinned below.
 BASE = '973ccd04a20c6cca0dec4c01c46ed8c2a76f344c'
 WORKFLOW = '.github/workflows/ci.yml'
-DEPENDENCIES = %w[foundation controls_other controls_receipt].freeze
-RESULT_VARS = %w[FOUNDATION_RESULT OTHER_CONTROLS_RESULT RECEIPT_CONTROLS_RESULT].freeze
+CONTROL_LANES = %w[controls_other controls_tail controls_receipt].freeze
+DEPENDENCIES = (['foundation'] + CONTROL_LANES).freeze
+RESULT_VARS = %w[FOUNDATION_RESULT OTHER_CONTROLS_RESULT TAIL_CONTROLS_RESULT RECEIPT_CONTROLS_RESULT].freeze
 RECEIPT_STEP = 'Verify landed receipt guard controls'
+TAIL_STEP = 'Verify landed proof bounds controls'
 CHECK_STEP = 'Verify CI dependency and collector controls'
 UPLOAD_STEP = 'Upload CI dependency and collector control logs'
-COLLECTOR_STEP = 'Require foundation and both control lanes'
+COLLECTOR_STEP = 'Require foundation and all three control lanes'
 RETENTION_TOOLS = 'Install landed retention tools'
 RETENTION_STEP = 'Verify landed suite retention before foundation'
 RETENTION_UPLOAD = 'Upload early landed suite retention logs'
@@ -91,14 +93,18 @@ def check_original_controls(controls, all_steps, lane_steps)
   receipt_index = controls.index { |step| step['name'] == RECEIPT_STEP }
   insist(!receipt_index.nil?, 'original receipt anchor exists')
   expected_receipt = controls.slice(receipt_index, 2)
-  expected_other = controls - expected_receipt
+  remaining = controls - expected_receipt
+  tail_index = remaining.index { |step| step['name'] == TAIL_STEP }
+  insist(tail_index == 8, 'original four-pair split anchor exists')
+  expected_other = remaining.take(tail_index)
+  expected_tail = remaining.drop(tail_index)
   # Preserve every old step object (including commands, timeout and artifact
   # policy). New controls may be appended, but cannot replace the old inventory.
   controls.each do |step|
     matches = all_steps.select { |candidate| candidate['name'] == step['name'] }
     insist(matches == [step], "original control step preserved exactly once: #{step['name']}")
   end
-  %w[controls_other controls_receipt].zip([expected_other, expected_receipt]).each do |job, expected|
+  CONTROL_LANES.zip([expected_other, expected_tail, expected_receipt]).each do |job, expected|
     names = expected.map { |step| step['name'] }
     insist(lane_steps[job].select { |step| names.include?(step['name']) } == expected,
            "control order and placement: #{job}")
@@ -107,6 +113,7 @@ def check_original_controls(controls, all_steps, lane_steps)
 end
 
 def check_lane_controls(lane_steps)
+  insist(lane_steps.values.sum(&:length) == 30, 'exact 15 control and upload pairs')
   drivers = []
   artifacts = []
   lane_steps.each do |job, steps|
@@ -148,8 +155,8 @@ def check_task_source_controls(lane_steps, all_steps)
          'task-source driver is required exactly once')
   insist(all_steps.select { |step| step['name'] == TASK_SOURCE_UPLOAD } == [upload],
          'task-source evidence survives failures')
-  insist(lane_steps['controls_other'].last(2) == [driver, upload],
-         'task-source pair stays in remaining controls')
+  insist(lane_steps['controls_tail'].last(2) == [driver, upload],
+         'task-source pair stays in tail controls')
 end
 
 def check_foundation(jobs, setup, make_step)
@@ -229,7 +236,7 @@ def check_structure(workflow, original)
   setup = old_steps.take(make_index)
   all_steps = jobs.values.flat_map { |job| job.fetch('steps') }
   check_setup(jobs, old_steps, make_index, setup, all_steps)
-  lane_steps = %w[controls_other controls_receipt].to_h do |job|
+  lane_steps = CONTROL_LANES.to_h do |job|
     [job, jobs[job].fetch('steps').drop(setup.length)]
   end
   check_original_controls(old_steps.drop(make_index + 1), all_steps, lane_steps)
@@ -255,8 +262,9 @@ def exercise_collector(script, label, directory)
     ['failure', 'cancelled', 'skipped', '', nil, 'neutral', 'Success'].each_with_index do |value, index|
       result, stderr = run_shell(script, success.merge(variable => value), "#{label}-#{job}-#{index}", directory)
       diagnostic = "Required CI job did not succeed: #{job}:#{value}\n"
+      insist(!result.success?, "collector accepted #{job}:#{value}")
+      insist(result.exitstatus == 1, "wrong refusal exit: #{job}:#{value}")
       insist(stderr == diagnostic, "wrong refusal diagnostic: #{job}:#{value}")
-      insist(result.exitstatus == 1, "collector accepted #{job}:#{value}")
     end
   end
 end
@@ -290,6 +298,26 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
     structure_mutant(workflow, original, 'missing-dependency', 'collector dependency edges', summary) do |mutant|
       mutant['jobs']['gate']['needs'].delete('controls_receipt')
     end
+    structure_mutant(workflow, original, 'missing-tail-dependency', 'collector dependency edges', summary) do |mutant|
+      mutant['jobs']['gate']['needs'].delete('controls_tail')
+    end
+    structure_mutant(workflow, original, 'missing-tail-result',
+                     'collector consumes exact dependency results', summary) do |mutant|
+      mutant['jobs']['gate']['steps'][1]['env'].delete('TAIL_CONTROLS_RESULT')
+    end
+    structure_mutant(workflow, original, 'misplaced-tail-control',
+                     'control order and placement: controls_tail', summary) do |mutant|
+      steps = mutant['jobs']['controls_tail']['steps']
+      index = steps.index { |step| step['name'] == TAIL_STEP }
+      mutant['jobs']['controls_other']['steps'].concat(steps.slice!(index, 2))
+    end
+    structure_mutant(workflow, original, 'extra-control-pair',
+                     'exact 15 control and upload pairs', summary) do |mutant|
+      steps = mutant['jobs']['controls_other']['steps']
+      extra = Marshal.load(Marshal.dump(steps.last(2)))
+      extra.each { |step| step['name'] = "Unexpected #{step['name']}" }
+      steps.concat(extra)
+    end
     structure_mutant(workflow, original, 'missing-retention-tools',
                      'early suite retention tools are required', summary) do |mutant|
       mutant['jobs']['foundation']['steps'].reject! { |step| step['name'] == RETENTION_TOOLS }
@@ -319,23 +347,23 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
     end
     structure_mutant(workflow, original, 'missing-task-source-pair',
                      'task-source driver is required exactly once', summary) do |mutant|
-      mutant['jobs']['controls_other']['steps'].reject! do |step|
+      mutant['jobs']['controls_tail']['steps'].reject! do |step|
         [TASK_SOURCE_STEP, TASK_SOURCE_UPLOAD].include?(step['name'])
       end
     end
     structure_mutant(workflow, original, 'conditional-task-source-driver',
                      'task-source driver is required exactly once', summary) do |mutant|
-      step = mutant['jobs']['controls_other']['steps'].find { |entry| entry['name'] == TASK_SOURCE_STEP }
+      step = mutant['jobs']['controls_tail']['steps'].find { |entry| entry['name'] == TASK_SOURCE_STEP }
       step['if'] = 'false'
     end
     structure_mutant(workflow, original, 'lost-task-source-artifact',
                      'task-source evidence survives failures', summary) do |mutant|
-      step = mutant['jobs']['controls_other']['steps'].find { |entry| entry['name'] == TASK_SOURCE_UPLOAD }
+      step = mutant['jobs']['controls_tail']['steps'].find { |entry| entry['name'] == TASK_SOURCE_UPLOAD }
       step.delete('if')
     end
     structure_mutant(workflow, original, 'reversed-task-source-pair',
-                     'task-source pair stays in remaining controls', summary) do |mutant|
-      steps = mutant['jobs']['controls_other']['steps']
+                     'task-source pair stays in tail controls', summary) do |mutant|
+      steps = mutant['jobs']['controls_tail']['steps']
       steps[-2], steps[-1] = steps[-1], steps[-2]
     end
     old_driver = original['jobs']['gate']['steps'].find { |step| step['name'] == RECEIPT_STEP }
@@ -355,7 +383,7 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
     syntax, = run_shell(script_path, {}, 'baseline-syntax', directory, syntax: true)
     insist(syntax.success?, 'BROKEN-RUN baseline collector syntax')
     exercise_collector(script_path, 'baseline', directory)
-    summary.puts('PASS all-success and 21 failure/cancel/skip/empty/missing/unexpected result cases')
+    summary.puts('PASS all-success and 28 failure/cancel/skip/empty/missing/unexpected result cases')
 
     anchor = 'exit 1 # FAC-833 refusal'
     insist(script.scan(anchor).length == 1, 'exact refusal mutation anchor')
@@ -370,6 +398,22 @@ File.open(File.join(directory, 'summary.log'), 'w') do |summary|
       insist(error.message == 'collector accepted foundation:failure',
              "WRONG-ASSERTION refusal-disabled collector: #{error.message}")
       summary.puts("KILLED refusal-disabled collector: #{error.message}")
+    end
+    # Keep a syntactically valid real collector while ignoring ONLY the new
+    # result. The same oracle must reach and reject the tail's failing case.
+    tail_anchor = 'controls_tail:${TAIL_CONTROLS_RESULT-}'
+    insist(script.scan(tail_anchor).length == 1, 'exact tail result mutation anchor')
+    tail_mutant_path = File.join(directory, 'collector-tail-result-ignored.zsh')
+    File.write(tail_mutant_path, script.sub(tail_anchor, 'controls_tail:success'))
+    syntax, = run_shell(tail_mutant_path, {}, 'tail-mutant-syntax', directory, syntax: true)
+    insist(syntax.success?, 'BROKEN-RUN tail-result-ignored collector syntax')
+    begin
+      exercise_collector(tail_mutant_path, 'tail-mutant', directory)
+      raise ControlFailure, 'SURVIVED tail-result-ignored collector'
+    rescue ControlFailure => error
+      insist(error.message == 'collector accepted controls_tail:failure',
+             "WRONG-ASSERTION tail-result-ignored collector: #{error.message}")
+      summary.puts("KILLED tail-result-ignored collector: #{error.message}")
     end
     insist(File.read(WORKFLOW) == workflow_text && File.read(script_path) == script,
            'production workflow and baseline collector remain byte-identical')

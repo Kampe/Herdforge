@@ -164,9 +164,9 @@ jobs:
         env:
           CHAINSEER_BIN: chainseer/bin
 
-  # Two fixed control jobs bound concurrency while every driver stays serial.
+  # Three fixed control jobs bound concurrency while every driver stays serial.
   controls_other:
-    name: Mutation controls (remaining suites)
+    name: Mutation controls (process and resource suites)
     runs-on: ubuntu-latest
     needs: foundation
     steps:
@@ -348,6 +348,74 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
+
+  controls_tail:
+    name: Mutation controls (proof and lifecycle suites)
+    runs-on: ubuntu-latest
+    needs: foundation
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Set up pinned gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+
+      # Use the upstream CLI directly. The v2 action performs a GitHub user
+      # lookup and turns transient API failures into a license failure before
+      # the repository's deterministic security gate can run.
+      - name: Set up pinned Gitleaks CLI
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 "$url" --output "$tmp_dir/$archive"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$tmp_dir/$archive" | sha256sum --check --status
+          tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+          test -x "$tmp_dir/gitleaks"
+          install -m 0755 "$tmp_dir/gitleaks" "$RUNNER_TEMP/gitleaks"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gitleaks" version
+
+      # Pinned to setup-trivy v0.3.1. This installs the scanner consumed by
+      # make lint's tracked-module HIGH/CRITICAL dependency gate.
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567
+        with:
+          version: v0.74.0
+
+      - name: Checkout Chainseer parity source
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: Kampe/chainseer
+          path: chainseer
+          fetch-depth: 1
+
+      - name: Report Chainseer parity availability
+        run: |
+          if [ -d chainseer/bin ]; then
+            echo "Chainseer parity source available; FAC-309 parity gate will run."
+            echo "CHAINSEER_BIN=chainseer/bin" >> "$GITHUB_ENV"
+          else
+            echo "Chainseer parity source unavailable to this CI token; FAC-309 parity is explicitly skipped."
+            echo "CHAINSEER_PARITY_OPTIONAL=1" >> "$GITHUB_ENV"
+          fi
 
       # FAC-831: the landed-proof producer is defended by bounds that only
       # matter if real work actually consults them. Each control removes one —
@@ -679,29 +747,31 @@ jobs:
           retention-days: 7
 
   # Keep the merge policy's required check name. always() also schedules this
-  # collector when a failed foundation caused both control jobs to be skipped.
-  # Only three explicit success results can produce a successful required gate.
+  # collector when a failed foundation caused all three control jobs to be skipped.
+  # Only four explicit success results can produce a successful required gate.
   gate:
     name: Build, Preflight & Test Suite
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: ${{ always() }}
-    needs: [foundation, controls_other, controls_receipt]
+    needs: [foundation, controls_other, controls_tail, controls_receipt]
     steps:
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh
 
-      - name: Require foundation and both control lanes
+      - name: Require foundation and all three control lanes
         shell: zsh {0}
         env:
           FOUNDATION_RESULT: ${{ needs.foundation.result }}
           OTHER_CONTROLS_RESULT: ${{ needs.controls_other.result }}
+          TAIL_CONTROLS_RESULT: ${{ needs.controls_tail.result }}
           RECEIPT_CONTROLS_RESULT: ${{ needs.controls_receipt.result }}
         run: |
           set -euo pipefail
           for required_job in \
             "foundation:${FOUNDATION_RESULT-}" \
             "controls_other:${OTHER_CONTROLS_RESULT-}" \
+            "controls_tail:${TAIL_CONTROLS_RESULT-}" \
             "controls_receipt:${RECEIPT_CONTROLS_RESULT-}"
           do
             if [[ "${required_job#*:}" != success ]]; then
