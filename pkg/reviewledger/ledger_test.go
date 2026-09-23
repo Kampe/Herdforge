@@ -779,6 +779,34 @@ func TestVerdictIdempotent(t *testing.T) {
 	}
 }
 
+func TestVerdictChangedPolarityAppendsFailClosed(t *testing.T) {
+	l := newTestLedger(t)
+	if _, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: VerdictPASS, ReviewerFamily: "google",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: VerdictFAIL, ReviewerFamily: "google",
+	}); err != nil {
+		t.Fatalf("changed polarity: %v", err)
+	}
+	rows, _ := l.AllRows()
+	n := 0
+	latest := ""
+	for _, r := range rows {
+		if r.Event == string(EventVerdict) {
+			n++
+			latest = r.Verdict
+		}
+	}
+	if n != 2 || latest != string(VerdictFAIL) {
+		t.Fatalf("want 2 verdict rows ending FAIL, got n=%d latest=%s", n, latest)
+	}
+}
+
 func TestRetryPASSExplicitlySupersedesOnlyNamedReviewer(t *testing.T) {
 	l := newTestLedger(t)
 	const sha = "retry-candidate"

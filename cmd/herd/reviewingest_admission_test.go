@@ -78,7 +78,7 @@ func TestReviewIngestAdmissionDecisionParity(t *testing.T) {
 			}
 			ledger := &fakeReviewIngestLedger{readable: true, reviewer: tc.priorReviewer}
 			got, err := reviewIngestAdmissionDecision(ledger, reviewledger.IngestOpts{
-				Verdict: reviewledger.VerdictOpts{SHA: sha, Reviewer: tc.reviewer},
+				Verdict: reviewledger.VerdictOpts{SHA: sha, Reviewer: tc.reviewer, Verdict: reviewledger.VerdictPASS},
 			}, source, "review.md")
 			if err != nil {
 				t.Fatal(err)
@@ -97,7 +97,7 @@ func TestReviewIngestDuplicateDoesNotMoveArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledger := &fakeReviewIngestLedger{readable: true, reviewer: "reviewer"}
-	got, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{Reviewer: "reviewer"}}, source, "review.md")
+	got, err := admitVerdictAndMove(ledger, reviewledger.IngestOpts{Verdict: reviewledger.VerdictOpts{Reviewer: "reviewer", Verdict: reviewledger.VerdictPASS}}, source, "review.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +109,25 @@ func TestReviewIngestDuplicateDoesNotMoveArtifact(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "ingested", "review.md")); !os.IsNotExist(err) {
 		t.Fatalf("duplicate artifact moved to ingested: %v", err)
+	}
+}
+
+func TestReviewIngestAdmissionDecisionChangedPolarityIsNotDuplicate(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	root := t.TempDir()
+	source := filepath.Join(root, "review.md")
+	if err := os.WriteFile(source, []byte("verdict: FAIL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ledger := &fakeReviewIngestLedger{readable: true, reviewer: "reviewer-a"}
+	got, err := reviewIngestAdmissionDecision(ledger, reviewledger.IngestOpts{
+		Verdict: reviewledger.VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Verdict: reviewledger.VerdictFAIL},
+	}, source, "review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != reviewIngestAdmit {
+		t.Fatalf("PASS then FAIL on the same path must admit, got %v", got)
 	}
 }
 

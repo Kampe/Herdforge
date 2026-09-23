@@ -939,14 +939,19 @@ func reviewIngestAdmissionDecision(ledger reviewIngestLedger, opts reviewledger.
 			return "", fmt.Errorf("read existing ledger verdict: %w", err)
 		} else if found {
 			if opts.Verdict.Reassesses == "" {
-				return reviewIngestSkipDuplicate, nil
-			}
-			replay, err := reviewledger.CheckReassessment(prior, opts.Verdict)
-			if err != nil {
-				return "", err
-			}
-			if replay {
-				return reviewIngestSkipDuplicate, nil
+				if strings.EqualFold(strings.TrimSpace(prior.Verdict), string(opts.Verdict.Verdict)) {
+					return reviewIngestSkipDuplicate, nil
+				}
+				// Same reviewer/path with a changed polarity (PASS→FAIL) is a
+				// new event. Skipping it leaves readiness at the earlier PASS.
+			} else {
+				replay, err := reviewledger.CheckReassessment(prior, opts.Verdict)
+				if err != nil {
+					return "", err
+				}
+				if replay {
+					return reviewIngestSkipDuplicate, nil
+				}
 			}
 		} else if opts.Verdict.Reassesses != "" {
 			return "", fmt.Errorf("reassessment prior verdict not found")
