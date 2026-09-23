@@ -125,6 +125,12 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 		}
 		return ProbeResult{Model: model, Reason: "probe failed: " + boundProbeFailureDetail(detail, status)}
 	}
+	if strings.EqualFold(provider, "agy") {
+		if reason := router.AgyStructuredProbeReason(sanitizedOut, model, probeToken); reason != "" {
+			return ProbeResult{Model: model, Reason: reason}
+		}
+		return ProbeResult{Model: model, Available: true}
+	}
 	if strings.TrimSpace(sanitizedOut) != probeToken {
 		return ProbeResult{Model: model, Reason: "no exact probe output"}
 	}
@@ -186,6 +192,9 @@ func providerProbeCommand(provider, model, effort string) (string, []string, pro
 	argv, delivery := router.HeadlessArgvFor(provider, model, effort, "")
 	if len(argv) == 0 {
 		return "", nil, probeDelivery{}, fmt.Errorf("no headless contract for provider %q (cannot probe what cannot be launched)", provider)
+	}
+	if provider == "agy" {
+		argv = router.InsertAgyStructuredPrintFlags(argv)
 	}
 	return argv[0], argv[1:], probeDelivery{Mode: probeDeliveryFor(provider, delivery)}, nil
 }
