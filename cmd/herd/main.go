@@ -58,6 +58,7 @@ import (
 	"github.com/Kampe/Herdforge/pkg/posture"
 	"github.com/Kampe/Herdforge/pkg/preflight"
 	"github.com/Kampe/Herdforge/pkg/process"
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/provenance"
 	"github.com/Kampe/Herdforge/pkg/provider"
 	"github.com/Kampe/Herdforge/pkg/quotasup"
@@ -2421,7 +2422,7 @@ func setDurableGoal(cwd, lane, task, owner string, generation int64, envelope *g
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), standingGoalGuardDeadline)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, self, "goal-guard", "--set",
+	cmd := procsignal.CommandContext(ctx, self, "goal-guard", "--set",
 		"--lane", lane, "--task", task, "--owner", owner,
 		"--generation", strconv.FormatInt(generation, 10))
 	if envelope != nil {

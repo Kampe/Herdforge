@@ -54,17 +54,32 @@ case "$1 $2" in
         *) shift ;;
       esac
     done
-    printf '%s|%s|%s|%s\n' "fakeT1" "fakeP1" "fakeTERM1" "$cwd" > "$STATE"
+    printf '%s|%s|%s|%s|\n' "fakeT1" "fakeP1" "fakeTERM1" "$cwd" > "$STATE"
     printf '{"result":{"tab":{"tab_id":"fakeT1","label":"%s"},"root_pane":{"pane_id":"fakeP1","tab_id":"fakeT1","terminal_id":"fakeTERM1"}}}\n' "$label"
     ;;
   "tab close") : > "$STATE"; printf '{"result":{"closed":true}}\n' ;;
   "tab compare-close") : > "$STATE"; printf '{"result":{"receipt":{"outcome":"closed","resulting_absence":true}}}\n' ;;
-  "agent start") printf '{"result":{"started":true}}\n' ;;
-  "agent prompt") printf '{"result":{"delivered":true}}\n' ;;
+  "agent start")
+    name="$3"
+    if [ -s "$STATE" ]; then
+      IFS='|' read -r t p term cwd _ < "$STATE"
+      printf '%s|%s|%s|%s|%s\n' "$t" "$p" "$term" "$cwd" "$name" > "$STATE"
+    fi
+    printf '{"result":{"started":true}}\n'
+    ;;
+  "agent prompt")
+    if [ -s "$STATE" ]; then
+      IFS='|' read -r t p term cwd name _ < "$STATE"
+      printf '%s|%s|%s|%s|%s|working\n' "$t" "$p" "$term" "$cwd" "$name" > "$STATE"
+      printf 'consumed-kickoff\n' > "$STATE.body"
+    fi
+    printf '{"result":{"delivered":true}}\n'
+    ;;
   "agent list")
     if [ -s "$STATE" ]; then
-      IFS='|' read -r t p term cwd < "$STATE"
-      printf '{"result":{"agents":[{"tab_id":"%s","pane_id":"%s","terminal_id":"%s","workspace_id":"wFAKE","cwd":"%s","foreground_cwd":"%s","agent_status":"idle","revision":1,"focused":false}],"type":"agents"}}\n' "$t" "$p" "$term" "$cwd" "$cwd"
+      IFS='|' read -r t p term cwd name st < "$STATE"
+      status="${st:-idle}"
+      printf '{"result":{"agents":[{"name":"%s","tab_id":"%s","pane_id":"%s","terminal_id":"%s","workspace_id":"wFAKE","cwd":"%s","foreground_cwd":"%s","agent_status":"%s","agent":"grok","revision":1,"focused":false}],"type":"agents"}}\n' "$name" "$t" "$p" "$term" "$cwd" "$cwd" "$status"
     else
       printf '{"result":{"agents":[],"type":"agents"}}\n'
     fi
@@ -81,11 +96,22 @@ case "$1 $2" in
     fi
     ;;
   "pane read")
-    printf '{"result":{"text":"%s"}}\n' "${HERD_FAKE_PANE_BODY:-ready}"
+    body="${HERD_FAKE_PANE_BODY:-ready}"
+    if [ -f "$STATE.body" ]; then
+      body=$(tr -d '\n' < "$STATE.body")
+    fi
+    printf '{"result":{"text":"%s"}}\n' "$body"
     ;;
   "pane process-info")
     if [ "${HERD_FAKE_PANE_MODE:-}" = "dead" ]; then
       printf '{"result":{"process_info":{"foreground_processes":[]}}}\n'
+    elif [ -s "$STATE" ]; then
+      IFS='|' read -r _ _ _ _ name < "$STATE"
+      if [ -n "$name" ]; then
+        printf '{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"grok"}]}}}\n'
+      else
+        printf '{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"zsh"}]}}}\n'
+      fi
     else
       printf '{"result":{"process_info":{"foreground_processes":[{"pid":1,"name":"zsh"}]}}}\n'
     fi
