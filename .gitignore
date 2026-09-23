@@ -37,6 +37,8 @@ TASK-CONTEXT.json
 # Durable claim/lease store and evidence receipts (runtime, per-host).
 .herd/claim/
 .herd/receipts/
+# FAC-621 admitted origin/main at standing raise (runtime, per-host).
+/.herd/standing-admitted/
 /.herd/source/task-worktrees.jsonl
 /.herd/source/task-worktrees.jsonl.lock
 /.herd/landed/

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"os/exec"
@@ -137,5 +138,25 @@ func TestPrepareStandingWorktreeFreshZeroZeroStillRaises(t *testing.T) {
 	got := standingGit(t, laneDir, "rev-parse", "HEAD")
 	if got != base {
 		t.Fatalf("healthy raise moved HEAD %s want %s", got, base)
+	}
+}
+
+func TestPrepareStandingWorktreeRecordsAdmittedBase(t *testing.T) {
+	_, origin, _, _ := standingLaneRepo(t)
+	fresh := standingCommit(t, origin, "origin-ahead")
+	lane := &config.LaneDef{Name: "scout", Worktree: "wt/scout"}
+	if err := prepareStandingWorktree(lane); err != nil {
+		t.Fatalf("behind clean lane must refresh: %v", err)
+	}
+	raw, err := os.ReadFile(standingAdmittedBasePath("scout"))
+	if err != nil {
+		t.Fatalf("admitted base must be recorded: %v", err)
+	}
+	var rec standingAdmittedBase
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Lane != "scout" || rec.BaseSHA != fresh || rec.Behind != 1 || rec.Ahead != 0 {
+		t.Fatalf("admitted base record %#v want base %s behind 1", rec, fresh)
 	}
 }

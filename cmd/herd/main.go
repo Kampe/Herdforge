@@ -6935,8 +6935,52 @@ func admitExistingStandingWorktree(wtPath, laneName string) error {
 			return fmt.Errorf("refuse standing raise for lane %s: fast-forward onto origin/main failed (%d behind / %d ahead): %w", laneName, behind, ahead, err)
 		}
 	}
+	base = strings.TrimSpace(base)
 	fmt.Printf("standing worktree %s admitted at %s (%d behind / %d ahead vs origin/main)\n", laneName, base, behind, ahead)
+	if err := recordStandingAdmittedBase(laneName, base, behind, ahead); err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: record admitted base: %w", laneName, err)
+	}
 	return nil
+}
+
+type standingAdmittedBase struct {
+	Lane    string `json:"lane"`
+	BaseSHA string `json:"base_sha"`
+	Behind  int    `json:"behind"`
+	Ahead   int    `json:"ahead"`
+}
+
+func standingAdmittedBasePath(laneName string) string {
+	return filepath.Join(".", ".herd", "standing-admitted", laneName+".json")
+}
+
+func recordStandingAdmittedBase(laneName, base string, behind, ahead int) error {
+	if strings.TrimSpace(laneName) == "" || strings.TrimSpace(base) == "" {
+		return fmt.Errorf("admitted base requires lane and origin/main SHA")
+	}
+	dir := filepath.Join(".", ".herd", "standing-admitted")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(standingAdmittedBase{Lane: laneName, BaseSHA: base, Behind: behind, Ahead: ahead})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "admit-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(append(payload, '\n')); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, standingAdmittedBasePath(laneName))
 }
 
 func routedLaneDecision(ctx context.Context, task *provider.Task) func(*config.LaneDef) (*router.LaunchDecision, error) {
