@@ -279,6 +279,13 @@ func main() {
 	case "review-ingest":
 		runReviewIngest()
 
+	case "review-abort":
+		if err := runReviewAbort(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd review-abort:", err)
+			os.Exit(1)
+		}
+		return
+
 	case "review-complete-record":
 		if err := runReviewCompleteRecord(); err != nil {
 			fmt.Fprintln(os.Stderr, "herd review-complete-record:", err)
@@ -4499,7 +4506,7 @@ func runBoardSync() {
 
 	if *intervalSec > 0 {
 		for {
-			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, providerLabel(cfg), *asJSON)
 			if code != 0 {
 				os.Exit(code)
 			}
@@ -4507,13 +4514,27 @@ func runBoardSync() {
 		}
 	}
 
-	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, providerLabel(cfg), *asJSON)
 	os.Exit(code)
 }
 
-func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID string, asJSON bool) int {
-	drift, err := syncer.ReconcileBoard(context.Background(), projectID, ".")
+func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID, providerName string, asJSON bool) int {
+	drift, diag, err := provider.BoundedRead(context.Background(), providerName, providerReadBudget(), "",
+		func(ctx context.Context, phases *provider.Phases) (*hsync.BoardDrift, error) {
+			phases.Enter("ReconcileBoard provider census")
+			return syncer.ReconcileBoard(ctx, projectID, ".")
+		})
+	// deps check exits 3 on diag.Unknown() (timeout or failed read). board-sync
+	// keeps exit 3 for ReadTimedOut only so a fast provider error stays exit 1
+	// (hard error) rather than collapsing into the UNKNOWN timeout code.
+	if diag.Outcome == provider.ReadTimedOut {
+		fmt.Fprintf(os.Stderr, "board-sync: UNKNOWN: %s\n", diag.String())
+		return 3
+	}
 	if err != nil {
+		if cause := errors.Unwrap(err); cause != nil {
+			err = cause
+		}
 		fmt.Fprintf(os.Stderr, "board-sync: %v\n", err)
 		return 1
 	}
@@ -10859,6 +10880,7 @@ func runBrokerEnsure() {
 func runReceiptIssue() {
 	fs := flag.NewFlagSet("receipt issue", flag.ExitOnError)
 	role := fs.String("role", "", "verifier|recovery|integration")
+	explicitBase := fs.String("base", "", "candidate-relative base SHA (verifier)")
 	candidateSupersession := fs.Bool("candidate-supersession", false, "issue exact candidate-supersession authority (recovery role only)")
 	args := os.Args[2:]
 	if len(args) > 0 && args[0] == "issue" {
@@ -10866,7 +10888,7 @@ func runReceiptIssue() {
 	}
 	fs.Parse(args)
 	if fs.NArg() != 2 || *role == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration [--candidate-supersession] <ref> <worktree>")
+		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration [--base SHA] [--candidate-supersession] <ref> <worktree>")
 		os.Exit(2)
 	}
 	ref, targetDir := hsync.NormalizeRef(fs.Arg(0)), fs.Arg(1)
@@ -10878,6 +10900,10 @@ func runReceiptIssue() {
 	}
 	if *candidateSupersession && *role != dispatch.RoleRecovery {
 		fmt.Fprintln(os.Stderr, "herd receipt: --candidate-supersession requires --role recovery")
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*explicitBase) != "" && *role != dispatch.RoleVerifier {
+		fmt.Fprintln(os.Stderr, "herd receipt: --base is only valid for --role verifier")
 		os.Exit(2)
 	}
 	scopedRecovery := *role == dispatch.RoleRecovery && *candidateSupersession
@@ -10918,11 +10944,12 @@ func runReceiptIssue() {
 		out, _ := exec.Command("git", append([]string{"-C", targetDir}, args...)...).Output()
 		return strings.TrimSpace(string(out))
 	}
-	branch, candidate, base := gitOut("rev-parse", "--abbrev-ref", "HEAD"), gitOut("rev-parse", "HEAD"), gitOut("rev-parse", "origin/main")
+	branch, candidate, originMain := gitOut("rev-parse", "--abbrev-ref", "HEAD"), gitOut("rev-parse", "HEAD"), gitOut("rev-parse", "origin/main")
 	if branch == "" || candidate == "" {
 		fmt.Fprintf(os.Stderr, "herd receipt: %s is not a readable worktree (FAC-145)\n", targetDir)
 		os.Exit(1)
 	}
+	base := originMain
 	var priorRecovery dispatch.TaskContext
 	if scopedRecovery {
 		priorRecovery, err = authenticatedRecoveryIdentity(context.Background(), root, targetDir, ref, branch, candidate, cfg, task)
@@ -10933,6 +10960,17 @@ func runReceiptIssue() {
 		// Preserve all authenticated immutable identity. In particular, never
 		// substitute a later origin/main for the builder's signed base.
 		base = priorRecovery.BaseSHA
+	} else if *role == dispatch.RoleVerifier {
+		authBase, authErr := authenticatedBuilderBase(root, targetDir, candidate)
+		if authErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", authErr)
+			os.Exit(1)
+		}
+		base, err = verifierIssuanceBase(targetDir, originMain, candidate, authBase, *explicitBase)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+			os.Exit(1)
+		}
 	} else if base == "" {
 		fmt.Fprintf(os.Stderr, "herd receipt: %s has no readable origin/main base (FAC-145)\n", targetDir)
 		os.Exit(1)

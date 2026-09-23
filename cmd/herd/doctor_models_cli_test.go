@@ -56,7 +56,11 @@ lanes:
 	binDir := t.TempDir()
 	for _, command := range []string{"agy", "codex", "grok", "opencode"} {
 		path := filepath.Join(binDir, command)
-		if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' PROBE_OK\n"), 0o755); err != nil {
+		body := "#!/bin/sh\nprintf '%s\\n' PROBE_OK\n"
+		if command == "agy" {
+			body = "#!/bin/sh\nprintf '%s\\n' '{\"conversation_id\":\"sess-probe\",\"status\":\"SUCCESS\",\"response\":\"PROBE_OK\"}'\n"
+		}
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -120,9 +120,14 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 	if err != nil {
 		return ReviewRetirementEvidence{}, err
 	}
-	ack, ackErr := reviewack.ReadArtifact(n.Root, m.CandidateSHA, m.Reviewer, verdict.ArtifactDigest)
-	if ackErr != nil {
-		return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict}, Repository: n.RepositoryIdentity}, nil
+	abort, hasAbort := reviewledger.MatchingCoordinatorAbort(rows, m.CandidateSHA, m.Reviewer, m.Nonce, m.SessionID)
+	var ack reviewack.Ack
+	if !hasAbort {
+		var ackErr error
+		ack, ackErr = reviewack.ReadArtifact(n.Root, m.CandidateSHA, m.Reviewer, verdict.ArtifactDigest)
+		if ackErr != nil {
+			return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict}, Abort: abort, Repository: n.RepositoryIdentity}, nil
+		}
 	}
 	focused := (*bool)(nil)
 	live := ReviewRetirementLive{}
@@ -185,7 +190,7 @@ func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRe
 			return ReviewRetirementEvidence{}, wtErr
 		}
 	}
-	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Live: live, Worktree: wt, WorktreeRoot: m.Pool, PromptRoot: filepath.Dir(m.PromptArtifact), Repository: n.RepositoryIdentity}, nil
+	return ReviewRetirementEvidence{Manifest: m, Launch: launch, Verdict: ReviewRetirementVerdict{Row: verdict, Ack: ack}, Abort: abort, Live: live, Worktree: wt, WorktreeRoot: m.Pool, PromptRoot: filepath.Dir(m.PromptArtifact), Repository: n.RepositoryIdentity}, nil
 }
 
 var errRetirementPoolAlreadyRemoved = errors.New("review retirement pool already removed under authenticated phase intent")
