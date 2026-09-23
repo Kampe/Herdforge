@@ -3102,7 +3102,8 @@ REPORT_TARGET: %s (mandatory; never coordinator)
 REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
 	cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
-2. %s   (targeted tests for the changed packages, not the whole repo)
+2. %s   (named tests from the diff with -run; full heavy packages are hosted CI)
+`+reviewVerificationBudgetSection(testCmd)+`
 File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"
@@ -12428,10 +12429,9 @@ func changedFilesIncludingUncommitted(worktree string) []string {
 	return paths
 }
 
-// scopedTestCommand (FAC-131) derives a TARGETED go test command from a
-// worktree's diff against origin/main — only the Go packages that actually
-// changed, so a small-context reviewer runs a focused suite instead of the
-// whole repo. Falls back to `go test ./...` when the diff can't be read.
+// scopedTestCommand (FAC-131, FAC-852) derives a TARGETED go test command from
+// a worktree's diff. Heavy packages (cmd/herd, pkg/herdr) require named -run
+// tests. Full-package go test of those trees is hosted CI, not targeted-first.
 func scopedTestCommand(worktree string) string {
 	// FAC-430: this diffed origin/main..HEAD only, so UNCOMMITTED work was
 	// invisible and a reviewer was handed a "scoped" suite that did not cover
@@ -12440,7 +12440,7 @@ func scopedTestCommand(worktree string) string {
 	// relevant.
 	changed := changedFilesIncludingUncommitted(worktree)
 	if len(changed) == 0 {
-		return "go test ./..."
+		return nativeReviewHostedGateReuse()
 	}
 	pkgs := map[string]bool{}
 	for _, line := range changed {
@@ -12455,14 +12455,14 @@ func scopedTestCommand(worktree string) string {
 		pkgs["./"+dir+"/"] = true
 	}
 	if len(pkgs) == 0 {
-		return "go test ./..."
+		return nativeReviewHostedGateReuse()
 	}
 	var list []string
 	for p := range pkgs {
 		list = append(list, p)
 	}
 	sort.Strings(list)
-	return "go test -count=1 " + strings.Join(list, " ")
+	return formatNativeReviewTargetedCommand(list, extractNativeReviewTestNames(worktree, changed))
 }
 
 // runDrainSelftest verifies the drain's own integration seams. git is a hard

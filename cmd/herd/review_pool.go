@@ -554,7 +554,11 @@ func runPoolReview(ref string) error {
 	if st, statErr := os.Stat(surfaceAbs); statErr != nil || !st.IsDir() {
 		return fmt.Errorf("reviewer cwd %q does not resolve to a directory: %v", surfaceAbs, statErr)
 	}
-	tab, err := herdr.TabCreate(herdr.TabCreateOptions{Workspace: ws, Label: tabLabel, Cwd: surfaceAbs, NoFocus: true, Env: []string{herdr.AgentRoleEnv}})
+	tabOpts, err := herdr.ReviewTabCreateOptions(ws, tabLabel, surfaceAbs)
+	if err != nil {
+		return fmt.Errorf("create reviewer tab: %w", err)
+	}
+	tab, err := herdr.TabCreate(tabOpts)
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}
@@ -2245,6 +2249,8 @@ Leased slot: %s
 Read .herd/prompts/reviewer.md and .herd/prompts/review-verdict.template.md from
 the candidate surface and inspect only this candidate. These paths are
 candidate-owned; never fall back to files from the shared checkout.
+
+`+reviewVerificationBudgetSection(scopedTestCommand(poolSlotPath))+`
 
 WRITE YOUR VERDICT ARTIFACT TO EXACTLY THIS PATH:
 

@@ -379,6 +379,45 @@ func TestReviewPacketExplainsSurfaceAliasAndPoolToplevel(t *testing.T) {
 	}
 }
 
+func TestReviewPacketSerializesVerificationBudget(t *testing.T) {
+	body := packetBody("FAC-607", strings.Repeat("a", 40), "surface",
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "xai", "wK")
+	for _, want := range []string{
+		"VERIFICATION BUDGET",
+		"serialize, do not fan out",
+		"GOMAXPROCS=2",
+		"GOFLAGS includes -p=1",
+		"one process at a time",
+		"Never start make test-unit, a full-package go test of cmd/herd or pkg/herdr without -run, or go test ./...",
+		"honest reuse",
+		"Build, Preflight & Test Suite",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("packet missing verification budget %q", want)
+		}
+	}
+	if strings.Contains(body, "run make test-unit in parallel") {
+		t.Error("packet must not instruct parallel full-suite execution")
+	}
+}
+
+func TestReviewPoolLaunchUsesReviewTabCreate(t *testing.T) {
+	src, err := os.ReadFile("review_pool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	if !strings.Contains(body, "herdr.ReviewTabCreateOptions(ws, tabLabel, surfaceAbs)") {
+		t.Fatal("native review tab must inherit ReviewTabCreateOptions budget env")
+	}
+	if !strings.Contains(body, "herdr.TabCreate(tabOpts)") {
+		t.Fatal("native review tab must still call shared TabCreate")
+	}
+	if strings.Contains(body, "Env: []string{herdr.AgentRoleEnv}") {
+		t.Fatal("review tab must not launch with AgentRoleEnv alone")
+	}
+}
+
 // Native AGY reviews pin a model independently of the harness. A packet that
 // says "agy writes google" made a claude-opus-4-6-thinking reviewer emit
 // reviewer-family google. Coordinator refused that google artifact; only the
