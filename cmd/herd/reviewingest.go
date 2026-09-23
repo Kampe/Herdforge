@@ -939,14 +939,21 @@ func reviewIngestAdmissionDecision(ledger reviewIngestLedger, opts reviewledger.
 			return "", fmt.Errorf("read existing ledger verdict: %w", err)
 		} else if found {
 			if opts.Verdict.Reassesses == "" {
-				return reviewIngestSkipDuplicate, nil
-			}
-			replay, err := reviewledger.CheckReassessment(prior, opts.Verdict)
-			if err != nil {
-				return "", err
-			}
-			if replay {
-				return reviewIngestSkipDuplicate, nil
+				if strings.EqualFold(strings.TrimSpace(prior.Verdict), string(opts.Verdict.Verdict)) {
+					return reviewIngestSkipDuplicate, nil
+				}
+				if err := reviewledger.RefuseStalePassReplay(prior, opts.Verdict); err != nil {
+					return "", err
+				}
+				// PASS→FAIL/BLOCKED is a new veto event, not a duplicate skip.
+			} else {
+				replay, err := reviewledger.CheckReassessment(prior, opts.Verdict)
+				if err != nil {
+					return "", err
+				}
+				if replay {
+					return reviewIngestSkipDuplicate, nil
+				}
 			}
 		} else if opts.Verdict.Reassesses != "" {
 			return "", fmt.Errorf("reassessment prior verdict not found")

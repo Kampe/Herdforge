@@ -428,7 +428,8 @@ type VerdictOpts struct {
 }
 
 // Verdict appends a verdict event and side-writes to the queue.
-// Duplicate verdicts (same SHA+Reviewer) are idempotent — second call is a no-op.
+// Duplicate identical verdicts (same SHA+Reviewer+polarity) are idempotent.
+// A later different polarity on the same identity appends so readiness cannot keep a superseded PASS.
 func (l *Ledger) Verdict(opts VerdictOpts) (enqueued bool, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -460,7 +461,14 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 		if r.Event == string(EventVerdict) && r.SHA == opts.SHA && r.Reviewer == opts.Reviewer && strings.TrimSpace(r.Host) == strings.TrimSpace(opts.Host) {
 			found = true
 			if opts.Reassesses == "" {
-				return false, nil
+				if strings.EqualFold(strings.TrimSpace(r.Verdict), string(opts.Verdict)) {
+					return false, nil
+				}
+				if err := RefuseStalePassReplay(r, opts); err != nil {
+					return false, err
+				}
+				// PASS→FAIL/BLOCKED appends so readiness cannot keep the earlier PASS.
+				break
 			}
 			replay, err := CheckReassessment(r, opts)
 			if err != nil || replay {

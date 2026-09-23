@@ -140,6 +140,7 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 	superseded := retrySupersessionFromLatest(latest, records, "")
 	reviewers := map[string]string{}
 	unrecorded := map[string]bool{}
+	missingDigest := 0
 	for k, row := range latest {
 		if superseded[k] {
 			continue
@@ -152,6 +153,9 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 		reviewers[name] = verdict
 		if row.Gate == GateProvenanceUnrecorded || strings.EqualFold(strings.TrimSpace(row.BuilderFamily), FamilyUnrecorded) {
 			unrecorded[name] = true
+		}
+		if verdict == string(VerdictPASS) && strings.TrimSpace(row.VerificationDigest) == "" {
+			missingDigest++
 		}
 	}
 	if len(reviewers) == 0 {
@@ -203,6 +207,9 @@ func (l *Ledger) mergeReadinessFor(sha string, allowUnrecorded bool) (MergeReadi
 			"cross-family independence cannot be claimed. Nothing else blocks this candidate: "+
 			"re-run with --allow-unrecorded-provenance to merge on that basis, or record the builder "+
 			"family at dispatch with `herd launch-record` so future candidates carry it", out.Passes)
+	case missingDigest > 0 && missingDigest >= out.Passes:
+		out.Ready = false
+		out.Reason = fmt.Sprintf("%d PASS with no verification digest; harvest-merge will refuse", missingDigest)
 	default:
 		out.Ready = true
 		out.Reason = fmt.Sprintf("%d PASS, no dissent", out.Passes)
