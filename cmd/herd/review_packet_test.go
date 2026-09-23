@@ -1,16 +1,19 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/reviewingest"
 	"github.com/Kampe/Herdforge/pkg/reviewledger"
+	"github.com/Kampe/Herdforge/pkg/router"
 )
 
 func packetBody(ref, sha, surface, verdictPath, supervisor, builderFamily, workspace string) string {
-	return reviewPacketBody(ref, sha, "base", surface, ".herd/pool/pool-01", verdictPath, supervisor, builderFamily, workspace, ref)
+	return reviewPacketBody(ref, sha, "base", surface, ".herd/pool/pool-01", verdictPath, supervisor, builderFamily, workspace, ref, "", "", "")
 }
 
 // FAC-583: the packet used to ask for "the required verdict artifact" without
@@ -75,7 +78,7 @@ func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
 				"base", ".herd/review-surfaces/review-a0a0704dde90",
 				".herd/pool/pool-01",
 				"/repo/.herd/review/inbox/a0a0704dde90-review.md",
-				"forge-review-supervisor-4922de28", "xai", "wK", tt.card)
+				"forge-review-supervisor-4922de28", "xai", "wK", tt.card, "", "", "")
 			if tt.selector != tt.card && strings.Contains(body, "\ntask: "+tt.selector+"\n") {
 				t.Fatalf("old branch-prefill path is live: packet task is %s; ingest cannot close that", tt.selector)
 			}
@@ -90,7 +93,7 @@ func TestReviewPacketBindsCloseableTaskIdentity(t *testing.T) {
 }
 
 func TestReviewPacketNamesRepositoryOwnedContractPaths(t *testing.T) {
-	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "base", "surface", ".herd/pool/pool-01", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-668")
+	body := reviewPacketBody("FAC-668", strings.Repeat("a", 40), "base", "surface", ".herd/pool/pool-01", "/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-668", "", "", "")
 	for _, path := range []string{".herd/prompts/reviewer.md", ".herd/prompts/review-verdict.template.md"} {
 		if !strings.Contains(body, path) {
 			t.Errorf("packet must name candidate-owned contract path %q", path)
@@ -185,6 +188,11 @@ func TestReviewPacketEnumeratesFamiliesAndRejectsHarnessNames(t *testing.T) {
 	for _, invalid := range []string{"codex", "claude", "grok", "opencode"} {
 		if strings.Contains(body, "  "+invalid+"  ") || strings.Contains(body, "  "+invalid+"\n") {
 			t.Errorf("packet accidentally advertises harness %q as a family value", invalid)
+		}
+	}
+	for _, hardcode := range harnessFamilyHardcodes {
+		if strings.Contains(body, hardcode) {
+			t.Errorf("packet hardcodes harness=>family %q; family must follow the resolved model", hardcode)
 		}
 	}
 }
@@ -368,5 +376,88 @@ func TestReviewPacketExplainsSurfaceAliasAndPoolToplevel(t *testing.T) {
 	// and produced the false non-isolated report. Keep the shared-checkout stop.
 	if !strings.Contains(body, "shared checkout root") {
 		t.Error("packet must still fail closed when toplevel is the shared checkout")
+	}
+}
+
+// Native AGY reviews pin a model independently of the harness. A packet that
+// says "agy writes google" made a claude-opus-4-6-thinking reviewer emit
+// reviewer-family google. Coordinator refused that google artifact; only the
+// reviewer-corrected anthropic artifact was ingested.
+var harnessFamilyHardcodes = []string{
+	"agy writes google",
+	"codex writes openai",
+	"claude writes anthropic",
+	"grok writes xai",
+}
+
+func TestReviewPacketRendersResolvedAGYGeminiGoogle(t *testing.T) {
+	provider, model := "agy", "gemini-3.1-pro-high"
+	family := router.FamilyFor(provider, model)
+	if family != "google" {
+		t.Fatalf("FamilyFor(%q, %q) = %q, want google", provider, model, family)
+	}
+	body := reviewPacketBody("FAC-848", strings.Repeat("a", 40), "base", "surface",
+		".herd/pool/pool-01", "/repo/.herd/review/inbox/v.md", "review-supervisor",
+		"xai", "wK", "FAC-848", provider, model, family)
+	assertResolvedReviewerBinding(t, body, provider, model, family)
+	if strings.Contains(body, "Write reviewer-family: anthropic") {
+		t.Fatal("AGY Gemini packet must not instruct anthropic")
+	}
+}
+
+func TestReviewPacketRendersResolvedAGYClaudeAnthropic(t *testing.T) {
+	provider, model := "agy", "claude-opus-4-6-thinking"
+	family := router.FamilyFor(provider, model)
+	if family != "anthropic" {
+		t.Fatalf("FamilyFor(%q, %q) = %q, want anthropic", provider, model, family)
+	}
+	body := reviewPacketBody("FAC-848", strings.Repeat("a", 40), "base", "surface",
+		".herd/pool/pool-01", "/repo/.herd/review/inbox/v.md", "review-supervisor",
+		"xai", "wK", "FAC-848", provider, model, family)
+	assertResolvedReviewerBinding(t, body, provider, model, family)
+	if strings.Contains(body, "Write reviewer-family: google") {
+		t.Fatal("AGY Claude packet must not instruct google as the family to write")
+	}
+}
+
+func TestReviewPacketRunPoolReviewThreadsResolvedReviewerBinding(t *testing.T) {
+	src, err := os.ReadFile("review_pool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, ok := funcBody(string(src), "func runPoolReview(")
+	if !ok {
+		t.Fatal("cannot locate runPoolReview")
+	}
+	if !strings.Contains(body, "reviewer.Provider, reviewer.Model, reviewer.Family") {
+		t.Fatal("runPoolReview must pass the resolved provider/model/family into the packet")
+	}
+	for _, hardcode := range harnessFamilyHardcodes {
+		if strings.Contains(string(src), hardcode) {
+			t.Fatalf("harness=>family hardcode %q must not return in the packet builder", hardcode)
+		}
+	}
+}
+
+func assertResolvedReviewerBinding(t *testing.T, body, provider, model, family string) {
+	t.Helper()
+	wantFront := "reviewer-family: " + family + "\n"
+	if !strings.Contains(body, wantFront) {
+		t.Fatalf("packet must prefill %q", strings.TrimSpace(wantFront))
+	}
+	if strings.Contains(body, "reviewer-family: <your VENDOR family") {
+		t.Fatal("resolved binding must not leave the family placeholder")
+	}
+	want := fmt.Sprintf("This launch's resolved binding is provider=%s model=%s vendor-family=%s. Write reviewer-family: %s.", provider, model, family, family)
+	if !strings.Contains(body, want) {
+		t.Fatalf("packet must render exact resolved binding %q", want)
+	}
+	for _, hardcode := range harnessFamilyHardcodes {
+		if strings.Contains(body, hardcode) {
+			t.Fatalf("harness=>family hardcode %q must not appear", hardcode)
+		}
+	}
+	if strings.Contains(body, "reviewer-family: agy\n") {
+		t.Fatal("packet must not treat the agy harness as a vendor family")
 	}
 }

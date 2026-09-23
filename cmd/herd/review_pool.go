@@ -492,7 +492,7 @@ func runPoolReview(ref string) error {
 	if wsErr != nil {
 		packetWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	}
-	packetBody := reviewPacketBody(ref, sha, base, surface, lease.Path, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
+	packetBody := reviewPacketBody(ref, sha, base, surface, lease.Path, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask, reviewer.Provider, reviewer.Model, reviewer.Family)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -2194,7 +2194,7 @@ func liveAgentByPrefix(prefixes ...string) string {
 	return ""
 }
 
-func reviewPacketBody(ref, sha, base, surface, poolSlotPath, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
+func reviewPacketBody(ref, sha, base, surface, poolSlotPath, verdictPath, supervisor, builderFamily, workspace, taskRef, reviewerProvider, reviewerModel, reviewerFamily string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
@@ -2263,7 +2263,7 @@ sha: %s
 branch: <the branch this candidate lives on>
 task: %s
 reviewer: <your lane name — never a coordinator>
-reviewer-family: <your VENDOR family — see the exact list below>
+reviewer-family: %s
 builder-family: %s
 verdict: PASS|FAIL|BLOCKED
 reviewed-base: %s
@@ -2287,9 +2287,7 @@ FAMILY VALUES ARE A CLOSED SET. Use exactly one of:
   anthropic  openai  google  xai  zhipu  moonshot  alibaba  deepseek
   open-weight  antigravity  proxy
 
-These are VENDOR families, not harness names. Your harness is not a family: a
-reviewer running under codex writes openai, claude writes anthropic, grok writes
-xai, agy writes google. A verdict recorded as reviewer-family "codex" is refused
+These are VENDOR families, not harness names. %s A verdict recorded as reviewer-family "codex" is refused
 as an unknown family and the whole review is discarded, which has already
 happened in this inbox.
 
@@ -2312,7 +2310,25 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, poolSlotPath, sha, surface, poolSlotPath, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), base, reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+`, ref, poolSlotPath, sha, surface, poolSlotPath, verdictPath, sha, taskRef, reviewerFamilyFrontMatter(reviewerFamily), builderFamilyOrUnrecorded(builderFamily), base, reviewerFamilyBindingInstruction(reviewerProvider, reviewerModel, reviewerFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+}
+
+func reviewerFamilyFrontMatter(family string) string {
+	family = strings.TrimSpace(family)
+	if family == "" {
+		return "<your VENDOR family — see the exact list below>"
+	}
+	return family
+}
+
+func reviewerFamilyBindingInstruction(provider, model, family string) string {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	family = strings.TrimSpace(family)
+	if provider != "" && model != "" && family != "" {
+		return fmt.Sprintf("This launch's resolved binding is provider=%s model=%s vendor-family=%s. Write reviewer-family: %s. Do not substitute the harness name, and do not write google merely because the harness is agy.", provider, model, family, family)
+	}
+	return "Derive the family from the model you actually ran, not the harness (agy+gemini-* is google; agy+claude-* is anthropic; agy+gpt-* is open-weight; otherwise use the vendor of that model). Do not write google merely because the harness is agy."
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing
