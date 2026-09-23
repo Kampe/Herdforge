@@ -2030,6 +2030,15 @@ func splitCSV(s string) []string {
 	return out
 }
 
+// standingAdmitDeadline bounds one standing AdmitRoute attempt so a stalled
+// provider probe or quota read cannot hang ModeRaise before PrepareWorktree.
+// Tests shorten it; production matches the probe budget.
+var standingAdmitDeadline = 45 * time.Second
+
+// standingGoalGuardDeadline bounds the re-exec of `herd goal-guard --set` so a
+// test binary or stalled helper cannot hang ModeRaise after PrepareWorktree.
+var standingGoalGuardDeadline = 8 * time.Second
+
 // runStandingConfig is the testable raise entry used by launch-policy tests.
 // It raises every standing lane with live herdr seams when herdrAvailable.
 func runStandingConfig(cfg *config.Config, herdrAvailable bool) error {
@@ -2126,7 +2135,11 @@ func runStandingConfigMode(cfg *config.Config, herdrAvailable bool, mode standin
 			// coordinator's entire uptime. Mint one identity per attempt,
 			// here, once, carried on ctx rather than a package global so
 			// two textually-concurrent admissions cannot cross-contaminate.
-			ctx := withAttemptID(context.Background(), launch.NewAttemptID())
+			// FAC-621: a disposable/shipped raise must not hang forever in
+			// provider probe or quota. Bound the attempt so a stalled
+			// admission fail-closes instead of blocking PrepareWorktree.
+			ctx, cancel := context.WithTimeout(withAttemptID(context.Background(), launch.NewAttemptID()), standingAdmitDeadline)
+			defer cancel()
 			// The launch decision is the sole standing admission authority. Do
 			// not run a separate quota-only pre-gate here: it reads a different
 			// snapshot from the router and cannot account for live concurrency,
@@ -2406,7 +2419,9 @@ func setDurableGoal(cwd, lane, task, owner string, generation int64, envelope *g
 	if err != nil {
 		return fmt.Errorf("resolve self for goal-guard: %w", err)
 	}
-	cmd := exec.Command(self, "goal-guard", "--set",
+	ctx, cancel := context.WithTimeout(context.Background(), standingGoalGuardDeadline)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, self, "goal-guard", "--set",
 		"--lane", lane, "--task", task, "--owner", owner,
 		"--generation", strconv.FormatInt(generation, 10))
 	if envelope != nil {
@@ -2419,6 +2434,9 @@ func setDurableGoal(cwd, lane, task, owner string, generation int64, envelope *g
 	cmd.Dir = cwd
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("goal-guard --set timed out: %w: %s", ctx.Err(), strings.TrimSpace(string(out)))
+		}
 		return fmt.Errorf("goal-guard --set: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
