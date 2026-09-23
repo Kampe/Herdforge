@@ -13,6 +13,7 @@ import (
 type fakeReviewIngestLedger struct {
 	readable    bool
 	reviewer    string
+	verdict     string
 	ingests     int
 	validateErr error
 }
@@ -30,7 +31,11 @@ func (f *fakeReviewIngestLedger) VerdictFor(sha string) (reviewledger.LedgerRow,
 	if !f.readable {
 		return reviewledger.LedgerRow{}, false, errors.New("simulated ledger read failure")
 	}
-	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: f.reviewer, Verdict: "PASS"}, true, nil
+	v := f.verdict
+	if v == "" {
+		v = "PASS"
+	}
+	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: f.reviewer, Verdict: v}, true, nil
 }
 
 func TestReviewIngestAdmissionDecisionRefusesLedgerValidationFailure(t *testing.T) {
@@ -55,7 +60,11 @@ func (f *fakeReviewIngestLedger) VerdictForReviewer(sha, reviewer string) (revie
 	if f.reviewer == "" || f.reviewer != reviewer {
 		return reviewledger.LedgerRow{}, false, nil
 	}
-	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: reviewer, Verdict: "PASS"}, true, nil
+	v := f.verdict
+	if v == "" {
+		v = "PASS"
+	}
+	return reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, Reviewer: reviewer, Verdict: v}, true, nil
 }
 
 func TestReviewIngestAdmissionDecisionParity(t *testing.T) {
@@ -109,6 +118,22 @@ func TestReviewIngestDuplicateDoesNotMoveArtifact(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "ingested", "review.md")); !os.IsNotExist(err) {
 		t.Fatalf("duplicate artifact moved to ingested: %v", err)
+	}
+}
+
+func TestReviewIngestAdmissionDecisionStalePassReplayRefused(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	root := t.TempDir()
+	source := filepath.Join(root, "review.md")
+	if err := os.WriteFile(source, []byte("verdict: PASS"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ledger := &fakeReviewIngestLedger{readable: true, reviewer: "reviewer-a", verdict: "FAIL"}
+	_, err := reviewIngestAdmissionDecision(ledger, reviewledger.IngestOpts{
+		Verdict: reviewledger.VerdictOpts{SHA: sha, Reviewer: "reviewer-a", Verdict: reviewledger.VerdictPASS},
+	}, source, "review.md")
+	if err == nil || !strings.Contains(err.Error(), "stale PASS replay requires explicit reassessment") {
+		t.Fatalf("stale PASS after FAIL must refuse, got %v", err)
 	}
 }
 

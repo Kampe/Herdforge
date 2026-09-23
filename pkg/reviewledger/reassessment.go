@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // VerdictEventDigest names the exact prior immutable verdict, not just its SHA.
@@ -23,6 +24,20 @@ func rawEventDigest(row LedgerRow) string {
 
 // CheckReassessment is shared by dry-run and the locked append path.
 // It returns true only for a byte-identical replay of a prior reassessment.
+// RefuseStalePassReplay fails closed when a later PASS would clear an
+// existing FAIL/BLOCKED without authenticated reassessment. PASS→FAIL still
+// appends as a genuine veto.
+func RefuseStalePassReplay(prior LedgerRow, opts VerdictOpts) error {
+	if strings.TrimSpace(opts.Reassesses) != "" {
+		return nil
+	}
+	priorV := strings.ToUpper(strings.TrimSpace(prior.Verdict))
+	if opts.Verdict == VerdictPASS && (priorV == string(VerdictFAIL) || priorV == string(VerdictBLOCKED)) {
+		return fmt.Errorf("stale PASS replay requires explicit reassessment")
+	}
+	return nil
+}
+
 func CheckReassessment(prior LedgerRow, opts VerdictOpts) (bool, error) {
 	if opts.Reassesses == "" {
 		return false, fmt.Errorf("reassessment must bind the prior verdict event")

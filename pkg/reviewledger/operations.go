@@ -464,8 +464,10 @@ func (l *Ledger) verdict(opts VerdictOpts) (enqueued bool, err error) {
 				if strings.EqualFold(strings.TrimSpace(r.Verdict), string(opts.Verdict)) {
 					return false, nil
 				}
-				// Same reviewer/path, changed polarity (PASS→FAIL). Append so
-				// readiness cannot keep the earlier PASS. Identical replays stay skipped.
+				if err := RefuseStalePassReplay(r, opts); err != nil {
+					return false, err
+				}
+				// PASS→FAIL/BLOCKED appends so readiness cannot keep the earlier PASS.
 				break
 			}
 			replay, err := CheckReassessment(r, opts)

@@ -779,6 +779,36 @@ func TestVerdictIdempotent(t *testing.T) {
 	}
 }
 
+func TestVerdictRefusesStalePassReplayAfterFail(t *testing.T) {
+	l := newTestLedger(t)
+	if _, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: VerdictFAIL, ReviewerFamily: "google",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := l.Verdict(VerdictOpts{
+		SHA: "abc123", Reviewer: "reviewer-1",
+		Verdict: VerdictPASS, ReviewerFamily: "google",
+	})
+	if err == nil || !strings.Contains(err.Error(), "stale PASS replay requires explicit reassessment") {
+		t.Fatalf("FAIL then PASS without reassessment must refuse, got %v", err)
+	}
+	rows, _ := l.AllRows()
+	n := 0
+	for _, r := range rows {
+		if r.Event == string(EventVerdict) {
+			n++
+			if r.Verdict != string(VerdictFAIL) {
+				t.Fatalf("ledger must keep FAIL, got %s", r.Verdict)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("stale PASS must not append, verdict rows=%d", n)
+	}
+}
+
 func TestVerdictChangedPolarityAppendsFailClosed(t *testing.T) {
 	l := newTestLedger(t)
 	if _, err := l.Verdict(VerdictOpts{

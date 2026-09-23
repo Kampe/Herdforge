@@ -942,8 +942,10 @@ func reviewIngestAdmissionDecision(ledger reviewIngestLedger, opts reviewledger.
 				if strings.EqualFold(strings.TrimSpace(prior.Verdict), string(opts.Verdict.Verdict)) {
 					return reviewIngestSkipDuplicate, nil
 				}
-				// Same reviewer/path with a changed polarity (PASS→FAIL) is a
-				// new event. Skipping it leaves readiness at the earlier PASS.
+				if err := reviewledger.RefuseStalePassReplay(prior, opts.Verdict); err != nil {
+					return "", err
+				}
+				// PASS→FAIL/BLOCKED is a new veto event, not a duplicate skip.
 			} else {
 				replay, err := reviewledger.CheckReassessment(prior, opts.Verdict)
 				if err != nil {
