@@ -40,16 +40,32 @@ func (m *Mailbox) PendingOrdinary(recipient string) ([]*Envelope, error) {
 }
 
 // OrdinaryStatus is the read-only disposition view used by collectors.
+// Kind distinguishes ordinary reports from queued-durable rows. Queued is
+// true only while a queued-durable envelope is unconsumed. There is no
+// delivered field: consumption is Handled after the native drain ack.
 type OrdinaryStatus struct {
 	ID        string `json:"id"`
 	Recipient string `json:"recipient"`
+	Kind      string `json:"kind"`
 	Ordinary  bool   `json:"ordinary"`
+	Queued    bool   `json:"queued"`
 	Pending   bool   `json:"pending"`
 	Handled   bool   `json:"handled"`
 }
 
-// StatusOrdinary reports local state for one exact ordinary envelope.
-func (m *Mailbox) StatusOrdinary(recipient, id string) (OrdinaryStatus, error) {
+// PendingVisible returns unacknowledged ordinary reports and queued-durable
+// envelopes. Control and callback mail stay off this list.
+func (m *Mailbox) PendingVisible(recipient string) ([]*Envelope, error) {
+	return m.pendingRoutine(recipient, func(env *Envelope) bool {
+		if IsQueuedDelivery(env) {
+			return true
+		}
+		return !env.Read && IsOrdinaryReport(env)
+	})
+}
+
+// StatusEnvelope reports local state for one ordinary or queued-durable envelope.
+func (m *Mailbox) StatusEnvelope(recipient, id string) (OrdinaryStatus, error) {
 	if m == nil {
 		return OrdinaryStatus{}, fmt.Errorf("mail: nil mailbox")
 	}
@@ -65,16 +81,37 @@ func (m *Mailbox) StatusOrdinary(recipient, id string) (OrdinaryStatus, error) {
 		if env == nil || env.ID != id {
 			continue
 		}
-		if !IsOrdinaryReport(env) {
-			return OrdinaryStatus{}, ordinaryEnvelopeClassError(id)
-		}
 		handled, err := m.Handled(recipient, id)
 		if err != nil {
 			return OrdinaryStatus{}, err
 		}
-		return OrdinaryStatus{ID: id, Recipient: recipient, Ordinary: true, Pending: !handled, Handled: handled}, nil
+		if IsQueuedDelivery(env) {
+			return OrdinaryStatus{
+				ID: id, Recipient: recipient, Kind: EnvelopeKindQueuedDurable,
+				Ordinary: false, Queued: !handled, Pending: !handled, Handled: handled,
+			}, nil
+		}
+		if !IsOrdinaryReport(env) {
+			return OrdinaryStatus{}, ordinaryEnvelopeClassError(id)
+		}
+		return OrdinaryStatus{
+			ID: id, Recipient: recipient, Kind: EnvelopeKindOrdinary,
+			Ordinary: true, Queued: false, Pending: !handled, Handled: handled,
+		}, nil
 	}
 	return OrdinaryStatus{}, ordinaryEnvelopeNotFound(id, recipient)
+}
+
+// StatusOrdinary reports local state for one exact ordinary envelope.
+func (m *Mailbox) StatusOrdinary(recipient, id string) (OrdinaryStatus, error) {
+	status, err := m.StatusEnvelope(recipient, id)
+	if err != nil {
+		return OrdinaryStatus{}, err
+	}
+	if !status.Ordinary {
+		return OrdinaryStatus{}, ordinaryEnvelopeClassError(id)
+	}
+	return status, nil
 }
 
 // ImportOrdinary appends one source-host-labelled ordinary envelope. Retries

@@ -178,7 +178,7 @@ func runMailPending(args []string) {
 		fmt.Fprintf(os.Stderr, "mail pending: %v\n", err)
 		os.Exit(1)
 	}
-	envs, err := mail.NewMailbox(path).PendingOrdinary(strings.TrimSpace(*recipient))
+	envs, err := mail.NewMailbox(path).PendingVisible(strings.TrimSpace(*recipient))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail pending: %v\n", err)
 		os.Exit(1)
@@ -195,7 +195,7 @@ func runMailPending(args []string) {
 func runMailStatus(args []string) {
 	fs := flag.NewFlagSet("mail status", flag.ContinueOnError)
 	recipient := fs.String("recipient", "", "exact envelope recipient")
-	id := fs.String("id", "", "exact ordinary envelope ID")
+	id := fs.String("id", "", "exact ordinary or queued-durable envelope ID")
 	mailPath := fs.String("mail", "", "mailbox path override")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -209,7 +209,7 @@ func runMailStatus(args []string) {
 		fmt.Fprintf(os.Stderr, "mail status: %v\n", err)
 		os.Exit(1)
 	}
-	status, err := mail.NewMailbox(path).StatusOrdinary(*recipient, *id)
+	status, err := mail.NewMailbox(path).StatusEnvelope(*recipient, *id)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mail status: %v\n", err)
 		os.Exit(1)
