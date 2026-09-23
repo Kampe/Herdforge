@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 )
 
 // Advertising probe helpers remain for optional bounded live checks and for
@@ -72,7 +74,7 @@ func runProviderProbe(provider, model string, timeout time.Duration) (bool, stri
 	stdout, stderr, runErr, timedOut := execProviderProbe(ctx, command, args, stdin)
 	elapsed := time.Since(started)
 	combined := stdout + "\n" + stderr
-	ok, reason := classifyProviderProbeOutput(stdout, combined, runErr, timedOut)
+	ok, reason := classifyProviderProbeResult(provider, model, stdout, combined, runErr, timedOut)
 	if timedOut && reason == probeTimeoutMarker {
 		// CHA-2451's read paths keep their terse machine marker; they already
 		// skip the live probe and only need a deadline token.
@@ -93,7 +95,7 @@ func runProviderProbe(provider, model string, timeout time.Duration) (bool, stri
 var execProviderProbe = defaultExecProviderProbe
 
 func defaultExecProviderProbe(ctx context.Context, command string, args []string, stdin string) (stdout, stderr string, err error, timedOut bool) {
-	cmd := exec.CommandContext(ctx, command, args...)
+	cmd := procsignal.CommandContext(ctx, command, args...)
 	cmd.Stdin = strings.NewReader(stdin)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf

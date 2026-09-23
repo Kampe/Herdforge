@@ -48,6 +48,10 @@ func defaultProviderProbe(provider, model string) (bool, string) {
 }
 
 func classifyProviderProbeOutput(output, combined string, runErr error, timedOut bool) (bool, string) {
+	return classifyProviderProbeResult("", "", output, combined, runErr, timedOut)
+}
+
+func classifyProviderProbeResult(provider, model, output, combined string, runErr error, timedOut bool) (bool, string) {
 	cleanOutput := spin.StripTerminalControlSequences(output)
 	cleanCombined := spin.StripTerminalControlSequences(combined)
 	lower := strings.ToLower(cleanCombined)
@@ -63,6 +67,12 @@ func classifyProviderProbeOutput(output, combined string, runErr error, timedOut
 	}
 	if runErr != nil {
 		return false, "provider probe failed: " + firstProbeLine(combined, runErr.Error())
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "agy") {
+		if reason := AgyStructuredProbeReason(cleanOutput, model, providerProbeSentinel); reason != "" {
+			return false, reason
+		}
+		return true, ""
 	}
 	if strings.TrimSpace(cleanOutput) != providerProbeSentinel {
 		return false, "provider probe returned no exact readiness token"
@@ -81,7 +91,8 @@ func providerProbeCommand(provider, model string) (string, []string, string, err
 	case "claude":
 		return "claude", []string{"--model", model, "-p"}, prompt, nil
 	case "agy":
-		return "agy", []string{"--model", model, "--print", prompt}, "", nil
+		argv := InsertAgyStructuredPrintFlags([]string{"--model", model, "--print", prompt})
+		return "agy", argv, "", nil
 	case "codex":
 		return "codex", []string{"exec", "--model", model, "-s", "read-only"}, prompt, nil
 	case "grok":
