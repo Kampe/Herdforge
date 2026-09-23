@@ -201,6 +201,39 @@ func TestCoordinatorAbortRefusesWrongLease(t *testing.T) {
 	}
 }
 
+func TestCoordinatorAbortRefusesRecordedPaneMismatch(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, filepath.Join(dir, "ledger.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := AbortOpts{SHA: strings.Repeat("4", 40), Reviewer: "r", Lease: "l", SessionID: "s", Reason: "quota-exhausted", Pane: "wK:p1EQ", Task: "FAC-851"}
+	wrong := opts
+	wrong.Pane = "wK:pOTHER"
+	seedAbortLaunch(t, l, wrong)
+	err = l.CheckCoordinatorAbort(opts)
+	if err == nil || !strings.Contains(err.Error(), "pane does not bind") {
+		t.Fatalf("want recorded pane mismatch refuse, got %v", err)
+	}
+}
+
+func TestCoordinatorAbortAllowsUnrecordedLaunchPaneWhenAbortProvidesRosterPane(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewReviewLedger(dir, filepath.Join(dir, "ledger.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := AbortOpts{SHA: strings.Repeat("5", 40), Reviewer: "review-fac-851-ad78e2762013", Lease: "pool-02-1790108554212514000", SessionID: "b9e586e4-410b-47d8-8725-20ab904f4105", Reason: "quota-exhausted", Pane: "wK:p1EQ", Task: "FAC-851"}
+	if err := l.Record(RecordOpts{
+		SHA: opts.SHA, Reviewer: opts.Reviewer, Lease: opts.Lease, Task: opts.Task, BuilderFamily: "xai",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.CheckCoordinatorAbort(opts); err != nil {
+		t.Fatalf("unrecorded launch pane must not refuse roster pane_id: %v", err)
+	}
+}
+
 func TestCoordinatorAbortRefusesWrongSession(t *testing.T) {
 	dir := t.TempDir()
 	l, err := NewReviewLedger(dir, filepath.Join(dir, "ledger.jsonl"))
