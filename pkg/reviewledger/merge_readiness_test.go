@@ -72,7 +72,7 @@ func TestMergeReadiness_BlockedAlwaysBlocks(t *testing.T) {
 func TestMergeReadiness_SameReviewerSupersedes(t *testing.T) {
 	l := ledgerWith(t,
 		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"FAIL"}`,
-		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"PASS"}`)
+		`{"event":"verdict","sha":"ddd","reviewer":"r1","verdict":"PASS","verification_digest":"0123456789abcdef0123456789abcdef"}`)
 	got, _ := l.MergeReadinessFor("ddd")
 	if !got.Ready {
 		t.Fatalf("a reviewer's own later PASS must supersede its FAIL: %+v", got)
@@ -90,8 +90,22 @@ func TestMergeReadiness_NoVerdictIsNotReady(t *testing.T) {
 
 // A genuine clean pass must still be ready, so the guard cannot be satisfied by
 // never returning true.
+func TestMergeReadiness_PassWithoutVerificationDigestIsNotReady(t *testing.T) {
+	l := ledgerWith(t, `{"event":"verdict","sha":"fff1111111111111111111111111111111111111","reviewer":"r1","verdict":"PASS"}`)
+	got, _ := l.MergeReadinessFor("fff1111111111111111111111111111111111111")
+	if got.Ready {
+		t.Fatalf("PASS without verification digest must not be harvest-ready: %+v", got)
+	}
+	if !strings.Contains(got.Reason, "verification digest") {
+		t.Fatalf("reason must name the digest gap: %+v", got)
+	}
+	if got.Passes != 1 {
+		t.Fatalf("the PASS must still be counted: %+v", got)
+	}
+}
+
 func TestMergeReadiness_CleanPassIsReady(t *testing.T) {
-	l := ledgerWith(t, `{"event":"verdict","sha":"fff","reviewer":"r1","verdict":"PASS"}`)
+	l := ledgerWith(t, `{"event":"verdict","sha":"fff","reviewer":"r1","verdict":"PASS","verification_digest":"0123456789abcdef0123456789abcdef"}`)
 	got, _ := l.MergeReadinessFor("fff")
 	if !got.Ready || got.Passes != 1 {
 		t.Fatalf("a clean PASS must be ready: %+v", got)
@@ -157,7 +171,7 @@ func TestMergeReadiness_ProvableePassAlongsideUnrecordedIsReady(t *testing.T) {
 	sha := "bbb1111111111111111111111111111111111111"
 	l := ledgerWith(t,
 		`{"event":"verdict","sha":"`+sha+`","reviewer":"r1","verdict":"PASS","gate":"provenance-unrecorded","builder_family":"unrecorded"}`,
-		`{"event":"verdict","sha":"`+sha+`","reviewer":"r2","verdict":"PASS","gate":"independent","builder_family":"openai"}`)
+		`{"event":"verdict","sha":"`+sha+`","reviewer":"r2","verdict":"PASS","gate":"independent","builder_family":"openai","verification_digest":"0123456789abcdef0123456789abcdef"}`)
 	got, _ := l.MergeReadinessFor(sha)
 	if !got.Ready {
 		t.Fatalf("a provable PASS must still carry the candidate: %+v", got)

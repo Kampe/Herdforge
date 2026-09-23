@@ -47,6 +47,8 @@ var verificationHeadings = []string{
 	"verification",
 	"verification evidence",
 	"commands run",
+	"exact named test command and output",
+	"named test command and output",
 }
 
 // VerificationEvidence extracts and normalises the reviewer's record of what it
@@ -214,7 +216,7 @@ func isSectionHeading(lower string) bool {
 	lower = strings.TrimSuffix(strings.TrimSpace(lower), ":")
 	for _, h := range []string{
 		"verdict", "rubric", "required findings", "optional findings",
-		"acceptance criteria", "merge recommendation", "residual risk",
+		"acceptance criteria", "card acceptance clauses", "merge recommendation", "residual risk",
 		"invariant and adr result", "skills used", "task id", "model family",
 		"author instructions", "findings and risk", "findings",
 		"identity and optional metadata", "delivery and retention",

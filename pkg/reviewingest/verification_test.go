@@ -241,6 +241,64 @@ Instructions here.
 	}
 }
 
+func TestVerificationDigestReadsExactNamedTestCommandAndOutput(t *testing.T) {
+	// FAC-857 admitted artifact used this heading plus a fenced `ok` line,
+	// split from the command. FAC-854 "## Tests run" with a bash fence was
+	// ingested with a digest. The heading mismatch left harvest-merge refusing
+	// "no verification digest" while readiness reported ready:true.
+	artifact := `sha: 93368159237b2c1124d1d9f0bd6fbdf45e782655
+---
+The targeted tests passed.
+
+## Exact Named Test Command and Output
+**Command:**
+` + "`GOMAXPROCS=2 go test -count=1 -p=1 -timeout=90s -run '^TestReviewPacketRendersResolvedAGYClaudeAnthropic$' ./cmd/herd/`" + `
+
+**Output:**
+` + "```" + `
+ok  	github.com/Kampe/Herdforge/cmd/herd	0.803s
+` + "```" + `
+
+## Card Acceptance Clauses
+1. Independent exact-head review. -> In progress.
+`
+	a := Parse(artifact)
+	ev := a.VerificationEvidence()
+	if !strings.Contains(ev, "GOMAXPROCS=2 go test") {
+		t.Fatalf("named command must be captured: %q", ev)
+	}
+	if !strings.Contains(ev, "ok github.com/Kampe/Herdforge/cmd/herd") {
+		t.Fatalf("ok output must be captured: %q", ev)
+	}
+	if strings.Contains(ev, "Card Acceptance") || strings.Contains(ev, "In progress") {
+		t.Fatalf("card-acceptance section must not be digested: %q", ev)
+	}
+	if a.VerificationDigest() == "" {
+		t.Fatal("FAC-857 named-test heading must produce a digest")
+	}
+	control := Parse(`sha: abc
+---
+## Tests run
+` + "```bash" + `
+$ GOMAXPROCS=2 go test -count=1 ./pkg/herdr/
+ok  	github.com/Kampe/Herdforge/pkg/herdr	5.987s
+` + "```" + `
+`)
+	if control.VerificationDigest() == "" {
+		t.Fatal("FAC-854 Tests run fence must still produce a digest")
+	}
+	if a.VerificationDigest() == control.VerificationDigest() {
+		t.Fatal("different commands/results must not share a digest")
+	}
+}
+
+func TestVerificationDigestDoesNotTreatNamedTestProseAsEvidence(t *testing.T) {
+	a := Parse("sha: abc\n---\nVerdict: PASS\n\nI could not see the exact named test command and output in CI.\n")
+	if got := a.VerificationDigest(); got != "" {
+		t.Fatalf("prose mention must not open a verification section, got %q", got)
+	}
+}
+
 func TestVerificationDigestEmptySubsectionsFailClosed(t *testing.T) {
 	artifact := `sha: abc
 ---
@@ -263,4 +321,3 @@ Replace placeholders.
 		t.Fatalf("empty subsections must produce no digest, got %q", got)
 	}
 }
-
