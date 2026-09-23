@@ -24,7 +24,8 @@ type AgyPrintEnvelope struct {
 // --disable-slash-commands before --print/-p/--prompt.
 //
 // --print consumes the next argv as the prompt, so flags after it become the
-// prompt and never reach print-mode JSON.
+// prompt and never reach print-mode JSON. FAC-855 admission and herdr model
+// probes share this helper.
 func InsertAgyStructuredPrintFlags(argv []string) []string {
 	out := make([]string, 0, len(argv)+4)
 	inserted := false

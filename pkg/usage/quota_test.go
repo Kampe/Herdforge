@@ -197,6 +197,27 @@ func TestPoolResources(t *testing.T) {
 	}
 }
 
+func TestAntigravityPoolResourcesClassifiesRouterKeys(t *testing.T) {
+	prov := ProviderUsage{Resources: map[string]ResourceUsage{
+		"gemini-5h":       {Remaining: 10},
+		"gemini-weekly":   {Remaining: 20},
+		"3p-5h":           {Remaining: 30},
+		"3p-weekly":       {Remaining: 40},
+		"nonGeminiWeekly": {Remaining: 50},
+		"unknown-window":  {Remaining: 1},
+	}}
+	pools := poolResources("antigravity", prov)
+	if len(pools["gemini"]) != 2 || !pools["gemini"]["gemini-5h"] || !pools["gemini"]["gemini-weekly"] {
+		t.Fatalf("gemini pool keys = %v", pools["gemini"])
+	}
+	if len(pools["nonGemini"]) != 3 || !pools["nonGemini"]["3p-5h"] || !pools["nonGemini"]["3p-weekly"] || !pools["nonGemini"]["nonGeminiWeekly"] {
+		t.Fatalf("nonGemini pool keys = %v", pools["nonGemini"])
+	}
+	if pools["gemini"]["3p-weekly"] || pools["nonGemini"]["gemini-weekly"] {
+		t.Fatalf("pool membership crossed families: gemini=%v nonGemini=%v", pools["gemini"], pools["nonGemini"])
+	}
+}
+
 func TestClaudeFableExhaustionDoesNotExhaustDefaultPool(t *testing.T) {
 	now := freezeTime()
 	snap := &UsageSnapshot{

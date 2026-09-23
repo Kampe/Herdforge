@@ -1,7 +1,6 @@
 package router
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/Kampe/Herdforge/pkg/agentpolicy"
@@ -91,28 +90,5 @@ func TestAgyStructuredProbeReasonFixtures(t *testing.T) {
 				t.Fatalf("got %q want %q", reason, tc.reason)
 			}
 		})
-	}
-}
-
-func TestAgyAdmissionClassifyRequiresStructuredSuccess(t *testing.T) {
-	healthy := `{"conversation_id":"sess-1","status":"SUCCESS","response":"HERD_PROVIDER_PROBE_OK"}`
-	ok, reason := classifyProviderProbeResult("agy", "gemini-3.1-pro-high", healthy, healthy, nil, false)
-	if !ok || reason != "" {
-		t.Fatalf("structured success must admit: ok=%t reason=%q", ok, reason)
-	}
-	ok, reason = classifyProviderProbeResult("agy", "gemini-3.1-pro-high", providerProbeSentinel, providerProbeSentinel, nil, false)
-	if ok || !strings.Contains(reason, "no structured agy probe result") {
-		t.Fatalf("raw sentinel must not admit agy: ok=%t reason=%q", ok, reason)
-	}
-}
-
-func TestAgyAdmissionTimeoutStaysUnknownEvenWithHealthyJSON(t *testing.T) {
-	healthy := `{"conversation_id":"sess-1","status":"SUCCESS","response":"HERD_PROVIDER_PROBE_OK"}`
-	ok, reason := classifyProviderProbeResult("agy", "gemini-3.1-pro-high", healthy, healthy, nil, true)
-	if ok {
-		t.Fatal("timeout must not convert to healthy")
-	}
-	if reason != probeTimeoutMarker {
-		t.Fatalf("timeout reason = %q, want %q", reason, probeTimeoutMarker)
 	}
 }

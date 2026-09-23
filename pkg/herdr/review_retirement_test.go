@@ -63,6 +63,47 @@ func TestEvaluateReviewRetirementAllowsExactCleanSettledLane(t *testing.T) {
 	}
 }
 
+func TestEvaluateReviewRetirementAllowsCoordinatorAbortWithoutVerdict(t *testing.T) {
+	m := retirementManifest(t, "g-abort")
+	e := retirementEvidence(m)
+	e.Verdict = ReviewRetirementVerdict{}
+	e.Abort = reviewledger.LedgerRow{
+		Event: string(reviewledger.EventCoordinatorAbort), SHA: m.CandidateSHA, Reviewer: m.Reviewer,
+		Lease: m.Nonce, SessionID: m.SessionID, Authority: reviewledger.CoordinatorAbortAuthority, Reason: "quota-exhausted",
+	}
+	d := EvaluateReviewRetirement(e)
+	if !d.Eligible || !strings.Contains(d.Reason, "coordinator abort") {
+		t.Fatalf("abort should permit retirement: %+v", d)
+	}
+}
+
+func TestEvaluateReviewRetirementAbortStillRefusesActiveLane(t *testing.T) {
+	m := retirementManifest(t, "g-abort-active")
+	e := retirementEvidence(m)
+	e.Verdict = ReviewRetirementVerdict{}
+	e.Abort = reviewledger.LedgerRow{
+		Event: string(reviewledger.EventCoordinatorAbort), SHA: m.CandidateSHA, Reviewer: m.Reviewer,
+		Lease: m.Nonce, SessionID: m.SessionID, Authority: reviewledger.CoordinatorAbortAuthority, Reason: "quota-exhausted",
+	}
+	e.Live.Status = "working"
+	if d := EvaluateReviewRetirement(e); d.Eligible {
+		t.Fatal("abort must not retire a working reviewer")
+	}
+}
+
+func TestEvaluateReviewRetirementRefusesAbortSessionMismatch(t *testing.T) {
+	m := retirementManifest(t, "g-abort-mismatch")
+	e := retirementEvidence(m)
+	e.Verdict = ReviewRetirementVerdict{}
+	e.Abort = reviewledger.LedgerRow{
+		Event: string(reviewledger.EventCoordinatorAbort), SHA: m.CandidateSHA, Reviewer: m.Reviewer,
+		Lease: m.Nonce, SessionID: "other-session", Authority: reviewledger.CoordinatorAbortAuthority, Reason: "quota-exhausted",
+	}
+	if d := EvaluateReviewRetirement(e); d.Eligible {
+		t.Fatal("session mismatch abort must not retire")
+	}
+}
+
 func TestEvaluateReviewRetirementTaskAndBranchBindings(t *testing.T) {
 	m := retirementManifest(t, "g-bind")
 	baseEvidence := retirementEvidence(m)
