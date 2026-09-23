@@ -46,10 +46,11 @@ func runQuotaSupervisor() {
 	stateFile := filepath.Join(".herd", "quota-supervisor.json")
 	now := time.Now().UTC()
 
-	// Live quota is the authority. If it is unreadable, refuse — guessing
-	// capacity is how work gets sent at a dead pool.
+	// Shared cache/backoff is the authority, same as review/router. Live
+	// FetchSnapshot() bypasses persisted 429 backoff and re-hits the usage
+	// endpoint every tick (FAC-853).
 	engine := usage.NewQuotaEngine()
-	snap, err := usage.FetchSnapshot()
+	snap, err := loadQuotaSupervisorSnapshot()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "herd quota-supervisor: live quota unreadable; refusing to guess: %v\n", err)
 		os.Exit(1)
@@ -69,7 +70,7 @@ func runQuotaSupervisor() {
 
 	current := &quotasup.Snapshot{
 		ObservedAt:        now.Format(time.RFC3339),
-		SourceAt:          snap.GeneratedAt.UTC().Format(time.RFC3339),
+		SourceAt:          oldestProviderObservation(snap).UTC().Format(time.RFC3339),
 		Workspace:         workspace,
 		WarnRunwayMinutes: *warn,
 	}
@@ -132,7 +133,7 @@ func runQuotaSupervisor() {
 		ev := quotasup.Observation{
 			Surface:        s,
 			Burn:           quotasup.BurnFor(computed, s),
-			SourceAt:       snap.GeneratedAt,
+			SourceAt:       quotaObservationTime(snap, s.Provider),
 			Cooldown:       quotasup.SurfaceCooldown(now, s),
 			Active:         active[s],
 			Models:         sortedKeys(models[s]),
@@ -298,4 +299,66 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// loadQuotaSupervisorSnapshot is the shared cache/backoff path review and
+// router already use. FetchSnapshot (fetchDirectAll) is the live bypass.
+func loadQuotaSupervisorSnapshot() (*usage.UsageSnapshot, error) {
+	snap, _, err := usage.FetchSnapshotCached()
+	return snap, err
+}
+
+// quotaObservationTime is when that quota provider generated the reading, not
+// when this supervisor process assembled the snapshot. Missing providers and
+// zero ObservedAt stay unknown (zero time) so Grade fail-closes instead of
+// treating assembly time as a fresh observation.
+func quotaObservationTime(snap *usage.UsageSnapshot, quotaProvider string) time.Time {
+	p, ok := snapshotProviderUsage(snap, quotaProvider)
+	if !ok || p.ObservedAt.IsZero() {
+		return time.Time{}
+	}
+	return p.ObservedAt.UTC()
+}
+
+func snapshotProviderUsage(snap *usage.UsageSnapshot, quotaProvider string) (usage.ProviderUsage, bool) {
+	if snap == nil {
+		return usage.ProviderUsage{}, false
+	}
+	name := strings.ToLower(strings.TrimSpace(quotaProvider))
+	if name == "" {
+		return usage.ProviderUsage{}, false
+	}
+	keys := []string{name}
+	switch name {
+	case "agy":
+		keys = append(keys, "antigravity")
+	case "antigravity":
+		keys = append(keys, "agy")
+	case "lazer":
+		keys = append(keys, "litellm")
+	case "litellm":
+		keys = append(keys, "lazer")
+	}
+	for _, k := range keys {
+		if p, ok := snap.Providers[k]; ok {
+			return p, true
+		}
+	}
+	return usage.ProviderUsage{}, false
+}
+
+func oldestProviderObservation(snap *usage.UsageSnapshot) time.Time {
+	if snap == nil {
+		return time.Time{}
+	}
+	oldest := time.Time{}
+	for _, p := range snap.Providers {
+		if p.ObservedAt.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || p.ObservedAt.Before(oldest) {
+			oldest = p.ObservedAt
+		}
+	}
+	return oldest
 }
