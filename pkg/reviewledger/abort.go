@@ -63,7 +63,10 @@ func canonicalLaunchForAbort(rows []LedgerRow, opts AbortOpts) (LedgerRow, error
 	if sid := strings.TrimSpace(launch.SessionID); sid != "" && sid != opts.SessionID {
 		return LedgerRow{}, fmt.Errorf("coordinator abort session does not bind the canonical launch")
 	}
-	if pane := strings.TrimSpace(opts.Pane); pane != "" && strings.TrimSpace(launch.Pane) != pane {
+	// Roster/manifest always carry pane_id. Production launch-provenance rows
+	// often omit pane. Only a recorded launch pane is identity; an empty
+	// launch pane is not a mismatch against a live roster pane.
+	if recorded := strings.TrimSpace(launch.Pane); recorded != "" && recorded != strings.TrimSpace(opts.Pane) {
 		return LedgerRow{}, fmt.Errorf("coordinator abort pane does not bind the canonical launch")
 	}
 	if task := strings.TrimSpace(opts.Task); task != "" && strings.TrimSpace(launch.Task) != task {

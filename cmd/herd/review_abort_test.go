@@ -191,6 +191,32 @@ func TestReviewAbortCLI_RefusesWrongLease(t *testing.T) {
 	}
 }
 
+func TestReviewAbortCLI_DryRunAllowsUnrecordedLaunchPane(t *testing.T) {
+	binary := buildHerd(t)
+	dir := t.TempDir()
+	path, m := writeAbortManifest(t, dir)
+	ledgerPath := filepath.Join(dir, "ledger.jsonl")
+	l, err := reviewledger.NewReviewLedger(dir, ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record(reviewledger.RecordOpts{
+		SHA: m.CandidateSHA, Reviewer: m.Reviewer, Lease: m.Nonce, Task: m.TaskRef, BuilderFamily: "google",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "review-abort", "--manifest", path, "--session", m.SessionID, "--reason", "quota-exhausted", "--dry-run")
+	cmd.Dir = dir
+	cmd.Env = abortCLIEnv(ledgerPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("unrecorded launch pane dry-run: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "review-abort dry-run:") {
+		t.Fatalf("want dry-run admit, got %s", out)
+	}
+}
+
 func TestReviewAbortCLI_RefusesWrongSession(t *testing.T) {
 	binary := buildHerd(t)
 	dir := t.TempDir()
