@@ -381,7 +381,7 @@ func TestReviewPacketSerializesVerificationBudget(t *testing.T) {
 		"GOMAXPROCS=2",
 		"GOFLAGS includes -p=1",
 		"one process at a time",
-		"Never start make test-unit, go test ./cmd/herd, and go test ./... together",
+		"Never start make test-unit, a full-package go test of cmd/herd or pkg/herdr without -run, or go test ./...",
 		"honest reuse",
 		"Build, Preflight & Test Suite",
 	} {
