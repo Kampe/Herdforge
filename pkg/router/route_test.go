@@ -1,6 +1,7 @@
 package router
 
 import (
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -652,7 +653,7 @@ func TestArgvContracts(t *testing.T) {
 		want    []string
 	}{
 		{"claude", "claude-fable-5", "medium",
-			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--fallback-model", "claude-sonnet-5", "--permission-mode", "bypassPermissions"}},
+			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-fable-5", "--effort", "medium", "--permission-mode", "bypassPermissions"}},
 		{"claude", "claude-sonnet-5", "high",
 			[]string{"claude", "--mcp-config", `{"mcpServers":{}}`, "--strict-mcp-config", "--disable-slash-commands", "--disallowed-tools", "Agent", "Task", "ToolSearch", "--model", "claude-sonnet-5", "--effort", "high", "--permission-mode", "bypassPermissions"}},
 		{"codex", "gpt-5.6-luna", "xhigh",
@@ -709,6 +710,53 @@ func TestAGYInteractiveArgvDoesNotRequirePrompt(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("AGY interactive argv must preserve permission bypass: %v", argv)
+	}
+}
+
+func TestArgvForExactOpusReviewHasNoSilentFallback(t *testing.T) {
+	argv := ArgvFor("claude", "claude-opus-5", "high")
+	if argvHasFlag(argv, "--fallback-model") {
+		t.Fatalf("exact opus pin leaked --fallback-model: %v", argv)
+	}
+	model, ok := argvFlagValue(argv, "--model")
+	if !ok || model != "claude-opus-5" {
+		t.Fatalf("exact opus --model missing: %v", argv)
+	}
+}
+
+func TestArgvForWithFallbacksKeepsExplicitClaudeFallback(t *testing.T) {
+	argv := ArgvForWithFallbacks("claude", "claude-opus-5", "high", []string{"grok-4.6", "claude-sonnet-5"})
+	fb, ok := argvFlagValue(argv, "--fallback-model")
+	if !ok || fb != "claude-sonnet-5" {
+		t.Fatalf("explicit claude fallback missing: %v", argv)
+	}
+	if model, _ := argvFlagValue(argv, "--model"); model != "claude-opus-5" {
+		t.Fatalf("primary model drifted: %v", argv)
+	}
+}
+
+func TestArgvForWithFallbacksIgnoresNonClaudeRoutingFallbacks(t *testing.T) {
+	argv := ArgvForWithFallbacks("claude", "claude-opus-5", "high", []string{"grok-4.6", "glm-5.2"})
+	if argvHasFlag(argv, "--fallback-model") {
+		t.Fatalf("non-claude routing fallbacks became CLI --fallback-model: %v", argv)
+	}
+}
+
+func TestClaudeFallbackFlagIsOptionalOnNativeBinary(t *testing.T) {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		t.Skip("claude not on PATH")
+	}
+	out, err := exec.Command(bin, "--help").CombinedOutput()
+	if err != nil {
+		t.Skipf("claude --help: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "--fallback-model") {
+		t.Fatal("claude --help no longer documents --fallback-model; exact pin still must omit it")
+	}
+	argv := ArgvFor("claude", "claude-opus-5", "high")
+	if argvHasFlag(argv, "--fallback-model") {
+		t.Fatalf("compiled exact argv still has silent fallback: %v", argv)
 	}
 }
 

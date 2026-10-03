@@ -1274,6 +1274,9 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 	if err != nil {
 		return nil, fmt.Errorf("herd-route: Pi harness: %w", err)
 	}
+	if !useLegacyPi() {
+		harnessArgv = applyExplicitClaudeFallback(harnessArgv, model, req.PreferredFallbackModels)
+	}
 	d := &LaunchDecision{
 		LaneName:          req.LaneName,
 		Provider:          best.provider,
@@ -1296,7 +1299,7 @@ func (r *SurfaceRouter) Decide(req LaunchRequest) (*LaunchDecision, error) {
 		QuotaPressure:     best.pressure,
 		Score:             best.rank,
 		LazerLastResort:   best.provider == "lazer",
-		Argv:              ArgvFor(best.provider, model, effort),
+		Argv:              ArgvForWithFallbacks(best.provider, model, effort, req.PreferredFallbackModels),
 		ArgvAuthoritative: true,
 		TaskRef:           req.TaskRef, LeaseGeneration: req.LeaseGeneration, Scope: req.Scope,
 	}
