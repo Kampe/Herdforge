@@ -20,6 +20,34 @@ func freezeTime() time.Time {
 	return time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 }
 
+// The binding-window rule every quota consumer must mirror: a pool routes on
+// its MOST CONSTRAINED measured window. Live observation 2026-09-10 21:05Z:
+// claude session 3% remaining, weekly 20% — the binding window is session,
+// and any reader keying claude:default to weekly alone discards the 5h
+// headroom and over-admits (the shell herdr-route did exactly that; fixed in
+// dotfiles fix/herdroute-binding-window). This pins the Go engine's own rule
+// so the two authorities cannot drift apart again.
+func TestComputeBindingSelectsTheMostConstrainedWindow(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 5, 0, 0, time.UTC)
+	prov := ProviderUsage{
+		Resources: map[string]ResourceUsage{
+			"session": {Kind: "consumption", Unit: "percent", Used: 97, Remaining: 3, Limit: 100, ResetsAt: now.Add(2 * time.Hour).Format(time.RFC3339), WindowSeconds: Window5h},
+			"weekly":  {Kind: "consumption", Unit: "percent", Used: 80, Remaining: 20, Limit: 100, ResetsAt: now.Add(96 * time.Hour).Format(time.RFC3339), WindowSeconds: WindowWeekly},
+		},
+	}
+
+	bs := computeBinding(prov, map[string]bool{"session": true, "weekly": true}, DefaultExhaustedPct, now)
+	if bs == nil {
+		t.Fatal("binding returned nil")
+	}
+	if bs.Resource != "session" || bs.Window != "5h" {
+		t.Fatalf("session (3%% remaining) must bind claude/default, got resource=%s window=%s", bs.Resource, bs.Window)
+	}
+	if bs.Used != 97 {
+		t.Fatalf("binding must carry the constrained window's usage, got %f", bs.Used)
+	}
+}
+
 // newTestEngine pins the engine clock to freezeTime so pace classification is
 // reproducible. Without it these tests silently rot: the fixture's resetsAt
 // timestamps recede into the past, elapsed% climbs, and pace collapses from

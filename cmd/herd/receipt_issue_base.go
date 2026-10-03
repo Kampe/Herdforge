@@ -15,6 +15,33 @@ func gitC(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+func isFullCommitSHA(sha string) bool {
+	if len(sha) != 40 {
+		return false
+	}
+	for _, c := range sha {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveFullCommitSHA expands a revision to the unique 40-hex commit object
+// name, or refuses. Abbreviated names that git accepts for ancestry must not
+// be written into receipts; review later requires a full SHA.
+func resolveFullCommitSHA(dir, rev string) (string, error) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", fmt.Errorf("empty revision")
+	}
+	out, err := gitC(dir, "rev-parse", "--verify", rev+"^{commit}")
+	if err != nil || !isFullCommitSHA(out) {
+		return "", fmt.Errorf("revision %q did not resolve to a full commit SHA", rev)
+	}
+	return strings.ToLower(out), nil
+}
+
 func gitIsAncestor(dir, ancestor, rev string) bool {
 	ancestor = strings.TrimSpace(ancestor)
 	rev = strings.TrimSpace(rev)
@@ -74,7 +101,11 @@ func verifierIssuanceBase(dir, originMain, candidate, authenticatedBase, explici
 	if !gitIsAncestor(dir, pick, candidate) {
 		return "", fmt.Errorf("verifier issuance base %s is not an ancestor of candidate %s", pick, candidate)
 	}
-	return pick, nil
+	full, err := resolveFullCommitSHA(dir, pick)
+	if err != nil {
+		return "", fmt.Errorf("verifier issuance base %s: %w", pick, err)
+	}
+	return full, nil
 }
 
 // authenticatedBuilderBase returns a verified worker/recovery BaseSHA.
