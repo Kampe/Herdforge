@@ -1779,6 +1779,84 @@ func TestReceiptIssueCLI_BaseFlagRejectedForNonVerifierRole(t *testing.T) {
 	}
 }
 
+func receiptIssueVerifierLease(t *testing.T, dir string) *claim.Lease {
+	t.Helper()
+	db := filepath.Join(dir, ".herd", "herdforge.db")
+	if _, err := os.Stat(db); err != nil {
+		return nil
+	}
+	st, err := claim.NewSQLiteLeaseStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	key := claim.LeaseKey{
+		Repo:     dispatch.RepositoryIdentityOrName(dir, "herdforge-test"),
+		Provider: "kaneo",
+		Project:  "proj-x",
+		TaskRef:  "FAC-1:verifier",
+	}
+	lease, err := st.CurrentLease(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lease
+}
+
+func TestReceiptIssueCLI_InvalidBaseAcquiresNoLease(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-1")
+	before, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "--base", "deadbeefdead", "FAC-1", target).CombinedOutput()
+	if err == nil {
+		t.Fatalf("invalid --base must be refused:\n%s", out)
+	}
+	if lease := receiptIssueVerifierLease(t, dir); lease != nil && lease.Status == claim.StatusActive {
+		t.Fatalf("invalid --base acquired verifier lease gen=%d owner=%s", lease.Generation, lease.OwnerID)
+	}
+	after, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.EqualsIssued(before) {
+		t.Fatal("invalid --base mutated TASK-CONTEXT")
+	}
+}
+
+func TestReceiptIssueCLI_ShortBaseIssuesFullSHA(t *testing.T) {
+	binary := buildHerd(t)
+	dir, keyDir, _ := approveFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("TASK-CONTEXT.json\n.herd/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", ".gitignore")
+	gitIn(t, dir, "commit", "-m", "test: ignore receipt state")
+	full := strings.TrimSpace(runGitOut(t, dir, "rev-parse", "HEAD"))
+	target := filepath.Join(dir, ".herd", "worktrees", "fac-short-base")
+	gitIn(t, dir, "worktree", "add", "-b", "herd/fac-short-base", target, full)
+	if len(full) < 12 {
+		t.Fatal("fixture SHA too short")
+	}
+	out, err := herdCmd(binary, dir, keyDir, "receipt", "issue", "--role", "verifier", "--base", full[:12], "FAC-1", target).CombinedOutput()
+	if err != nil {
+		t.Fatalf("abbreviated ancestral --base must issue: %v\n%s", err, out)
+	}
+	tc, err := dispatch.ReadTaskContext(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc.BaseSHA != strings.ToLower(full) {
+		t.Fatalf("issued BaseSHA=%s want full %s", tc.BaseSHA, full)
+	}
+	if len(tc.BaseSHA) != 40 {
+		t.Fatalf("issued BaseSHA length %d want 40", len(tc.BaseSHA))
+	}
+}
+
 func TestReceiptIssueCLI_VerifierBaseRefusesExplicitConflictWithAuthenticated(t *testing.T) {
 	binary := buildHerd(t)
 	dir, keyDir, _ := approveFixture(t)

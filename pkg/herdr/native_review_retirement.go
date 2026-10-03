@@ -67,16 +67,34 @@ func canonicalRetirementVerdict(rows []reviewledger.LedgerRow, candidateSHA, rev
 		}
 		superseded[item.row.Reassesses] = true
 	}
-	var terminal []reviewledger.LedgerRow
+	var terminal []indexedRow
 	for _, item := range verdicts {
 		if !superseded[reviewledger.VerdictEventDigest(item.row)] {
-			terminal = append(terminal, item.row)
+			terminal = append(terminal, item)
 		}
 	}
-	if len(terminal) != 1 {
+	if len(terminal) == 0 {
+		return reviewledger.LedgerRow{}, nil
+	}
+	if len(terminal) == 1 {
+		return terminal[0].row, nil
+	}
+	reassessed := 0
+	latest := terminal[0]
+	for _, item := range terminal {
+		if item.row.Reassesses != "" {
+			reassessed++
+		}
+		if item.idx > latest.idx {
+			latest = item
+		}
+	}
+	// Append-only PASS then FAIL without Reassesses is one latest event, not
+	// two terminals. Conflicting reassessment branches stay ambiguous.
+	if reassessed >= 2 {
 		return reviewledger.LedgerRow{}, errors.New("ambiguous matching terminal verdict")
 	}
-	return terminal[0], nil
+	return latest.row, nil
 }
 
 func (n *NativeReviewRetirementOp) Observe(m ReviewRetirementManifest) (ReviewRetirementEvidence, error) {

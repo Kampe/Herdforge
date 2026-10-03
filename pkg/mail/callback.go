@@ -272,6 +272,20 @@ func VerdictEffectID(effect string) string { return VerdictDeliveredPrefix + eff
 // VerdictIntentID is the non-consumable pre-delivery intent identity.
 func VerdictIntentID(effect string) string { return verdictIntentPrefix + effect }
 
+// IsVerdictIntentID reports whether a callback identity is a pre-delivery
+// intent rather than a delivered verdict.
+//
+// FAC-750: an intent is recorded with Kind=blocked BEFORE provider delivery, so
+// that a half-published verdict can never read as an approval. The cost is that
+// a reviewer's APPROVAL whose delivery then failed is shaped exactly like a
+// reviewer's VETO, and consumers that classify on Kind alone cannot tell them
+// apart. This is the structural discriminator — the identity prefix, not the
+// human-readable detail text — so a consumer can distinguish "reviewer refused
+// this" from "reviewer decided and delivery stranded".
+func IsVerdictIntentID(id string) bool {
+	return strings.HasPrefix(strings.TrimSpace(id), verdictIntentPrefix)
+}
+
 // HasDeliveredVerdict reports whether a delivered verdict with this exact
 // identity already exists — the exactly-once guard for retries.
 func (m *Mailbox) HasDeliveredVerdict(deliveredID string) (Callback, bool, error) {
