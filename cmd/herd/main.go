@@ -9645,13 +9645,19 @@ func runVerify() {
 			os.Exit(1)
 		}
 		fmt.Println(provenance.Format(info))
-		if err := provenance.Validate(info, info.SourceRevision); err != nil {
-			fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
-			os.Exit(1)
-		}
-		if err := provenance.ValidateInstalled(wt); err != nil {
-			fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
-			os.Exit(1)
+		// The target may be an unrelated application that happens to contain
+		// the factory executable under bin/herd. Only a matching module proves
+		// that the target HEAD is the factory source HEAD; an UNKNOWN module
+		// identity must not become a cross-repository stale verdict.
+		if info.Comparable {
+			if err := provenance.Validate(info, info.SourceRevision); err != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
+				os.Exit(1)
+			}
+			if err := provenance.ValidateInstalled(wt); err != nil {
+				fmt.Fprintf(os.Stderr, "herd verify: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 
