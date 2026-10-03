@@ -299,7 +299,7 @@ func pickAgyLaunchLog(cands []agyLogCand, started time.Time) string {
 func agyLaunchConversationID(req AgyPinnedModelReadyRequest) (string, error) {
 	indexPath := strings.TrimSpace(req.IndexPath)
 	if indexPath == "" {
-		indexPath = filepath.Join(req.Home, ".gemini", "antigravity-cli", "cache", "last_conversations.json")
+		indexPath = agyLastConversationsPath(req.Home)
 	}
 	body, err := os.ReadFile(indexPath)
 	if err != nil {
