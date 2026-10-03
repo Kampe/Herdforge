@@ -34,7 +34,7 @@ func AgyWorkspaceConversationID(home, cwd string) (string, error) {
 	if home == "" || cwd == "" {
 		return "", fmt.Errorf("agy workspace conversation requires home and cwd")
 	}
-	body, err := os.ReadFile(filepath.Join(home, ".gemini", "antigravity-cli", "cache", "last_conversations.json"))
+	body, err := os.ReadFile(agyLastConversationsPath(home))
 	if err != nil {
 		return "", fmt.Errorf("agy workspace conversation index: %w", err)
 	}
@@ -72,6 +72,10 @@ func AgyWorkspaceConversationID(home, cwd string) (string, error) {
 
 func agyConversationDB(home, id string) string {
 	return filepath.Join(home, ".gemini", "antigravity-cli", "conversations", id+".db")
+}
+
+func agyLastConversationsPath(home string) string {
+	return filepath.Join(home, ".gemini", "antigravity-cli", "cache", "last_conversations.json")
 }
 
 func agyConversationFreshness(home, id string, notBefore time.Time) error {
