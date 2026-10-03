@@ -65,19 +65,17 @@ func TestResolveReviewTaskRef(t *testing.T) {
 		err      string
 	}{
 		{name: "exact provider ref", selector: "FAC-654", ref: "FAC-654", project: project, status: provider.StatusInProgress, want: "FAC-654"},
-		{name: "branch resolves exact card", selector: "herd/fac-654", ref: "FAC-654", project: project, status: provider.StatusInProgress, want: "FAC-654"},
-		{name: "native fac-755 branch selector", selector: "herd/fac-755", ref: "FAC-755", project: project, status: provider.StatusInReview, want: "FAC-755"},
-		{name: "zero padded branch selector matches padded provider card", selector: "herd/fac-018", ref: "FAC-018", project: project, status: provider.StatusInProgress, want: "FAC-018"},
 		{name: "unpadded selector matches padded provider card", selector: "FAC-18", ref: "FAC-018", project: project, status: provider.StatusInProgress, want: "FAC-018"},
 		{name: "padded selector matches unpadded provider card", selector: "FAC-018", ref: "FAC-18", project: project, status: provider.StatusInProgress, want: "FAC-18"},
-		{name: "branch and card mismatch", selector: "herd/fac-654", ref: "FAC-655", project: project, status: provider.StatusInProgress, err: "card FAC-654 not found"},
+		{name: "branch is not guessed without authenticated context", selector: "herd/fac-654", ref: "FAC-654", project: project, status: provider.StatusInProgress, err: "refusing to guess"},
+		{name: "diagnostics suffix is not guessed as the card", selector: "fix/fac607-diagnostics-3342", ref: "FAC-607", project: project, status: provider.StatusInProgress, err: "refusing to guess"},
 		{name: "missing project context", selector: "FAC-654", ref: "FAC-654", project: "", status: provider.StatusInProgress, err: "project context is required"},
-		{name: "non-closeable provider identity", selector: "standing/api-crusader", ref: "standing/api-crusader", project: project, status: provider.StatusInProgress, err: "neither a closeable card ref"},
+		{name: "non-closeable provider identity", selector: "standing/api-crusader", ref: "standing/api-crusader", project: project, status: provider.StatusInProgress, err: "not a closeable card ref"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := newProvider(tt.ref, tt.project, tt.status)
-			got, err := resolveReviewTaskRef(context.Background(), p, tt.project, tt.selector)
+			got, err := resolveReviewTaskRef(context.Background(), p, tt.project, tt.selector, "", "")
 			if tt.err != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.err) {
 					t.Fatalf("resolveReviewTaskRef error = %v, want substring %q", err, tt.err)
@@ -111,9 +109,9 @@ func TestResolveReviewTaskRefZeroPaddedBranchAndProviderCard(t *testing.T) {
 	p := provider.NewMemoryProvider()
 	p.AddTask(&provider.Task{ID: "task-018", Ref: "FAC-018", ProjectID: "project-1", Status: provider.StatusInProgress})
 
-	got, err := resolveReviewTaskRef(context.Background(), p, "project-1", "herd/fac-018")
+	got, err := resolveReviewTaskRef(context.Background(), p, "project-1", "FAC-018", "", "")
 	if err != nil {
-		t.Fatalf("resolveReviewTaskRef(herd/fac-018) failed: %v", err)
+		t.Fatalf("resolveReviewTaskRef(FAC-018) failed: %v", err)
 	}
 	if got == nil || got.Ref != "FAC-018" {
 		t.Fatalf("got task ref %v, want FAC-018", got)
@@ -132,7 +130,7 @@ func TestResolveReviewTaskRefRejectsAmbiguousCards(t *testing.T) {
 	for _, id := range []string{"task-a", "task-b"} {
 		p.AddTask(&provider.Task{ID: id, Ref: "FAC-654", ProjectID: "project-1", Status: provider.StatusInProgress})
 	}
-	if _, err := resolveReviewTaskRef(context.Background(), p, "project-1", "herd/fac-654"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+	if _, err := resolveReviewTaskRef(context.Background(), p, "project-1", "FAC-654", "", ""); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous card identity was accepted: %v", err)
 	}
 }
@@ -140,7 +138,7 @@ func TestResolveReviewTaskRefRejectsAmbiguousCards(t *testing.T) {
 func TestResolveReviewTaskRefRejectsCrossProjectCard(t *testing.T) {
 	p := provider.NewMemoryProvider()
 	p.AddTask(&provider.Task{ID: "task-1", Ref: "FAC-734", ProjectID: "other-project", Status: provider.StatusToDo})
-	if _, err := resolveReviewTaskRef(context.Background(), p, "project-1", "herd/fac-734"); err == nil || !strings.Contains(err.Error(), "belongs to project") {
+	if _, err := resolveReviewTaskRef(context.Background(), p, "project-1", "FAC-734", "", ""); err == nil || !strings.Contains(err.Error(), "belongs to project") {
 		t.Fatalf("cross-project card was accepted: %v", err)
 	}
 }
@@ -148,7 +146,7 @@ func TestResolveReviewTaskRefRejectsCrossProjectCard(t *testing.T) {
 func TestReviewPacketBindsResolvedCardFromBranchSelector(t *testing.T) {
 	p := provider.NewMemoryProvider()
 	p.AddTask(&provider.Task{ID: "task-1", Ref: "fac-755", ProjectID: "project-1", Status: provider.StatusInProgress})
-	task, err := resolveReviewTaskRef(context.Background(), p, "project-1", "herd/fac-755")
+	task, err := resolveReviewTaskRef(context.Background(), p, "project-1", "FAC-755", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
