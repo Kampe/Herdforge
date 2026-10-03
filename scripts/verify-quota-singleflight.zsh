@@ -250,7 +250,7 @@ restore_source() {
 # that does not compile proves nothing.
 sep=$'\x1f'
 mutations=(
-"provider-lock-removed${sep}${lock_src}${sep}	return withCacheFileLock(lockPath, 300*time.Millisecond, fn)${sep}	_ = lockPath; return fn() // MUTANT: cross-process single-flight guard removed${sep}TestProviderCacheAcrossProcessesSingleFlight${sep}want exactly 1"
+"provider-lock-removed${sep}${lock_src}${sep}	return withCacheFileLock(lockPath, providerCacheLockWait, fn)${sep}	_ = lockPath; return fn() // MUTANT: cross-process single-flight guard removed${sep}TestProviderCacheAcrossProcessesSingleFlight${sep}want exactly 1"
 "busy-lock-loses-its-sentinel${sep}${lock_unix_src}${sep}			return fmt.Errorf(\"%w after %s: %w\", ErrCacheLockBusy, wait, err)${sep}			return fmt.Errorf(\"%w after %s\", err, wait) // MUTANT: a busy lock is indistinguishable from a broken one${sep}TestProviderCacheContendedLockIsBusyNotAPoll${sep}contender failed instead of reporting a busy lock"
 )
 

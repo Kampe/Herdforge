@@ -80,9 +80,23 @@ func TestProviderCacheSubprocessHelper(t *testing.T) {
 	defer restore()
 	_, err := FetchProviderForce("codex", false)
 	if os.Getenv("HERD_CACHE_429_HELPER") == "1" {
-		if err == nil || pollErrorCode(err) != "rate-limited" {
-			t.Fatalf("expected persisted rate-limit result, got %v", err)
+		// Same legal single-flight set as the non-429 helper: the waiter may
+		// observe the persisted 429, or wait out the production 300ms lock
+		// budget. Demanding rate-limited from both racers treated lock-busy
+		// as a test failure, which is how CI flake 35766968347 happened.
+		outcome := ""
+		switch {
+		case err != nil && pollErrorCode(err) == "rate-limited" && polls.Load() == 1:
+			outcome = singleFlightServed
+		case err != nil && pollErrorCode(err) == "rate-limited" && polls.Load() == 0:
+			outcome = singleFlightCached
+		case errors.Is(err, ErrCacheLockBusy) && polls.Load() == 0:
+			outcome = singleFlightContended
 		}
+		if outcome == "" {
+			t.Fatalf("expected persisted rate-limit result, got polls=%d err=%v", polls.Load(), err)
+		}
+		fmt.Printf("%s%s polls=%d\n", singleFlightOutcomePrefix, outcome, polls.Load())
 		return
 	}
 	// Report the outcome instead of demanding one. Under cross-process
@@ -435,49 +449,117 @@ func TestProviderCacheAcrossProcessesShares429Backoff(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	env := append(os.Environ(), "HERD_CACHE_SUBPROCESS_HELPER=1", "HERD_CACHE_429_HELPER=1", "HERD_CACHE_FIXTURE_URL="+server.URL, "HERD_QUOTA_CACHE_PATH="+cachePath, "HOME="+home, "CODEX_HOME="+home)
-	results := make(chan error, 2)
-	for i := 0; i < 2; i++ {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestProviderCacheSubprocessHelper$", "-test.v")
-		cmd.Env = env
-		go func() {
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				results <- fmt.Errorf("429 helper failed: %w: %s", err, strings.TrimSpace(string(output)))
-				return
-			}
-			results <- nil
-		}()
+	baseEnv := append(os.Environ(),
+		"HERD_CACHE_SUBPROCESS_HELPER=1",
+		"HERD_CACHE_429_HELPER=1",
+		"HERD_CACHE_FIXTURE_URL="+server.URL,
+		"HERD_QUOTA_CACHE_PATH="+cachePath,
+		"HOME="+home,
+		"CODEX_HOME="+home,
+	)
+	first := startOwnedHelper(t, "429-writer", baseEnv)
+	if _, err := first.wait(helperResultBudget); err != nil {
+		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		if err := <-results; err != nil {
-			t.Fatal(err)
+	// Handshake is the persisted backoff record, not a sleep. The second
+	// process starts only after the winner has released the lock and written
+	// the cooldown, so this proves sharing rather than racing the 300ms wait.
+	deadline := time.Now().Add(holderReadyBudget)
+	for {
+		body, err := os.ReadFile(cachePath)
+		if err == nil {
+			var cached cachedSnapshot
+			if json.Unmarshal(body, &cached) == nil && cached.Providers["codex"].BackoffUntil.After(time.Now()) {
+				break
+			}
 		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("429 writer did not persist a future cooldown")
+		}
+		time.Sleep(helperReadyPollInterval)
+	}
+	second := startOwnedHelper(t, "429-reader", baseEnv)
+	text, err := second.wait(helperResultBudget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, parseErr := singleFlightOutcome(text)
+	if parseErr != nil {
+		t.Fatalf("429 reader: %v: %s", parseErr, text)
+	}
+	if outcome != singleFlightCached {
+		t.Fatalf("second caller after persisted backoff must be cached, got %s", outcome)
 	}
 	if requests.Load() != 1 {
-		t.Fatalf("concurrent 429 callers made %d upstream requests, want 1", requests.Load())
+		t.Fatalf("shared 429 backoff made %d upstream requests, want 1", requests.Load())
 	}
-	var cached cachedSnapshot
 	body, err := os.ReadFile(cachePath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var cached cachedSnapshot
 	if err := json.Unmarshal(body, &cached); err != nil {
 		t.Fatal(err)
 	}
-	if !cached.Providers["codex"].BackoffUntil.After(time.Now()) {
-		t.Fatal("concurrent 429 did not persist a future cooldown")
-	}
-	// FAC-818: the bound here is ONE backoff window, not the old flat 15s
-	// default (the floor is now the success TTL, and the helper's
-	// retry-after=15 no longer undercuts it). What this still proves is the
-	// single-flight property it was written for: the waiting caller must not
-	// write a second record and push the deadline out to a second window.
 	if cached.Providers["codex"].BackoffUntil.After(time.Now().Add(2 * defaultSnapshotTTL)) {
 		t.Fatal("cooldown deadline was extended by the waiting caller")
 	}
 	if got := cached.Providers["codex"].FailureStreak; got != 1 {
-		t.Fatalf("concurrent 429 callers recorded a failure streak of %d, want 1: the waiting caller escalated a failure it never observed", got)
+		t.Fatalf("shared 429 recorded a failure streak of %d, want 1", got)
+	}
+}
+
+func TestProviderCacheContentionUsesProductionLockWait(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	cachePath := filepath.Join(dir, "quota.json")
+	t.Setenv("HERD_QUOTA_CACHE_PATH", cachePath)
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"tokens":{"account_id":"lock-wait"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(dir, "codex-holder.ready")
+	release := filepath.Join(dir, "codex-holder.release")
+	holder := startOwnedHelper(t, "lock-holder", append(os.Environ(),
+		"HERD_CACHE_SUBPROCESS_HELPER=1",
+		"HERD_CACHE_HOLD_PROVIDER=codex",
+		"HERD_CACHE_HOLDER_READY="+ready,
+		"HERD_CACHE_HOLDER_RELEASE="+release,
+		"HERD_QUOTA_CACHE_PATH="+cachePath,
+		"HOME="+home,
+		"CODEX_HOME="+home,
+	))
+	deadline := time.Now().Add(holderReadyBudget)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("holder did not complete ready handshake")
+		}
+		time.Sleep(helperReadyPollInterval)
+	}
+	restore := SetNativePollersForTest(map[string]func() (ProviderUsage, error){"codex": func() (ProviderUsage, error) {
+		t.Fatal("waiter must not poll while the production lock is held")
+		return ProviderUsage{}, nil
+	}})
+	_, err := FetchProviderForce("codex", false)
+	restore()
+	if err := os.WriteFile(release, []byte("release\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, waitErr := holder.wait(helperResultBudget); waitErr != nil {
+		t.Fatalf("holder: %v", waitErr)
+	}
+	if !errors.Is(err, ErrCacheLockBusy) {
+		t.Fatalf("contended waiter must be ErrCacheLockBusy, got %v", err)
+	}
+}
+
+func TestProviderCacheLockWaitIsTheProductionBudget(t *testing.T) {
+	if providerCacheLockWait != 300*time.Millisecond {
+		t.Fatalf("providerCacheLockWait = %v, want 300ms production budget", providerCacheLockWait)
 	}
 }
 
