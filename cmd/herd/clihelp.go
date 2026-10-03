@@ -168,10 +168,10 @@ var subcommandUsage = map[string]string{
 		"  Never mutates a provider or local bookkeeping; --settle is refused (no coordinator\n" +
 		"  authority primitive exists for a one-shot CLI). Exit: 0 applied/nothing pending,\n" +
 		"  1 error/refusal, 3 ambiguous/work remains, 4 unknown.",
-	"hooks-pin":   "Usage: herd hooks-pin [--provider claude] [--file PATH] [--dry-run]\n  Refresh the pinned hook policy set against the harness's LIVE hooks.\n  Drops policies whose handler no longer exists (those ground every launch\n  with hook.policy_mismatch) and adds newly discovered hooks as optional.\n  Preserves existing classifications; verifies the result binds before writing.",
-	"board-sync":  "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
-	"sh":          "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
-	"repl":        "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
+	"hooks-pin":  "Usage: herd hooks-pin [--provider claude] [--file PATH] [--dry-run]\n  Refresh the pinned hook policy set against the harness's LIVE hooks.\n  Drops policies whose handler no longer exists (those ground every launch\n  with hook.policy_mismatch) and adds newly discovered hooks as optional.\n  Preserves existing classifications; verifies the result binds before writing.",
+	"board-sync": "Usage: herd board-sync [flags]\n  Reconcile board status against git reality and live lanes (report only).\n  --fix: advance to-do cards to in-progress when a live lane or branch proves work is in flight.",
+	"sh":         "Usage: herd sh\n  Interactive REPL shell (alias: herd repl).",
+	"repl":       "Usage: herd repl\n  Interactive REPL shell (alias: herd sh).",
 	"send": `Usage: herd send <pane|name> "<text>" [--file path] [--no-verify] [--timeout s] [--workspace id] [--drain] [--supersede-pending]
   Deliver a prompt when the recipient is idle, or queue it durably while the recipient works.
 
@@ -322,6 +322,8 @@ Commands:
 		"  patch is verifiably in base. The one detached exception: a harvest-merge\n" +
 		"  staging surface proven by its own receipt and live generation marker is\n" +
 		"  retired by the same gates when its reviewed content is on base.",
+	"worktree-migrate": "Usage: herd worktree-migrate [--apply] [--json]\n" +
+		"  Plan (default) or losslessly move registered legacy worktrees to the XDG state root.",
 	"lane-cut": "Usage: herd lane-cut --branch <lane-branch> --scope <path> [--scope <path>...] [--task <ref>] [--base origin/main] [--name <branch>] [--dry-run]\n" +
 		"  Extract ONE bounded candidate from a long-lived standing-lane branch onto a\n" +
 		"  fresh branch cut from origin/main. Takes the NET DIFF for the scoped paths\n" +

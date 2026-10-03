@@ -24,6 +24,12 @@ const AnchorRefPrefix = "refs/herd/anchors/"
 type WorktreeManager struct {
 	RepoRoot    string
 	WorktreeDir string
+	// StateRoot, Owner and Kind are set by NewStateWorktreeManager. They make
+	// worktree ownership durable without putting host-specific paths in the
+	// repository. Legacy/custom managers leave them empty for compatibility.
+	StateRoot string
+	Owner     string
+	Kind      string
 	// DiskAdmission is checked before every creation mutation. It is an
 	// explicit seam so tests can prove rejected paths invoke no git or FS
 	// mutation callbacks.
@@ -131,14 +137,17 @@ func (w *WorktreeManager) RemoveWorktree(ctx context.Context, targetDir string) 
 		return err
 	}
 	if w.RemoveWorktreeFunc != nil {
-		return w.RemoveWorktreeFunc(ctx, targetDir)
+		if err := w.RemoveWorktreeFunc(ctx, targetDir); err != nil {
+			return err
+		}
+		return w.recordRetiredWorktree(targetDir)
 	}
 	cmd := execCommandContext(ctx, "git", "worktree", "remove", "--force", targetDir)
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to remove worktree: %v, output: %s", err, string(output))
 	}
-	return nil
+	return w.recordRetiredWorktree(targetDir)
 }
 
 // RemoveWorktreeSafely removes only a clean worktree. Unlike the historical
@@ -149,14 +158,17 @@ func (w *WorktreeManager) RemoveWorktreeSafely(ctx context.Context, targetDir st
 		return err
 	}
 	if w.RemoveWorktreeFunc != nil {
-		return w.RemoveWorktreeFunc(ctx, targetDir)
+		if err := w.RemoveWorktreeFunc(ctx, targetDir); err != nil {
+			return err
+		}
+		return w.recordRetiredWorktree(targetDir)
 	}
 	cmd := execCommandContext(ctx, "git", "worktree", "remove", targetDir)
 	cmd.Dir = w.RepoRoot
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to safely remove worktree: %v, output: %s", err, string(output))
 	}
-	return nil
+	return w.recordRetiredWorktree(targetDir)
 }
 
 // ListWorktrees runs git worktree list and returns structured worktree information
@@ -355,13 +367,27 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 
 	// Existing worktree path: reattach, preserve actual Git branch.
 	if _, err := os.Stat(filepath.Join(targetPath, ".git")); err == nil {
-		return w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+		info, attachErr := w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+		if attachErr != nil {
+			return nil, attachErr
+		}
+		if err := w.recordActiveWorktree(taskRef, baseSHA, info.Path); err != nil {
+			return nil, fmt.Errorf("record worktree lifecycle: %w", err)
+		}
+		return info, nil
 	}
 	// Also match by listed path (some checkouts use a bare .git file).
 	if wtList, listErr := w.ListWorktrees(ctx); listErr == nil {
 		for _, wt := range wtList {
 			if wt.Path == targetPath {
-				return w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+				info, attachErr := w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+				if attachErr != nil {
+					return nil, attachErr
+				}
+				if err := w.recordActiveWorktree(taskRef, baseSHA, info.Path); err != nil {
+					return nil, fmt.Errorf("record worktree lifecycle: %w", err)
+				}
+				return info, nil
 			}
 		}
 	}
@@ -378,7 +404,15 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify worktree containment: %w", err)
 	}
-	if err := RejectContainedDestination(w.RepoRoot, targetPath, registered); err != nil {
+	containmentRoot := w.RepoRoot
+	if w.StateRoot != "" {
+		// Managed state pools deliberately live outside the repository, while
+		// legacy pools remain below it. The root checkout is itself a git
+		// registration, so using RepoRoot for an external target would make
+		// every state-root creation look like an invalid escape.
+		containmentRoot = w.WorktreeDir
+	}
+	if err := RejectContainedDestination(containmentRoot, targetPath, registered); err != nil {
 		return nil, err
 	}
 
@@ -391,13 +425,27 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 			if wtList, listErr := w.ListWorktrees(ctx); listErr == nil {
 				for _, wt := range wtList {
 					if wt.Path == targetPath || wt.Branch == branch {
-						return w.attachExisting(ctx, wt.Path, branch, baseSHA, anchorRef)
+						info, attachErr := w.attachExisting(ctx, wt.Path, branch, baseSHA, anchorRef)
+						if attachErr != nil {
+							return nil, attachErr
+						}
+						if err := w.recordActiveWorktree(taskRef, baseSHA, info.Path); err != nil {
+							return nil, fmt.Errorf("record worktree lifecycle: %w", err)
+						}
+						return info, nil
 					}
 				}
 			}
 			return nil, fmt.Errorf("failed to reattach worktree for existing branch %s: %v, output: %s", branch, err, string(output))
 		}
-		return w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+		info, attachErr := w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+		if attachErr != nil {
+			return nil, attachErr
+		}
+		if err := w.recordActiveWorktree(taskRef, baseSHA, info.Path); err != nil {
+			return nil, fmt.Errorf("record worktree lifecycle: %w", err)
+		}
+		return info, nil
 	}
 
 	// Fresh: create branch from immutable base SHA (never local HEAD).
@@ -407,7 +455,14 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 		if wtList, listErr := w.ListWorktrees(ctx); listErr == nil {
 			for _, wt := range wtList {
 				if wt.Path == targetPath || wt.Branch == branch {
-					return w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+					info, attachErr := w.attachExisting(ctx, targetPath, branch, baseSHA, anchorRef)
+					if attachErr != nil {
+						return nil, attachErr
+					}
+					if err := w.recordActiveWorktree(taskRef, baseSHA, info.Path); err != nil {
+						return nil, fmt.Errorf("record worktree lifecycle: %w", err)
+					}
+					return info, nil
 				}
 			}
 		}
@@ -446,6 +501,9 @@ func (w *WorktreeManager) CreateTaskWorktreeFrom(ctx context.Context, taskRef, d
 		// hook is best-effort: a failure to install must not block worktree
 		// creation (the coordinator can still call WriteSafeRef manually).
 		_ = w.InstallPreRebaseHook(ctx, targetPath, taskRef)
+	}
+	if err := w.recordActiveWorktree(taskRef, baseSHA, info.Path); err != nil {
+		return nil, fmt.Errorf("record worktree lifecycle: %w", err)
 	}
 	return info, nil
 }

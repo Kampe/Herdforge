@@ -98,12 +98,24 @@ func (v *taskSourceView) names(e worktreeEntry) bool {
 	if v == nil || v.err != nil {
 		return false
 	}
-	rel, err := filepath.Rel(v.root, e.Path)
+	rel, err := v.relativePath(e.Path)
 	if err != nil {
 		return false
 	}
 	b, ok := v.bindings[rel]
 	return ok && b.Branch == e.Branch && b.Head == e.Head
+}
+
+// relativePath derives journal keys from a canonical path. Git may report a
+// macOS temporary worktree through /var while its common directory resolves
+// through /private/var; both spellings name the same registration and must
+// therefore authorize against the same repository-relative journal key.
+func (v *taskSourceView) relativePath(path string) (string, error) {
+	canonical, err := canonicalWorktreePath(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Rel(v.root, canonical)
 }
 
 func taskSourceRoot(root string) (string, error) {
@@ -211,11 +223,16 @@ func taskSourceManagedPath(root, relative string) (string, error) {
 	if filepath.IsAbs(relative) || clean != relative || (!strings.HasPrefix(clean, ".worktrees/") && !strings.HasPrefix(clean, ".herd/worktrees/")) {
 		return "", fmt.Errorf("task source: target must be an exact managed repository-relative path")
 	}
-	path, err := canonicalWorktreePath(filepath.Join(root, relative))
+	canonicalRoot, err := canonicalWorktreePath(root)
 	if err != nil {
 		return "", err
 	}
-	if path != filepath.Join(root, relative) {
+	expected := filepath.Join(canonicalRoot, relative)
+	path, err := canonicalWorktreePath(expected)
+	if err != nil {
+		return "", err
+	}
+	if path != expected {
 		return "", fmt.Errorf("task source: symlinked or escaping managed path")
 	}
 	return path, nil
@@ -311,7 +328,7 @@ func (v *taskSourceView) authorize(e worktreeEntry) (*taskSourceBinding, error) 
 	if err := v.hardHome(e); err != nil {
 		return nil, err
 	}
-	rel, err := filepath.Rel(v.root, e.Path)
+	rel, err := v.relativePath(e.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +340,11 @@ func (v *taskSourceView) authorize(e worktreeEntry) (*taskSourceBinding, error) 
 	if err != nil {
 		return nil, err
 	}
-	if path != e.Path || b.Branch != e.Branch || b.Head != e.Head {
+	entryPath, err := canonicalWorktreePath(e.Path)
+	if err != nil {
+		return nil, err
+	}
+	if path != entryPath || b.Branch != e.Branch || b.Head != e.Head {
 		return nil, fmt.Errorf("task source: path, branch or head changed")
 	}
 	admin, err := herdr.HarvestRegistrationDir(path)
@@ -355,8 +376,13 @@ func readTaskSourceReceipt(root, relative string) (*hsync.CompletionReceipt, err
 	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, "../") {
 		return nil, fmt.Errorf("task source: receipt must be repository-relative")
 	}
-	path, err := canonicalWorktreePath(filepath.Join(root, relative))
-	if err != nil || path != filepath.Join(root, relative) {
+	canonicalRoot, err := canonicalWorktreePath(root)
+	if err != nil {
+		return nil, fmt.Errorf("task source: receipt path changed or escaped")
+	}
+	expected := filepath.Join(canonicalRoot, relative)
+	path, err := canonicalWorktreePath(expected)
+	if err != nil || path != expected {
 		return nil, fmt.Errorf("task source: receipt path changed or escaped")
 	}
 	raw, err := taskSourceRead(path, 65536)
