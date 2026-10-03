@@ -138,6 +138,52 @@ func TestVerifierIssuanceBaseRefusesExplicitConflictWithAuthenticated(t *testing
 	}
 }
 
+func TestVerifierIssuanceBaseResolvesAbbreviatedExplicitBaseToFullSHA(t *testing.T) {
+	dir := gitInitIssuanceRepo(t)
+	base := gitSHA(t, dir, "HEAD")
+	gitIssuanceRun(t, dir, "checkout", "-q", "-b", "feature")
+	gitIssuanceRun(t, dir, "commit", "--allow-empty", "-q", "-m", "candidate")
+	candidate := gitSHA(t, dir, "HEAD")
+	if len(base) < 12 {
+		t.Fatal("fixture base too short")
+	}
+	got, err := verifierIssuanceBase(dir, base, candidate, "", base[:12])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != strings.ToLower(base) {
+		t.Fatalf("abbreviated --base resolved to %s want full %s", got, base)
+	}
+	if len(got) != 40 {
+		t.Fatalf("issuance base length %d want 40", len(got))
+	}
+}
+
+func TestVerifierIssuanceBaseRefusesUnresolvableAbbreviatedBase(t *testing.T) {
+	dir := gitInitIssuanceRepo(t)
+	cand := gitSHA(t, dir, "HEAD")
+	if _, err := verifierIssuanceBase(dir, cand, cand, "", "deadbeefdead"); err == nil {
+		t.Fatal("unresolvable abbreviated base was accepted")
+	}
+}
+
+func TestReceiptIssueResolvesFullSHABeforeLeaseMutation(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	issue := strings.Index(body, "func runReceiptIssue()")
+	lease := strings.Index(body, "acquireCoordinationLease(context.Background(), root, leaseKey, \"coordinator-\"+*role, *role)")
+	resolve := strings.Index(body, "fullBase, baseErr := resolveFullCommitSHA(targetDir, base)")
+	if issue < 0 || lease < 0 || resolve < 0 {
+		t.Fatal("cannot locate receipt issue, full-SHA resolve, or lease acquire")
+	}
+	if !(issue < resolve && resolve < lease) {
+		t.Fatalf("full SHA resolve must run after issue starts and before lease mutation (issue=%d resolve=%d lease=%d)", issue, resolve, lease)
+	}
+}
+
 func TestVerifierIssuanceBaseAllowsExplicitMatchingAuthenticated(t *testing.T) {
 	dir := gitInitIssuanceRepo(t)
 	gitIssuanceRun(t, dir, "checkout", "-q", "-b", "feature")

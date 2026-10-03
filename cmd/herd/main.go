@@ -11038,6 +11038,19 @@ func runReceiptIssue() {
 		os.Exit(1)
 	}
 
+	fullCandidate, candErr := resolveFullCommitSHA(targetDir, candidate)
+	if candErr != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: candidate %s: %v\n", candidate, candErr)
+		os.Exit(1)
+	}
+	candidate = fullCandidate
+	fullBase, baseErr := resolveFullCommitSHA(targetDir, base)
+	if baseErr != nil {
+		fmt.Fprintf(os.Stderr, "herd receipt: base %s: %v\n", base, baseErr)
+		os.Exit(1)
+	}
+	base = fullBase
+
 	// Role-scoped lease key: a session lease must never collide with the
 	// builder's live claim on the same task. Each receipt fences against
 	// its OWN key (LeaseTaskRef); unifying these under one canonical task
