@@ -61,10 +61,26 @@ const (
 	BlockedUnpublishedCandidate BlockedReason = "unpublished_candidate"
 	BlockedMalformedEvidence    BlockedReason = "malformed_evidence"
 	BlockedVetoVerdict          BlockedReason = "veto_verdict"
-	BlockedNoPassingVerdict     BlockedReason = "no_passing_verdict"
-	BlockedAlreadyConsumed      BlockedReason = "already_consumed"
-	BlockedMissingWorktree      BlockedReason = "missing_worktree"
-	BlockedMissingReceipt       BlockedReason = "missing_receipt"
+	// BlockedVerdictIntentOnly means the index has seen only the WRITE-AHEAD
+	// intent for a verdict, never the delivered effect. It is NOT a refusal.
+	//
+	// FAC-750: the intent is recorded as Kind=blocked before provider delivery
+	// so a half-published verdict can never read as an approval, and its detail
+	// text is stamped "verdict intent (undelivered)" at that moment and never
+	// updated. Classifying on Kind alone therefore files a reviewer's APPROVAL
+	// as a veto, and reading the stamped text as a live status suggests delivery
+	// failed. Both are wrong: on this fleet every such verdict WAS delivered to
+	// the provider, signed, within ~200ms — the effect is on the card and only
+	// the ledger ingest is missing.
+	//
+	// So this reason means "decision not yet ingested; look at the provider",
+	// never "reviewer refused" and never "delivery failed". It still blocks,
+	// deliberately — an un-ingested verdict is not a pass.
+	BlockedVerdictIntentOnly BlockedReason = "verdict_intent_only"
+	BlockedNoPassingVerdict  BlockedReason = "no_passing_verdict"
+	BlockedAlreadyConsumed   BlockedReason = "already_consumed"
+	BlockedMissingWorktree   BlockedReason = "missing_worktree"
+	BlockedMissingReceipt    BlockedReason = "missing_receipt"
 )
 
 // Candidate represents an unintegrated or active review candidate.
@@ -287,8 +303,21 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 						}
 						if cb.Kind == mail.CallbackBlocked {
 							c.State = StateBlocked
-							c.BlockedReasons = append(c.BlockedReasons, BlockedVetoVerdict)
-							c.BlockedEvidence = append(c.BlockedEvidence, fmt.Sprintf("callback blocked: %s", cb.Detail))
+							// FAC-750: a pre-delivery verdict intent is also
+							// Kind=blocked, so classifying on Kind alone files a
+							// reviewer's APPROVAL as a veto. Discriminate on the
+							// identity prefix, which is structural, rather than on
+							// the human-readable detail text. Both still block —
+							// an undelivered verdict is not a pass — but a veto is
+							// repaired by the builder and a stranded verdict by
+							// re-delivery, so they cannot share a reason.
+							reason, evidence := BlockedVetoVerdict, fmt.Sprintf("callback blocked: %s", cb.Detail)
+							if mail.IsVerdictIntentID(cb.DedupeID) {
+								reason = BlockedVerdictIntentOnly
+								evidence = fmt.Sprintf("callback blocked: write-ahead verdict intent only, NOT a reviewer veto; the delivered verdict may already exist on the provider (FAC-750 ingest): %s", cb.Detail)
+							}
+							c.BlockedReasons = append(c.BlockedReasons, reason)
+							c.BlockedEvidence = append(c.BlockedEvidence, evidence)
 							// Retain the highest active generation's block. A
 							// lower-generation block never supersedes a newer
 							// generation's veto, so out-of-order arrival must
@@ -314,6 +343,7 @@ func (idx *CandidateIndex) BuildIndex(ctx context.Context) ([]*Candidate, error)
 							if block, ok := callbackBlocks[key]; ok && env.Sequence > block.sequence && cb.LeaseGeneration >= block.lease {
 								c.State = StatePending
 								c.BlockedReasons = removeBlockedReason(c.BlockedReasons, BlockedVetoVerdict)
+								c.BlockedReasons = removeBlockedReason(c.BlockedReasons, BlockedVerdictIntentOnly)
 								c.BlockedEvidence = removeCallbackBlockedEvidence(c.BlockedEvidence)
 								delete(callbackBlocks, key)
 							}
