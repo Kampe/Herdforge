@@ -465,6 +465,9 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "artifact-archive":
+		runArtifactArchive()
+
 	case "maintenance":
 		runMaintenance()
 
