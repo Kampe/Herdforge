@@ -128,7 +128,8 @@ func runPoolReview(ref string) error {
 	if err != nil {
 		return fmt.Errorf("review task identity: load provider: %w", err)
 	}
-	providerTask, err := resolveReviewTaskRef(context.Background(), tasks, cfg.TaskProvider.ProjectID, ref)
+	sha := strings.TrimSpace(*shaFlag)
+	providerTask, err := resolveReviewTaskRef(context.Background(), tasks, cfg.TaskProvider.ProjectID, ref, root, sha)
 	if err != nil {
 		return err
 	}
@@ -138,12 +139,11 @@ func runPoolReview(ref string) error {
 	}
 	// FAC-648: the exact SHA participates in candidate resolution, because a
 	// detached exact-SHA surface is a legitimate candidate and used to be refused.
-	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
-		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))
+	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, sha,
+		needsCandidateDirectory(sha, strings.TrimSpace(*opts.Base)))
 	if err != nil {
 		return err
 	}
-	sha := strings.TrimSpace(*shaFlag)
 	if sha == "" {
 		out, err := exec.Command("git", "-C", candidateDir, "rev-parse", "HEAD").Output()
 		if err != nil {
@@ -492,7 +492,7 @@ func runPoolReview(ref string) error {
 	if wsErr != nil {
 		packetWorkspace = strings.TrimSpace(os.Getenv("HERD_WORKSPACE"))
 	}
-	packetBody := reviewPacketBody(ref, sha, base, surface, lease.Path, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask)
+	packetBody := reviewPacketBody(ref, sha, base, surface, lease.Path, verdictPath, reviewSupervisorTarget(), provenFamily, packetWorkspace, packetTask, reviewer.Provider, reviewer.Model, reviewer.Family)
 	if err := os.WriteFile(packet, []byte(packetBody), 0o600); err != nil {
 		return fmt.Errorf("write review packet: %w", err)
 	}
@@ -554,7 +554,11 @@ func runPoolReview(ref string) error {
 	if st, statErr := os.Stat(surfaceAbs); statErr != nil || !st.IsDir() {
 		return fmt.Errorf("reviewer cwd %q does not resolve to a directory: %v", surfaceAbs, statErr)
 	}
-	tab, err := herdr.TabCreate(herdr.TabCreateOptions{Workspace: ws, Label: tabLabel, Cwd: surfaceAbs, NoFocus: true, Env: []string{herdr.AgentRoleEnv}})
+	tabOpts, err := herdr.ReviewTabCreateOptions(ws, tabLabel, surfaceAbs)
+	if err != nil {
+		return fmt.Errorf("create reviewer tab: %w", err)
+	}
+	tab, err := herdr.TabCreate(tabOpts)
 	if err != nil {
 		return fmt.Errorf("create reviewer tab: %w", err)
 	}
@@ -619,6 +623,12 @@ func runPoolReview(ref string) error {
 	// interactive, which measured ~20s here. Silent, it is the third stretch a
 	// bounded caller cannot tell apart from a hang.
 	startedAt := time.Now()
+	priorAgyConversation := ""
+	if strings.EqualFold(reviewer.Kind, "agy") {
+		if home, homeErr := os.UserHomeDir(); homeErr == nil {
+			priorAgyConversation, _ = herdr.AgyWorkspaceConversationID(home, surfaceAbs)
+		}
+	}
 	fmt.Printf("starting %s agent %s in pane %s\n", reviewer.Kind, agentName, tab.Pane.ID)
 	if err := herdr.StartReviewAgent(tab.ID, agentName, tab.Pane.ID, reviewer.Kind, reviewer.LaunchFlags()...); err != nil {
 		launchFailureReason = err.Error()
@@ -638,6 +648,22 @@ func runPoolReview(ref string) error {
 	// slow-but-healthy harness would throw away a working reviewer.
 	if _, readyErr := herdr.AwaitInteractiveReady(agentName, 30*time.Second); readyErr != nil {
 		fmt.Fprintf(os.Stderr, "review --pool: %s not interactive yet (%v); delivering anyway\n", agentName, readyErr)
+	}
+	if strings.EqualFold(reviewer.Kind, "agy") && strings.TrimSpace(reviewer.Model) != "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			launchFailureReason = homeErr.Error()
+			return fmt.Errorf("agy pinned-model readiness: %w", homeErr)
+		}
+		ev, modelErr := herdr.AwaitAgyPinnedModelReady(herdr.AgyPinnedModelReadyRequest{
+			Home: home, Cwd: surfaceAbs, PinnedModel: reviewer.Model, StartedAt: startedAt,
+			PaneID: tab.Pane.ID, Budget: 30 * time.Second,
+		})
+		if modelErr != nil {
+			launchFailureReason = modelErr.Error()
+			return fmt.Errorf("agy pinned model %s not ready for this launch: %w", reviewer.Model, modelErr)
+		}
+		fmt.Fprintf(os.Stderr, "review --pool: agy pinned model ready model=%s conversation=%s log=%s\n", ev.PinnedModel, ev.ConversationID, filepath.Base(ev.LogFile))
 	}
 	// FAC-592: the delivered path must be ABSOLUTE. --packet-root defaults to the
 	// relative ".herd/review-packets", and the reviewer resolves it against its
@@ -671,7 +697,7 @@ func runPoolReview(ref string) error {
 	// Cold Codex/OpenCode assigns agent_session only after the first accepted
 	// model turn. Capture it authoritatively after the single delivery boundary;
 	// never fabricate a session from pane, terminal, timestamp, or revision.
-	launchedAgent, err := awaitNativeReviewerSession(agentName, ws, *tab, 30*time.Second)
+	launchedAgent, err := awaitNativeReviewerSession(agentName, ws, *tab, 30*time.Second, priorAgyConversation, startedAt)
 	if err != nil {
 		cleanupPending("cleanup-pending", err.Error())
 		return fmt.Errorf("capture authoritative reviewer session after delivery: %w", err)
@@ -842,7 +868,7 @@ func verifyReviewLaunchFence(workspace, cwd string, tab herdr.TabInfo, lease *wo
 // awaitNativeReviewerSession waits only for the model-owned session identity
 // that cold Codex/OpenCode emits after its first accepted turn. It never uses
 // a pane, terminal, revision, timestamp, or provisional value as a session.
-func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeout time.Duration) (*herdr.AgentEntry, error) {
+func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeout time.Duration, priorAgyConversation string, launchedAt time.Time) (*herdr.AgentEntry, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -852,12 +878,26 @@ func awaitNativeReviewerSession(name, workspace string, tab herdr.TabInfo, timeo
 		a, err := herdr.LookupAgent(name)
 		if err == nil {
 			if a.TabID != tab.ID || a.PaneID != tab.Pane.ID || a.TerminalID != tab.Pane.TerminalID || a.Workspace != workspace {
-				return nil, fmt.Errorf("authoritative reviewer identity changed: name=%q tab=%q pane=%q terminal=%q workspace=%q", a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
+				return nil, herdr.ReviewerIdentityChangedError(a.Name, a.TabID, a.PaneID, a.TerminalID, a.Workspace)
 			}
 			if herdr.RealModelSessionID(a.Session.Value) {
 				return a, nil
 			}
-			last = "agent session remains unavailable after delivery"
+			last = herdr.ErrAgentSessionUnavailableAfterDelivery.Error()
+			// AGY 1.2.x TUI does not fire PreInvocation hooks, so herdr never
+			// receives conversationId. After a real consumed turn, bind the
+			// conversation UUID AGY stored for this cwd through the official
+			// pane.report_agent_session API. Never use pane/terminal/timestamp.
+			if strings.EqualFold(strings.TrimSpace(a.Kind), "agy") {
+				bound, bindErr := herdr.BindAgyWorkspaceSession(*a, priorAgyConversation, launchedAt)
+				if bindErr == nil {
+					if bound.TabID != tab.ID || bound.PaneID != tab.Pane.ID || bound.TerminalID != tab.Pane.TerminalID || bound.Workspace != workspace {
+						return nil, herdr.ReviewerIdentityChangedError(bound.Name, bound.TabID, bound.PaneID, bound.TerminalID, bound.Workspace)
+					}
+					return bound, nil
+				}
+				last = bindErr.Error()
+			}
 		} else if !errors.Is(err, herdr.ErrAgentNotFound) {
 			last = err.Error()
 		}
@@ -1045,6 +1085,32 @@ func resolvePoolReviewCandidateAt(root, ref, sha string) (string, error) {
 // create one: it answers "" so the caller proceeds from the identities it was
 // given rather than from a directory nobody reads.
 func resolvePoolReviewCandidateAtFor(root, ref, sha string, mayPrepare bool) (string, error) {
+	// FAC-653: a SHA too short to verify is a bad ARGUMENT, not a missing
+	// worktree and not a Git-discovery failure. Check it before any
+	// `git worktree list` so a non-repo fixture still names the argument.
+	sha = strings.TrimSpace(sha)
+	if sha != "" && len(sha) < 12 {
+		return "", fmt.Errorf("candidate sha %q is too short to verify (need at least 12 hex characters); "+
+			"an abbreviation could match more than one commit, so it is refused rather than guessed. "+
+			"Pass the full 40-character sha", sha)
+	}
+
+	// FAC-844: a FAC-number selector used to miss the exclusive author
+	// worktree (different branch name, attached HEAD) and prepare a blank
+	// detached carrier. TASK-CONTEXT.json is gitignored, so the new surface
+	// had no authenticated SHA/base/lease identity and operators reissued
+	// receipts by hand. Prefer a verified existing home before any path
+	// probe or speculative prepare, and never copy or Issue a replacement.
+	if sha != "" {
+		home, err := authenticatedCandidateHome(root, ref, sha)
+		if err != nil {
+			return "", err
+		}
+		if home != "" {
+			return home, nil
+		}
+	}
+
 	// Probe both spellings: the raw-ref path for historical ticket-style refs and
 	// the launcher's sanitized path, so one sanitizer cannot hide the other's dir.
 	for _, dir := range candidateSurfaceDirs(root, ref) {
@@ -1284,6 +1350,132 @@ func headMatchesSHA(dir, sha string) bool {
 		return false
 	}
 	return strings.EqualFold(head, sha) || strings.HasPrefix(strings.ToLower(head), strings.ToLower(sha))
+}
+
+// authenticatedCandidateHome returns the unique registered worktree whose
+// verified TASK-CONTEXT matches the closeable ref and exact candidate SHA.
+// Attached author worktrees qualify; the shared root never does. A matching
+// file that fails verification refuses rather than preparing a replacement
+// surface. Zero matches is not an error: callers may still prepare a blank
+// carrier when no authenticated home exists (FAC-678).
+func authenticatedCandidateHome(root, ref, sha string) (string, error) {
+	homes, unverified, err := findAuthenticatedCandidateHomes(root, ref, sha)
+	if err != nil {
+		return "", err
+	}
+	if unverified {
+		return "", fmt.Errorf("review candidate %q at %s has a TASK-CONTEXT that failed authentication; refusing to prepare a replacement surface or reissue authority", ref, shortSHA(sha))
+	}
+	switch len(homes) {
+	case 0:
+		return "", nil
+	case 1:
+		return homes[0], nil
+	default:
+		return "", fmt.Errorf("review candidate %q at %s has %d authenticated TASK-CONTEXT homes %v; refuse rather than pick one", ref, shortSHA(sha), len(homes), homes)
+	}
+}
+
+func findAuthenticatedCandidateHomes(root, ref, sha string) (homes []string, unverified bool, err error) {
+	out, listErr := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	if listErr != nil {
+		// Not a git repo (or worktree list is unavailable) means there is no
+		// authenticated home to discover. That is a miss, not an auth failure:
+		// callers still emit FAC-653 short-SHA and genuine-worktree-miss
+		// diagnostics instead of "git worktree list: exit status 128".
+		return nil, false, nil
+	}
+	absRoot, _ := filepath.Abs(root)
+	var verifier *dispatch.Verifier
+	loadVerifier := func() error {
+		if verifier != nil {
+			return nil
+		}
+		v, vErr := dispatch.LoadVerifier(root)
+		if vErr != nil {
+			return vErr
+		}
+		verifier = v
+		return nil
+	}
+
+	var path string
+	flush := func() error {
+		if path == "" {
+			return nil
+		}
+		abs, absErr := filepath.Abs(path)
+		if absErr == nil && abs == absRoot {
+			return nil
+		}
+		if !worktreeExists(path) || !headMatchesSHA(path, sha) {
+			return nil
+		}
+		tc, readErr := dispatch.ReadTaskContext(path)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				return nil
+			}
+			unverified = true
+			return nil
+		}
+		if !sameCloseableCardRef(tc.TaskRef, ref) {
+			return nil
+		}
+		if cand := strings.TrimSpace(tc.CandidateSHA); cand != "" && !receiptSHAMatches(cand, sha) {
+			unverified = true
+			return nil
+		}
+		if vErr := loadVerifier(); vErr != nil {
+			unverified = true
+			return nil
+		}
+		if vErr := verifier.Verify(tc); vErr != nil {
+			unverified = true
+			return nil
+		}
+		homes = append(homes, path)
+		return nil
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			if err := flush(); err != nil {
+				return nil, unverified, err
+			}
+			path = strings.TrimPrefix(line, "worktree ")
+		case line == "":
+			if err := flush(); err != nil {
+				return nil, unverified, err
+			}
+			path = ""
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, unverified, fmt.Errorf("read Git worktrees for authenticated candidate home: %w", err)
+	}
+	if err := flush(); err != nil {
+		return nil, unverified, err
+	}
+	return homes, unverified, nil
+}
+
+func receiptSHAMatches(got, want string) bool {
+	got, want = strings.TrimSpace(got), strings.TrimSpace(want)
+	if got == "" || want == "" {
+		return false
+	}
+	if strings.EqualFold(got, want) {
+		return true
+	}
+	if len(got) < 12 || len(want) < 12 {
+		return false
+	}
+	gl, wl := strings.ToLower(got), strings.ToLower(want)
+	return strings.HasPrefix(gl, wl) || strings.HasPrefix(wl, gl)
 }
 
 // detachedSurfaceAtSHA finds any registered worktree whose HEAD is the exact
@@ -2194,7 +2386,7 @@ func liveAgentByPrefix(prefixes ...string) string {
 	return ""
 }
 
-func reviewPacketBody(ref, sha, base, surface, poolSlotPath, verdictPath, supervisor, builderFamily, workspace, taskRef string) string {
+func reviewPacketBody(ref, sha, base, surface, poolSlotPath, verdictPath, supervisor, builderFamily, workspace, taskRef, reviewerProvider, reviewerModel, reviewerFamily string) string {
 	return fmt.Sprintf(`REVIEW %s — verdict only, edit nothing.
 
 ISOLATION — READ THIS BEFORE RUNNING ANY GIT COMMAND
@@ -2246,6 +2438,8 @@ Read .herd/prompts/reviewer.md and .herd/prompts/review-verdict.template.md from
 the candidate surface and inspect only this candidate. These paths are
 candidate-owned; never fall back to files from the shared checkout.
 
+`+reviewVerificationBudgetSection(scopedTestCommand(poolSlotPath))+`
+
 WRITE YOUR VERDICT ARTIFACT TO EXACTLY THIS PATH:
 
   %s
@@ -2263,7 +2457,7 @@ sha: %s
 branch: <the branch this candidate lives on>
 task: %s
 reviewer: <your lane name — never a coordinator>
-reviewer-family: <your VENDOR family — see the exact list below>
+reviewer-family: %s
 builder-family: %s
 verdict: PASS|FAIL|BLOCKED
 reviewed-base: %s
@@ -2287,9 +2481,7 @@ FAMILY VALUES ARE A CLOSED SET. Use exactly one of:
   anthropic  openai  google  xai  zhipu  moonshot  alibaba  deepseek
   open-weight  antigravity  proxy
 
-These are VENDOR families, not harness names. Your harness is not a family: a
-reviewer running under codex writes openai, claude writes anthropic, grok writes
-xai, agy writes google. A verdict recorded as reviewer-family "codex" is refused
+These are VENDOR families, not harness names. %s A verdict recorded as reviewer-family "codex" is refused
 as an unknown family and the whole review is discarded, which has already
 happened in this inbox.
 
@@ -2312,7 +2504,25 @@ result the supervisor needs in order to release the slot and re-plan; silence is
 the only outcome that helps nobody.
 
 A verdict that stays on this filesystem is invisible to the ledger.
-`, ref, poolSlotPath, sha, surface, poolSlotPath, verdictPath, sha, taskRef, builderFamilyOrUnrecorded(builderFamily), base, reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+`, ref, poolSlotPath, sha, surface, poolSlotPath, verdictPath, sha, taskRef, reviewerFamilyFrontMatter(reviewerFamily), builderFamilyOrUnrecorded(builderFamily), base, reviewerFamilyBindingInstruction(reviewerProvider, reviewerModel, reviewerFamily), reportHomeInstruction(reviewAgentName(ref, sha), supervisor, verdictPath, workspace))
+}
+
+func reviewerFamilyFrontMatter(family string) string {
+	family = strings.TrimSpace(family)
+	if family == "" {
+		return "<your VENDOR family — see the exact list below>"
+	}
+	return family
+}
+
+func reviewerFamilyBindingInstruction(provider, model, family string) string {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	family = strings.TrimSpace(family)
+	if provider != "" && model != "" && family != "" {
+		return fmt.Sprintf("This launch's resolved binding is provider=%s model=%s vendor-family=%s. Write reviewer-family: %s. Do not substitute the harness name, and do not write google merely because the harness is agy.", provider, model, family, family)
+	}
+	return "Derive the family from the model you actually ran, not the harness (agy+gemini-* is google; agy+claude-* is anthropic; agy+gpt-* is open-weight; otherwise use the vendor of that model). Do not write google merely because the harness is agy."
 }
 
 // settledAgentStatuses are the states in which a reviewer is no longer doing

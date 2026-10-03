@@ -8,6 +8,11 @@ import (
 	"github.com/Kampe/Herdforge/pkg/gitroot"
 )
 
+// GitRevListLeftRight is the shared git flag for counting commits unique to
+// each side of a symmetric difference. Preflight and standing raise admission
+// must measure the same way.
+const GitRevListLeftRight = "--left-right"
+
 // MainOriginDivergence describes commits present on one main ref but not the
 // other. LocalAhead is the number of commits in main but not origin/main;
 // RemoteAhead is the number of commits in origin/main but not main.
@@ -36,7 +41,7 @@ func CheckMainOriginDivergence(root string) (MainOriginDivergence, error) {
 	if _, err := runCmd(root, "git", "rev-parse", "--verify", "--quiet", gitroot.MainBranchRef); err != nil {
 		return MainOriginDivergence{}, nil
 	}
-	out, err := runCmd(root, "git", "rev-list", "--left-right", "--count", "main...origin/main")
+	out, err := runCmd(root, "git", "rev-list", GitRevListLeftRight, "--count", "main...origin/main")
 	if err != nil {
 		return MainOriginDivergence{}, fmt.Errorf("check main/origin/main divergence: %w", err)
 	}

@@ -387,6 +387,9 @@ lanes:
 # until roles may own several lanes.
 
 # Project Verification Suite
+# Native review launch inherits GOMAXPROCS=2 GOFLAGS=-p=1 and serializes
+# targeted-first checks. test_command remains the hosted/full-suite contract
+# (honest CI reuse); reviewers must not run it concurrently with go test ./cmd/herd.
 verification:
   test_command: "go test ./..."
   test_timeout: "30m"

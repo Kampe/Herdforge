@@ -28,6 +28,11 @@ import (
 // remain different answers.
 var ErrCacheLockBusy = errors.New("usage: cache lock held by another holder for the whole wait")
 
+// providerCacheLockWait is the production single-flight wait for one provider
+// lock. Snapshot-file locking stays at 2s. Tests observe this duration as
+// configuration, not as a wall-clock CI budget.
+const providerCacheLockWait = 300 * time.Millisecond
+
 // FAC-679: a live quota fetch reaches every provider serially, and it ran before
 // EVERY review launch. Measured on this fleet: 29 seconds on one launch and 272
 // on another, tracking provider API latency, while the launch itself was
@@ -287,7 +292,7 @@ func withProviderFileLock(name, accountKey string, fn func() error) error {
 	}
 	key := sha256.Sum256([]byte(name + ":" + accountKey))
 	lockPath := filepath.Join(filepath.Dir(path), filepath.Base(path)+"."+hex.EncodeToString(key[:])[:16])
-	return withCacheFileLock(lockPath, 300*time.Millisecond, fn)
+	return withCacheFileLock(lockPath, providerCacheLockWait, fn)
 }
 
 func mergeSnapshotFile(snap *UsageSnapshot, backoff *cachedProviderRecord) error {

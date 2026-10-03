@@ -75,6 +75,7 @@ type ReviewRetirementVerdict struct {
 type ReviewRetirementEvidence struct {
 	Manifest     ReviewRetirementManifest
 	Verdict      ReviewRetirementVerdict
+	Abort        reviewledger.LedgerRow
 	Launch       reviewledger.LedgerRow
 	Live         ReviewRetirementLive
 	Worktree     ReviewRetirementWorktree
@@ -198,12 +199,20 @@ func EvaluateReviewRetirement(e ReviewRetirementEvidence) ReviewRetirementDecisi
 	if e.Launch.Event != string(reviewledger.EventRecord) || e.Launch.SHA != m.CandidateSHA || e.Launch.Reviewer != m.Reviewer || e.Launch.Lease != m.Nonce || !launchBindsTask(e.Launch, m.TaskRef, m.Branch) {
 		return blockReviewRetirement("verified launch provenance does not bind the exact candidate, reviewer, branch, and lease")
 	}
-	if e.Verdict.Row.Event != string(reviewledger.EventVerdict) || e.Verdict.Row.SHA != m.CandidateSHA || e.Verdict.Row.CandidateSHA != m.CandidateSHA || e.Verdict.Row.Reviewer != m.Reviewer ||
-		(e.Verdict.Row.Verdict != string(reviewledger.VerdictPASS) && e.Verdict.Row.Verdict != string(reviewledger.VerdictFAIL) && e.Verdict.Row.Verdict != string(reviewledger.VerdictBLOCKED)) {
-		return blockReviewRetirement("canonical ledger has no terminal PASS, FAIL, or BLOCKED verdict for the exact reviewer and candidate")
-	}
-	if e.Verdict.Ack.SHA != m.CandidateSHA || e.Verdict.Ack.Reviewer != m.Reviewer || e.Verdict.Ack.LaunchIdentity != m.Reviewer || e.Verdict.Ack.ArtifactDigest == "" || e.Verdict.Ack.ArtifactDigest != e.Verdict.Row.ArtifactDigest {
-		return blockReviewRetirement("canonical reviewer acknowledgment is missing or mismatched")
+	aborted := false
+	if abort, ok := reviewledger.MatchingCoordinatorAbort([]reviewledger.LedgerRow{e.Abort}, m.CandidateSHA, m.Reviewer, m.Nonce, m.SessionID); ok {
+		if abort.SessionID != m.SessionID || abort.Lease != m.Nonce {
+			return blockReviewRetirement("coordinator abort does not bind the exact lease and session")
+		}
+		aborted = true
+	} else {
+		if e.Verdict.Row.Event != string(reviewledger.EventVerdict) || e.Verdict.Row.SHA != m.CandidateSHA || e.Verdict.Row.CandidateSHA != m.CandidateSHA || e.Verdict.Row.Reviewer != m.Reviewer ||
+			(e.Verdict.Row.Verdict != string(reviewledger.VerdictPASS) && e.Verdict.Row.Verdict != string(reviewledger.VerdictFAIL) && e.Verdict.Row.Verdict != string(reviewledger.VerdictBLOCKED)) {
+			return blockReviewRetirement("canonical ledger has no terminal PASS, FAIL, or BLOCKED verdict for the exact reviewer and candidate")
+		}
+		if e.Verdict.Ack.SHA != m.CandidateSHA || e.Verdict.Ack.Reviewer != m.Reviewer || e.Verdict.Ack.LaunchIdentity != m.Reviewer || e.Verdict.Ack.ArtifactDigest == "" || e.Verdict.Ack.ArtifactDigest != e.Verdict.Row.ArtifactDigest {
+			return blockReviewRetirement("canonical reviewer acknowledgment is missing or mismatched")
+		}
 	}
 	if e.Live.Status != "idle" && e.Live.Status != "done" {
 		return blockReviewRetirement("review lane is still active or its status is unknown")
@@ -237,6 +246,9 @@ func EvaluateReviewRetirement(e ReviewRetirementEvidence) ReviewRetirementDecisi
 	}
 	if !pathUnder(e.PromptRoot, m.PromptArtifact) {
 		return blockReviewRetirement("prompt artifact is outside the approved review namespace")
+	}
+	if aborted {
+		return ReviewRetirementDecision{Eligible: true, Reason: "exact bound manifest and coordinator abort verified"}
 	}
 	return ReviewRetirementDecision{Eligible: true, Reason: "exact bound manifest and durable terminal verdict verified"}
 }

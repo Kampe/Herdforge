@@ -141,6 +141,9 @@ var subcommandUsage = map[string]string{
 	"verdict-harvest":  "Usage: herd verdict-harvest [--remote origin] [--dry-run]\n  Pull verdict artifacts other hosts pushed into the local inbox. Never overwrites\n  a local artifact, so an already-ingested verdict cannot be resurrected.",
 	"verdict-push":     "Usage: herd verdict-push (--artifact <path> | --sweep) [--workspace <id>] [--dry-run]\n  Transport verdict artifacts to the ledger host over git. Uses plumbing only:\n  never checks out, stashes, or switches a branch in the reviewer's worktree.\n  --sweep also retires an exact idle/done, unfocused resident reviewer after the\n  remote ref, candidate HEAD, tab incarnation, and PID start-token tree are proved.",
 	"review-ingest":    "Usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run] [--json]\n  Validate, admit, and audit reviewer verdict artifacts.\n  --ack-only FILE: recover one exact admitted artifact acknowledgment; no new verdict.\n  --sweep: ingest every inbox verdict the ledger has never recorded. Without it\n  artifacts must be named explicitly, so a verdict nobody enumerates stays inert.",
+	"review-abort": "Usage: herd review-abort --manifest FILE --session ID --reason TEXT [--dry-run|--act]\n" +
+		"  Coordinator-attributed abort of an exact review launch (quota-dead before verdict).\n" +
+		"  Not a reviewer verdict and not merge/PASS authority. Preserves packet/inbox evidence.\n",
 	"review-complete-record": "Usage: herd review-complete-record REF --candidate SHA --reviewer NAME [--host HOST] --artifact FILE\n" +
 		"  Complete one admitted record from retained evidence; --host selects the exact projection (empty is unhosted, not a wildcard). No family/tier assertions or corpus mode.\n",
 	"review-bind-evidence": "Usage: herd review-bind-evidence <REF> --candidate <sha> --receipt <digest>\n" +
@@ -359,6 +362,8 @@ Commands:
   herd mail read --recipient NAME [--mail path] [--after-cursor C] [--limit N] [--max-bytes N]
   herd mail repair --id ID [--id ID...] [--mail path] [--reason TEXT]
   herd mail repair --id ID [--id ID...] --fingerprint SHA256 [--fingerprint SHA256...] --actor NAME --act [--mail path] [--reason TEXT]
+  herd mail repair --sequence-order [--mail path] [--reason TEXT] [--plan-out PATH] [--max-rows N] [--max-bytes N] [--after-cursor C --recipient NAME]
+  herd mail repair --sequence-order --act --actor NAME --plan-file PATH --plan-digest SHA256 [--mail path] [--reason TEXT]
   herd mail control <issue|drain> [flags]
 
 Bounded paging (inbox/read): passing --after-cursor, --limit or --max-bytes
@@ -372,9 +377,15 @@ acknowledges, rewrites, or deletes anything.
 herd mail repair recovers 1 to 32 explicitly selected quarantined rows with
 legacy non-RFC3339 timestamps. It normalizes timestamps and assigns sequences
 above the existing rows and counter under the canonical mailbox lock. The ids,
-payloads, row positions and every unselected byte are preserved. It does not
-reorder history or resolve existing sequence-order failures in bounded paging.
-It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
+payloads, row positions and every unselected byte are preserved. Timestamp
+repair does not reorder history. Sequence-order recovery (--sequence-order)
+restores file-order monotonic sequences by assigning seq values above the
+running max to inverting rows only; ids, payloads, row positions and signed
+controls are preserved. The compact --plan-out artifact plus --plan-digest is
+the CAS for --act (whole-store digest, not argv fingerprints). Duplicate ids,
+stale plan/store digests, stale paging cursors, privileged signed rows that
+would be rewritten, and stores over the configured row/byte ceiling refuse
+with the mailbox untouched. It is REPORT-ONLY unless --act is given. One --id returns the unchanged JSON
 plan object; repeated --id flags return an array in the order supplied.
 Acting REQUIRES --actor and one --fingerprint per --id, paired in the same
 order. Run report-only first and pass back each plan's original_sha256, so the

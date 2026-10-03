@@ -5,10 +5,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/Kampe/Herdforge/pkg/procsignal"
 	"github.com/Kampe/Herdforge/pkg/router"
 	"github.com/Kampe/Herdforge/pkg/spin"
 )
@@ -59,8 +59,10 @@ func ProbeModel(ctx context.Context, model string) ProbeResult {
 // silently measured through a different execution surface.
 //
 // Codex logical routes execute through the Pi harness with exact noninteractive
-// flags and require stdout to be exactly PROBE_OK after trim. OpenCode-backed
-// routes (opencode/ollama/lazer) keep the legacy OpenCode probe surface.
+// flags and require stdout to be exactly PROBE_OK after trim. AGY probes use
+// router.InsertAgyStructuredPrintFlags and require a structured SUCCESS
+// envelope whose response is exactly PROBE_OK. OpenCode-backed routes
+// (opencode/ollama/lazer) keep the legacy OpenCode probe surface.
 func ProbeProviderModel(ctx context.Context, provider, model, effort string) ProbeResult {
 	pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -97,7 +99,7 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 		}
 		command, args = argv[0], argv[1:]
 	}
-	cmd := exec.CommandContext(pctx, command, args...)
+	cmd := procsignal.CommandContext(pctx, command, args...)
 	if delivery.Mode == router.DeliverByStdin {
 		cmd.Stdin = strings.NewReader(probePrompt)
 	}
@@ -124,6 +126,12 @@ func ProbeProviderModel(ctx context.Context, provider, model, effort string) Pro
 			status = ""
 		}
 		return ProbeResult{Model: model, Reason: "probe failed: " + boundProbeFailureDetail(detail, status)}
+	}
+	if strings.EqualFold(provider, "agy") {
+		if reason := router.AgyStructuredProbeReason(sanitizedOut, model, probeToken); reason != "" {
+			return ProbeResult{Model: model, Reason: reason}
+		}
+		return ProbeResult{Model: model, Available: true}
 	}
 	if strings.TrimSpace(sanitizedOut) != probeToken {
 		return ProbeResult{Model: model, Reason: "no exact probe output"}
@@ -186,6 +194,9 @@ func providerProbeCommand(provider, model, effort string) (string, []string, pro
 	argv, delivery := router.HeadlessArgvFor(provider, model, effort, "")
 	if len(argv) == 0 {
 		return "", nil, probeDelivery{}, fmt.Errorf("no headless contract for provider %q (cannot probe what cannot be launched)", provider)
+	}
+	if provider == "agy" {
+		argv = router.InsertAgyStructuredPrintFlags(argv)
 	}
 	return argv[0], argv[1:], probeDelivery{Mode: probeDeliveryFor(provider, delivery)}, nil
 }

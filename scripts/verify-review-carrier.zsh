@@ -245,8 +245,8 @@ controls=(
 			return \"\", nil
 		}${sep}TestPinnedCandidateAndBaseAllocateNoCarrier${sep}a fully pinned resolution allocated a carrier at"
 "pinned-identities-need-no-directory${sep}${pool_src}${sep}${worktree_pkg}${sep}	return strings.TrimSpace(sha) == \"\" || strings.TrimSpace(explicitBase) == \"\"${sep}	return true // MUTANT: every resolution claims it needs a directory${sep}TestNeedsCandidateDirectoryFollowsWhatIsActuallyRead/both_pinned_reads_nothing${sep}needsCandidateDirectory("
-"entry-allocates-no-redundant-carrier${sep}${pool_src}${sep}${worktree_pkg}${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
-		needsCandidateDirectory(strings.TrimSpace(*shaFlag), strings.TrimSpace(*opts.Base)))${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, strings.TrimSpace(*shaFlag),
+"entry-allocates-no-redundant-carrier${sep}${pool_src}${sep}${worktree_pkg}${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, sha,
+		needsCandidateDirectory(sha, strings.TrimSpace(*opts.Base)))${sep}	candidateDir, err := resolvePoolReviewCandidateAtFor(root, ref, sha,
 		true) // MUTANT: the production entry allocates unconditionally, as it did before${sep}TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier${sep}no-launch preparation left an unowned carrier"
 "review-roots-anchor-to-the-repository${sep}${pool_src}${sep}${worktree_pkg}${sep}			*anchor.target = filepath.Join(root, \".herd\", anchor.segment)${sep}			*anchor.target = filepath.Join(\".herd\", anchor.segment) // MUTANT: the default resolves against the caller again${sep}TestUnnamedReviewRootsAnchorToTheRepository${sep}want the repository-anchored"
 "repository-root-resolved-absolutely${sep}${pool_src}${sep}${worktree_pkg}${sep}	root, err := filepath.Abs(firstEnv(\"HERD_ROOT\", \"HERD_REPO_ROOT\", \".\"))

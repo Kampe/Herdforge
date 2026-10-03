@@ -195,7 +195,11 @@ func TestProbeProviderModel_UsesEachNativeHeadlessAdapter(t *testing.T) {
 			for _, command := range []string{"agy", "grok", "opencode", "pi"} {
 				name := command
 				if command == tc.command {
-					writeProbeCLI(t, dir, name, `: > "`+marker+`"; printf '%s\n' PROBE_OK`)
+					body := `: > "` + marker + `"; printf '%s\n' PROBE_OK`
+					if command == "agy" {
+						body = `: > "` + marker + `"; printf '%s\n' '{"conversation_id":"sess-probe","status":"SUCCESS","response":"PROBE_OK","model":"gemini-2.5-pro"}'`
+					}
+					writeProbeCLI(t, dir, name, body)
 					continue
 				}
 				writeProbeCLI(t, dir, name, `echo unexpected-`+name+` >&2; exit 91`)
@@ -256,6 +260,87 @@ func TestProbeProviderModel_OSCWithoutTokenFails(t *testing.T) {
 	result := ProbeProviderModel(context.Background(), "codex", "gpt-5.6-luna", "medium")
 	if result.Available || result.Reason != "no exact probe output" {
 		t.Fatalf("OSC output without the token must fail closed: %+v", result)
+	}
+}
+
+func TestProbeProviderModel_AgyRequiresStructuredFinalAssistant(t *testing.T) {
+	healthy := `{"conversation_id":"cb414436-f458-407c-8541-6ce272b9e066","status":"SUCCESS","response":"PROBE_OK","model":"gemini-3.1-pro-high"}`
+	cases := []struct {
+		name   string
+		script string
+		ok     bool
+		reason string
+	}{
+		{name: "json-success", script: `printf '%s\n' '` + healthy + `'`, ok: true},
+		{name: "tool-preamble-trailing-token", script: `printf 'view_file antigravity_guide\nPROBE_OK\n'`, reason: "no structured agy probe result"},
+		{name: "json-slash-command-no-session", script: `printf '%s\n' '{"conversation_id":"","status":"SUCCESS","response":"PROBE_OK"}'`, reason: "agy probe missing conversation session"},
+		{name: "json-response-extra", script: `printf '%s\n' '{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK\nextra"}'`, reason: "agy probe response is not the exact token"},
+		{name: "json-wrong-model", script: `printf '%s\n' '{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK","model":"gemini-2.5-flash"}'`, reason: "agy probe model does not match requested model"},
+		{name: "json-not-success", script: `printf '%s\n' '{"conversation_id":"sess-1","status":"ERROR","response":"PROBE_OK"}'`, reason: "agy probe status is not SUCCESS"},
+		{name: "stream-json-competing-result", script: `printf '%s\n' '{"event":"tool","name":"view_file"}' '{"event":"result","result":{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK","model":"gemini-3.1-pro-high"}}'`, reason: "no structured agy probe result"},
+		{name: "trailing-garbage", script: `printf '%s\nERROR boom\n' '` + healthy + `'`, reason: "no structured agy probe result"},
+		{name: "trailing-error-json", script: `printf '%s\n%s\n' '` + healthy + `' '{"error":"cascade failed"}'`, reason: "no structured agy probe result"},
+		{name: "competing-second-result", script: `printf '%s\n%s\n' '` + healthy + `' '{"conversation_id":"sess-2","status":"SUCCESS","response":"PROBE_OK","model":"gemini-3.1-pro-high"}'`, reason: "no structured agy probe result"},
+		{name: "malformed-after-valid", script: `printf '%s\n{"status":\n' '` + healthy + `'`, reason: "no structured agy probe result"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeProbeCLI(t, dir, "agy", tc.script)
+			t.Setenv("PATH", dir)
+			result := ProbeProviderModel(context.Background(), "agy", "gemini-3.1-pro-high", "medium")
+			if tc.ok {
+				if !result.Available {
+					t.Fatalf("want available, got %+v", result)
+				}
+				return
+			}
+			if result.Available || result.Reason != tc.reason {
+				t.Fatalf("got %+v want reason %q", result, tc.reason)
+			}
+		})
+	}
+}
+
+func TestProbeProviderModel_AgyPrintJSONFlagsBeforePrint(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "agy.args")
+	writeProbeCLI(t, dir, "agy", `printf '%s\n' "$@" > "`+argsPath+`"
+printf '%s\n' '{"conversation_id":"sess-1","status":"SUCCESS","response":"PROBE_OK"}'`)
+	t.Setenv("PATH", dir)
+	result := ProbeProviderModel(context.Background(), "agy", "gemini-3.1-pro-high", "medium")
+	if !result.Available {
+		t.Fatalf("agy structured probe: %+v", result)
+	}
+	raw, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	printAt, jsonAt := -1, -1
+	for i, a := range got {
+		if a == "--print" || a == "-p" {
+			printAt = i
+		}
+		if a == "--output-format" {
+			jsonAt = i
+		}
+	}
+	if jsonAt < 0 || printAt < 0 || jsonAt > printAt {
+		t.Fatalf("--output-format json must precede --print: %#v", got)
+	}
+	if i := jsonAt + 1; i >= len(got) || got[i] != "json" {
+		t.Fatalf("missing json format value: %#v", got)
+	}
+	slashAt := -1
+	for i, a := range got {
+		if a == "--disable-slash-commands" {
+			slashAt = i
+			break
+		}
+	}
+	if slashAt < 0 || slashAt > printAt {
+		t.Fatalf("--disable-slash-commands must precede --print: %#v", got)
 	}
 }
 

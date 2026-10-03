@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Kampe/Herdforge/internal/testgit"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -36,6 +37,11 @@ func queuedSendRepo(t *testing.T) string {
 
 func installQueuedSendFake(t *testing.T, status, pid string) (bin, logPath, statusPath string) {
 	t.Helper()
+	return installQueuedSendFakeRoster(t, status, pid, false)
+}
+
+func installQueuedSendFakeRoster(t *testing.T, status, pid string, idlePeer bool) (bin, logPath, statusPath string) {
+	t.Helper()
 	dir := t.TempDir()
 	bin = filepath.Join(dir, "herdr")
 	logPath = filepath.Join(dir, "calls.log")
@@ -46,12 +52,16 @@ func installQueuedSendFake(t *testing.T, status, pid string) (bin, logPath, stat
 	if err := os.WriteFile(statusPath, []byte(status), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	peer := ""
+	if idlePeer {
+		peer = `,{"name":"distractor","pane_id":"p2","workspace_id":"wK","agent_status":"idle"}`
+	}
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$HERD_FAKE_LOG"
 case "$1 $2" in
   "agent list")
     st=$(cat "$HERD_FAKE_STATUS")
-    printf '{"result":{"agents":[{"name":"worker","pane_id":"p1","workspace_id":"wK","agent_status":"%s"}]}}\n' "$st"
+    printf '{"result":{"agents":[{"name":"worker","pane_id":"p1","workspace_id":"wK","agent_status":"%s"}` + peer + `]}}\n' "$st"
     ;;
   "agent prompt")
     shift 2
@@ -293,6 +303,63 @@ func TestWatchWakeReconcilesPreexistingOrdinaryReportAndRestartDoesNotRedeliver(
 	}
 	if strings.Contains(fakeCallLog(t, logPath), "agent prompt") {
 		t.Fatalf("restart redelivered acknowledged report:\n%s", fakeCallLog(t, logPath))
+	}
+}
+
+func TestWatchWakeDoesNotExitOnUnrelatedIdlePanesWhileRecipientIsWorking(t *testing.T) {
+	proc := startFakeCommand(t)
+	repo := queuedSendRepo(t)
+	bin, logPath, _ := installQueuedSendFakeRoster(t, "working", strconv.Itoa(proc.Pid), true)
+	env := queuedSendEnv(bin, repo)
+	box := mail.NewMailbox(filepath.Join(repo, ".herd", "control-mail.jsonl"))
+	if _, err := box.SendMessage("coord", "worker", "queued while working", "payload-bytes"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runHerd(t, repo, env, "watch", "--wake", "--recipient", "worker", "--workspace", "wK", "--interval", "1", "--timeout", "3")
+	if exitCode(err) != 2 {
+		t.Fatalf("working recipient with idle peers must time out, exit=%d out=%s", exitCode(err), out)
+	}
+	if strings.Contains(string(out), "WAKE") {
+		t.Fatalf("must not wake a working recipient:\n%s", out)
+	}
+	if strings.Contains(fakeCallLog(t, logPath), "agent prompt") {
+		t.Fatalf("must not prompt a working recipient:\n%s", fakeCallLog(t, logPath))
+	}
+	pending, err := box.PendingRoutine("worker")
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("queued mail must remain pending: n=%d err=%v", len(pending), err)
+	}
+}
+
+func TestWatchWakeConsumesAfterRecipientIdlesDespiteIdlePeers(t *testing.T) {
+	proc := startFakeCommand(t)
+	repo := queuedSendRepo(t)
+	bin, logPath, statusPath := installQueuedSendFakeRoster(t, "working", strconv.Itoa(proc.Pid), true)
+	env := queuedSendEnv(bin, repo)
+	body := "drain after idle"
+	box := mail.NewMailbox(filepath.Join(repo, ".herd", "control-mail.jsonl"))
+	if _, err := box.SendMessage("coord", "worker", "queued while working", body); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(2500 * time.Millisecond)
+		_ = os.WriteFile(statusPath, []byte("idle"), 0o600)
+		close(done)
+	}()
+	t.Cleanup(func() { <-done })
+
+	out, err := runHerd(t, repo, env, "watch", "--wake", "--recipient", "worker", "--workspace", "wK", "--interval", "1", "--timeout", "6")
+	if err != nil {
+		t.Fatalf("watch wake after idle: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "WAKE worker workspace=wK durable mail consumed") {
+		t.Fatalf("wake output = %s", out)
+	}
+	if strings.Count(fakeCallLog(t, logPath), "agent prompt") != 1 || !strings.Contains(fakeCallLog(t, logPath), body) {
+		t.Fatalf("queued payload was not delivered once:\n%s", fakeCallLog(t, logPath))
 	}
 }
 

@@ -18,11 +18,27 @@ import (
 func isolatedHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
-	for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CONFIG_DIR", "XDG_CONFIG_HOME"} {
+	for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CONFIG_DIR", "XDG_CONFIG_HOME", "ANTIGRAVITY_APP_DATA_DIR"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HOME", home)
 	return home
+}
+
+func TestIsolatedHomeClearsAntigravityAppDataDir(t *testing.T) {
+	leak := t.TempDir()
+	t.Setenv("ANTIGRAVITY_APP_DATA_DIR", leak)
+	if err := os.WriteFile(filepath.Join(leak, antigravityOAuthFile), []byte(`{"token":{"access_token":"leaked","expiry":"2099-01-01T00:00:00Z"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	isolatedHome(t)
+	if got := os.Getenv("ANTIGRAVITY_APP_DATA_DIR"); got != "" {
+		t.Fatalf("ANTIGRAVITY_APP_DATA_DIR leaked as %q", got)
+	}
+	_, err := antigravityTokenFromFile()
+	if err == nil || pollErrorCode(err) != "auth-missing" {
+		t.Fatalf("isolated home must not read leaked AGY creds, got %v", err)
+	}
 }
 
 func TestOpenCodeAccountIdentityUsesConfiguredClaim(t *testing.T) {

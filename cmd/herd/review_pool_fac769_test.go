@@ -45,7 +45,7 @@ func fac769Fixture(t *testing.T) (root, base, candidate string) {
 func TestFac769PacketNamesActualLeasedSlotForCustomPoolRoot(t *testing.T) {
 	body := reviewPacketBody("FAC-769", strings.Repeat("a", 40),
 		"base", "surface", "/custom/pool-root/pool-07",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-769")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-769", "", "", "")
 
 	if !strings.Contains(body, "/custom/pool-root/pool-07") {
 		t.Fatal("packet must name the actual custom leased slot path, not a literal default")
@@ -69,7 +69,7 @@ func TestFac769PacketNamesActualLeasedSlotForCustomPoolRoot(t *testing.T) {
 func TestFac769PacketPermitsOnlyCanonicalWriteAndTransport(t *testing.T) {
 	body := reviewPacketBody("FAC-769", strings.Repeat("a", 40),
 		"base", "surface", ".herd/pool/pool-01",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-769")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-769", "", "", "")
 
 	for _, want := range []string{
 		"writing your verdict artifact to the canonical inbox path below",
@@ -93,7 +93,7 @@ func TestFac769PacketCarriesExactReviewedBase(t *testing.T) {
 	base := strings.Repeat("b", 40)
 	body := reviewPacketBody("FAC-769", strings.Repeat("a", 40),
 		base, "surface", ".herd/pool/pool-01",
-		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-769")
+		"/repo/.herd/review/inbox/v.md", "review-supervisor", "openai", "w2", "FAC-769", "", "", "")
 
 	if !strings.Contains(body, "reviewed-base: "+base) {
 		t.Fatal("packet must prefill the exact reviewed-base from the launch pin")
@@ -181,7 +181,7 @@ func TestFac769BaseResolutionPrecedesPacketAndThreadsSlot(t *testing.T) {
 func TestFac769DefaultPoolAndSupervisorMailStillWork(t *testing.T) {
 	body := reviewPacketBody("FAC-769", strings.Repeat("a", 40),
 		"base", "surface", ".herd/pool/pool-01",
-		"/repo/.herd/review/inbox/v.md", "forge-review-harvest-su-467b70d7", "openai", "w2", "FAC-769")
+		"/repo/.herd/review/inbox/v.md", "forge-review-harvest-su-467b70d7", "openai", "w2", "FAC-769", "", "", "")
 
 	if !strings.Contains(body, ".herd/pool/pool-01") {
 		t.Fatal("default pool-root packet must still name its actual leased slot")

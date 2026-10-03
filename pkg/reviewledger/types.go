@@ -29,6 +29,9 @@ const (
 	// verdict was recorded against the wrong closeable card. It changes no
 	// verdict or evidence; consumers resolve the effective task from this row.
 	EventTaskBinding Event = "task-binding"
+	// EventCoordinatorAbort records a coordinator-attributed abort of an
+	// exact review launch. It is not a reviewer verdict and never admits merge.
+	EventCoordinatorAbort Event = "coordinator-abort"
 )
 
 // Verdict values.
@@ -100,6 +103,7 @@ type LedgerRow struct {
 	Reason             string `json:"reason,omitempty"`
 	ContentProof       string `json:"content_proof,omitempty"`
 	Authority          string `json:"authority,omitempty"`
+	SessionID          string `json:"session_id,omitempty"`
 	PreviousTask       string `json:"previous_task,omitempty"`
 	// rawEventDigest is populated when a row is read from the append-only
 	// ledger.  Projections may change Task, but the event digest must continue
