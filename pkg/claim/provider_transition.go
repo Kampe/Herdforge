@@ -354,3 +354,11 @@ func isProviderTransitionKind(kind string) bool {
 	}
 	return strings.HasPrefix(kind, "status:") || strings.HasPrefix(kind, "comment:")
 }
+
+// IsProviderTransitionKind reports whether an outbox record kind is a
+// provider transition that ReconcileProviderTransitions considers. Exported
+// for read-only diagnostics (FAC-785 fence-op) that must enumerate the same
+// record set the reconcile primitive closes without duplicating the rule.
+func IsProviderTransitionKind(kind string) bool {
+	return isProviderTransitionKind(kind)
+}

@@ -165,7 +165,10 @@ func (c *FenceBrokerClient) Status(ctx context.Context) (*FenceBrokerStatus, err
 		return nil, fmt.Errorf("fence-broker status: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("fence-broker status: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
 		return nil, fmt.Errorf("fence-broker status: %w", err)
 	}
@@ -192,7 +195,10 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 		return false, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("fence-broker op lookup: %w", err)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return false, nil
 	}
@@ -205,6 +211,7 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 	var out struct {
 		Applied        bool   `json:"applied"`
 		Ambiguous      bool   `json:"ambiguous"`
+		OpID           string `json:"op_id"`
 		TaskID         string `json:"task_id"`
 		ExpectedStatus string `json:"expected_status"`
 	}
@@ -214,6 +221,9 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 	if !out.Applied || out.Ambiguous {
 		return false, nil
 	}
+	if out.OpID == "" || !strings.EqualFold(out.OpID, opID) {
+		return false, nil
+	}
 	if out.TaskID != taskID {
 		return false, nil
 	}
@@ -221,6 +231,88 @@ func (c *FenceBrokerClient) OpApplied(ctx context.Context, opID, taskID, wantSta
 		return false, nil
 	}
 	return true, nil
+}
+
+// FenceOpReadback is the full read-only view of one fenced operation, mirroring
+// the broker's GET /v1/ops/<opID> receipt shape (FAC-785).
+type FenceOpReadback struct {
+	Applied        bool   `json:"applied"`
+	Ambiguous      bool   `json:"ambiguous"`
+	OpID           string `json:"op_id,omitempty"`
+	TaskID         string `json:"task_id,omitempty"`
+	FenceToken     int64  `json:"fence_token,omitempty"`
+	ExpectedStatus string `json:"expected_status,omitempty"`
+	Revision       string `json:"revision,omitempty"`
+}
+
+// LookupOp performs the exact-operation readback GET /v1/ops/<opID> and
+// returns the full receipt. Read-only: it issues a GET and nothing else.
+// Fail-closed: a 404 means unknown op (nil, nil); an HTTP 200 body carrying
+// {"error":...}, a malformed body, or any non-200 is a hard error — never
+// silently read as "not applied". opID is validated so it can never alter
+// the request path.
+func (c *FenceBrokerClient) LookupOp(ctx context.Context, opID string) (*FenceOpReadback, error) {
+	if c == nil || opID == "" {
+		return nil, fmt.Errorf("fence-broker: op lookup requires client+op")
+	}
+	if err := ValidateOpID(opID); err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/v1/ops/"+opID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("fence-broker op lookup: %w", err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("fence-broker op lookup HTTP %d: %s", resp.StatusCode, body)
+	}
+	var out FenceOpReadback
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("fence-broker op lookup: malformed body: %w", err)
+	}
+	if out.Ambiguous && out.Applied {
+		return nil, fmt.Errorf("fence-broker op lookup: contradictory receipt (applied and ambiguous)")
+	}
+	if out.OpID == "" || !strings.EqualFold(out.OpID, opID) {
+		return nil, fmt.Errorf("fence-broker op lookup: receipt op_id %q does not match requested %q", out.OpID, opID)
+	}
+	if out.Applied && strings.TrimSpace(out.TaskID) == "" {
+		return nil, fmt.Errorf("fence-broker op lookup: applied receipt is missing task identity")
+	}
+	return &out, nil
+}
+
+// ValidateOpID refuses op identifiers that could alter an HTTP request path
+// or smuggle anything but an opaque operation id (hex UUID shape produced by
+// the claim outbox, case-insensitive).
+func ValidateOpID(opID string) error {
+	s := strings.TrimSpace(opID)
+	if s == "" {
+		return fmt.Errorf("fence-broker: op id is required")
+	}
+	if s != opID {
+		return fmt.Errorf("fence-broker: op id has surrounding whitespace")
+	}
+	if len(s) > 128 {
+		return fmt.Errorf("fence-broker: op id too long")
+	}
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == '-' {
+			continue
+		}
+		return fmt.Errorf("fence-broker: op id %q is not a hex/dash operation id", opID)
+	}
+	return nil
 }
 
 // MutateStatus performs broker-enforced status mutation with an immutable
@@ -251,7 +343,10 @@ func (c *FenceBrokerClient) MutateStatus(ctx context.Context, taskID, status str
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("fence-broker mutate: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
 		return err
 	}
@@ -291,7 +386,10 @@ func (c *FenceBrokerClient) MutateComment(ctx context.Context, taskID, commentBo
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("fence-broker comment: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, body); err != nil {
 		return err
 	}
@@ -304,19 +402,19 @@ func (c *FenceBrokerClient) MutateComment(ctx context.Context, taskID, commentBo
 	return nil
 }
 
-// rejectJSONErrorBody enforces fail-closed: HTTP 2xx with {"error":...} is a hard error.
+// rejectJSONErrorBody enforces fail-closed: HTTP 2xx with {"error":...} of any JSON type is a hard error.
 func rejectJSONErrorBody(status int, body []byte) error {
 	if status < 200 || status >= 300 || len(body) == 0 {
 		return nil
 	}
-	var probe struct {
-		Error string `json:"error"`
-	}
+	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(body, &probe); err != nil {
 		return nil
 	}
-	if strings.TrimSpace(probe.Error) != "" {
-		return fmt.Errorf("fence-broker: HTTP %d body carries error (fail-closed): %s", status, probe.Error)
+	for k, raw := range probe {
+		if strings.EqualFold(k, "error") {
+			return fmt.Errorf("fence-broker: HTTP %d body carries error (fail-closed): %s", status, strings.TrimSpace(string(raw)))
+		}
 	}
 	return nil
 }

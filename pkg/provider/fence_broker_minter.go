@@ -242,7 +242,10 @@ func (m *FenceBrokerMinter) IssueCapability(ctx context.Context, req CapabilityI
 		return "", err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("fence-broker mint: %w", err)
+	}
 	if err := rejectJSONErrorBody(resp.StatusCode, b); err != nil {
 		return "", err
 	}
