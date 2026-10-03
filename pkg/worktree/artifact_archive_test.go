@@ -169,6 +169,184 @@ func TestArchiveIgnoredActiveOwnerRefuses(t *testing.T) {
 	}
 }
 
+func TestArchiveAccountingRelocationIsNotReclaim(t *testing.T) {
+	root, wt := archiveFixture(t)
+	src := filepath.Join(wt, ".herd", "receipts", "FAC-843.json")
+	size := int64(len(`{"ref":"FAC-843"}`))
+	info, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size = info.Size()
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.SourceBytes == 0 {
+		t.Fatal("source_bytes")
+	}
+	if rep.RelocatedBytes == 0 || rep.ArchiveNewBytes == 0 {
+		t.Fatalf("unique files must be relocation, report=%+v", rep)
+	}
+	if rep.NetReclaim != 0 {
+		t.Fatalf("relocation claimed as reclaim: net_reclaim=%d", rep.NetReclaim)
+	}
+	_ = size
+}
+
+func TestArchiveDuplicateCarrierDedupReclaims(t *testing.T) {
+	root, wtA := archiveFixture(t)
+	payload := []byte("shared-bin-herd-bytes")
+	if err := os.WriteFile(filepath.Join(wtA, "bin", "herd"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wtA, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.NetReclaim != 0 {
+		t.Fatalf("first carrier relocation must not reclaim, got %d", first.NetReclaim)
+	}
+
+	wtB := filepath.Join(root, ".herd", "worktrees", "fac-843-b")
+	cmd := exec.Command("git", "-C", root, "worktree", "add", "-q", wtB, "HEAD")
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t", "GIT_CONFIG_GLOBAL=/dev/null")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("second carrier: %v\n%s", err, out)
+	}
+	if err := os.MkdirAll(filepath.Join(wtB, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtB, "bin", "herd"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wtB, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var derived int64
+	for _, e := range second.Entries {
+		if e.Path == "bin/herd" {
+			if e.Disposition != "deduped" || e.Retention != "regenerable" {
+				t.Fatalf("second derived file %+v", e)
+			}
+			derived = e.Size
+		}
+	}
+	if derived == 0 || second.ArchiveNewBytes != 0 {
+		t.Fatalf("second carrier must not grow the archive: %+v", second)
+	}
+	if second.DedupSavings != derived {
+		t.Fatalf("logical dedup savings=%d want %d", second.DedupSavings, derived)
+	}
+	if second.PhysicalReclaimUncertainBytes != derived {
+		t.Fatalf("nlink=1 extra copy is reflink-uncertain, uncertain=%d want %d", second.PhysicalReclaimUncertainBytes, derived)
+	}
+	if second.NetReclaim != 0 {
+		t.Fatalf("nlink=1 extra copy is not certain physical reclaim, net_reclaim=%d", second.NetReclaim)
+	}
+}
+
+func TestArchiveSameBatchHardlinksDoNotOverclaim(t *testing.T) {
+	root, wt := archiveFixture(t)
+	src := filepath.Join(wt, "bin", "herd")
+	alias := filepath.Join(wt, "bin", "herdforge")
+	payload := []byte("hardlink-payload-bytes")
+	if err := os.WriteFile(src, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Link(src, alias); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aliases int
+	for _, e := range rep.Entries {
+		if e.Disposition == "hardlink-alias" {
+			aliases++
+		}
+	}
+	if aliases == 0 {
+		t.Fatalf("expected a hardlink-alias in %+v", rep.Entries)
+	}
+	if rep.SourceAllocatedBytes >= rep.SourceBytes {
+		t.Fatalf("allocated %d should be below logical %d for hardlinks", rep.SourceAllocatedBytes, rep.SourceBytes)
+	}
+	if rep.NetReclaim != 0 {
+		t.Fatalf("same-batch hardlinks overclaimed net_reclaim=%d report=%+v", rep.NetReclaim, rep)
+	}
+}
+
+func TestArchiveSameBatchCopiesDedupOnce(t *testing.T) {
+	root, wt := archiveFixture(t)
+	payload := []byte("copy-payload-bytes")
+	if err := os.WriteFile(filepath.Join(wt, "bin", "herd"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "bin", "herdforge"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copies int64
+	for _, e := range rep.Entries {
+		if e.Path == "bin/herd" || e.Path == "bin/herdforge" {
+			copies += e.Size
+		}
+	}
+	if copies == 0 || rep.DedupSavings == 0 {
+		t.Fatalf("two copies should record logical dedup, report=%+v", rep)
+	}
+	if rep.PhysicalReclaimUncertainBytes != int64(len(payload)) {
+		t.Fatalf("nlink=1 extra copy is reflink-uncertain, uncertain=%d want %d report=%+v", rep.PhysicalReclaimUncertainBytes, len(payload), rep)
+	}
+	if rep.NetReclaim != 0 {
+		t.Fatalf("nlink=1 extra copy must not be certain physical reclaim, net_reclaim=%d", rep.NetReclaim)
+	}
+}
+
+func TestArchiveExternalHardlinkIsNotPhysicalReclaim(t *testing.T) {
+	root, wt := archiveFixture(t)
+	payload := []byte("external-alias-payload")
+	outside := filepath.Join(root, "outside-alias")
+	inside := filepath.Join(wt, "bin", "herd")
+	if err := os.WriteFile(inside, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(inside, outside); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(root, filepath.FromSlash(ArtifactArchiveDir))
+	sum, _, err := hashFile(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeObject(archive, inside, sum); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := ArchiveIgnored(ArchiveRequest{Root: root, Target: wt, Archive: archive, Act: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("external alias must survive: %v", err)
+	}
+	if rep.NetReclaim != 0 || rep.PhysicalReclaimCertainBytes != 0 {
+		t.Fatalf("external hardlink counted as physical reclaim: %+v", rep)
+	}
+	if int64(len(payload)) > 0 && rep.LogicalUnlinkedBytes == 0 {
+		t.Fatal("logical unlink of the in-target name must still be reported")
+	}
+}
+
 func TestClassifyArtifactPathReceipts(t *testing.T) {
 	if ClassifyArtifactPath(".herd/receipts/FAC-843.json") != ArtifactReceipt {
 		t.Fatal("receipt")

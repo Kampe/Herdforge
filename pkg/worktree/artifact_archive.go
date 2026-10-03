@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/gitroot"
@@ -67,10 +68,12 @@ const (
 
 // ArtifactEntry is one archived ignored file.
 type ArtifactEntry struct {
-	Path   string       `json:"path"`
-	Digest string       `json:"digest"`
-	Size   int64        `json:"size"`
-	Kind   ArtifactKind `json:"kind"`
+	Path        string       `json:"path"`
+	Digest      string       `json:"digest"`
+	Size        int64        `json:"size"`
+	Kind        ArtifactKind `json:"kind"`
+	Retention   string       `json:"retention"`
+	Disposition string       `json:"disposition,omitempty"`
 }
 
 // ArtifactManifest records every archived path for one target worktree.
@@ -91,15 +94,27 @@ type ArchiveRequest struct {
 }
 
 // ArchiveReport is the operator-visible outcome. Dry-run never sets Removed.
+// NetReclaim is physical_reclaim_certain_bytes only. Last-name unlinks are
+// logical deletion; without exclusive-extent proof they are uncertain, even
+// when nlink>1. RelocatedBytes is a copy, not reclaim.
 type ArchiveReport struct {
-	Target   string          `json:"target"`
-	Archive  string          `json:"archive"`
-	Manifest string          `json:"manifest,omitempty"`
-	Act      bool            `json:"act"`
-	Entries  []ArtifactEntry `json:"entries"`
-	Archived int             `json:"archived"`
-	Removed  int             `json:"removed"`
-	Reason   string          `json:"reason,omitempty"`
+	Target                        string          `json:"target"`
+	Archive                       string          `json:"archive"`
+	Manifest                      string          `json:"manifest,omitempty"`
+	Act                           bool            `json:"act"`
+	Entries                       []ArtifactEntry `json:"entries"`
+	Archived                      int             `json:"archived"`
+	Removed                       int             `json:"removed"`
+	SourceBytes                   int64           `json:"source_bytes"`
+	SourceAllocatedBytes          int64           `json:"source_allocated_bytes"`
+	ArchiveNewBytes               int64           `json:"archive_new_bytes"`
+	DedupSavings                  int64           `json:"dedup_savings"`
+	RelocatedBytes                int64           `json:"relocated_bytes"`
+	LogicalUnlinkedBytes          int64           `json:"logical_unlinked_bytes"`
+	PhysicalReclaimCertainBytes   int64           `json:"physical_reclaim_certain_bytes"`
+	PhysicalReclaimUncertainBytes int64           `json:"physical_reclaim_uncertain_bytes"`
+	NetReclaim                    int64           `json:"net_reclaim"`
+	Reason                        string          `json:"reason,omitempty"`
 }
 
 // ClassifyArtifactPath marks receipt evidence versus rebuildable derived files.
@@ -187,7 +202,15 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		return rep, nil
 	}
 
+	type inodeAcc struct {
+		size   int64
+		nlink  uint64
+		names  int
+		newObj bool
+	}
 	var entries []ArtifactEntry
+	seenIno := map[uint64]*inodeAcc{}
+	seenDigest := map[string]struct{}{}
 	for _, rel := range files {
 		src := filepath.Join(target, filepath.FromSlash(rel))
 		if err := refuseCanonicalReceipt(root, target, src); err != nil {
@@ -200,10 +223,32 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 		if err != nil {
 			return nil, fmt.Errorf("artifact-archive: hash %s: %w", rel, err)
 		}
-		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: ClassifyArtifactPath(rel)}
-		if req.Act {
-			if err := writeObject(archive, src, sum); err != nil {
+		ino, nlink, err := fileAlloc(src)
+		if err != nil {
+			return nil, fmt.Errorf("artifact-archive: inode %s: %w", rel, err)
+		}
+		kind := ClassifyArtifactPath(rel)
+		ent := ArtifactEntry{Path: rel, Digest: sum, Size: size, Kind: kind, Retention: retentionOf(kind)}
+		rep.SourceBytes += size
+		acc, seenName := seenIno[ino]
+		if !seenName {
+			acc = &inodeAcc{size: size, nlink: nlink}
+			seenIno[ino] = acc
+			rep.SourceAllocatedBytes += size
+		}
+		acc.names++
+		existed := objectExists(archive, sum)
+		if _, ok := seenDigest[sum]; ok {
+			existed = true
+		}
+		if req.Act && !seenName {
+			created, err := writeObject(archive, src, sum)
+			if err != nil {
 				return nil, fmt.Errorf("artifact-archive: store %s: %w", rel, err)
+			}
+			existed = !created
+			if created {
+				acc.newObj = true
 			}
 			if afterArchiveHook != nil {
 				afterArchiveHook(src)
@@ -213,13 +258,26 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 				return nil, fmt.Errorf("artifact-archive: drift on %s before removal (archived %s, now %s)", rel, sum, again)
 			}
 		}
+		switch {
+		case seenName:
+			ent.Disposition = "hardlink-alias"
+		case existed:
+			ent.Disposition = "deduped"
+			rep.DedupSavings += size
+		default:
+			ent.Disposition = "relocated"
+			rep.RelocatedBytes += size
+			rep.ArchiveNewBytes += size
+		}
+		seenDigest[sum] = struct{}{}
 		entries = append(entries, ent)
 	}
 	rep.Entries = entries
 	rep.Archived = len(entries)
 
 	if !req.Act {
-		rep.Reason = "dry-run: archived nothing, removed nothing"
+		rep.NetReclaim = 0
+		rep.Reason = "dry-run: relocation is not reclaim; net_reclaim stays 0 until sources are removed against an existing digest"
 		return rep, nil
 	}
 
@@ -259,8 +317,44 @@ func ArchiveIgnored(req ArchiveRequest) (*ArchiveReport, error) {
 			return nil, fmt.Errorf("artifact-archive: remove %s: %w", ent.Path, err)
 		}
 		rep.Removed++
+		rep.LogicalUnlinkedBytes += ent.Size
 	}
+	for _, acc := range seenIno {
+		leftover := int64(acc.nlink) - int64(acc.names)
+		if leftover > 0 {
+			continue
+		}
+		if acc.newObj {
+			continue
+		}
+		// Last names of this inode are gone. nlink>1 only proves other names
+		// of this inode, not exclusive extents: a reflink clone can carry its
+		// own hardlink set and keep the blocks. Without filesystem proof of
+		// exclusive allocation, last-name reclaim is uncertain.
+		rep.PhysicalReclaimUncertainBytes += acc.size
+	}
+	rep.NetReclaim = rep.PhysicalReclaimCertainBytes
 	return rep, nil
+}
+
+func retentionOf(kind ArtifactKind) string {
+	if kind == ArtifactReceipt {
+		return "evidence"
+	}
+	return "regenerable"
+}
+
+func objectExists(archive, digest string) bool {
+	got, _, err := hashFile(objectPath(archive, digest))
+	return err == nil && got == digest
+}
+
+func fileAlloc(path string) (ino uint64, nlink uint64, err error) {
+	var st syscall.Stat_t
+	if err := syscall.Lstat(path, &st); err != nil {
+		return 0, 0, err
+	}
+	return st.Ino, uint64(st.Nlink), nil
 }
 
 func listIgnoredFiles(target string) ([]string, error) {
@@ -452,51 +546,51 @@ func objectPath(archive, digest string) string {
 	return filepath.Join(archive, "objects", "sha256", digest[:2], digest)
 }
 
-func writeObject(archive, src, digest string) error {
+func writeObject(archive, src, digest string) (created bool, err error) {
 	dst := objectPath(archive, digest)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := os.Lstat(dst); err == nil {
 		got, _, err := hashFile(dst)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if got != digest {
-			return fmt.Errorf("object %s already exists with a different digest", digest)
+			return false, fmt.Errorf("object %s already exists with a different digest", digest)
 		}
-		return nil
+		return false, nil
 	}
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer in.Close()
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		_ = os.Remove(dst)
-		return err
+		return false, err
 	}
 	if err := out.Sync(); err != nil {
 		out.Close()
-		return err
+		return false, err
 	}
 	if err := out.Close(); err != nil {
-		return err
+		return false, err
 	}
 	got, _, err := hashFile(dst)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if got != digest {
 		_ = os.Remove(dst)
-		return fmt.Errorf("object readback digest %s != %s", got, digest)
+		return false, fmt.Errorf("object readback digest %s != %s", got, digest)
 	}
-	return nil
+	return true, nil
 }
 
 func writeManifest(archive, target string, entries []ArtifactEntry) (string, error) {
