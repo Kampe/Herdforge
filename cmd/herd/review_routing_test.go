@@ -61,7 +61,7 @@ func TestExactReviewModelOverrideUsesItsOwnHealthyPool(t *testing.T) {
 	dir := t.TempDir()
 	probeLog := filepath.Join(dir, "provider-probes.log")
 	agy := filepath.Join(dir, "agy")
-	if err := os.WriteFile(agy, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_PROBE_LOG\"\nprintf 'HERD_PROVIDER_PROBE_OK\\n'\n"), 0o755); err != nil {
+	if err := os.WriteFile(agy, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_PROBE_LOG\"\n"+agyAdmissionProbeJSON+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	quota := `{"generatedAt":"2026-08-29T20:00:00Z","providers":{"antigravity":{"displayName":"antigravity","stale":false,"resources":{"nonGeminiWeekly":{"kind":"consumption","limit":100,"remaining":0,"used":100,"utilization":1,"unit":"percent","resetsAt":"2099-01-01T00:00:00Z","windowSeconds":604800},"geminiWeekly":{"kind":"consumption","limit":100,"remaining":90,"used":10,"utilization":0.1,"unit":"percent","resetsAt":"2099-01-01T00:00:00Z","windowSeconds":604800}}}}}`
@@ -123,7 +123,7 @@ func TestExactReviewModelOverrideRefusalsAreFailClosed(t *testing.T) {
 	}{
 		{name: "unknown quota", quota: `{"generatedAt":"2026-08-29T20:00:00Z","providers":{}}`, wantReason: "UNKNOWN quota"},
 		{name: "no quota data", quota: `{"generatedAt":"2026-08-29T20:00:00Z","providers":{"antigravity":{"displayName":"antigravity","stale":false,"resources":{}}}}`, wantReason: "UNKNOWN quota"},
-		{name: "unavailable exact model", quota: healthy, providerProbe: "case \"$*\" in *gemini-3.7-flash*) printf 'no configured model\\n' ;; *) printf 'HERD_PROVIDER_PROBE_OK\\n' ;; esac", wantReason: "no configured model"},
+		{name: "unavailable exact model", quota: healthy, providerProbe: "case \"$*\" in *gemini-3.7-flash*) printf 'no configured model\\n' ;; *) " + agyAdmissionProbeJSON + " ;; esac", wantReason: "no configured model"},
 		{name: "excluded exact family", quota: healthy, excludeFamily: "google", wantReason: "family google excluded"},
 	}
 	for _, tc := range cases {
@@ -170,6 +170,8 @@ func TestExactReviewModelOverrideRefreshesStaleQuotaCache(t *testing.T) {
 	// fetch log is involved.
 }
 
+const agyAdmissionProbeJSON = `printf '%s\n' '{"conversation_id":"sess-probe","status":"SUCCESS","response":"HERD_PROVIDER_PROBE_OK"}'`
+
 type exactReviewRouteFixture struct {
 	dir           string
 	tabLog        string
@@ -182,7 +184,7 @@ func installExactReviewRouteFixture(t *testing.T, quota, providerProbe string) e
 	dir := t.TempDir()
 	probeLog := filepath.Join(dir, "provider-probes.log")
 	if providerProbe == "" {
-		providerProbe = "printf 'HERD_PROVIDER_PROBE_OK\\n'"
+		providerProbe = agyAdmissionProbeJSON
 	}
 	agy := filepath.Join(dir, "agy")
 	agyScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERD_TEST_PROBE_LOG\"\n" + providerProbe + "\n"

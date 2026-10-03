@@ -371,7 +371,7 @@ func poolResources(name string, prov ProviderUsage) map[string]map[string]bool {
 			lower := strings.ToLower(n)
 			if strings.HasPrefix(lower, "gemini") {
 				gemini[n] = true
-			} else if strings.HasPrefix(lower, "nongemini") {
+			} else if strings.HasPrefix(lower, "nongemini") || strings.HasPrefix(lower, "3p-") {
 				nonGemini[n] = true
 			}
 		}

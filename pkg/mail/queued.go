@@ -13,6 +13,17 @@ import (
 // prefix so control, callback, and help traffic stay on their own paths.
 const QueuedDeliverySubject = "herd.queued/v1"
 
+// EnvelopeKindQueuedDurable is the mail status kind for herd.queued/v1 rows.
+// It is visibility, not consumption: status stays queued until Handled.
+const EnvelopeKindQueuedDurable = "queued-durable"
+
+const EnvelopeKindOrdinary = "ordinary"
+
+// IsQueuedDelivery reports a routine queued-durable envelope.
+func IsQueuedDelivery(env *Envelope) bool {
+	return env != nil && env.Subject == QueuedDeliverySubject
+}
+
 // AnonymousIssuer is the sender every UNBOUND caller of herd send shares when
 // no lane identity is exported. It is a default, not an identity: two
 // unrelated coordinators both appear as this, so equality on it proves

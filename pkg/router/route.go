@@ -606,6 +606,10 @@ func ArgvFor(provider, model, effort string) []string {
 	return nil
 }
 
+// OutputFormatFlag is the shared vendor flag for print format. Grok headless
+// shots use it for plain text; AGY probes use it for json.
+const OutputFormatFlag = "--output-format"
+
 // HeadlessArgvFor is the argv for a ONE-SHOT, non-interactive run.
 //
 // This is deliberately separate from ArgvFor. ArgvFor launches an interactive
@@ -619,7 +623,7 @@ func HeadlessArgvFor(provider, model, effort, promptPath string) (argv []string,
 	switch provider {
 	case "grok":
 		return []string{"grok", "--model", model, "--reasoning-effort", pe,
-			"--prompt-file", promptPath, "--output-format", "plain"}, DeliverByFile
+			"--prompt-file", promptPath, OutputFormatFlag, "plain"}, DeliverByFile
 	case "agy":
 		// agy --print takes the prompt as a POSITIONAL argument; piping it on
 		// stdin is silently ignored and agy answers as if asked nothing.

@@ -279,6 +279,13 @@ func main() {
 	case "review-ingest":
 		runReviewIngest()
 
+	case "review-abort":
+		if err := runReviewAbort(); err != nil {
+			fmt.Fprintln(os.Stderr, "herd review-abort:", err)
+			os.Exit(1)
+		}
+		return
+
 	case "review-complete-record":
 		if err := runReviewCompleteRecord(); err != nil {
 			fmt.Fprintln(os.Stderr, "herd review-complete-record:", err)
@@ -3098,7 +3105,8 @@ REPORT_TARGET: %s (mandatory; never coordinator)
 REPORT_CONTRACT: retain the signed verdict artifact in the Herdforge review inbox before pane teardown. The supervisor owns exact-SHA admission, reviewer retries, author feedback, ledger ingest, and cleanup. The coordinator receives only exact PASS plus merge-ready evidence.
 	cd %s
 1. git diff origin/main..HEAD --stat  (see ONLY the changed files — review just these)
-2. %s   (targeted tests for the changed packages, not the whole repo)
+2. %s   (named tests from the diff with -run; full heavy packages are hosted CI)
+`+reviewVerificationBudgetSection(testCmd)+`
 File your verdict through the broker (typed, receipt-bound):
   herd task verdict %s APPROVED
   herd task verdict %s REJECTED "<numbered fixes>"
@@ -4501,7 +4509,7 @@ func runBoardSync() {
 
 	if *intervalSec > 0 {
 		for {
-			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+			code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, providerLabel(cfg), *asJSON)
 			if code != 0 {
 				os.Exit(code)
 			}
@@ -4509,13 +4517,27 @@ func runBoardSync() {
 		}
 	}
 
-	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, *asJSON)
+	code := runBoardSyncOnce(syncer, cfg.TaskProvider.ProjectID, providerLabel(cfg), *asJSON)
 	os.Exit(code)
 }
 
-func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID string, asJSON bool) int {
-	drift, err := syncer.ReconcileBoard(context.Background(), projectID, ".")
+func runBoardSyncOnce(syncer *hsync.BoardSyncer, projectID, providerName string, asJSON bool) int {
+	drift, diag, err := provider.BoundedRead(context.Background(), providerName, providerReadBudget(), "",
+		func(ctx context.Context, phases *provider.Phases) (*hsync.BoardDrift, error) {
+			phases.Enter("ReconcileBoard provider census")
+			return syncer.ReconcileBoard(ctx, projectID, ".")
+		})
+	// deps check exits 3 on diag.Unknown() (timeout or failed read). board-sync
+	// keeps exit 3 for ReadTimedOut only so a fast provider error stays exit 1
+	// (hard error) rather than collapsing into the UNKNOWN timeout code.
+	if diag.Outcome == provider.ReadTimedOut {
+		fmt.Fprintf(os.Stderr, "board-sync: UNKNOWN: %s\n", diag.String())
+		return 3
+	}
 	if err != nil {
+		if cause := errors.Unwrap(err); cause != nil {
+			err = cause
+		}
 		fmt.Fprintf(os.Stderr, "board-sync: %v\n", err)
 		return 1
 	}
@@ -6848,13 +6870,75 @@ func prepareStandingWorktreeWith(lane *config.LaneDef, add func(path, branch str
 		return nil
 	}
 	wtPath := filepath.Join(".", lane.Worktree)
-	if _, err := os.Stat(wtPath); os.IsNotExist(err) {
+	info, err := os.Stat(wtPath)
+	if os.IsNotExist(err) {
 		fmt.Printf("Creating worktree %s for lane %s...\n", lane.Worktree, lane.Name)
 		branch := fmt.Sprintf("wt/%s", lane.Name)
 		if err := add(lane.Worktree, branch); err != nil {
 			return fmt.Errorf("create standing worktree %s: %w", lane.Name, err)
 		}
+		return admitExistingStandingWorktree(wtPath, lane.Name)
 	}
+	if err != nil {
+		return fmt.Errorf("stat standing worktree %s: %w", lane.Name, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("standing worktree %s is not a directory", lane.Name)
+	}
+	return admitExistingStandingWorktree(wtPath, lane.Name)
+}
+
+// admitExistingStandingWorktree re-admits a standing lane against fresh
+// origin/main at raise time (FAC-621). Dirty trees and unmerged commits ahead
+// refuse; a clean behind tree fast-forwards. A 0/0 tree raises unchanged.
+// Network fetch uses mergeadmit.BoundedGit under ProofContext so a stalled
+// remote is killed by the existing proof deadline instead of hanging raise.
+func admitExistingStandingWorktree(wtPath, laneName string) error {
+	ctx, cancel := (&mergeadmit.Gate{ProofBudget: cliProofBudget}).ProofContext()
+	defer cancel()
+	git := mergeadmit.BoundedGit(ctx, wtPath)
+	if _, err := git("fetch", "-q", "origin"); err != nil {
+		if mergeadmit.ProofRunAborted(ctx, err) {
+			return fmt.Errorf("refuse standing raise for lane %s: fetch origin timed out: %w", laneName, err)
+		}
+		return fmt.Errorf("refuse standing raise for lane %s: fetch origin failed: %w", laneName, err)
+	}
+	base, err := git("rev-parse", "origin/main")
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: origin/main is missing after fetch: %w", laneName, err)
+	}
+	counts, err := git("rev-list", preflight.GitRevListLeftRight, "--count", "HEAD...origin/main")
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: measure origin/main distance: %w", laneName, err)
+	}
+	parts := strings.Fields(counts)
+	if len(parts) != 2 {
+		return fmt.Errorf("refuse standing raise for lane %s: expected two distance counts, got %q", laneName, counts)
+	}
+	ahead, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: parse ahead count %q: %w", laneName, parts[0], err)
+	}
+	behind, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: parse behind count %q: %w", laneName, parts[1], err)
+	}
+	dirty, err := git("status", "--porcelain")
+	if err != nil {
+		return fmt.Errorf("refuse standing raise for lane %s: status: %w", laneName, err)
+	}
+	if strings.TrimSpace(dirty) != "" {
+		return fmt.Errorf("refuse standing raise for lane %s: worktree is dirty; origin/main is %d commit(s) ahead and the lane is %d commit(s) ahead", laneName, behind, ahead)
+	}
+	if ahead > 0 {
+		return fmt.Errorf("refuse standing raise for lane %s: unmerged commits ahead of origin/main: origin/main is %d commit(s) ahead and the lane is %d commit(s) ahead", laneName, behind, ahead)
+	}
+	if behind > 0 {
+		if _, err := git("merge", "--ff-only", "origin/main"); err != nil {
+			return fmt.Errorf("refuse standing raise for lane %s: fast-forward onto origin/main failed (%d behind / %d ahead): %w", laneName, behind, ahead, err)
+		}
+	}
+	fmt.Printf("standing worktree %s admitted at %s (%d behind / %d ahead vs origin/main)\n", laneName, base, behind, ahead)
 	return nil
 }
 
@@ -10861,6 +10945,7 @@ func runBrokerEnsure() {
 func runReceiptIssue() {
 	fs := flag.NewFlagSet("receipt issue", flag.ExitOnError)
 	role := fs.String("role", "", "verifier|recovery|integration")
+	explicitBase := fs.String("base", "", "candidate-relative base SHA (verifier)")
 	candidateSupersession := fs.Bool("candidate-supersession", false, "issue exact candidate-supersession authority (recovery role only)")
 	args := os.Args[2:]
 	if len(args) > 0 && args[0] == "issue" {
@@ -10868,7 +10953,7 @@ func runReceiptIssue() {
 	}
 	fs.Parse(args)
 	if fs.NArg() != 2 || *role == "" {
-		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration [--candidate-supersession] <ref> <worktree>")
+		fmt.Fprintln(os.Stderr, "usage: herd receipt issue --role verifier|recovery|integration [--base SHA] [--candidate-supersession] <ref> <worktree>")
 		os.Exit(2)
 	}
 	ref, targetDir := hsync.NormalizeRef(fs.Arg(0)), fs.Arg(1)
@@ -10880,6 +10965,10 @@ func runReceiptIssue() {
 	}
 	if *candidateSupersession && *role != dispatch.RoleRecovery {
 		fmt.Fprintln(os.Stderr, "herd receipt: --candidate-supersession requires --role recovery")
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*explicitBase) != "" && *role != dispatch.RoleVerifier {
+		fmt.Fprintln(os.Stderr, "herd receipt: --base is only valid for --role verifier")
 		os.Exit(2)
 	}
 	scopedRecovery := *role == dispatch.RoleRecovery && *candidateSupersession
@@ -10920,11 +11009,12 @@ func runReceiptIssue() {
 		out, _ := exec.Command("git", append([]string{"-C", targetDir}, args...)...).Output()
 		return strings.TrimSpace(string(out))
 	}
-	branch, candidate, base := gitOut("rev-parse", "--abbrev-ref", "HEAD"), gitOut("rev-parse", "HEAD"), gitOut("rev-parse", "origin/main")
+	branch, candidate, originMain := gitOut("rev-parse", "--abbrev-ref", "HEAD"), gitOut("rev-parse", "HEAD"), gitOut("rev-parse", "origin/main")
 	if branch == "" || candidate == "" {
 		fmt.Fprintf(os.Stderr, "herd receipt: %s is not a readable worktree (FAC-145)\n", targetDir)
 		os.Exit(1)
 	}
+	base := originMain
 	var priorRecovery dispatch.TaskContext
 	if scopedRecovery {
 		priorRecovery, err = authenticatedRecoveryIdentity(context.Background(), root, targetDir, ref, branch, candidate, cfg, task)
@@ -10935,6 +11025,17 @@ func runReceiptIssue() {
 		// Preserve all authenticated immutable identity. In particular, never
 		// substitute a later origin/main for the builder's signed base.
 		base = priorRecovery.BaseSHA
+	} else if *role == dispatch.RoleVerifier {
+		authBase, authErr := authenticatedBuilderBase(root, targetDir, candidate)
+		if authErr != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", authErr)
+			os.Exit(1)
+		}
+		base, err = verifierIssuanceBase(targetDir, originMain, candidate, authBase, *explicitBase)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "herd receipt: %v\n", err)
+			os.Exit(1)
+		}
 	} else if base == "" {
 		fmt.Fprintf(os.Stderr, "herd receipt: %s has no readable origin/main base (FAC-145)\n", targetDir)
 		os.Exit(1)
@@ -12393,10 +12494,9 @@ func changedFilesIncludingUncommitted(worktree string) []string {
 	return paths
 }
 
-// scopedTestCommand (FAC-131) derives a TARGETED go test command from a
-// worktree's diff against origin/main — only the Go packages that actually
-// changed, so a small-context reviewer runs a focused suite instead of the
-// whole repo. Falls back to `go test ./...` when the diff can't be read.
+// scopedTestCommand (FAC-131, FAC-852) derives a TARGETED go test command from
+// a worktree's diff. Heavy packages (cmd/herd, pkg/herdr) require named -run
+// tests. Full-package go test of those trees is hosted CI, not targeted-first.
 func scopedTestCommand(worktree string) string {
 	// FAC-430: this diffed origin/main..HEAD only, so UNCOMMITTED work was
 	// invisible and a reviewer was handed a "scoped" suite that did not cover
@@ -12405,7 +12505,7 @@ func scopedTestCommand(worktree string) string {
 	// relevant.
 	changed := changedFilesIncludingUncommitted(worktree)
 	if len(changed) == 0 {
-		return "go test ./..."
+		return nativeReviewHostedGateReuse()
 	}
 	pkgs := map[string]bool{}
 	for _, line := range changed {
@@ -12420,14 +12520,14 @@ func scopedTestCommand(worktree string) string {
 		pkgs["./"+dir+"/"] = true
 	}
 	if len(pkgs) == 0 {
-		return "go test ./..."
+		return nativeReviewHostedGateReuse()
 	}
 	var list []string
 	for p := range pkgs {
 		list = append(list, p)
 	}
 	sort.Strings(list)
-	return "go test -count=1 " + strings.Join(list, " ")
+	return formatNativeReviewTargetedCommand(list, extractNativeReviewTestNames(worktree, changed))
 }
 
 // runDrainSelftest verifies the drain's own integration seams. git is a hard

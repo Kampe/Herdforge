@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/lifecycle"
+	"github.com/Kampe/Herdforge/pkg/provider"
 	hsync "github.com/Kampe/Herdforge/pkg/sync"
 )
 
@@ -174,8 +176,24 @@ func runBoardAudit() {
 		os.Exit(1)
 	}
 
-	findings, err := hsync.AuditDone(context.Background(), tp, ".", cfg.TaskProvider.ProjectID)
+	findings, diag, err := provider.BoundedRead(context.Background(), providerLabel(cfg), providerReadBudget(), "",
+		func(ctx context.Context, phases *provider.Phases) ([]hsync.AuditFinding, error) {
+			phases.Enter("AuditDone provider census")
+			return hsync.AuditDone(ctx, tp, ".", cfg.TaskProvider.ProjectID)
+		})
+	// deps check exits 3 on diag.Unknown(); board-audit uses exit 3 only for
+	// ReadTimedOut so a fast provider error stays operational exit 1.
+	if diag.Outcome == provider.ReadTimedOut {
+		fmt.Fprintf(os.Stderr, "herd board-audit: UNKNOWN: %s\n", diag.String())
+		os.Exit(3)
+	}
 	if err != nil {
+		// BoundedRead wraps fast failures so it can preserve typed causes. The
+		// production BoundClient already attached the provider-read diagnostic;
+		// expose that cause rather than duplicating the outer operation wrapper.
+		if cause := errors.Unwrap(err); cause != nil {
+			err = cause
+		}
 		fmt.Fprintf(os.Stderr, "herd board-audit: %v\n", err)
 		os.Exit(1)
 	}
