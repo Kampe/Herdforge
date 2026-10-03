@@ -761,13 +761,13 @@ func (p *Pool) RetireExact(ctx context.Context, slotName, wantPath, expectedLeas
 				continue
 			}
 			slotPath := p.repoPath(slot.Path)
-			if slotPath != p.repoPath(wantPath) {
+			if !samePath(slotPath, p.repoPath(wantPath)) {
 				return fmt.Errorf("worktree pool: slot %s path changed", slotName)
 			}
 			if slot.LeaseID != "" {
 				return fmt.Errorf("worktree pool: slot %s is still leased", slotName)
 			}
-			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || p.repoPath(slot.LastReleasePath) != slotPath {
+			if slot.LastReleaseLeaseID != expectedLeaseID || slot.LastReleaseGeneration != expectedGeneration || !samePath(p.repoPath(slot.LastReleasePath), slotPath) {
 				return fmt.Errorf("worktree pool: slot %s release incarnation changed", slotName)
 			}
 			completeSlot := func() error {

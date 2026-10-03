@@ -468,6 +468,12 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "worktree-migrate":
+		if err := runWorktreeMigrate(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "herd worktree-migrate: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "artifact-archive":
 		runArtifactArchive()
 
@@ -6265,7 +6271,7 @@ func resolveCanonicalWorktreeManager() *worktree.WorktreeManager {
 		fmt.Fprintf(os.Stderr, "herd: cannot resolve canonical repository root (FAC-152 fail-closed): %v\n", err)
 		os.Exit(1)
 	}
-	return worktree.NewWorktreeManager(root)
+	return worktree.NewStateWorktreeManager(root)
 }
 
 func stateDir() string {
