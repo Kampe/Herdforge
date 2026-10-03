@@ -1,7 +1,9 @@
 package reviewingest
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -139,6 +141,82 @@ func CheckMoveToIngested(source, name string) error {
 // review authority after pane cleanup (FAC-373).
 const InboxRel = ".herd/review/inbox"
 
+// retainedTempPattern is the shared temp-file pattern for atomic publication
+// of review evidence — one definition for every retention path.
+const retainedTempPattern = ".verdict-*.tmp"
+
+// confirmRetainedHit re-stats existing evidence after a digest hit so a file
+// that vanished mid-check is never reported as retained. One definition for
+// every retention path.
+func confirmRetainedHit(dst string) error {
+	if _, err := os.Stat(dst); err != nil {
+		return fmt.Errorf("retained artifact vanished after read: %w", err)
+	}
+	return nil
+}
+
+// ErrRetainedCollision reports that evidence already exists under the
+// destination name with DIFFERENT content. Publication is atomic no-replace,
+// so this is the only way two writers of the same artifact name disagree:
+// the first publisher's bytes stay on disk, byte for byte.
+var ErrRetainedCollision = errors.New("retained artifact exists with different content")
+
+// publishRetainedArtifact atomically publishes review evidence at dst with
+// the durability contract shared by every retention path (the FAC-373 copy
+// and the FAC-740 composed artifact): a 0700 inbox, a 0600 fsynced temp
+// file, and an ATOMIC NO-REPLACE link — os.Rename silently REPLACES an
+// existing destination on POSIX, which let two concurrent recoveries of the
+// same effect with different records each report success while the last
+// rename replaced the first artifact. With link, the loser observes the
+// existing evidence and compares content: equal content is an idempotent
+// success, different content refuses without touching what is on disk.
+// A post-publish re-stat keeps a vanished artifact from ever becoming
+// coordinator-facing PASS evidence.
+func publishRetainedArtifact(dst string, content []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(dst), retainedTempPattern)
+	if err != nil {
+		return fmt.Errorf("create retained artifact: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copy retained artifact: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("secure retained artifact: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync retained artifact: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close retained artifact: %w", err)
+	}
+	if err := os.Link(tmpName, dst); err != nil {
+		if os.IsExist(err) {
+			existing, readErr := os.ReadFile(dst)
+			if readErr != nil {
+				return fmt.Errorf("read retained artifact after publish collision: %w", readErr)
+			}
+			if bytes.Equal(existing, content) {
+				return nil
+			}
+			return ErrRetainedCollision
+		}
+		return fmt.Errorf("publish retained artifact: %w", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		return fmt.Errorf("retained artifact vanished after publish: %w", err)
+	}
+	if info.Size() == 0 || info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("retained artifact published insecurely (empty or mode %v, want 0600)", info.Mode().Perm())
+	}
+	return nil
+}
+
 // RetainArtifact copies a validated verdict into the repo-local review inbox
 // using a content-addressed filename. The returned path is relative to root
 // (slash-separated) so the ledger remains portable across worktrees.
@@ -158,14 +236,12 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 		return "", fmt.Errorf("open verdict artifact: %w", err)
 	}
 	defer in.Close()
-	digest := sha256.New()
-	if _, err := io.Copy(digest, in); err != nil {
-		return "", fmt.Errorf("hash verdict artifact: %w", err)
+	content, err := io.ReadAll(in)
+	if err != nil {
+		return "", fmt.Errorf("read verdict artifact: %w", err)
 	}
-	if _, err := in.Seek(0, 0); err != nil {
-		return "", fmt.Errorf("rewind verdict artifact: %w", err)
-	}
-	contentDigest := fmt.Sprintf("%x", digest.Sum(nil))[:16]
+	digest := sha256.Sum256(content)
+	contentDigest := fmt.Sprintf("%x", digest)[:16]
 	name := fmt.Sprintf("%s-%s-%s.md", strings.ToLower(shortSHA(sha)), sanitizeReviewerName(reviewer), contentDigest)
 	rel := filepath.ToSlash(filepath.Join(InboxRel, name))
 	dst := filepath.Join(root, filepath.FromSlash(rel))
@@ -177,8 +253,8 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 	if existing, err := os.ReadFile(dst); err == nil {
 		sum := sha256.Sum256(existing)
 		if fmt.Sprintf("%x", sum)[:16] == contentDigest {
-			if _, err := os.Stat(dst); err != nil {
-				return "", fmt.Errorf("retained artifact vanished after read: %w", err)
+			if err := confirmRetainedHit(dst); err != nil {
+				return "", err
 			}
 			return rel, nil
 		}
@@ -186,38 +262,14 @@ func RetainArtifact(root, source, sha, reviewer string) (string, error) {
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("stat retained artifact: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".verdict-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("create retained artifact: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := io.Copy(tmp, in); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("copy verdict artifact: %w", err)
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("secure retained artifact: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return "", fmt.Errorf("sync retained artifact: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("close retained artifact: %w", err)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return "", fmt.Errorf("publish retained artifact: %w", err)
-	}
-	// Re-stat after publish: a concurrent cleanup of the destination (or a
-	// flaky FS) must never become coordinator-facing PASS evidence.
-	info, err := os.Stat(dst)
-	if err != nil {
-		return "", fmt.Errorf("retained artifact vanished after publish: %w", err)
-	}
-	if info.Size() == 0 {
-		return "", fmt.Errorf("retained artifact is empty after publish")
+	// Publish is atomic no-replace: a concurrent retain of the same name is
+	// arbitrated by the link — equal content converges, different content
+	// refuses with the exact conflict error.
+	if err := publishRetainedArtifact(dst, content); err != nil {
+		if errors.Is(err, ErrRetainedCollision) {
+			return "", fmt.Errorf("retained artifact %s exists with different content", rel)
+		}
+		return "", err
 	}
 	return rel, nil
 }

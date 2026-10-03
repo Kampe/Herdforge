@@ -10263,41 +10263,98 @@ func serveBrokerConn(conn net.Conn, root string, cfg *config.Config, authority d
 			return false, nil
 		}
 
+		// Authority-side short circuit first (cheap): the delivered marker is
+		// the durable truth of a completed delivery, checked BEFORE ownership
+		// contention — a retry regenerates its ownership claim nonce, so the
+		// provider claim check cannot recognize its own earlier claim, but
+		// the bus can. Convergence and the crash-window re-retain (FAC-351,
+		// restored by FAC-740) happen here: retention is content-addressed
+		// and idempotent, so a retry re-retains exactly once, and failing
+		// here stays retryable instead of reporting success past a missing
+		// artifact.
+		_, alreadyDeliveredFound, dErr := mb.HasDeliveredVerdict(effectID)
+		if dErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict state unreadable (FAC-145 fail-closed): %v", dErr)})
+			return
+		}
+		if alreadyDeliveredFound {
+			if _, rErr := retainVerdictInboxArtifact(root, tc, verdict, canonicalBody, verifier); rErr != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("verdict already delivered but canonical retention failed — retry reconciles (FAC-351): %v", rErr)})
+				return
+			}
+			respond(brokerResponse{OK: true})
+			return
+		}
+
 		// CROSS-HOST exclusive ownership (FAC-145): the local lock only
 		// serializes this clone. The PROVIDER is the one medium every
 		// coordinator shares, so ownership is decided there: each
 		// contender writes a signed claim marker, then re-reads; the
-		// EARLIEST claim for this effect wins and only that owner
+		// EARLIEST claim for that effect wins and only that owner
 		// delivers. A loser never writes a second verdict comment.
 		if owned, ownErr := winVerdictClaim(ctx, btp, signer, verifier, tc, effectID); ownErr != nil {
 			respond(brokerResponse{Error: ownErr.Error()})
 			return
 		} else if !owned {
 			// Another coordinator owns delivery for this exact effect.
-			// Converge on ITS result rather than duplicating the effect.
+			// Converge on ITS RESULT — but a result is EVIDENCE, not intent:
+			// the owner may have stalled between its claim marker and
+			// delivery, and a silent OK here would strand the verdict with
+			// the provider claim in place and no canonical authority (the
+			// exact FAC-737/738 shape). Give an in-flight owner a bounded
+			// window to land the effect, then refuse with a retryable error
+			// unless the effect is actually present on the provider.
+			delivered := false
+			for attempt := 0; ; attempt++ {
+				var dErr error
+				delivered, dErr = effectDelivered()
+				if dErr != nil {
+					respond(brokerResponse{Error: fmt.Sprintf("provider effect readback failed while converging on the owning coordinator — refusing verdict (FAC-145 fail-closed): %v", dErr)})
+					return
+				}
+				if delivered || attempt >= verdictConvergencePolls {
+					break
+				}
+				time.Sleep(verdictConvergencePollInterval)
+			}
+			if !delivered {
+				respond(brokerResponse{Error: "verdict effect claimed by another coordinator but not delivered — refusing to report success without evidence; retry to converge (FAC-145/FAC-351)"})
+				return
+			}
+			// The provider effect is real: converge the canonical artifact
+			// (idempotent; a conflicting artifact refuses with its own exact
+			// error) and the delivered record if it is still missing. This
+			// closes the owner-stalled-after-retention-failure window: the
+			// retry reconciles instead of reporting a success that never
+			// happened.
+			if _, rErr := retainVerdictInboxArtifact(root, tc, verdict, canonicalBody, verifier); rErr != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("verdict delivered by another coordinator but canonical retention failed — retry reconciles (FAC-351): %v", rErr)})
+				return
+			}
+			if _, foundNow, fErr := mb.HasDeliveredVerdict(effectID); fErr != nil {
+				respond(brokerResponse{Error: fmt.Sprintf("verdict state unreadable (FAC-145 fail-closed): %v", fErr)})
+				return
+			} else if !foundNow {
+				convergedRec := mail.Callback{
+					Ref: tc.TaskRef, Kind: kind, SHA: tc.CandidateSHA,
+					Detail: canonicalBody, Repo: tc.Repository,
+					LeaseGeneration: tc.LeaseGeneration, SenderRole: tc.Role,
+					DedupeID: effectID,
+				}
+				if _, err := mb.PostCallback(tc.Role, convergedRec); err != nil {
+					respond(brokerResponse{Error: fmt.Sprintf("verdict delivered to provider but authority record failed (retry reconciles): %v", err)})
+					return
+				}
+			}
 			respond(brokerResponse{OK: true})
 			return
 		}
 
-		// Authority-side short circuit first (cheap), then the PROVIDER
-		// truth: a prior attempt that crashed after AddComment but before
-		// the delivered marker is detected here and never re-delivered.
-		_, alreadyDeliveredFound, dErr := mb.HasDeliveredVerdict(effectID)
-		if dErr != nil {
-			respond(brokerResponse{Error: fmt.Sprintf("verdict state unreadable (FAC-145 fail-closed): %v", dErr)})
-			return
-		}
-		providerHas := false
-		if !alreadyDeliveredFound {
-			var pErr error
-			providerHas, pErr = effectDelivered()
-			if pErr != nil {
-				respond(brokerResponse{Error: fmt.Sprintf("provider effect readback failed — refusing verdict (FAC-145 fail-closed): %v", pErr)})
-				return
-			}
-		}
-		if alreadyDeliveredFound {
-			respond(brokerResponse{OK: true})
+		// PROVIDER truth: a prior attempt that crashed after AddComment but
+		// before the delivered marker is detected here and never re-delivered.
+		providerHas, pErr := effectDelivered()
+		if pErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("provider effect readback failed — refusing verdict (FAC-145 fail-closed): %v", pErr)})
 			return
 		}
 
@@ -10339,6 +10396,16 @@ func serveBrokerConn(conn net.Conn, root string, cfg *config.Config, authority d
 		}
 		if hits != 1 {
 			respond(brokerResponse{Error: fmt.Sprintf("verdict effect readback found %d matching provider comments, want exactly 1 — refusing to publish (FAC-145 fail-closed)", hits)})
+			return
+		}
+		// (3.5) FAC-351 canonical retention, restored by FAC-740: the exact-SHA
+		// verdict is retained as a content-addressed review-inbox artifact
+		// AFTER the confirmed delivery readback and BEFORE any consumable
+		// record exists. Retention failure publishes nothing consumable; the
+		// retry converges from the durable intent (the provider effect is
+		// already delivered, so a retry re-attempts retention, not delivery).
+		if _, rErr := retainVerdictInboxArtifact(root, tc, verdict, canonicalBody, verifier); rErr != nil {
+			respond(brokerResponse{Error: fmt.Sprintf("verdict delivered and read back, but canonical review retention failed — nothing consumable published (FAC-351 fail-closed): %v", rErr)})
 			return
 		}
 		// (4) The ONLY consumable record, written after confirmed delivery.
@@ -10685,6 +10752,46 @@ func releaseCoordinationAndLaunchLeaseBounded(root string, key claim.LeaseKey, o
 
 // verdictClaimPrefix marks provider-side ownership claims.
 const verdictClaimPrefix = "[verdict-claim "
+
+// Convergence polling for the claimed-but-undelivered window (FAC-351/FAC-740):
+// an in-flight owner lands its effect within milliseconds, so a short bounded
+// poll lets a racing loser converge on evidence instead of erroring; a stalled
+// owner still produces a retryable error, never a silent stranded OK.
+const (
+	verdictConvergencePolls        = 8
+	verdictConvergencePollInterval = 250 * time.Millisecond
+)
+
+// retainVerdictInboxArtifact composes and retains the canonical review-inbox
+// artifact for one delivered verdict effect (FAC-351, restored by FAC-740).
+// The record is built ONLY from the authenticated receipt and the
+// broker-composed canonical body — the reviewer identity is the receipt's
+// session identity, so nothing here can be influenced by free-form agent
+// text. The effect signature is re-verified against the published key before
+// anything is written; a retention path that cannot authenticate the effect
+// retains nothing (fail closed).
+func retainVerdictInboxArtifact(root string, tc dispatch.TaskContext, verdict, canonicalBody string, verifier *dispatch.Verifier) (string, error) {
+	if verifier == nil {
+		return "", fmt.Errorf("no verification key — refusing verdict retention without effect authentication (FAC-351)")
+	}
+	rec := reviewingest.VerdictRecoveryRecord{
+		Repo:            tc.Repository,
+		Ref:             tc.TaskRef,
+		CandidateSHA:    tc.CandidateSHA,
+		BaseSHA:         tc.BaseSHA,
+		Branch:          tc.Branch,
+		LeaseID:         tc.LeaseID,
+		LeaseGeneration: tc.LeaseGeneration,
+		Verdict:         verdict,
+		Reviewer:        tc.SessionID,
+		CanonicalBody:   canonicalBody,
+	}
+	return reviewingest.RetainVerdictArtifact(root, rec, reviewingest.VerdictRecoveryOptions{
+		VerifyEffect: func(line, effectID, sigHex string) error {
+			return verifier.VerifyBytes([]byte("herd-verdict-effect:"+effectID+"\n"+line), sigHex)
+		},
+	})
+}
 
 // winVerdictClaim decides cross-host ownership of one verdict effect using
 // the PROVIDER as the shared serializer (FAC-145). Every contender posts a

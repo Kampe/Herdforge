@@ -196,15 +196,21 @@ func (m *Mailbox) scanCallbackDedupeLocked(cb Callback) (*Envelope, error) {
 		if err := json.Unmarshal([]byte(env.Body), &c); err != nil {
 			return nil, fmt.Errorf("mailbox line %d callback body is malformed — refusing dedupe decision on corrupt state (FAC-145 fail-closed): %w", i+1, err)
 		}
-		// Completion is an effect keyed by the task ref and lease fence. A
-		// producer retry must converge even when it did not provide a
-		// caller-generated DedupeID (or generated a different one).
-		if cb.Kind == CallbackComplete && c.Kind == CallbackComplete &&
-			c.Ref == cb.Ref && c.LeaseGeneration == cb.LeaseGeneration {
-			e := env
-			return &e, nil
-		}
+		// A callback WITH an identity is deduped by that identity alone —
+		// never by ref and fence. The FAC-740 delivered-verdict marker
+		// carries its own DedupeID: an unrelated completion with the same
+		// task ref and lease generation must not swallow it, or the broker
+		// reports OK while the consumable verdict never lands.
 		if cb.DedupeID == "" {
+			// Completion is an effect keyed by the task ref and lease fence.
+			// A producer retry must converge even when it did not provide a
+			// caller-generated DedupeID (or generated a different one) —
+			// this fast path is only for identity-less completions.
+			if cb.Kind == CallbackComplete && c.Kind == CallbackComplete &&
+				c.Ref == cb.Ref && c.LeaseGeneration == cb.LeaseGeneration {
+				e := env
+				return &e, nil
+			}
 			continue
 		}
 		if c.DedupeID != cb.DedupeID {
@@ -253,12 +259,15 @@ func (m *Mailbox) DrainCallbacksContext(ctx context.Context) ([]Callback, error)
 // a DELIVERED record — written after confirmed provider delivery and
 // readback — participates in EffectiveVerdict.
 const (
-	verdictDeliveredPrefix = "verdict-delivered:"
+	// VerdictDeliveredPrefix is the dedupe-id prefix of every DELIVERED
+	// verdict record; consumers scan the bus for it to decide supersession
+	// order and recovery eligibility (FAC-351).
+	VerdictDeliveredPrefix = "verdict-delivered:"
 	verdictIntentPrefix    = "verdict-intent:"
 )
 
 // VerdictEffectID is the consumable delivered-verdict identity.
-func VerdictEffectID(effect string) string { return verdictDeliveredPrefix + effect }
+func VerdictEffectID(effect string) string { return VerdictDeliveredPrefix + effect }
 
 // VerdictIntentID is the non-consumable pre-delivery intent identity.
 func VerdictIntentID(effect string) string { return verdictIntentPrefix + effect }
@@ -329,7 +338,7 @@ func (m *Mailbox) EffectiveVerdict(repo, ref, candidate string) (Callback, bool,
 		}
 		// ONLY delivered records are consumable: an intent (or any other
 		// callback) can never be read as a verdict.
-		if !strings.HasPrefix(cb.DedupeID, verdictDeliveredPrefix) {
+		if !strings.HasPrefix(cb.DedupeID, VerdictDeliveredPrefix) {
 			continue
 		}
 		if cb.Repo != repo || cb.Ref != ref || cb.SHA != candidate {

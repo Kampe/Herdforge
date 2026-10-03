@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/Kampe/Herdforge/pkg/classify"
 	"github.com/Kampe/Herdforge/pkg/committime"
+	"github.com/Kampe/Herdforge/pkg/config"
 	"github.com/Kampe/Herdforge/pkg/dispatch"
 	"github.com/Kampe/Herdforge/pkg/harvestmerge"
 	"github.com/Kampe/Herdforge/pkg/herdr"
@@ -63,8 +66,10 @@ func runReviewIngest() {
 
 	// Resolve the review corpus ONCE, before any branch, and say which one it
 	// is. A review tool that does not name its corpus makes "ingested"
-	// unattributable, which is exactly how two roots diverged unnoticed.
-	if !parsed.asJSON {
+	// unattributable, which is exactly how two roots diverged unnoticed. The
+	// record-signing surface is machine-consumed end to end and prints ONLY
+	// the signed record.
+	if !parsed.asJSON && parsed.signRecoveryRecord == "" {
 		fmt.Println("herd review-ingest: " + reviewRoot.Paths.Describe())
 	}
 	if !parsed.dryRun && !parsed.audit {
@@ -102,6 +107,30 @@ func runReviewIngest() {
 		if len(findings) > 0 {
 			os.Exit(1)
 		}
+		return
+	}
+	// Recovery materializes typed delivered-verdict records into the canonical
+	// review inbox (FAC-351/FAC-740) — a WRITE, so it runs behind the same
+	// mutation-safety gate as admission.
+	if len(parsed.recoverVerdict) > 0 {
+		if err := roots.requireMutationSafe(); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+			os.Exit(1)
+		}
+		runVerdictRecovery(projectRoot, parsed.recoverVerdict)
+		return
+	}
+	// Record signing is the only sanctioned way to mint recovery records: it
+	// binds reviewer/verification metadata to the effect under the
+	// coordinator signature. It writes nothing to the repository — the signed
+	// record goes to stdout — but it wields the coordinator key, so it is
+	// held to the same root-safety gate as the write paths.
+	if parsed.signRecoveryRecord != "" {
+		if err := roots.requireMutationSafe(); err != nil {
+			fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+			os.Exit(1)
+		}
+		runSignRecoveryRecord(projectRoot, parsed.signRecoveryRecord)
 		return
 	}
 	if len(files) == 0 {
@@ -477,6 +506,14 @@ type reviewIngestArgs struct {
 	files      []string
 	// asJSON emits structured outcomes instead of prose (FAC-556).
 	asJSON bool
+	// recoverVerdict names typed delivered-verdict records to materialize into
+	// the canonical review inbox (FAC-351/FAC-740). Recovery verifies and
+	// writes; admission stays with the normal artifact path.
+	recoverVerdict []string
+	// signRecoveryRecord reads an unsigned typed record, derives the effect id
+	// from its canonical body, and emits the record with the coordinator
+	// record_sig to stdout (FAC-351). Recovery refuses unsigned records.
+	signRecoveryRecord string
 }
 
 // parseReviewIngestArgs parses flags independently of positional artifacts.
@@ -505,6 +542,20 @@ func parseReviewIngestArgs(args []string, roots reviewIngestRoots) (reviewIngest
 			parsed.ackOnly = true
 		case arg == "--json" || arg == "-json":
 			parsed.asJSON = true
+		case arg == "--recover-verdict":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return reviewIngestArgs{}, fmt.Errorf("%s requires a record path", arg)
+			}
+			i++
+			parsed.recoverVerdict = append(parsed.recoverVerdict, args[i])
+		case strings.HasPrefix(arg, "--recover-verdict="):
+			parsed.recoverVerdict = append(parsed.recoverVerdict, strings.TrimPrefix(arg, "--recover-verdict="))
+		case arg == "--sign-recovery-record":
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return reviewIngestArgs{}, fmt.Errorf("%s requires a record path", arg)
+			}
+			i++
+			parsed.signRecoveryRecord = args[i]
 		case arg == "--dry-run" || arg == "-dry-run":
 			parsed.dryRun = true
 		case arg == "--sweep" || arg == "-sweep":
@@ -534,6 +585,12 @@ func parseReviewIngestArgs(args []string, roots reviewIngestRoots) (reviewIngest
 	if parsed.ackOnly && (parsed.sweep || parsed.audit || len(parsed.files) != 1) {
 		return reviewIngestArgs{}, fmt.Errorf("--ack-only requires exactly one artifact and cannot sweep or audit")
 	}
+	if len(parsed.recoverVerdict) > 0 && (parsed.sweep || parsed.audit || parsed.ackOnly || parsed.dryRun || len(parsed.files) != 0 || parsed.signRecoveryRecord != "") {
+		return reviewIngestArgs{}, fmt.Errorf("--recover-verdict materializes typed records and cannot be combined with artifacts, --sweep, --audit, --ack-only, --dry-run, or --sign-recovery-record")
+	}
+	if parsed.signRecoveryRecord != "" && (parsed.sweep || parsed.audit || parsed.ackOnly || parsed.dryRun || len(parsed.files) != 0 || len(parsed.recoverVerdict) > 0) {
+		return reviewIngestArgs{}, fmt.Errorf("--sign-recovery-record emits a signed record and cannot be combined with artifacts, --sweep, --audit, --ack-only, --dry-run, or --recover-verdict")
+	}
 	if parsed.sweep && parsed.audit {
 		return reviewIngestArgs{}, fmt.Errorf("--sweep and --audit are mutually exclusive")
 	}
@@ -557,8 +614,8 @@ func parseReviewIngestArgs(args []string, roots reviewIngestRoots) (reviewIngest
 	if parsed.audit && len(parsed.files) != 0 {
 		return reviewIngestArgs{}, fmt.Errorf("--audit cannot be combined with verdict artifacts")
 	}
-	if !parsed.audit && len(parsed.files) == 0 {
-		return reviewIngestArgs{}, fmt.Errorf("usage: herd review-ingest (<verdict-artifact>... | --sweep) [--dry-run]")
+	if !parsed.audit && len(parsed.files) == 0 && len(parsed.recoverVerdict) == 0 && parsed.signRecoveryRecord == "" {
+		return reviewIngestArgs{}, fmt.Errorf("usage: herd review-ingest (<verdict-artifact>... | --sweep | --recover-verdict <record.json> | --sign-recovery-record <record.json>) [--dry-run]")
 	}
 	return parsed, nil
 }
@@ -882,6 +939,163 @@ func reclaimReviewPoolSlotFor(sha string) {
 	}
 }
 */
+
+// decodeRecoveryRecordStrict decodes exactly ONE typed recovery record and
+// refuses anything after it. Recovery evidence is a single JSON value: a
+// trailing value or garbage after it is malformed evidence, never an
+// afterthought to recover (FAC-351 fail-closed).
+func decodeRecoveryRecordStrict(body []byte, rec any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(rec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("trailing data after the JSON value")
+	}
+	return nil
+}
+
+// runSignRecoveryRecord mints a coordinator-signed recovery record: the only
+// sanctioned authority binding reviewer identity, reviewer family, and the
+// verification digest to a delivered effect (FAC-351). The unsigned record is
+// read strictly, the effect id is derived from its own canonical body, and the
+// signed record goes to stdout — the repository is never written.
+func runSignRecoveryRecord(projectRoot, recordPath string) {
+	cfg, err := config.LoadConfig(filepath.Join(projectRoot, ".herd", "herd.yaml"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: load project config: %v\n", err)
+		os.Exit(1)
+	}
+	signer, err := dispatch.LoadSignerForConfig(cfg.Project.Name, projectRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+		os.Exit(1)
+	}
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+		os.Exit(1)
+	}
+	var rec reviewingest.VerdictRecoveryRecord
+	if err := decodeRecoveryRecordStrict(body, &rec); err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: malformed recovery record: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := reviewingest.SignRecoveryRecord(&rec, signer.SignBytes); err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+		os.Exit(1)
+	}
+	out, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(out))
+}
+
+// runVerdictRecovery materializes canonical review-inbox artifacts from typed
+// delivered-verdict records (FAC-351, restored by FAC-740).
+//
+// The control drain cannot consume broker verdict callbacks, and the FAC-373
+// retain path only copies an artifact that already exists — so a delivered
+// effect (or a delivered bus callback) whose retention was lost to a crash had
+// no way back into the review corpus: FAC-737 seq587 and FAC-738 seq584
+// resolved their leases and produced applied=[] with no inbox or ledger entry.
+// Recovery closes that window without hand-authored markdown: every record is
+// verified against the coordinator-signed delivered effect, the review corpus
+// supersession order, and git ancestry before anything is written, and an
+// intent-only record (FAC-739 gen1 seq592) is refused because it was never
+// delivered and never signed as an effect.
+//
+// Recovery NEVER admits: it materializes evidence only, and admission stays
+// with the ordinary artifact path in this command.
+func runVerdictRecovery(projectRoot string, records []string) {
+	verifier, err := dispatch.LoadVerifier(projectRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "herd review-ingest: %v\n", err)
+		os.Exit(1)
+	}
+	coordinators := map[string]struct{}{}
+	for k := range reviewledger.DefaultCoordinators {
+		coordinators[k] = struct{}{}
+	}
+	coordinators["herdforge-orchestrator"] = struct{}{}
+	mb := mail.NewMailbox(mail.CallbackMailPath(projectRoot))
+	opts := reviewingest.VerdictRecoveryOptions{
+		VerifyEffect: func(line, effectID, sigHex string) error {
+			return verifier.VerifyBytes([]byte("herd-verdict-effect:"+effectID+"\n"+line), sigHex)
+		},
+		VerifyRecord:  verifier.VerifyBytes,
+		BranchReaches: branchReachesSHA,
+		LatestDeliveredVerdict: func(repo, ref, candidate string) (string, int64, bool, error) {
+			return latestDeliveredVerdictOnBus(mb, repo, ref, candidate)
+		},
+		Coordinators: coordinators,
+	}
+	recovered, refused := 0, 0
+	for _, r := range records {
+		body, readErr := os.ReadFile(r)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(r), readErr)
+			refused++
+			continue
+		}
+		var rec reviewingest.VerdictRecoveryRecord
+		if decodeErr := decodeRecoveryRecordStrict(body, &rec); decodeErr != nil {
+			fmt.Fprintf(os.Stderr, "REFUSED %s: malformed recovery record: %v\n", filepath.Base(r), decodeErr)
+			refused++
+			continue
+		}
+		rel, recoverErr := reviewingest.RecoverVerdictArtifact(projectRoot, rec, opts)
+		if recoverErr != nil {
+			fmt.Fprintf(os.Stderr, "REFUSED %s: %v\n", filepath.Base(r), recoverErr)
+			refused++
+			continue
+		}
+		fmt.Printf("RECOVERED %s -> %s\n", filepath.Base(r), rel)
+		recovered++
+	}
+	fmt.Printf("herd review-ingest: recovered=%d refused=%d\n", recovered, refused)
+	if refused > 0 {
+		os.Exit(1)
+	}
+}
+
+// latestDeliveredVerdictOnBus resolves the LATEST delivered verdict effect for
+// (repo, ref, candidate) from the durable callback bus. Corrupt callback state
+// fails closed: an unreadable veto must never let a superseded effect recover.
+func latestDeliveredVerdictOnBus(mb *mail.Mailbox, repo, ref, candidate string) (string, int64, bool, error) {
+	envs, err := mb.ReadInbox(mail.CoordinatorInbox)
+	if err != nil {
+		return "", 0, false, err
+	}
+	bestID, bestSeq, found := "", int64(0), false
+	for _, e := range envs {
+		if e == nil {
+			continue
+		}
+		subject := e.Subject
+		if !strings.HasPrefix(subject, string(mail.CallbackComplete)+":") &&
+			!strings.HasPrefix(subject, string(mail.CallbackBlocked)+":") {
+			continue
+		}
+		var cb mail.Callback
+		if err := json.Unmarshal([]byte(e.Body), &cb); err != nil {
+			return "", 0, false, fmt.Errorf("corrupt callback body in envelope %s — refusing recovery (FAC-351 fail-closed): %w", e.ID, err)
+		}
+		if !strings.HasPrefix(cb.DedupeID, mail.VerdictDeliveredPrefix) {
+			continue
+		}
+		if cb.Repo != repo || !strings.EqualFold(cb.Ref, ref) || cb.SHA != candidate {
+			continue
+		}
+		if !found || e.Sequence > bestSeq {
+			bestID, bestSeq, found = cb.DedupeID, e.Sequence, true
+		}
+	}
+	return bestID, bestSeq, found, nil
+}
 
 func postReviewCompleteCallback(root, sha, branch, reviewer, verdict string) {
 	sha = strings.TrimSpace(sha)
