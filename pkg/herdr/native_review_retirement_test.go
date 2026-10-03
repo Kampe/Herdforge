@@ -45,6 +45,21 @@ func TestCanonicalRetirementVerdictSelectsLatestReassessment(t *testing.T) {
 	}
 }
 
+func TestCanonicalRetirementVerdictSelectsLatestPassThenFail(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	pass := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: "review-fac-853-fd7a0b842a5e", Verdict: string(reviewledger.VerdictPASS), ArtifactDigest: strings.Repeat("1", 64)}
+	fail := pass
+	fail.Verdict = string(reviewledger.VerdictFAIL)
+	fail.ArtifactDigest = strings.Repeat("2", 64)
+	got, err := canonicalRetirementVerdict([]reviewledger.LedgerRow{pass, fail}, sha, "review-fac-853-fd7a0b842a5e")
+	if err != nil {
+		t.Fatalf("PASS then FAIL must not be ambiguous: %v", err)
+	}
+	if got.Verdict != string(reviewledger.VerdictFAIL) {
+		t.Fatalf("latest event must be FAIL, got %+v", got)
+	}
+}
+
 func TestCanonicalRetirementVerdictRejectsConflictingReassessmentBranches(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	base := reviewledger.LedgerRow{Event: string(reviewledger.EventVerdict), SHA: sha, CandidateSHA: sha, Reviewer: "reviewer", Verdict: string(reviewledger.VerdictFAIL), ArtifactDigest: strings.Repeat("1", 64)}
