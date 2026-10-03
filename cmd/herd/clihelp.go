@@ -294,9 +294,10 @@ Commands:
 		"  Memory it cannot measure is reported unknown, never as a refusal.",
 	"resource-governor": "Usage: herd resource-governor [--json] [--apply] [--max-reaps N] [--foreign owner:kind:path]\n" +
 		"  Inventory host-local registered worktrees and safely reap declared generated data.",
-	"artifact-archive": "Usage: herd artifact-archive --target <worktree> [--archive DIR] [--dry-run|--act] [--json]\n" +
+	"artifact-archive": "Usage: herd artifact-archive --target <worktree> [--archive DIR] [--plan FILE] [--dry-run|--act] [--json]\n" +
 		"  Copy ignored worktree files into a digest-addressed archive with a manifest\n" +
 		"  before any removal. Receipts are archived first. Dry-run is the default.\n" +
+		"  --plan binds apply to the dry-run snapshot; digest, inode, and nlink drift refuse.\n" +
 		"  Fails closed on active TASK-CONTEXT ownership, symlinks, path escape, and digest drift.",
 	"worktree-reap": "Usage: herd worktree-reap [--apply] [--json] [--base origin/main] [--target <path>]... [--by-pr]\n" +
 		"       herd worktree-reap --enroll-task <FAC-N> --target <path> --receipt <path> [--write]\n" +
