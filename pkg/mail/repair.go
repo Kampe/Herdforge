@@ -89,6 +89,10 @@ var (
 	// ErrRepairActorRequired mirrors the CLI's --actor requirement at the
 	// package boundary, so no caller can apply an unattributed mutation.
 	ErrRepairActorRequired = errors.New("mail repair: acting requires an actor")
+	// ErrRepairCursorNeedsRecipient is the CLI and package rule that a paging
+	// cursor is recipient-bound. One definition so the flag parser and the
+	// repair walk cannot diverge.
+	ErrRepairCursorNeedsRecipient = errors.New("mail repair: --after-cursor requires --recipient")
 	// ErrRepairCompletionUnrecorded is returned when the mailbox was repaired
 	// and verified but the completion record could not be durably recorded.
 	//
@@ -351,9 +355,13 @@ func (m *Mailbox) verifyRepairedMailbox(expected []byte, want *Envelope) error {
 		return fmt.Errorf("%w: repaired row does not parse: %v", ErrRepairReadbackFailed, err)
 	}
 	if !sameEnvelope(&durable, want) {
-		return fmt.Errorf("%w: durable row differs from the repaired row", ErrRepairReadbackFailed)
+		return repairReadbackRowMismatch()
 	}
 	return nil
+}
+
+func repairReadbackRowMismatch() error {
+	return fmt.Errorf("%w: durable row differs from the repaired row", ErrRepairReadbackFailed)
 }
 
 // sameEnvelope compares every field an Envelope carries. A new Envelope field

@@ -84,6 +84,14 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 	reason := fs.String("reason", "", "why this recovery is being performed")
 	actor := fs.String("actor", "", "operator performing the recovery")
 	act := fs.Bool("act", false, "perform the repair (default is report-only)")
+	sequenceOrder := fs.Bool("sequence-order", false, "restore file-order monotonic sequences without reordering or dropping rows")
+	afterCursor := fs.String("after-cursor", "", "refuse if this paging cursor is stale for the store")
+	recipient := fs.String("recipient", "", "recipient the --after-cursor was issued for")
+	planOut := fs.String("plan-out", "", "write the compact sequence-order plan artifact")
+	planFile := fs.String("plan-file", "", "reviewed sequence-order plan (required with --act)")
+	planDigest := fs.String("plan-digest", "", "sha256 of --plan-file bytes (required with --act)")
+	maxRows := fs.Int("max-rows", 0, "refuse if the store has more records than this (default 10000)")
+	maxBytes := fs.Int("max-bytes", 0, "refuse if the store is larger than this many bytes (default 32MiB)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -92,6 +100,15 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() > 0 {
 		fmt.Fprintf(stderr, "mail repair: unexpected argument %q; every input is a flag\n", fs.Arg(0))
 		return 2
+	}
+	if *sequenceOrder {
+		return mailSequenceOrderMain(mailRepairSeqArgs{
+			mailPath: *mailPath, reason: strings.TrimSpace(*reason), actor: strings.TrimSpace(*actor),
+			act: *act, fingerprints: fingerprints, ids: ids,
+			cursor: strings.TrimSpace(*afterCursor), recipient: strings.TrimSpace(*recipient),
+			planOut: strings.TrimSpace(*planOut), planFile: strings.TrimSpace(*planFile),
+			planDigest: strings.TrimSpace(*planDigest), maxRows: *maxRows, maxBytes: *maxBytes,
+		}, stdout, stderr)
 	}
 	if len(ids) == 0 {
 		fmt.Fprintln(stderr, "mail repair: --id is required")
@@ -158,6 +175,96 @@ func mailRepairMain(args []string, stdout, stderr io.Writer) int {
 	}
 	if !*act {
 		fmt.Fprintln(stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor <name> to apply")
+	}
+	return 0
+}
+
+type mailRepairSeqArgs struct {
+	mailPath, reason, actor string
+	act                     bool
+	fingerprints, ids       []string
+	cursor, recipient       string
+	planOut, planFile       string
+	planDigest              string
+	maxRows, maxBytes       int
+}
+
+func mailSequenceOrderMain(args mailRepairSeqArgs, stdout, stderr io.Writer) int {
+	if len(args.ids) > 0 {
+		fmt.Fprintln(stderr, "mail repair: --sequence-order cannot be combined with --id")
+		return 2
+	}
+	if len(args.fingerprints) > 0 {
+		fmt.Fprintln(stderr, "mail repair: --sequence-order uses --plan-file/--plan-digest, not --fingerprint")
+		return 2
+	}
+	if args.act && strings.TrimSpace(args.actor) == "" {
+		fmt.Fprintln(stderr, "mail repair: --actor is required with --act")
+		return 2
+	}
+	if args.cursor != "" && args.recipient == "" {
+		fmt.Fprintln(stderr, mail.ErrRepairCursorNeedsRecipient.Error())
+		return 2
+	}
+	if args.act && (args.planFile == "" || args.planDigest == "") {
+		fmt.Fprintln(stderr, "mail repair: --act --sequence-order requires --plan-file and --plan-digest from a report-only run")
+		return 2
+	}
+	path, err := controlMailPath(args.mailPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: %v\n", err)
+		return 1
+	}
+	req := mail.SequenceOrderRequest{
+		Act: args.act, Actor: args.actor, Reason: args.reason,
+		Cursor: args.cursor, Recipient: args.recipient, FeedbackDir: feedbackMailDir(),
+		MaxRows: args.maxRows, MaxBytes: args.maxBytes,
+	}
+	if args.planFile != "" {
+		raw, readErr := os.ReadFile(args.planFile)
+		if readErr != nil {
+			fmt.Fprintf(stderr, "mail repair: read plan-file: %v\n", readErr)
+			return 1
+		}
+		req.Plan = raw
+		req.PlanDigest = args.planDigest
+	}
+	report, err := mail.NewMailbox(path).RepairSequenceOrder(context.Background(), req)
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: %v\n", err)
+		return 1
+	}
+	encoded, err := report.MarshalPlan()
+	if err != nil {
+		fmt.Fprintf(stderr, "mail repair: encode plan: %v\n", err)
+		return 1
+	}
+	if args.planOut != "" && !args.act {
+		if err := os.WriteFile(args.planOut, encoded, 0o600); err != nil {
+			fmt.Fprintf(stderr, "mail repair: write plan-out: %v\n", err)
+			return 1
+		}
+	}
+	summary := map[string]any{
+		"defect":       report.Schema,
+		"store_sha256": report.StoreSHA256,
+		"plan_sha256":  mail.SequenceOrderPlanDigest(encoded),
+		"total_rows":   report.TotalRows,
+		"changed":      report.Changed,
+		"kept":         report.Kept,
+		"max_rows":     report.MaxRows,
+		"max_bytes":    report.MaxBytes,
+		"applied":      args.act,
+	}
+	if args.planOut != "" {
+		summary["plan_out"] = args.planOut
+	}
+	if err := json.NewEncoder(stdout).Encode(summary); err != nil {
+		fmt.Fprintf(stderr, "mail repair: encode summary: %v\n", err)
+		return 1
+	}
+	if !args.act {
+		fmt.Fprintln(stderr, "mail repair: REPORT ONLY, nothing was written; re-run with --act --actor --plan-file --plan-digest to apply")
 	}
 	return 0
 }
