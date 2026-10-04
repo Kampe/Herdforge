@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 func cutRepo(t *testing.T) string {
@@ -42,6 +44,7 @@ func cutRepo(t *testing.T) string {
 func runCut(t *testing.T, root string, args ...string) error {
 	t.Helper()
 	t.Setenv("HERD_ROOT", root)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	return runLaneCut(args)
 }
 
@@ -54,7 +57,7 @@ func TestLaneCutExtractsOnlyTheScopedWork(t *testing.T) {
 	if err := runCut(t, root, "--branch", "standing/lane", "--scope", "docs", "--name", "cut/x"); err != nil {
 		t.Fatalf("cut: %v", err)
 	}
-	dir := filepath.Join(root, ".herd", "worktrees", "cut-x")
+	dir := filepath.Join(os.Getenv("XDG_STATE_HOME"), "herdforge", "worktrees", worktree.RepositoryID(root), "lane-cut", "cut-x")
 	got, err := os.ReadFile(filepath.Join(dir, "docs", "a.md"))
 	if err != nil {
 		t.Fatalf("scoped file missing from candidate: %v", err)

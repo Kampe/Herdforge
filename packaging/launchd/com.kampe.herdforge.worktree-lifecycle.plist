@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kampe.herdforge.worktree-lifecycle</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>sh</string>
+    <string>-lc</string>
+    <string>cd "${HERD_ROOT:?HERD_ROOT must name the canonical repository}" &amp;&amp; exec herd maintenance --act</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

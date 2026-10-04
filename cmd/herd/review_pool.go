@@ -1196,7 +1196,12 @@ func prepareCandidateSurface(root, ref, sha string) (string, error) {
 	if err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", sha+"^{commit}").Run(); err != nil {
 		return "", nil // not a commit here; not ours to prepare
 	}
-	dir := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart(ref)+"-"+shortSHA(sha))
+	id := safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	manager := worktree.NewStateWorktreeManagerFor(root, "review-surface", "review")
+	dir, pathErr := manager.ManagedPath(id)
+	if pathErr != nil {
+		return "", pathErr
+	}
 	if worktreeExists(dir) {
 		// Someone prepared it between the lookup and now. Use it only if it is
 		// actually at the candidate, never merely because the path exists.
@@ -1205,10 +1210,32 @@ func prepareCandidateSurface(root, ref, sha string) (string, error) {
 		}
 		return "", fmt.Errorf("surface %s exists but is not at %s", dir, shortSHA(sha))
 	}
-	if out, err := exec.Command("git", "-C", root, "worktree", "add", "-q", "--detach", dir, sha).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	if _, err := manager.CreateManagedDetached(context.Background(), id, sha); err != nil {
+		return "", fmt.Errorf("%w", err)
 	}
 	return dir, nil
+}
+
+// retirePreparedCandidateSurface closes the detached carrier that this review
+// path created once the verdict is durable. Pool slots are deliberately not
+// touched here: they have a separate lease/manifest retirement authority.
+func retirePreparedCandidateSurface(root, ref, sha string) error {
+	if len(strings.TrimSpace(sha)) < 12 {
+		return nil
+	}
+	manager := worktree.NewStateWorktreeManagerFor(root, "review-surface", "review")
+	id := safeReviewSurfacePart(ref) + "-" + shortSHA(sha)
+	path, err := manager.ManagedPath(id)
+	if err != nil {
+		return err
+	}
+	if !worktreeExists(path) {
+		return nil
+	}
+	if err := manager.RetireManaged(context.Background(), id); err != nil {
+		return fmt.Errorf("retire prepared review surface: %w", err)
+	}
+	return nil
 }
 
 // candidateSurfaceDirs returns every directory spelling a candidate surface may

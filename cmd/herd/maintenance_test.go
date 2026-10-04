@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 type maintenanceTickCall struct {
@@ -96,6 +98,30 @@ func TestMaintenanceRunsWhileFleetAdmissionRefuses(t *testing.T) {
 	}
 	if len(*calls) != 1 {
 		t.Fatalf("cycles = %d, want 1 while admission refuses", len(*calls))
+	}
+}
+
+func TestMaintenanceRunsLosslessExpiryOnItsOwnCarrier(t *testing.T) {
+	maintenanceScratchRoot(t)
+	stubMaintenanceTick(t, func(context.Context, string, string, bool) (reapPulseReport, error) {
+		return reapPulseReport{}, nil
+	})
+	original := maintenanceExpiry
+	defer func() { maintenanceExpiry = original }()
+	called := false
+	maintenanceExpiry = func(_ context.Context, _ string, act bool, age time.Duration) ([]worktree.ExpiryResult, error) {
+		called = true
+		if !act || age != 72*time.Hour {
+			t.Fatalf("expiry invocation = act=%t age=%s", act, age)
+		}
+		return []worktree.ExpiryResult{{Archived: true}}, nil
+	}
+	var out, errOut bytes.Buffer
+	if code := runMaintenanceCommandContext(context.Background(), []string{"--act", "--expire-after", "72h"}, &out, &errOut); code != 0 {
+		t.Fatalf("maintenance exit = %d stderr=%q", code, errOut.String())
+	}
+	if !called || !strings.Contains(out.String(), "archived=1") {
+		t.Fatalf("maintenance did not report scheduled expiry: called=%t output=%q", called, out.String())
 	}
 }
 
@@ -210,7 +236,7 @@ func TestMaintenanceReportsActualCycleCounts(t *testing.T) {
 		t.Fatalf("exit = %d, want 0; stderr=%q", code, errOut.String())
 	}
 	for _, want := range []string{
-		"cycle 1 registered=41 eligible=12 inspected=8 landed=3 retired=2 failed=0 acted=true",
+		"cycle 1 registered=41 eligible=12 inspected=8 landed=3 retired=2 archived=0 failed=0 acted=true",
 		"cycle 2 registered=41",
 	} {
 		if !strings.Contains(out.String(), want) {

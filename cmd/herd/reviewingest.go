@@ -473,6 +473,12 @@ func runReviewIngest() {
 		o.Disposition = dispositionAdmitted
 		emit.record(o, fmt.Sprintf("ADMITTED %s verdict=%s reviewer=%s sha=%s enqueued=%v\n",
 			filepath.Base(f), a.Verdict, a.Reviewer, a.SHA[:12], enqueued), false)
+		if retireErr := retirePreparedCandidateSurface(projectRoot, a.Branch, a.SHA); retireErr != nil {
+			// Admission is already durable. Keep the carrier for the lossless
+			// expiry sweep rather than changing an admitted verdict into a
+			// refusal over cleanup.
+			fmt.Fprintf(os.Stderr, "review-ingest: admitted %s but could not retire prepared surface: %v\n", a.SHA[:12], retireErr)
+		}
 		postReviewCompleteCallback(projectRoot, a.SHA, a.Branch, a.Reviewer, a.Verdict)
 		// FAC-708: admission only wakes the bounded coordinator retirement edge.
 		// Lease release must occur after exact tab/process absence and the

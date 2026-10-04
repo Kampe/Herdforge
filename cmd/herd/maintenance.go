@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Kampe/Herdforge/pkg/daemon"
+	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // herd maintenance is the unattended carrier for the FAC-805 cleanup beat.
@@ -38,6 +41,20 @@ func runMaintenance() {
 // retirement, and so the beat's own contract stays owned by its own file.
 var maintenanceTick = runReapPulseTick
 
+// maintenanceExpiry is distinct from the pulse reaper: it consumes only
+// state-root ownership records and archives stale, unmerged evidence before a
+// checkout is removed. The launchd carrier invokes it even when no pulse or
+// provider exists.
+var maintenanceExpiry = func(ctx context.Context, root string, act bool, age time.Duration) ([]worktree.ExpiryResult, error) {
+	if !act {
+		return nil, nil
+	}
+	return worktree.ArchiveExpired(ctx, worktree.ExpiryPolicy{
+		RepoRoot: root, StateRoot: worktree.StateWorktreeRoot(root), InactiveFor: age,
+		Processes: resources.LSOFProcessInspector{Timeout: 2 * time.Second, MaxOutputBytes: 1 << 20},
+	})
+}
+
 func runMaintenanceCommand(args []string, out, errOut io.Writer) int {
 	// A supervisor stops this job with SIGTERM. Cancellation reaches the tick's
 	// own checkpoints, which is a bounded stop, not a kill: a retirement batch
@@ -53,6 +70,7 @@ func runMaintenanceCommandContext(ctx context.Context, args []string, out, errOu
 	act := fs.Bool("act", false, "retire the landed worktrees this cycle finds; without it, report only")
 	interval := fs.Duration("interval", 0, "resident cadence between cycles; zero runs one cycle and exits")
 	maxCycles := fs.Int("max-cycles", 0, "stop after this many cycles; zero runs until cancelled (requires --interval)")
+	expireAfter := fs.Duration("expire-after", 30*24*time.Hour, "archive ownerless managed worktrees inactive for this long")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -70,6 +88,10 @@ func runMaintenanceCommandContext(ctx context.Context, args []string, out, errOu
 	}
 	if *maxCycles > 0 && *interval == 0 {
 		fmt.Fprintln(errOut, "maintenance: --max-cycles needs --interval; without a cadence there is exactly one cycle")
+		return 2
+	}
+	if *expireAfter <= 0 {
+		fmt.Fprintln(errOut, "maintenance: --expire-after must be positive")
 		return 2
 	}
 
@@ -120,9 +142,21 @@ func runMaintenanceCommandContext(ctx context.Context, args []string, out, errOu
 			fmt.Fprintf(errOut, "maintenance: cycle %d: %v\n", cycles, err)
 			return err
 		}
-		fmt.Fprintf(out, "maintenance: cycle %d registered=%d eligible=%d inspected=%d landed=%d retired=%d failed=%d acted=%t\n",
+		archived := 0
+		if archiveResults, archiveErr := maintenanceExpiry(tickCtx, root, *act, *expireAfter); archiveErr != nil {
+			faults++
+			fmt.Fprintf(errOut, "maintenance: cycle %d expiry: %v\n", cycles, archiveErr)
+			return archiveErr
+		} else {
+			for _, result := range archiveResults {
+				if result.Archived {
+					archived++
+				}
+			}
+		}
+		fmt.Fprintf(out, "maintenance: cycle %d registered=%d eligible=%d inspected=%d landed=%d retired=%d archived=%d failed=%d acted=%t\n",
 			cycles, report.Registered, report.Eligible, report.Inspected,
-			report.Landed, report.Retired, report.Failed, report.Acted)
+			report.Landed, report.Retired, archived, report.Failed, report.Acted)
 		if report.Failed > 0 {
 			faults++
 			for _, f := range report.Failures {
