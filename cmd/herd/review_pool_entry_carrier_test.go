@@ -39,6 +39,7 @@ const entryRef = "FAC-9320"
 // reviewer contract the entry requires, and returns root and the candidate sha.
 func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	root = t.TempDir()
 	git := func(args ...string) string {
 		t.Helper()
@@ -197,6 +198,10 @@ func entryFixture(t *testing.T) (root, sha string, herdrCalls func() []string) {
 	t.Setenv("HERD_WORKSPACE", "wFAKE")
 	t.Setenv("HERD_ROOT", root)
 	t.Setenv("HERD_REPO_ROOT", root)
+	// bindOwnedHostObservation resets host-scoped state while it builds its
+	// fixture. Set this after that setup so the state-root carrier assertion
+	// observes the same location as the production call.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	// Keep the real capacity gate in play but guarantee it admits on any host.
 	t.Setenv("HERD_MEM_FLOOR_MIB", "1")
 	t.Setenv("HERD_REVIEWER_RSS_MIB", "1")
@@ -245,18 +250,26 @@ func runEntryWith(t *testing.T, sha, base string, extra ...string) error {
 
 func entryCarriers(t *testing.T, root string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(root, ".herd", "worktrees"))
+	// The production entry isolates its environment before candidate preparation,
+	// so a test-side HOME or XDG lookup is not authoritative. Git's registration
+	// is: it finds the managed review-surface regardless of which state fallback
+	// the isolated call selected.
+	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		t.Fatal(err)
 	}
-	var names []string
-	for _, e := range entries {
-		names = append(names, e.Name())
+	marker := string(filepath.Separator) + "review-surface" + string(filepath.Separator)
+	var carriers []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		path := strings.TrimPrefix(line, "worktree ")
+		if strings.Contains(path, marker) {
+			carriers = append(carriers, path)
+		}
 	}
-	return names
+	return carriers
 }
 
 // THE ACCEPTANCE: fully pinned no-launch preparation is ready for the exact
@@ -270,7 +283,7 @@ func TestPoolNoLaunchEntryPreparesTheLeasedSlotWithoutACarrier(t *testing.T) {
 		t.Fatalf("fully pinned no-launch preparation failed: %v", err)
 	}
 
-	// THE REGRESSION: no redundant carrier anywhere under .herd/worktrees.
+	// THE REGRESSION: no redundant carrier anywhere in the managed state root.
 	if got := entryCarriers(t, root); len(got) != 0 {
 		t.Fatalf("no-launch preparation left an unowned carrier: %v", got)
 	}
