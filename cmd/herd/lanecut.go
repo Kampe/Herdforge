@@ -1,12 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
+
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // runLaneCut turns accumulated standing-lane work into ONE bounded candidate on
@@ -104,19 +105,21 @@ func runLaneCut(args []string) error {
 		return fmt.Errorf("candidate branch %q already exists; pass --name to cut a distinct one rather than overwriting a previous cut", candidate)
 	}
 
-	dir := filepath.Join(root, ".herd", "worktrees", safeReviewSurfacePart(candidate))
-	if _, err := os.Stat(dir); err == nil {
-		return fmt.Errorf("worktree %s already exists; remove it or pass --name", dir)
-	}
-	if out, err := git("worktree", "add", "-q", "-b", candidate, dir, *base); err != nil {
-		return fmt.Errorf("create candidate worktree from %s: %v: %s", *base, err, out)
+	cutID := safeReviewSurfacePart(candidate)
+	manager := worktree.NewStateWorktreeManagerFor(root, "lane-cut", "lane-cut")
+	dir, err := manager.CreateManagedBranch(context.Background(), cutID, candidate, *base)
+	if err != nil {
+		return fmt.Errorf("create managed candidate worktree from %s: %w", *base, err)
 	}
 	// Fail closed and leave nothing behind: a half-created candidate is worse
 	// than none, because it looks reviewable.
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_, _ = git("worktree", "remove", "--force", dir)
+			// Partial cuts have no user-owned history. This is the one failure
+			// boundary allowed to force-remove after the lifecycle record was
+			// published; successful cuts retire through the landed reaper.
+			_ = manager.RemoveWorktree(context.Background(), dir)
 			_, _ = git("branch", "-D", candidate)
 		}
 	}()

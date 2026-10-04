@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // FAC-832: pool preparation allocated a detached carrier under .herd/worktrees
@@ -26,6 +28,7 @@ import (
 // candidate branch, and NO worktree holding the candidate.
 func carrierRepo(t *testing.T) (root, sha string) {
 	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	root = t.TempDir()
 	run := func(args ...string) {
 		t.Helper()
@@ -50,11 +53,11 @@ func carrierRepo(t *testing.T) (root, sha string) {
 	return root, strings.TrimSpace(string(out))
 }
 
-// managedWorktrees lists the carriers under .herd/worktrees, which is where the
-// orphans accumulated.
+// managedWorktrees lists the state-root review carriers. The repository-local
+// location is deliberately no longer a creator destination.
 func managedWorktrees(t *testing.T, root string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(root, ".herd", "worktrees"))
+	entries, err := os.ReadDir(filepath.Join(worktree.StateWorktreeRoot(root), "review-surface"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil

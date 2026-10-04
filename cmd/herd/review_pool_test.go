@@ -272,6 +272,7 @@ func TestResolvePoolCandidateStillReportsAGenuineWorktreeMiss(t *testing.T) {
 // and two dispatches (#3340, #3339) were rejected for forgetting a step the
 // command can do itself.
 func TestCandidateSurfaceIsPreparedWhenTheSHAResolves(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	root := t.TempDir()
 	run := func(a ...string) {
 		t.Helper()
@@ -302,6 +303,12 @@ func TestCandidateSurfaceIsPreparedWhenTheSHAResolves(t *testing.T) {
 	// may be working on. A detached surface at an exact SHA is inert.
 	if exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Run() == nil {
 		t.Error("the surface must be DETACHED so no branch ref is moved")
+	}
+	if err := retirePreparedCandidateSurface(root, "feat/thing", sha); err != nil {
+		t.Fatalf("retire prepared surface: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("ingested surface was not retired: %v", err)
 	}
 }
 

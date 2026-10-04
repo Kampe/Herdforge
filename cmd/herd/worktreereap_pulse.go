@@ -223,9 +223,11 @@ func reapPulseTickLocked(ctx context.Context, root, base string, act bool) (reap
 	}
 	report.Inspected = len(inspected)
 
-	// The native classifier decides. byPR is false: a scheduled beat must not
-	// depend on network reachability of a PR host to answer "did this land".
-	landed, _ := classifyReapEntriesWithSources(root, base, false, inspected, sources)
+	// Include the recorded merged-PR proof. A squash merge has no shared
+	// ancestry with its source branch, so an ancestry-only scheduled sweep
+	// leaves exactly the completed checkout it is meant to retire. A missing
+	// or unreadable PR answer is fail-closed inside the classifier.
+	landed, _ := classifyReapEntriesWithSources(root, base, true, inspected, sources)
 	report.Landed = len(landed)
 	if len(landed) > reapPulseRetireBudget {
 		landed = landed[:reapPulseRetireBudget]

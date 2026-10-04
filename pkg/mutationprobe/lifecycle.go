@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Kampe/Herdforge/pkg/resources"
+	"github.com/Kampe/Herdforge/pkg/worktree"
 )
 
 // KnownProbePrefixes are leaf-name prefixes this package will create and
@@ -45,10 +46,10 @@ type Probe struct {
 
 // Classification is the fail-closed evidence used before cleanup.
 type Classification struct {
-	Class   Class
-	HEAD    string
-	Dirty   bool
-	Reason  string
+	Class  Class
+	HEAD   string
+	Dirty  bool
+	Reason string
 	// PreserveAction is operator-facing recovery guidance; free of host paths.
 	PreserveAction string
 }
@@ -56,24 +57,24 @@ type Classification struct {
 // RecoveryReport is a read-only description of a leaked or preserved probe
 // (including the FAC-83 shape). It never deletes anything.
 type RecoveryReport struct {
-	ProbeName     string `json:"probe_name"`
-	TaskRef       string `json:"task_ref,omitempty"`
-	CandidateSHA  string `json:"candidate_sha,omitempty"`
-	Generation    string `json:"generation,omitempty"`
-	Class         Class  `json:"class"`
-	HEAD          string `json:"head,omitempty"`
-	Dirty         bool   `json:"dirty"`
-	Registered    bool   `json:"registered_in_origin"`
-	DirectoryExists bool `json:"directory_exists"`
-	Reason        string `json:"reason"`
-	PreserveAction string `json:"preserve_action"`
+	ProbeName       string `json:"probe_name"`
+	TaskRef         string `json:"task_ref,omitempty"`
+	CandidateSHA    string `json:"candidate_sha,omitempty"`
+	Generation      string `json:"generation,omitempty"`
+	Class           Class  `json:"class"`
+	HEAD            string `json:"head,omitempty"`
+	Dirty           bool   `json:"dirty"`
+	Registered      bool   `json:"registered_in_origin"`
+	DirectoryExists bool   `json:"directory_exists"`
+	Reason          string `json:"reason"`
+	PreserveAction  string `json:"preserve_action"`
 	// PathLeaf is the portable basename only — never a host absolute path.
 	PathLeaf string `json:"path_leaf"`
 }
 
 // Manager owns create/classify/remove against one hermetic origin repository
 // and one temp root. Production callers pass the repository root and leave
-// TempRoot empty (defaults to os.TempDir()). Tests inject a TempRoot under
+// TempRoot empty (defaults to the managed state root). Tests inject a TempRoot under
 // t.TempDir so git worktree mutations never touch the developer checkout.
 //
 // Git worktree add/remove against a shared origin is serialized via mu:
@@ -124,7 +125,7 @@ func (m *Manager) tempRoot() (string, error) {
 	}
 	root := m.TempRoot
 	if root == "" {
-		root = os.TempDir()
+		root = filepath.Join(worktree.StateWorktreeRoot(m.OriginRoot), "mutation-probe")
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -154,10 +155,10 @@ func (m *Manager) admitDisk(targetPath string) error {
 		return fmt.Errorf("disk capacity gate: invalid requirement")
 	}
 	decision := m.DiskAdmission.Admit(resources.DiskRequest{
-		Operation:     "mutation_probe_create",
-		Path:          origin,
-		TempPath:      tmp,
-		RequiredBytes: requirement.Bytes,
+		Operation:      "mutation_probe_create",
+		Path:           origin,
+		TempPath:       tmp,
+		RequiredBytes:  requirement.Bytes,
 		RequiredInodes: requirement.Inodes,
 	})
 	if decision.Allowed {
@@ -227,6 +228,13 @@ func (m *Manager) Create(ctx context.Context, store *Store, req CreateRequest) (
 	m.mu.Unlock()
 	if addErr != nil {
 		return nil, fmt.Errorf("mutationprobe: git worktree add: %v (%s)", addErr, strings.TrimSpace(string(out)))
+	}
+	if m.TempRoot == "" {
+		manager := worktree.NewStateWorktreeManagerFor(m.OriginRoot, "mutation-probe", "mutation-probe")
+		if err := manager.RegisterManaged(probeName, sha, target); err != nil {
+			_ = m.forceSafeRemoveBestEffort(ctx, target)
+			return nil, fmt.Errorf("mutationprobe: record managed worktree: %w", err)
+		}
 	}
 
 	receipt, err := store.Register(Receipt{
@@ -395,7 +403,6 @@ func EnsureCleanup(ctx context.Context, store *Store, m *Manager, probeID, expec
 		return fmt.Errorf("%w: task=%s candidate=%s probe=%s: remove failed: %v",
 			ErrProbePreserved, receipt.TaskRef, shortSHA(receipt.CandidateSHA), probeID, err)
 	}
-
 	absent, aerr := m.absenceProved(ctx, path, receipt.ProbeName)
 	if aerr != nil || !absent {
 		reason := "absence not proved after remove"
@@ -405,6 +412,11 @@ func EnsureCleanup(ctx context.Context, store *Store, m *Manager, probeID, expec
 		_ = store.MarkPreserved(probeID, ClassUnknown, reason)
 		return fmt.Errorf("%w: task=%s candidate=%s probe=%s: %s",
 			ErrProbePreserved, receipt.TaskRef, shortSHA(receipt.CandidateSHA), probeID, reason)
+	}
+	if m.TempRoot == "" {
+		if err := worktree.NewStateWorktreeManagerFor(m.OriginRoot, "mutation-probe", "mutation-probe").MarkManagedRetired(receipt.ProbeName); err != nil {
+			return fmt.Errorf("mutationprobe: record retirement: %w", err)
+		}
 	}
 	return store.MarkRemoved(probeID, true)
 }
